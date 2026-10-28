@@ -69,7 +69,7 @@ pub use capabilities::{
 };
 pub use convergence_pass::{
     ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassMemberRole, ConvergencePassPhase,
-    DurableConvergencePass,
+    ConvergencePassRetry, ConvergencePassStep, DurableConvergencePass,
 };
 pub use engine::{
     AutoPublish, CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,

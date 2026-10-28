@@ -90,6 +90,7 @@ mod tests {
             frozen_at_wall_ms: Some(1_020),
             cutoff_cause: Some(ConvergenceCutoffCause::Quiescence),
             fairness_slot_available: false,
+            retry: None,
         }
     }
 

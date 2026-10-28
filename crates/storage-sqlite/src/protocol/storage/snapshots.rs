@@ -1024,6 +1024,7 @@ mod tests {
             frozen_at_wall_ms: Some(1_200),
             cutoff_cause: Some(ConvergenceCutoffCause::Quiescence),
             fairness_slot_available: false,
+            retry: None,
         };
         source.put_convergence_pass(&pass).unwrap();
 

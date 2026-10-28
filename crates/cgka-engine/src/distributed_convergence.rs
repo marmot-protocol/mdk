@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cgka_traits::convergence_pass::{
     ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassMemberRole, ConvergencePassPhase,
-    DurableConvergencePass,
+    ConvergencePassRetry, ConvergencePassStep, DurableConvergencePass,
 };
 use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent, GroupStateInvalidationReason};
 use cgka_traits::engine_state::EpochState;
@@ -86,6 +86,80 @@ fn convergence_run_context(run_id: &str, phase: ConvergencePhase) -> AuditEventC
 
 fn storage_projection_error(error: StorageError) -> OpenMlsProjectionError {
     OpenMlsProjectionError::Storage(format!("{error:?}"))
+}
+
+/// Delay before the second attempt at a frozen batch that failed (mdk#2684).
+/// Each further failure doubles it, up to [`CONVERGENCE_PASS_RETRY_MAX_MS`].
+pub const CONVERGENCE_PASS_RETRY_BASE_MS: u64 = 1_000;
+/// Longest wait between two attempts at a failing frozen batch.
+pub const CONVERGENCE_PASS_RETRY_MAX_MS: u64 = 300_000;
+/// Consecutive failed attempts after which a frozen batch parks. A parked pass
+/// waits for new selection input or an explicit retry.
+pub const CONVERGENCE_PASS_PARK_AFTER_FAILURES: u32 = 12;
+
+fn convergence_pass_retry_delay_ms(failed_attempts: u32) -> u64 {
+    let doublings = failed_attempts.saturating_sub(1).min(31);
+    CONVERGENCE_PASS_RETRY_BASE_MS
+        .saturating_mul(1_u64 << doublings)
+        .min(CONVERGENCE_PASS_RETRY_MAX_MS)
+}
+
+/// Low-cardinality class of a failed attempt's error, for audit records.
+fn projection_error_kind(error: &OpenMlsProjectionError) -> &'static str {
+    match error {
+        OpenMlsProjectionError::Decode(_) => "decode",
+        OpenMlsProjectionError::EmptyCandidatePath(_) => "empty_candidate_path",
+        OpenMlsProjectionError::CandidatePathDidNotCommit(_) => "candidate_path_did_not_commit",
+        OpenMlsProjectionError::UnsupportedMessageKind(_) => "unsupported_message_kind",
+        OpenMlsProjectionError::MissingGroup => "missing_group",
+        OpenMlsProjectionError::Snapshot(_) => "snapshot",
+        OpenMlsProjectionError::Replay(_) => "replay",
+        OpenMlsProjectionError::RejectedProposal { .. } => "rejected_proposal",
+        OpenMlsProjectionError::UnauthorizedCommit { .. } => "unauthorized_commit",
+        OpenMlsProjectionError::InvalidCommit { .. } => "invalid_commit",
+        OpenMlsProjectionError::Serialize(_) => "serialize",
+        OpenMlsProjectionError::Storage(_) => "storage",
+        OpenMlsProjectionError::InvalidPolicy(_) => "invalid_policy",
+        OpenMlsProjectionError::ReplayBudgetExceeded => "replay_budget_exceeded",
+        OpenMlsProjectionError::MissingOwnCommitCheckpoint => "missing_own_commit_checkpoint",
+        OpenMlsProjectionError::CheckpointStateMismatch => "checkpoint_state_mismatch",
+    }
+}
+
+/// An attempt at a frozen batch that stopped before its apply committed.
+struct ConvergencePassFailure {
+    step: ConvergencePassStep,
+    error: OpenMlsProjectionError,
+}
+
+impl ConvergencePassFailure {
+    fn at(step: ConvergencePassStep) -> impl Fn(OpenMlsProjectionError) -> Self {
+        move |error| Self { step, error }
+    }
+}
+
+/// How an attempt at a frozen batch ended, short of a failure.
+enum FrozenPassResolution {
+    /// The search used up this slice's budget; the continuation is kept.
+    Yielded,
+    /// The pass halted or completed with nothing to apply.
+    Finished(CanonicalizationResult),
+    /// The selected result is durably applied; the caller announces it.
+    Applied(Box<AppliedConvergencePass>),
+}
+
+/// What a committed apply leaves for the post-commit announcements.
+struct AppliedConvergencePass {
+    result: CanonicalizationResult,
+    completed_pass: DurableConvergencePass,
+    disposition_transitions: Vec<(
+        crate::openmls_projection::OpenMlsCanonicalizationDisposition,
+        MessageState,
+    )>,
+    pre_apply_commit_states: BTreeMap<String, (MessageState, EpochId)>,
+    group_changes: Vec<AppliedGroupChanges>,
+    application_events: Vec<GroupEvent>,
+    membership_effects: Option<crate::membership_effects::CanonicalMembershipEffects>,
 }
 
 #[cfg(feature = "test-policy-overrides")]
@@ -131,10 +205,20 @@ pub(crate) fn normalize_convergence_pass_for_runtime(
     #[cfg(not(feature = "test-policy-overrides"))]
     let _ = policy;
 
-    if pass.phase != ConvergencePassPhase::Collecting
-        || pass.clock_instance_id == convergence_clock_instance_id
-    {
+    if pass.clock_instance_id == convergence_clock_instance_id {
         return false;
+    }
+    if pass.phase != ConvergencePassPhase::Collecting {
+        // A frozen batch keeps one process-local instant: the next attempt
+        // after a failure. Rebase it like the cutoffs below.
+        let Some(retry) = pass.retry.as_mut() else {
+            return false;
+        };
+        retry.next_attempt_monotonic_ms = now
+            .monotonic_ms
+            .saturating_add(retry.next_attempt_wall_ms.saturating_sub(now.wall_ms));
+        pass.clock_instance_id = convergence_clock_instance_id;
+        return true;
     }
 
     // A process-local monotonic deadline cannot survive restart. Rebase every
@@ -586,6 +670,9 @@ impl<S: StorageProvider> Engine<S> {
             return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         };
         if pass.phase != ConvergencePassPhase::Collecting {
+            if self.reopen_failed_convergence_pass_for_input(&pass, message_id, &policy, now)? {
+                return Ok((ConvergenceAdmissionOutcome::Admitted, true));
+            }
             return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         }
         if pass
@@ -809,8 +896,26 @@ impl<S: StorageProvider> Engine<S> {
         let generation = previous
             .as_ref()
             .map_or(0, |pass| pass.generation.saturating_add(1));
+        let pass = self.new_collecting_convergence_pass(
+            group_id, base_epoch, generation, members, policy, now,
+        );
+        self.storage
+            .put_convergence_pass(&pass)
+            .map_err(storage_projection_error)?;
+        Ok((Some(pass), true))
+    }
+
+    fn new_collecting_convergence_pass(
+        &self,
+        group_id: &GroupId,
+        base_epoch: EpochId,
+        generation: u64,
+        members: Vec<ConvergencePassMember>,
+        policy: &CanonicalizationPolicy,
+        now: ConvergenceTime,
+    ) -> DurableConvergencePass {
         let opened_monotonic_ms = now.monotonic_ms;
-        let pass = DurableConvergencePass {
+        DurableConvergencePass {
             group_id: group_id.clone(),
             generation,
             phase: ConvergencePassPhase::Collecting,
@@ -830,11 +935,85 @@ impl<S: StorageProvider> Engine<S> {
             frozen_at_wall_ms: None,
             cutoff_cause: None,
             fairness_slot_available: false,
+            retry: None,
+        }
+    }
+
+    /// Reopen a frozen batch that failed, now that `message_id` brings selection
+    /// input it does not hold (mdk#2684).
+    ///
+    /// A failed batch is resolved from the same members on every attempt, so a
+    /// deterministic failure repeats until the input changes. A commit or a
+    /// proposal from the pass's horizon or beyond is such a change; an
+    /// application is not, or a busy group's traffic would keep a failing batch
+    /// retrying. Reopening is the stale-base discard's repair: the batch holds no
+    /// canonical state, and its members reseed into a collecting pass with a
+    /// fresh failure count. Returns whether a pass was reopened.
+    fn reopen_failed_convergence_pass_for_input(
+        &self,
+        pass: &DurableConvergencePass,
+        message_id: &MessageId,
+        policy: &CanonicalizationPolicy,
+        now: ConvergenceTime,
+    ) -> Result<bool, OpenMlsProjectionError> {
+        if pass.retry.is_none()
+            || pass
+                .members
+                .iter()
+                .any(|member| &member.message_id == message_id)
+        {
+            return Ok(false);
+        }
+        let Some(candidate) = self.convergence_pass_candidate(message_id)? else {
+            return Ok(false);
         };
-        self.storage
-            .put_convergence_pass(&pass)
-            .map_err(storage_projection_error)?;
-        Ok((Some(pass), true))
+        let floor = pass
+            .base_epoch
+            .0
+            .saturating_sub(policy.convergence.max_rewind_commits);
+        if !matches!(
+            candidate.member.role,
+            ConvergencePassMemberRole::CommitEdge | ConvergencePassMemberRole::ProposalDependency
+        ) || candidate.member.source_epoch < floor
+        {
+            return Ok(false);
+        }
+        let (members, has_trigger) =
+            self.seed_convergence_pass_members(&pass.group_id, pass.base_epoch, policy)?;
+        if members.is_empty() || !has_trigger {
+            self.storage
+                .delete_convergence_pass(&pass.group_id)
+                .map_err(storage_projection_error)?;
+        } else {
+            let reopened = self.new_collecting_convergence_pass(
+                &pass.group_id,
+                pass.base_epoch,
+                pass.generation.saturating_add(1),
+                members,
+                policy,
+                now,
+            );
+            self.storage
+                .put_convergence_pass(&reopened)
+                .map_err(storage_projection_error)?;
+        }
+        self.audit_group(
+            &pass.group_id,
+            marmot_forensics::AuditEventKind::ConvergenceRunState {
+                phase: ConvergencePhase::Waiting,
+                current_tip_epoch: Some(pass.base_epoch.0),
+                retained_anchor_horizon: Some(floor),
+                reason: Some("pass_reopened:new_input".to_string()),
+                error_kind: None,
+            },
+        );
+        tracing::info!(
+            target: "cgka_engine::distributed_convergence",
+            method = "reopen_failed_convergence_pass_for_input",
+            failed_attempts = pass.retry.as_ref().map_or(0, |retry| retry.failed_attempts),
+            "new selection input reopened a failed convergence pass"
+        );
+        Ok(true)
     }
 
     fn seed_convergence_pass_members(
@@ -1503,327 +1682,54 @@ impl<S: StorageProvider> Engine<S> {
         if pass.phase == ConvergencePassPhase::Completed {
             return Ok(settled_empty_result(previous_tip.0));
         }
-        let max_retained_anchor_rewind = policy.convergence.max_rewind_commits;
+        // A failed batch waits out its backoff, and a parked one waits for new
+        // selection input or an explicit retry (mdk#2684). This gates new
+        // attempts only: a running attempt's later slices are already due.
+        if pass
+            .retry
+            .as_ref()
+            .is_some_and(|retry| retry.is_parked() || now_ms < retry.next_attempt_monotonic_ms)
+        {
+            return Ok(waiting_result(previous_tip.0));
+        }
         let retained_anchor_epoch = previous_tip
             .0
             .saturating_sub(policy.convergence.max_rewind_commits);
-        let state = CanonicalizationState {
-            current_tip_epoch: previous_tip.0,
-            retained_anchor_epoch,
-            // The pass has already crossed its immutable cutoff. Keep the
-            // canonicalization model's legacy status calculation settled;
-            // membership, not a live re-enumeration, now controls the batch.
-            last_convergence_relevant_input_ms: now_ms
-                .saturating_sub(policy.settlement_quiescence_ms),
-            seen_message_ids: std::collections::BTreeSet::new(),
-        };
-
-        let max_rewind_commits = policy.convergence.max_rewind_commits;
         let run_id = convergence_run_id(group_id, previous_tip.0);
-        self.audit_group_with_context(
+        let AppliedConvergencePass {
+            result,
+            completed_pass,
+            disposition_transitions,
+            pre_apply_commit_states,
+            group_changes,
+            application_events,
+            membership_effects,
+        } = match self.resolve_frozen_convergence_pass(
             group_id,
-            convergence_run_context(&run_id, ConvergencePhase::Started),
-            marmot_forensics::AuditEventKind::ConvergenceRunState {
-                phase: ConvergencePhase::Started,
-                current_tip_epoch: Some(previous_tip.0),
-                retained_anchor_horizon: Some(retained_anchor_epoch),
-                reason: None,
-                error_kind: None,
-            },
-        );
-        let replay_profile_policy = ReplayProfilePolicy {
-            reject_legacy_group_additions: self.new_protocol_profile
-                == cgka_traits::group::ProtocolProfile::Current,
-        };
-        let admitted_message_ids: Vec<MessageId> = pass
-            .members
-            .iter()
-            .map(|member| member.message_id.clone())
-            .collect();
-        let shared_seen_message_ids = self.seen_pass_members_hex(&admitted_message_ids);
-        let options = StoredCanonicalizationOptions {
-            replay_profile: replay_profile_policy,
-            admitted_message_ids: Some(&admitted_message_ids),
-            shared_seen_message_ids: Some(shared_seen_message_ids),
-            admit_app_witnesses: {
-                #[cfg(feature = "test-policy-overrides")]
-                {
-                    self.admit_app_witnesses
-                }
-                #[cfg(not(feature = "test-policy-overrides"))]
-                {
-                    true
-                }
-            },
-            replay_probe_budget_override: {
-                #[cfg(feature = "test-policy-overrides")]
-                {
-                    self.replay_probe_budget_override
-                }
-                #[cfg(not(feature = "test-policy-overrides"))]
-                {
-                    None
-                }
-            },
-        };
-        let result = if let Some(deadline) = deadline {
-            let mut continuation = self.canonical_replays.remove(group_id);
-            let result = crate::openmls_projection::canonicalize_stored_slice(
-                &self.storage,
-                group_id,
-                state,
-                vec![],
-                policy,
-                now_ms,
-                options,
-                pass.generation,
-                &mut continuation,
-                &mut crate::openmls_projection::ReplaySlice::new(
-                    deadline,
-                    self.replay_slice_probe_limit,
-                ),
-            )?;
-            if let Some(continuation) = continuation {
-                self.canonical_replays
-                    .insert(group_id.clone(), continuation);
-            }
-            let Some(result) = result else {
-                self.schedule_pending_convergence_group(group_id);
-                return Ok(waiting_result(previous_tip.0));
-            };
-            result
-        } else {
-            self.canonical_replays.remove(group_id);
-            canonicalize_stored_openmls_messages_with_profile_policy(
-                &self.storage,
-                group_id,
-                state,
-                vec![],
-                policy,
-                now_ms,
-                options,
-            )?
-        };
-        let mut result = result;
-        #[cfg(feature = "test-conformance-snapshot")]
-        {
-            self.conformance_replay_probe_count = self
-                .conformance_replay_probe_count
-                .saturating_add(result.replay_probe_count);
-        }
-        let evaluated_status = result.convergence_status;
-        // Missing dependencies stay retained for the next generation. Once a
-        // pass is frozen, later arrivals cannot extend or alter this batch.
-        if matches!(
-            result.convergence_status,
-            ConvergenceStatus::Syncing | ConvergenceStatus::Resolving
+            &pass,
+            previous_tip,
+            policy,
+            now,
+            deadline,
+            retained_anchor_epoch,
+            &run_id,
         ) {
-            result.convergence_status = ConvergenceStatus::Settled;
-        }
-        let error_kinds: Vec<String> = result
-            .errors
-            .iter()
-            .map(|error| canonicalization_error_tag(*error).to_string())
-            .collect();
-        self.audit_group_with_context(
-            group_id,
-            convergence_run_context(&run_id, ConvergencePhase::Evaluating),
-            crate::audit_helpers::convergence_decision_event(
-                previous_tip.0,
-                max_rewind_commits,
-                result.selection_trace.as_ref(),
-                error_kinds.clone(),
-            ),
-        );
-        if matches!(
-            evaluated_status,
-            ConvergenceStatus::Syncing | ConvergenceStatus::Resolving
-        ) {
-            self.audit_group_with_context(
-                group_id,
-                convergence_run_context(&run_id, ConvergencePhase::Waiting),
-                marmot_forensics::AuditEventKind::ConvergenceRunState {
-                    phase: ConvergencePhase::Waiting,
-                    current_tip_epoch: Some(previous_tip.0),
-                    retained_anchor_horizon: Some(retained_anchor_epoch),
-                    reason: Some(
-                        match evaluated_status {
-                            ConvergenceStatus::Resolving => "resolving",
-                            _ => "syncing",
-                        }
-                        .to_string(),
-                    ),
-                    error_kind: None,
-                },
-            );
-        }
-
-        // Missing branch state inside the rollback horizon must leave
-        // canonical state unchanged and move the group to `Unrecoverable`.
-        // This includes an epoch anchor and the exact checkpoint required to
-        // realize a locally authored pre-upgrade commit.
-        let missing_retained_state = result.errors.iter().copied().find(|error| {
-            matches!(
-                error,
-                CanonicalizationError::MissingRetainedAnchor
-                    | CanonicalizationError::MissingOwnCommitCheckpoint
-            )
-        });
-        if let Some(missing_retained_state) = missing_retained_state {
-            let error_kind = canonicalization_error_tag(missing_retained_state);
-            let mut group = self
-                .storage
-                .get_group(group_id)
-                .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-            if !group.unrecoverable {
-                group.unrecoverable = true;
-                self.storage
-                    .put_group(&group)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+            Ok(FrozenPassResolution::Yielded) => return Ok(waiting_result(previous_tip.0)),
+            Ok(FrozenPassResolution::Finished(result)) => return Ok(result),
+            Ok(FrozenPassResolution::Applied(applied)) => *applied,
+            Err(ConvergencePassFailure { step, error }) => {
+                self.record_convergence_pass_failure(
+                    &pass,
+                    step,
+                    &error,
+                    now,
+                    previous_tip,
+                    retained_anchor_epoch,
+                    &run_id,
+                );
+                return Err(error);
             }
-            let previous_state = self
-                .epoch_manager
-                .state(group_id)
-                .map(|state| crate::audit_helpers::epoch_state_name_str(state.name()).to_string());
-            self.epoch_manager.mark_unrecoverable(group_id);
-            let epoch = self.epoch_manager.epoch(group_id).unwrap_or(previous_tip);
-            self.audit_group(
-                group_id,
-                marmot_forensics::AuditEventKind::EpochStateChanged {
-                    previous_state,
-                    new_state: "unrecoverable".to_string(),
-                    epoch: epoch.0,
-                    reason: error_kind.to_string(),
-                    pending_ref: None,
-                    pending_kind: None,
-                },
-            );
-            self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
-                group_id: group_id.clone(),
-            });
-            self.audit_group_with_context(
-                group_id,
-                convergence_run_context(&run_id, ConvergencePhase::Unrecoverable),
-                marmot_forensics::AuditEventKind::ConvergenceRunState {
-                    phase: ConvergencePhase::Unrecoverable,
-                    current_tip_epoch: Some(previous_tip.0),
-                    retained_anchor_horizon: Some(retained_anchor_epoch),
-                    reason: None,
-                    error_kind: Some(error_kind.to_string()),
-                },
-            );
-            return Ok(result);
-        }
-        if result.convergence_status == ConvergenceStatus::Blocked {
-            self.audit_group_with_context(
-                group_id,
-                convergence_run_context(&run_id, ConvergencePhase::Blocked),
-                marmot_forensics::AuditEventKind::ConvergenceRunState {
-                    phase: ConvergencePhase::Blocked,
-                    current_tip_epoch: Some(previous_tip.0),
-                    retained_anchor_horizon: Some(retained_anchor_epoch),
-                    reason: Some("blocked".to_string()),
-                    error_kind: None,
-                },
-            );
-            pass.phase = ConvergencePassPhase::Completed;
-            pass.fairness_slot_available = false;
-            self.storage
-                .put_convergence_pass(&pass)
-                .map_err(storage_projection_error)?;
-            self.schedule_drain_for_retained_outbound_intents(group_id);
-            return Ok(result);
-        }
-
-        let mut completed_pass = pass.clone();
-        completed_pass.phase = ConvergencePassPhase::Completed;
-        completed_pass.fairness_slot_available = true;
-        // The disposition writes are part of the atomic convergence apply.
-        // Snapshot their prior values first, then emit forensic transitions
-        // only after that transaction commits so Goggles never observes a
-        // state change that rolled back.
-        let disposition_transitions = if self.recorder.is_enabled() {
-            openmls_canonicalization_dispositions(&result)?
-                .into_iter()
-                .map(|disposition| {
-                    let record = self
-                        .storage
-                        .get_message(&disposition.message_id)
-                        .map_err(storage_projection_error)?;
-                    Ok((disposition, record.state))
-                })
-                .collect::<Result<Vec<_>, OpenMlsProjectionError>>()?
-        } else {
-            Vec::new()
         };
-        let pre_apply_commit_states = self.pre_apply_commit_states(&result)?;
-        // Capture the actual source tree only after selection finishes. Yielded,
-        // rejected and app-only passes must not pay for a membership snapshot.
-        let previous_membership = if result.selected_tip.is_some() {
-            Some(
-                self.canonical_membership_snapshot(group_id)
-                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?,
-            )
-        } else {
-            None
-        };
-        let (group_changes, application_events, membership_effects) =
-            self.storage.with_transaction(|storage| {
-                let output = apply_openmls_canonicalization_result_with_profile_policy(
-                    storage,
-                    group_id,
-                    &result,
-                    max_retained_anchor_rewind,
-                    replay_profile_policy,
-                )?;
-                // Membership cleanup belongs to canonical apply: a failed queue or
-                // leave-request write must roll back MLS and the completed pass too.
-                let membership_effects = if let Some(before) = previous_membership.as_ref() {
-                    let group = openmls::group::MlsGroup::load(
-                        storage.mls_storage(),
-                        &openmls::group::GroupId::from_slice(group_id.as_slice()),
-                    )
-                    .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?
-                    .ok_or_else(|| {
-                        OpenMlsProjectionError::Replay("selected group missing".into())
-                    })?;
-                    // Disband owns its terminal cleanup and must not announce an
-                    // intermediate local restoration from its replayed source tree.
-                    if crate::app_components::lifecycle_of_group(&group)
-                        .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
-                        == Some(cgka_traits::app_components::GroupLifecycleV1::Disbanded)
-                    {
-                        None
-                    } else {
-                        let after = crate::membership_effects::MembershipSnapshot::capture(
-                            &group,
-                            self.identity.self_id(),
-                            storage.get_group(group_id)?.removed,
-                        );
-                        Some(
-                            self.prepare_canonical_membership_effects_on_storage(
-                                storage, group_id, before, &after,
-                            )
-                            .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?,
-                        )
-                    }
-                } else {
-                    None
-                };
-                storage.put_convergence_pass(&completed_pass)?;
-                let application_events =
-                    Self::application_replay_events(group_id, &output.observations)?;
-                for event in &application_events {
-                    storage
-                        .put_pending_application_event(event)
-                        .map_err(storage_projection_error)?;
-                }
-                Ok::<_, OpenMlsProjectionError>((
-                    output.group_changes,
-                    application_events,
-                    membership_effects,
-                ))
-            })?;
         // mdk#1472: completing the pass opens the gate that held queued
         // outbound intents. A drain that ran before the settle consumed the
         // one-shot schedule edge without releasing them, so completion must
@@ -1972,6 +1878,458 @@ impl<S: StorageProvider> Engine<S> {
             self.schedule_pending_convergence_group(group_id);
         }
         Ok(result)
+    }
+
+    /// Select a branch for an active frozen batch and apply it atomically.
+    ///
+    /// Every error before the apply commits leaves the pass unresolved, so the
+    /// caller records it against the batch's failure budget; the step it names
+    /// is aggregate diagnostics (mdk#2684). The announcements after the commit
+    /// stay with the caller: by then the pass is complete and a later error
+    /// there cannot replay it.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_frozen_convergence_pass(
+        &mut self,
+        group_id: &GroupId,
+        pass: &DurableConvergencePass,
+        previous_tip: EpochId,
+        policy: CanonicalizationPolicy,
+        now: ConvergenceTime,
+        deadline: Option<web_time::Instant>,
+        retained_anchor_epoch: u64,
+        run_id: &str,
+    ) -> Result<FrozenPassResolution, ConvergencePassFailure> {
+        let now_ms = now.monotonic_ms;
+        let max_retained_anchor_rewind = policy.convergence.max_rewind_commits;
+        let state = CanonicalizationState {
+            current_tip_epoch: previous_tip.0,
+            retained_anchor_epoch,
+            // The pass has already crossed its immutable cutoff. Keep the
+            // canonicalization model's legacy status calculation settled;
+            // membership, not a live re-enumeration, now controls the batch.
+            last_convergence_relevant_input_ms: now_ms
+                .saturating_sub(policy.settlement_quiescence_ms),
+            seen_message_ids: std::collections::BTreeSet::new(),
+        };
+
+        let max_rewind_commits = policy.convergence.max_rewind_commits;
+        self.audit_group_with_context(
+            group_id,
+            convergence_run_context(run_id, ConvergencePhase::Started),
+            marmot_forensics::AuditEventKind::ConvergenceRunState {
+                phase: ConvergencePhase::Started,
+                current_tip_epoch: Some(previous_tip.0),
+                retained_anchor_horizon: Some(retained_anchor_epoch),
+                reason: None,
+                error_kind: None,
+            },
+        );
+        let replay_profile_policy = ReplayProfilePolicy {
+            reject_legacy_group_additions: self.new_protocol_profile
+                == cgka_traits::group::ProtocolProfile::Current,
+        };
+        let admitted_message_ids: Vec<MessageId> = pass
+            .members
+            .iter()
+            .map(|member| member.message_id.clone())
+            .collect();
+        let shared_seen_message_ids = self.seen_pass_members_hex(&admitted_message_ids);
+        let options = StoredCanonicalizationOptions {
+            replay_profile: replay_profile_policy,
+            admitted_message_ids: Some(&admitted_message_ids),
+            shared_seen_message_ids: Some(shared_seen_message_ids),
+            admit_app_witnesses: {
+                #[cfg(feature = "test-policy-overrides")]
+                {
+                    self.admit_app_witnesses
+                }
+                #[cfg(not(feature = "test-policy-overrides"))]
+                {
+                    true
+                }
+            },
+            replay_probe_budget_override: {
+                #[cfg(feature = "test-policy-overrides")]
+                {
+                    self.replay_probe_budget_override
+                }
+                #[cfg(not(feature = "test-policy-overrides"))]
+                {
+                    None
+                }
+            },
+        };
+        let result = if let Some(deadline) = deadline {
+            let mut continuation = self.canonical_replays.remove(group_id);
+            let result = crate::openmls_projection::canonicalize_stored_slice(
+                &self.storage,
+                group_id,
+                state,
+                vec![],
+                policy,
+                now_ms,
+                options,
+                pass.generation,
+                &mut continuation,
+                &mut crate::openmls_projection::ReplaySlice::new(
+                    deadline,
+                    self.replay_slice_probe_limit,
+                ),
+            )
+            .map_err(ConvergencePassFailure::at(ConvergencePassStep::Select))?;
+            if let Some(continuation) = continuation {
+                self.canonical_replays
+                    .insert(group_id.clone(), continuation);
+            }
+            let Some(result) = result else {
+                self.schedule_pending_convergence_group(group_id);
+                return Ok(FrozenPassResolution::Yielded);
+            };
+            result
+        } else {
+            self.canonical_replays.remove(group_id);
+            canonicalize_stored_openmls_messages_with_profile_policy(
+                &self.storage,
+                group_id,
+                state,
+                vec![],
+                policy,
+                now_ms,
+                options,
+            )
+            .map_err(ConvergencePassFailure::at(ConvergencePassStep::Select))?
+        };
+        let mut result = result;
+        #[cfg(feature = "test-conformance-snapshot")]
+        {
+            self.conformance_replay_probe_count = self
+                .conformance_replay_probe_count
+                .saturating_add(result.replay_probe_count);
+        }
+        let evaluated_status = result.convergence_status;
+        // Missing dependencies stay retained for the next generation. Once a
+        // pass is frozen, later arrivals cannot extend or alter this batch.
+        if matches!(
+            result.convergence_status,
+            ConvergenceStatus::Syncing | ConvergenceStatus::Resolving
+        ) {
+            result.convergence_status = ConvergenceStatus::Settled;
+        }
+        let error_kinds: Vec<String> = result
+            .errors
+            .iter()
+            .map(|error| canonicalization_error_tag(*error).to_string())
+            .collect();
+        self.audit_group_with_context(
+            group_id,
+            convergence_run_context(&run_id, ConvergencePhase::Evaluating),
+            crate::audit_helpers::convergence_decision_event(
+                previous_tip.0,
+                max_rewind_commits,
+                result.selection_trace.as_ref(),
+                error_kinds.clone(),
+            ),
+        );
+        if matches!(
+            evaluated_status,
+            ConvergenceStatus::Syncing | ConvergenceStatus::Resolving
+        ) {
+            self.audit_group_with_context(
+                group_id,
+                convergence_run_context(&run_id, ConvergencePhase::Waiting),
+                marmot_forensics::AuditEventKind::ConvergenceRunState {
+                    phase: ConvergencePhase::Waiting,
+                    current_tip_epoch: Some(previous_tip.0),
+                    retained_anchor_horizon: Some(retained_anchor_epoch),
+                    reason: Some(
+                        match evaluated_status {
+                            ConvergenceStatus::Resolving => "resolving",
+                            _ => "syncing",
+                        }
+                        .to_string(),
+                    ),
+                    error_kind: None,
+                },
+            );
+        }
+
+        // Missing branch state inside the rollback horizon must leave
+        // canonical state unchanged and move the group to `Unrecoverable`.
+        // This includes an epoch anchor and the exact checkpoint required to
+        // realize a locally authored pre-upgrade commit.
+        let missing_retained_state = result.errors.iter().copied().find(|error| {
+            matches!(
+                error,
+                CanonicalizationError::MissingRetainedAnchor
+                    | CanonicalizationError::MissingOwnCommitCheckpoint
+            )
+        });
+        if let Some(missing_retained_state) = missing_retained_state {
+            let error_kind = canonicalization_error_tag(missing_retained_state);
+            let halt = ConvergencePassFailure::at(ConvergencePassStep::Halt);
+            let mut group = self
+                .storage
+                .get_group(group_id)
+                .map_err(|e| halt(OpenMlsProjectionError::Storage(format!("{e:?}"))))?;
+            if !group.unrecoverable {
+                group.unrecoverable = true;
+                self.storage
+                    .put_group(&group)
+                    .map_err(|e| halt(OpenMlsProjectionError::Storage(format!("{e:?}"))))?;
+            }
+            let previous_state = self
+                .epoch_manager
+                .state(group_id)
+                .map(|state| crate::audit_helpers::epoch_state_name_str(state.name()).to_string());
+            self.epoch_manager.mark_unrecoverable(group_id);
+            let epoch = self.epoch_manager.epoch(group_id).unwrap_or(previous_tip);
+            self.audit_group(
+                group_id,
+                marmot_forensics::AuditEventKind::EpochStateChanged {
+                    previous_state,
+                    new_state: "unrecoverable".to_string(),
+                    epoch: epoch.0,
+                    reason: error_kind.to_string(),
+                    pending_ref: None,
+                    pending_kind: None,
+                },
+            );
+            self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
+                group_id: group_id.clone(),
+            });
+            self.audit_group_with_context(
+                group_id,
+                convergence_run_context(&run_id, ConvergencePhase::Unrecoverable),
+                marmot_forensics::AuditEventKind::ConvergenceRunState {
+                    phase: ConvergencePhase::Unrecoverable,
+                    current_tip_epoch: Some(previous_tip.0),
+                    retained_anchor_horizon: Some(retained_anchor_epoch),
+                    reason: None,
+                    error_kind: Some(error_kind.to_string()),
+                },
+            );
+            return Ok(FrozenPassResolution::Finished(result));
+        }
+        if result.convergence_status == ConvergenceStatus::Blocked {
+            self.audit_group_with_context(
+                group_id,
+                convergence_run_context(&run_id, ConvergencePhase::Blocked),
+                marmot_forensics::AuditEventKind::ConvergenceRunState {
+                    phase: ConvergencePhase::Blocked,
+                    current_tip_epoch: Some(previous_tip.0),
+                    retained_anchor_horizon: Some(retained_anchor_epoch),
+                    reason: Some("blocked".to_string()),
+                    error_kind: None,
+                },
+            );
+            let mut blocked_pass = pass.clone();
+            blocked_pass.phase = ConvergencePassPhase::Completed;
+            blocked_pass.fairness_slot_available = false;
+            blocked_pass.retry = None;
+            self.storage
+                .put_convergence_pass(&blocked_pass)
+                .map_err(storage_projection_error)
+                .map_err(ConvergencePassFailure::at(
+                    ConvergencePassStep::CompleteBlocked,
+                ))?;
+            self.schedule_drain_for_retained_outbound_intents(group_id);
+            return Ok(FrozenPassResolution::Finished(result));
+        }
+
+        let mut completed_pass = pass.clone();
+        completed_pass.phase = ConvergencePassPhase::Completed;
+        completed_pass.fairness_slot_available = true;
+        completed_pass.retry = None;
+        // The disposition writes are part of the atomic convergence apply.
+        // Snapshot their prior values first, then emit forensic transitions
+        // only after that transaction commits so Goggles never observes a
+        // state change that rolled back.
+        let disposition_transitions = if self.recorder.is_enabled() {
+            openmls_canonicalization_dispositions(&result)
+                .map_err(ConvergencePassFailure::at(
+                    ConvergencePassStep::PrepareApply,
+                ))?
+                .into_iter()
+                .map(|disposition| {
+                    let record = self
+                        .storage
+                        .get_message(&disposition.message_id)
+                        .map_err(storage_projection_error)?;
+                    Ok((disposition, record.state))
+                })
+                .collect::<Result<Vec<_>, OpenMlsProjectionError>>()
+                .map_err(ConvergencePassFailure::at(
+                    ConvergencePassStep::PrepareApply,
+                ))?
+        } else {
+            Vec::new()
+        };
+        let pre_apply_commit_states =
+            self.pre_apply_commit_states(&result)
+                .map_err(ConvergencePassFailure::at(
+                    ConvergencePassStep::PrepareApply,
+                ))?;
+        // Capture the actual source tree only after selection finishes. Yielded,
+        // rejected and app-only passes must not pay for a membership snapshot.
+        let previous_membership = if result.selected_tip.is_some() {
+            Some(
+                self.canonical_membership_snapshot(group_id)
+                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))
+                    .map_err(ConvergencePassFailure::at(
+                        ConvergencePassStep::PrepareApply,
+                    ))?,
+            )
+        } else {
+            None
+        };
+        let (group_changes, application_events, membership_effects) = self
+            .storage
+            .with_transaction(|storage| {
+                let output = apply_openmls_canonicalization_result_with_profile_policy(
+                    storage,
+                    group_id,
+                    &result,
+                    max_retained_anchor_rewind,
+                    replay_profile_policy,
+                )?;
+                // Membership cleanup belongs to canonical apply: a failed queue or
+                // leave-request write must roll back MLS and the completed pass too.
+                let membership_effects = if let Some(before) = previous_membership.as_ref() {
+                    let group = openmls::group::MlsGroup::load(
+                        storage.mls_storage(),
+                        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+                    )
+                    .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?
+                    .ok_or_else(|| {
+                        OpenMlsProjectionError::Replay("selected group missing".into())
+                    })?;
+                    // Disband owns its terminal cleanup and must not announce an
+                    // intermediate local restoration from its replayed source tree.
+                    if crate::app_components::lifecycle_of_group(&group)
+                        .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+                        == Some(cgka_traits::app_components::GroupLifecycleV1::Disbanded)
+                    {
+                        None
+                    } else {
+                        let after = crate::membership_effects::MembershipSnapshot::capture(
+                            &group,
+                            self.identity.self_id(),
+                            storage.get_group(group_id)?.removed,
+                        );
+                        Some(
+                            self.prepare_canonical_membership_effects_on_storage(
+                                storage, group_id, before, &after,
+                            )
+                            .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?,
+                        )
+                    }
+                } else {
+                    None
+                };
+                storage.put_convergence_pass(&completed_pass)?;
+                let application_events =
+                    Self::application_replay_events(group_id, &output.observations)?;
+                for event in &application_events {
+                    storage
+                        .put_pending_application_event(event)
+                        .map_err(storage_projection_error)?;
+                }
+                Ok::<_, OpenMlsProjectionError>((
+                    output.group_changes,
+                    application_events,
+                    membership_effects,
+                ))
+            })
+            .map_err(ConvergencePassFailure::at(ConvergencePassStep::Apply))?;
+        Ok(FrozenPassResolution::Applied(Box::new(
+            AppliedConvergencePass {
+                result,
+                completed_pass,
+                disposition_transitions,
+                pre_apply_commit_states,
+                group_changes,
+                application_events,
+                membership_effects,
+            },
+        )))
+    }
+
+    /// Charge a failed attempt to its frozen batch and schedule the next one.
+    ///
+    /// The apply rolled back, so the stored pass is still `pass`. The caller
+    /// returns the attempt's error either way; a record that cannot be written
+    /// leaves the batch as it was, and the host's own error backoff covers it.
+    #[allow(clippy::too_many_arguments)]
+    fn record_convergence_pass_failure(
+        &mut self,
+        pass: &DurableConvergencePass,
+        step: ConvergencePassStep,
+        error: &OpenMlsProjectionError,
+        now: ConvergenceTime,
+        previous_tip: EpochId,
+        retained_anchor_epoch: u64,
+        run_id: &str,
+    ) {
+        let group_id = &pass.group_id;
+        let failed_attempts = pass
+            .retry
+            .as_ref()
+            .map_or(0, |retry| retry.failed_attempts)
+            .saturating_add(1);
+        let parked = failed_attempts >= CONVERGENCE_PASS_PARK_AFTER_FAILURES;
+        let retry_after_ms = convergence_pass_retry_delay_ms(failed_attempts);
+        let mut failed = pass.clone();
+        failed.clock_instance_id = self.convergence_clock_instance_id;
+        failed.retry = Some(ConvergencePassRetry {
+            failed_attempts,
+            failed_step: step,
+            next_attempt_monotonic_ms: now.monotonic_ms.saturating_add(retry_after_ms),
+            next_attempt_wall_ms: now.wall_ms.saturating_add(retry_after_ms),
+            parked_at_wall_ms: parked.then_some(now.wall_ms),
+        });
+        if self.storage.put_convergence_pass(&failed).is_err() {
+            tracing::warn!(
+                target: "cgka_engine::distributed_convergence",
+                method = "record_convergence_pass_failure",
+                step = step.as_str(),
+                error_kind = projection_error_kind(error),
+                "convergence pass attempt failed and its failure could not be recorded"
+            );
+            return;
+        }
+        tracing::warn!(
+            target: "cgka_engine::distributed_convergence",
+            method = "record_convergence_pass_failure",
+            step = step.as_str(),
+            error_kind = projection_error_kind(error),
+            failed_attempts,
+            parked,
+            retry_after_ms,
+            "convergence pass attempt failed"
+        );
+        let phase = if parked {
+            ConvergencePhase::Blocked
+        } else {
+            ConvergencePhase::Failed
+        };
+        self.audit_group_with_context(
+            group_id,
+            convergence_run_context(run_id, phase),
+            marmot_forensics::AuditEventKind::ConvergenceRunState {
+                phase,
+                current_tip_epoch: Some(previous_tip.0),
+                retained_anchor_horizon: Some(retained_anchor_epoch),
+                reason: Some(if parked {
+                    format!("pass_parked:{}", step.as_str())
+                } else {
+                    format!("pass_failed:{}", step.as_str())
+                }),
+                error_kind: Some(projection_error_kind(error).to_string()),
+            },
+        );
+        // The host re-reads the schedule and arms the next attempt; a parked
+        // pass reports none.
+        self.schedule_pending_convergence_group(group_id);
     }
 
     /// Emit immutable commit deltas without reading live MLS state, including
