@@ -320,7 +320,7 @@ fn record_range(
     Ok(())
 }
 
-fn widen_goal(
+pub(crate) fn widen_goal(
     conn: &Connection,
     route: &TransportReconciliationRoute,
     since_seconds: u64,
@@ -1387,6 +1387,45 @@ mod tests {
         assert_eq!(
             ranges(&app, &second, RELAY_A),
             vec![(100, 299, RecoveryCoverageProof::Comparison)]
+        );
+    }
+
+    /// A named route the ledger does not hold yet still gets a goal when an
+    /// unrouted generation imported beside it reaches below its bound.
+    #[test]
+    fn a_mixed_import_gives_an_unrecorded_named_route_its_goal() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let (held, named) = (group(1), group(2));
+        prove(&app, &[&held], 1);
+        app.record_account_recovery_loss_routed(
+            "alice",
+            crate::RecoveryLossCause::Queue,
+            41,
+            1,
+            1_000,
+            Some(700),
+            Some(&[(named.clone(), 700)]),
+        )
+        .unwrap();
+        app.record_account_recovery_loss_routed(
+            "alice",
+            crate::RecoveryLossCause::Queue,
+            42,
+            1,
+            1_000,
+            Some(500),
+            None,
+        )
+        .unwrap();
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(imports[0].every_route);
+        assert_eq!(app.recovery_coverage_goal(&named).unwrap(), Some(500));
+        assert_eq!(app.recovery_coverage_goal(&held).unwrap(), Some(500));
+        assert_eq!(
+            ranges(&app, &held, RELAY_A),
+            vec![(100, 499, RecoveryCoverageProof::Comparison)]
         );
     }
 

@@ -436,9 +436,16 @@ impl ChargedLoss {
         }
         let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64())?;
         for (route, bound) in self.routes {
-            // Every route already lost coverage from the account-wide floor.
-            if self.every_route.is_none_or(|floor| bound < floor) {
-                crate::app::recovery_coverage::uncover_route_loss_tx(conn, &route, bound, now)?;
+            match self.every_route {
+                Some(floor) if bound >= floor => {
+                    // Its coverage went with the account-wide floor, but that
+                    // widens only goals the ledger already holds, and this
+                    // route may have left current routing.
+                    crate::app::recovery_coverage::widen_goal(conn, &route, floor)?
+                }
+                _ => {
+                    crate::app::recovery_coverage::uncover_route_loss_tx(conn, &route, bound, now)?
+                }
             }
         }
         Ok(self.every_route.is_some())
