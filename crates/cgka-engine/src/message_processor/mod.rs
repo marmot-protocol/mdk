@@ -1367,9 +1367,19 @@ impl<S: StorageProvider> Engine<S> {
             // An already-owned admin/same-account attempt still precedes
             // automatic maintenance. Its eventual Commit also changes epochs;
             // until confirmation no application may use the restored ratchet.
-            if !FairnessReservation::load(self, group_id, &queued)?.is_available() {
+            // Epoch-pinned sends are refused, so leave their publication to
+            // the scheduled drain instead of stranding effects on the error.
+            if matches!(
+                intent,
+                SendIntent::AppMessage {
+                    expected_epoch: None,
+                    ..
+                }
+            ) && !FairnessReservation::load(self, group_id, &queued)?.is_available()
+            {
                 self.stage_replay_rotation(group_id).await?;
             }
+            self.schedule_pending_convergence_group(group_id);
             return Ok(Some(OutboundQueueReason::ReplayRotation));
         }
         self.stage_due_self_remove_auto_commit(group_id, now_ms)

@@ -28,7 +28,7 @@ Tracking issue: marmot-protocol/mdk#381.
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
-| Epoch-bound Manual maintenance markers | One per restored own-checkpoint epoch/authenticator; retained across the same horizon as exact checkpoints | Prune only after checkpoint pruning, strictly below its retained epoch floor. Completed or failed phases never release the restored epoch's send gate. A different authenticated epoch makes the old marker dormant; group deletion and terminal teardown remove its records. |
+| Epoch-bound Manual maintenance markers | One per restored own-checkpoint epoch/authenticator; retained across the same horizon as exact checkpoints | Prune only after checkpoint pruning, strictly below its retained epoch floor. Completed or failed phases never release the restored epoch's send gate. A different authenticated epoch releases that gate; ordinary Manual maintenance may still perform one rotation. Group deletion and terminal teardown remove its records. |
 
 ### `marmot-app` audit export admission (`src/audit_export_lifecycle.rs`)
 

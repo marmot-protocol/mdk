@@ -1614,6 +1614,24 @@ async fn check_restored_tip(
         alice.hydrate_all_stored_groups().unwrap();
     }
     let payload = app_payload("after replay");
+    if matches!(capacity, OutboundCapacity::Available) {
+        let pinned = alice
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                expected_epoch: Some(EpochId(source_epoch + 1)),
+                payload: payload.clone(),
+            })
+            .await;
+        assert!(matches!(
+            pinned,
+            Err(cgka_traits::error::EngineError::AppMessageEpochUnsettled { .. })
+        ));
+        assert!(
+            alice.epoch_manager.state(&group_id).unwrap().is_stable(),
+            "a refused pinned send must not strand a staged rotation"
+        );
+        assert!(alice.drain_auto_publish().is_empty());
+    }
     if matches!(capacity, OutboundCapacity::Full) {
         for index in 0..crate::message_processor::MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP {
             let queued_payload = if index == 0 {
