@@ -11,8 +11,10 @@ use std::sync::Arc;
 /// the kind-1059 wrap is NIP-44 encrypted to `receiver`, carries one
 /// `["p", receiver]` tag and is signed by a one-time key that is generated for
 /// this wrap and dropped when it returns. Both `created_at` values are
-/// randomized up to two days into the past. Welcomes and moderation reports
-/// share this path; do not build a second wrap implementation.
+/// randomized up to two days into the past. Welcomes, moderation reports and
+/// MDK-private recovery share this path; do not build a second implementation.
+/// Dispatch markers stay inside the authenticated rumor. Every caller emits
+/// the same recipient-only outer tags, regardless of the encrypted message kind.
 pub async fn gift_wrap_rumor(
     signer: Arc<dyn MarmotNostrSigner>,
     receiver: PublicKey,

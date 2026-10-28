@@ -9,7 +9,8 @@ wraps / peels Marmot group MLS bytes for Nostr kind `445`.
 ## What this crate does
 
 - Maps kind `445` events with an `h` tag into group `TransportMessage`s.
-- Maps kind `1059` events with a `p` tag into welcome `TransportMessage`s.
+- Maps kind `1059` events with a `p` tag into account-inbox `TransportMessage`s; authenticated inner content determines
+  whether each delivery is a Welcome or recovery control.
 - Encrypts and decrypts kind `445` group envelopes with ChaCha20Poly1305 (`content = base64(nonce || ciphertext)`,
   empty AAD) using the engine exporter snapshot.
 - Carries no source-epoch hint in the kind `445` envelope: an undecryptable message returns `DecryptFailed`, and the
@@ -36,6 +37,20 @@ Welcome peeling fails closed unless all of these hold:
 - the rumor carries an `e` tag holding a 32-byte hex KeyPackage event id,
 - the rumor carries a `relays` tag with at least one non-empty relay,
 - the rumor content decodes to non-empty MLS Welcome bytes.
+
+## Private recovery control
+
+`wrap_group_recovery` uses the same NIP-59 construction and recipient-only outer tags as Welcomes. It carries the
+MDK-private proposed kind `1159` and singleton `mdk_group_recovery` version tag inside the authenticated rumor, never
+as a public recovery marker. `peel_welcome` unwraps once before dispatching either inner kind.
+
+Recovery admission requires agreement between the transport recipient, outer `p` tag, local signer and inner `p`
+tag, plus bounded carrier and body sizes. The authenticated seal author is returned in `AuthenticatedGroupRecovery`;
+controls have neither a Welcome sender nor Welcome provenance. Peeling authenticates account control, but does not
+authorize recovery or persist it as chat or MLS input. The account runtime owns its durable disposition.
+
+Welcome processing retains its existing analytics family and operation. An authenticated control still awaiting
+runtime ownership is discarded from that observation, without exporting a control-specific outcome.
 
 ## Boundary shape
 

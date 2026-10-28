@@ -1174,6 +1174,9 @@ mod stored_payload_codec_tests {
             source_epoch_authenticator: "source-authenticator".to_owned(),
         };
         let values = [
+            StoredMessagePayload::RawTransport(transport(TransportEnvelope::Welcome {
+                recipient: MemberId::new(vec![0xef; 32]),
+            })),
             StoredMessagePayload::RawTransport(group_message.clone()),
             StoredMessagePayload::outbound_welcome(welcome.clone(), None, None, None),
             StoredMessagePayload::outbound_welcome(
@@ -1370,6 +1373,24 @@ mod stored_payload_codec_tests {
             assert_eq!(payload.encode().unwrap(), expected);
             assert_eq!(StoredMessagePayload::decode(&expected).unwrap(), payload);
         }
+    }
+
+    #[test]
+    fn v2_inbox_envelope_tag() {
+        let value = StoredMessagePayload::OpenMlsWire(TransportMessage {
+            id: MessageId::new([0xaa]),
+            payload: vec![0xbb, 0xcc],
+            timestamp: Timestamp(7),
+            causal_deps: Vec::new(),
+            source: TransportSource("x".to_owned()),
+            envelope: TransportEnvelope::Welcome {
+                recipient: MemberId::new(vec![0xdd]),
+            },
+        });
+        let encoded =
+            hex::decode("4d444b4d5000020201aa02bbcc00000000000000070001780101dd").unwrap();
+        assert_eq!(value.encode().unwrap(), encoded);
+        assert_eq!(StoredMessagePayload::decode(&encoded).unwrap(), value);
     }
 
     #[test]

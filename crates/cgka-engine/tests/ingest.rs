@@ -120,6 +120,16 @@ fn content_id(msg: &TransportMessage) -> MessageId {
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -187,6 +197,16 @@ impl TransportPeeler for MockPeeler {
 
 #[async_trait]
 impl TransportPeeler for RecordingPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -228,6 +248,16 @@ impl TransportPeeler for RecordingPeeler {
 
 #[async_trait]
 impl TransportPeeler for FailOncePeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -266,6 +296,16 @@ impl TransportPeeler for FailOncePeeler {
 
 #[async_trait]
 impl TransportPeeler for MalformedShortPayloadPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -302,6 +342,16 @@ impl TransportPeeler for MalformedShortPayloadPeeler {
 
 #[async_trait]
 impl TransportPeeler for BoundaryRejectionPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -369,6 +419,16 @@ struct SnapshotFallbackMalformedPeeler {
 
 #[async_trait]
 impl TransportPeeler for SnapshotFallbackMalformedPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -416,6 +476,16 @@ struct CountingPeeler {
 
 #[async_trait]
 impl TransportPeeler for CountingPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,

@@ -81,6 +81,7 @@ pub(crate) fn envelope_kind_str(env: &TransportEnvelope) -> &'static str {
 pub(crate) fn ingest_outcome_kind_str(outcome: &IngestOutcome) -> &'static str {
     match outcome {
         IngestOutcome::Processed => "processed",
+        IngestOutcome::GroupRecovery { .. } => "account_control",
         IngestOutcome::Buffered { .. } => "buffered",
         IngestOutcome::Ignored { .. } => "ignored",
         IngestOutcome::LocalState { .. } => "local_state",

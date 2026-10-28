@@ -101,6 +101,95 @@ impl transport_nostr_peeler::MarmotNostrSigner for OnceSigner {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_inbox_demux() {
+    use cgka_traits::{GroupId, GroupRecoveryBody, GroupRecoveryMessage, PeeledContent};
+    use nostr::prelude::Keys;
+    let sender = Keys::generate();
+    let recipient = Keys::generate();
+    let store = storage_sqlite::SqliteAccountStorage::in_memory().unwrap();
+    let storage = store.app_storage();
+    storage
+        .adopt_block_list(
+            &storage_sqlite::StoredBlockList {
+                event_id: "policy".into(),
+                event_created_at: 1,
+                ..Default::default()
+            },
+            &[(sender.public_key().to_hex(), true)],
+            1,
+            "local",
+            &|_, _| false,
+        )
+        .unwrap();
+    let from = NostrMlsPeeler::new().with_welcome_signer(sender.clone());
+    let target = MemberId::new(recipient.public_key().to_bytes().to_vec());
+    let peeler = ProbePeeler {
+        inner: NostrMlsPeeler::new().with_welcome_signer(OnceSigner {
+            keys: recipient,
+            consumed: Arc::new(Mutex::new(HashSet::new())),
+            denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }),
+        slot: Arc::new(Mutex::new(PeelSlot::default())),
+        storage: storage.clone(),
+    };
+    let welcome = from
+        .wrap_welcome_with_metadata(
+            &EncryptedPayload {
+                ciphertext: b"blocked invitation".to_vec(),
+                aad: Vec::new(),
+            },
+            &target,
+            &WelcomeMetadata {
+                key_package_event_id: MessageId::new(vec![4; 32]),
+                relays: vec!["wss://relay.example".into()],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        peeler.peel_welcome(&welcome).await.is_err(),
+        "blocked invitation cannot reach MLS admission"
+    );
+    assert!(
+        storage
+            .is_blocked_welcome_dismissed(&hex::encode(welcome.id.as_slice()))
+            .unwrap()
+    );
+    let control = GroupRecoveryMessage {
+        group_id: GroupId::new(vec![7; 16]),
+        request_id: [8; 32],
+        expires_at: 2_000_000_000,
+        body: GroupRecoveryBody::Request {
+            device_key_hash: [9; 32],
+        },
+    };
+    let wrapped = from.wrap_group_recovery(&control, &target).await.unwrap();
+    let id: [u8; 32] = wrapped.id.as_slice().try_into().unwrap();
+    peeler.slot.lock().unwrap().arm(
+        &wrapped,
+        (
+            "33".repeat(16).try_into().unwrap(),
+            NostrEventRef::from_validated_event_id(&id),
+        ),
+    );
+    let peeled = peeler.peel_welcome(&wrapped).await.unwrap();
+    let PeeledContent::GroupRecovery { recovery } = peeled.content else {
+        panic!("control must not become a Welcome");
+    };
+    assert_eq!(recovery.message, control);
+    assert_eq!(recovery.sender.as_slice(), sender.public_key().as_bytes());
+    assert!(
+        !storage
+            .is_blocked_welcome_dismissed(&hex::encode(wrapped.id.as_slice()))
+            .unwrap()
+    );
+    assert!(
+        peeler.slot.lock().unwrap().take().is_none(),
+        "control has no Welcome provenance or unwrap row"
+    );
+}
+
 impl marmot_session::AccountIdentityProofSigner for OnceSigner {
     fn sign_account_identity_proof(
         &self,
@@ -114,6 +203,148 @@ impl marmot_session::AccountIdentityProofSigner for OnceSigner {
         })?;
         request.signature_from_signed_event(event)
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_inbox_single_unseal() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        use cgka_traits::{GroupRecoveryBody, GroupRecoveryMessage};
+        use nostr::prelude::Keys;
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let alice_dir = tempfile::tempdir().unwrap();
+        let bob_dir = tempfile::tempdir().unwrap();
+        let alice_account = AccountHome::open(alice_dir.path())
+            .create_account("alice")
+            .unwrap();
+        let bob_keys = Keys::generate();
+        let bob_account = AccountHome::open(bob_dir.path())
+            .add_external_signer_account(&bob_keys.public_key().to_hex())
+            .unwrap();
+        let alice_app = app(alice_dir.path(), &url);
+        let bob_app = app(bob_dir.path(), &url);
+        let consumed = Arc::new(Mutex::new(HashSet::new()));
+        let denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        bob_app
+            .register_external_signer(
+                &bob_account.account_id_hex,
+                OnceSigner {
+                    keys: bob_keys,
+                    consumed: consumed.clone(),
+                    denied: denied.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut alice = alice_app.client("alice").await.unwrap();
+        let mut bob = bob_app.client(&bob_account.account_id_hex).await.unwrap();
+        bob.publish_key_package().await.unwrap();
+        let storage = bob_app
+            .account_storage(&bob_account.label)
+            .unwrap()
+            .app_storage();
+        storage
+            .adopt_block_list(
+                &storage_sqlite::StoredBlockList {
+                    event_id: "policy".into(),
+                    event_created_at: 1,
+                    ..Default::default()
+                },
+                &[(alice_account.account_id_hex.clone(), true)],
+                1,
+                &bob_account.label,
+                &|_, _| false,
+            )
+            .unwrap();
+        alice
+            .create_group_with_initial_source_and_optional_telemetry(
+                "blocked invitation",
+                &[&bob_account.account_id_hex],
+                crate::AppCreateGroupOptions::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let retained = alice.runtime.outstanding_welcome_deliveries().unwrap();
+        assert_eq!(retained.len(), 1);
+        let welcome_id = hex::encode(retained[0].1.id.as_slice());
+        let mut deliveries = bob
+            .adapter
+            .recovered_deliveries(transport_nostr_adapter::NostrRelayEvent {
+                endpoint: url.clone().into(),
+                subscription_id: None,
+                event: NostrTransportEvent::from_transport_message(&retained[0].1).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        bob.relay_plane
+            .route_account_delivery_for_test(deliveries.remove(0));
+        bob.sync().await.unwrap();
+        assert!(
+            storage.is_blocked_welcome_dismissed(&welcome_id).unwrap(),
+            "the real blocked invitation was authenticated and dismissed"
+        );
+        assert!(bob_app.groups(&bob_account.label).unwrap().is_empty());
+
+        let sender = alice_app
+            .account_signer_for_summary(&alice_account)
+            .unwrap()
+            .as_nostr_signer();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let control = GroupRecoveryMessage {
+            group_id: GroupId::new(vec![7; 16]),
+            request_id: [8; 32],
+            expires_at: now + 60,
+            body: GroupRecoveryBody::Request {
+                device_key_hash: [9; 32],
+            },
+        };
+        let wrapped = NostrMlsPeeler::new()
+            .with_welcome_signer_arc(sender)
+            .wrap_group_recovery(
+                &control,
+                &MemberId::new(hex::decode(&bob_account.account_id_hex).unwrap()),
+            )
+            .await
+            .unwrap();
+        let event = NostrTransportEvent::from_transport_message(&wrapped).unwrap();
+        let outer_ciphertext = event.content.clone();
+        let mut deliveries = bob
+            .adapter
+            .recovered_deliveries(transport_nostr_adapter::NostrRelayEvent {
+                endpoint: url.clone().into(),
+                subscription_id: None,
+                event,
+            })
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        bob.relay_plane
+            .route_account_delivery_for_test(deliveries.remove(0));
+        bob.sync().await.unwrap();
+        assert!(
+            consumed.lock().unwrap().contains(&outer_ciphertext),
+            "the account signer consumed the recovery envelope's decryption grant"
+        );
+        assert!(
+            !denied.load(std::sync::atomic::Ordering::SeqCst),
+            "inner dispatch must not request a second grant for either encrypted layer"
+        );
+        assert!(
+            !storage
+                .is_blocked_welcome_dismissed(&hex::encode(wrapped.id.as_slice()))
+                .unwrap()
+        );
+        assert!(bob_app.groups(&bob_account.label).unwrap().is_empty());
+        assert!(bob_app.messages(&bob_account.label).unwrap().is_empty());
+    })
+    .await
+    .expect("bounded real app inbox scenario");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -133,6 +364,13 @@ async fn welcome_policy_single_unseal() {
             .unwrap();
         let alice_app = app(alice_dir.path(), &url);
         let bob_app = app(bob_dir.path(), &url);
+        #[cfg(feature = "product-analytics-export")]
+        let bob_app = {
+            let mut bob_app = bob_app;
+            bob_app.product_analytics = crate::product_analytics::test_product_collector();
+            bob_app.set_usage_diagnostics_consent(true).unwrap();
+            bob_app
+        };
         let consumed = Arc::new(Mutex::new(HashSet::new()));
         let denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
         bob_app
@@ -229,6 +467,20 @@ async fn welcome_policy_single_unseal() {
                 assert!(bob.runtime.group_record(&group).is_err());
             } else {
                 assert!(summary.joined_groups.contains(&group));
+                #[cfg(feature = "product-analytics-export")]
+                {
+                    let payloads = bob_app.product_analytics.test_payloads();
+                    let outcomes = payloads
+                        .iter()
+                        .filter(|event| {
+                            event["eventName"] == "mdk_welcome_summary"
+                                && event["props"]["operation"] == "process"
+                                && event["props"]["unit"] == "attempt"
+                        })
+                        .map(|event| event["props"]["outcome"].as_str().unwrap())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    assert_eq!(outcomes, std::collections::BTreeSet::from(["success"]));
+                }
                 assert!(projected.unwrap().pending_confirmation);
                 assert_eq!(bob.runtime.group_record(&group).unwrap().members.len(), 2);
                 bob.accept_group_invite(&group).unwrap();

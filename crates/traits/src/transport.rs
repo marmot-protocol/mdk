@@ -43,8 +43,9 @@ pub enum TransportEnvelope {
     /// (e.g. the Nostr `h`-tag value, which equals the `nostr_group_id` in
     /// `NostrTransportData`).
     GroupMessage { transport_group_id: Vec<u8> },
-    /// Welcome addressed to a specific member. `recipient` is matched against
-    /// `CgkaEngine::self_id`.
+    /// Account-inbox delivery addressed to a specific member. The authenticated
+    /// inner content determines whether this is a Welcome or account control.
+    /// `recipient` is matched against `CgkaEngine::self_id`.
     Welcome { recipient: MemberId },
 }
 

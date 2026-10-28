@@ -51,6 +51,7 @@ pub(crate) struct PendingFounding {
 pub(crate) struct PeelSlot {
     armed: Option<(Vec<u8>, LocalId, NostrEventRef)>,
     completed: Option<PeelCompletion>,
+    private_control: bool,
 }
 
 pub(crate) struct PeelCompletion {
@@ -66,11 +67,15 @@ impl PeelSlot {
     pub(crate) fn arm(&mut self, message: &TransportMessage, receive: (LocalId, NostrEventRef)) {
         self.armed = Some((message.id.as_slice().to_vec(), receive.0, receive.1));
         self.completed = None;
+        self.private_control = false;
     }
 
-    pub(crate) fn take(&mut self) -> Option<PeelCompletion> {
+    pub(crate) fn take(&mut self) -> (bool, Option<PeelCompletion>) {
         self.armed = None;
-        self.completed.take()
+        (
+            std::mem::take(&mut self.private_control),
+            self.completed.take(),
+        )
     }
 }
 
@@ -87,20 +92,29 @@ pub(crate) struct ProbePeeler {
 
 impl ProbePeeler {
     /// Open a gift wrap to the account once: a Welcome peels as before, and
-    /// a pairing message goes to the pairing inbox. Anything not a Welcome
-    /// is still refused, so the engine ignores it.
+    /// a pairing message goes to the pairing inbox and recovery keeps its
+    /// authenticated control payload. Other rumors are still refused.
     async fn open_welcome(
         &self,
         msg: &TransportMessage,
-    ) -> Result<(PeeledMessage, WelcomePeelProvenance), PeelerError> {
+    ) -> Result<(PeeledMessage, Option<WelcomePeelProvenance>), PeelerError> {
         #[cfg(feature = "unreleased-device-pairing")]
-        if let Some(pairing) = &self.pairing {
+        {
             let opened = self.inner.peel_account_gift_wrap(msg).await?;
             if let AccountGiftWrap::Other(unwrapped) = &opened {
-                pairing.offer(unwrapped);
+                // Remember the authenticated inner kind before the engine
+                // refuses this non-Welcome, even when pairing is disabled or
+                // its content cannot be admitted to the pairing inbox.
+                if marmot_pairing::PAIRING_KINDS.contains(&unwrapped.rumor.kind.as_u16()) {
+                    self.slot.lock().unwrap().private_control = true;
+                }
+                if let Some(pairing) = &self.pairing {
+                    pairing.offer(unwrapped);
+                }
             }
-            return opened.into_welcome();
+            opened.into_welcome()
         }
+        #[cfg(not(feature = "unreleased-device-pairing"))]
         self.inner.peel_welcome_with_provenance(msg).await
     }
 }
@@ -148,11 +162,16 @@ impl TransportPeeler for ProbePeeler {
             });
         let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let mut slot = self.slot.lock().unwrap();
+        // Retain the already authenticated classification even without audit
+        // capture, and even if runtime recovery processing subsequently fails.
+        slot.private_control |= matches!(&result, Ok((peeled, _))
+            if matches!(&peeled.content, cgka_traits::PeeledContent::GroupRecovery { .. }));
         if let Some((id, receive_id, outer)) = slot.armed.take()
             && id == msg.id.as_slice()
+            && !slot.private_control
         {
             let (outcome, reason, provenance) = match &result {
-                Ok((_, provenance)) => (UnwrapResult::Validated, None, Some(provenance.clone())),
+                Ok((_, provenance)) => (UnwrapResult::Validated, None, provenance.clone()),
                 Err(error) => {
                     let (outcome, reason) = match error {
                         PeelerError::WrongRecipient => {
@@ -187,6 +206,14 @@ impl TransportPeeler for ProbePeeler {
             });
         }
         result.map(|(peeled, _)| peeled)
+    }
+
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.wrap_group_recovery(message, recipient).await
     }
 
     async fn wrap_group_message(
@@ -533,31 +560,23 @@ impl WelcomeProbe {
         };
         let receive_id = self.local_id();
         let outer = NostrEventRef::from_validated_event_id(&id);
-        let before = if self.live {
-            self.pending_live.len()
-        } else {
-            self.rows.len()
-        };
+        // Allocate the receipt episode now, but record it only after the
+        // normal peeler distinguishes a Welcome (or peel failure) from control.
+        Some((receive_id, outer))
+    }
+
+    pub(super) fn unwrapped(&mut self, completion: PeelCompletion) {
         self.record(
             None,
             Event::WelcomeObserved(WelcomeObserved {
-                receive_id: receive_id.clone(),
-                outer_event_ref: outer.clone(),
+                receive_id: completion.receive_id.clone(),
+                outer_event_ref: completion.outer.clone(),
                 // The app drain does not expose a reliable live/history distinction.
                 acquisition: Acquisition::Unknown,
                 endpoint_ref: None,
                 fetch_id: None,
             }),
         );
-        let after = if self.live {
-            self.pending_live.len()
-        } else {
-            self.rows.len()
-        };
-        (after > before).then_some((receive_id, outer))
-    }
-
-    pub(super) fn unwrapped(&mut self, completion: PeelCompletion) {
         self.record(
             None,
             Event::WelcomeUnwrapped(WelcomeUnwrapped {

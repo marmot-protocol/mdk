@@ -48,17 +48,17 @@ impl NostrTransportEvent {
             },
             KIND_NIP59_GIFT_WRAP => {
                 let recipient = self.single_tag_value(RECIPIENT_TAG)?;
-                TransportEnvelope::Welcome {
-                    recipient: MemberId::new(decode_hex_exact("recipient p tag", recipient, 32)?),
-                }
+                let recipient = MemberId::new(decode_hex_exact("recipient p tag", recipient, 32)?);
+                TransportEnvelope::Welcome { recipient }
             }
             other => return Err(NostrPeelerError::UnsupportedKind(other)),
         };
 
+        let payload =
+            serde_json::to_vec(self).map_err(|e| NostrPeelerError::Malformed(e.to_string()))?;
         Ok(TransportMessage {
             id,
-            payload: serde_json::to_vec(self)
-                .map_err(|e| NostrPeelerError::Malformed(e.to_string()))?,
+            payload,
             timestamp: Timestamp(self.created_at),
             // Kind 445 MUST NOT carry any tag other than h/expiration
             // (transports/nostr.md). The peeler no longer extracts `e` causal
