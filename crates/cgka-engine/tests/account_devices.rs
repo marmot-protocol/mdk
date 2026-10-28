@@ -82,6 +82,12 @@ mod send_intents;
 #[path = "account_devices/creation.rs"]
 mod creation;
 
+// The device roster's wire format is unreleased, so only test-policy builds
+// may advertise it (mdk#2628 3.1).
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/device_roster.rs"]
+mod device_roster;
+
 const ACCOUNT_DEVICES: Feature = Feature("account-devices");
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -637,6 +643,10 @@ struct Parts {
     by_reference: Vec<TransportMessage>,
     /// Extensions for the Welcome's GroupInfo, beside the ratchet tree.
     group_info_extensions: Vec<Extension>,
+    /// Resulting GroupContext bytes the committer writes for a component in
+    /// place of its update's bytes, as a client that resolves the update its
+    /// own way would.
+    app_data_state: Vec<(u16, Vec<u8>)>,
 }
 
 /// A Commit `sender` builds with raw OpenMLS, bypassing the engine's send
@@ -768,6 +778,9 @@ fn craft_bundle(
                 updater.remove(&proposal.component_id());
             }
         }
+    }
+    for (component_id, state) in parts.app_data_state {
+        updater.set(ComponentData::from_parts(component_id, state.into()));
     }
     builder.with_app_data_dictionary_updates(updater.changes());
     let bundle = builder
