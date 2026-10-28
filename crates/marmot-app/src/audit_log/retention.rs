@@ -483,7 +483,9 @@ mod tests {
         *slot.lock().unwrap() = Some(recorder.downgrade());
         let active = recorder.audit_log_path().unwrap();
         age(&active, UNIX_EPOCH);
-        assert!(!app.expire_audit_file(&active).unwrap());
+        assert!(app.expire_audit_file(&active).unwrap());
+        assert_eq!(fs::metadata(&active).unwrap().len(), 0);
+        age(&active, UNIX_EPOCH);
         let listed = app.account_dir("alice").join(active.file_name().unwrap());
         assert!(!app.expire_audit_file(&listed).unwrap());
         let old = app

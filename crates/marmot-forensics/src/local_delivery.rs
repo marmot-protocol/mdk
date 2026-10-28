@@ -2080,4 +2080,33 @@ mod tests {
         );
         assert!(worker.gaps().is_empty());
     }
+    #[test]
+    fn retention_expires_idle_live_data_and_keeps_recording_without_false_gap() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        let before = fs::read(&active).unwrap();
+        let health = recorder.health_snapshot();
+        assert!(
+            recorder
+                .expire_file_before(&active, u64::MAX, &mut |closed| {
+                    assert_eq!(fs::read(closed).unwrap(), before);
+                    assert!(fs::read(&active).unwrap().is_empty());
+                    retention::expire_closed_source(closed, &state_dir)
+                })
+                .unwrap()
+        );
+        assert_eq!(recorder.health_snapshot(), health);
+        assert_eq!(
+            worker.prepare_once().unwrap(),
+            Preparation::Step(DeliveryStep::Idle)
+        );
+        assert!(worker.gaps().is_empty());
+        let count = sink.batches.len();
+        record(&recorder, "after-expiry");
+        drain(&mut worker, &mut sink);
+        assert_eq!(sink.batches.len(), count + 1);
+        assert!(worker.gaps().is_empty());
+    }
 }

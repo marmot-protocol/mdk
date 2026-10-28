@@ -169,7 +169,7 @@ async fn real_session_and_live_toggle_register_the_writer_for_retention() {
             .unwrap()
     };
     age();
-    assert!(!app.expire_audit_file(&path).unwrap());
+    assert!(app.expire_audit_file(&path).unwrap());
     let before = std::fs::metadata(&path).unwrap().len();
     client.record_epoch_stall_backfill_escalated(&group, 7, 3);
     assert!(std::fs::metadata(&path).unwrap().len() > before);
@@ -178,7 +178,7 @@ async fn real_session_and_live_toggle_register_the_writer_for_retention() {
     assert!(app.expire_audit_file(&path).unwrap());
     client.set_audit_recording(true);
     age();
-    assert!(!app.expire_audit_file(&path).unwrap());
+    assert!(app.expire_audit_file(&path).unwrap());
     let before = std::fs::metadata(&path).unwrap().len();
     client.record_epoch_stall_backfill_escalated(&group, 8, 3);
     assert!(std::fs::metadata(&path).unwrap().len() > before);

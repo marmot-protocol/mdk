@@ -1459,7 +1459,9 @@ or open. Already-known sealed files unlink without staging space. An old active 
 retirement first; a metadata-write failure leaves its bytes intact while other sealed files continue expiring.
 
 A weak recorder registry serializes writer creation and expiry. The live recorder rechecks each candidate under
-its writer lock and protects both its canonical path and its actual writer path after failed roll compensation.
+its writer lock. Expired idle data is sealed into a closed inode after a fresh empty writer is ready; this emits no
+rows or record failures, and source context is deferred to the next actual event. Uncertain writers stay protected,
+including the actual segment path after failed roll compensation.
 Expiry serializes local cursor work for the source directory and cancels only an attempt owning the expiring inode.
 Other uploads remain valid, including another file in the same account; their local completion waits for retirement.
 No account-file lookup or installation-wide cancellation is needed for orphan directories or failed wipes.

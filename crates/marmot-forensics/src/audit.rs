@@ -1659,11 +1659,7 @@ pub trait ForensicRecorder: Send + Sync {
     }
 }
 
-fn expire_closed_audit_file(
-    path: &Path,
-    cutoff_ms: u64,
-    expire: &mut dyn FnMut(&Path) -> std::io::Result<bool>,
-) -> std::io::Result<bool> {
+fn audit_file_expired(path: &Path, cutoff_ms: u64) -> std::io::Result<bool> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -1677,7 +1673,15 @@ fn expire_closed_audit_file(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    if modified >= u128::from(cutoff_ms) {
+    Ok(modified < u128::from(cutoff_ms))
+}
+
+fn expire_closed_audit_file(
+    path: &Path,
+    cutoff_ms: u64,
+    expire: &mut dyn FnMut(&Path) -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    if !audit_file_expired(path, cutoff_ms)? {
         return Ok(false);
     }
     expire(path)
@@ -1762,6 +1766,7 @@ struct JsonlInner {
     /// Repeated source bytes do not consume the next segment's event budget.
     /// Even an oversized source must not cause a roll on every ordinary event.
     repeated_source_bytes: u64,
+    source_prefix_pending: bool,
     /// Test seam: fail the next row or segment-prefix write after capturing source
     /// context, so retention can be proven independently of a durable write.
     #[cfg(test)]
@@ -1913,6 +1918,7 @@ impl JsonlRecorder {
                 next_segment_index: None,
                 retained_source_context: None,
                 repeated_source_bytes: 0,
+                source_prefix_pending: false,
                 #[cfg(test)]
                 fail_next_write: false,
                 #[cfg(test)]
@@ -2066,6 +2072,16 @@ impl ForensicRecorder for JsonlRecorder {
         }
         // Seal before the first row after a quiet day, so a fresh event does
         // not extend the lifetime of the preceding day's records.
+        if inner.source_prefix_pending {
+            inner.source_prefix_pending = false;
+            if let Some(source) = inner.retained_source_context.clone() {
+                Self::write_record(
+                    &mut inner,
+                    AuditRecord::new(None, AuditEventKind::SourceContext { source }),
+                );
+                inner.repeated_source_bytes = inner.active_bytes;
+            }
+        }
         if inner.active_bytes == inner.repeated_source_bytes {
             inner.active_started_at = SystemTime::now();
         }
@@ -2093,6 +2109,16 @@ impl ForensicRecorder for JsonlRecorder {
         }
         if self.ensure_safe_writer(&mut inner).is_err() {
             return;
+        }
+        if inner.source_prefix_pending {
+            inner.source_prefix_pending = false;
+            if let Some(source) = inner.retained_source_context.clone() {
+                Self::write_record(
+                    &mut inner,
+                    AuditRecord::new(None, AuditEventKind::SourceContext { source }),
+                );
+                inner.repeated_source_bytes = inner.active_bytes;
+            }
         }
         if inner.active_bytes == inner.repeated_source_bytes {
             inner.active_started_at = SystemTime::now();
@@ -2127,6 +2153,16 @@ impl ForensicRecorder for JsonlRecorder {
         }
         // A quiet shutdown must not refresh a month-old file's retention
         // clock merely by appending its terminal row.
+        if inner.source_prefix_pending {
+            inner.source_prefix_pending = false;
+            if let Some(source) = inner.retained_source_context.clone() {
+                Self::write_record(
+                    &mut inner,
+                    AuditRecord::new(None, AuditEventKind::SourceContext { source }),
+                );
+                inner.repeated_source_bytes = inner.active_bytes;
+            }
+        }
         if inner.active_bytes == inner.repeated_source_bytes {
             inner.active_started_at = SystemTime::now();
         }
@@ -2177,11 +2213,20 @@ impl ForensicRecorder for JsonlRecorder {
         cutoff_ms: u64,
         expire: &mut dyn FnMut(&Path) -> std::io::Result<bool>,
     ) -> std::io::Result<bool> {
-        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        // Expiry never writes or recovers the live recorder. Ordinary rows
-        // own daily rollover and uncertain-writer recovery.
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if path == self.path || path == inner.writer_path {
-            return Ok(false);
+            if path != inner.writer_path
+                || inner.writer_needs_seal
+                || inner.active_bytes == 0
+                || !audit_file_expired(path, cutoff_ms)?
+            {
+                return Ok(false);
+            }
+            // Retire idle data too. Close the old writer before the action,
+            // without emitting a row or charging a record failure. The next
+            // actual event repeats source context into the empty fresh file.
+            let sealed = self.seal_segment(&mut inner, false)?;
+            return expire(&sealed);
         }
         expire_closed_audit_file(path, cutoff_ms, expire)
     }
@@ -2282,6 +2327,7 @@ impl JsonlRecorder {
                 inner.repeated_source_bytes = 0;
                 inner.writer_path = self.path.clone();
                 inner.writer_needs_seal = false;
+                inner.source_prefix_pending = false;
                 if let Some(source) = inner.retained_source_context.clone() {
                     let before = inner.health.clone();
                     if !Self::write_record(
@@ -2637,6 +2683,7 @@ impl JsonlRecorder {
         inner.active_bytes = 0;
         inner.active_started_at = SystemTime::now();
         inner.repeated_source_bytes = 0;
+        inner.source_prefix_pending = false;
         inner.segment_retry_after = None;
         inner.writer_path = self.path.clone();
         Ok(())
@@ -2665,15 +2712,33 @@ impl JsonlRecorder {
     /// segment is renamed back so the still-open writer fd and the active path
     /// agree again.
     fn roll_into_segment(&self, inner: &mut JsonlInner) -> std::io::Result<()> {
-        // A failed flush must not seal a segment or discard buffered bytes.
-        inner
-            .writer
-            .as_mut()
-            .expect("active writer")
-            .flush()
-            .inspect_err(|_| {
-                inner.health.flush_failures = inner.health.flush_failures.saturating_add(1);
-            })?;
+        self.seal_segment(inner, true).map(|_| ())
+    }
+
+    fn seal_segment(
+        &self,
+        inner: &mut JsonlInner,
+        repeat_context: bool,
+    ) -> std::io::Result<PathBuf> {
+        if repeat_context {
+            inner
+                .writer
+                .as_mut()
+                .expect("active writer")
+                .flush()
+                .inspect_err(|_| {
+                    inner.health.flush_failures = inner.health.flush_failures.saturating_add(1);
+                })?;
+        } else if inner.writer_needs_seal
+            || !inner
+                .writer
+                .as_ref()
+                .expect("active writer")
+                .buffer()
+                .is_empty()
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
         let (segment, index) = self.next_segment_path(inner)?;
         let previous_path = inner.writer_path.clone();
         std::fs::rename(&previous_path, &segment)?;
@@ -2686,14 +2751,15 @@ impl JsonlRecorder {
                 inner.writer_path = self.path.clone();
                 // Use the same best-effort write and health accounting as all
                 // other rows. write_record neither relocks nor attempts rollover.
-                if let Some(source) = inner.retained_source_context.clone() {
+                if repeat_context && let Some(source) = inner.retained_source_context.clone() {
                     Self::write_record(
                         inner,
                         AuditRecord::new(None, AuditEventKind::SourceContext { source }),
                     );
                 }
                 inner.repeated_source_bytes = inner.active_bytes;
-                Ok(())
+                inner.source_prefix_pending = !repeat_context;
+                Ok(segment)
             }
             Err(err) => {
                 // Compensate the one applied step. If even this fails the data

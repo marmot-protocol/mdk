@@ -14,7 +14,7 @@ forensic logging. Read this if you produce, validate, or analyze Marmot audit fi
   into one file and one sequence. Swapping or finishing it closes the old file for every clone.
 - Seals files daily or at 1 MiB, preserving bytes and identity for incremental delivery. The app supplies a retention
   cutoff and retirement action to `ForensicRecorder::expire_file_before`; the live writer protects its backing file
-  throughout the action. Expiry itself never writes to the live recorder.
+  throughout the action. Idle data can be sealed without emitting rows, then retired while recording continues.
 - Provides weak recorder references for registries that must not keep a closed session's file alive.
 - Provides a local delivery boundary (`local_delivery`, Unix only) that prepares bounded batches of original, complete
   JSONL lines for a sender, and coordinates closed-source expiry with persisted cursor retirement. It does no network I/O itself; `marmot-app` owns the upload path.

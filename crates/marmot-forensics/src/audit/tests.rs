@@ -3227,13 +3227,18 @@ fn daily_rotation_does_not_seal_a_repeated_header_without_an_actual_row() {
     assert_eq!(segment_paths(&path).len(), 1);
     let health = recorder.health_snapshot();
     assert!(
-        !recorder
-            .expire_file_before(&path, u64::MAX, &mut |_| panic!(
-                "live file must stay protected"
-            ))
+        recorder
+            .expire_file_before(&path, u64::MAX, &mut |closed| fs::remove_file(closed)
+                .map(|()| true))
             .unwrap()
     );
     assert_eq!(recorder.health_snapshot(), health);
+    assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    assert!(
+        !recorder
+            .expire_file_before(&path, u64::MAX, &mut |_| panic!("empty live file"))
+            .unwrap()
+    );
     recorder.record(AuditRecord::new(
         None,
         AuditEventKind::RecorderHealth {
@@ -3275,13 +3280,15 @@ fn file_expiry_protects_the_segment_owned_after_failed_roll_compensation() {
     ));
     let actual = recorder.inner.lock().unwrap().writer_path.clone();
     assert_ne!(actual, path);
-    let before = fs::metadata(&actual).unwrap().len();
+    assert!(fs::metadata(&actual).unwrap().len() > 0);
     let health = recorder.health_snapshot();
     assert!(
-        !recorder
-            .expire_file_before(&actual, u64::MAX, &mut |_| panic!(
-                "actual writer must stay protected"
-            ))
+        recorder
+            .expire_file_before(&actual, u64::MAX, &mut |closed| {
+                assert_ne!(closed, path);
+                assert!(path.exists()); // Fresh writer already owns a different inode.
+                fs::remove_file(closed).map(|()| true)
+            })
             .unwrap()
     );
     assert_eq!(recorder.health_snapshot(), health);
@@ -3293,5 +3300,6 @@ fn file_expiry_protects_the_segment_owned_after_failed_roll_compensation() {
             flush_failures: 0,
         },
     ));
-    assert!(fs::metadata(actual).unwrap().len() > before);
+    assert!(!actual.exists());
+    assert!(fs::metadata(path).unwrap().len() > 0);
 }
