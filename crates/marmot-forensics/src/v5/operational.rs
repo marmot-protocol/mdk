@@ -307,6 +307,7 @@ fn safe_failure_category(input: &str) -> String {
         | "full_history_repair_unconfirmed"
         | "group_create_includes_creator"
         | "group_disbanding"
+        | "group_invite_includes_inviter"
         | "group_invite_not_pending"
         | "group_removed"
         | "hex"

@@ -835,28 +835,21 @@ mod same_account_welcome {
     use openmls_traits::OpenMlsProvider as _;
     use tls_codec::{Deserialize as _, Serialize as _};
 
-    const ACCOUNT_DEVICES: Feature = Feature("account-devices");
-
-    /// A device of `account` that advertises account-devices. The test keeps
-    /// a handle on its connection to build Commits the engine does not send.
-    fn advertising_session(
+    /// A device of `account` that advertises account-devices when
+    /// `advertises` is set. The test keeps a handle on its connection to build
+    /// Commits the engine does not send.
+    fn device_session(
         path: std::path::PathBuf,
         key: &SqlCipherKey,
         account: &[u8],
+        advertises: bool,
     ) -> (AccountDeviceSession, SqliteAccountStorage) {
         let storage = SqliteAccountStorage::open_encrypted(path, key).unwrap();
-        let mut registry = FeatureRegistry::new();
-        registry.register(
-            ACCOUNT_DEVICES,
-            CapabilityRequirement {
-                requires: Capability::AppComponent(ACCOUNT_DEVICES_COMPONENT_ID),
-                level: RequirementLevel::Optional,
-                description: "account-devices",
-            },
-        );
         let mut components = default_group_components();
         components.insert(NOSTR_ROUTING_COMPONENT_ID);
-        components.insert(ACCOUNT_DEVICES_COMPONENT_ID);
+        if advertises {
+            components.insert(ACCOUNT_DEVICES_COMPONENT_ID);
+        }
         let session = AccountDeviceSession::open(
             SessionConfig::with_storage(
                 storage.clone(),
@@ -868,7 +861,6 @@ mod same_account_welcome {
                 keys: deterministic_nostr_keys(account),
             }))
             .protocol_profile(ProtocolProfile::Current)
-            .feature_registry(registry)
             .supported_app_components(components)
             .allow_account_devices_advertising_for_tests(),
         )
@@ -883,7 +875,7 @@ mod same_account_welcome {
         account: &[u8],
     ) -> (Device, SqliteAccountStorage) {
         let (session, storage) =
-            advertising_session(dir.path().join(format!("{name}.sqlite")), key, account);
+            device_session(dir.path().join(format!("{name}.sqlite")), key, account, true);
         let mut device =
             Device::with_session(session, cgka_traits::engine::KeyPackage::new(Vec::new()));
         device.publish().await;
@@ -945,16 +937,17 @@ mod same_account_welcome {
             .unwrap()
     }
 
-    /// Bob's group, requiring account-devices when `require` is set, with
-    /// Alice's phone as a member who is not an admin. Alice's laptop has
-    /// published a KeyPackage and not joined. Returns the phone's connection
-    /// too.
+    /// Bob's group, with Alice's phone as a member who is not an admin.
+    /// Alice's laptop has published a KeyPackage and not joined. Returns the
+    /// phone's connection too. Alice's devices advertise account-devices, and
+    /// Bob's does when `require` is set: the group then requires it from its
+    /// founding, without Bob asking (mdk#2628 item 2.3).
     async fn phone_in_bobs_group(
         dir: &tempfile::TempDir,
         require: bool,
     ) -> (Device, SqliteAccountStorage, Device, GroupId) {
         let key = SqlCipherKey::new("same-account welcome").unwrap();
-        let (mut bob, _) = advertising_session(dir.path().join("bob.sqlite"), &key, b"bob");
+        let (mut bob, _) = device_session(dir.path().join("bob.sqlite"), &key, b"bob", require);
         let (mut phone, phone_storage) = advertising_device(dir, &key, "alice-phone", b"alice").await;
         let (laptop, _) = advertising_device(dir, &key, "alice-laptop", b"alice").await;
         let created = bob
@@ -962,11 +955,7 @@ mod same_account_welcome {
                 name: "same account".into(),
                 description: String::new(),
                 members: vec![phone.key_package.clone()],
-                required_features: if require {
-                    vec![ACCOUNT_DEVICES]
-                } else {
-                    Vec::new()
-                },
+                required_features: Vec::new(),
                 app_components: vec![nostr_routing()],
                 initial_admins: Vec::new(),
             })

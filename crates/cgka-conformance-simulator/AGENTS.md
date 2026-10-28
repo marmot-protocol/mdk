@@ -52,7 +52,9 @@ command matrix beside durable evidence.
   `ProbeBidirectionalDecryptability` actively exercises send, peel, MLS decrypt, and delivery. V3's `expect_tick_error`
   records a normalized expected transport refusal and continues. V3's account-devices actions set per-client 0x800d
   support (`HarnessClient::set_account_devices_supported` plus a restart) and send the activation Commit
-  (`HarnessClient::try_require_account_devices`); keep new 0x800d scenarios on these rather than a second path.
+  (`HarnessClient::try_require_account_devices`); keep new 0x800d scenarios on these rather than a second path. A
+  group founded while every founder supports 0x800d requires it from the start, so an activation scenario gives one
+  founder support only after creation, then a `self_update`.
   `remove_own_account_devices` sends the engine's same-account Remove intent
   (`HarnessClient::try_remove_own_account_devices`, naming each device by its leaf signature key).
 - **`src/scenario_ir.rs`** — Canonical v2/v3 compiler: validates input, assigns stable action ids, records the

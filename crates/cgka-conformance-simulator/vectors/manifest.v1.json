@@ -136,12 +136,27 @@
       "next": "Extend the trace format so the selected branch member identity can be asserted portably."
     },
     {
+      "id": "account-devices-founding/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "account-devices-founding.v1.json",
+      "coverage": [
+        "founding state requires 0x800d when every founder supports it",
+        "invitees join a group that requires 0x800d",
+        "non-admin same-account Remove right after founding",
+        "converged state requires 0x800d and satisfies its rules"
+      ],
+      "next": "Cover a founding Add over the leaf limit if a cheap many-device topology lands."
+    },
+    {
       "id": "account-devices-activation/v1",
       "kind": "scenario_vector",
       "status": "portable",
       "artifact": "account-devices-activation.v1.json",
       "coverage": [
         "per-client account-devices (0x800d) support",
+        "a founder without support leaves the founding state without 0x800d",
+        "support gained through a leaf refresh",
         "activation Commit through publication and apply",
         "two devices of one account",
         "account-devices state rules on the exact converged state"
@@ -193,6 +208,7 @@
       "artifact": "account-devices-own-device-removal-loses-to-admin-remove.v1.json",
       "coverage": [
         "two devices of one account racing from one parent",
+        "group requiring 0x800d from its founding",
         "same-account Remove committed without the proposal store",
         "admin-required Commit beats a same-account Commit by priority class",
         "converged state requires 0x800d and satisfies its rules"
