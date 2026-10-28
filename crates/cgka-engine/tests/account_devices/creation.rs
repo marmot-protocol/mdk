@@ -57,7 +57,11 @@ async fn a_group_requires_account_devices_when_every_founder_advertises_it() {
         .required_capabilities;
     expected.app_components.insert(ACCOUNT_DEVICES_COMPONENT_ID);
     assert_eq!(
-        alice.engine.group_record(&gid).unwrap().required_capabilities,
+        alice
+            .engine
+            .group_record(&gid)
+            .unwrap()
+            .required_capabilities,
         expected
     );
 }

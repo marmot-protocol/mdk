@@ -160,7 +160,14 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     the legacy profile, 0x800d data stays unknown data and only an admin's Welcome joins. Also same-account Commits
     (mdk#2628 item 2.1c): which shapes a non-admin may commit, from both sides; the stamp's priority equal to replay's
     for every class; and races settled the same way on every client. Needs `test-policy-overrides` or
-    `test-conformance-snapshot`.
+    `test-conformance-snapshot`. Its `found_group(.., false, ..)` founds with a member that does not advertise 0x800d
+    and then removes it, because creation requires 0x800d whenever every founder advertises it.
+
+- **File:** `account_devices/creation.rs`
+  - **Owns:** Creating a group (mdk#2628 item 2.3): the founding state requires 0x800d exactly when the creator's leaf
+    and every founding KeyPackage advertise it, without the host asking; a founding Add over the leaf limit is refused
+    with no group, Welcome or event left; invitees join the requiring group, a non-admin member then adds and removes
+    its own devices, and a device that does not advertise 0x800d cannot be added later, from both sides.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and

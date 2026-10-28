@@ -433,6 +433,42 @@ async fn direct_chat_created_with_a_two_device_account_adds_both_and_stays_direc
     }
 }
 
+/// A creator never adds its own account's devices from published KeyPackages
+/// (mdk#2628 D14): naming its account, alone or beside another, is refused
+/// before anything is published, even when another of its devices has a
+/// KeyPackage out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_a_group_with_the_creators_own_account_publishes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_dirs = [tempfile::tempdir().unwrap()];
+    let home = AccountHome::open(dir.path());
+    let alice_id = home.create_account("alice").unwrap().account_id_hex;
+    let bob_id = home.create_account("bob").unwrap().account_id_hex;
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
+    remember_test_member_inbox(&app, &alice_id, "wss://relay.example");
+    let _bob = devices_with_key_packages(&app, &home, "bob", &[], &relay).await;
+    let (mut alices, _alice_apps, alice_key_packages) =
+        devices_with_key_packages(&app, &home, "alice", &alice_dirs, &relay).await;
+    assert_eq!(alice_key_packages.len(), 2);
+    let alice = &mut alices[0];
+
+    let before = relay.published_events.lock().unwrap().len();
+    for members in [
+        vec![alice_id.as_str()],
+        vec![bob_id.as_str(), alice_id.as_str()],
+    ] {
+        let result = alice.create_group("", &members).await;
+        assert!(
+            matches!(result, Err(AppError::GroupCreateIncludesCreator)),
+            "{result:?}"
+        );
+    }
+    assert_eq!(relay.published_events.lock().unwrap().len(), before);
+    assert!(app.groups("alice").unwrap().is_empty());
+}
+
 fn conversation_kind(app: &MarmotApp, label: &str, group: &GroupId) -> crate::ChatConversationKind {
     app.chat_list_row(label, &hex::encode(group.as_slice()))
         .unwrap()

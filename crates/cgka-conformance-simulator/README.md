@@ -217,8 +217,8 @@ V3 adds:
   replayed after a later prerequisite state transition.
 - `set_account_devices_support`, `require_account_devices` and `expect_require_account_devices_error` — per-client
   support for `marmot.group.account-devices.v1` (0x800d) and an admin's Commit that makes a group require it, so
-  vectors can model mixed support. The `account_devices_state` expectation checks a client's exact state against the
-  component's rules.
+  vectors can model mixed support. A group whose founders all support 0x800d requires it from its founding. The
+  `account_devices_state` expectation checks a client's exact state against the component's rules.
 - `remove_own_account_devices` — a same-account Commit in which a device removes other devices of its own account,
   which needs no admin once a group requires 0x800d.
 - Real app-runtime stimuli: `interrupt_relay` (cuts live relay sockets for a real wall-time outage),

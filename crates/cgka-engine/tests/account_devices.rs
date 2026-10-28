@@ -296,9 +296,9 @@ async fn found_group(
 ///
 /// Creation requires 0x800d by itself when `alice` and every founder advertise
 /// it (mdk#2628 item 2.3), so `require` needs every founder to. Without
-/// `require`, the group is one founded with a member that does not advertise
-/// it and has since been removed: the state a group in which everyone
-/// advertises 0x800d, but which does not require it, is in.
+/// `require`, a device that does not advertise it is founded with the others
+/// and removed right after, which is how a group whose members all advertise
+/// 0x800d comes not to require it.
 async fn found_group_with_admins(
     alice: &mut Device,
     mut members: Vec<KeyPackage>,

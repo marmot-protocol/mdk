@@ -35,6 +35,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- A new group now requires `marmot.group.account-devices.v1` (0x800d) when the creating device and every device added
+  at creation advertise it, so each member's devices can add and remove their own account's devices from the start
+  (mdk#2628). The host doesn't ask for it. A group whose founding devices don't all advertise it is created as before.
+  A group that requires 0x800d does so for good: a client that doesn't advertise 0x800d can't be invited into it, and
+  no account may hold more than 20 devices in it, so creating one with more is refused before anything is published.
+  Creating a group still refuses the creator's own account, so it never adds the creator's other devices. MDK doesn't
+  advertise 0x800d yet, so nothing changes in practice. The simulator's account-devices vectors follow: the activation
+  vectors give one founder support only after creation, the removal race runs in a group that requires 0x800d from its
+  founding, and `account-devices-founding/v1` covers creation.
 - Creating a group or inviting adds every device of each recipient account (mdk#2628, mdk#1696): every valid,
   compatible KeyPackage published in the last 30 days, at most 20, or the single best one when none is that recent.
   `key-package` lookup returns the best of the same selection and no longer prefers a package by its `client` tag.
