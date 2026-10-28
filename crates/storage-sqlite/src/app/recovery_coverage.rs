@@ -23,6 +23,7 @@
 //! be logged.
 #[cfg(test)]
 use crate::SqliteAccountStorage;
+use crate::app::recovery_units::trim_spans_tx;
 use crate::base::codec::i64_to_u64;
 use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt, TransportReconciliationRoute};
@@ -99,15 +100,15 @@ pub struct RecoveryCoverageSlice<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RecoveryCoverageMark(u64);
 
-fn invalid() -> StorageError {
+pub(crate) fn invalid() -> StorageError {
     StorageError::Serialization("invalid recovery coverage".into())
 }
 
-fn integer(value: u64) -> StorageResult<i64> {
+pub(crate) fn integer(value: u64) -> StorageResult<i64> {
     i64::try_from(value).map_err(|_| invalid())
 }
 
-fn route_from(kind: i64, id: &[u8]) -> StorageResult<TransportReconciliationRoute> {
+pub(crate) fn route_from(kind: i64, id: &[u8]) -> StorageResult<TransportReconciliationRoute> {
     match (kind, id.len()) {
         (0, 0) => Ok(TransportReconciliationRoute::Inbox),
         (1, 32) => Ok(TransportReconciliationRoute::Group(
@@ -118,7 +119,7 @@ fn route_from(kind: i64, id: &[u8]) -> StorageResult<TransportReconciliationRout
 }
 
 /// Sort and merge overlapping or touching ranges.
-fn union(mut ranges: Vec<RecoveryCoverageRange>) -> Vec<RecoveryCoverageRange> {
+pub(crate) fn union(mut ranges: Vec<RecoveryCoverageRange>) -> Vec<RecoveryCoverageRange> {
     ranges.sort();
     let mut merged: Vec<RecoveryCoverageRange> = Vec::with_capacity(ranges.len());
     for range in ranges {
@@ -157,7 +158,7 @@ fn intersect(
 }
 
 /// `goal` minus a merged, sorted `covered` list.
-fn subtract(
+pub(crate) fn subtract(
     goal: RecoveryCoverageRange,
     covered: &[RecoveryCoverageRange],
 ) -> Vec<RecoveryCoverageRange> {
@@ -249,9 +250,10 @@ fn record_slice(
                 now_seconds,
             )?;
         }
-        return Ok(());
+        return trim_spans_tx(conn, slice.route, slice.relay);
     }
-    record_range(conn, slice, now_seconds)
+    record_range(conn, slice, now_seconds)?;
+    trim_spans_tx(conn, slice.route, slice.relay)
 }
 
 /// Record a validated slice, merging it with the same proof's ranges it
@@ -445,6 +447,7 @@ fn log_uncover_tx(
         )
         .storage()?;
     }
+    crate::app::recovery_units::probe_on_uncover_tx(conn, route, ranges, now_seconds)?;
     prune_uncover_log_tx(conn, None)
 }
 
@@ -543,21 +546,126 @@ pub(crate) fn uncover_released_event_tx(conn: &Connection, event_id: &[u8]) -> S
         .storage()?
         .collect::<Result<Vec<_>, _>>()
         .storage()?;
-    let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64())?;
     for (kind, id, created_at) in placed {
-        let route = route_from(kind, &id)?;
-        let second = i64_to_u64(created_at)?;
-        remove_coverage_tx(conn, Some(&route), second, Some(second))?;
-        widen_goal(conn, &route, second)?;
-        conn.execute_cached(
-            "INSERT OR IGNORE INTO account_recovery_coverage_released (route_kind, route_id, second)
-             VALUES (?1, ?2, ?3)",
-            params![kind, id, created_at],
-        )
-        .storage()?;
-        log_uncover_tx(conn, Some(&route), &[(second, Some(second))], now)?;
+        uncover_second_tx(conn, &route_from(kind, &id)?, i64_to_u64(created_at)?)?;
     }
     Ok(())
+}
+
+/// The device no longer holds an event it had on `route` at `second`: that
+/// second's coverage goes, the route's goal widens to it, live boundaries
+/// leave it out until a fetch proves it again, and the un-cover log records
+/// it.
+pub(crate) fn uncover_second_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    second: u64,
+) -> StorageResult<()> {
+    remove_coverage_tx(conn, Some(route), second, Some(second))?;
+    widen_goal(conn, route, second)?;
+    let (kind, id) = route.storage_key();
+    conn.execute_cached(
+        "INSERT OR IGNORE INTO account_recovery_coverage_released (route_kind, route_id, second)
+         VALUES (?1, ?2, ?3)",
+        params![kind, id, integer(second)?],
+    )
+    .storage()?;
+    log_uncover_tx(
+        conn,
+        Some(route),
+        &[(second, Some(second))],
+        i64_to_u64(crate::base::codec::unix_now_seconds_i64())?,
+    )
+}
+
+/// [`SqliteAppStorage::record_recovery_coverage_since`] inside the caller's
+/// transaction.
+pub(crate) fn record_coverage_since_tx(
+    conn: &Connection,
+    slices: &[RecoveryCoverageSlice<'_>],
+    now_seconds: u64,
+    mark: RecoveryCoverageMark,
+) -> StorageResult<bool> {
+    if slices
+        .iter()
+        .any(|slice| slice.since_seconds > slice.until_seconds || slice.relay.is_empty())
+    {
+        return Err(invalid());
+    }
+    if slices.is_empty() {
+        return Ok(true);
+    }
+    let mark = integer(mark.0)?;
+    let pruned: i64 = conn
+        .query_row_cached(
+            "SELECT pruned_through FROM account_recovery_coverage_uncover_state
+                 WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if pruned > mark {
+        return Ok(false);
+    }
+    let uncovered = conn
+        .prepare_cached(
+            "SELECT route_kind, route_id, since_seconds, until_seconds
+                 FROM account_recovery_coverage_uncovers WHERE generation > ?1",
+        )
+        .storage()?
+        .query_map([mark], |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    let uncovered = uncovered
+        .into_iter()
+        .map(|(kind, id, since, until)| {
+            let route = match (kind, id) {
+                (Some(kind), Some(id)) => Some(route_from(kind, &id)?),
+                _ => None,
+            };
+            let range = RecoveryCoverageRange {
+                since_seconds: i64_to_u64(since)?,
+                until_seconds: until.map_or(Ok(u64::MAX), i64_to_u64)?,
+            };
+            Ok((route, range))
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    for slice in slices {
+        let taken = union(
+            uncovered
+                .iter()
+                .filter(|(route, _)| route.as_ref().is_none_or(|route| route == slice.route))
+                .map(|(_, range)| *range)
+                .collect(),
+        );
+        let kept = subtract(
+            RecoveryCoverageRange {
+                since_seconds: slice.since_seconds,
+                until_seconds: slice.until_seconds,
+            },
+            &taken,
+        );
+        for range in kept {
+            record_slice(
+                conn,
+                &RecoveryCoverageSlice {
+                    since_seconds: range.since_seconds,
+                    until_seconds: range.until_seconds,
+                    ..*slice
+                },
+                now_seconds,
+            )?;
+        }
+    }
+    Ok(true)
 }
 
 impl SqliteAppStorage {
@@ -608,90 +716,8 @@ impl SqliteAppStorage {
         now_seconds: u64,
         mark: RecoveryCoverageMark,
     ) -> StorageResult<bool> {
-        if slices
-            .iter()
-            .any(|slice| slice.since_seconds > slice.until_seconds || slice.relay.is_empty())
-        {
-            return Err(invalid());
-        }
-        if slices.is_empty() {
-            return Ok(true);
-        }
-        let mark = integer(mark.0)?;
         self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let pruned: i64 = conn
-                .query_row_cached(
-                    "SELECT pruned_through FROM account_recovery_coverage_uncover_state
-                     WHERE singleton = 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .storage()?;
-            if pruned > mark {
-                return Ok(false);
-            }
-            let uncovered = conn
-                .prepare_cached(
-                    "SELECT route_kind, route_id, since_seconds, until_seconds
-                     FROM account_recovery_coverage_uncovers WHERE generation > ?1",
-                )
-                .storage()?
-                .query_map([mark], |row| {
-                    Ok((
-                        row.get::<_, Option<i64>>(0)?,
-                        row.get::<_, Option<Vec<u8>>>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                    ))
-                })
-                .storage()?
-                .collect::<Result<Vec<_>, _>>()
-                .storage()?;
-            let uncovered = uncovered
-                .into_iter()
-                .map(|(kind, id, since, until)| {
-                    let route = match (kind, id) {
-                        (Some(kind), Some(id)) => Some(route_from(kind, &id)?),
-                        _ => None,
-                    };
-                    let range = RecoveryCoverageRange {
-                        since_seconds: i64_to_u64(since)?,
-                        until_seconds: until.map_or(Ok(u64::MAX), i64_to_u64)?,
-                    };
-                    Ok((route, range))
-                })
-                .collect::<StorageResult<Vec<_>>>()?;
-            for slice in slices {
-                let taken = union(
-                    uncovered
-                        .iter()
-                        .filter(|(route, _)| {
-                            route.as_ref().is_none_or(|route| route == slice.route)
-                        })
-                        .map(|(_, range)| *range)
-                        .collect(),
-                );
-                let kept = subtract(
-                    RecoveryCoverageRange {
-                        since_seconds: slice.since_seconds,
-                        until_seconds: slice.until_seconds,
-                    },
-                    &taken,
-                );
-                for range in kept {
-                    record_slice(
-                        &conn,
-                        &RecoveryCoverageSlice {
-                            since_seconds: range.since_seconds,
-                            until_seconds: range.until_seconds,
-                            ..*slice
-                        },
-                        now_seconds,
-                    )?;
-                }
-            }
-            Ok(true)
+            record_coverage_since_tx(&*self.lock()?, slices, now_seconds, mark)
         })
     }
 
@@ -770,6 +796,7 @@ impl SqliteAppStorage {
                 [floor],
             )
             .storage()?;
+            crate::app::recovery_units::prune_spans_tx(&conn, floor)?;
             Ok(deleted)
         })
     }

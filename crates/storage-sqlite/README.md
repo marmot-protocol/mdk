@@ -267,6 +267,16 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   on their routes after the mark, or records nothing once the log (an hour, at most 4,096 rows) no longer reaches
   back to it. `prune_recovery_coverage` drops coverage below the retention floor, raises goals to it and ages the log;
   pruning is not an un-cover. The ledger is in shadow mode: no obligation, retry, fence or schedule reads it.
+- **Retry state and staging (`recovery_units.rs`, `recovery_staging.rs`, migration 0127, mdk#2660).** One row per
+  `(route, relay)` unit holds the recovery runner's retry state: active, broken (no progress or refused, with a park
+  revision and one probe a newer loss can earn) or retired, plus backoff, fencing, slicing, planned relay caps and
+  re-check progress. Relay health (unreachable streak, cooldown, NIP-11 caps), the account's rolling-hour attempt and
+  byte budget and each unit's parked and retired spans sit beside it. `settle_recovery_unit` applies one quantum's
+  outcome in one transaction with policy values the caller passes; a unit's debt is the route goal minus that relay's
+  coverage, its retired spans and, unless it holds a probe, its parked spans. Parked and retired spans are never
+  coverage. `stage_recovery_slice` writes a proven slice's unseen events and its coverage, through the subtracting
+  write, in one transaction, so a crash before settlement refetches nothing; staged rows leave once seen. Nothing
+  schedules on this state yet.
 
 ## Tests and benchmarks
 
