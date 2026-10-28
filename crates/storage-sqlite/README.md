@@ -258,8 +258,9 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   its own transaction every route the ledger holds from the floor of the generations it newly charged upward (all of
   it when a floor is unknown) and widens their goals to it; `uncover_recovery_coverage` does the same for the given
   routes only. A released receipt (`cross/release.rs`) un-covers its event's second on each route its inventory row
-  placed it on, and live boundaries leave that second out until a fetch proof (comparison, sweep slice, re-check)
-  covers it, since the REQ that delivered the event will not deliver it again; a release with no inventory row leaves
+  placed it on. Live boundaries never cover that second again, since the REQ that delivered the event will not
+  deliver it again; only a fetch proof (comparison, sweep slice, re-check) covers it, on its own relay, and the hold
+  ends when retention pruning passes it. A release with no inventory row leaves
   the ledger to the epoch gap it arms. Every un-cover is also
   appended to the un-cover log (migration 0125) under a new account generation. `recovery_coverage_mark` reads that
   generation before a fetch, and `record_recovery_coverage_since` subtracts from its slices every range un-covered

@@ -13,8 +13,9 @@
 //! below that cannot see everything un-covered since, so it records nothing.
 //!
 //! `account_recovery_coverage_released` holds each route's seconds released
-//! for replay that no fetch has proved since. A live boundary leaves them out:
-//! its REQ will not deliver a released event again.
+//! for replay. A live boundary leaves them out, since its REQ will not deliver
+//! a released event again; only a fetch proof covers them, on its own relay.
+//! A row ends at retention pruning.
 use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
