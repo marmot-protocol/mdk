@@ -276,6 +276,11 @@
   `cgka_traits::storage::AccountDeviceHistoryKeyStorage`, which
   `StorageProvider` now requires; `put_account_device_history_key_if_absent`
   never replaces a stored key.
+- Migration 0172 advances account storage to schema 172 after migration 0171.
+  It adds the protocol-owned `cgka_group_rejoin` journal, with one recipient
+  job per group and bounded coordinator jobs. Capacity refusals preserve
+  existing work; group deletion cascades to its recovery jobs. Older binaries
+  reject the upgraded database.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it
