@@ -71,6 +71,12 @@ pub struct PinnedCollector {
 }
 
 impl PinnedCollector {
+    /// The URL this pin was made for; a client from [`Self::build_client`]
+    /// dials its host only at the pinned addresses.
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
     pub(crate) fn build_client(&self) -> Result<reqwest::Client, CollectorRequestError> {
         self.build_client_with_timeouts(CONNECT_TIMEOUT, REQUEST_TIMEOUT)
     }

@@ -110,7 +110,7 @@ impl Nip11Fetch {
             .build_client_with_timeouts(self.connect_timeout, self.request_timeout)
             .map_err(|_| Nip11Failure::Refused)?;
         let mut response = client
-            .get(pin.url.clone())
+            .get(pin.url().clone())
             .header(ACCEPT, "application/nostr+json")
             .send()
             .await
