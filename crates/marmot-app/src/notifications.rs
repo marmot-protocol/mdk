@@ -1224,7 +1224,8 @@ pub(crate) fn push_have_prefix(record_digest_hex: &str) -> Option<[u8; 8]> {
 pub(crate) type PushHave = HashSet<[u8; 8]>;
 
 /// What an inbound kind 447 asks of the members that receive it: an announce
-/// asks for what its `have` lacks, and a request (empty `tokens`, no `have`)
+/// asks for what its `have` lacks, and a request (empty or missing `tokens`,
+/// no `have`)
 /// for everything, as an announce whose `have` is empty. `None` for a
 /// self-update with no `have`, or whose `have` is not an array or holds more
 /// than 4,096 elements: such a `have` is ignored before any element is
@@ -1239,7 +1240,10 @@ pub(crate) fn parse_push_repair_ask(content: &str) -> Option<PushHave> {
         return None;
     }
     match (shape.tokens, shape.have) {
-        (PushArrayLen::Len(0), PushArrayLen::Absent) => Some(PushHave::new()),
+        // A missing `tokens` reads as an empty one.
+        (PushArrayLen::Absent | PushArrayLen::Len(0), PushArrayLen::Absent) => {
+            Some(PushHave::new())
+        }
         (_, PushArrayLen::Len(_)) => {
             let elements: PushHaveElements = serde_json::from_str(content).ok()?;
             Some(

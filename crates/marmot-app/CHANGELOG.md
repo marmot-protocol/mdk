@@ -67,16 +67,17 @@
   - an announce held in the outbox when the client restarts is owed again,
     so the outbox may publish it as well as its replacement.
 - Members now repair what an announce lacks (mdk#2611). A device that
-  receives an announce, or a request (a kind 447 with `tokens: []` and no
-  `have`, taken as an announce whose `have` is empty), works out which
-  records and tombstones it can relay that the announce does not name, once
-  the announce's own entries are applied. Every leaf but the announcer's is
+  receives an announce, or a request (a kind 447 with an empty or missing
+  `tokens` and no `have`, taken as an announce whose `have` is empty), works
+  out which records and tombstones it can relay that the announce does not
+  name, once the announce's own entries are applied. Every leaf but the announcer's is
   ranked by SHA-256 of the announce's event id and the leaf index; only the
   top three reply, rank `r` after `r` × 30 seconds, with kind 448 and 449
   lists of just the missing entries, exactly as their owners signed them.
   Before sending, a device drops whatever kind 448 and 449 entries carried at
-  the announce's epoch or later already cover, and sends nothing when none
-  is left. A device decides only once its catch-up has run, so replies it
+  the announce's epoch or later already cover, sends what it now holds for
+  the rest (a newer entry than a cover still goes), and sends nothing when
+  none is left. A device decides only once its catch-up has run, so replies it
   catches up on can cancel its own, and replies to each announcer's leaf at
   most once per 24 hours in a group; every 447's entries are still applied.
   A `have` that is not an array or holds more than 4,096 elements draws no

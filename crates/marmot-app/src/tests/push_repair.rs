@@ -330,6 +330,65 @@ async fn a_lower_rank_cancels_when_a_higher_ranks_reply_covers_it() {
     }
 }
 
+/// A cover applies to the entry it carries and older ones: when this device
+/// comes to hold a newer record for a key after a higher rank's reply covered
+/// the one it decided on, it still sends the newer record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_newer_entry_than_a_cover_is_still_sent() {
+    let mut fx = four_members().await;
+    let relay = fx.relay.clone();
+    let group = fx.group.clone();
+    let group_hex = fx.group_hex();
+    let server = fx.server.clone();
+    let alice_hex = fx.alice.account_id_hex.clone();
+    let requested = send_447(&mut fx.dave, &group, request()).await;
+    let order = ranked(
+        &[&fx.alice, &fx.bob, &fx.carol, &fx.dave],
+        &group,
+        &requested,
+        fx.dave.leaf(&group).1,
+    );
+    let mut ranks = by_rank(
+        vec![&mut fx.alice, &mut fx.bob, &mut fx.carol],
+        &group,
+        &order,
+    );
+    for device in ranks.iter_mut() {
+        device.client.push_announce_timing.repair_slot = Duration::from_secs(3_600);
+        device.receive(&relay).await;
+    }
+    for device in ranks.iter_mut() {
+        assert!(!repair(device).await);
+    }
+
+    // A member other than rank 1 changes its token in a plain self-update;
+    // Alice, the creator, would announce instead.
+    let changer = if ranks[0].account_id_hex != alice_hex {
+        0
+    } else {
+        2
+    };
+    ranks[changer].register("changed-token", &server);
+    assert_eq!(ranks[changer].share().await.succeeded_groups, 1);
+    let changed = held_records(ranks[changer], &group_hex)
+        .into_iter()
+        .find(|(member, _, _)| *member == ranks[changer].account_id_hex)
+        .unwrap();
+
+    // Rank 1 receives rank 0's reply, which covers what it decided on, then
+    // the newer record.
+    let second = &mut ranks[1];
+    let from = gossip_sent(second);
+    second.receive(&relay).await;
+    assert!(held_records(second, &group_hex).contains(&changed));
+    second.client.push_repairs.test_make_replies_due();
+    assert!(!repair(second).await);
+    assert_eq!(
+        listed_records(&replies(second, from)),
+        BTreeSet::from([changed])
+    );
+}
+
 /// A device catching up decides only after it has processed its backlog: a
 /// reply another member sent while it was away cancels its own, though its
 /// leaf ranks first.
@@ -396,7 +455,13 @@ async fn a_member_replies_to_each_leaf_at_most_once_a_day() {
                     .test_age_replies_past_rate_limit();
             }
         }
-        send_447(&mut fx.dave, &group, request()).await;
+        // A request may also leave `tokens` out.
+        let content = if round == 2 {
+            serde_json::json!({"v": notifications::PUSH_VERSION})
+        } else {
+            request()
+        };
+        send_447(&mut fx.dave, &group, content).await;
         let mut peers = [&mut fx.alice, &mut fx.bob, &mut fx.carol];
         for device in peers.iter_mut() {
             device.receive(&relay).await;

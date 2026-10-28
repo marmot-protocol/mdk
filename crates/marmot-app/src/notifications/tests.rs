@@ -1515,7 +1515,7 @@ fn push_announce_names_a_prefix_that_fits_64_kib() {
 }
 
 /// A kind 447 asks for repair as an announce, by the 8-byte digests its
-/// `have` names, or as a request, an empty `tokens` with no `have`, which
+/// `have` names, or as a request, an empty or missing `tokens` with no `have`, which
 /// names nothing. A self-update without `have`, a `have` that is not an array
 /// or holds more than 4,096 elements, and another version ask for nothing.
 #[test]
@@ -1575,7 +1575,15 @@ fn repair_ask_reads_have_and_takes_a_request_as_an_empty_have() {
         ),
         None
     );
-    assert_eq!(parse_push_repair_ask(r#"{"v": "marmot-push-v1"}"#), None);
+    assert_eq!(
+        parse_push_repair_ask(r#"{"v": "marmot-push-v1"}"#),
+        Some(PushHave::new()),
+        "a missing `tokens` reads as an empty one"
+    );
+    assert_eq!(
+        parse_push_repair_ask(r#"{"v": "marmot-push-v1", "tokens": {}}"#),
+        None
+    );
     assert_eq!(parse_push_repair_ask("not json"), None);
 }
 

@@ -109,7 +109,7 @@ impl PushRepairs {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-policy-overrides"))]
 impl PushRepairs {
     /// Every reply this device decided on is due now.
     pub(crate) fn test_make_replies_due(&mut self) {
@@ -594,13 +594,14 @@ impl AppClient {
         let Some(reply) = &ask.reply else {
             return Ok(None);
         };
-        // Items others covered since the decision are dropped; the rest are
-        // sent as this device now holds them.
+        // Each item is sent as this device now holds it, unless entries
+        // others sent since cover what it holds: a cover of the item as
+        // decided does not cover a newer entry for its key.
         let wanted = |key: &PushRecordKey, stamp: &PushStamp| {
             reply
                 .lacking
                 .get(key)
-                .is_some_and(|item| stamp >= item && !ask.covers(key, item) && ask.lacks(&stamp.1))
+                .is_some_and(|item| stamp >= item && !ask.covers(key, stamp) && ask.lacks(&stamp.1))
         };
         let relayable = self.relayable_push_entries(&peer.0)?;
         let tokens = relayable
