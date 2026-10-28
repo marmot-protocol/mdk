@@ -30,8 +30,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   a same-account Commit with nothing else in it and leaves pending proposals alone. Anything else is refused before
   anything is published or changed, including every request in a group that does not require 0x800d. A queued one
   gets the preparation attempt after a convergence pass that admin intents get; self-updates and Leave still don't.
-  marmot-app does not expose them and MDK does not advertise 0x800d yet, so nothing changes in practice. The
-  simulator's `remove_own_account_devices` now sends the Remove intent.
+  marmot-app does not expose them, so hosts cannot send them yet. The simulator's `remove_own_account_devices` now
+  sends the Remove intent.
 
 ### Changed
 
@@ -40,10 +40,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   (mdk#2628). The host doesn't ask for it. A group whose founding devices don't all advertise it is created as before.
   A group that requires 0x800d does so for good: a client that doesn't advertise 0x800d can't be invited into it, and
   no account may hold more than 20 devices in it, so creating one with more is refused before anything is published.
-  Creating a group still refuses the creator's own account, so it never adds the creator's other devices. MDK doesn't
-  advertise 0x800d yet, so nothing changes in practice. The simulator's account-devices vectors follow: the activation
-  vectors give one founder support only after creation, the removal race runs in a group that requires 0x800d from its
-  founding, and `account-devices-founding/v1` covers creation.
+  Creating a group still refuses the creator's own account, so it never adds the creator's other devices. The
+  simulator's account-devices vectors follow: the activation vectors give one founder support only after creation, the
+  removal race runs in a group that requires 0x800d from its founding, and `account-devices-founding/v1` covers
+  creation.
 - Inviting now refuses the inviter's own account, under any alias, with `GroupInviteIncludesInviter` before anything
   is staged or published, as creating a group already did (mdk#2628). An admin never adds its own account's other
   devices from published KeyPackages. Receivers still accept such an Add from another client.
@@ -55,26 +55,27 @@ versioning through the workspace version in the root `Cargo.toml`.
   last-admin check count accounts, and a chat between two accounts stays direct whatever devices either person uses.
 - MDK now advertises `marmot.group.account-devices.v1` (0x800d) (mdk#2628). New KeyPackages list it, a device replaces
   a published KeyPackage that does not, and its leaf in each existing group gains it through the randomized refresh of
-  stale leaves, each group at its own time within five days. No group starts requiring it, and a device that doesn't
-  advertise it can still be invited into groups that don't require it. The engine builder now accepts 0x800d, and the
-  test-only `allow_account_devices_advertising_for_tests` builder flags are gone.
+  stale leaves, each group at its own time within five days. So a group founded only by upgraded devices now requires
+  it, and a device on an older build can't be invited into that group. An existing group keeps its requirements, and a
+  device that doesn't advertise 0x800d can still be invited into any group that doesn't require it. The engine builder
+  now accepts 0x800d, and the test-only `allow_account_devices_advertising_for_tests` builder flags are gone.
 - MDK now enforces `marmot.group.account-devices.v1` (0x800d) in groups that require it (mdk#2628). In such a group
   nothing carries data for it (GroupContext, leaves, added KeyPackages) and no AppDataUpdate targets it, every leaf
   supports it, no account holds more than 20 leaves, and the group never stops requiring it. A Commit or standalone
-  proposal that breaks a rule is rejected. MDK does not advertise 0x800d yet, so it cannot be in such a group; groups
-  that don't require it behave as before, and data under 0x800d there is still unknown data. The engine builder now
-  refuses to advertise a protocol component id the engine does not implement, such as SafeAAD (0x0002) and 0x800d.
+  proposal that breaks a rule is rejected. Groups that don't require it behave as before, and data under 0x800d there
+  is still unknown data. The engine builder now refuses to advertise a protocol component id the engine does not
+  implement, such as SafeAAD (0x0002).
 - In a group that requires `marmot.group.account-devices.v1` (0x800d), a device now joins through a Welcome from
   another device of its own account, as it does through an admin's (mdk#2628). The joiner applies the component's
   state rules to the group it joins, as members do to every Commit, and rejects a Welcome whose GroupInfo carries data
-  under 0x800d. In any other group only an admin's Welcome joins, as before. Nothing sends such a Welcome yet, and MDK
-  does not advertise 0x800d, so nothing changes in practice.
+  under 0x800d. In any other group only an admin's Welcome joins, as before. Nothing in marmot-app sends such a Welcome
+  yet.
 - In a group that requires `marmot.group.account-devices.v1` (0x800d), a device may now commit adds and removes of its
   own account's devices without being an admin (mdk#2628). The Commit must carry them by value and nothing else, and a
   Commit that also touches another account, carries a proposal by reference or changes group state still needs an
   admin. Such a Commit has ordinary branch priority whoever commits it, so an admin's Remove beats an admin's add of
   their own device. One classifier now decides authorization and priority at replay, on every send path and in the
-  publish stamp. Groups that don't require 0x800d behave exactly as before; MDK does not advertise 0x800d yet.
+  publish stamp. Groups that don't require 0x800d behave exactly as before.
   Scenario IR v3 gains `remove_own_account_devices`, and a vector races two devices of one account: an admin's
   Remove of another member beats the other device's same-account Remove on every client.
 - JSON error codes now depend on what an error is, not on which MDK layers wrapped it (mdk#2602). Two codes change.

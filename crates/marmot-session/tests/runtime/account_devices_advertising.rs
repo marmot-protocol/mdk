@@ -1,7 +1,7 @@
 // Advertising `marmot.group.account-devices.v1` (mdk#2628, item 2.2). A build
 // that starts advertising it replaces this device's published KeyPackage and
 // refreshes its own leaf in each existing group through the randomized
-// stale-leaf refresh. Nothing makes a group require it.
+// stale-leaf refresh. Neither makes an existing group require it.
 
 /// A current-profile device of `account`; its build advertises
 /// account-devices when `upgraded`, on top of what it supported before.

@@ -7683,10 +7683,10 @@ impl MarmotApp {
         // negotiation: each group's required component id selects exactly one.
         components.insert(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID);
         components.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
-        // Advertised, never turned on here: a group requires account-devices
-        // only when its creator or an admin asks for it (mdk#2628, items 2.3
-        // and 2.4). Advertising it makes leaves eligible and lets this device
-        // join groups that already require it.
+        // A new group requires account-devices when every founding device
+        // advertises it (mdk#2628, item 2.3); an existing group gains it only
+        // through an admin's activation (item 2.4). Advertising it makes
+        // leaves eligible and lets this device join groups that require it.
         components.insert(ACCOUNT_DEVICES_COMPONENT_ID);
         components.into_iter().collect()
     }

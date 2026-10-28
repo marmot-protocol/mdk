@@ -113,8 +113,9 @@ Load-bearing departures from the original plan; each is also documented at its s
    defense.
 8. **Advertise only what the engine implements.** `EngineBuilder::build` refuses a protocol-owned component id outside
    `ADVERTISABLE_PROTOCOL_APP_COMPONENTS`. A component joins that list only once the engine enforces every rule of it,
-   because a group may require what its members advertise. Advertising never turns a component on: group creation
-   and upgrades require it only when asked, and upgrades never add account-devices (0x800d).
+   because a group may require what its members advertise. Advertising never changes an existing group: upgrades
+   require a component only when asked and never add account-devices (0x800d). Creation requires account-devices,
+   unasked, exactly when the creator's leaf and every founding KeyPackage advertise it (`group_lifecycle.rs`).
 
 ## Publish-before-apply
 
