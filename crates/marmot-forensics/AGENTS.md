@@ -18,7 +18,10 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   events and sealed bytes remain unchanged during rotation. Also roll before the first row after a day (including
   a quiet stop); preserve the age boundary across reopen. The app supplies expiry cutoffs to `expire_file_before`;
   check under the writer lock and protect both the canonical path and the actual writer path after failed compensation.
-  Maintenance must not invoke uncertain-writer recovery or charge failed record attempts.
+  Maintenance must not invoke uncertain-writer recovery, roll or write the live file, or charge failed record attempts.
+  Retire a closed source through `local_delivery::expire_closed_source` before unlinking it: publish its immutable alias
+  and final length first, preserve unaccepted-tail evidence, and compensate cursor and filename on errors. Never relax
+  generic missing-active detection based on the cursor's previously observed length alone.
   Destructive `rotate()` — which discards the current file — stays a
   separate, explicit operation.
 - Retry failed segment rolls after bounded backoff, without requiring a recorder restart or destructive rotation.

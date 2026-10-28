@@ -34,7 +34,7 @@ pub(crate) fn cleanup_expired_audit_logs(root: &Path) {
         |path| {
             failed += usize::from(
                 marmot_forensics::NoopRecorder
-                    .expire_file_before(&path, cutoff)
+                    .expire_file_before(&path, cutoff, &mut expire_source_file)
                     .is_err(),
             );
             true
@@ -194,24 +194,39 @@ impl MarmotApp {
             .as_ref()
             .and_then(|registration| registration.as_ref())
             .and_then(|weak| weak.upgrade());
-        let owner = if container == accounts {
-            label.and_then(|l| self.account_home().account(l).ok())
-        } else {
-            None
-        };
-        // Fence only actual candidates. Unreadable/signed-out account records
-        // and failed wipes still expire, using the conservative global fence.
-        let _mutation = match owner {
-            Some(account) => self
-                .audit_export_lifecycle
-                .mutate_account(&account.account_id_hex),
-            None => self.audit_export_lifecycle.mutate_all(),
-        };
+        let directory = path.parent().expect("validated account directory");
         let cutoff = cutoff_ms(SystemTime::now());
+        let mut expire = |closed: &Path| {
+            let source = marmot_forensics::local_delivery::source_identity(closed)?;
+            self.audit_export_lifecycle
+                .mutate_source(directory, source, || expire_source_file(closed))
+        };
         Ok(match recorder {
-            Some(recorder) => recorder.expire_file_before(&path, cutoff)?,
-            None => marmot_forensics::NoopRecorder.expire_file_before(&path, cutoff)?,
+            Some(recorder) => recorder.expire_file_before(&path, cutoff, &mut expire)?,
+            None => {
+                marmot_forensics::NoopRecorder.expire_file_before(&path, cutoff, &mut expire)?
+            }
         })
+    }
+}
+
+fn expire_source_file(path: &Path) -> io::Result<bool> {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains("-v5"))
+    {
+        let state = path
+            .parent()
+            .expect("account directory")
+            .join("audit-otlp-delivery-v5");
+        marmot_forensics::local_delivery::expire_closed_source(path, &state)
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -416,9 +431,17 @@ mod tests {
         age(&path, SystemTime::now());
         let attempt = app
             .audit_export_lifecycle
-            .reserve(&account.account_id_hex, "test")
+            .reserve(
+                &account.account_id_hex,
+                "test",
+                &fs::canonicalize(app.account_dir("alice")).unwrap(),
+            )
             .unwrap();
 
+        app.audit_export_lifecycle.prepared_source(
+            &attempt,
+            marmot_forensics::local_delivery::source_identity(&path).unwrap(),
+        );
         assert!(!app.expire_audit_file(&path).unwrap());
         assert!(app.audit_export_lifecycle.admit(&attempt, || ()).is_some());
         age(&path, UNIX_EPOCH);
@@ -553,5 +576,68 @@ mod tests {
         assert!(path.exists());
         drop(opening);
         assert!(app.expire_audit_file(&path).unwrap());
+    }
+    #[test]
+    fn audit_retention_does_not_cancel_other_sources_or_accounts() {
+        let root = tempfile::tempdir().unwrap();
+        let home = marmot_account::AccountHome::open(root.path());
+        let alice = home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let app = MarmotApp::with_relays_and_account_home(root.path(), Vec::new(), home);
+        let alice_dir = fs::canonicalize(app.account_dir("alice")).unwrap();
+        let bob_dir = fs::canonicalize(app.account_dir("bob")).unwrap();
+        let alice_attempt = app
+            .audit_export_lifecycle
+            .reserve(&alice.account_id_hex, "receiver", &alice_dir)
+            .unwrap();
+        let bob_attempt = app
+            .audit_export_lifecycle
+            .reserve(&bob.account_id_hex, "receiver", &bob_dir)
+            .unwrap();
+        let file = |directory: &Path, id: &str| {
+            let path = directory.join(format!("audit-{id}-v5-seg000001.jsonl"));
+            fs::write(&path, b"source").unwrap();
+            path
+        };
+        let on_wire = file(&alice_dir, &"a".repeat(32));
+        let bob_wire = file(&bob_dir, &"b".repeat(32));
+        app.audit_export_lifecycle.prepared_source(
+            &alice_attempt,
+            marmot_forensics::local_delivery::source_identity(&on_wire).unwrap(),
+        );
+        app.audit_export_lifecycle.prepared_source(
+            &bob_attempt,
+            marmot_forensics::local_delivery::source_identity(&bob_wire).unwrap(),
+        );
+        let other_alice = file(&alice_dir, &"c".repeat(32));
+        age(&other_alice, UNIX_EPOCH);
+        assert!(app.expire_audit_file(&other_alice).unwrap());
+        let tomb = root.path().join(".wipe-tombstones/old");
+        fs::create_dir_all(&tomb).unwrap();
+        let remnant = file(&tomb, &"d".repeat(32));
+        age(&remnant, UNIX_EPOCH);
+        assert!(app.expire_audit_file(&remnant).unwrap());
+        assert!(
+            app.audit_export_lifecycle
+                .admit(&alice_attempt, || ())
+                .is_some()
+        );
+        assert!(
+            app.audit_export_lifecycle
+                .admit(&bob_attempt, || ())
+                .is_some()
+        );
+        age(&on_wire, UNIX_EPOCH);
+        assert!(app.expire_audit_file(&on_wire).unwrap());
+        assert!(
+            app.audit_export_lifecycle
+                .admit(&alice_attempt, || ())
+                .is_none()
+        );
+        assert!(
+            app.audit_export_lifecycle
+                .admit(&bob_attempt, || ())
+                .is_some()
+        );
     }
 }

@@ -3129,8 +3129,17 @@ fn file_expiry_protects_a_stuck_writer_and_does_not_charge_record_failures() {
         inner.writer_needs_seal = true;
     }
     let before = recorder.health_snapshot();
-    assert!(recorder.expire_file_before(&closed, u64::MAX).unwrap());
-    assert!(!recorder.expire_file_before(&path, u64::MAX).unwrap());
+    assert!(
+        recorder
+            .expire_file_before(&closed, u64::MAX, &mut |p| fs::remove_file(p)
+                .map(|()| true))
+            .unwrap()
+    );
+    assert!(
+        !recorder
+            .expire_file_before(&path, u64::MAX, &mut |p| fs::remove_file(p).map(|()| true))
+            .unwrap()
+    );
     assert_eq!(recorder.health_snapshot(), before);
     assert!(path.exists());
 }
@@ -3193,4 +3202,96 @@ fn daily_rotation_seals_a_failed_source_prefix_before_the_next_actual_row() {
     assert_eq!(segment_paths(&path).len(), 2);
     assert_eq!(fs::read(&segment_paths(&path)[0]).unwrap(), original);
     assert!(recorder.health_snapshot().write_failures > 0);
+}
+
+#[test]
+fn daily_rotation_does_not_seal_a_repeated_header_without_an_actual_row() {
+    let dir = TempDir::new().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"a".repeat(32));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "a".repeat(32), None, v5_test_producer())
+            .unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: AuditSourceContext::default(),
+        },
+    ));
+    {
+        let mut inner = recorder.inner.lock().unwrap();
+        recorder.roll_into_segment(&mut inner).unwrap();
+        assert_eq!(inner.active_bytes, inner.repeated_source_bytes);
+        inner.active_started_at = SystemTime::now() - AUDIT_LOG_SEGMENT_MAX_AGE * 35;
+        recorder.try_roll_segment(&mut inner, Instant::now());
+    }
+    assert_eq!(segment_paths(&path).len(), 1);
+    let health = recorder.health_snapshot();
+    assert!(
+        !recorder
+            .expire_file_before(&path, u64::MAX, &mut |_| panic!(
+                "live file must stay protected"
+            ))
+            .unwrap()
+    );
+    assert_eq!(recorder.health_snapshot(), health);
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::RecorderHealth {
+            serialization_failures: 0,
+            write_failures: 0,
+            flush_failures: 0,
+        },
+    ));
+    assert_eq!(segment_paths(&path).len(), 1);
+    assert!(
+        recorder
+            .inner
+            .lock()
+            .unwrap()
+            .active_started_at
+            .elapsed()
+            .unwrap()
+            < Duration::from_secs(3)
+    );
+}
+
+#[test]
+fn file_expiry_protects_the_segment_owned_after_failed_roll_compensation() {
+    let dir = TempDir::new().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"a".repeat(32));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "a".repeat(32), None, v5_test_producer())
+            .unwrap();
+    recorder.inner.lock().unwrap().active_bytes = AUDIT_LOG_SEGMENT_MAX_BYTES;
+    recorder.fail_segment_reopen.store(true, Ordering::Relaxed);
+    recorder.fail_segment_restore.store(true, Ordering::Relaxed);
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::RecorderHealth {
+            serialization_failures: 0,
+            write_failures: 0,
+            flush_failures: 0,
+        },
+    ));
+    let actual = recorder.inner.lock().unwrap().writer_path.clone();
+    assert_ne!(actual, path);
+    let before = fs::metadata(&actual).unwrap().len();
+    let health = recorder.health_snapshot();
+    assert!(
+        !recorder
+            .expire_file_before(&actual, u64::MAX, &mut |_| panic!(
+                "actual writer must stay protected"
+            ))
+            .unwrap()
+    );
+    assert_eq!(recorder.health_snapshot(), health);
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::RecorderHealth {
+            serialization_failures: 0,
+            write_failures: 0,
+            flush_failures: 0,
+        },
+    ));
+    assert!(fs::metadata(actual).unwrap().len() > before);
 }

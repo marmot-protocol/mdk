@@ -130,8 +130,13 @@ impl ForensicRecorder for SharedRecorder {
         self.read().rotate()
     }
 
-    fn expire_file_before(&self, path: &std::path::Path, cutoff_ms: u64) -> std::io::Result<bool> {
-        self.read().expire_file_before(path, cutoff_ms)
+    fn expire_file_before(
+        &self,
+        path: &std::path::Path,
+        cutoff_ms: u64,
+        expire: &mut dyn FnMut(&std::path::Path) -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
+        self.read().expire_file_before(path, cutoff_ms, expire)
     }
 }
 

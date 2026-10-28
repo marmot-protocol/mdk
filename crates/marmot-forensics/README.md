@@ -13,10 +13,11 @@ forensic logging. Read this if you produce, validate, or analyze Marmot audit fi
 - Provides `SharedRecorder`, the cloneable handle through which the engine, the account runtime and the app record
   into one file and one sequence. Swapping or finishing it closes the old file for every clone.
 - Seals files daily or at 1 MiB, preserving bytes and identity for incremental delivery. The app supplies a retention
-  cutoff to `ForensicRecorder::expire_file_before`; the live writer protects its backing file during expiry.
+  cutoff and retirement action to `ForensicRecorder::expire_file_before`; the live writer protects its backing file
+  throughout the action. Expiry itself never writes to the live recorder.
 - Provides weak recorder references for registries that must not keep a closed session's file alive.
 - Provides a local delivery boundary (`local_delivery`, Unix only) that prepares bounded batches of original, complete
-  JSONL lines for a sender. It does no network I/O itself; `marmot-app` owns the upload path.
+  JSONL lines for a sender, and coordinates closed-source expiry with persisted cursor retirement. It does no network I/O itself; `marmot-app` owns the upload path.
 - Stays independent of engine, storage, transport, and simulator crates.
 
 ## What it does not do

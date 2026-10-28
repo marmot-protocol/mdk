@@ -1441,10 +1441,12 @@ MDK expires closed forensic files 30 days after their last filesystem write, wit
 at 1 MiB or before the first row after a day, whichever comes first, preserving original bytes, inode identity,
 session, sequence and the repeated source header. Daily files therefore keep roughly 30 days of history, with up to
 one extra day plus the hourly sweep delay. Reopening uses the bounded first row to preserve the age boundary across
-short sessions. A quiet shutdown rolls before its stop row rather than refreshing an old file's retention clock.
+short sessions. Header-only prefixes do not roll on their own; their age clock starts with the next actual row.
+A quiet shutdown rolls before its stop row rather than refreshing an old file's retention clock.
 Legacy files are not split or rewritten; they age out 30 days after their last write.
 
-Exclusive-root startup sweeps account directories and failed-wipe remnants using filenames and metadata only.
+Exclusive-root startup sweeps account directories and failed-wipe remnants. Scanning uses filenames and metadata;
+expiry consults bounded delivery state (at most 1 MiB) and a bounded source fingerprint when a cursor exists.
 An installation-wide hourly worker also covers signed-out/dormant accounts and remnants created after launch,
 independently of recording consent, upload configuration and upload success. Its metadata scanner has a size-one
 path queue and owns no recorder or storage guard. Each unlink is admitted separately; shutdown cancels the walk
@@ -1453,13 +1455,22 @@ without waiting for payload copying or holding account commands behind a full sw
 Only the reserved `audit-<32 lowercase hex>-v4/v5[-seg<index>].jsonl` families are swept. Symlinks are not followed;
 custom names, databases and the always-on key-reveal security log are excluded. Empty or malformed reserved files
 expire by the same metadata policy. Failures are isolated per file/account, nonfatal and retried on the next sweep
-or open. Whole-file deletion needs no staging space, so it can free space on a full disk.
+or open. Already-known sealed files unlink without staging space. An old active filename needs a durable cursor
+retirement first; a metadata-write failure leaves its bytes intact while other sealed files continue expiring.
 
 A weak recorder registry serializes writer creation and expiry. The live recorder rechecks each candidate under
 its writer lock and protects both its canonical path and its actual writer path after failed roll compensation.
-Outstanding v5 delivery is fenced only for expiry candidates; acknowledged sealed files can disappear without
-replays or false gaps. Delivery drops retired, gap-free acknowledged journals, while retaining real gaps and
-unaccepted extents. Retention never claims expired data reached a receiver.
+Expiry serializes local cursor work for the source directory and cancels only an attempt owning the expiring inode.
+Other uploads remain valid, including another file in the same account; their local completion waits for retirement.
+No account-file lookup or installation-wide cancellation is needed for orphan directories or failed wipes.
+
+Before deleting a tracked source still known as active, retirement seals its filename and durably publishes its closed
+alias and exact final byte length. It preserves ACKs and prepared ranges. A crash leaves a discoverable sealed inode
+or a durably retired alias; publication/unlink errors compensate both cursor and filename, retaining source bytes if
+compensation cannot complete. Acknowledged sources disappear without false gaps; unobserved or prepared unsent tails
+retain genuine missing-source evidence. Generic missing-active detection stays conservative. Delivery drops retired,
+gap-free acknowledged journals while retaining real gaps and unaccepted extents. Retention never claims expired data
+reached a receiver.
 
 ### Explicit upload
 

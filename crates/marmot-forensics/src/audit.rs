@@ -1645,15 +1645,25 @@ pub trait ForensicRecorder: Send + Sync {
         Ok(())
     }
 
-    /// Remove a closed file last written before this Unix-millisecond cutoff.
-    /// Live writers must serialize this check with rotation and protect their
-    /// actual backing inode. Callers own path validation and delivery fencing.
-    fn expire_file_before(&self, path: &Path, cutoff_ms: u64) -> std::io::Result<bool> {
-        expire_closed_audit_file(path, cutoff_ms)
+    /// Run expiry only for a closed file older than this Unix-ms cutoff.
+    /// A live recorder holds its writer lock through the supplied action and
+    /// protects its actual backing inode. The action owns delivery retirement
+    /// and unlink; callers own root/path validation and account admission.
+    fn expire_file_before(
+        &self,
+        path: &Path,
+        cutoff_ms: u64,
+        expire: &mut dyn FnMut(&Path) -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
+        expire_closed_audit_file(path, cutoff_ms, expire)
     }
 }
 
-fn expire_closed_audit_file(path: &Path, cutoff_ms: u64) -> std::io::Result<bool> {
+fn expire_closed_audit_file(
+    path: &Path,
+    cutoff_ms: u64,
+    expire: &mut dyn FnMut(&Path) -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -1670,11 +1680,7 @@ fn expire_closed_audit_file(path: &Path, cutoff_ms: u64) -> std::io::Result<bool
     if modified >= u128::from(cutoff_ms) {
         return Ok(false);
     }
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
+    expire(path)
 }
 
 /// Default recorder. Drops every event without observable side effects.
@@ -2060,6 +2066,9 @@ impl ForensicRecorder for JsonlRecorder {
         }
         // Seal before the first row after a quiet day, so a fresh event does
         // not extend the lifetime of the preceding day's records.
+        if inner.active_bytes == inner.repeated_source_bytes {
+            inner.active_started_at = SystemTime::now();
+        }
         self.try_roll_segment(&mut inner, Instant::now());
         if self.ensure_safe_writer(&mut inner).is_err() {
             return;
@@ -2084,6 +2093,9 @@ impl ForensicRecorder for JsonlRecorder {
         }
         if self.ensure_safe_writer(&mut inner).is_err() {
             return;
+        }
+        if inner.active_bytes == inner.repeated_source_bytes {
+            inner.active_started_at = SystemTime::now();
         }
         self.try_roll_segment(&mut inner, Instant::now());
         if self.ensure_safe_writer(&mut inner).is_err() {
@@ -2115,6 +2127,9 @@ impl ForensicRecorder for JsonlRecorder {
         }
         // A quiet shutdown must not refresh a month-old file's retention
         // clock merely by appending its terminal row.
+        if inner.active_bytes == inner.repeated_source_bytes {
+            inner.active_started_at = SystemTime::now();
+        }
         self.try_roll_segment(&mut inner, Instant::now());
         if self.ensure_safe_writer(&mut inner).is_err() {
             return;
@@ -2156,17 +2171,19 @@ impl ForensicRecorder for JsonlRecorder {
         Some(self.path.clone())
     }
 
-    fn expire_file_before(&self, path: &Path, cutoff_ms: u64) -> std::io::Result<bool> {
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        // Maintenance never attempts uncertain-writer recovery or charges a
-        // failed record. A later real record owns that recovery path.
-        if !inner.writer_needs_seal {
-            self.try_roll_segment(&mut inner, Instant::now());
-        }
+    fn expire_file_before(
+        &self,
+        path: &Path,
+        cutoff_ms: u64,
+        expire: &mut dyn FnMut(&Path) -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Expiry never writes or recovers the live recorder. Ordinary rows
+        // own daily rollover and uncertain-writer recovery.
         if path == self.path || path == inner.writer_path {
             return Ok(false);
         }
-        expire_closed_audit_file(path, cutoff_ms)
+        expire_closed_audit_file(path, cutoff_ms, expire)
     }
 
     fn rotate(&self) -> std::io::Result<()> {
@@ -2541,7 +2558,7 @@ impl JsonlRecorder {
             .active_bytes
             .saturating_sub(inner.repeated_source_bytes)
             >= AUDIT_LOG_SEGMENT_MAX_BYTES;
-        let age_due = inner.active_bytes > 0
+        let age_due = inner.active_bytes > inner.repeated_source_bytes
             && SystemTime::now()
                 .duration_since(inner.active_started_at)
                 .is_ok_and(|age| age >= AUDIT_LOG_SEGMENT_MAX_AGE);
