@@ -21,6 +21,8 @@ agnostic; the optional `sdk` feature adds a `nostr-sdk` backed `NostrSdkRelayCli
 - Publishes already-wrapped `TransportMessage`s to target endpoints and returns endpoint-level publish reports.
 - Builds and publishes Marmot kind `30443` KeyPackage events through the same relay-client boundary when supplied with
   the MIP-00 metadata.
+- With the `unreleased-device-pairing` feature, gift-wraps device-pairing messages from `marmot-pairing` to the
+  account's own key and reads them back (`pairing`). No release enables it until the pairing spec merges.
 - Builds NIP-65 kind `10002` and Marmot inbox kind `10050` account relay-list events. KeyPackages are published to the
   NIP-65 relays; there is no dedicated KeyPackage relay list.
 - Exposes adapter-local lifecycle metrics for diagnostics.

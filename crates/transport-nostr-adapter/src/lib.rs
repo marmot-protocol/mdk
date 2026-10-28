@@ -73,6 +73,8 @@ mod key_package;
 #[cfg(feature = "sdk")]
 #[doc(hidden)]
 pub mod network_proxy;
+#[cfg(any(test, feature = "unreleased-device-pairing"))]
+pub mod pairing;
 mod publish_accounting;
 mod relay_list;
 mod replay_admission;

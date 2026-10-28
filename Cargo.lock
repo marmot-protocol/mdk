@@ -3714,6 +3714,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "marmot-pairing"
+version = "0.15.0-dev"
+dependencies = [
+ "cgka-traits",
+ "hex",
+ "hkdf 0.12.4",
+ "hmac 0.12.1",
+ "marmot-pairing",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "marmot-session"
 version = "0.15.0-dev"
 dependencies = [
@@ -6863,6 +6881,7 @@ dependencies = [
  "cgka-traits",
  "futures",
  "hex",
+ "marmot-pairing",
  "nostr 0.45.5",
  "nostr-gossip",
  "nostr-memory",
