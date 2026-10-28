@@ -79,6 +79,9 @@ pub struct GroupRecoveryRecord {
     pub native_epoch: Option<EpochId>,
     /// Highest authenticated selected-coordinator epoch observed in this episode.
     pub observed_epoch: Option<EpochId>,
+    /// Remote epoch evidence has spent its one refill until local evidence or retry.
+    #[serde(default)]
+    pub remote_rearmed: bool,
     /// Durable reservation of a coordinator Commit, independent of request expiry.
     pub commit_started_at: Option<u64>,
     pub phase: GroupRecoveryPhase,
@@ -276,6 +279,7 @@ mod tests {
             candidate_set_hash: Some([41; 32]),
             native_epoch: Some(EpochId(17)),
             observed_epoch: Some(EpochId(23)),
+            remote_rearmed: true,
             commit_started_at: Some(1_800_000_000),
             phase: GroupRecoveryPhase::Request,
             message: GroupRecoveryMessage {

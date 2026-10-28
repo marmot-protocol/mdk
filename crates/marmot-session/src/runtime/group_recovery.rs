@@ -99,6 +99,8 @@ where
                 // renews the budget without creating a second authorization.
                 let mut record = previous.clone();
                 record.total_attempts = 0;
+                record.observed_epoch = None;
+                record.remote_rearmed = false;
                 record.attempts = 0;
                 record.retry_at = now;
                 record
@@ -278,6 +280,7 @@ where
                             } else {
                                 record.observed_epoch
                             };
+                            replacement.remote_rearmed = !evidence && record.remote_rearmed;
                             self.session
                                 .storage
                                 .with_transaction(|storage| {
@@ -667,6 +670,7 @@ where
             candidate_set_hash: Some(state.candidate_set_hash),
             native_epoch: Some(state.epoch),
             observed_epoch: None,
+            remote_rearmed: false,
             commit_started_at: None,
             message,
             outbound: None,
@@ -793,6 +797,7 @@ where
             candidate_set_hash: None,
             native_epoch: None,
             observed_epoch: None,
+            remote_rearmed: false,
             commit_started_at: None,
             message: challenge,
             outbound: None,
@@ -851,11 +856,15 @@ where
             .observed_epoch
             .or(record.native_epoch)
             .is_some_and(|epoch| source.epoch > epoch);
-        if record.phase == Phase::Parked && !newer {
+        // An authenticated account can invent epochs. Permit one refill, not
+        // an unlimited sequence of fresh packages from ever-higher claims.
+        let rearm = newer && !record.remote_rearmed;
+        if record.phase == Phase::Parked && !rearm {
             return Ok(false);
         }
-        if newer {
+        if rearm {
             record.total_attempts = 0;
+            record.remote_rearmed = true;
         }
         record.observed_epoch = Some(source.epoch);
         record.leaf_index = source.leaf_index;

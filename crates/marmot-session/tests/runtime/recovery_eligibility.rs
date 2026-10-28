@@ -31,12 +31,14 @@ fn eligibility_runtime(
     publisher: RecordingKeyPackages,
 ) -> RecoveryRuntime {
     let endpoint = TransportEndpoint("wss://eligibility-inbox.example".into());
+    let self_id = session.self_id();
     AccountDeviceRuntime::new(
         session,
         adapter,
         StaticTransportRouting::new(vec![endpoint.clone()])
             .key_package_endpoints(vec![endpoint.clone()])
-            .with_inbox_route(peer, vec![endpoint]),
+            .with_inbox_route(peer, vec![endpoint.clone()])
+            .with_inbox_route(self_id, vec![endpoint]),
         publisher,
     )
     .with_maintenance_sources(
@@ -199,6 +201,7 @@ async fn recovery_quarantine_isolated() {
                 candidate_set_hash: None,
                 native_epoch: None,
                 observed_epoch: None,
+                remote_rearmed: false,
                 commit_started_at: None,
                 message: cgka_traits::GroupRecoveryMessage {
                     group_id: orphan.clone(),

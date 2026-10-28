@@ -1956,6 +1956,7 @@ async fn run_recovery_child(database: &Path) {
                 candidate_set_hash: None,
                 native_epoch: None,
                 observed_epoch: None,
+                remote_rearmed: false,
                 commit_started_at: Some(0),
                 message: GroupRecoveryMessage {
                     group_id,
