@@ -723,3 +723,317 @@ fn take_u64(cursor: &mut &[u8], label: &str) -> Result<u64, String> {
     *cursor = rest;
     Ok(u64::from_be_bytes(*bytes))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot(n: u8) -> DeviceSlotId {
+        [n; 32]
+    }
+
+    fn device(label: &str) -> DeviceEntryV1 {
+        DeviceEntryV1 {
+            label: label.into(),
+            ..DeviceEntryV1::default()
+        }
+    }
+
+    /// One of everything: two devices, one with every optional field, a
+    /// rejected slot, a rejected KeyPackage and the reserved account fields.
+    fn full_roster() -> DeviceRosterV1 {
+        let phone = DeviceEntryV1 {
+            label: "Phone".into(),
+            client: "wn".into(),
+            platform: "ios".into(),
+            linked_at: 1_700_000_000,
+            linked_by: None,
+            settings: DeviceSettingsV1 {
+                add_to_all_chats: true,
+                bring_history: true,
+                keep_while_inactive: false,
+            },
+            status: DeviceStatusV1::Active,
+            announced_key_package: Some(vec![0xaa; 32]),
+            leaf_map: [(vec![0x01; 16], vec![0x02; 32])].into_iter().collect(),
+            history_key: None,
+        };
+        let laptop = DeviceEntryV1 {
+            label: "Laptop".into(),
+            linked_at: 1_700_000_600,
+            linked_by: Some(slot(1)),
+            status: DeviceStatusV1::Leaving,
+            history_key: Some(vec![0x03; 32]),
+            ..DeviceEntryV1::default()
+        };
+        DeviceRosterV1 {
+            devices: [(slot(1), phone), (slot(2), laptop)].into_iter().collect(),
+            rejected_slots: [(
+                slot(9),
+                RejectedSlotV1 {
+                    reason: RejectedSlotReasonV1::Removed,
+                    rejected_at: 1_700_001_000,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            rejected_key_packages: [(
+                vec![0xbb; 32],
+                RejectedKeyPackageV1 {
+                    slot: slot(2),
+                    rejected_at: 1_700_002_000,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            account: AccountEntryV1 {
+                backup_writer: Some(slot(1)),
+                recovery_public_key: Some(vec![0x04; 33]),
+            },
+        }
+    }
+
+    #[test]
+    fn empty_roster_is_three_empty_vectors_and_an_empty_account_entry() {
+        let bytes = encode_device_roster_v1(&DeviceRosterV1::default()).unwrap();
+        assert_eq!(bytes, [0, 0, 0, 0, 0]);
+        assert_eq!(
+            decode_device_roster_v1(&bytes).unwrap(),
+            DeviceRosterV1::default()
+        );
+    }
+
+    #[test]
+    fn roster_round_trips_canonically() {
+        let roster = full_roster();
+        let bytes = encode_device_roster_v1(&roster).unwrap();
+        assert_eq!(decode_device_roster_v1(&bytes).unwrap(), roster);
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode_device_roster_v1(&trailing).is_err());
+    }
+
+    /// Fixed bytes for one device, so independent implementations can check
+    /// their encoding.
+    #[test]
+    fn one_device_roster_vector() {
+        let roster = DeviceRosterV1 {
+            devices: [(
+                slot(0x11),
+                DeviceEntryV1 {
+                    label: "Phone".into(),
+                    client: "wn".into(),
+                    platform: String::new(),
+                    linked_at: 0x6553_f100,
+                    linked_by: None,
+                    settings: DeviceSettingsV1 {
+                        add_to_all_chats: true,
+                        bring_history: false,
+                        keep_while_inactive: true,
+                    },
+                    status: DeviceStatusV1::Active,
+                    announced_key_package: None,
+                    leaf_map: BTreeMap::new(),
+                    history_key: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..DeviceRosterV1::default()
+        };
+        let expected = concat!(
+            "38",                                                               // devices<V>: 56 bytes
+            "1111111111111111111111111111111111111111111111111111111111111111", // slot
+            "0550686f6e65",                                                     // label "Phone"
+            "02776e",                                                           // client "wn"
+            "00",                                                               // platform ""
+            "000000006553f100",                                                 // linked_at
+            "00",                                                               // linked_by absent
+            "05",                                                               // settings
+            "00",                                                               // status active
+            "00",                                                               // no KeyPackageRef
+            "00",                                                               // leaf_map<V>
+            "00",                                                               // no history key
+            "00",                                                               // rejected_slots<V>
+            "00",                                                               // rejected_key_packages<V>
+            "0000",                                                             // account entry
+        );
+        assert_eq!(hex::encode(encode_device_roster_v1(&roster).unwrap()), expected);
+        let update = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::RemoveDevice(
+            slot(0x11),
+        )])
+        .unwrap();
+        assert_eq!(
+            hex::encode(encode_device_roster_update_v1(&update).unwrap()),
+            concat!(
+                "21",                                                               // operations<V>: 33 bytes
+                "01",                                                               // remove_device
+                "1111111111111111111111111111111111111111111111111111111111111111", // slot
+            )
+        );
+    }
+
+    #[test]
+    fn decoding_rejects_non_canonical_rosters() {
+        let two = DeviceRosterV1 {
+            devices: [(slot(1), device("A")), (slot(2), device("B"))]
+                .into_iter()
+                .collect(),
+            ..DeviceRosterV1::default()
+        };
+        let bytes = encode_device_roster_v1(&two).unwrap();
+        // Swap the two device entries, which have the same length. Their
+        // 100-byte vector takes a two-byte length prefix; the two empty
+        // rejection vectors and the empty account entry, four bytes, follow.
+        let entry_len = (bytes.len() - 2 - 4) / 2;
+        let mut swapped = bytes[..2].to_vec();
+        swapped.extend_from_slice(&bytes[2 + entry_len..2 + 2 * entry_len]);
+        swapped.extend_from_slice(&bytes[2..2 + entry_len]);
+        swapped.extend_from_slice(&bytes[2 + 2 * entry_len..]);
+        assert!(
+            decode_device_roster_v1(&swapped)
+                .unwrap_err()
+                .contains("sorted and unique")
+        );
+
+        let one = encode_device_roster_v1(&DeviceRosterV1 {
+            devices: [(slot(1), device("A"))].into_iter().collect(),
+            ..DeviceRosterV1::default()
+        })
+        .unwrap();
+        // Layout: devices len, slot, label (2), client, platform, linked_at,
+        // linked_by, settings, status, ...
+        let settings_at = 1 + 32 + 2 + 1 + 1 + 8 + 1;
+        let mut reserved_bit = one.clone();
+        reserved_bit[settings_at] = 0b1000;
+        assert!(decode_device_roster_v1(&reserved_bit).is_err());
+        let mut unknown_status = one.clone();
+        unknown_status[settings_at + 1] = 3;
+        assert!(decode_device_roster_v1(&unknown_status).is_err());
+        let mut bad_presence = one.clone();
+        bad_presence[settings_at - 1] = 2;
+        assert!(decode_device_roster_v1(&bad_presence).is_err());
+        let mut bad_utf8 = one;
+        bad_utf8[1 + 32 + 1] = 0xff;
+        assert!(decode_device_roster_v1(&bad_utf8).is_err());
+    }
+
+    #[test]
+    fn the_roster_keeps_its_invariants() {
+        let too_many = DeviceRosterV1 {
+            devices: (0..=MAX_LEAVES_PER_ACCOUNT as u8)
+                .map(|n| (slot(n), device("Spare")))
+                .collect(),
+            ..DeviceRosterV1::default()
+        };
+        assert!(encode_device_roster_v1(&too_many).is_err());
+
+        let mut both = DeviceRosterV1 {
+            devices: [(slot(1), device("A"))].into_iter().collect(),
+            ..DeviceRosterV1::default()
+        };
+        both.rejected_slots.insert(
+            slot(1),
+            RejectedSlotV1 {
+                reason: RejectedSlotReasonV1::NotMe,
+                rejected_at: 0,
+            },
+        );
+        assert!(encode_device_roster_v1(&both).is_err());
+
+        let long_label = DeviceRosterV1 {
+            devices: [(slot(1), device(&"x".repeat(65)))].into_iter().collect(),
+            ..DeviceRosterV1::default()
+        };
+        assert!(encode_device_roster_v1(&long_label).is_err());
+    }
+
+    #[test]
+    fn an_update_is_sorted_with_one_operation_per_entry() {
+        assert!(DeviceRosterUpdateV1::new(vec![]).is_err());
+        assert!(
+            DeviceRosterUpdateV1::new(vec![
+                DeviceRosterOperationV1::SetDevice(slot(1), device("A")),
+                DeviceRosterOperationV1::RemoveDevice(slot(1)),
+            ])
+            .is_err()
+        );
+        // A device and a rejected slot with the same key are different
+        // entries.
+        let update = DeviceRosterUpdateV1::new(vec![
+            DeviceRosterOperationV1::SetAccount(AccountEntryV1::default()),
+            DeviceRosterOperationV1::RemoveRejectedSlot(slot(1)),
+            DeviceRosterOperationV1::RemoveDevice(slot(1)),
+        ])
+        .unwrap();
+        assert!(matches!(
+            update.operations(),
+            [
+                DeviceRosterOperationV1::RemoveDevice(_),
+                DeviceRosterOperationV1::RemoveRejectedSlot(_),
+                DeviceRosterOperationV1::SetAccount(_),
+            ]
+        ));
+        let bytes = encode_device_roster_update_v1(&update).unwrap();
+        assert_eq!(decode_device_roster_update_v1(&bytes).unwrap(), update);
+
+        // Out of order on the wire.
+        let in_order = encode_device_roster_update_v1(
+            &DeviceRosterUpdateV1::new(vec![
+                DeviceRosterOperationV1::RemoveDevice(slot(1)),
+                DeviceRosterOperationV1::RemoveDevice(slot(2)),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let mut reversed = vec![in_order[0]];
+        reversed.extend_from_slice(&in_order[34..]);
+        reversed.extend_from_slice(&in_order[1..34]);
+        assert!(decode_device_roster_update_v1(&reversed).is_err());
+        let mut unknown_op = in_order;
+        unknown_op[1] = 7;
+        assert!(decode_device_roster_update_v1(&unknown_op).is_err());
+        assert!(decode_device_roster_update_v1(&[0]).is_err());
+    }
+
+    #[test]
+    fn applying_an_update_sets_and_removes_entries() {
+        let prior = full_roster();
+        let update = DeviceRosterUpdateV1::new(vec![
+            DeviceRosterOperationV1::SetDevice(slot(2), device("Work laptop")),
+            DeviceRosterOperationV1::SetDevice(slot(3), device("Tablet")),
+            DeviceRosterOperationV1::RemoveRejectedKeyPackage(vec![0xbb; 32]),
+        ])
+        .unwrap();
+        let next = prior.apply(&update).unwrap();
+        assert_eq!(next.devices[&slot(2)], device("Work laptop"));
+        assert_eq!(next.devices[&slot(3)], device("Tablet"));
+        assert!(next.rejected_key_packages.is_empty());
+        assert_eq!(next.rejected_slots, prior.rejected_slots);
+        assert_eq!(next.account, prior.account);
+        assert_eq!(
+            apply_device_roster_update_v1(
+                &encode_device_roster_v1(&prior).unwrap(),
+                &encode_device_roster_update_v1(&update).unwrap(),
+            )
+            .unwrap(),
+            encode_device_roster_v1(&next).unwrap()
+        );
+
+        for invalid in [
+            DeviceRosterOperationV1::RemoveDevice(slot(7)),
+            DeviceRosterOperationV1::RemoveRejectedSlot(slot(7)),
+            DeviceRosterOperationV1::RemoveRejectedKeyPackage(vec![0xcc; 32]),
+            DeviceRosterOperationV1::SetRejectedSlot(
+                slot(1),
+                RejectedSlotV1 {
+                    reason: RejectedSlotReasonV1::NotMe,
+                    rejected_at: 0,
+                },
+            ),
+        ] {
+            let update = DeviceRosterUpdateV1::new(vec![invalid.clone()]).unwrap();
+            assert!(prior.apply(&update).is_err(), "{invalid:?}");
+        }
+    }
+}
