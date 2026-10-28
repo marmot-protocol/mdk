@@ -255,6 +255,10 @@ pub(crate) struct AttemptGrant {
     /// never replaces a certificate still valid for this goal.
     pub(super) certified_scopes: std::collections::HashSet<([u8; 16], u64)>,
     loss: Vec<GrantedLoss>,
+    /// The coverage ledger's un-cover generation before the pass fetched
+    /// anything: its certificates lose whatever is un-covered after it. `None`
+    /// when it could not be read, and the pass records no certificates.
+    pub(super) coverage_mark: Option<storage_sqlite::RecoveryCoverageMark>,
     _live: Arc<()>,
     admission: Option<Arc<RecoveryAdmissionSnapshot>>,
 }
@@ -541,6 +545,9 @@ impl AccountRecoveryOwner {
             .app_storage()
             .release_due_recovery_capacity_probes(now_ms, duration_ms(self.policy.base)?)?;
         let immediate = explicit.as_ref().is_some_and(|permit| !permit.spent);
+        // Read before anything is frozen or fetched. A ledger read failure
+        // costs only the pass's shadow certificates, never the grant.
+        let coverage_mark = storage.app_storage().recovery_coverage_mark().ok();
         let mut fence = storage
             .app_storage()
             .recovery_eligible_revision_fence(immediate)?;
@@ -629,6 +636,7 @@ impl AccountRecoveryOwner {
             replay_capture: Vec::new(),
             certified_scopes: Default::default(),
             loss: Vec::new(),
+            coverage_mark,
             _live: live,
             admission: None,
         }))

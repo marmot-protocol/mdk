@@ -11,7 +11,7 @@ the list only shrinks.
 | --- | --- | --- |
 | `routes.rs` | Deleting a route's recovery inventory and NIP-77 reconciliation state when the engine deletes the route or the group | `protocol/storage/transport_routes.rs`, `protocol/storage/groups.rs` |
 | `groups.rs` | Lifting the media-secret retirement barrier when a forgotten group rejoins | `protocol/storage/groups.rs` |
-| `release.rs` | Message release for replay: whether an app owns the messages, retiring seen-ring and inventory entries, arming or invalidating the recovery ledger | `protocol/storage/messages.rs` |
+| `release.rs` | Message release for replay: whether an app owns the messages, retiring seen-ring and inventory entries, un-covering their seconds in the coverage ledger, arming or invalidating the recovery ledger | `protocol/storage/messages.rs` |
 | `outbound.rs` | The confirm path consuming the local submission and the draft a message came from, and waking the app's draft observer; the observer's type, its slot on the account handle and its setter, which `marmot-session` calls on the engine's storage | `protocol/storage/outbound.rs` |
 | `projection.rs` | The projection checkpoint acknowledging the engine outbox and probing forgotten groups, in its own transaction | `app/account_projection.rs` |
 | `authority.rs` | The app queueing backfilled authority requests in the engine's outbox | `app/timeline/reports.rs` |
