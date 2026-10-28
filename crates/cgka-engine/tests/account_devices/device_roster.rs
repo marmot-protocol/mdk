@@ -472,9 +472,30 @@ async fn a_group_requires_the_roster_from_creation_or_never() {
             AppDataUpdateOperation::Update(encode_components_list(&ids.ids).into()),
         ),
         standalone_required_list_extensions(&phone, &gid, &ids),
+        // Nor drops its roster, or keeps requiring it with bytes that aren't
+        // a roster. No Commit could carry either, so neither is admitted.
+        standalone_app_data_update(
+            &phone,
+            &gid,
+            DEVICE_ROSTER_COMPONENT_ID,
+            AppDataUpdateOperation::Remove,
+        ),
+        standalone_dictionary_extensions(&phone, &gid, DEVICE_ROSTER_COMPONENT_ID, vec![0xff]),
     ] {
         assert_rejected_at_ingest(&mut laptop, &proposal).await;
     }
+    // A whole valid roster in a GroupContextExtensions proposal is admitted.
+    let replacement = standalone_dictionary_extensions(
+        &phone,
+        &gid,
+        DEVICE_ROSTER_COMPONENT_ID,
+        encode_device_roster_v1(&roster(&[(1, "Phone"), (2, "Laptop"), (3, "Tablet")])).unwrap(),
+    );
+    let outcome = laptop.engine.ingest(replacement).await.unwrap();
+    assert!(
+        !matches!(outcome, IngestOutcome::Rejected { .. }),
+        "unexpected rejection: {outcome:?}"
+    );
 }
 
 /// Before a group requires the roster, bytes under its id are unknown data:

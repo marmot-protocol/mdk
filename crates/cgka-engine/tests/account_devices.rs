@@ -857,6 +857,22 @@ fn standalone_required_list_extensions(
     gid: &GroupId,
     ids: &AppComponentSet,
 ) -> TransportMessage {
+    standalone_dictionary_extensions(
+        sender,
+        gid,
+        APP_COMPONENTS_COMPONENT_ID,
+        encode_components_list(&ids.ids),
+    )
+}
+
+/// A standalone GroupContextExtensions proposal that keeps the current
+/// GroupContext except for `bytes` under `component_id`.
+fn standalone_dictionary_extensions(
+    sender: &Device,
+    gid: &GroupId,
+    component_id: u16,
+    bytes: Vec<u8>,
+) -> TransportMessage {
     let crypto = RustCrypto::default();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, sender.storage.mls_storage());
@@ -867,10 +883,7 @@ fn standalone_required_list_extensions(
         .unwrap()
         .dictionary()
         .clone();
-    dictionary.insert(
-        APP_COMPONENTS_COMPONENT_ID,
-        encode_components_list(&ids.ids),
-    );
+    dictionary.insert(component_id, bytes);
     extensions
         .add_or_replace(Extension::AppDataDictionary(
             AppDataDictionaryExtension::new(dictionary),

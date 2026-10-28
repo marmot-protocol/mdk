@@ -607,6 +607,13 @@ fn authorize_proposal(
                     ));
                 }
                 if update.component_id() == DEVICE_ROSTER_COMPONENT_ID {
+                    // device-roster-v1.md, "Removal": a device group keeps
+                    // its roster, so no Commit can carry this removal.
+                    if roster_required
+                        && matches!(update.operation(), AppDataUpdateOperation::Remove)
+                    {
+                        return Err(StandaloneProposalRejection::invalid("device_roster_remove"));
+                    }
                     resolved_app_data_update(
                         roster_required,
                         app_component_bytes(mls_group, DEVICE_ROSTER_COMPONENT_ID),
@@ -760,6 +767,11 @@ fn validate_group_context_extension_proposal(
                 "group_context_extensions_not_supported_by_all_members",
             )
         },
+    )?;
+    // A roster the proposed state requires must be valid now, as every other
+    // known component's bytes must; unknown data elsewhere stays opaque.
+    validate_device_roster_state(extensions, &required_components, leaves.iter()).map_err(
+        |_| StandaloneProposalRejection::invalid("group_context_extensions_device_roster_invalid"),
     )?;
     Ok(required_components)
 }
