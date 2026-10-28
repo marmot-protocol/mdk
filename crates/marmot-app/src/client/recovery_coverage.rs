@@ -131,13 +131,12 @@ impl AppClient {
     /// A loss import un-covers every current route from the loss's floor
     /// upward; a loss with no known time un-covers them entirely. Any route
     /// could have carried a lost delivery or notification, but coverage below
-    /// the floor stays.
+    /// the floor stays. Every import that changed demand is new evidence, even
+    /// with nothing counted: a notification lag charges no delivery count.
     pub(crate) fn record_coverage_loss(&self, imports: &[RecoveryLossImport]) {
         let floors = imports
             .iter()
-            .filter(|import| {
-                import.charged > 0 && import.transition != RecoveryDemandTransition::Unchanged
-            })
+            .filter(|import| import.transition != RecoveryDemandTransition::Unchanged)
             .map(|import| import.goal_floor.unwrap_or(0))
             .collect::<Vec<_>>();
         let Some(floor) = floors.into_iter().min() else {

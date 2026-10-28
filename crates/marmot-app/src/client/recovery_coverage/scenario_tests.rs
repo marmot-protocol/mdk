@@ -284,3 +284,40 @@ async fn loss_imported_after_the_grant_froze_keeps_its_debt() {
         "a current pass records its certificates"
     );
 }
+
+/// A notification lag charges no delivery count, but it is loss: every
+/// current route is un-covered from the lag's REQ floor and owes from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notification_lag_uncovers_every_route_from_its_floor() {
+    let fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let routes = routes(&fixture.client);
+    // Caught up: every route holds a live boundary.
+    assert_eq!(report(&fixture).await.disagreements(), 0);
+    let floor = unix_now_seconds().saturating_sub(30);
+    app.record_account_recovery_loss_bounded(
+        "alice",
+        storage_sqlite::RecoveryLossCause::NotificationConsumer,
+        7,
+        0,
+        unix_now_seconds(),
+        Some(floor),
+    )
+    .unwrap();
+    fixture.client.synchronize_recovery_loss(&app).unwrap();
+    for route in &routes {
+        assert!(
+            app.recovery_coverage_ranges(route, &relay())
+                .unwrap()
+                .iter()
+                .all(|proved| proved.range.until_seconds < floor),
+            "the lag un-covers its routes from the floor"
+        );
+        assert!(app.recovery_coverage_goal(route).unwrap() <= Some(floor));
+        assert!(
+            !app.recovery_coverage_debt(route, &[relay()], unix_now_seconds())
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
