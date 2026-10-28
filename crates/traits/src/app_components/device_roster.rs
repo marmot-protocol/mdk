@@ -251,11 +251,9 @@ impl DeviceRosterV1 {
                         .insert(key_package_ref.clone(), *rejected);
                 }
                 DeviceRosterOperationV1::RemoveRejectedKeyPackage(key_package_ref) => {
-                    next.rejected_key_packages
-                        .remove(key_package_ref)
-                        .ok_or(
-                            "device roster update removes a rejected KeyPackage it does not hold",
-                        )?;
+                    next.rejected_key_packages.remove(key_package_ref).ok_or(
+                        "device roster update removes a rejected KeyPackage it does not hold",
+                    )?;
                 }
                 DeviceRosterOperationV1::SetAccount(account) => {
                     next.account = account.clone();
@@ -286,7 +284,9 @@ fn validate_text(value: &str, label: &str) -> Result<(), String> {
 
 fn validate_bounded(value: &[u8], max_len: usize, label: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > max_len {
-        return Err(format!("device roster {label} must be 1 to {max_len} bytes"));
+        return Err(format!(
+            "device roster {label} must be 1 to {max_len} bytes"
+        ));
     }
     Ok(())
 }
@@ -560,9 +560,7 @@ fn insert_sorted<K: Ord, V>(
     label: &str,
 ) -> Result<(), String> {
     if map.last_key_value().is_some_and(|(last, _)| *last >= key) {
-        return Err(format!(
-            "device roster {label} must be sorted and unique"
-        ));
+        return Err(format!("device roster {label} must be sorted and unique"));
     }
     map.insert(key, value);
     Ok(())
@@ -692,7 +690,9 @@ fn decode_optional<T>(
     match take_u8(cursor, label)? {
         0 => Ok(None),
         1 => decode(cursor).map(Some),
-        _ => Err(format!("device roster {label} has an invalid presence byte")),
+        _ => Err(format!(
+            "device roster {label} has an invalid presence byte"
+        )),
     }
 }
 
@@ -855,14 +855,16 @@ mod tests {
             "00",                                                               // leaf_map<V>
             "00",                                                               // no history key
             "00",                                                               // rejected_slots<V>
-            "00",                                                               // rejected_key_packages<V>
-            "0000",                                                             // account entry
+            "00",   // rejected_key_packages<V>
+            "0000", // account entry
         );
-        assert_eq!(hex::encode(encode_device_roster_v1(&roster).unwrap()), expected);
-        let update = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::RemoveDevice(
-            slot(0x11),
-        )])
-        .unwrap();
+        assert_eq!(
+            hex::encode(encode_device_roster_v1(&roster).unwrap()),
+            expected
+        );
+        let update =
+            DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::RemoveDevice(slot(0x11))])
+                .unwrap();
         assert_eq!(
             hex::encode(encode_device_roster_update_v1(&update).unwrap()),
             concat!(

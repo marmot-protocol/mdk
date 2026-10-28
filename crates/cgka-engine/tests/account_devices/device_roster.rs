@@ -250,7 +250,10 @@ async fn the_committer_refuses_a_roster_update_that_breaks_the_roster() {
             .await,
     );
     assert!(error.contains("device roster update"), "{error}");
-    assert_eq!(roster_of(&phone, &gid), roster(&[(1, "Phone"), (2, "Laptop")]));
+    assert_eq!(
+        roster_of(&phone, &gid),
+        roster(&[(1, "Phone"), (2, "Laptop")])
+    );
 }
 
 /// A member that resolves a roster update its own way, for example by taking
@@ -399,7 +402,10 @@ async fn a_group_requires_the_roster_from_creation_or_never() {
         })
         .await
         .expect_err("activating the roster is refused");
-    assert!(error.to_string().contains("from creation or never"), "{error}");
+    assert!(
+        error.to_string().contains("from creation or never"),
+        "{error}"
+    );
     let crafted = crafted_commit(&alice, &gid, vec![], activation, None);
     assert_rejected_on_replay(&mut bob, &crafted, &gid).await;
     for proposal in [
@@ -423,7 +429,10 @@ async fn a_group_requires_the_roster_from_creation_or_never() {
         .send(update_required(&gid, &ids))
         .await
         .expect_err("un-requiring the roster is refused");
-    assert!(error.to_string().contains("from creation or never"), "{error}");
+    assert!(
+        error.to_string().contains("from creation or never"),
+        "{error}"
+    );
     let crafted = crafted_commit(
         &phone,
         &gid,
@@ -489,5 +498,8 @@ async fn roster_bytes_are_unknown_data_in_other_groups() {
         )
         .await
         .expect_err("an optional roster is refused");
-    assert!(error.to_string().contains("optional device roster"), "{error}");
+    assert!(
+        error.to_string().contains("optional device roster"),
+        "{error}"
+    );
 }

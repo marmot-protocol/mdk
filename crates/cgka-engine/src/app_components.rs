@@ -5,16 +5,17 @@ use cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID,
     AppComponentData, AppComponentId, AppComponentSet, DEVICE_ROSTER_COMPONENT_ID,
-    GROUP_ADMIN_POLICY_COMPONENT_ID,
-    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-    GROUP_LIFECYCLE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
-    GroupLifecycleV1, GroupProfileV1, MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID,
-    NostrRoutingV1, PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID,
-    apply_device_roster_update_v1, decode_components_list, decode_device_roster_v1, decode_encrypted_media_policy_v1, decode_encrypted_media_policy_v2,
-    decode_group_avatar_url_v1, decode_group_blossom_image_v1, decode_group_lifecycle_v1,
-    decode_group_profile_v1, decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors,
-    encode_components_list, encode_group_lifecycle_v1, encode_group_profile_v1,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, GROUP_LIFECYCLE_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupLifecycleV1,
+    GroupProfileV1, MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID, apply_device_roster_update_v1,
+    decode_components_list, decode_device_roster_v1, decode_encrypted_media_policy_v1,
+    decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
+    decode_group_lifecycle_v1, decode_group_profile_v1, decode_nostr_routing_v1,
+    decode_quic_varint, encode_component_vectors, encode_components_list,
+    encode_group_lifecycle_v1, encode_group_profile_v1,
 };
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
@@ -23,7 +24,8 @@ use cgka_traits::types::{GroupId, MemberId};
 use openmls::component::ComponentData;
 use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension, Extensions};
 use openmls::group::{
-    AppDataDictionaryUpdater, GroupContext, MlsGroup, ProcessMessageError, StageCommitError, StagedCommit, ValidationError,
+    AppDataDictionaryUpdater, GroupContext, MlsGroup, ProcessMessageError, StageCommitError,
+    StagedCommit, ValidationError,
 };
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{
@@ -1090,13 +1092,14 @@ pub(crate) fn resolved_app_data_update(
     if roster_required && update.component_id() == DEVICE_ROSTER_COMPONENT_ID {
         let prior = parent_bytes.ok_or_else(|| {
             EngineError::Other(
-                "invalid device roster state: the required roster has no GroupContext state"
-                    .into(),
+                "invalid device roster state: the required roster has no GroupContext state".into(),
             )
         })?;
         return apply_device_roster_update_v1(prior, data.as_slice())
             .map(Some)
-            .map_err(|error| EngineError::Serialize(format!("invalid device roster update: {error}")));
+            .map_err(|error| {
+                EngineError::Serialize(format!("invalid device roster update: {error}"))
+            });
     }
     Ok(Some(data.as_slice().to_vec()))
 }
@@ -1142,8 +1145,7 @@ fn validate_device_roster_state<'a>(
         .and_then(|dictionary| dictionary.dictionary().get(&DEVICE_ROSTER_COMPONENT_ID))
         .ok_or_else(|| {
             EngineError::Other(
-                "invalid device roster state: the required roster has no GroupContext state"
-                    .into(),
+                "invalid device roster state: the required roster has no GroupContext state".into(),
             )
         })?;
     decode_device_roster_v1(bytes)
@@ -2337,6 +2339,16 @@ mod tests {
                 )
             });
         }
+    }
+
+    #[test]
+    fn the_device_roster_is_advertisable_only_in_test_policy_builds() {
+        // Its wire format is unreleased until its spec lands (mdk#2628 3.1).
+        let supported = AppComponentSet::new([DEVICE_ROSTER_COMPONENT_ID]);
+        assert_eq!(
+            validate_supported_app_components(&supported).is_ok(),
+            cfg!(feature = "test-policy-overrides")
+        );
     }
 
     #[test]
