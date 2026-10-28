@@ -376,6 +376,20 @@ Epoch-gap paging uses the raw evidence to descend, and a completed oldest page f
 neither the evidence nor end of stored events certifies durable history coverage.
 The byte allowance counts validated serialized event JSON, not rejected wire bytes or process memory.
 
+## Time-sliced sweep
+
+`sweep::run_sweep` walks one group route on one relay forward through a `created_at` range, one slice REQ at a time
+(`since = cursor`, `until = cursor + Δ`, one filter, closed at EOSE). A reply proven complete is handed to the
+caller's sink oldest first and the cursor advances through the caller's store, so a cancelled or cut call resumes
+where it stopped and never fetches a covered slice again. A full reply halves Δ, a nearly empty one doubles it, and
+a full one-second slice is fetched through NIP-77. Completeness comes from a NIP-67 `finish` hint, a reply below the
+relay's NIP-11 `max_limit` (strfry 500, wok's marmot preset 5,000), or, with no published cap, a reply below the
+largest full reply the relay sent. `rate-limited:` refusals are waited out; unreachable relays and refusals are
+reported apart from "answered, nothing new". Each call reports its covered slices (with their proof) and one
+outcome for the caller's backoff. `SdkSweepRelay` (`sdk` feature) runs it over a relay already in a
+`NostrSdkRelayClient`'s pool; nostr-sdk drops NIP-67 hints, so it proves slices by counting. Nothing schedules the
+sweep yet; the recovery runner will (#2660).
+
 ## Run tests
 
 ```sh

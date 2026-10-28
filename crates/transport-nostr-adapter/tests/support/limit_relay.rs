@@ -39,6 +39,9 @@ pub mod reason {
     pub const KIND_NOT_ALLOWED: &str = "invalid: kind not allowed";
     pub const MALFORMED: &str = "invalid: malformed REQ";
     pub const TOO_MANY_TAGS: &str = "invalid: too many tags in filter";
+    /// wok's refusal when a connection's queued scans are full.
+    pub const RATE_LIMITED: &str =
+        "rate-limited: too many historical queries waiting on this connection";
     /// strfry sends this as a NOTICE with no session id.
     pub const TOO_MANY_NEG: &str = "ERROR: too many concurrent NEG requests";
 }
@@ -312,6 +315,8 @@ struct Shared {
     stats: LimitStats,
     states: Vec<ConnectionState>,
     neg_fault: Option<NegFault>,
+    /// REQs still to refuse with `reason::RATE_LIMITED`.
+    rate_limit_next_reqs: usize,
     /// Delay before each client frame is handled, so a refusal or an upstream
     /// answer costs about one simulated round trip.
     client_delay: Duration,
@@ -509,6 +514,11 @@ impl LimitRelay {
         self.shared.lock().unwrap().client_delay = delay;
     }
 
+    /// Refuse the next `count` otherwise-valid REQs with `reason::RATE_LIMITED`.
+    pub fn rate_limit_next_reqs(&self, count: usize) {
+        self.shared.lock().unwrap().rate_limit_next_reqs = count;
+    }
+
     /// Switch the injected NEG behaviour for every connection.
     pub fn set_neg_fault(&self, fault: NegFault) {
         self.shared.lock().unwrap().neg_fault = Some(fault);
@@ -671,6 +681,10 @@ fn inspect_client_frame(
                 && shared.counted(connection, config) >= config.max_subscriptions
             {
                 violation = Some(reason::TOO_MANY_SUBSCRIPTIONS);
+            }
+            if violation.is_none() && shared.rate_limit_next_reqs > 0 {
+                shared.rate_limit_next_reqs -= 1;
+                violation = Some(reason::RATE_LIMITED);
             }
             let outcome = match violation {
                 None if already_active => ReqOutcome::Replaced,
