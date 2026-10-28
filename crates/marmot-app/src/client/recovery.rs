@@ -670,6 +670,7 @@ impl AccountRecoveryOwner {
                     else {
                         return Err(FreezeError::Stale);
                     };
+                    storage.app_storage().count_recovery_attempt(id)?;
                     let demand = demands
                         .iter()
                         .find(|demand| demand.ticket.id == id)
@@ -718,6 +719,11 @@ impl AccountRecoveryOwner {
             Err(FreezeError::Stale) => return Ok(None),
             Err(FreezeError::Storage(error)) => return Err(error),
         };
+        // Native goals have no upper bound: live traffic is their input too.
+        // Only input created before this attempt started can be what the
+        // attempt acquired, so later live messages cannot reset pacing.
+        // Event times are whole seconds, so the starting second is excluded.
+        let started = (grant.reservation.recorded_at_ms / 1000).saturating_sub(1);
         let admission = Arc::new(RecoveryAdmissionSnapshot {
             scopes: grant
                 .plan
@@ -730,6 +736,10 @@ impl AccountRecoveryOwner {
                         .iter()
                         .flat_map(|plan| plan.routes.iter().cloned()),
                 )
+                .map(|mut scope| {
+                    scope.until_seconds = scope.until_seconds.min(started);
+                    scope
+                })
                 .collect(),
             attempt: grant.reservation.attempt_serial,
             fence: grant.fence.clone(),
@@ -2542,6 +2552,113 @@ mod tests {
         );
     }
 
+    /// An owner capture the pass cutoff always cuts (mdk#2660): each attempt
+    /// discards its pages without charging loss or a park streak, pacing
+    /// still backs off, and the attempt cap parks the goal, which a new wire
+    /// generation does not reopen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_capture_cut_every_attempt_parks_at_the_cap() {
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        client.prepare_transport().await.unwrap();
+        relay
+            .acquisition_block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let storage = app.account_storage("alice").unwrap();
+        let mut native = None;
+        let mut ordinal = 0;
+        for attempt in 1..=storage_sqlite::RECOVERY_PARK_AFTER_ATTEMPTS {
+            if let Some(id) = native {
+                assert_ne!(
+                    storage
+                        .app_storage()
+                        .recovery_obligation_status(id)
+                        .unwrap()
+                        .unwrap()
+                        .eligibility,
+                    storage_sqlite::RecoveryEligibility::NeedsDeepRepair,
+                    "a cut capture spends no park streak (attempt {attempt})"
+                );
+            }
+            client.recovery_owner.test_advance_to_retry(&storage);
+            let mut permit = ExplicitRecoveryPermit::default();
+            let grant = client
+                .authorize_account_recovery(
+                    Some(&mut permit),
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .await
+                .unwrap()
+                .expect("the native goal is still owed");
+            assert!(!grant.replay_capture.is_empty());
+            native = grant
+                .plan()
+                .unwrap()
+                .iter()
+                .find(|obligation| {
+                    obligation.cause == storage_sqlite::RecoveryCause::SubscriptionReplay
+                })
+                .map(|obligation| obligation.id);
+            assert!(native.is_some());
+            let execution = client.begin_comparison_grant(&grant).await.unwrap();
+            let credit = Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap();
+            let mut job = crate::client::sync::ComparisonNetworkJob::start(
+                &client,
+                &grant,
+                credit,
+                tokio::time::Instant::now() + Duration::from_millis(200),
+                None,
+            )
+            .unwrap();
+            let (_credit, network) = job.wait().await.unwrap();
+            client
+                .admit_comparison_inline(None, grant, execution, network)
+                .await
+                .unwrap();
+            let retry = storage.app_storage().recovery_retry_state().unwrap();
+            assert!(retry.ordinal >= ordinal, "nothing resets pacing");
+            ordinal = retry.ordinal;
+        }
+        assert!(ordinal > 1);
+        let native = native.unwrap();
+        let parked = |storage: &SqliteAccountStorage| {
+            storage
+                .app_storage()
+                .recovery_obligation_status(native)
+                .unwrap()
+                .unwrap()
+                .eligibility
+                == storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+        };
+        assert!(parked(&storage), "the attempt cap parks the goal");
+        assert!(
+            storage
+                .app_storage()
+                .recovery_loss_watermarks(
+                    "alice",
+                    storage_sqlite::RecoveryLossCause::NotificationConsumer
+                )
+                .unwrap()
+                .is_empty(),
+            "a cut capture charges no notification loss"
+        );
+        client.create_group("new native source", &[]).await.unwrap();
+        client.sync_runtime_groups().await.unwrap();
+        client.synchronize_native_replay().await.unwrap();
+        assert!(
+            parked(&storage),
+            "a new wire generation is not new evidence"
+        );
+        assert!(
+            client
+                .history_notices()
+                .unwrap()
+                .iter()
+                .any(|notice| { notice.cause == crate::HistoryNoticeCause::IncrementalHistory })
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_absence_keeps_floor() {
         let (_dir, app, relay, mut client) = native_fixture().await;
@@ -4081,6 +4198,69 @@ mod tests {
                 .unwrap()
                 .ordinal,
             2
+        );
+    }
+
+    /// A native goal's window is open-ended, but only input created before
+    /// the attempt started resets pacing: live traffic during the attempt
+    /// is not what the attempt acquired.
+    #[test]
+    fn live_input_after_the_attempt_started_keeps_pacing() {
+        let (storage, mut owner, now) = fixture();
+        drop(
+            owner
+                .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+                .unwrap()
+                .unwrap(),
+        );
+        let later = now + Duration::from_secs(15);
+        let grant = owner
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, later, None)
+            .unwrap()
+            .unwrap();
+        let started = grant.reservation.recorded_at_ms / 1000;
+        let id = grant.fence.obligations[0].0;
+        let scope = RecoveryScopePlan {
+            scope_id: 0,
+            route_kind: 0,
+            route_role: 0,
+            group_id: None,
+            transport_group_id: None,
+            since_seconds: Some(5),
+            until_seconds: i64::MAX as u64,
+            known_event_id: None,
+            inventory_floor: None,
+            required_endpoints: vec!["relay".into()],
+            admitted_endpoints: vec!["relay".into()],
+        };
+        let _grant = owner
+            .freeze_plan(&storage, grant, vec![(id, vec![scope])], None)
+            .unwrap()
+            .unwrap();
+        let inbox = storage_sqlite::TransportReconciliationRoute::Inbox;
+        let observe = |created_at| {
+            owner
+                .observe_scoped_admission(&storage.app_storage(), &inbox, created_at, later)
+                .unwrap()
+        };
+        assert!(!observe(started + 1), "live input during the attempt");
+        assert!(
+            !observe(started),
+            "live input later in the attempt's starting second"
+        );
+        assert_eq!(
+            storage
+                .app_storage()
+                .recovery_retry_state()
+                .unwrap()
+                .ordinal,
+            2
+        );
+        assert!(observe(started - 1), "history the attempt acquired");
+        assert_eq!(
+            storage.app_storage().count_recovery_attempt(id).unwrap(),
+            2,
+            "account-wide pacing progress does not restart an obligation's attempt count"
         );
     }
 

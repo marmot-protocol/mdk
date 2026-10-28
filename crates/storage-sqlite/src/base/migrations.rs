@@ -260,6 +260,8 @@ mod migration_0121_drop_member_capabilities;
 mod migration_0122_push_join_window;
 #[path = "migrations/0123_recovery_coverage_ledger.rs"]
 mod migration_0123_recovery_coverage_ledger;
+#[path = "migrations/0124_recovery_attempt_cap.rs"]
+mod migration_0124_recovery_attempt_cap;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1019,6 +1021,12 @@ const MIGRATIONS: &[Migration] = &[
         suspend_foreign_keys: &[],
         apply: migration_0123_recovery_coverage_ledger::apply,
     },
+    Migration {
+        version: 124,
+        name: "0124_recovery_attempt_cap",
+        suspend_foreign_keys: &[],
+        apply: migration_0124_recovery_attempt_cap::apply,
+    },
 ];
 
 /// Run migration 0117's push-token share repair on an open database. Test
@@ -1690,9 +1698,15 @@ mod tests {
                 }
             }
             if *table == "account_recovery_obligations" {
-                // No existing row has a known parking time or a dismissal.
+                // No existing row has a known parking time or a dismissal,
+                // and none has counted an attempt.
                 for row in &mut upgraded {
-                    row.extend([rusqlite::types::Value::Null, rusqlite::types::Value::Null]);
+                    row.extend([
+                        rusqlite::types::Value::Null,
+                        rusqlite::types::Value::Null,
+                        rusqlite::types::Value::Integer(0),
+                        rusqlite::types::Value::Integer(0),
+                    ]);
                 }
             }
             assert_eq!(
@@ -1719,7 +1733,7 @@ mod tests {
                 .iter()
                 .cloned()
                 .map(|mut row| {
-                    row.extend([Null, Null]);
+                    row.extend([Null, Null, Integer(0), Integer(0)]);
                     row
                 })
                 .collect::<Vec<_>>()
@@ -1971,6 +1985,13 @@ mod tests {
                 .into_iter()
                 .map(|mut row| {
                     row.extend(std::iter::repeat_n(rusqlite::types::Value::Null, added));
+                    if *table == "account_recovery_obligations" {
+                        // No existing row has counted an attempt or an admission.
+                        row.extend([
+                            rusqlite::types::Value::Integer(0),
+                            rusqlite::types::Value::Integer(0),
+                        ]);
+                    }
                     row
                 })
                 .collect();

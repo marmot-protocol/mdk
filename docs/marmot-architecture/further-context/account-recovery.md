@@ -91,7 +91,18 @@ The simulator comes first; Jeff validates on a phone.
      retry pacing reaches its cap. A quiet comparison starts this count over. Offline
      passes, local deadline cuts, unsupported backends and refused admission count nothing.
      A relay that answered but could not hand over a claimed event, or whose events were
-     not durably admitted, still answered and can spend the quiet budget.
+     not durably admitted, still answered and can spend the quiet budget. An owner capture
+     the cutoff cancelled, or one gone stale, is a local deadline cut too: it counts
+     nothing toward a native goal's budget, though pacing still backs off.
+   - As a safety net, an obligation also parks after 24 reserved attempts in a row without
+     progress (mdk#2660), whatever its streaks say. Progress on any of its own scopes, or
+     the obligation completing or being retired, starts the count over. A re-arm makes a
+     native goal prove its sources' admission again, so only having more of its sources
+     admitted at once than it ever has counts as its progress; that bounds the restarts by
+     its number of sources. A native goal's re-arm for a new wire generation, a process
+     open and a route-policy change keep both the count and a goal this cap parked; new
+     loss or epoch evidence gets it one more attempt. Hitting the cap is logged as its own
+     `park_capped_recovery` warning.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
    a cap.
 3. **Required relays are the relays we operate.** `MarmotDeployment::recovery_operated_relays`
@@ -130,6 +141,8 @@ process-monotonic wire generation to identify the current goal. It freezes sourc
 comparison job and uses that job's recovery credit and cancellation.
 Native capture and comparison run concurrently under that grant's cutoff. A quiet native REQ cannot consume
 the whole pass before comparison starts; both remain owned until cancellation and IO cleanup finish.
+A native goal's window has no upper bound, but only input created before the attempt started can reset retry
+pacing, so live traffic during an attempt cannot hold the backoff at its floor.
 Neither the adapter nor the relay plane selects retries or runs a quiet-period repair timer.
 
 All native group input, including local publication fanout and post-EOSE live tails, uses the owner's ordered admission path rather than
@@ -692,7 +705,17 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   under its existing retry policy and process credit. Captures and delivery draining
   survive notification-worker cancellation; owner cancellation retains credit through IO
   cleanup. Empty expiry creates no loss. Actual discarded ciphertext and real notification
-  gaps retain separate loss evidence. See design section 0 for the limited native predicate.
+  gaps retain separate loss evidence. A capture cut by its comparison deadline, or failed,
+  discards what its source held without new loss, including copies the live REQ delivered
+  before the capture: the source stays unadmitted, the pending obligation still owes that
+  window, and a new loss would wipe that obligation's scope certificates so it could never
+  finish. That loss is deferred on the source, not dropped: a finished capture clears it,
+  and a reconnect, refusal, removal or execution failure records it, since the source can
+  then be admitted or retired without the capture. A parked obligation, or one whose notice
+  the user dismissed, schedules no capture, so the debt stays deferred until one of those
+  happens: until then the history the cut discarded is reported only by that notice, as
+  possibly incomplete, not as new loss. Native clamp paging is not an owner capture; its
+  cut records loss at once. See design section 0 for the limited native predicate.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
   startup comparison. Routing is by content, so the router cannot tell an unfloored

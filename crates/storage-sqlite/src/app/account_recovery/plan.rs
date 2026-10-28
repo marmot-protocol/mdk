@@ -117,6 +117,13 @@ pub enum RecoveryReplayPlacement {
 /// forever (mdk#2110). Six passes is where retry pacing reaches its cap.
 const RECOVERY_PARK_AFTER_UNSERVED_PASSES: u64 = 6;
 
+/// Reserved attempts in a row that may select one pending obligation without
+/// progress before it parks, whatever its scopes' streaks say. A safety net
+/// for retry loops that never charge a streak, such as an owner capture the
+/// cutoff always cuts, or goals re-armed with fresh streaks (mdk#2660). At
+/// the retry pacing cap this is about an hour and a half of retrying.
+pub const RECOVERY_PARK_AFTER_ATTEMPTS: u64 = 24;
+
 /// What one comparison pass did for one compared scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryPassProgress {
@@ -322,6 +329,27 @@ pub(super) fn retained_predicate_qualifies(
     predicate: i64,
 ) -> StorageResult<bool> {
     scopes_qualify_where(conn, id, predicate, |_| true)
+}
+
+/// How many of an obligation's current scopes hold a replay admission.
+fn admitted_scopes(conn: &Connection, obligation_id: &[u8]) -> StorageResult<u64> {
+    let rows = conn
+        .prepare_cached(
+            "SELECT scope_format, scope_payload FROM account_recovery_scopes
+                 WHERE obligation_id = ?1 AND snapshot_state = 1",
+        )
+        .storage()?
+        .query_map([obligation_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    let mut admitted = 0;
+    for (format, bytes) in rows {
+        admitted += u64::from(decode_scope(format, &bytes)?.replay_admitted);
+    }
+    Ok(admitted)
 }
 
 fn scopes_qualify_where(
@@ -878,15 +906,62 @@ impl SqliteAppStorage {
                     params![ticket.id.as_slice(), sqlite_integer(token.scope_id)?],
                 ).storage()?;
             }
+            // Retiring some windows is not new evidence for the rest: a goal
+            // parked by its attempt cap stays parked.
             conn.execute_cached(
                 "UPDATE account_recovery_obligations SET revision=MAX(revision,?2)+1,
                  state=CASE WHEN EXISTS(SELECT 1 FROM account_recovery_scopes WHERE obligation_id=?1)
-                     THEN 0 ELSE 2 END,eligibility=0,parked_at_ms=NULL
+                     THEN 0 ELSE 2 END,
+                 eligibility=CASE WHEN eligibility=4 AND recovery_attempts>=?3 THEN 4 ELSE 0 END,
+                 parked_at_ms=CASE WHEN eligibility=4 AND recovery_attempts>=?3
+                     THEN parked_at_ms ELSE NULL END
                  WHERE id=?1 AND cause=7 AND predicate=3",
-                params![ticket.id.as_slice(), high_water],
+                params![ticket.id.as_slice(), high_water, sqlite_integer(RECOVERY_PARK_AFTER_ATTEMPTS)?],
             ).storage()?;
             Ok(true)
         })
+    }
+
+    /// Count one reserved attempt that selected this pending obligation, and
+    /// return how many it has had since it last made progress.
+    pub fn count_recovery_attempt(&self, obligation_id: [u8; 16]) -> StorageResult<u64> {
+        let attempts: Option<i64> = self
+            .lock()?
+            .query_row_cached(
+                "UPDATE account_recovery_obligations SET recovery_attempts=recovery_attempts+1
+                 WHERE id=?1 AND state=0 RETURNING recovery_attempts",
+                [obligation_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()?;
+        attempts.map_or(Ok(0), i64_to_u64)
+    }
+
+    /// Park an obligation that has used [`RECOVERY_PARK_AFTER_ATTEMPTS`]
+    /// without progress, through the same deep-repair notice as an exhausted
+    /// streak. Returns whether this call parked it.
+    pub fn park_capped_recovery_obligation(
+        &self,
+        obligation_id: [u8; 16],
+        revision: u64,
+    ) -> StorageResult<bool> {
+        let parked = self
+            .lock()?
+            .execute_cached(
+                "UPDATE account_recovery_obligations SET eligibility=4,
+                 parked_at_ms=COALESCE(parked_at_ms,?3)
+                 WHERE id=?1 AND revision=?2 AND state=0 AND eligibility IN (0,1)
+                   AND recovery_attempts>=?4",
+                params![
+                    obligation_id.as_slice(),
+                    sqlite_integer(revision)?,
+                    crate::base::codec::unix_now_ms().max(0),
+                    sqlite_integer(RECOVERY_PARK_AFTER_ATTEMPTS)?
+                ],
+            )
+            .storage()?;
+        Ok(parked != 0)
     }
 
     /// A wanted native range has no serving source in an installed route set.
@@ -990,6 +1065,16 @@ impl SqliteAppStorage {
                     params![ticket.id.as_slice(), sqlite_integer(scope_id)?, payload],
                 ).storage()?;
             }
+            // A native goal progresses only by having more of its sources
+            // admitted at once than ever before. A re-arm makes it prove the
+            // ones it had again, which is not progress (mdk#2660).
+            if checkpoints.iter().any(|checkpoint| checkpoint.replay_admitted) {
+                conn.execute_cached(
+                    "UPDATE account_recovery_obligations SET recovery_attempts=0,recovery_admitted_high=?2
+                     WHERE id=?1 AND recovery_admitted_high<?2",
+                    params![ticket.id.as_slice(), sqlite_integer(admitted_scopes(&conn, &ticket.id)?)?],
+                ).storage()?;
+            }
             let qualified = placement == RecoveryReplayPlacement::Placed
                 && scopes_qualify(&conn, fence, None, ticket.id, RecoveryPredicate::ReplayAdmission as i64)?;
             if qualified {
@@ -1085,6 +1170,7 @@ impl SqliteAppStorage {
                 return Ok(false);
             }
             let mut updates = Vec::with_capacity(checkpoints.len());
+            let mut progressed = false;
             let mut seen = std::collections::BTreeSet::new();
             for checkpoint in checkpoints {
                 let token = &checkpoint.token;
@@ -1114,11 +1200,13 @@ impl SqliteAppStorage {
                     Some((_, RecoveryPassProgress::Progressed)) => {
                         payload.quiet_passes = 0;
                         payload.unserved_passes = 0;
+                        progressed = true;
                     }
                     Some((_, RecoveryPassProgress::WindowCertified)) => {
                         payload.quiet_passes = 0;
                         payload.unserved_passes = 0;
                         payload.window_certified = true;
+                        progressed = true;
                     }
                     Some((_, RecoveryPassProgress::Quiet)) => {
                         payload.quiet_passes = payload.quiet_passes.saturating_add(1);
@@ -1149,6 +1237,15 @@ impl SqliteAppStorage {
                     "UPDATE account_recovery_scopes SET scope_payload = ?3
                      WHERE obligation_id = ?1 AND scope_id = ?2",
                     params![obligation_id.as_slice(), sqlite_integer(scope_id)?, payload],
+                ).storage()?;
+            }
+            // Only this obligation's own scope progress restarts its count.
+            // Account-wide pacing resets say nothing about which one progressed.
+            if progressed {
+                conn.execute_cached(
+                    "UPDATE account_recovery_obligations SET recovery_attempts=0
+                     WHERE id=?1 AND recovery_attempts!=0",
+                    [obligation_id.as_slice()],
                 ).storage()?;
             }
             let (predicate, cause, dismissed): (i64, i64, Option<Vec<u8>>) = conn.query_row_cached(

@@ -19,7 +19,8 @@ use tokio::task::JoinHandle;
 use transport_nostr::MarmotRelayPlane;
 use transport_nostr_adapter::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionRequest,
-    NostrAcquisitionScope, NostrReconciliationProgress, ReplayCapturePlan, SubscriptionAttempt,
+    NostrAcquisitionScope, NostrReconciliationProgress, ReplayCaptureOutcome, ReplayCapturePlan,
+    SubscriptionAttempt,
 };
 
 /// Owned events one worker turn admits before commands and live input run.
@@ -81,6 +82,8 @@ pub(crate) struct ComparisonAdmission {
     /// The grant changed mid-admission. The admitted prefix stays durable,
     /// but the pass certifies nothing.
     invalid: bool,
+    /// How the pass's owner capture ended, or `None` when it had none.
+    capture: Option<ReplayCaptureOutcome>,
 }
 
 /// Where an owned event came from. Only comparison events bear on the
@@ -238,7 +241,8 @@ impl ComparisonRouteWorkResult {
 
 pub(crate) struct ComparisonNetworkResult {
     routes: Vec<ComparisonRouteResult>,
-    capture_error: Option<cgka_traits::TransportAdapterError>,
+    /// The owner capture's outcome, or `None` when the pass had none to run.
+    capture: Option<Result<ReplayCaptureOutcome, cgka_traits::TransportAdapterError>>,
 }
 
 impl ComparisonNetworkResult {
@@ -724,7 +728,10 @@ impl ComparisonNetworkJob {
             // Native capture and comparison share the cutoff, not each other's
             // wait. A quiet original REQ must not consume the whole pass first.
             let capture = async {
-                if !replay_capture.sources.is_empty() && tokio::time::Instant::now() < deadline {
+                if replay_capture.sources.is_empty() {
+                    return None;
+                }
+                if tokio::time::Instant::now() < deadline {
                     let cancellation = NostrAcquisitionCancellation::new();
                     let _cancel_on_drop = cancellation.clone().drop_guard();
                     let capture = adapter.capture_replay(replay_capture, cancellation.clone());
@@ -738,9 +745,10 @@ impl ComparisonNetworkJob {
                             capture.await
                         }
                     };
-                    return captured.err();
+                    return Some(captured);
                 }
-                None
+                // The cutoff passed before the capture could start.
+                Some(Ok(ReplayCaptureOutcome::Cancelled))
             };
             let compare = async {
                 // Refill a completed slot even while an earlier route is stalled.
@@ -921,14 +929,8 @@ impl ComparisonNetworkJob {
                     .map(|result| result.expect("every frozen route returned"))
                     .collect()
             };
-            let (capture_error, routes) = tokio::join!(capture, compare);
-            (
-                credit,
-                ComparisonNetworkResult {
-                    routes,
-                    capture_error,
-                },
-            )
+            let (capture, routes) = tokio::join!(capture, compare);
+            (credit, ComparisonNetworkResult { routes, capture })
         });
         Ok(Self { handle })
     }
@@ -1073,9 +1075,11 @@ impl AppClient {
         execution: &mut ComparisonExecution,
         mut network: ComparisonNetworkResult,
     ) -> Result<Option<ComparisonAdmission>, AppError> {
-        if let Some(error) = network.capture_error.take() {
-            return Err(error.into());
-        }
+        let capture = match network.capture.take() {
+            Some(Err(error)) => return Err(error.into()),
+            Some(Ok(outcome)) => Some(outcome),
+            None => None,
+        };
         let stable = self.comparison_grant_stable(grant, execution, true).await;
         if !matches!(stable, Ok(true)) {
             // The result is discarded unadmitted; its finish row still says
@@ -1086,7 +1090,10 @@ impl AppClient {
                 .observe_unsettled_routes(network.unsettled_routes());
             return stable.map(|_| None);
         }
-        let mut admission = ComparisonAdmission::default();
+        let mut admission = ComparisonAdmission {
+            capture,
+            ..ComparisonAdmission::default()
+        };
         for (index, route) in network.routes.into_iter().enumerate() {
             let inventory = grant
                 .inventory
@@ -1872,6 +1879,7 @@ impl AppClient {
             &mut execution.counts,
             &mut execution.tally,
             outcomes,
+            admission.capture,
             summary,
         )
         .await
@@ -1945,7 +1953,7 @@ mod tests {
                     credit,
                     ComparisonNetworkResult {
                         routes: Vec::new(),
-                        capture_error: None,
+                        capture: None,
                     },
                 )
             }
@@ -1985,7 +1993,7 @@ mod tests {
                     credit,
                     ComparisonNetworkResult {
                         routes: Vec::new(),
-                        capture_error: None,
+                        capture: None,
                     },
                 )
             }
@@ -2018,7 +2026,7 @@ mod tests {
                 credit,
                 ComparisonNetworkResult {
                     routes: Vec::new(),
-                    capture_error: None,
+                    capture: None,
                 },
             )
         });
@@ -2148,7 +2156,7 @@ mod tests {
         .unwrap();
         let (credit, network) = job.wait().await.unwrap();
         assert!(network.routes.is_empty());
-        assert!(network.capture_error.is_none());
+        assert!(network.capture.is_none());
         assert_eq!(
             fixture.relay.acquisition_calls.load(Ordering::SeqCst),
             calls
@@ -2176,7 +2184,9 @@ mod tests {
                 execution,
                 ComparisonNetworkResult {
                     routes: Vec::new(),
-                    capture_error: Some(cgka_traits::TransportAdapterError::InvalidInboundEncoding),
+                    capture: Some(Err(
+                        cgka_traits::TransportAdapterError::InvalidInboundEncoding,
+                    )),
                 },
             )
             .await;
@@ -2231,7 +2241,7 @@ mod tests {
                     Vec::new(),
                 )))),
             }],
-            capture_error: None,
+            capture: None,
         }
     }
 
@@ -3972,7 +3982,7 @@ mod tests {
                 .unwrap();
             sdk.client().shutdown().await;
             let network = ComparisonNetworkResult {
-                capture_error: None,
+                capture: None,
                 routes: vec![ComparisonRouteResult {
                     route: route.clone(),
                     initial_cursor,
@@ -4904,7 +4914,7 @@ mod tests {
                 execution,
                 ComparisonNetworkResult {
                     routes,
-                    capture_error: None,
+                    capture: None,
                 },
             )
             .await
@@ -4961,7 +4971,7 @@ mod tests {
                             result: ComparisonRouteWorkResult::TimedOut,
                         })
                         .collect(),
-                    capture_error: None,
+                    capture: None,
                 }
             };
             fixture
@@ -5046,7 +5056,7 @@ mod tests {
                 execution,
                 ComparisonNetworkResult {
                     routes,
-                    capture_error: None,
+                    capture: None,
                 },
             )
             .await
@@ -5093,7 +5103,7 @@ mod tests {
                 execution,
                 ComparisonNetworkResult {
                     routes,
-                    capture_error: None,
+                    capture: None,
                 },
             )
             .await

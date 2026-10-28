@@ -5192,6 +5192,7 @@ impl AppClient {
             &execution.counts,
             &execution.tally,
         );
+        self.park_capped_recovery(grant);
         if result.is_err() {
             self.abandon_loss_completion().map_err(|error| {
                 ClassifiedSyncFailure::at_stage(
@@ -5291,6 +5292,35 @@ impl AppClient {
         result
     }
 
+    /// Park every selected obligation that has now used its attempt cap
+    /// without progress. Hitting the cap means some retry loop never charged
+    /// a streak, so it is recorded as its own signal. Best effort: an
+    /// obligation this misses parks at the end of its next attempt.
+    fn park_capped_recovery(&self, grant: &AttemptGrant) {
+        let Ok(storage) = self.app.account_storage(&self.state.label) else {
+            return;
+        };
+        let app = storage.app_storage();
+        let parked = grant
+            .fence
+            .obligations
+            .iter()
+            .filter(|(id, revision)| {
+                app.park_capped_recovery_obligation(*id, *revision)
+                    .unwrap_or(false)
+            })
+            .count();
+        if parked > 0 {
+            tracing::warn!(
+                target: "marmot_app::recovery",
+                method = "park_capped_recovery",
+                parked,
+                attempts = storage_sqlite::RECOVERY_PARK_AFTER_ATTEMPTS,
+                "recovery obligations parked at their attempt cap"
+            );
+        }
+    }
+
     /// Settle a finished comparison: the comparison slot's route outcomes,
     /// then every selected obligation's checkpoint, with the existing revision
     /// fences. Old attempts still cannot clear newer demand.
@@ -5300,9 +5330,20 @@ impl AppClient {
         counts: &mut DrainCounts,
         tally: &mut super::audit_recovery::RecoveryPassTally,
         comparison_outcomes: Vec<RouteComparison>,
+        capture: Option<transport_nostr_adapter::ReplayCaptureOutcome>,
         mut summary: SyncSummary,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         tally.observe_routes(&comparison_outcomes);
+        // A capture the cutoff cancelled, or one gone stale, never asked its
+        // relays to finish: like a deadline-cut comparison it counts nothing
+        // toward a native goal's park budget. The pass still backs off.
+        let capture_served = capture.is_none_or(|outcome| {
+            matches!(
+                outcome,
+                transport_nostr_adapter::ReplayCaptureOutcome::Complete
+                    | transport_nostr_adapter::ReplayCaptureOutcome::Incomplete
+            )
+        });
         self.synchronize_native_replay().await.map_err(|error| {
             ClassifiedSyncFailure::at_stage(summary.clone(), error, SyncFailureStage::StatePersist)
         })?;
@@ -5416,6 +5457,7 @@ impl AppClient {
                     let progress = obligation
                         .scopes
                         .iter()
+                        .filter(|_| capture_served)
                         .filter(|scope| {
                             !stored.iter().any(|old| {
                                 old.plan.scope_id == scope.goal.scope_id && old.replay_admitted
