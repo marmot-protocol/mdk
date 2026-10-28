@@ -37,12 +37,12 @@
   `join_window_counted_ms`, which they leave 0, and `announce_owed_at_ms`,
   which they leave NULL, with a partial index over the rows that have it.
   `AccountGroupPushGossipState` gains the matching fields.
-- Migration 0123 advances account storage to schema 123 (mdk#2660). It adds
+- Migration 0124 advances account storage to schema 124 (mdk#2660). It adds
   `recovery_attempts` and `recovery_admitted_high` to
   `account_recovery_obligations`, which existing rows leave 0, and a trigger
-  that clears both when an obligation leaves the pending state. `count_recovery_attempt` and `park_capped_recovery_obligation` count
-  and cap reserved attempts per obligation; `RECOVERY_PARK_AFTER_ATTEMPTS` is
-  the cap. Progress resets the count; for a native goal that means more of its
+  that clears both when an obligation leaves the pending state.
+  `count_recovery_attempt` and `park_capped_recovery_obligation` count and cap
+  reserved attempts per obligation; `RECOVERY_PARK_AFTER_ATTEMPTS` is the cap. Progress resets the count; for a native goal that means more of its
   sources admitted at once than ever before (`recovery_admitted_high`). A
   native goal's re-arm, retired native windows and route-policy changes keep a
   goal the cap parked.
