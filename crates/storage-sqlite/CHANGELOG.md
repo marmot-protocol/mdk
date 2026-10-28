@@ -4,6 +4,27 @@
 
 ### Breaking changes
 
+- Migration 0127 advances account storage to schema 127 (mdk#2660 phase 4).
+  It adds the recovery runner's retry state, which nothing in production
+  writes yet: `account_recovery_units` (per route and relay: active, broken
+  or retired, backoff, park and probe), `account_recovery_unit_spans` (parked
+  and retired spans, never coverage), `account_recovery_relays` (health and
+  NIP-11 caps), `account_recovery_budget` (a rolling-hour account budget),
+  `account_recovery_park_revision` and `account_recovery_staged` (a proven
+  slice's unseen events, written with its coverage). `SqliteAppStorage` gains
+  `begin_recovery_unit_attempt`, `settle_recovery_unit`, the re-arm,
+  dismissal, relay and re-check writers, `stage_recovery_slice` and the
+  matching reads; `RecoveryUnitPolicy` carries the caller's policy values.
+  The retention prune trims parked and retired spans at its floor.
+- Migration 0126 advances account storage to schema 126 (mdk#2660 phase 4).
+  It adds the coverage ledger's un-cover log
+  (`account_recovery_coverage_uncovers`,
+  `account_recovery_coverage_uncover_state`) and
+  `account_recovery_coverage_released`, the seconds released for replay that
+  live boundaries leave out. Loss imports and receipt releases append what
+  they un-cover; `recovery_coverage_mark` and `record_recovery_coverage_since`
+  let a fetch subtract everything un-covered since it started, and replace
+  `record_recovery_coverage_at_loss_revision`.
 - Migration 0125 advances account storage to schema 125 (mdk#2628 item 3.1).
   It adds `device_groups`, one row per device group this device knows of, with
   how it came to know it: `creating`, `created`, `awaiting_welcome`, `linked`
