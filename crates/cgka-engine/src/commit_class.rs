@@ -28,12 +28,16 @@
 //! admin-required. `tests::groups_without_account_devices_keep_the_shape_only_answers`
 //! checks this for every shape.
 
+use cgka_traits::app_components::{
+    DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1, decode_device_roster_update_v1,
+    decode_device_roster_v1,
+};
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
 use cgka_traits::ingest::ProposalRejectionCategory;
 use cgka_traits::types::{GroupId, MemberId};
 use openmls::group::{MlsGroup, StagedCommit};
-use openmls::messages::proposals::Proposal;
+use openmls::messages::proposals::{AppDataUpdateOperation, Proposal};
 use openmls::prelude::{LeafNodeIndex, ProposalOrRefType, QueuedProposal};
 
 /// The one class a Commit has in its candidate parent state.
@@ -133,6 +137,9 @@ pub(crate) fn authorize_own_staged_commit(
     self_id: &MemberId,
     staged: &StagedCommit,
 ) -> Result<CommitClass, EngineError> {
+    if crate::app_components::group_requires_device_roster(parent)? {
+        check_device_group_add(parent, staged)?;
+    }
     authorize_staged_commit(
         parent,
         group_id,
@@ -151,6 +158,73 @@ pub(crate) fn authorize_own_staged_commit(
         )),
         CommitAuthorityError::ParentState(error) | CommitAuthorityError::Other(error) => error,
     })
+}
+
+/// device-group.md, "Linking a device": in a device group a leaf joins only by
+/// a link. An own Commit there that adds a leaf adds exactly one, by value,
+/// and its roster update sets a device entry for a slot the parent roster does
+/// not list, announcing the added KeyPackage. Every own Commit passes here,
+/// whatever intent built it or took from the proposal store. Merging two
+/// device groups (mdk#2628 item 3.7) will widen this shape.
+fn check_device_group_add(parent: &MlsGroup, staged: &StagedCommit) -> Result<(), EngineError> {
+    let refused = |reason| {
+        EngineError::InvalidTransition(cgka_traits::engine_state::InvalidTransition {
+            from: "DeviceGroup",
+            to: "Commit",
+            reason,
+        })
+    };
+    let mut adds = staged
+        .queued_proposals()
+        .filter(|queued| matches!(queued.proposal(), Proposal::Add(_)));
+    let Some(add) = adds.next() else {
+        return Ok(());
+    };
+    if adds.next().is_some() {
+        return Err(refused("a device group's Commit adds at most one device"));
+    }
+    let (Proposal::Add(add), ProposalOrRefType::Proposal) =
+        (add.proposal(), add.proposal_or_ref_type())
+    else {
+        return Err(refused("a device group's Commit carries its Add by value"));
+    };
+    let added = crate::key_package::key_package_ref(add.key_package())?;
+    let roster =
+        crate::app_components::app_component_data_of_group(parent, DEVICE_ROSTER_COMPONENT_ID)
+            .ok_or_else(|| {
+                EngineError::Other(
+                    "invalid device roster state: the required roster has no GroupContext state"
+                        .into(),
+                )
+            })?;
+    let roster = decode_device_roster_v1(&roster)
+        .map_err(|error| EngineError::Serialize(format!("invalid device roster state: {error}")))?;
+    let announced = staged.queued_proposals().any(|queued| {
+        let Proposal::AppDataUpdate(update) = queued.proposal() else {
+            return false;
+        };
+        let AppDataUpdateOperation::Update(data) = update.operation() else {
+            return false;
+        };
+        update.component_id() == DEVICE_ROSTER_COMPONENT_ID
+            && decode_device_roster_update_v1(data.as_slice()).is_ok_and(|update| {
+                update.operations().iter().any(|operation| {
+                    matches!(
+                        operation,
+                        DeviceRosterOperationV1::SetDevice(slot, device)
+                            if !roster.devices.contains_key(slot)
+                                && device.announced_key_package.as_deref()
+                                    == Some(added.as_slice())
+                    )
+                })
+            })
+    });
+    if !announced {
+        return Err(refused(
+            "a device group's Commit that adds a device sets its roster entry, for a new slot, announcing the added KeyPackage",
+        ));
+    }
+    Ok(())
 }
 
 /// What the classifier reads from a Commit: how many proposals it carries,

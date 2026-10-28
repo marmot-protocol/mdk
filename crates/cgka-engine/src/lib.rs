@@ -63,6 +63,7 @@ pub mod group_state_changes;
 pub mod identity;
 pub mod key_package;
 pub mod leaf_advertisement;
+mod link_device;
 pub mod maintenance;
 mod membership_effects;
 pub(crate) mod message_disposition;

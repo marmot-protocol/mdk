@@ -24,7 +24,7 @@ use cgka_traits::storage::GroupStorage as _;
 
 /// A device of `account` that advertises the device roster beside
 /// account-devices.
-fn roster_device(account: &[u8]) -> Device {
+pub(super) fn roster_device(account: &[u8]) -> Device {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let mut supported: Vec<_> = default_group_components().into_iter().collect();
     supported.extend([ACCOUNT_DEVICES_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID]);
@@ -40,7 +40,7 @@ fn roster_device(account: &[u8]) -> Device {
     Device { engine, storage }
 }
 
-fn slot(n: u8) -> DeviceSlotId {
+pub(super) fn slot(n: u8) -> DeviceSlotId {
     [n; 32]
 }
 
@@ -53,7 +53,7 @@ fn leaf(n: u8, group: u8) -> LeafMapKeyV1 {
     }
 }
 
-fn entry(label: &str) -> DeviceEntryV1 {
+pub(super) fn entry(label: &str) -> DeviceEntryV1 {
     DeviceEntryV1 {
         label: label.into(),
         client: "test-client".into(),
@@ -62,7 +62,7 @@ fn entry(label: &str) -> DeviceEntryV1 {
 }
 
 /// A roster with one device per `(slot, label)`.
-fn roster(devices: &[(u8, &str)]) -> DeviceRosterV1 {
+pub(super) fn roster(devices: &[(u8, &str)]) -> DeviceRosterV1 {
     DeviceRosterV1 {
         devices: devices
             .iter()
@@ -83,7 +83,7 @@ fn update_bytes(operations: Vec<DeviceRosterOperationV1>) -> Vec<u8> {
     encode_device_roster_update_v1(&DeviceRosterUpdateV1::new(operations).unwrap()).unwrap()
 }
 
-fn roster_update(gid: &GroupId, operations: Vec<DeviceRosterOperationV1>) -> SendIntent {
+pub(super) fn roster_update(gid: &GroupId, operations: Vec<DeviceRosterOperationV1>) -> SendIntent {
     SendIntent::UpdateAppComponents {
         group_id: gid.clone(),
         updates: vec![AppComponentData {
@@ -102,7 +102,7 @@ fn roster_bytes_of(device: &Device, gid: &GroupId) -> Option<Vec<u8>> {
         .map(<[u8]>::to_vec)
 }
 
-fn roster_of(device: &Device, gid: &GroupId) -> DeviceRosterV1 {
+pub(super) fn roster_of(device: &Device, gid: &GroupId) -> DeviceRosterV1 {
     decode_device_roster_v1(&roster_bytes_of(device, gid).expect("the group holds a roster"))
         .unwrap()
 }
@@ -113,7 +113,7 @@ fn requires_roster(device: &Device, gid: &GroupId) -> bool {
 
 /// `creator` founds a device group holding `initial`, with each of `joiners`
 /// joining from its founding Welcome.
-async fn found_device_group(
+pub(super) async fn found_device_group(
     creator: &mut Device,
     initial: &DeviceRosterV1,
     joiners: &mut [&mut Device],
@@ -170,7 +170,7 @@ async fn create_under(
         .await
 }
 
-async fn phone_and_laptop() -> (Device, Device, GroupId) {
+pub(super) async fn phone_and_laptop() -> (Device, Device, GroupId) {
     let mut phone = roster_device(b"alice");
     let mut laptop = roster_device(b"alice");
     let gid = found_device_group(
@@ -491,7 +491,12 @@ async fn a_device_group_holds_only_its_accounts_devices() {
         })
         .await
         .expect_err("inviting another account into a device group is refused");
-    assert!(error.to_string().contains("another account"), "{error}");
+    // The sender refuses every Invite into a device group; a receiver
+    // rejects another account's leaf in one.
+    assert!(
+        error.to_string().contains("only through LinkDevice"),
+        "{error}"
+    );
 
     let crafted = crafted_commit(&phone, &gid, vec![bob_kp.clone()], vec![], None);
     assert_rejected_on_replay(&mut laptop, &crafted, &gid).await;

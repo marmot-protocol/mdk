@@ -1717,6 +1717,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::UpdateGroupData { .. } => "update_group_data",
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
+        SendIntent::LinkDevice { .. } => "link_device",
         SendIntent::Disband { .. } => "disband",
     }
 }

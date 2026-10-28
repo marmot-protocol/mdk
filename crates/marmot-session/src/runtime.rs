@@ -6662,6 +6662,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::UpdateGroupData { .. }
             | SendIntent::EnableDisbanding { .. }
             | SendIntent::EnableAccountDevices { .. }
+            | SendIntent::LinkDevice { .. }
     )
 }
 

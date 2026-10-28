@@ -2548,6 +2548,7 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         // to caller input (the pinned epoch), not a protocol failure.
         | EngineError::AppMessageEpochMismatch { .. }
         | EngineError::AppMessageEpochUnsettled { .. }
+        | EngineError::LinkDeviceUnsettled { .. }
         | EngineError::InvalidWelcome
         | EngineError::MissingWelcomeKeyPackage
         | EngineError::WelcomeNotAddressedToThisDevice
@@ -2617,6 +2618,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::LeaveAlreadyRequested { .. } => "leave_already_requested",
         EngineError::AppMessageEpochMismatch { .. } => "app_message_epoch_mismatch",
         EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
+        EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
         // Every decode failure the engine can reach, not an admin-policy
         // verdict: `audit_helpers::engine_error_kind` names it the same way.
         EngineError::Serialize(_) => "serialize",

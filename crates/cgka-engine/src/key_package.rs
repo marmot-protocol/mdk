@@ -177,6 +177,14 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
     })
 }
 
+/// The KeyPackageRef of an already validated KeyPackage, such as one a staged
+/// Commit adds.
+pub(crate) fn key_package_ref(
+    key_package: &MlsKeyPackage,
+) -> Result<openmls::prelude::KeyPackageRef, EngineError> {
+    validation_crypto::hash_ref(key_package)
+}
+
 /// Parse and validate a transported KeyPackage and report whether it carries
 /// either the current last-resort application-data component or the legacy
 /// last-resort extension.

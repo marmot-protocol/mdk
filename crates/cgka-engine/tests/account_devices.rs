@@ -91,6 +91,12 @@ mod activation;
 #[path = "account_devices/device_roster.rs"]
 mod device_roster;
 
+// The link Commit writes the roster, so it is test-policy only too
+// (mdk#2628 3.3b).
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/link_device.rs"]
+mod link_device;
+
 const ACCOUNT_DEVICES: Feature = Feature("account-devices");
 
 fn pad32(name: &[u8]) -> Vec<u8> {
