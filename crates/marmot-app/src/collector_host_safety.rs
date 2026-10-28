@@ -1,5 +1,6 @@
 //! Per-attempt collector resolution and pinning. No DNS cache or connection
 //! pool survives an export attempt; retries must clear the same gate again.
+//! Relay NIP-11 fetches (`relay_caps.rs`) pin through [`pin_with`] too.
 
 use std::{
     future::Future,
@@ -64,28 +65,39 @@ impl std::fmt::Display for CollectorRequestError {
 impl std::error::Error for CollectorRequestError {}
 
 // Deliberately no Debug: the configured URL and DNS answers are private.
-pub(crate) struct PinnedCollector {
+pub struct PinnedCollector {
     pub(crate) url: Url,
     addrs: Vec<SocketAddr>,
 }
 
 impl PinnedCollector {
+    pub(crate) fn build_client(&self) -> Result<reqwest::Client, CollectorRequestError> {
+        self.build_client_with_timeouts(CONNECT_TIMEOUT, REQUEST_TIMEOUT)
+    }
+
+    /// [`Self::build_client`] with its own connect and whole-request limits.
     // `build_client_from` applies the process proxy policy.
     #[allow(clippy::disallowed_methods)]
-    pub(crate) fn build_client(&self) -> Result<reqwest::Client, CollectorRequestError> {
-        self.build_client_from(reqwest::Client::builder())
+    pub fn build_client_with_timeouts(
+        &self,
+        connect: Duration,
+        request: Duration,
+    ) -> Result<reqwest::Client, CollectorRequestError> {
+        self.build_client_from(reqwest::Client::builder(), connect, request)
     }
 
     fn build_client_from(
         &self,
         builder: reqwest::ClientBuilder,
+        connect: Duration,
+        request: Duration,
     ) -> Result<reqwest::Client, CollectorRequestError> {
         let http_builder = http_builder().ok_or(CollectorRequestError)?;
         http_builder(builder)
             .map_err(|_| CollectorRequestError)?
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(connect)
+            .timeout(request)
             .resolve_to_addrs(
                 self.url.host_str().ok_or(CollectorRequestError)?,
                 &self.addrs,
@@ -97,7 +109,7 @@ impl PinnedCollector {
     }
 }
 
-pub(crate) async fn system_resolve(host: String, port: u16) -> std::io::Result<Vec<IpAddr>> {
+pub async fn system_resolve(host: String, port: u16) -> std::io::Result<Vec<IpAddr>> {
     tokio::net::lookup_host((host.as_str(), port))
         .await
         .map(|addrs| addrs.map(|addr| addr.ip()).collect())
@@ -112,11 +124,30 @@ where
     Fut: Future<Output = std::io::Result<Vec<IpAddr>>>,
 {
     let url = parse_relay_telemetry_endpoint(endpoint).ok_or(CollectorRequestError)?;
-    let port = url.port_or_known_default().ok_or(CollectorRequestError)?;
+    // The test endpoint must stay on this device. In particular, HTTP
+    // localhost resolving to a public IP must never send plaintext auth.
     let loopback_test = endpoint_host_is_loopback(url.as_str());
+    pin_with(url, loopback_test, CONNECT_TIMEOUT, resolver).await
+}
+
+/// Resolves `url`'s host once within `resolve_timeout`, validates every
+/// address and pins them all. `loopback` admits loopback addresses and then
+/// requires every address to be one; callers set it only for a literal
+/// loopback host the configuration opted into, never from a resolved address.
+pub async fn pin_with<F, Fut>(
+    url: Url,
+    loopback: bool,
+    resolve_timeout: Duration,
+    resolver: F,
+) -> Result<PinnedCollector, CollectorRequestError>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: Future<Output = std::io::Result<Vec<IpAddr>>>,
+{
+    let port = url.port_or_known_default().ok_or(CollectorRequestError)?;
     let ips = match url.host().ok_or(CollectorRequestError)? {
         Host::Domain(host) => {
-            tokio::time::timeout(CONNECT_TIMEOUT, resolver(host.to_owned(), port))
+            tokio::time::timeout(resolve_timeout, resolver(host.to_owned(), port))
                 .await
                 .map_err(|_| CollectorRequestError)?
                 .map_err(|_| CollectorRequestError)?
@@ -128,12 +159,10 @@ where
         return Err(CollectorRequestError);
     }
     for ip in &ips {
-        // The test endpoint must stay on this device. In particular, HTTP
-        // localhost resolving to a public IP must never send plaintext auth.
-        if loopback_test && !is_loopback_ip(*ip) {
+        if loopback && !is_loopback_ip(*ip) {
             return Err(CollectorRequestError);
         }
-        reject_non_public_ip(*ip, loopback_test).map_err(|_| CollectorRequestError)?;
+        reject_non_public_ip(*ip, loopback).map_err(|_| CollectorRequestError)?;
     }
     Ok(PinnedCollector {
         url,
