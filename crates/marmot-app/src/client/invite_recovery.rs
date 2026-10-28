@@ -101,7 +101,11 @@ impl AppClient {
             failed_reinvites,
             group_id_hex: hex::encode(group_id.as_slice()),
             automatic_recovery_failed: !group.is_terminal()
-                && storage.app_storage().automatic_recovery_failed(group_id)?,
+                && (storage.app_storage().automatic_recovery_failed(group_id)?
+                    || matches!(
+                        self.runtime.group_rejoin_status(group_id)?,
+                        marmot_session::GroupRejoinStatus::Parked { .. }
+                    )),
             rejoin_invitations,
             history_may_be_incomplete: !history_notice_ids.is_empty(),
             history_notice_ids,
@@ -209,7 +213,30 @@ impl AppClient {
             return Ok(());
         }
         self.app.ensure_storage_open("automatic group recovery")?;
+        let mut before = Vec::new();
+        for group_id in self.runtime.live_group_ids()? {
+            if matches!(
+                self.runtime.epoch_state(&group_id),
+                Some(cgka_traits::EpochState::Unrecoverable { .. })
+            ) {
+                let parked = matches!(
+                    self.runtime.group_rejoin_status(&group_id)?,
+                    marmot_session::GroupRejoinStatus::Parked { .. }
+                );
+                before.push((group_id, parked));
+            }
+        }
         let peers = self.runtime.prepare_group_recovery()?;
+        for (group_id, parked) in before {
+            if parked
+                != matches!(
+                    self.runtime.group_rejoin_status(&group_id)?,
+                    marmot_session::GroupRejoinStatus::Parked { .. }
+                )
+            {
+                self.mark_recovery_status_changed(&group_id);
+            }
+        }
         let directory = self.app.directory();
         for peer in peers {
             let member = hex::encode(peer.as_slice());
@@ -245,6 +272,22 @@ impl AppClient {
         // Reuse native maintenance projection, group-route refresh and buffered
         // summaries; control envelopes themselves never become chat entries.
         self.observe_native_membership_effects(&effects).await?;
+        Ok(())
+    }
+
+    pub(crate) fn retry_parked_rejoins(&mut self) -> Result<(), AppError> {
+        for group_id in self.runtime.live_group_ids()? {
+            if matches!(
+                self.runtime.epoch_state(&group_id),
+                Some(cgka_traits::EpochState::Unrecoverable { .. })
+            ) && matches!(
+                self.runtime.group_rejoin_status(&group_id)?,
+                marmot_session::GroupRejoinStatus::Parked { .. }
+            ) {
+                self.runtime.retry_group_rejoin(&group_id)?;
+                self.mark_recovery_status_changed(&group_id);
+            }
+        }
         Ok(())
     }
 

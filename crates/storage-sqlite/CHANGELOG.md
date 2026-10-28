@@ -5,8 +5,9 @@
 ### Breaking changes
 
 - Migration 0123 advances account storage to schema 123 after the upstream
-  migrations through 0122. It adds the protocol-owned `cgka_group_recovery`
-  journal for durable authenticated recovery handshakes. Older binaries reject
+  migrations through 0122. It adds the protocol-owned `cgka_group_rejoin`
+  journal for finite authenticated rejoin episodes, per-member Commit cooldowns
+  and durable publication ownership. Older binaries reject
   the upgraded database; deleting a group also deletes its recovery jobs.
 - Migration 0121 advances account storage to schema 121 (mdk#2628). It drops
   `cgka_member_capabilities`, the engine's per-account capability cache: with

@@ -165,9 +165,6 @@ impl TransportPublishRequest {
             (
                 TransportEnvelope::Welcome {
                     recipient: msg_recipient,
-                }
-                | TransportEnvelope::GroupRecovery {
-                    recipient: msg_recipient,
                 },
                 TransportPublishTarget::Inbox {
                     recipient: target_recipient,
@@ -1206,7 +1203,6 @@ fn envelope_label(envelope: &TransportEnvelope) -> &'static str {
     match envelope {
         TransportEnvelope::GroupMessage { .. } => "group",
         TransportEnvelope::Welcome { .. } => "welcome",
-        TransportEnvelope::GroupRecovery { .. } => "group_recovery",
     }
 }
 
@@ -1554,7 +1550,7 @@ mod tests {
     fn recovery_inbox_match() {
         let recipient = MemberId::new(vec![0xE5; 32]);
         let mut request = fanout_request();
-        request.message.envelope = TransportEnvelope::GroupRecovery {
+        request.message.envelope = TransportEnvelope::Welcome {
             recipient: recipient.clone(),
         };
         assert!(request.validate_envelope_matches_target().is_err());

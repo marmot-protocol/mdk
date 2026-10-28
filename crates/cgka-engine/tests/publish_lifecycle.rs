@@ -101,15 +101,6 @@ impl FailFirstGroupWrapPeeler {
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, PeelerError> {
-        Err(PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -189,13 +180,6 @@ impl TransportPeeler for MockPeeler {
 
 #[async_trait]
 impl TransportPeeler for FailFirstGroupWrapPeeler {
-    async fn peel_group_recovery(
-        &self,
-        msg: &TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, PeelerError> {
-        self.inner.peel_group_recovery(msg).await
-    }
-
     async fn wrap_group_recovery(
         &self,
         message: &cgka_traits::GroupRecoveryMessage,

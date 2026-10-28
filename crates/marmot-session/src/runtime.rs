@@ -2,6 +2,7 @@
 //! confirmation, and rollback, and the effect aggregates it produces.
 
 mod group_recovery;
+pub use group_recovery::GroupRejoinStatus;
 
 /// Closed timing boundaries; callbacks receive no delivery or identity data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3739,21 +3740,24 @@ where
         if delivery.account_id != self.session.self_id() {
             return Err(AccountError::WrongAccountDelivery);
         }
-        if matches!(
-            delivery.message.envelope,
-            TransportEnvelope::GroupRecovery { .. }
-        ) {
-            let started = Instant::now();
-            let ingested = self.ingest_group_recovery(&delivery.message).await;
-            observe(
-                AccountIngestPhase::Engine,
-                started.elapsed(),
-                ingested.is_ok(),
-            );
-            return ingested;
-        }
         let started = Instant::now();
-        let ingested = self.session.ingest_delivery(delivery).await;
+        let ingested = match self.session.ingest_delivery(delivery).await {
+            Ok(IngestEffects {
+                outcome: IngestOutcome::GroupRecovery { recovery },
+                ..
+            }) => {
+                let ingested = self
+                    .ingest_group_recovery(&delivery.message, *recovery)
+                    .await;
+                observe(
+                    AccountIngestPhase::Engine,
+                    started.elapsed(),
+                    ingested.is_ok(),
+                );
+                return ingested;
+            }
+            ingested => ingested,
+        };
         observe(
             AccountIngestPhase::Engine,
             started.elapsed(),
@@ -4862,8 +4866,7 @@ where
             let wire = publish_wire_metadata(&fanout.exact_message);
             let artifact_kind = match &fanout.exact_message.envelope {
                 TransportEnvelope::Welcome { .. } => Some(MessageArtifactKind::Welcome),
-                TransportEnvelope::GroupMessage { .. }
-                | TransportEnvelope::GroupRecovery { .. } => None,
+                TransportEnvelope::GroupMessage { .. } => None,
             };
             let target_kind = publish_target_kind(&fanout.target).to_string();
             let publish_context = AuditEventContext {
@@ -5657,9 +5660,7 @@ where
         // transport envelope alone, so it is left unattributed here.
         let artifact_kind = match &message.envelope {
             TransportEnvelope::Welcome { .. } => Some(MessageArtifactKind::Welcome),
-            TransportEnvelope::GroupMessage { .. } | TransportEnvelope::GroupRecovery { .. } => {
-                None
-            }
+            TransportEnvelope::GroupMessage { .. } => None,
         };
         let mut publish_context = context.unwrap_or_default();
         publish_context.operation_id = Some(format!("publish-{msg_id_hex}"));
@@ -6692,7 +6693,7 @@ fn classify_prepared_session_send(
 fn welcome_recipient(message: &TransportMessage) -> Option<MemberId> {
     match &message.envelope {
         TransportEnvelope::Welcome { recipient } => Some(recipient.clone()),
-        TransportEnvelope::GroupMessage { .. } | TransportEnvelope::GroupRecovery { .. } => None,
+        TransportEnvelope::GroupMessage { .. } => None,
     }
 }
 
@@ -6713,7 +6714,7 @@ fn publish_wire_metadata(message: &TransportMessage) -> AuditTransportWire {
         TransportEnvelope::GroupMessage { transport_group_id } => {
             Some(hex::encode(transport_group_id))
         }
-        TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => None,
+        TransportEnvelope::Welcome { .. } => None,
     };
     AuditTransportWire {
         transport: Some(message.source.0.clone()),

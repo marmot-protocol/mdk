@@ -159,21 +159,31 @@ fn snapshot_recovery_dtos() {
 }
 
 #[test]
-fn snapshot_recovery_envelope() {
-    let envelope = TransportEnvelope::GroupRecovery {
-        recipient: MemberId::new(vec![1, 2, 3]),
+fn snapshot_inbox_control() {
+    let recovery = Box::new(cgka_traits::AuthenticatedGroupRecovery {
+        sender: MemberId::new(vec![3]),
+        message: cgka_traits::GroupRecoveryMessage {
+            group_id: GroupId::new(vec![1; 16]),
+            request_id: [2; 32],
+            expires_at: 1234,
+            body: cgka_traits::GroupRecoveryBody::Request {
+                device_key_hash: [4; 32],
+            },
+        },
+    });
+    let content = PeeledContent::GroupRecovery {
+        recovery: recovery.clone(),
     };
-    insta::assert_json_snapshot!(envelope, @r###"
-    {
-      "GroupRecovery": {
-        "recipient": [
-          1,
-          2,
-          3
-        ]
-      }
-    }
-    "###);
+    let outcome = IngestOutcome::GroupRecovery { recovery };
+    insta::assert_snapshot!(serde_json::to_string(&outcome).unwrap(), @r###"{"GroupRecovery":{"recovery":{"sender":[3],"message":{"group_id":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"request_id":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"expires_at":1234,"body":{"type":"request","device_key_hash":[4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4]}}}}}"###);
+    assert_eq!(
+        serde_json::to_value(&content).unwrap(),
+        serde_json::to_value(&outcome).unwrap()
+    );
+    assert_eq!(
+        serde_json::from_value::<IngestOutcome>(serde_json::to_value(&outcome).unwrap()).unwrap(),
+        outcome
+    );
 }
 
 #[test]

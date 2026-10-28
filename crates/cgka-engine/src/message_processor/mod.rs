@@ -56,7 +56,7 @@ use crate::engine_metrics::DeferredPeelCapacityResource;
 use crate::openmls_projection::decode_openmls_wire_projection;
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
-use cgka_traits::error::EngineError;
+use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{
     DeferralLineage, InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState,
 };
@@ -841,11 +841,6 @@ impl<S: StorageProvider> Engine<S> {
             TransportEnvelope::GroupMessage { transport_group_id } => {
                 self.ingest_group_message(msg, transport_group_id.clone())
                     .await?
-            }
-            TransportEnvelope::GroupRecovery { .. } => {
-                return Err(EngineError::Other(
-                    "group recovery belongs to the account runtime".into(),
-                ));
             }
         };
 
@@ -2939,6 +2934,9 @@ impl<S: StorageProvider> Engine<S> {
                 self.release_cap_slot_if_row_left_peel_deferred(record, current);
                 Ok(!store::row_state_is_awaiting_retry(current))
             }
+            Ok(Outcome(IngestOutcome::GroupRecovery { .. })) => Err(EngineError::Peeler(
+                PeelerError::Malformed("group retry returned account control".into()),
+            )),
             Ok(Outcome(IngestOutcome::Processed)) => {
                 // Applied. A direct apply records the wrapper in the
                 // processed-transport-id set rather than restating its row, so
@@ -4019,9 +4017,7 @@ fn record_group_id(msg: &TransportMessage) -> GroupId {
         TransportEnvelope::GroupMessage { transport_group_id } => {
             GroupId::new(transport_group_id.clone())
         }
-        TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => {
-            GroupId::new(Vec::new())
-        }
+        TransportEnvelope::Welcome { .. } => GroupId::new(Vec::new()),
     }
 }
 
@@ -4234,16 +4230,6 @@ mod deferred_peel_accounting_tests {
         struct OpaquePeeler;
         #[async_trait::async_trait]
         impl TransportPeeler for OpaquePeeler {
-            async fn peel_group_recovery(
-                &self,
-                _msg: &cgka_traits::TransportMessage,
-            ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError>
-            {
-                Err(cgka_traits::PeelerError::Malformed(
-                    "pass-through fixture has no authenticated account channel".into(),
-                ))
-            }
-
             async fn wrap_group_recovery(
                 &self,
                 _message: &cgka_traits::GroupRecoveryMessage,

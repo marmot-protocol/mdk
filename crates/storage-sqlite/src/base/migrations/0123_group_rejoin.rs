@@ -1,4 +1,4 @@
-//! Migration 0123: bounded durable authenticated group-recovery handshakes.
+//! Migration 0123: bounded durable authenticated group-rejoin handshakes.
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;
@@ -7,17 +7,17 @@ use rusqlite::Transaction;
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         r#"
-CREATE TABLE cgka_group_recovery (
+CREATE TABLE cgka_group_rejoin (
     group_id BLOB NOT NULL REFERENCES cgka_groups(id) ON DELETE CASCADE,
     role INTEGER NOT NULL CHECK (role IN (0, 1)),
     request_id BLOB NOT NULL CHECK (length(request_id) = 32),
     record BLOB NOT NULL,
     PRIMARY KEY (group_id, role, request_id)
 ) WITHOUT ROWID;
-CREATE UNIQUE INDEX cgka_group_recovery_recipient_idx
-    ON cgka_group_recovery (group_id) WHERE role = 0;
-CREATE INDEX cgka_group_recovery_role_idx
-    ON cgka_group_recovery (role, group_id);
+CREATE UNIQUE INDEX cgka_group_rejoin_recipient_idx
+    ON cgka_group_rejoin (group_id) WHERE role = 0;
+CREATE INDEX cgka_group_rejoin_role_idx
+    ON cgka_group_rejoin (role, group_id);
 "#,
     )
     .storage()
@@ -32,7 +32,7 @@ mod tests {
     use rusqlite::{Connection, params};
 
     #[test]
-    fn group_recovery_migration() {
+    fn group_rejoin_migration() {
         let mut connection = Connection::open_in_memory().unwrap();
         let index = MIGRATIONS
             .iter()
@@ -54,7 +54,7 @@ mod tests {
         }
         let present: bool = connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'cgka_group_recovery')",
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'cgka_group_rejoin')",
                 [],
                 |row| row.get(0),
             )

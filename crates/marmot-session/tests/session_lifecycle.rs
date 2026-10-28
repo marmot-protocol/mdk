@@ -75,15 +75,6 @@ struct MockPeeler;
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, PeelerError> {
-        Err(PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -280,7 +271,7 @@ async fn default_session_cutover_retires_legacy_key_packages_on_every_open() {
 
 fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
     match msg.envelope {
-        TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => msg,
+        TransportEnvelope::Welcome { .. } => msg,
         TransportEnvelope::GroupMessage { .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),

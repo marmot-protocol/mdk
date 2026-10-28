@@ -120,15 +120,6 @@ fn encode_admin_policy_for_test(admins: &[MemberId]) -> Vec<u8> {
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -206,15 +197,6 @@ impl TransportPeeler for MockPeeler {
 
 #[async_trait]
 impl TransportPeeler for EpochGatePeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -10340,7 +10322,7 @@ fn app_content(payload: &[u8]) -> Vec<u8> {
 
 fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
     match msg.envelope {
-        TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => msg,
+        TransportEnvelope::Welcome { .. } => msg,
         TransportEnvelope::GroupMessage { .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),

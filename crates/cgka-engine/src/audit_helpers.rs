@@ -74,7 +74,6 @@ pub(crate) fn proposal_kind_str(proposal: &Proposal) -> &'static str {
 pub(crate) fn envelope_kind_str(env: &TransportEnvelope) -> &'static str {
     match env {
         TransportEnvelope::Welcome { .. } => "welcome",
-        TransportEnvelope::GroupRecovery { .. } => "group_recovery",
         TransportEnvelope::GroupMessage { .. } => "group_message",
     }
 }
@@ -82,6 +81,7 @@ pub(crate) fn envelope_kind_str(env: &TransportEnvelope) -> &'static str {
 pub(crate) fn ingest_outcome_kind_str(outcome: &IngestOutcome) -> &'static str {
     match outcome {
         IngestOutcome::Processed => "processed",
+        IngestOutcome::GroupRecovery { .. } => "account_control",
         IngestOutcome::Buffered { .. } => "buffered",
         IngestOutcome::Ignored { .. } => "ignored",
         IngestOutcome::LocalState { .. } => "local_state",

@@ -3950,15 +3950,21 @@ async fn recovery_account_inbox() {
     assert_eq!(delivery.source.plane, TransportDeliveryPlane::AccountInbox);
     assert_eq!(
         delivery.message.envelope,
-        TransportEnvelope::GroupRecovery {
+        TransportEnvelope::Welcome {
             recipient: receiver_id
         }
     );
-    let authenticated = NostrMlsPeeler::new()
+    let peeled = NostrMlsPeeler::new()
         .with_welcome_signer(receiver)
-        .peel_group_recovery(&delivery.message)
+        .peel_welcome(&delivery.message)
         .await
         .unwrap();
+    let cgka_traits::PeeledContent::GroupRecovery {
+        recovery: authenticated,
+    } = peeled.content
+    else {
+        panic!("recovery must be classified from authenticated inner content");
+    };
     assert_eq!(authenticated.sender, sender_id);
     assert_eq!(authenticated.message, body);
 }

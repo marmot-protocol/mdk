@@ -14604,7 +14604,7 @@ fn recovery_selected_inbox_only() {
         timestamp: Timestamp(1),
         causal_deps: Vec::new(),
         source: cgka_traits::transport::TransportSource("nostr".into()),
-        envelope: TransportEnvelope::GroupRecovery {
+        envelope: TransportEnvelope::Welcome {
             recipient: recipient.clone(),
         },
     };

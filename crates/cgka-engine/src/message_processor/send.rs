@@ -111,7 +111,7 @@ impl<S: StorageProvider> Engine<S> {
                 key_packages,
                 initial_admins,
             } => {
-                self.do_send_invite(group_id, key_packages, initial_admins, Vec::new())
+                self.do_send_member_adds(group_id, key_packages, initial_admins, Vec::new())
                     .await
             }
             SendIntent::RecoverMembers { group_id, members } => {
@@ -120,7 +120,7 @@ impl<S: StorageProvider> Engine<S> {
                         "recovery requires 1 to {MAX_RECOVERY_MEMBERS} member grants"
                     )));
                 }
-                self.do_send_invite(group_id, Vec::new(), Vec::new(), members)
+                self.do_send_member_adds(group_id, Vec::new(), Vec::new(), members)
                     .await
             }
             SendIntent::RemoveMembers { group_id, members } => {
@@ -181,7 +181,7 @@ impl<S: StorageProvider> Engine<S> {
         result
     }
 
-    async fn do_send_invite(
+    async fn do_send_member_adds(
         &mut self,
         group_id: GroupId,
         key_packages: Vec<cgka_traits::engine::KeyPackage>,
@@ -209,7 +209,12 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
+        // Ordinary invitations remain admin-only. Recovery authorizes every
+        // exact target below through the shared member-edit classifier, then
+        // authorizes the complete staged Commit through the replay gate.
+        if recovery_sources.is_empty() {
+            crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
+        }
 
         // Source-bound grants are checked against this exact pre-staging MLS
         // state, with no await between validation and staging. Replacing only
@@ -363,49 +368,47 @@ impl<S: StorageProvider> Engine<S> {
         // which is the right key for receivers to derive when peeling
         // (they're at the same pre-commit epoch when they decrypt the
         // wrap; only after they apply the inner commit do they advance).
-        // Empty `initial_admins` keeps the add-only OpenMLS path so Welcome
-        // fanout after confirm is unchanged. Non-empty grants couple the
-        // admin-policy update into the same Add commit (#1298).
-        let (commit_out, welcome_out) =
-            if granted_admin_ids.is_empty() && recovery_removals.is_empty() {
-                let (commit_out, welcome_out, _gi) = mls_group
-                    .add_members(&provider, &self.identity.signer, &parsed_kps)
-                    .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
-                (commit_out, welcome_out)
-            } else {
-                let admin_updates = if granted_admin_ids.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![Proposal::AppDataUpdate(Box::new(
-                        AppDataUpdateProposal::update(
-                            GROUP_ADMIN_POLICY_COMPONENT_ID,
-                            crate::app_components::encode_admin_policy(&resulting_admins)?,
-                        ),
-                    ))]
-                };
-                let stage = || {
-                    self.stage_commit_with_app_data_updates(
-                        &mut mls_group,
-                        &provider,
-                        recovery_removals,
-                        parsed_kps.clone(),
-                        admin_updates,
-                        "invite",
-                    )
-                };
-                let (commit_out, welcome_out) = if recovery_evolution.is_some() {
-                    // Preparing already owns this attempt. A kill inside OpenMLS
-                    // staging must leave either the original state or a complete
-                    // pending commit that hydration can atomically abandon.
-                    self.storage.with_transaction(|_| stage())?
-                } else {
-                    stage()?
-                };
-                let welcome_out = welcome_out.ok_or_else(|| {
-                    EngineError::Backend("invite-with-admin produced no Welcome".into())
-                })?;
-                (commit_out, welcome_out)
-            };
+        // Replacements use the own-account primitive: atomic by-value
+        // Remove+Add, with no proposal-store consumption or policy changes.
+        // Ordinary invitations retain their add-only/admin-grant paths.
+        let (commit_out, welcome_out) = if !recovery_removals.is_empty() {
+            // Preparing already owns this attempt. A kill inside OpenMLS
+            // staging leaves either the original state or a complete
+            // pending commit that hydration can atomically abandon.
+            let (commit, welcome) = self.storage.with_transaction(|_| {
+                self.stage_member_edits(&mut mls_group, &provider, &parsed_kps, &recovery_removals)
+            })?;
+            (
+                commit,
+                welcome.ok_or_else(|| {
+                    EngineError::Backend("member recovery produced no Welcome".into())
+                })?,
+            )
+        } else if granted_admin_ids.is_empty() {
+            let (commit_out, welcome_out, _gi) = mls_group
+                .add_members(&provider, &self.identity.signer, &parsed_kps)
+                .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+            (commit_out, welcome_out)
+        } else {
+            let admin_updates = vec![Proposal::AppDataUpdate(Box::new(
+                AppDataUpdateProposal::update(
+                    GROUP_ADMIN_POLICY_COMPONENT_ID,
+                    crate::app_components::encode_admin_policy(&resulting_admins)?,
+                ),
+            ))];
+            let (commit_out, welcome_out) = self.stage_commit_with_app_data_updates(
+                &mut mls_group,
+                &provider,
+                Vec::new(),
+                parsed_kps.clone(),
+                admin_updates,
+                "invite",
+            )?;
+            let welcome_out = welcome_out.ok_or_else(|| {
+                EngineError::Backend("invite-with-admin produced no Welcome".into())
+            })?;
+            (commit_out, welcome_out)
+        };
         let own_leaf_index = mls_group.own_leaf_index();
         let staged_commit = mls_group
             .pending_commit()

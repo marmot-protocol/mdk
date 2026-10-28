@@ -9,7 +9,7 @@ use cgka_traits::group_recovery::{
 use cgka_traits::storage::{
     GroupStorage, MaintenanceStorage, MessageStorage, OutboundFanoutStorage, StorageProvider,
 };
-use cgka_traits::{EpochState, InputRejectionCategory, PeelerError};
+use cgka_traits::{EpochState, InputRejectionCategory};
 use storage_sqlite::{
     GroupRecoveryPhase as Phase, GroupRecoveryRecord as Record, GroupRecoveryRole as Role,
 };
@@ -18,9 +18,24 @@ const REQUEST_LIFETIME_SECS: u64 = 10 * 60;
 const MAX_RECIPIENT_JOBS: usize = 64;
 const MAX_RECOVERY_BATCH: usize = 16;
 const RECOVERY_RETRY_SECS: [u64; 5] = [5, 15, 30, 60, 120];
+const MAX_RECIPIENT_ATTEMPTS: u32 = 32;
+const COMMIT_COOLDOWN_SECS: u64 = 600;
+
+/// Automatic replacement-Welcome progress for this device's group copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupRejoinStatus {
+    /// No automatic rejoin episode is active for this copy.
+    Inactive,
+    /// Automatic work is pending; reservations include cancelled lookups.
+    Pending { attempts: u32 },
+    /// Automatic work stopped until fresh evidence or an explicit user retry.
+    Parked { attempts: u32 },
+}
 
 struct RecipientState {
     token: [u8; 32],
+    epoch: EpochId,
+    candidate_set_hash: [u8; 32],
     leaf_index: u32,
     device_key_hash: [u8; 32],
     coordinators: Vec<MemberId>,
@@ -32,6 +47,79 @@ where
     R: TransportRoutingPolicy,
     K: KeyPackagePublisher,
 {
+    /// Read durable automatic rejoin progress without scheduling network work.
+    pub fn group_rejoin_status(&self, group_id: &GroupId) -> AccountResult<GroupRejoinStatus> {
+        let group = self.session.group_record(group_id)?;
+        if !group.unrecoverable || group.is_terminal() {
+            return Ok(GroupRejoinStatus::Inactive);
+        }
+        let record = self
+            .session
+            .storage
+            .list_group_recoveries()
+            .map_err(SessionError::from)?
+            .into_iter()
+            .find(|record| record.role == Role::Recipient && &record.group_id == group_id);
+        Ok(match record {
+            Some(record) if record.phase == Phase::Parked => GroupRejoinStatus::Parked {
+                attempts: record.total_attempts,
+            },
+            Some(record) => GroupRejoinStatus::Pending {
+                attempts: record.total_attempts,
+            },
+            None => GroupRejoinStatus::Inactive,
+        })
+    }
+
+    /// Explicit user retry starts a fresh bounded episode, owned by this runtime.
+    /// It does not authorize replacing a usable copy or publishing any Commit.
+    pub fn retry_group_rejoin(&mut self, group_id: &GroupId) -> AccountResult<GroupRejoinStatus> {
+        if !self.session.ensure_group_hydrated(group_id)? {
+            return Ok(GroupRejoinStatus::Inactive);
+        }
+        let Some(record) = self.new_recipient_recovery(group_id, None, self.wall_clock.now().0)?
+        else {
+            return Ok(GroupRejoinStatus::Inactive);
+        };
+        let old = self
+            .session
+            .storage
+            .list_group_recoveries()
+            .map_err(SessionError::from)?;
+        if !old
+            .iter()
+            .any(|previous| previous.role == Role::Recipient && &previous.group_id == group_id)
+            && old
+                .iter()
+                .filter(|previous| previous.role == Role::Recipient)
+                .count()
+                >= MAX_RECIPIENT_JOBS
+        {
+            return Err(SessionError::from(StorageError::Capacity(
+                "group rejoin recipient journal is full".into(),
+            ))
+            .into());
+        }
+        self.session
+            .storage
+            .with_transaction(|storage| {
+                for previous in &old {
+                    if previous.role == Role::Recipient && &previous.group_id == group_id {
+                        storage.delete_group_recovery(
+                            group_id,
+                            previous.role,
+                            &previous.request_id,
+                        )?;
+                    }
+                }
+                storage.put_group_recovery(&record)
+            })
+            .map_err(SessionError::from)?;
+        self.recovery_turn
+            .retain(|record| record.role != Role::Recipient || &record.group_id != group_id);
+        Ok(GroupRejoinStatus::Pending { attempts: 0 })
+    }
+
     /// Reserve one bounded recovery turn before the host resolves inbox routes.
     /// Cancellation retains the durable retry deadline, never a reusable permit.
     pub fn prepare_group_recovery(&mut self) -> AccountResult<Vec<MemberId>> {
@@ -139,33 +227,64 @@ where
                     continue;
                 }
                 let state = self.recipient_recovery_state(&record.group_id)?;
-                if state
-                    .as_ref()
-                    .is_none_or(|state| Some(state.token) != record.local_state_token)
-                {
+                if state.is_none() {
                     self.session
                         .storage
                         .delete_group_recovery(&record.group_id, record.role, &record.request_id)
                         .map_err(SessionError::from)?;
-                } else if record.expires_at <= now {
-                    let replacement =
-                        self.new_recipient_recovery(&record.group_id, Some(&record.peer), now)?;
-                    self.session
-                        .storage
-                        .with_transaction(|storage| {
-                            storage.delete_group_recovery(
-                                &record.group_id,
-                                record.role,
-                                &record.request_id,
-                            )?;
-                            if let Some(replacement) = &replacement {
-                                storage.put_group_recovery(replacement)?;
-                            }
-                            Ok::<_, StorageError>(())
-                        })
-                        .map_err(SessionError::from)?;
+                } else if let Some(state) = state {
+                    let hash = state.candidate_set_hash;
+                    let evidence = record.candidate_set_hash != Some(hash)
+                        || record
+                            .observed_epoch
+                            .is_none_or(|epoch| state.epoch > epoch);
+                    if evidence
+                        || (record.phase != Phase::Parked
+                            && (record.expires_at <= now
+                                || Some(state.token) != record.local_state_token)
+                            && record.total_attempts < MAX_RECIPIENT_ATTEMPTS)
+                    {
+                        if let Some(mut replacement) =
+                            self.new_recipient_recovery(&record.group_id, Some(&record.peer), now)?
+                        {
+                            replacement.total_attempts =
+                                if evidence { 0 } else { record.total_attempts };
+                            replacement.observed_epoch = Some(
+                                record
+                                    .observed_epoch
+                                    .unwrap_or(state.epoch)
+                                    .max(state.epoch),
+                            );
+                            self.session
+                                .storage
+                                .with_transaction(|storage| {
+                                    storage.delete_group_recovery(
+                                        &record.group_id,
+                                        record.role,
+                                        &record.request_id,
+                                    )?;
+                                    storage.put_group_recovery(&replacement)
+                                })
+                                .map_err(SessionError::from)?;
+                        }
+                    } else if record.phase != Phase::Parked
+                        && record.total_attempts >= MAX_RECIPIENT_ATTEMPTS
+                    {
+                        let mut parked = record.clone();
+                        parked.phase = Phase::Parked;
+                        self.session
+                            .storage
+                            .put_group_recovery(&parked)
+                            .map_err(SessionError::from)?;
+                    }
                 }
-            } else if record.expires_at <= now && record.phase != Phase::Publishing {
+            } else if record.expires_at.max(
+                record
+                    .commit_started_at
+                    .map_or(0, |start| start.saturating_add(COMMIT_COOLDOWN_SECS)),
+            ) <= now
+                && record.phase != Phase::Publishing
+            {
                 self.session
                     .storage
                     .delete_group_recovery(&record.group_id, record.role, &record.request_id)
@@ -213,6 +332,7 @@ where
         }
         records.retain(|record| {
             record.phase != Phase::Complete
+                && record.phase != Phase::Parked
                 && record.retry_at <= now
                 && (record.expires_at > now || record.phase == Phase::Publishing)
         });
@@ -250,6 +370,9 @@ where
                 }
             }
             record.attempts = record.attempts.saturating_add(1);
+            if record.role == Role::Recipient {
+                record.total_attempts = record.total_attempts.saturating_add(1);
+            }
             let index = usize::try_from(record.attempts.saturating_sub(1))
                 .unwrap_or(usize::MAX)
                 .min(RECOVERY_RETRY_SECS.len() - 1);
@@ -309,14 +432,17 @@ where
         }
         for mut record in ready {
             if record.role == Role::Recipient {
-                if self
-                    .recipient_recovery_state(&record.group_id)?
-                    .is_none_or(|state| Some(state.token) != record.local_state_token)
-                {
+                let state = self.recipient_recovery_state(&record.group_id)?;
+                if state.is_none() {
                     self.session
                         .storage
                         .delete_group_recovery(&record.group_id, record.role, &record.request_id)
                         .map_err(SessionError::from)?;
+                    continue;
+                }
+                if state.is_some_and(|state| Some(state.token) != record.local_state_token) {
+                    // Maintenance replaces this stale nonce without discarding
+                    // its episode budget; never publish an old-copy grant.
                     continue;
                 }
                 if record.phase == Phase::Challenge {
@@ -443,6 +569,14 @@ where
             .into_iter()
             .map(|key| MemberId::new(key.to_vec()))
             .collect::<Vec<_>>();
+        coordinators.sort_by(|left, right| left.as_slice().cmp(right.as_slice()));
+        coordinators.dedup();
+        // Hash the actual administrator set before appending the own-account
+        // fallback, so gaining/losing our admin role is still fresh evidence.
+        let candidate_set_hash = candidate_hash(&coordinators);
+        if !coordinators.contains(&self_id) {
+            coordinators.push(self_id.clone());
+        }
         // Another account's admin is tried first; a healthy sibling device can
         // also coordinate through this account's own inbox.
         coordinators.sort_by(|left, right| {
@@ -453,6 +587,8 @@ where
         coordinators.dedup();
         Ok(Some(RecipientState {
             token,
+            epoch: group.epoch,
+            candidate_set_hash,
             leaf_index,
             device_key_hash,
             coordinators,
@@ -501,6 +637,10 @@ where
             retry_at: now,
             attempts: 0,
             phase: Phase::Request,
+            total_attempts: 0,
+            candidate_set_hash: Some(state.candidate_set_hash),
+            observed_epoch: Some(state.epoch),
+            commit_started_at: None,
             message,
             outbound: None,
             commit_id: None,
@@ -510,36 +650,18 @@ where
     pub(super) async fn ingest_group_recovery(
         &mut self,
         carrier: &TransportMessage,
+        authenticated: AuthenticatedGroupRecovery,
     ) -> AccountResult<AccountIngestEffects> {
         let ignored = |category| AccountIngestEffects {
             outcome: IngestOutcome::Ignored { category },
             left_object_unpersisted: true,
             effects: AccountDeviceEffects::default(),
         };
-        if !matches!(&carrier.envelope, TransportEnvelope::GroupRecovery { recipient }
+        if !matches!(&carrier.envelope, TransportEnvelope::Welcome { recipient }
             if recipient == &self.session.self_id())
         {
             return Ok(ignored(InputRejectionCategory::WrongRecipient));
         }
-        let authenticated = match self
-            .session
-            .recovery_peeler
-            .peel_group_recovery(carrier)
-            .await
-        {
-            Ok(message) => message,
-            Err(PeelerError::InvalidSignature) => {
-                return Ok(ignored(InputRejectionCategory::InvalidSignature));
-            }
-            Err(
-                PeelerError::Malformed(_)
-                | PeelerError::DecryptFailed
-                | PeelerError::WrongRecipient,
-            ) => {
-                return Ok(ignored(InputRejectionCategory::InvalidEncoding));
-            }
-            Err(error) => return Err(EngineError::Peeler(error).into()),
-        };
         let AuthenticatedGroupRecovery { sender, message } = authenticated;
         let now = self.wall_clock.now().0;
         if message.expires_at <= now
@@ -616,9 +738,13 @@ where
             .any(|record| {
                 record.role == Role::Coordinator
                     && record.group_id == message.group_id
-                    && record.leaf_index == leaf_index
-                    && record.expires_at > now
-                    && record.phase != Phase::Complete
+                    && ((record.peer == *sender
+                        && record
+                            .commit_started_at
+                            .is_some_and(|start| start.saturating_add(COMMIT_COOLDOWN_SECS) > now))
+                        || (record.leaf_index == leaf_index
+                            && record.expires_at > now
+                            && record.phase != Phase::Complete))
             })
         {
             return Ok(false);
@@ -636,6 +762,10 @@ where
             retry_at: now,
             attempts: 0,
             phase: Phase::Challenge,
+            total_attempts: 0,
+            candidate_set_hash: None,
+            observed_epoch: None,
+            commit_started_at: None,
             message: challenge,
             outbound: None,
             commit_id: None,
@@ -669,6 +799,9 @@ where
             || record.expires_at != message.expires_at
             || Some(state.token) != record.local_state_token
             || state.device_key_hash != source.device_key_hash
+            || record
+                .observed_epoch
+                .is_some_and(|epoch| source.epoch < epoch)
         {
             return Ok(false);
         }
@@ -685,6 +818,16 @@ where
             GroupRecoveryBody::Challenge { source: old } | GroupRecoveryBody::Grant { source: old, .. } if old == source)
         {
             return Ok(true);
+        }
+        let newer = record
+            .observed_epoch
+            .is_none_or(|epoch| source.epoch > epoch);
+        if record.phase == Phase::Parked && !newer {
+            return Ok(false);
+        }
+        if newer {
+            record.total_attempts = 0;
+            record.observed_epoch = Some(source.epoch);
         }
         record.leaf_index = source.leaf_index;
         record.phase = Phase::Challenge;
@@ -817,6 +960,29 @@ where
     ) -> AccountResult<AccountDeviceEffects> {
         let mut output = AccountDeviceEffects::default();
         let now = self.wall_clock.now().0;
+        let retained = self
+            .session
+            .storage
+            .list_group_recoveries()
+            .map_err(SessionError::from)?;
+        // A batch admitted before any Commit reservation may include several
+        // leaves of one account. Later arrivals cannot bypass that account's
+        // cooldown, while every already-owned continuation remains resumable.
+        records.retain(|record| {
+            record.commit_started_at.is_some()
+                || !retained.iter().any(|old| {
+                    old.role == Role::Coordinator
+                        && old.group_id == record.group_id
+                        && old.peer == record.peer
+                        && old.request_id != record.request_id
+                        && old
+                            .commit_started_at
+                            .is_some_and(|start| start.saturating_add(COMMIT_COOLDOWN_SECS) > now)
+                })
+        });
+        if records.is_empty() {
+            return Ok(output);
+        }
         let mut members = Vec::with_capacity(records.len());
         for record in &records {
             let GroupRecoveryBody::Grant {
@@ -844,6 +1010,18 @@ where
             });
         }
         let group_id = records[0].group_id.clone();
+        for record in &mut records {
+            record.commit_started_at.get_or_insert(now);
+        }
+        self.session
+            .storage
+            .with_transaction(|storage| {
+                for record in &records {
+                    storage.put_group_recovery(record)?;
+                }
+                Ok::<_, StorageError>(())
+            })
+            .map_err(SessionError::from)?;
         let staged = self
             .session
             .send(SendIntent::RecoverMembers { group_id, members })
@@ -986,6 +1164,15 @@ where
         record.attempts = 0;
         Ok(true)
     }
+}
+
+fn candidate_hash(candidates: &[MemberId]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    for candidate in candidates {
+        hash.update((candidate.as_slice().len() as u64).to_be_bytes());
+        hash.update(candidate.as_slice());
+    }
+    hash.finalize().into()
 }
 
 fn recovery_expected_refusal(error: &EngineError) -> bool {

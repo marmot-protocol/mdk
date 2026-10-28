@@ -300,12 +300,36 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
+        let peeled = match self.peeler.peel_welcome(msg).await {
+            Ok(cgka_traits::ingest::PeeledMessage {
+                content: PeeledContent::GroupRecovery { recovery },
+                ..
+            }) => {
+                // Account control has no engine-owned durable disposition. The
+                // runtime must authorize and persist it before receipt dedup.
+                self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
+                return Ok(IngestOutcome::GroupRecovery { recovery });
+            }
+            result => result.map_err(EngineError::Peeler),
+        };
+        let prepared = peeled.and_then(|peeled| {
+            let content_id = group_lifecycle::welcome_content_dedup_id(&peeled)?;
+            Ok((peeled, content_id))
+        });
+        let content_id = prepared
+            .as_ref()
+            .ok()
+            .map(|(_, content_id)| content_id.clone());
         // Reuse the existing join_welcome machinery. Any classifiable failure
         // for this individual welcome is terminal input, not a failure of the
         // transport drain: persist an account-scoped marker even when no group
         // id could be recovered, then return a typed stale outcome. Storage and
         // truly internal transition failures still propagate.
-        match self.do_join_welcome(msg.clone()).await {
+        let joined = match prepared {
+            Ok(prepared) => self.do_join_welcome(msg.clone(), Some(prepared)).await,
+            Err(error) => Err(error),
+        };
+        match joined {
             Ok(gid) => {
                 self.persist_transport_message(msg, &gid, EpochId(0), MessageState::Processed)?;
                 Ok(IngestOutcome::Processed)
@@ -320,12 +344,7 @@ impl<S: StorageProvider> Engine<S> {
                 // The offer may have arrived under another transport wrapper.
                 // It owns the content but must remain eligible for ordinary
                 // trusted-removal reentry as well as explicit confirmation.
-                let peeled = self
-                    .peeler
-                    .peel_welcome(msg)
-                    .await
-                    .map_err(EngineError::Peeler)?;
-                let content_id = group_lifecycle::welcome_content_dedup_id(&peeled)?;
+                let content_id = content_id.ok_or(EngineError::InvalidWelcome)?;
                 if self.storage.list_welcomes()?.iter().any(|candidate| {
                     candidate
                         .rejoin
@@ -956,8 +975,8 @@ impl<S: StorageProvider> Engine<S> {
         };
         let mls_bytes = match peeled.content {
             PeeledContent::MlsMessage { bytes } => bytes,
-            PeeledContent::Welcome { .. } => {
-                // A group-message envelope that peels to a Welcome is
+            PeeledContent::Welcome { .. } | PeeledContent::GroupRecovery { .. } => {
+                // A group-message envelope that peels to account-inbox content is
                 // malformed: terminal. Retire the raw deferred row first
                 // so its cap slot is released (mdk#339).
                 self.mark_raw_transport_message_failed_if_awaiting_retry(

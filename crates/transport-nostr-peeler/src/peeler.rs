@@ -191,13 +191,13 @@ impl NostrMlsPeeler {
         })
     }
 
-    /// Peel once and return the public IDs validated at this transport boundary.
-    /// Existing callers use `TransportPeeler::peel_welcome`, which discards this
-    /// metadata without changing admission or error behavior.
+    /// Unseal once and return public Welcome IDs only for authenticated Welcomes.
+    /// Account-control rumors have no Welcome provenance. The ordinary trait
+    /// method discards this metadata without repeating decryption.
     pub async fn peel_welcome_with_provenance(
         &self,
         msg: &TransportMessage,
-    ) -> Result<(PeeledMessage, WelcomePeelProvenance), PeelerError> {
+    ) -> Result<(PeeledMessage, Option<WelcomePeelProvenance>), PeelerError> {
         let signer = self.welcome_signer()?;
         let event = NostrTransportEvent::from_transport_message(msg).map_err(to_peeler_error)?;
         if event.kind != KIND_NIP59_GIFT_WRAP {
@@ -207,11 +207,11 @@ impl NostrMlsPeeler {
             )));
         }
         ensure_welcome_routing_matches(&event, msg)?;
-        if event.is_group_recovery().map_err(to_peeler_error)? {
-            return Err(PeelerError::Malformed(
-                "welcome peeler received recovery control".into(),
-            ));
-        }
+        let recipient = event
+            .single_tag_value(RECIPIENT_TAG)
+            .map_err(to_peeler_error)?;
+        let recipient =
+            decode_hex_exact("recipient p tag", recipient, 32).map_err(to_peeler_error)?;
         ensure_event_identity_matches(&event, msg)?;
         if event.sig.is_none() {
             return Err(PeelerError::InvalidSignature);
@@ -225,9 +225,55 @@ impl NostrMlsPeeler {
                 .await
                 .map_err(map_nip59_error)?;
 
+        // The outer carrier carries no recovery discriminator. Only the verified
+        // seal author's authenticated inner kind and singleton version dispatch.
+        if unwrapped.rumor.kind == Kind::Custom(KIND_MDK_GROUP_RECOVERY_RUMOR) {
+            let local = signer
+                .get_public_key()
+                .await
+                .map_err(|_| PeelerError::DecryptFailed)?;
+            if recipient.as_slice() != local.as_bytes() {
+                return Err(PeelerError::WrongRecipient);
+            }
+            if msg.payload.len() > MAX_GROUP_RECOVERY_EVENT_BYTES {
+                return Err(PeelerError::Malformed(
+                    "recovery carrier exceeds limit".into(),
+                ));
+            }
+            let protocol = rumor_single_tag(&unwrapped.rumor, GROUP_RECOVERY_PROTOCOL_TAG)?;
+            if protocol.len() != 2 || protocol[1] != GROUP_RECOVERY_PROTOCOL_VERSION {
+                return Err(PeelerError::Malformed(
+                    "invalid authenticated recovery protocol tag".into(),
+                ));
+            }
+            let inner_recipient = rumor_single_tag(&unwrapped.rumor, RECIPIENT_TAG)?;
+            if inner_recipient.len() != 2
+                || decode_hex_exact("recovery recipient", &inner_recipient[1], 32)
+                    .map_err(to_peeler_error)?
+                    != recipient
+            {
+                return Err(PeelerError::WrongRecipient);
+            }
+            let message = GroupRecoveryMessage::decode(unwrapped.rumor.content.as_bytes())?;
+            return Ok((
+                PeeledMessage {
+                    id: msg.id.clone(),
+                    group_id: None,
+                    sender: None,
+                    content: PeeledContent::GroupRecovery {
+                        recovery: Box::new(AuthenticatedGroupRecovery {
+                            sender: MemberId::new(unwrapped.sender.to_bytes().to_vec()),
+                            message,
+                        }),
+                    },
+                    origin: msg.clone(),
+                },
+                None,
+            ));
+        }
         if unwrapped.rumor.kind != Kind::Custom(KIND_MARMOT_WELCOME_RUMOR) {
             return Err(PeelerError::Malformed(format!(
-                "expected Marmot welcome rumor kind {KIND_MARMOT_WELCOME_RUMOR}, got {}",
+                "unsupported authenticated account-inbox rumor kind {}",
                 u16::from(unwrapped.rumor.kind)
             )));
         }
@@ -273,10 +319,10 @@ impl NostrMlsPeeler {
                 },
                 origin: msg.clone(),
             },
-            WelcomePeelProvenance {
+            Some(WelcomePeelProvenance {
                 rumor_event_id,
                 key_package_event_id,
-            },
+            }),
         ))
     }
 }
@@ -346,72 +392,6 @@ impl TransportPeeler for NostrMlsPeeler {
         self.peel_welcome_with_provenance(msg)
             .await
             .map(|(peeled, _)| peeled)
-    }
-
-    async fn peel_group_recovery(
-        &self,
-        msg: &TransportMessage,
-    ) -> Result<AuthenticatedGroupRecovery, PeelerError> {
-        if msg.payload.len() > MAX_GROUP_RECOVERY_EVENT_BYTES {
-            return Err(PeelerError::Malformed(
-                "recovery carrier exceeds limit".into(),
-            ));
-        }
-        let signer = self.welcome_signer()?;
-        let event = NostrTransportEvent::from_transport_message(msg).map_err(to_peeler_error)?;
-        if event.kind != KIND_NIP59_GIFT_WRAP
-            || !event.is_group_recovery().map_err(to_peeler_error)?
-        {
-            return Err(PeelerError::Malformed("expected recovery gift wrap".into()));
-        }
-        ensure_event_identity_matches(&event, msg)?;
-        let recipient = event
-            .single_tag_value(RECIPIENT_TAG)
-            .map_err(to_peeler_error)?;
-        let recipient =
-            decode_hex_exact("recipient p tag", recipient, 32).map_err(to_peeler_error)?;
-        let local = signer
-            .get_public_key()
-            .await
-            .map_err(|_| PeelerError::DecryptFailed)?;
-        if recipient.as_slice() != local.as_bytes()
-            || !matches!(&msg.envelope, TransportEnvelope::GroupRecovery { recipient: route } if route.as_slice() == recipient.as_slice())
-        {
-            return Err(PeelerError::WrongRecipient);
-        }
-        // Both signatures are verified by NIP-59, and the rumor author must
-        // equal the signed seal author. The ephemeral outer pubkey is not an
-        // account identity and the signed outer marker is only a dispatch hint.
-        let gift_wrap =
-            Event::from_json(&msg.payload).map_err(|_| PeelerError::InvalidSignature)?;
-        let unwrapped =
-            nostr::nips::nip59::extract_rumor_async(&SdkSigner(signer.clone()), &gift_wrap)
-                .await
-                .map_err(map_nip59_error)?;
-        if unwrapped.rumor.kind != Kind::Custom(KIND_MDK_GROUP_RECOVERY_RUMOR) {
-            return Err(PeelerError::Malformed(
-                "expected recovery rumor kind".into(),
-            ));
-        }
-        let protocol = rumor_single_tag(&unwrapped.rumor, GROUP_RECOVERY_PROTOCOL_TAG)?;
-        if protocol.len() != 2 || protocol[1] != GROUP_RECOVERY_PROTOCOL_VERSION {
-            return Err(PeelerError::Malformed(
-                "invalid authenticated recovery protocol tag".into(),
-            ));
-        }
-        let inner_recipient = rumor_single_tag(&unwrapped.rumor, RECIPIENT_TAG)?;
-        if inner_recipient.len() != 2
-            || decode_hex_exact("recovery recipient", &inner_recipient[1], 32)
-                .map_err(to_peeler_error)?
-                != recipient
-        {
-            return Err(PeelerError::WrongRecipient);
-        }
-        let message = GroupRecoveryMessage::decode(unwrapped.rumor.content.as_bytes())?;
-        Ok(AuthenticatedGroupRecovery {
-            sender: MemberId::new(unwrapped.sender.to_bytes().to_vec()),
-            message,
-        })
     }
 
     async fn wrap_group_recovery(
@@ -597,7 +577,7 @@ fn transport_group_id(msg: &TransportMessage) -> Option<GroupId> {
         TransportEnvelope::GroupMessage { transport_group_id } => {
             Some(GroupId::new(transport_group_id.clone()))
         }
-        TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => None,
+        TransportEnvelope::Welcome { .. } => None,
     }
 }
 
@@ -629,9 +609,9 @@ fn ensure_group_routing_matches(
             Ok(())
         }
         TransportEnvelope::GroupMessage { .. } => Err(PeelerError::WrongRecipient),
-        TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => Err(
-            PeelerError::Malformed("group peeler received welcome envelope".into()),
-        ),
+        TransportEnvelope::Welcome { .. } => Err(PeelerError::Malformed(
+            "group peeler received welcome envelope".into(),
+        )),
     }
 }
 
@@ -648,9 +628,9 @@ fn ensure_welcome_routing_matches(
             Ok(())
         }
         TransportEnvelope::Welcome { .. } => Err(PeelerError::WrongRecipient),
-        TransportEnvelope::GroupMessage { .. } | TransportEnvelope::GroupRecovery { .. } => Err(
-            PeelerError::Malformed("welcome peeler received group envelope".into()),
-        ),
+        TransportEnvelope::GroupMessage { .. } => Err(PeelerError::Malformed(
+            "welcome peeler received group envelope".into(),
+        )),
     }
 }
 
@@ -1299,6 +1279,7 @@ mod tests {
                 .unwrap();
             let (peeled, provenance) = peeler.peel_welcome_with_provenance(&message).await.unwrap();
             assert!(matches!(peeled.content, PeeledContent::Welcome { .. }));
+            let provenance = provenance.expect("Welcome has authenticated provenance");
             assert_eq!(provenance.rumor_event_id, expected);
             assert_eq!(provenance.key_package_event_id, [0x44; 32]);
         }

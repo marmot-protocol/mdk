@@ -281,7 +281,11 @@ impl<S: StorageProvider> Engine<S> {
                 group_id: group_id.clone(),
             });
         }
-        crate::app_components::require_admin(group, group_id, self.identity.self_id())?;
+        if crate::commit_class::classify_member_edit(group, self.identity.self_id(), member)?
+            .requires_admin()
+        {
+            crate::app_components::require_admin(group, group_id, self.identity.self_id())?;
+        }
         let epoch = EpochId(group.epoch().as_u64());
         if record.epoch != epoch {
             return Err(EngineError::GroupRecoveryUnsettled {

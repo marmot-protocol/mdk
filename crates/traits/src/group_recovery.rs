@@ -72,7 +72,7 @@ pub enum GroupRecoveryBody {
 }
 
 /// Control content bound to the verified account signer, not an outer carrier.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthenticatedGroupRecovery {
     pub sender: MemberId,
     pub message: GroupRecoveryMessage,

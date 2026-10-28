@@ -53,7 +53,7 @@ fn inbound_wire_metadata(
         TransportEnvelope::GroupMessage { transport_group_id } => {
             Some(hex::encode(transport_group_id))
         }
-        TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => None,
+        TransportEnvelope::Welcome { .. } => None,
     };
     let is_gift_wrap = event.kind == KIND_NIP59_GIFT_WRAP;
     TransportWireMetadata {
@@ -6699,8 +6699,7 @@ impl AdapterState {
                     })
                     .collect()
             }
-            TransportEnvelope::Welcome { recipient }
-            | TransportEnvelope::GroupRecovery { recipient } => {
+            TransportEnvelope::Welcome { recipient } => {
                 // #698/#752: parse the inbound endpoint once (not per candidate,
                 // not per account) and match against pre-canonicalized inbox
                 // endpoints, mirroring the group arm above.

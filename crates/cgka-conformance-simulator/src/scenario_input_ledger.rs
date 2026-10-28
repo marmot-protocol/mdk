@@ -191,6 +191,10 @@ impl ScenarioInputTracker {
                 entry.disposition = ScenarioInputDisposition::Accepted;
                 entry.pending = false;
             }
+            Ok(IngestOutcome::GroupRecovery { .. }) => {
+                entry.disposition = ScenarioInputDisposition::Pending;
+                entry.pending = true;
+            }
             Ok(IngestOutcome::Buffered { .. }) => {
                 entry.ingest_accepted += 1;
                 entry.disposition = ScenarioInputDisposition::Pending;

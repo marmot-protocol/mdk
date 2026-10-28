@@ -120,15 +120,6 @@ fn content_id(msg: &TransportMessage) -> MessageId {
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -206,15 +197,6 @@ impl TransportPeeler for MockPeeler {
 
 #[async_trait]
 impl TransportPeeler for RecordingPeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -266,15 +248,6 @@ impl TransportPeeler for RecordingPeeler {
 
 #[async_trait]
 impl TransportPeeler for FailOncePeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -323,15 +296,6 @@ impl TransportPeeler for FailOncePeeler {
 
 #[async_trait]
 impl TransportPeeler for MalformedShortPayloadPeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -378,15 +342,6 @@ impl TransportPeeler for MalformedShortPayloadPeeler {
 
 #[async_trait]
 impl TransportPeeler for BoundaryRejectionPeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -464,15 +419,6 @@ struct SnapshotFallbackMalformedPeeler {
 
 #[async_trait]
 impl TransportPeeler for SnapshotFallbackMalformedPeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -530,15 +476,6 @@ struct CountingPeeler {
 
 #[async_trait]
 impl TransportPeeler for CountingPeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,

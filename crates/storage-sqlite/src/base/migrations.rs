@@ -258,8 +258,8 @@ mod migration_0120_member_count_accounts;
 mod migration_0121_drop_member_capabilities;
 #[path = "migrations/0122_push_join_window.rs"]
 mod migration_0122_push_join_window;
-#[path = "migrations/0123_group_recovery.rs"]
-mod migration_0123_group_recovery;
+#[path = "migrations/0123_group_rejoin.rs"]
+mod migration_0123_group_rejoin;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1015,9 +1015,9 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 123,
-        name: "0123_group_recovery",
+        name: "0123_group_rejoin",
         suspend_foreign_keys: &[],
-        apply: migration_0123_group_recovery::apply,
+        apply: migration_0123_group_rejoin::apply,
     },
 ];
 

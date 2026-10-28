@@ -421,10 +421,7 @@ fn transport_reconciliation_record(
     delivery: &cgka_traits::TransportDelivery,
 ) -> Option<(TransportReconciliationRoute, TransportReconciliationItem)> {
     let route = match &delivery.message.envelope {
-        TransportEnvelope::Welcome { recipient }
-        | TransportEnvelope::GroupRecovery { recipient }
-            if recipient == account_id =>
-        {
+        TransportEnvelope::Welcome { recipient } if recipient == account_id => {
             TransportReconciliationRoute::Inbox
         }
         TransportEnvelope::GroupMessage { transport_group_id }
@@ -3850,15 +3847,11 @@ impl AppClient {
         let group_id_hint = delivery.group_id_hint.clone();
         let reconciliation_record =
             transport_reconciliation_record(client.adapter.account_id(), delivery);
-        let welcome = matches!(
+        let inbox = matches!(
             &delivery.message.envelope,
             TransportEnvelope::Welcome { .. }
         );
-        let group_recovery = matches!(
-            &delivery.message.envelope,
-            TransportEnvelope::GroupRecovery { .. }
-        );
-        let probe_receive = if welcome && (client.audit_v5_enabled() || cfg!(test)) {
+        let probe_receive = if inbox && (client.audit_v5_enabled() || cfg!(test)) {
             client
                 .audit_v5_probe
                 .as_mut()
@@ -3870,12 +3863,12 @@ impl AppClient {
         // Hold the same account policy lock through admission and projection, so a
         // block cannot commit between authenticating the inviter and creating state.
         let policy_lock = client.app.block_update_lock(&client.state.label).await;
-        let _welcome_policy_guard = if welcome {
+        let _welcome_policy_guard = if inbox {
             Some(policy_lock.lock().await)
         } else {
             None
         };
-        if welcome {
+        if inbox {
             let storage = client
                 .app
                 .account_storage(&client.state.label)?
@@ -3888,54 +3881,17 @@ impl AppClient {
                     inventory_record: None,
                 });
             }
-            // Dismissals remain authoritative after unblock. With no current
-            // blocks the normal ingress peeler is sufficient.
-            if storage.has_blocked_users()? {
-                let account = client.app.account_home().account(&client.state.label)?;
-                let peeler = transport_nostr_peeler::NostrMlsPeeler::new().with_welcome_signer_arc(
-                    client
-                        .app
-                        .account_signer_for_summary(&account)?
-                        .as_nostr_signer(),
-                );
-                // The seal's authenticated sender is authoritative, never the outer gift-wrap key.
-                // A peel failure proceeds to normal admission, which rejects invalid envelopes.
-                if let Ok(peeled) =
-                    cgka_traits::peeler::TransportPeeler::peel_welcome(&peeler, &delivery.message)
-                        .await
-                    && let Some(sender) = peeled.sender
-                    && storage.is_user_blocked(&hex::encode(sender.as_slice()))?
-                {
-                    storage.dismiss_blocked_welcome(&source_message_id_hex)?;
-                    return Ok(DeliveryIngest {
-                        routes_dirty: false,
-                        must_stay_fetchable: false,
-                        refused_group: None,
-                        inventory_record: None,
-                    });
-                }
-            }
+            // Dismissals stay authoritative after unblock. The installed app
+            // peeler checks inviter policy after its one authenticated decode.
         }
-        let rejoin_offers_before = if welcome {
+        let rejoin_offers_before = if inbox {
             Some(client.rejoin_offer_snapshot()?)
         } else {
             None
         };
         let observation = client.app.product_analytics.begin(
-            if welcome {
-                crate::ProductFamily::Welcome
-            } else if group_recovery {
-                crate::ProductFamily::Recovery
-            } else {
-                crate::ProductFamily::MessageProcessing
-            },
-            if welcome {
-                "process"
-            } else if group_recovery {
-                "unrecoverable"
-            } else {
-                "receive"
-            },
+            crate::ProductFamily::MessageProcessing,
+            if inbox { "inbox" } else { "receive" },
             crate::ProductUnit::Attempt,
         );
         let telemetry = client.runtime_telemetry.clone();
@@ -4018,6 +3974,7 @@ impl AppClient {
             observation.finish(match &ingest {
                 Ok(effects) => match &effects.outcome {
                     IngestOutcome::Processed => "success",
+                    IngestOutcome::GroupRecovery { .. } => "account_control",
                     // Another device's Welcome delivery is one more copy of
                     // the account's invitation here, not a rejected Welcome.
                     IngestOutcome::Ignored {
@@ -5801,6 +5758,10 @@ impl AppClient {
                 self.delivery_loss_blocks_cursor(),
             ));
         }
+        // Explicit host Repair is user authorization for one new finite
+        // replacement-Welcome episode; the runtime alone mutates its journal.
+        self.retry_parked_rejoins()
+            .map_err(|error| state_persist(SyncSummary::default(), error))?;
         if self
             .refresh_sync_routes()
             .map_err(|error| state_persist(SyncSummary::default(), error))?

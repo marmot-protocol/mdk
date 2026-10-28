@@ -76,15 +76,6 @@ struct MockPeeler;
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -167,15 +158,6 @@ struct UnreadablePeeler;
 
 #[async_trait]
 impl TransportPeeler for UnreadablePeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -985,7 +967,7 @@ fn hash_id(bytes: &[u8]) -> MessageId {
 
 fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
     match msg.envelope {
-        TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => msg,
+        TransportEnvelope::Welcome { .. } => msg,
         TransportEnvelope::GroupMessage { .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
@@ -1970,6 +1952,10 @@ async fn run_recovery_child(database: &Path) {
                 retry_at: 0,
                 attempts: 0,
                 phase: GroupRecoveryPhase::Publishing,
+                total_attempts: 0,
+                candidate_set_hash: None,
+                observed_epoch: None,
+                commit_started_at: Some(0),
                 message: GroupRecoveryMessage {
                     group_id,
                     request_id,

@@ -4846,6 +4846,7 @@ impl MarmotApp {
             Box::new(client::audit_v5_probe::ProbePeeler {
                 inner: peeler,
                 slot: audit_v5_peel_slot.clone(),
+                storage: self.account_storage(label)?.app_storage(),
             });
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
         // The engine gets its own connection to `session.sqlite`, which no
@@ -7949,8 +7950,7 @@ impl TransportRoutingPolicy for AppTransportRouting {
     ) -> Result<TransportPublishTarget, TransportRoutingError> {
         let state = self.read();
         match &message.envelope {
-            TransportEnvelope::Welcome { recipient }
-            | TransportEnvelope::GroupRecovery { recipient } => {
+            TransportEnvelope::Welcome { recipient } => {
                 let endpoints = state
                     .inbox_routes
                     .get(recipient)

@@ -10,7 +10,6 @@ pub enum ScenarioTransportClass {
     Application,
     Welcome,
     GroupMessage,
-    GroupRecovery,
 }
 
 /// Select one queued transport object by stable scenario meaning rather than

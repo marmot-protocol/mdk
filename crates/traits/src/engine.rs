@@ -1186,7 +1186,9 @@ pub trait CgkaEngine: Send + Sync {
 
     /// Bind a recovery challenge to the current authenticated branch and exact
     /// current leaf whose signing-key SHA256 is `device_key_hash`, owned by
-    /// `member`. Requires a healthy, settled local admin copy.
+    /// `member`. Requires a healthy, settled copy and current member-edit
+    /// authority: an admin, or an own-account sibling when account-devices is
+    /// required. The coordinator's own leaf is never a replacement target.
     fn group_recovery_source(
         &self,
         group_id: &GroupId,

@@ -607,12 +607,6 @@ mod tests {
         struct OpaquePeeler(NostrMlsPeeler);
         #[async_trait::async_trait]
         impl TransportPeeler for OpaquePeeler {
-            async fn peel_group_recovery(
-                &self,
-                msg: &TransportMessage,
-            ) -> Result<cgka_traits::AuthenticatedGroupRecovery, PeelerError> {
-                self.0.peel_group_recovery(msg).await
-            }
             async fn wrap_group_recovery(
                 &self,
                 message: &cgka_traits::GroupRecoveryMessage,
@@ -1700,12 +1694,6 @@ struct WelcomeWrapRefusalPeeler {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl TransportPeeler for WelcomeWrapRefusalPeeler {
-    async fn peel_group_recovery(
-        &self,
-        msg: &TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, PeelerError> {
-        self.inner.peel_group_recovery(msg).await
-    }
     async fn wrap_group_recovery(
         &self,
         message: &cgka_traits::GroupRecoveryMessage,
@@ -3733,9 +3721,6 @@ impl HarnessClient {
             TransportEnvelope::Welcome { .. } => {
                 return Err("welcomes do not carry MLS group-message bytes".into());
             }
-            TransportEnvelope::GroupRecovery { .. } => {
-                return Err("group recovery does not carry MLS group-message bytes".into());
-            }
         };
         let ctx = self
             .engine()
@@ -3754,7 +3739,9 @@ impl HarnessClient {
                 payload: bytes,
                 ..msg.clone()
             }),
-            PeeledContent::Welcome { .. } => Err("group peeler returned a welcome".into()),
+            PeeledContent::Welcome { .. } | PeeledContent::GroupRecovery { .. } => {
+                Err("group peeler returned account-inbox content".into())
+            }
         }
     }
 }

@@ -95,7 +95,7 @@
         "publication": { "type": "string", "minLength": 1 },
         "sender": { "type": "string", "minLength": 1 },
         "class": {
-          "enum": ["commit", "proposal", "application", "welcome", "group_message", "group_recovery"]
+          "enum": ["commit", "proposal", "application", "welcome", "group_message"]
         },
         "occurrence": { "type": "integer", "minimum": 0 }
       },

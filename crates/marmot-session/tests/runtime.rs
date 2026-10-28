@@ -154,15 +154,6 @@ impl MaintenanceRandom for TestRandom {
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, PeelerError> {
-        Err(PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -728,7 +719,7 @@ impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
     ) -> Result<TransportPublishTarget, TransportRoutingError> {
         let transport_group_id = match &message.envelope {
             TransportEnvelope::GroupMessage { transport_group_id } => transport_group_id.clone(),
-            TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => {
+            TransportEnvelope::Welcome { .. } => {
                 return Err(TransportRoutingError::MissingInboxRoute);
             }
         };
@@ -751,6 +742,7 @@ include!("runtime/multi_device_welcome.rs");
 include!("runtime/key_package_slot.rs");
 include!("runtime/key_package_slot_withdrawal.rs");
 include!("runtime/recovery_eligibility.rs");
+include!("runtime/rejoin_budget.rs");
 include!("runtime/account_devices_advertising.rs");
 
 #[derive(Clone, Default)]

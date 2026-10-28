@@ -352,7 +352,6 @@ impl TransportBus {
                         broadcast_welcomes || recipient == ident
                     }
                     TransportEnvelope::GroupMessage { .. } => true,
-                    TransportEnvelope::GroupRecovery { recipient } => recipient == ident,
                 };
                 if deliver {
                     inner.mailboxes.get_mut(cid).unwrap().push(msg.clone());
@@ -594,9 +593,6 @@ fn transport_class_matches(
 ) -> bool {
     match class {
         ScenarioTransportClass::Welcome => matches!(envelope, TransportEnvelope::Welcome { .. }),
-        ScenarioTransportClass::GroupRecovery => {
-            matches!(envelope, TransportEnvelope::GroupRecovery { .. })
-        }
         ScenarioTransportClass::GroupMessage => {
             matches!(envelope, TransportEnvelope::GroupMessage { .. })
         }
@@ -623,7 +619,6 @@ fn targets_client(
     }
     match &in_flight.msg.envelope {
         TransportEnvelope::GroupMessage { .. } => true,
-        TransportEnvelope::GroupRecovery { recipient } => recipient == identity,
         TransportEnvelope::Welcome { recipient } => {
             matches!(
                 policy,
@@ -680,8 +675,10 @@ mod tests {
     use cgka_traits::transport::{Timestamp, TransportSource};
 
     #[test]
-    fn recovery_is_private() {
-        let bus = TransportBus::ordered();
+    fn inbox_is_account_addressed() {
+        let bus = TransportBus::with_policy(DeliveryPolicy::Ordered {
+            broadcast_welcomes: false,
+        });
         let sender = bus.attach(MemberId::new(vec![1; 32]));
         let recipient = MemberId::new(vec![2; 32]);
         let addressed = bus.attach(recipient.clone());
@@ -692,7 +689,7 @@ mod tests {
             timestamp: Timestamp(1),
             causal_deps: Vec::new(),
             source: TransportSource("test".into()),
-            envelope: TransportEnvelope::GroupRecovery { recipient },
+            envelope: TransportEnvelope::Welcome { recipient },
         };
         bus.send(sender, message.clone());
         bus.deliver_all();

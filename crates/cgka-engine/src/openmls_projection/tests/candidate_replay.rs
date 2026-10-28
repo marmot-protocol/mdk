@@ -81,15 +81,6 @@ struct PassthroughPeeler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TransportPeeler for PassthroughPeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,

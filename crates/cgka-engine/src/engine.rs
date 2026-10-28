@@ -1367,8 +1367,7 @@ impl<S: StorageProvider> Engine<S> {
         for welcome in welcomes {
             let recipient = match &welcome.envelope {
                 TransportEnvelope::Welcome { recipient } => Some(recipient.clone()),
-                TransportEnvelope::GroupMessage { .. }
-                | TransportEnvelope::GroupRecovery { .. } => None,
+                TransportEnvelope::GroupMessage { .. } => None,
             };
             let (expected_member_refs, expected_count) = match &recipient {
                 Some(recipient) => (
@@ -3814,7 +3813,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &mut self,
         welcome_msg: TransportMessage,
     ) -> Result<GroupId, EngineError> {
-        self.do_join_welcome(welcome_msg).await
+        self.do_join_welcome(welcome_msg, None).await
     }
 
     fn feature_status(

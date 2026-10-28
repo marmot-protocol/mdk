@@ -167,15 +167,6 @@ impl CountingEpochGatePeeler {
 
 #[async_trait]
 impl TransportPeeler for CountingEpochGatePeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -266,13 +257,6 @@ impl CancellableEpochSealedPeeler {
 
 #[async_trait]
 impl TransportPeeler for CancellableEpochSealedPeeler {
-    async fn peel_group_recovery(
-        &self,
-        msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        EpochSealedPeeler.peel_group_recovery(msg).await
-    }
-
     async fn wrap_group_recovery(
         &self,
         message: &cgka_traits::GroupRecoveryMessage,
@@ -346,15 +330,6 @@ impl NotifyEpochGatePeeler {
 
 #[async_trait]
 impl TransportPeeler for NotifyEpochGatePeeler {
-    async fn peel_group_recovery(
-        &self,
-        _msg: &cgka_traits::TransportMessage,
-    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
     async fn wrap_group_recovery(
         &self,
         _message: &cgka_traits::GroupRecoveryMessage,
@@ -527,7 +502,7 @@ fn build_epoch_sealed_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, Sqli
 
 fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
     match msg.envelope {
-        TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => msg,
+        TransportEnvelope::Welcome { .. } => msg,
         TransportEnvelope::GroupMessage { .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),

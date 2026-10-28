@@ -23,7 +23,7 @@ pub use key_package::{
 pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy};
 pub use runtime::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, AccountIngestPhase,
-    CompletedWelcomePublishTask, FailedApplicationMessage, MaintenanceActivity,
+    CompletedWelcomePublishTask, FailedApplicationMessage, GroupRejoinStatus, MaintenanceActivity,
     MaintenanceAttemptDuration, MaintenanceTiming, PendingResolution, PreparedSessionCommit,
     PreparedSessionSend, PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage,
     UndeliveredCommit, UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,

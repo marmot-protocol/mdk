@@ -83,8 +83,13 @@ available. A recovery warning, unreadable message, higher peer epoch or incoming
 Usable forks still require the explicit rejoin consent described above. Removed, leaving, disbanding and disbanded
 copies cannot request automatic reentry.
 
-The halted device contacts one known admin account at a time through its advertised inbox. A healthy current admin
-finds the device's current leaf by its persisted signing-key hash and challenges that exact leaf on its settled
+Both Unrecoverable checks are local client gates, not remotely attested conditions. The coordinator verifies
+current membership, device-key possession, the exact source and the fresh package; it cannot inspect the recipient's
+database or prove that its history is lost.
+
+The halted device contacts one known admin account at a time through its advertised inbox, then its own account
+as a fallback. A healthy authorized coordinator finds the device's current leaf by its persisted signing-key hash
+and challenges that exact leaf on its settled
 branch. The frozen device's old leaf position is not identity: a prior replacement may have moved it even when its
 Welcome was lost. A removed signing key cannot select a new device that reused the same position.
 The recipient publishes a fresh compatible KeyPackage,
@@ -92,32 +97,50 @@ retains its publication event reference, and signs a grant with its existing MLS
 group, coordinator account and device-key hash, nonce, expiry, source epoch/authenticator hash, exact leaf/hash,
 target device-key hash and complete
 KeyPackage. Possessing the account key or copying a sibling's public KeyPackage is insufficient to replace that
-sibling. A healthy admin device on the same account may coordinate; its own leaf is never a replacement target.
+sibling. When account-devices is required, a healthy non-admin sibling may use the existing own-account member-edit
+authority; replacing another account's device remains admin-only. The coordinator's own leaf is never a target.
 The recipient selects the first challenged coordinator device for each nonce. Other devices of that admin account
 cannot change the selection or stage the resulting grant; the selected device may refresh its source after an epoch
 advance. This prevents shared-account inbox delivery from producing competing recovery Commits.
 
-The coordinator revalidates current membership, admin authority, source state, package compatibility and device
+The coordinator revalidates current membership, member-edit authority, source state, package compatibility and device
 proof immediately before staging one atomic remove-and-add Commit. It preserves account admin roles and unrelated
 device leaves. The ordinary publish-before-apply path confirms the Commit before releasing its fresh Welcome.
 The existing authenticated Welcome repair installs the copy on the running recipient, preserves stored application
 history and retires obsolete convergence residue. It cannot reconstruct messages whose epoch secrets were pruned.
+
+The repair transaction records the installed epoch in `Group::local_copy_install_epoch` and the Welcome's creation
+time in `Group::local_copy_welcome_created_at`, clamped to the local clock. History recovery can read those durable
+fields after reopen; no additional rejoined event is required. Zero or `None` means that a bound is unknown.
+The timestamp is only a soft scheduling hint. Delayed messages may retain an old compose time while being encrypted
+at the current epoch, and retained anchors may still decrypt previous membership intervals. A replacement therefore
+resets `join_epoch` to zero and retires obsolete commits, not every older raw application row. Do not turn the
+Welcome timestamp into a terminal ciphertext-deletion cutoff.
 
 A delayed Welcome can heal the recipient while another recovery grant is already in flight. If that replacement
 then removes its old leaf, the ordinary trusted-removal retry installs the queued Welcome after the native copy
 becomes inactive, even if the account remains in the roster. A durable removal marker alone never bypasses
 consent for a usable native copy.
 
-These controls are an MDK-private NIP-59 extension: outer kind `1059`, inner rumor kind `21159`, with exactly one
-`["mdk_group_recovery", "1"]` tag on both. They use the account inbox, not the broken group's encryption context,
-and create no chat entries. They are not a Marmot-standard kind allocation.
+These controls are an MDK-private NIP-59 extension: outer kind `1059` has no recovery discriminator. After one
+authenticated unwrap, the inner rumor's kind `1159` and exactly one `["mdk_group_recovery", "1"]` tag distinguish
+it from a Welcome. They use the account inbox, not the broken group's encryption context, and create no chat entries.
+Kind `1159` is proposed, not allocated; the wire contract and older-client rollout questions are tracked in
+[marmot#451](https://github.com/marmot-protocol/marmot/issues/451).
 
-Migration 0123 adds the protocol-owned `cgka_group_recovery` journal and gates older writers. Retry reservations
-precede directory/network work; cancellation and reopen keep their deadlines and exact authored packets. Requests
-expire after ten minutes; delays are 5, 15, 30, 60 and then 120 seconds, revisited by ordinary worker maintenance.
-Expiry rotates to the next known admin. The runtime admits at most 64 recipient jobs per account, 256 coordinator
-jobs per account and 16 per group; compatible grants batch at most 16 recipients per turn. Capacity refusal never
-evicts an active grant. Paused maintenance, frozen cursor mode and closed storage suppress automatic execution.
+Migration 0123 adds the protocol-owned `cgka_group_rejoin` journal and gates older writers. Its number must be
+rechecked against the in-flight history-recovery migrations when rebasing. Retry reservations precede directory
+and network work. One recipient episode permits 32 reservations across nonce rotation, request expiry, phase
+changes, cancellation and reopen. Exhaustion durably parks the episode rather than rotating forever. A changed
+known admin set, a newer native epoch or authenticated newer coordinator epoch, or explicit user retry rearms it;
+elapsed time and restart do not.
+
+Requests expire after ten minutes; delays are 5, 15, 30, 60 and then 120 seconds, revisited by ordinary maintenance.
+Expiry rotates to the next candidate without resetting episode cost. A coordinator durably reserves a 600-second
+per-group/member Commit cooldown before staging; a new nonce cannot bypass it. The runtime admits at most 64
+recipient jobs per account, 256 coordinator jobs per account and 16 per group; compatible grants batch at most 16
+recipients per turn. Capacity refusal never evicts an active grant. Paused maintenance, frozen cursor mode and
+closed storage suppress automatic execution.
 
 Recovery evolution ownership is durable before MLS staging. A crash in unexposed preparation atomically abandons
 the pending Commit and staged Welcomes. A prepared publication resumes its original Commit, pending reference and
@@ -131,3 +154,9 @@ Quarantined group records retire their stale recipient jobs without blocking rec
 `MarmotAppRuntime` drives this automatically. Lower-level Rust hosts drive `prepare_group_recovery`, resolve only
 the returned members' safe inbox routes, then call `advance_group_recovery` in their existing account loop. Both
 methods belong to the same runtime owner; preparation durably reserves each turn before cancellable lookup work.
+Hosts can read `group_rejoin_status` as `Inactive`, `Pending { attempts }` or `Parked { attempts }`. A parked episode
+raises the existing app recovery-failure signal so a host can ask the user to retry or request an admin re-add.
+`retry_group_rejoin` explicitly starts a new budget only for an eligible Unrecoverable copy; it grants no authority
+to overwrite a usable copy. It drops remote-only epoch claims while retaining the frozen native epoch as its floor,
+so a dishonest coordinator cannot poison every later user-authorized episode. The app's existing Repair action uses
+that runtime-owned path.

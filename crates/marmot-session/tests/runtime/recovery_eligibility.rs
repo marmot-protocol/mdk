@@ -195,6 +195,10 @@ async fn recovery_quarantine_isolated() {
                 retry_at: now.saturating_sub(1),
                 attempts: 0,
                 phase: GroupRecoveryPhase::Request,
+                total_attempts: 0,
+                candidate_set_hash: None,
+                observed_epoch: None,
+                commit_started_at: None,
                 message: cgka_traits::GroupRecoveryMessage {
                     group_id: orphan.clone(),
                     request_id: [0x71; 32],
@@ -237,10 +241,7 @@ async fn recovery_quarantine_isolated() {
         1,
         "only the eligible group's request is published"
     );
-    let authenticated = nostr_peeler(b"cancel-alice")
-        .peel_group_recovery(&controls[0].message)
-        .await
-        .unwrap();
+    let authenticated = recovery_control(b"cancel-alice", &controls[0].message).await;
     assert_eq!(authenticated.message.group_id, peers.group);
     let received = peers
         .coordinator
@@ -285,10 +286,11 @@ async fn recovery_same_device_refresh() {
 
     let mut peers = recovery_peers().await;
     exchange_recovery(&mut peers).await;
-    let original = nostr_peeler(b"cancel-bob")
-        .peel_group_recovery(&peers.adapter.publishes().last().unwrap().message)
-        .await
-        .unwrap();
+    let original = recovery_control(
+        b"cancel-bob",
+        &peers.adapter.publishes().last().unwrap().message,
+    )
+    .await;
     let GroupRecoveryBody::Challenge { source: old_source } = original.message.body else {
         panic!("expected the initial coordinator challenge");
     };
@@ -311,10 +313,7 @@ async fn recovery_same_device_refresh() {
     );
     peers.coordinator.advance_group_recovery().await.unwrap();
     let refreshed = peers.adapter.publishes().last().unwrap().message.clone();
-    let authenticated = nostr_peeler(b"cancel-bob")
-        .peel_group_recovery(&refreshed)
-        .await
-        .unwrap();
+    let authenticated = recovery_control(b"cancel-bob", &refreshed).await;
     let GroupRecoveryBody::Challenge { source } = &authenticated.message.body else {
         panic!("stale Grant must produce a new native-source challenge");
     };

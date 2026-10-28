@@ -6,7 +6,7 @@ use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::group_recovery::GroupRecoveryMessage;
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::transport::TransportMessage;
-use cgka_traits::types::{GroupId, MemberId, MessageId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +48,8 @@ pub enum GroupRecoveryPhase {
     Publishing,
     /// The recipient is waiting for its replacement Welcome.
     AwaitWelcome,
+    /// Automatic recipient work exhausted its episode budget; retain until rearmed.
+    Parked,
     /// The workflow has completed; the runtime may explicitly remove it.
     Complete,
 }
@@ -69,6 +71,14 @@ pub struct GroupRecoveryRecord {
     pub expires_at: u64,
     pub retry_at: u64,
     pub attempts: u32,
+    /// Recipient reservations across phase changes and request nonce replacement.
+    pub total_attempts: u32,
+    /// Canonical candidate/admin-set fingerprint last observed by the recipient.
+    pub candidate_set_hash: Option<[u8; 32]>,
+    /// Highest native or authenticated selected-coordinator epoch observed.
+    pub observed_epoch: Option<EpochId>,
+    /// Durable reservation of a coordinator Commit, independent of request expiry.
+    pub commit_started_at: Option<u64>,
     pub phase: GroupRecoveryPhase,
     /// The latest request, challenge, or source-bound grant for this job.
     pub message: GroupRecoveryMessage,
@@ -122,7 +132,7 @@ impl SqliteAccountStorage {
             let connection = self.lock()?;
             let exists: bool = connection
                 .query_row_cached(
-                    "SELECT EXISTS(SELECT 1 FROM cgka_group_recovery
+                    "SELECT EXISTS(SELECT 1 FROM cgka_group_rejoin
                  WHERE group_id = ?1 AND role = ?2 AND request_id = ?3)",
                     params![
                         record.group_id.as_slice(),
@@ -137,7 +147,7 @@ impl SqliteAccountStorage {
                     GroupRecoveryRole::Recipient => {
                         let occupied: bool = connection
                             .query_row_cached(
-                                "SELECT EXISTS(SELECT 1 FROM cgka_group_recovery
+                                "SELECT EXISTS(SELECT 1 FROM cgka_group_rejoin
                              WHERE group_id = ?1 AND role = 0)",
                                 params![record.group_id.as_slice()],
                                 |row| row.get(0),
@@ -151,7 +161,7 @@ impl SqliteAccountStorage {
                         let (account, group): (i64, i64) = connection
                             .query_row_cached(
                                 "SELECT COUNT(*), COALESCE(SUM(group_id = ?1), 0)
-                             FROM cgka_group_recovery WHERE role = 1",
+                             FROM cgka_group_rejoin WHERE role = 1",
                                 params![record.group_id.as_slice()],
                                 |row| Ok((row.get(0)?, row.get(1)?)),
                             )
@@ -169,7 +179,7 @@ impl SqliteAccountStorage {
             }
             connection
                 .execute_cached(
-                    "INSERT INTO cgka_group_recovery (group_id, role, request_id, record)
+                    "INSERT INTO cgka_group_rejoin (group_id, role, request_id, record)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(group_id, role, request_id) DO UPDATE SET record = excluded.record",
                     params![
@@ -193,7 +203,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<GroupRecoveryRecord>> {
         self.lock()?
             .query_row_cached(
-                "SELECT record FROM cgka_group_recovery
+                "SELECT record FROM cgka_group_rejoin
              WHERE group_id = ?1 AND role = ?2 AND request_id = ?3",
                 params![group_id.as_slice(), role.as_sql(), request_id.as_slice()],
                 |row| row.get::<_, Vec<u8>>(0),
@@ -209,7 +219,7 @@ impl SqliteAccountStorage {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare_cached(
-                "SELECT record FROM cgka_group_recovery ORDER BY group_id, role, request_id",
+                "SELECT record FROM cgka_group_rejoin ORDER BY group_id, role, request_id",
             )
             .storage()?;
         let rows = statement
@@ -228,7 +238,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             self.lock()?
                 .execute_cached(
-                    "DELETE FROM cgka_group_recovery
+                    "DELETE FROM cgka_group_rejoin
                  WHERE group_id = ?1 AND role = ?2 AND request_id = ?3",
                     params![group_id.as_slice(), role.as_sql(), request_id.as_slice()],
                 )
@@ -260,6 +270,10 @@ mod tests {
             expires_at: u64::MAX,
             retry_at: 1_800_000_123,
             attempts: 4,
+            total_attempts: 19,
+            candidate_set_hash: Some([41; 32]),
+            observed_epoch: Some(EpochId(23)),
+            commit_started_at: Some(1_800_000_000),
             phase: GroupRecoveryPhase::Request,
             message: GroupRecoveryMessage {
                 group_id: gid(group),
@@ -275,7 +289,7 @@ mod tests {
                 timestamp: Timestamp(1_800_000_000),
                 causal_deps: vec![mid(10)],
                 source: TransportSource("opaque-transport".into()),
-                envelope: TransportEnvelope::GroupRecovery {
+                envelope: TransportEnvelope::Welcome {
                     recipient: member_id(7),
                 },
             }),
@@ -313,10 +327,14 @@ mod tests {
             (
                 GroupRecoveryPhase::Grant,
                 GroupRecoveryBody::Grant {
-                    source,
+                    source: source.clone(),
                     key_package: KeyPackage::with_source_event_id(vec![31, 0, 255], mid(32)),
                     device_signature: vec![33; 64],
                 },
+            ),
+            (
+                GroupRecoveryPhase::Parked,
+                GroupRecoveryBody::Challenge { source },
             ),
         ];
         for (phase, body) in phases {
@@ -539,10 +557,7 @@ mod tests {
         store
             .lock()
             .unwrap()
-            .execute(
-                "UPDATE cgka_group_recovery SET record = ?1",
-                params![unknown],
-            )
+            .execute("UPDATE cgka_group_rejoin SET record = ?1", params![unknown])
             .unwrap();
         assert!(matches!(
             store.group_recovery(&gid(1), job.role, &job.request_id),

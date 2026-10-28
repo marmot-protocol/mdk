@@ -1,0 +1,628 @@
+// Exercise the runtime owner: reservations precede lookup and survive request TTLs.
+#[tokio::test]
+async fn rejoin_retry_epoch_poison() {
+    let mut peers = recovery_peers().await;
+    let alice_id = peers.coordinator.self_id();
+    let bob_id = peers.recipient.self_id();
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers.recipient.advance_group_recovery().await.unwrap();
+    let request = peers
+        .bob_adapter
+        .publishes()
+        .last()
+        .unwrap()
+        .message
+        .clone();
+    let old_nonce = recovery_control(b"cancel-alice", &request)
+        .await
+        .message
+        .request_id;
+    peers
+        .coordinator
+        .ingest_delivery(&recovery_inbox_delivery(alice_id.clone(), request))
+        .await
+        .unwrap();
+    peers.coordinator.prepare_group_recovery().unwrap();
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let mut poisoned = recovery_control(
+        b"cancel-bob",
+        &peers.adapter.publishes().last().unwrap().message,
+    )
+    .await
+    .message;
+    let cgka_traits::GroupRecoveryBody::Challenge { source } = &mut poisoned.body else {
+        panic!("expected selected coordinator Challenge")
+    };
+    source.epoch = EpochId(u64::MAX);
+    // The selected account can authenticate an invented source epoch. The
+    // recipient cannot independently attest its remote MLS state.
+    let wrapped = nostr_peeler(b"cancel-alice")
+        .wrap_group_recovery(&poisoned, &bob_id)
+        .await
+        .unwrap();
+    let accepted = peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id.clone(), wrapped))
+        .await
+        .unwrap();
+    assert!(matches!(
+        accepted.outcome,
+        cgka_traits::IngestOutcome::Processed
+    ));
+
+    // Expire the coordinator's old request ownership, then explicitly authorize
+    // a new recipient episode. Neither action changes the frozen native epoch.
+    peers.wall.set(peers.wall.now().0 + 601);
+    peers.coordinator.prepare_group_recovery().unwrap();
+    peers.recipient.retry_group_rejoin(&peers.group).unwrap();
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers.recipient.advance_group_recovery().await.unwrap();
+    let request = peers
+        .bob_adapter
+        .publishes()
+        .last()
+        .unwrap()
+        .message
+        .clone();
+    let new_nonce = recovery_control(b"cancel-alice", &request)
+        .await
+        .message
+        .request_id;
+    assert_ne!(new_nonce, old_nonce);
+    let requested = peers
+        .coordinator
+        .ingest_delivery(&recovery_inbox_delivery(alice_id.clone(), request))
+        .await
+        .unwrap();
+    assert!(matches!(
+        requested.outcome,
+        cgka_traits::IngestOutcome::Processed
+    ));
+    peers.coordinator.prepare_group_recovery().unwrap();
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let challenge = peers.adapter.publishes().last().unwrap().message.clone();
+    let accepted = peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id, challenge))
+        .await
+        .unwrap();
+    assert!(
+        matches!(accepted.outcome, cgka_traits::IngestOutcome::Processed),
+        "explicit retry must release remote-only epoch poisoning and accept the honest fresh-nonce Challenge"
+    );
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers.recipient.advance_group_recovery().await.unwrap();
+    let grant = peers
+        .bob_adapter
+        .publishes()
+        .last()
+        .unwrap()
+        .message
+        .clone();
+    let authenticated = recovery_control(b"cancel-alice", &grant).await.message;
+    assert_eq!(authenticated.request_id, new_nonce);
+    assert!(
+        matches!(authenticated.body, cgka_traits::GroupRecoveryBody::Grant { source, .. } if source.epoch == peers.before)
+    );
+    let granted = peers
+        .coordinator
+        .ingest_delivery(&recovery_inbox_delivery(alice_id, grant))
+        .await
+        .unwrap();
+    assert!(matches!(
+        granted.outcome,
+        cgka_traits::IngestOutcome::Processed
+    ));
+    peers.coordinator.prepare_group_recovery().unwrap();
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    assert!(
+        peers.coordinator.group_record(&peers.group).unwrap().epoch > peers.before,
+        "the fresh grant must authorize real replacement Commit progress"
+    );
+}
+
+#[tokio::test]
+async fn rejoin_fresh_evidence() {
+    let mut peers = recovery_peers().await;
+    let alice_id = peers.coordinator.self_id();
+    let bob_id = peers.recipient.self_id();
+    let now = peers.wall.now().0;
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers.recipient.advance_group_recovery().await.unwrap();
+    let request = peers
+        .bob_adapter
+        .publishes()
+        .last()
+        .unwrap()
+        .message
+        .clone();
+    peers
+        .coordinator
+        .ingest_delivery(&recovery_inbox_delivery(alice_id.clone(), request))
+        .await
+        .unwrap();
+    peers.coordinator.prepare_group_recovery().unwrap();
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let challenge = peers.adapter.publishes().last().unwrap().message.clone();
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id.clone(), challenge.clone()))
+        .await
+        .unwrap();
+    let path = peers._dir.path().join("bob.sqlite");
+    let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
+    drop(peers.recipient);
+    {
+        // Closed public-storage fixture represents the exhausted same-nonce
+        // episode without requiring its remote source to keep advancing.
+        let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let mut row = storage.list_group_recoveries().unwrap().remove(0);
+        row.total_attempts = 32;
+        row.phase = storage_sqlite::GroupRecoveryPhase::Parked;
+        storage.put_group_recovery(&row).unwrap();
+    }
+    peers.recipient = eligibility_runtime(
+        nostr_device_session(path, &key, b"cancel-bob"),
+        alice_id,
+        peers.wall.clone(),
+        peers.bob_adapter.clone(),
+        RecordingKeyPackages::default(),
+    );
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id.clone(), challenge))
+        .await
+        .unwrap();
+    assert_eq!(
+        peers.recipient.group_rejoin_status(&peers.group).unwrap(),
+        marmot_session::GroupRejoinStatus::Parked { attempts: 32 }
+    );
+    peers
+        .coordinator
+        .send(SendIntent::SelfUpdate {
+            group_id: peers.group.clone(),
+        })
+        .await
+        .unwrap();
+    peers.wall.set(now + 5);
+    peers.coordinator.prepare_group_recovery().unwrap();
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let newer = peers.adapter.publishes().last().unwrap().message.clone();
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id.clone(), newer.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        peers.recipient.group_rejoin_status(&peers.group).unwrap(),
+        marmot_session::GroupRejoinStatus::Pending { attempts: 0 }
+    );
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id, newer))
+        .await
+        .unwrap();
+    assert_eq!(
+        peers.recipient.group_rejoin_status(&peers.group).unwrap(),
+        marmot_session::GroupRejoinStatus::Pending { attempts: 1 }
+    );
+}
+
+#[tokio::test]
+async fn rejoin_commit_cooldown() {
+    use sha2::{Digest, Sha256};
+    let mut peers = recovery_peers().await;
+    exchange_recovery(&mut peers).await;
+    let grant = recovery_control(
+        b"cancel-alice",
+        &peers.bob_adapter.publishes().last().unwrap().message,
+    )
+    .await
+    .message;
+    let cgka_traits::GroupRecoveryBody::Grant { key_package, .. } = grant.body else {
+        panic!("expected grant")
+    };
+    let metadata = peers.recipient.key_package_metadata(&key_package).unwrap();
+    let device_key_hash = Sha256::digest(&metadata.leaf_signature_key).into();
+    peers.wall.set(peers.wall.now().0 + 590);
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let now = peers.wall.now().0;
+    // A hostile but authenticated account can immediately claim its freshly
+    // installed signer is unusable; native recovery must not mint another Commit.
+    let request = cgka_traits::GroupRecoveryMessage {
+        group_id: peers.group.clone(),
+        request_id: [0xd4; 32],
+        expires_at: now + 600,
+        body: cgka_traits::GroupRecoveryBody::Request { device_key_hash },
+    };
+    let alice_id = peers.coordinator.self_id();
+    let wrapped = nostr_peeler(b"cancel-bob")
+        .wrap_group_recovery(&request, &alice_id)
+        .await
+        .unwrap();
+    let result = peers
+        .coordinator
+        .ingest_delivery(&recovery_inbox_delivery(alice_id.clone(), wrapped))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result.outcome,
+            cgka_traits::IngestOutcome::Ignored {
+                category: cgka_traits::InputRejectionCategory::AuthorizationFailed
+            }
+        ),
+        "a different nonce and fresh device leaf must not bypass per-member Commit cooldown"
+    );
+    peers.wall.set(now + 11);
+    peers.coordinator.prepare_group_recovery().unwrap();
+    let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
+    let path = peers._dir.path().join("alice.sqlite");
+    let bob_id = peers.recipient.self_id();
+    drop(peers.coordinator);
+    peers.coordinator = eligibility_runtime(
+        nostr_device_session(path, &key, b"cancel-alice"),
+        bob_id,
+        peers.wall.clone(),
+        peers.adapter.clone(),
+        RecordingKeyPackages::default(),
+    );
+    let wrapped = nostr_peeler(b"cancel-bob")
+        .wrap_group_recovery(&request, &alice_id)
+        .await
+        .unwrap();
+    let retained = peers
+        .coordinator
+        .ingest_delivery(&recovery_inbox_delivery(alice_id.clone(), wrapped))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            retained.outcome,
+            cgka_traits::IngestOutcome::Ignored {
+                category: cgka_traits::InputRejectionCategory::AuthorizationFailed
+            }
+        ),
+        "completed cooldown must survive request expiry and coordinator reopen"
+    );
+    peers.wall.set(now + 601);
+    peers.coordinator.prepare_group_recovery().unwrap();
+    let request = cgka_traits::GroupRecoveryMessage {
+        expires_at: now + 1_201,
+        ..request
+    };
+    let wrapped = nostr_peeler(b"cancel-bob")
+        .wrap_group_recovery(&request, &alice_id)
+        .await
+        .unwrap();
+    let result = peers
+        .coordinator
+        .ingest_delivery(&recovery_inbox_delivery(alice_id, wrapped))
+        .await
+        .unwrap();
+    assert!(matches!(
+        result.outcome,
+        cgka_traits::IngestOutcome::Processed
+    ));
+}
+
+#[tokio::test]
+async fn rejoin_two_admin_accounts() {
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("two admin rejoin key").unwrap();
+    let bob_path = dir.path().join("bob.sqlite");
+    let carol_path = dir.path().join("carol.sqlite");
+    let mut bob = Device::open(bob_path.clone(), &key, b"two-bob").await;
+    let mut carol = Device::open(carol_path.clone(), &key, b"two-carol").await;
+    let mut alice = nostr_device_session(dir.path().join("alice.sqlite"), &key, b"two-alice");
+    let alice_id = alice.self_id();
+    let carol_id = carol.runtime.self_id();
+    let bob_id = bob.runtime.self_id();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "two admin recovery".into(),
+            description: String::new(),
+            members: vec![bob.key_package.clone(), carol.key_package.clone()],
+            required_features: vec![],
+            app_components: vec![nostr_routing()],
+            initial_admins: vec![alice_id.clone(), carol_id.clone()],
+        })
+        .await
+        .unwrap();
+    let group = created.group_id;
+    let welcomes = match created.effects.publish.as_slice() {
+        [PublishWork::FoundingGroupCreated { welcomes }] => welcomes.clone(),
+        [PublishWork::GroupCreated { welcomes, pending }] => {
+            alice.confirm_published(*pending).await.unwrap();
+            welcomes.clone()
+        }
+        _ => panic!("expected founding publication"),
+    };
+    for welcome in &welcomes {
+        if matches!(&welcome.envelope, TransportEnvelope::Welcome { recipient } if recipient == &bob_id)
+        {
+            bob.ingest(welcome).await;
+        }
+        if matches!(&welcome.envelope, TransportEnvelope::Welcome { recipient } if recipient == &carol_id)
+        {
+            carol.ingest(welcome).await;
+        }
+    }
+    drop(bob);
+    drop(carol);
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&bob_path, &key).unwrap();
+        let mut frozen = storage.get_group(&group).unwrap();
+        frozen.unrecoverable = true;
+        storage.put_group(&frozen).unwrap();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let wall = Arc::new(TestWallClock::new(now));
+    let alice_adapter = RecordingAdapter::default();
+    let carol_adapter = RecordingAdapter::default();
+    let bob_adapter = RecordingAdapter::default();
+    let mut alice = eligibility_runtime(
+        alice,
+        bob_id.clone(),
+        wall.clone(),
+        alice_adapter.clone(),
+        RecordingKeyPackages::default(),
+    );
+    let mut carol = eligibility_runtime(
+        nostr_device_session(carol_path, &key, b"two-carol"),
+        bob_id.clone(),
+        wall.clone(),
+        carol_adapter.clone(),
+        RecordingKeyPackages::default(),
+    );
+    let mut routing = StaticTransportRouting::new(vec![])
+        .key_package_endpoints(vec![TransportEndpoint("wss://two-keys.example".into())]);
+    for peer in [&alice_id, &carol_id, &bob_id] {
+        routing = routing.with_inbox_route(
+            peer.clone(),
+            vec![TransportEndpoint("wss://two-inbox.example".into())],
+        );
+    }
+    let mut bob = AccountDeviceRuntime::new(
+        nostr_device_session(bob_path, &key, b"two-bob"),
+        bob_adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    let selected = bob.prepare_group_recovery().unwrap().remove(0);
+    bob.advance_group_recovery().await.unwrap();
+    let request = recovery_control(
+        if selected == alice_id {
+            b"two-alice"
+        } else {
+            b"two-carol"
+        },
+        &bob_adapter.publishes().last().unwrap().message,
+    )
+    .await
+    .message;
+    for admin in [&mut alice, &mut carol] {
+        let carrier = nostr_peeler(b"two-bob")
+            .wrap_group_recovery(&request, &admin.self_id())
+            .await
+            .unwrap();
+        admin
+            .ingest_delivery(&recovery_inbox_delivery(admin.self_id(), carrier))
+            .await
+            .unwrap();
+        admin.prepare_group_recovery().unwrap();
+        admin.advance_group_recovery().await.unwrap();
+    }
+    let (chosen, other) = if selected == alice_id {
+        (&alice_adapter, &carol_adapter)
+    } else {
+        (&carol_adapter, &alice_adapter)
+    };
+    let rejected = bob
+        .ingest_delivery(&recovery_inbox_delivery(
+            bob_id.clone(),
+            other.publishes().last().unwrap().message.clone(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        rejected.outcome,
+        cgka_traits::IngestOutcome::Ignored {
+            category: cgka_traits::InputRejectionCategory::AuthorizationFailed
+        }
+    ));
+    let accepted = bob
+        .ingest_delivery(&recovery_inbox_delivery(
+            bob_id,
+            chosen.publishes().last().unwrap().message.clone(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        accepted.outcome,
+        cgka_traits::IngestOutcome::Processed
+    ));
+    let mut tried = std::collections::HashSet::from([selected]);
+    for turn in 1..32 {
+        wall.set(now + turn * 601);
+        tried.extend(bob.prepare_group_recovery().unwrap());
+    }
+    assert!(tried.contains(&alice_id) && tried.contains(&carol_id));
+    wall.set(now + 32 * 601);
+    assert!(
+        bob.prepare_group_recovery().unwrap().is_empty(),
+        "rotating between distinct admin accounts must not mint new budget"
+    );
+}
+
+#[tokio::test]
+async fn rejoin_unreachable_budget() {
+    let mut peers = recovery_peers().await;
+    assert_eq!(
+        peers.coordinator.group_rejoin_status(&peers.group).unwrap(),
+        marmot_session::GroupRejoinStatus::Inactive
+    );
+    let started = peers.wall.now().0;
+    for turn in 0..32 {
+        peers.wall.set(started + turn * 601);
+        assert_eq!(peers.recipient.prepare_group_recovery().unwrap().len(), 1);
+        // No directory/network continuation: dropping this reservation still spends it.
+    }
+    peers.wall.set(started + 32 * 601);
+    assert!(
+        peers.recipient.prepare_group_recovery().unwrap().is_empty(),
+        "unreachable coordinators must exhaust a finite episode across nonce rotation"
+    );
+    assert_eq!(
+        peers.recipient.group_rejoin_status(&peers.group).unwrap(),
+        marmot_session::GroupRejoinStatus::Parked { attempts: 32 }
+    );
+    let bob_path = peers._dir.path().join("bob.sqlite");
+    let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
+    let alice_id = peers.coordinator.self_id();
+    drop(peers.recipient);
+    peers.recipient = eligibility_runtime(
+        nostr_device_session(bob_path, &key, b"cancel-bob"),
+        alice_id,
+        peers.wall.clone(),
+        peers.bob_adapter.clone(),
+        RecordingKeyPackages::default(),
+    );
+    peers.wall.set(started + 86_400);
+    assert!(
+        peers.recipient.prepare_group_recovery().unwrap().is_empty(),
+        "reopening or waiting cannot silently recreate a parked episode"
+    );
+    assert_eq!(
+        peers.recipient.group_rejoin_status(&peers.group).unwrap(),
+        marmot_session::GroupRejoinStatus::Parked { attempts: 32 }
+    );
+    assert_eq!(
+        peers.recipient.retry_group_rejoin(&peers.group).unwrap(),
+        marmot_session::GroupRejoinStatus::Pending { attempts: 0 }
+    );
+    assert_eq!(peers.recipient.prepare_group_recovery().unwrap().len(), 1);
+    assert_eq!(
+        peers.recipient.group_rejoin_status(&peers.group).unwrap(),
+        marmot_session::GroupRejoinStatus::Pending { attempts: 1 }
+    );
+}
+
+#[tokio::test]
+async fn rejoin_removed_budget() {
+    let mut peers = recovery_peers().await;
+    let bob_id = peers.recipient.self_id();
+    let alice_id = peers.coordinator.self_id();
+    evolve(
+        peers.coordinator.session_mut(),
+        SendIntent::RemoveMembers {
+            group_id: peers.group.clone(),
+            members: vec![bob_id.clone()],
+        },
+    )
+    .await;
+    let started = peers.wall.now().0;
+    for turn in 0..32 {
+        peers.wall.set(started + turn * 601);
+        let selected = peers.recipient.prepare_group_recovery().unwrap();
+        assert_eq!(selected.len(), 1);
+        peers.recipient.advance_group_recovery().await.unwrap();
+        if selected[0] == alice_id {
+            let request = peers
+                .bob_adapter
+                .publishes()
+                .last()
+                .unwrap()
+                .message
+                .clone();
+            let refused = peers
+                .coordinator
+                .ingest_delivery(&recovery_inbox_delivery(alice_id.clone(), request))
+                .await
+                .unwrap();
+            assert!(matches!(
+                refused.outcome,
+                cgka_traits::IngestOutcome::Ignored {
+                    category: cgka_traits::InputRejectionCategory::AuthorizationFailed
+                }
+            ));
+            assert!(
+                peers
+                    .coordinator
+                    .prepare_group_recovery()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+    peers.wall.set(started + 32 * 601);
+    assert!(
+        peers.recipient.prepare_group_recovery().unwrap().is_empty(),
+        "silently refusing current admins cannot keep a removed copy retrying forever"
+    );
+    assert!(peers.adapter.publishes().is_empty());
+    assert!(
+        peers
+            .recipient
+            .group_record(&peers.group)
+            .unwrap()
+            .unrecoverable
+    );
+}
+
+#[tokio::test]
+async fn rejoin_phase_budget() {
+    let mut peers = recovery_peers().await;
+    let now = peers.wall.now().0;
+    let alice_id = peers.coordinator.self_id();
+    let bob_id = peers.recipient.self_id();
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers.recipient.advance_group_recovery().await.unwrap();
+    let request = peers
+        .bob_adapter
+        .publishes()
+        .last()
+        .unwrap()
+        .message
+        .clone();
+    peers
+        .coordinator
+        .ingest_delivery(&recovery_inbox_delivery(alice_id, request))
+        .await
+        .unwrap();
+    peers.coordinator.prepare_group_recovery().unwrap();
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let challenge = peers.adapter.publishes().last().unwrap().message.clone();
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id.clone(), challenge.clone()))
+        .await
+        .unwrap();
+    // This fixture's first authenticated Challenge is genuinely one epoch
+    // newer; it may rearm once, unlike its expired duplicate deliveries.
+    for turn in 1..=32 {
+        peers.wall.set(now + turn * 601);
+        peers
+            .recipient
+            .ingest_delivery(&recovery_inbox_delivery(bob_id.clone(), challenge.clone()))
+            .await
+            .unwrap();
+        // Reserve without continuation: source replay must not replenish reservations.
+        peers.recipient.prepare_group_recovery().unwrap();
+    }
+    peers.wall.set(now + 33 * 601);
+    assert!(
+        peers.recipient.prepare_group_recovery().unwrap().is_empty(),
+        "Challenge phase and replay must share the original recipient budget"
+    );
+}
