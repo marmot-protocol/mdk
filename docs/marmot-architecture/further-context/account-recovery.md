@@ -573,6 +573,45 @@ Known disagreements, expected until later phases remove their cause:
   scope is compared on its required relays; a scope with none is not comparable. Live
   boundaries are recorded for every endpoint that admitted one.
 
+### 8. Retry state and staging (storage only)
+
+Phase 4's runner keeps its retry state per (route, relay) unit in the account database, so
+backoff, a broken unit's park and the account's rolling-hour budget survive a restart. Whether
+a unit is caught up, owed or backing off is not stored: it follows from the unit's debt and
+its next attempt time. Each quantum's outcome is one transaction:
+
+| Outcome | Unit | Relay | Account budget |
+| --- | --- | --- | --- |
+| Advanced | Active, budget and backoff reset, park dropped | Streak and cooldown reset | Charged |
+| Nothing owed | Re-armed as for Advanced, except that a broken unit without a probe is unchanged and a retired unit stays retired with its backoff reset | — | Refunded |
+| Answered, no progress | Backoff doubles from its base; the budget's last breaks it and parks its debt. A failed probe re-parks under the same revision | Streak and cooldown reset | Charged |
+| Unreachable | Retries after the unreachable delay | Streak +1; cools down after the threshold, each cooldown in a spell doubling | Charged |
+| Rate-limited | — | Cools down | Charged |
+| Refused | Breaks at once and parks its debt | — | Charged |
+| Unanswered, local failure | — | — | Refunded |
+
+An attempt is charged when it begins, so a process that dies mid-quantum still counts it.
+Newer loss over a parked span earns one probe under the same park. Newer loss inside a
+retired span reopens that part whatever the unit's state: an active unit owes it as ordinary
+debt, a broken one adds it to its park with one probe, and a retired one parks it under a new
+revision with one probe. A failed probe re-parks under the same revision and keeps every parked
+second the relay still does not cover. A relay added
+to a route and a known caps read that differs from what a broken unit was planned with re-arm
+it and drop its park; explicit repair re-arms every unit and drops retired spans too, so they
+are owed again. An unknown caps read is never evidence. Dismissing a route's
+notice checks its newest park revision and retires its broken units' parked spans, which are
+never coverage; the units then serve anything else they owe with a fresh budget. Any
+coverage write on a unit's relay trims its parked and retired spans; once
+its last parked part is proved, a broken unit re-arms and its notice ends. The retention prune
+trims parked and retired spans at its floor, as it does coverage and goals, so no span reaches
+below its route's goal and a re-arm owes exactly what the window still holds.
+
+A proven slice's unseen events go to staging, keyed by event id, in the transaction that
+records its coverage through the subtracting write. A crash after that loses nothing and
+refetches nothing: the events are durable and the ledger-derived cursor is past the slice.
+Staging is not admission; a row leaves once its event is in the seen index, or, if it no
+longer decodes, by un-covering its second so it is fetched again.
+
 ## What gets deleted
 
 Deleted in step 2:

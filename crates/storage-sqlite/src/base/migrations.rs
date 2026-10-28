@@ -266,6 +266,8 @@ mod migration_0124_recovery_attempt_cap;
 mod migration_0125_device_groups;
 #[path = "migrations/0126_recovery_coverage_uncovers.rs"]
 mod migration_0126_recovery_coverage_uncovers;
+#[path = "migrations/0127_recovery_units.rs"]
+mod migration_0127_recovery_units;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1042,6 +1044,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0126_recovery_coverage_uncovers",
         suspend_foreign_keys: &[],
         apply: migration_0126_recovery_coverage_uncovers::apply,
+    },
+    Migration {
+        version: 127,
+        name: "0127_recovery_units",
+        suspend_foreign_keys: &[],
+        apply: migration_0127_recovery_units::apply,
     },
 ];
 
