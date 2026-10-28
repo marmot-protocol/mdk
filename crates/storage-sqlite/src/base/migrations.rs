@@ -284,6 +284,8 @@ mod migration_0133_device_links;
 mod migration_0134_recovery_recheck_revision;
 #[path = "migrations/0140_private_key_packages.rs"]
 mod migration_0140_private_key_packages;
+#[path = "migrations/0141_group_rejoin.rs"]
+mod migration_0141_group_rejoin;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1114,6 +1116,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0140_private_key_packages",
         suspend_foreign_keys: &[],
         apply: migration_0140_private_key_packages::apply,
+    },
+    Migration {
+        version: 141,
+        name: "0141_group_rejoin",
+        suspend_foreign_keys: &[],
+        apply: migration_0141_group_rejoin::apply,
     },
 ];
 
