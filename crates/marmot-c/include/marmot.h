@@ -5340,7 +5340,8 @@ typedef enum MarmotEvent_Tag {
   MARMOT_EVENT_HISTORY_NOTICES_CHANGED,
   /**
    * The account's linked devices may have changed; re-read
-   * `marmot_linked_devices`. Carries no device or group identities, and
+   * `marmot_linked_devices`. Also fires once each time the account's
+   * worker opens or reconnects. Carries no device or group identities, and
    * may fire with no visible change.
    */
   MARMOT_EVENT_LINKED_DEVICES_CHANGED,

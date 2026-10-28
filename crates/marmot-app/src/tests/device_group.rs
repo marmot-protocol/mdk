@@ -1126,11 +1126,13 @@ async fn the_runtime_announces_a_device_group_join_and_lists_its_devices() {
 }
 
 /// A trusted device group whose roster cannot be read refuses with a fixed
-/// code that never names the group, and a terminal one lists nothing.
+/// code that never names the group, whether the read's own hydration or the
+/// open quarantined it, and a terminal one lists nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_nothing() {
     let Devices {
         _dirs,
+        relay,
         phone_app,
         mut phone,
         link,
@@ -1139,19 +1141,32 @@ async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_not
     let group = phone.dev_create_device_group(link).await.unwrap();
     let storage = phone_app.account_storage("alice").unwrap();
     let stored = || cgka_traits::storage::GroupStorage::get_group(&storage, &group).unwrap();
+    let unavailable = |phone: &mut AppClient| {
+        let error = phone.linked_devices().unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::DeviceGroupRefused("roster_unavailable")
+        ));
+        assert!(!error.to_string().contains(&hex::encode(group.as_slice())));
+    };
 
-    // The group fails hydration on the next open.
+    // The group fails hydration: first in the read itself, on a deferred
+    // open, then at an eager one.
     let mut damaged = stored();
     damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
     cgka_traits::storage::GroupStorage::put_group(&storage, &damaged).unwrap();
     drop(phone);
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut phone = phone_app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    assert!(phone.runtime.group_record(&group).is_err());
+    unavailable(&mut phone);
+    unavailable(&mut phone);
+    drop(phone);
     let mut phone = phone_app.client("alice").await.unwrap();
-    let error = phone.linked_devices().unwrap_err();
-    assert!(matches!(
-        error,
-        AppError::DeviceGroupRefused("roster_unavailable")
-    ));
-    assert!(!error.to_string().contains(&hex::encode(group.as_slice())));
+    unavailable(&mut phone);
 
     let mut removed = stored();
     removed.removed = true;
