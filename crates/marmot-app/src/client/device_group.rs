@@ -12,12 +12,17 @@
 //! - The founding Add may hold this account's own device only through the
 //!   exact `KeyPackageRef` a confirmed link names (D14, D21).
 //!
+//! - The host reads the roster only as [`LinkedDevice`]s, this account's own
+//!   devices, from the device group this device trusts. The group's own events
+//!   never reach the host; `LinkedDevicesChanged` stands in for them.
+//!
 //! A confirmed link comes from device pairing. Until pairing reaches the app,
 //! only the test-policy hook supplies one.
 
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterV1, DeviceSlotId,
-    NOSTR_ROUTING_COMPONENT_ID, encode_device_roster_v1, encode_nostr_routing_v1,
+    DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID, decode_device_roster_v1, encode_device_roster_v1,
+    encode_nostr_routing_v1,
 };
 use cgka_traits::engine::CreateGroupRequest;
 use cgka_traits::storage::{GroupStorage as _, MaintenanceStorage as _, StorageError};
@@ -39,6 +44,45 @@ pub struct ConfirmedDeviceLink {
     /// The device group, covered by the existing device's confirmation. On a
     /// first link the existing device chooses it before the group exists.
     pub device_group_id: GroupId,
+}
+
+/// One of this account's devices, as the roster of the device group this
+/// device trusts lists it. Every entry is this account's own device: the
+/// engine refuses a device group that holds another account's leaf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkedDevice {
+    /// The device's KeyPackage slot (the Nostr `d`), 64 lowercase hex
+    /// characters. Actions on the device name it by this.
+    pub slot_id_hex: String,
+    /// Whether this is the calling device.
+    pub is_this_device: bool,
+    /// The name the user gave the device; empty until set.
+    pub label: String,
+    /// The device's client name; empty until set.
+    pub client: String,
+    /// The device's platform; empty until set.
+    pub platform: String,
+    /// When the device was linked, in Unix seconds, as its linker wrote it.
+    pub linked_at: u64,
+    /// The slot of the device that linked it; `None` for the founder.
+    pub linked_by_slot_id_hex: Option<String>,
+    pub status: LinkedDeviceStatus,
+    /// Its siblings add it to the chats the account's devices were already
+    /// in when it was linked.
+    pub add_to_all_chats: bool,
+    /// Its siblings bring it chat history when they add it to a chat.
+    pub bring_history: bool,
+    /// Inactivity never removes it.
+    pub keep_while_inactive: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkedDeviceStatus {
+    Active,
+    /// Its siblings marked it inactive.
+    Inactive,
+    /// It recorded that it is signing out.
+    Leaving,
 }
 
 impl AppClient {
@@ -310,6 +354,7 @@ impl AppClient {
             "install_device_group_route",
             self.ensure_device_group_route(&group_id).map(drop),
         );
+        self.linked_devices_changed = true;
         Ok(group_id)
     }
 
@@ -338,6 +383,7 @@ impl AppClient {
             Some(&link.key_package_ref_hex),
             now,
         )? {
+            self.linked_devices_changed = true;
             return Ok(());
         }
         if !storage.insert_device_group(&DeviceGroupRecord {
@@ -389,8 +435,11 @@ impl AppClient {
             DeviceGroupTrust::Linked,
             None,
             now,
-        )? || storage.device_group(&group_id_hex)?.is_some()
-        {
+        )? {
+            self.linked_devices_changed = true;
+            return Ok(true);
+        }
+        if storage.device_group(&group_id_hex)?.is_some() {
             return Ok(true);
         }
         storage.insert_device_group(&DeviceGroupRecord {
@@ -430,6 +479,7 @@ impl AppClient {
                     None,
                     record.recorded_at,
                 )?;
+                self.linked_devices_changed = true;
             } else {
                 storage.delete_device_group(&record.group_id_hex, DeviceGroupTrust::Creating)?;
             }
@@ -463,7 +513,6 @@ impl AppClient {
     }
 
     /// This account's device group, if this device trusts one.
-    #[cfg(all(test, feature = "test-policy-overrides"))]
     pub(crate) fn trusted_device_group(&self) -> Result<Option<GroupId>, AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         storage
@@ -472,6 +521,96 @@ impl AppClient {
             .find(|record| record.trust.is_trusted())
             .map(|record| Ok(GroupId::new(hex::decode(record.group_id_hex)?)))
             .transpose()
+    }
+
+    /// The device group this device trusts and its roster: the one way to
+    /// read the roster. None when device groups are off, when this device
+    /// trusts none, or when that group is terminal. A roster that cannot be
+    /// read is `roster_unavailable`, an error that never names the group.
+    pub(crate) fn trusted_device_roster(
+        &mut self,
+    ) -> Result<Option<(GroupId, DeviceRosterV1)>, AppError> {
+        if !self.app.device_groups_enabled() {
+            return Ok(None);
+        }
+        let Some(group_id) = self.trusted_device_group()? else {
+            return Ok(None);
+        };
+        if self
+            .stored_group(&group_id)?
+            .is_none_or(|group| group.is_terminal() || !requires_roster(&group))
+        {
+            return Ok(None);
+        }
+        let unavailable = || AppError::DeviceGroupRefused("roster_unavailable");
+        if !self
+            .runtime
+            .ensure_group_hydrated(&group_id)
+            .map_err(|_| unavailable())?
+        {
+            return Err(unavailable());
+        }
+        let roster = self
+            .runtime
+            .app_component(&group_id, DEVICE_ROSTER_COMPONENT_ID)
+            .ok()
+            .flatten()
+            .and_then(|bytes| decode_device_roster_v1(&bytes).ok())
+            .ok_or_else(unavailable)?;
+        Ok(Some((group_id, roster)))
+    }
+
+    /// This account's devices from the trusted device group's roster: this
+    /// device first, then by when each was linked, then by slot. Empty when
+    /// [`Self::trusted_device_roster`] has no roster.
+    pub(crate) fn linked_devices(&mut self) -> Result<Vec<LinkedDevice>, AppError> {
+        let Some((_, roster)) = self.trusted_device_roster()? else {
+            return Ok(Vec::new());
+        };
+        // A slot that is not 32 bytes names no roster entry.
+        let own_slot = self
+            .app
+            .account_storage(&self.state.label)?
+            .key_package_lifecycle()?
+            .and_then(|lifecycle| device_slot(&lifecycle.stable_slot_id).ok());
+        let mut devices: Vec<_> = roster
+            .devices
+            .into_iter()
+            .map(|(slot, entry)| linked_device(slot, entry, own_slot.as_ref()))
+            .collect();
+        // Stable, so equal keys keep the roster's slot order.
+        devices.sort_by_key(|device| (!device.is_this_device, device.linked_at));
+        Ok(devices)
+    }
+
+    /// Whether the linked devices may have changed since the last call. Set
+    /// by every hidden device-group event and every change of trust.
+    pub(crate) fn take_linked_devices_changed(&mut self) -> bool {
+        std::mem::take(&mut self.linked_devices_changed) && self.app.device_groups_enabled()
+    }
+}
+
+fn linked_device(
+    slot: DeviceSlotId,
+    entry: DeviceEntryV1,
+    own_slot: Option<&DeviceSlotId>,
+) -> LinkedDevice {
+    LinkedDevice {
+        slot_id_hex: hex::encode(slot),
+        is_this_device: own_slot == Some(&slot),
+        label: entry.label,
+        client: entry.client,
+        platform: entry.platform,
+        linked_at: entry.linked_at,
+        linked_by_slot_id_hex: entry.linked_by.map(hex::encode),
+        status: match entry.status {
+            DeviceStatusV1::Active => LinkedDeviceStatus::Active,
+            DeviceStatusV1::Inactive => LinkedDeviceStatus::Inactive,
+            DeviceStatusV1::Leaving => LinkedDeviceStatus::Leaving,
+        },
+        add_to_all_chats: entry.settings.add_to_all_chats,
+        bring_history: entry.settings.bring_history,
+        keep_while_inactive: entry.settings.keep_while_inactive,
     }
 }
 
@@ -483,7 +622,6 @@ fn requires_roster(group: &Group) -> bool {
 }
 
 /// A KeyPackage slot as the roster keys it: 32 bytes, the Nostr `d`.
-#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
 fn device_slot(slot_hex: &str) -> Result<DeviceSlotId, AppError> {
     hex::decode(slot_hex)
         .ok()
