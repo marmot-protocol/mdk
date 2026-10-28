@@ -471,6 +471,7 @@ pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageR
         .storage()?
         .collect::<Result<Vec<_>, _>>()
         .storage()?;
+    let mut floor = None::<u64>;
     for (token, since, dropped) in &rows {
         join_loss_tx(conn, label, 0, *token, *dropped, *since, true)?;
         conn.execute_cached(
@@ -479,10 +480,11 @@ pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageR
             params![label, token],
         )
         .storage()?;
+        let restored = loss::evidence_floor(conn, label, 0, *token)?;
+        floor = Some(floor.map_or(restored, |floor| floor.min(restored)));
     }
-    if !rows.is_empty() {
-        let floor = loss::goal_floor(conn, label, RecoveryLossCause::Queue)?;
-        crate::app::recovery_coverage::uncover_loss_tx(conn, floor.unwrap_or(0))?;
+    if let Some(floor) = floor {
+        crate::app::recovery_coverage::uncover_loss_tx(conn, floor)?;
     }
     Ok(!rows.is_empty())
 }
@@ -754,7 +756,9 @@ impl SqliteAppStorage {
             // evidence set is deliberately not disk-capped; do not mirror it
             // into an unbounded temporary Vec on reopen. The audit summary is
             // constant-size: one accumulator per cause.
-            let mut imports: [Option<(Option<observe::DemandRow>, u64)>; 2] = [None, None];
+            // Per cause: the demand before, the count charged, and the lowest
+            // floor among the generations this import charged.
+            let mut imports: [Option<(Option<observe::DemandRow>, u64, u64)>; 2] = [None, None];
             let mut cursor = (-1_i64, -1_i64);
             loop {
                 let row = conn
@@ -786,12 +790,16 @@ impl SqliteAppStorage {
                     .and_then(|cause| imports.get_mut(cause))
                 {
                     let charged = i64_to_u64(dropped.saturating_sub(imported.unwrap_or(0)).max(0))?;
+                    let floor = loss::evidence_floor(&conn, label, cause, token)?;
                     match slot {
-                        Some((_, total)) => *total = total.saturating_add(charged),
+                        Some((_, total, lowest)) => {
+                            *total = total.saturating_add(charged);
+                            *lowest = (*lowest).min(floor);
+                        }
                         None => {
                             let before =
                                 observe::demand_row(&conn, &loss_demand_key(cause, label)?)?;
-                            *slot = Some((before, charged));
+                            *slot = Some((before, charged, floor));
                         }
                     }
                 }
@@ -805,7 +813,7 @@ impl SqliteAppStorage {
             }
             let mut changes = Vec::new();
             for (cause, slot) in imports.into_iter().enumerate() {
-                let Some((before, charged)) = slot else {
+                let Some((before, charged, uncover_floor)) = slot else {
                     continue;
                 };
                 let cause_value = i64::try_from(cause).map_err(|_| {
@@ -826,7 +834,7 @@ impl SqliteAppStorage {
                     RecoveryLossCause::NotificationConsumer
                 };
                 let goal_floor = loss::goal_floor(&conn, label, cause)?;
-                crate::app::recovery_coverage::uncover_loss_tx(&conn, goal_floor.unwrap_or(0))?;
+                crate::app::recovery_coverage::uncover_loss_tx(&conn, uncover_floor)?;
                 changes.push(RecoveryLossImport {
                     cause,
                     obligation: observe::ticket(&after)?,
@@ -882,7 +890,10 @@ impl SqliteAppStorage {
                 return Ok(None);
             }
             let goal_floor = loss::goal_floor(&conn, label, RecoveryLossCause::Queue)?;
-            crate::app::recovery_coverage::uncover_loss_tx(&conn, goal_floor.unwrap_or(0))?;
+            crate::app::recovery_coverage::uncover_loss_tx(
+                &conn,
+                loss::evidence_floor(&conn, label, 0, token)?,
+            )?;
             Ok(Some(RecoveryLossImport {
                 cause: RecoveryLossCause::Queue,
                 obligation: observe::ticket(&after)?,

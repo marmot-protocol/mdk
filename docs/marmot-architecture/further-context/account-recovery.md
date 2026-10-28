@@ -520,12 +520,19 @@ in `marmot-app` fills it from facts the owner already has:
 | Fact | Ledger effect |
 | --- | --- |
 | A live REQ's endpoint admitted and placed its whole original window in the current wire epoch | Live boundary covers `[since, now]` on that route and relay, unless a loss obligation is pending |
-| A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route |
-| A loss import changed demand, including a notification lag that charges no count | In the import's own transaction, every route the ledger holds loses coverage from the loss floor up (all of it when the floor is unknown) and its goal widens to the floor; the recorder then widens the other current routes' goals |
+| A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route, less every range un-covered after the grant was selected |
+| A loss import changed demand, including a notification lag that charges no count | In the import's own transaction, every route the ledger holds loses coverage from the floor of the generations it newly charged up (all of it when a floor is unknown) and its goal widens to the floor; the recorder then widens the other current routes' goals |
+| A receipt was released for replay | In the release's transaction, its event's second is un-covered on each route its inventory row placed it on, and that route's goal widens to it. A release with no inventory row changes nothing here; the epoch gap it arms keeps that debt |
 | A pending queue or notification loss | Each scope's route goal widens to the scope's floor, restoring a goal the best-effort write lost |
 | A startup incremental or explicit history request | Every current route's goal widens to the retained window (explicit: unbounded, pruned to the window) |
 | A pending epoch gap | The group's routes' goals widen to the retained window |
 | Every settlement | Coverage and goals below the retained window are pruned |
+
+Every un-cover is also appended to an un-cover log under a new account-wide generation. A
+grant reads that generation when it is selected, before anything is frozen or fetched, and its
+certificates leave out every range un-covered on their routes since, so a loss or release that
+lands mid-pass keeps its debt while the rest of the window stays proved. The log keeps an hour
+and at most 4,096 rows; a pass from before the oldest pruned row records nothing.
 
 At settlement the recorder compares the ledger with every pending obligation's scopes and logs
 aggregate counts: scopes owed or proved by both, scopes the obligation still owes that the
@@ -541,8 +548,8 @@ Known disagreements, expected until later phases remove their cause:
 
 - **Certificates voided by an unrelated loss.** A new loss bumps the account-wide loss
   revision, so no earlier certificate qualifies any more; the ledger keeps coverage below the
-  loss floor. Pending scopes whose windows end below the floor show as ledger ahead. Phase 4
-  deletes the global invalidation.
+  loss floor, including a running pass's certificates below it. Pending scopes whose windows
+  end below the floor show as ledger ahead. Phase 4 deletes the global invalidation.
 - **Route and inventory revisions.** A route-policy change or a released inventory journal
   bumps an account-wide revision, so pending scopes stop holding proof until the next pass
   captures it again. The ledger keeps per-relay coverage, so a covered window is ledger ahead

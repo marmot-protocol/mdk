@@ -114,6 +114,31 @@ pub(super) fn goal_floor(
         .and_then(|seconds| u64::try_from(seconds).ok()))
 }
 
+/// The floor one generation's import un-covers the coverage ledger from: the
+/// earliest `created_at` it charged, or zero when any charge had no known
+/// time. Generations imported earlier were un-covered by their own import, so
+/// a newer one never re-opens a range that a fetch since then proved.
+pub(super) fn evidence_floor(
+    conn: &Connection,
+    label: &str,
+    cause: i64,
+    token: i64,
+) -> StorageResult<u64> {
+    let bound: Option<(i64, Option<i64>)> = conn
+        .query_row_cached(
+            "SELECT bound_state, bound_seconds FROM account_delivery_loss_evidence
+             WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
+            params![label, cause, token],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .storage()?;
+    Ok(match bound {
+        Some((1, Some(seconds))) => u64::try_from(seconds).unwrap_or(0),
+        _ => 0,
+    })
+}
+
 impl SqliteAppStorage {
     /// Typed evidence only. A notification count is an observation count, never
     /// a claim about how many encrypted events the receiver missed.

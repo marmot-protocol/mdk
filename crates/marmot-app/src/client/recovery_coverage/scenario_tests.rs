@@ -30,6 +30,7 @@ struct Fixture {
     _pump: ScriptedEosePump,
     client: AppClient,
     storage: SqliteAccountStorage,
+    group: cgka_traits::GroupId,
 }
 
 /// One account with one group and a checkpointed cursor whose live
@@ -51,7 +52,7 @@ async fn fixture() -> Fixture {
     state.last_transport_timestamp = Some(unix_now_seconds().saturating_sub(60));
     app.save_state(&state).unwrap();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    client.create_group("coverage ledger", &[]).await.unwrap();
+    let group = client.create_group("coverage ledger", &[]).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             client.synchronize_native_replay().await.unwrap();
@@ -74,6 +75,7 @@ async fn fixture() -> Fixture {
         _pump: pump,
         client,
         storage,
+        group,
     }
 }
 
@@ -217,8 +219,9 @@ async fn pending_loss_keeps_live_boundaries_from_re_covering_it() {
     }
 }
 
-/// Loss imported after a grant froze can lie inside the window its pass
-/// certified, so settlement must not restore that window's coverage.
+/// Loss imported after a grant was selected can lie inside the window its
+/// pass certified, so settlement must not restore that window's coverage
+/// from the loss's floor up; below the floor the certificate stands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loss_imported_after_the_grant_froze_keeps_its_debt() {
     let mut fixture = fixture().await;
@@ -245,8 +248,13 @@ async fn loss_imported_after_the_grant_froze_keeps_its_debt() {
             app.recovery_coverage_ranges(&route, &relay())
                 .unwrap()
                 .iter()
-                .all(|proved| proved.proof != RecoveryCoverageProof::Comparison),
-            "the stale pass records no certificate"
+                .all(|proved| proved.proof != RecoveryCoverageProof::Comparison
+                    || proved.range.until_seconds < floor),
+            "the stale pass records no certificate from the newer loss's floor up"
+        );
+        assert!(
+            !app.recovery_coverage_covers(&route, &[relay()], floor, floor)
+                .unwrap()
         );
     }
     // A pass frozen after that loss records its certificates.
@@ -277,8 +285,106 @@ async fn loss_imported_after_the_grant_froze_keeps_its_debt() {
             .recovery_coverage_ranges(route, &relay())
             .unwrap()
             .iter()
-            .any(|proved| proved.proof == RecoveryCoverageProof::Comparison)),
-        "a current pass records its certificates"
+            .any(|proved| proved.proof == RecoveryCoverageProof::Comparison
+                && proved.range.since_seconds <= floor
+                && proved.range.until_seconds >= floor)),
+        "a current pass records its certificates over the loss"
+    );
+}
+
+/// Newer loss with a higher floor lands while a pass runs: the pass keeps its
+/// certificates below that floor, and only the newer loss stays owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_keeps_its_certificates_below_newer_loss() {
+    let mut fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let older = unix_now_seconds().saturating_sub(300);
+    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(older))
+        .unwrap();
+    let grant = authorize(&mut fixture.client).await;
+    let newer = unix_now_seconds().saturating_sub(60);
+    app.record_account_delivery_loss_bounded("alice", 42, 2, unix_now_seconds(), Some(newer))
+        .unwrap();
+    fixture.client.synchronize_recovery_loss(&app).unwrap();
+    let certified = grant
+        .inventory
+        .iter()
+        .map(|window| &window.route)
+        .collect::<Vec<_>>();
+    fixture
+        .client
+        .record_comparison_coverage(&app, &grant, &certified, unix_now_seconds());
+    let relays = [relay()];
+    for route in routes(&fixture.client) {
+        assert!(
+            app.recovery_coverage_covers(&route, &relays, older, newer - 1)
+                .unwrap(),
+            "the pass's certificate stands below the newer loss"
+        );
+        assert!(
+            !app.recovery_coverage_covers(&route, &relays, newer, newer)
+                .unwrap(),
+            "the newer loss stays owed"
+        );
+    }
+}
+
+/// A receipt released while a pass runs lets its event arrive again: the
+/// pass's certificate leaves that second owed on the event's route, and the
+/// account inbox keeps its whole window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receipt_released_during_a_pass_stays_owed() {
+    use cgka_traits::storage::MessageStorage;
+
+    let mut fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let floor = unix_now_seconds().saturating_sub(120);
+    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
+        .unwrap();
+    let grant = authorize(&mut fixture.client).await;
+    let group_route = routes(&fixture.client)
+        .into_iter()
+        .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
+        .expect("the group's route");
+    let sent = unix_now_seconds().saturating_sub(60);
+    let item = storage_sqlite::TransportReconciliationItem {
+        event_id: [0xfd; 32],
+        created_at: sent,
+    };
+    app.record_reconciliation_items(std::iter::once((&group_route, &item)))
+        .unwrap();
+    let record = cgka_traits::MessageRecord {
+        id: cgka_traits::MessageId::new(item.event_id.to_vec()),
+        group_id: fixture.group.clone(),
+        epoch: cgka_traits::EpochId(0),
+        state: cgka_traits::MessageState::PeelDeferred,
+        payload: Vec::new(),
+        deferred_peel: None,
+    };
+    fixture.storage.put_message(&record).unwrap();
+    fixture.storage.release_message_for_replay(&record).unwrap();
+    let certified = grant
+        .inventory
+        .iter()
+        .map(|window| &window.route)
+        .collect::<Vec<_>>();
+    fixture
+        .client
+        .record_comparison_coverage(&app, &grant, &certified, unix_now_seconds());
+    let relays = [relay()];
+    assert!(
+        !app.recovery_coverage_covers(&group_route, &relays, sent, sent)
+            .unwrap(),
+        "the released second stays owed"
+    );
+    assert!(
+        app.recovery_coverage_covers(&group_route, &relays, floor, sent - 1)
+            .unwrap()
+    );
+    assert!(
+        app.recovery_coverage_covers(&TransportReconciliationRoute::Inbox, &relays, floor, sent)
+            .unwrap(),
+        "the inbox keeps its whole window"
     );
 }
 

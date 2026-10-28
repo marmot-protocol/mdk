@@ -1272,6 +1272,53 @@ mod tests {
         assert_eq!(ranges(&app, &a, RELAY_A), vec![(100, 900, comparison)]);
     }
 
+    /// Imports un-cover from each newly charged generation's own bound, not
+    /// from the lowest of every unresolved one: a fetch that started after an
+    /// older loss keeps what it proved below a newer loss's floor, and a
+    /// falling floor still takes back everything from itself up.
+    #[test]
+    fn imports_with_rising_and_falling_floors_during_one_fetch() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let route = group(1);
+        let comparison = RecoveryCoverageProof::Comparison;
+        app.record_account_delivery_loss_bounded("alice", 41, 3, 1_000, Some(200))
+            .unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        let mark = app.recovery_coverage_mark().unwrap();
+        // A newer generation with a higher floor, then a notification lag
+        // with a still higher one, while the fetch runs.
+        app.record_account_delivery_loss_bounded("alice", 42, 2, 1_000, Some(600))
+            .unwrap();
+        app.record_account_recovery_loss_bounded(
+            "alice",
+            super::super::account_recovery::RecoveryLossCause::NotificationConsumer,
+            7,
+            0,
+            1_000,
+            Some(800),
+        )
+        .unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(
+            app.record_recovery_coverage_since(&[slice(&route, 100, 900)], 1_000, mark)
+                .unwrap()
+        );
+        assert_eq!(ranges(&app, &route, RELAY_A), vec![(100, 599, comparison)]);
+        // A falling floor: an older delivery joins the newest generation.
+        let mark = app.recovery_coverage_mark().unwrap();
+        app.record_account_delivery_loss_bounded("alice", 42, 3, 1_000, Some(300))
+            .unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(ranges(&app, &route, RELAY_A), vec![(100, 299, comparison)]);
+        assert!(
+            app.record_recovery_coverage_since(&[slice(&route, 100, 900)], 1_000, mark)
+                .unwrap()
+        );
+        assert_eq!(ranges(&app, &route, RELAY_A), vec![(100, 299, comparison)]);
+    }
+
     /// A receipt released while a comparison runs: the release un-covers the
     /// event's second on its route, and the comparison's write leaves that
     /// second owed.

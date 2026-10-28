@@ -3,7 +3,9 @@
 //! Fills storage's coverage ledger from facts the stack already produces:
 //! live REQ boundaries the adapter admitted, comparison certificates at
 //! settlement, epoch gaps and startup history goals. Storage itself un-covers
-//! the ledger inside each loss import's transaction. Then the recorder
+//! the ledger inside each loss import's and receipt release's transaction,
+//! and a certificate loses whatever was un-covered after its grant was
+//! selected. Then the recorder
 //! compares the ledger with every pending obligation and reports agreement as
 //! aggregate counts. Nothing here schedules, retries or fences recovery, and
 //! every write is best effort: a failure is logged and the recovery step it
@@ -272,8 +274,9 @@ impl AppClient {
     }
 
     /// A certified comparison covers its frozen window on each relay that
-    /// certifies the route, unless loss was imported after the grant froze:
-    /// that loss may lie inside the window, and its debt must stay.
+    /// certifies the route, less whatever was un-covered after the grant was
+    /// selected: a loss or released receipt since then may lie inside the
+    /// window, and its debt must stay.
     pub(super) fn record_comparison_coverage(
         &self,
         app: &SqliteAppStorage,
@@ -305,11 +308,15 @@ impl AppClient {
                 }
             }
         }
-        match app.record_recovery_coverage_at_loss_revision(&slices, now, grant.fence.loss_revision)
-        {
+        let Some(mark) = grant.coverage_mark else {
+            tracing::debug!(target: TARGET, method = "record_comparison_coverage",
+                routes = certified.len(), "pass has no coverage mark; certificates not recorded");
+            return;
+        };
+        match app.record_recovery_coverage_since(&slices, now, mark) {
             Ok(true) => {}
             Ok(false) => tracing::debug!(target: TARGET, method = "record_comparison_coverage",
-                routes = certified.len(), "newer loss supersedes the pass's certificates"),
+                routes = certified.len(), "un-cover log no longer reaches the pass's start"),
             Err(error) => log_failure("record_comparison_coverage", &error.into()),
         }
     }
