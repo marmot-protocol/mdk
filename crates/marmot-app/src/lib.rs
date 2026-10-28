@@ -1450,9 +1450,15 @@ impl MarmotApp {
     }
 
     /// A relay's caps for the time-sliced history sweep (#2660), from its
-    /// NIP-11 document behind the relay dial gate and cached per relay.
-    /// Unknown caps when the document is missing, malformed, unreachable or
-    /// refused, so the sweep infers the cap from full replies.
+    /// NIP-11 document behind the relay dial gate and cached per canonical
+    /// relay URL. Unknown caps when the document is missing, malformed,
+    /// unreachable or refused, so the sweep infers the cap from full replies.
+    ///
+    /// Nothing refreshes in the background: a call on a stale entry fetches
+    /// again, so call it when a relay reconnects. Caps compare by value, so a
+    /// caller sees a change by comparing a known read with the caps it
+    /// planned with. An unknown read means no information, not a change: a
+    /// failed fetch reads as unknown until a later one succeeds.
     // Phase 4 of #2660 hands these to `SdkSweepRelay` from the recovery runner.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn relay_caps(
