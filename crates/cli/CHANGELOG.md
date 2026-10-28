@@ -35,6 +35,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Creating a group now refuses an initial entry for `marmot.group.account-devices.v1` (0x800d), or any other protocol
+  component that carries no data, with `EngineError::NoDataAppComponent` before anything is created or published
+  (mdk#2628). Hosts could pass one among the optional initial components and create a GroupContext entry the spec
+  forbids; the engine alone decides whether a group requires the component. Optional state for other components is
+  unchanged.
 - A new group now requires `marmot.group.account-devices.v1` (0x800d) when the creating device and every device added
   at creation advertise it, so each member's devices can add and remove their own account's devices from the start
   (mdk#2628). The host doesn't ask for it. A group whose founding devices don't all advertise it is created as before.
