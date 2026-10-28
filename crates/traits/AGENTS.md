@@ -36,7 +36,7 @@ what lives here is in [`README.md`](README.md#what-lives-in-here).
 | `src/app_components/blossom_image.rs` | `GroupBlossomImageV1` state, codec, and Marmot media-type canonicalization. |
 | `src/app_components/encrypted_media.rs` | Frozen `EncryptedMediaPolicyV1` / `BlobStoreEndpointV1` state, codec, and endpoint-URL validation. |
 | `src/app_components/encrypted_media_v2.rs` | Current `marmot.group.encrypted-media.v2` state and codec. |
-| `src/app_components/device_roster.rs` | `DeviceRosterV1` (`marmot.account.device-roster.v1`) state, its diff-style `DeviceRosterUpdateV1` operations, codec and `apply`. Unreleased wire format until its spec is adopted. |
+| `src/app_components/device_roster.rs` | `DeviceRosterV1` (`marmot.account.device-roster.v1`) state: devices, leaf-map entries, rejected slots and rejected KeyPackages; its diff-style `DeviceRosterUpdateV1` operations, codec and `apply`. Unreleased wire format until its spec is adopted. |
 | `src/app_components/lifecycle.rs` | `GroupLifecycleV1` (`marmot.group.lifecycle.v1`) authenticated terminal lifecycle state. |
 | `src/app_components/tests.rs` | Byte-level component codec unit tests. |
 | `src/app_components/avatar_url.rs` | `GroupAvatarUrlV1` state, codec, wire URL validation, and contact-safety helper. |

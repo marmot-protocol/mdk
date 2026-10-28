@@ -1,9 +1,10 @@
 //! `marmot.account.device-roster.v1` state, update operations and codec.
 //!
 //! The roster is the GroupContext state of an account's device group
-//! (mdk#2628 D16). It holds three kinds of keyed entry: devices keyed by
-//! their KeyPackage publication slot, rejected slots, and rejected
-//! KeyPackages. One account-wide entry holds stage 4's reserved fields.
+//! (mdk#2628 D16, D23). It holds four kinds of keyed entry: devices keyed by
+//! their KeyPackage publication slot, leaf-map entries keyed by slot and MLS
+//! group id, rejected slots, and rejected KeyPackages. One account-wide entry
+//! holds stage 4's reserved fields.
 //!
 //! Unlike every other v1 GroupContext component, an update is a diff: a
 //! sorted list of operations, each setting or removing one entry. The
@@ -25,7 +26,7 @@ pub type DeviceSlotId = [u8; 32];
 pub const DEVICE_ROSTER_TEXT_MAX_LEN: usize = 64;
 /// Largest `KeyPackageRef`, in bytes. Marmot's ciphersuite makes it 32.
 pub const DEVICE_ROSTER_KEY_PACKAGE_REF_MAX_LEN: usize = 64;
-/// Largest MLS group id or leaf signature key in a leaf map entry, in bytes.
+/// Largest MLS group id or leaf signature key in a leaf-map entry, in bytes.
 pub const DEVICE_ROSTER_LEAF_MAP_VALUE_MAX_LEN: usize = 255;
 /// Largest reserved stage 4 key value, in bytes.
 pub const DEVICE_ROSTER_RESERVED_KEY_MAX_LEN: usize = 255;
@@ -35,9 +36,19 @@ pub const DEVICE_ROSTER_RESERVED_KEY_MAX_LEN: usize = 255;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeviceRosterV1 {
     pub devices: BTreeMap<DeviceSlotId, DeviceEntryV1>,
+    /// Each device's leaf in each group it joined: the leaf's signature key.
+    pub leaf_map: BTreeMap<LeafMapKeyV1, Vec<u8>>,
     pub rejected_slots: BTreeMap<DeviceSlotId, RejectedSlotV1>,
     pub rejected_key_packages: BTreeMap<Vec<u8>, RejectedKeyPackageV1>,
     pub account: AccountEntryV1,
+}
+
+/// A leaf-map entry's key: a device's slot and an MLS group id. Ordered by
+/// slot, then by group id bytes.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LeafMapKeyV1 {
+    pub slot: DeviceSlotId,
+    pub group_id: Vec<u8>,
 }
 
 /// One linked device, keyed by its slot.
@@ -57,8 +68,6 @@ pub struct DeviceEntryV1 {
     pub status: DeviceStatusV1,
     /// The `KeyPackageRef` the device announced for its slot.
     pub announced_key_package: Option<Vec<u8>>,
-    /// MLS group id to this device's leaf signature key in that group.
-    pub leaf_map: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Reserved for account sync: the device's history key. Opaque here.
     pub history_key: Option<Vec<u8>>,
 }
@@ -115,6 +124,9 @@ pub struct AccountEntryV1 {
 pub enum DeviceRosterOperationV1 {
     SetDevice(DeviceSlotId, DeviceEntryV1),
     RemoveDevice(DeviceSlotId),
+    /// Set a leaf-map entry to that leaf's signature key.
+    SetLeafMapEntry(LeafMapKeyV1, Vec<u8>),
+    RemoveLeafMapEntry(LeafMapKeyV1),
     SetRejectedSlot(DeviceSlotId, RejectedSlotV1),
     RemoveRejectedSlot(DeviceSlotId),
     SetRejectedKeyPackage(Vec<u8>, RejectedKeyPackageV1),
@@ -127,23 +139,29 @@ impl DeviceRosterOperationV1 {
         match self {
             Self::SetDevice(..) => 0,
             Self::RemoveDevice(..) => 1,
-            Self::SetRejectedSlot(..) => 2,
-            Self::RemoveRejectedSlot(..) => 3,
-            Self::SetRejectedKeyPackage(..) => 4,
-            Self::RemoveRejectedKeyPackage(..) => 5,
-            Self::SetAccount(..) => 6,
+            Self::SetLeafMapEntry(..) => 2,
+            Self::RemoveLeafMapEntry(..) => 3,
+            Self::SetRejectedSlot(..) => 4,
+            Self::RemoveRejectedSlot(..) => 5,
+            Self::SetRejectedKeyPackage(..) => 6,
+            Self::RemoveRejectedKeyPackage(..) => 7,
+            Self::SetAccount(..) => 8,
         }
     }
 
-    /// The entry this operation names: its kind, then its key bytes. The
-    /// canonical order of an update's operations is this order.
-    fn entry(&self) -> (u8, &[u8]) {
+    /// The entry this operation names: its kind, then its key bytes (a
+    /// leaf-map key is its slot, then its group id). The canonical order of
+    /// an update's operations is this order.
+    fn entry(&self) -> (u8, &[u8], &[u8]) {
         match self {
-            Self::SetDevice(slot, _) | Self::RemoveDevice(slot) => (0, slot),
-            Self::SetRejectedSlot(slot, _) | Self::RemoveRejectedSlot(slot) => (1, slot),
+            Self::SetDevice(slot, _) | Self::RemoveDevice(slot) => (0, slot, &[]),
+            Self::SetLeafMapEntry(key, _) | Self::RemoveLeafMapEntry(key) => {
+                (1, &key.slot, &key.group_id)
+            }
+            Self::SetRejectedSlot(slot, _) | Self::RemoveRejectedSlot(slot) => (2, slot, &[]),
             Self::SetRejectedKeyPackage(key_package_ref, _)
-            | Self::RemoveRejectedKeyPackage(key_package_ref) => (2, key_package_ref),
-            Self::SetAccount(_) => (3, &[]),
+            | Self::RemoveRejectedKeyPackage(key_package_ref) => (3, key_package_ref, &[]),
+            Self::SetAccount(_) => (4, &[], &[]),
         }
     }
 }
@@ -183,6 +201,12 @@ impl DeviceRosterUpdateV1 {
         for operation in &self.operations {
             match operation {
                 DeviceRosterOperationV1::SetDevice(_, device) => validate_device(device)?,
+                DeviceRosterOperationV1::SetLeafMapEntry(key, signature_key) => {
+                    validate_leaf_map_entry(key, signature_key)?;
+                }
+                DeviceRosterOperationV1::RemoveLeafMapEntry(key) => {
+                    validate_leaf_map_group_id(&key.group_id)?;
+                }
                 DeviceRosterOperationV1::SetRejectedKeyPackage(key_package_ref, _)
                 | DeviceRosterOperationV1::RemoveRejectedKeyPackage(key_package_ref) => {
                     validate_key_package_ref(key_package_ref)?;
@@ -199,8 +223,9 @@ impl DeviceRosterUpdateV1 {
 
 impl DeviceRosterV1 {
     /// The roster's own invariants: field bounds, at most
-    /// [`MAX_LEAVES_PER_ACCOUNT`] devices, and no slot both a device and
-    /// rejected.
+    /// [`MAX_LEAVES_PER_ACCOUNT`] devices, no slot both a device and
+    /// rejected, and every leaf-map entry held by a device or by a slot
+    /// rejected as removed.
     pub fn validate(&self) -> Result<(), String> {
         if self.devices.len() > MAX_LEAVES_PER_ACCOUNT {
             return Err(format!(
@@ -216,6 +241,21 @@ impl DeviceRosterV1 {
             .any(|slot| self.rejected_slots.contains_key(slot))
         {
             return Err("device roster lists a slot as both a device and rejected".into());
+        }
+        for (key, signature_key) in &self.leaf_map {
+            validate_leaf_map_entry(key, signature_key)?;
+            // A removed device's entries stay while its leaves remain in
+            // chats its siblings can't clean up.
+            let removed = self
+                .rejected_slots
+                .get(&key.slot)
+                .is_some_and(|rejected| rejected.reason == RejectedSlotReasonV1::Removed);
+            if !self.devices.contains_key(&key.slot) && !removed {
+                return Err(
+                    "device roster leaf map names a slot that is neither a device nor removed"
+                        .into(),
+                );
+            }
         }
         for key_package_ref in self.rejected_key_packages.keys() {
             validate_key_package_ref(key_package_ref)?;
@@ -237,6 +277,14 @@ impl DeviceRosterV1 {
                     next.devices
                         .remove(slot)
                         .ok_or("device roster update removes a device it does not hold")?;
+                }
+                DeviceRosterOperationV1::SetLeafMapEntry(key, signature_key) => {
+                    next.leaf_map.insert(key.clone(), signature_key.clone());
+                }
+                DeviceRosterOperationV1::RemoveLeafMapEntry(key) => {
+                    next.leaf_map
+                        .remove(key)
+                        .ok_or("device roster update removes a leaf-map entry it does not hold")?;
                 }
                 DeviceRosterOperationV1::SetRejectedSlot(slot, rejected) => {
                     next.rejected_slots.insert(*slot, *rejected);
@@ -306,18 +354,6 @@ fn validate_device(device: &DeviceEntryV1) -> Result<(), String> {
     if let Some(key_package_ref) = &device.announced_key_package {
         validate_key_package_ref(key_package_ref)?;
     }
-    for (group_id, signature_key) in &device.leaf_map {
-        validate_bounded(
-            group_id,
-            DEVICE_ROSTER_LEAF_MAP_VALUE_MAX_LEN,
-            "leaf map group id",
-        )?;
-        validate_bounded(
-            signature_key,
-            DEVICE_ROSTER_LEAF_MAP_VALUE_MAX_LEN,
-            "leaf map signature key",
-        )?;
-    }
     if let Some(history_key) = &device.history_key {
         validate_bounded(
             history_key,
@@ -326,6 +362,23 @@ fn validate_device(device: &DeviceEntryV1) -> Result<(), String> {
         )?;
     }
     Ok(())
+}
+
+fn validate_leaf_map_group_id(group_id: &[u8]) -> Result<(), String> {
+    validate_bounded(
+        group_id,
+        DEVICE_ROSTER_LEAF_MAP_VALUE_MAX_LEN,
+        "leaf map group id",
+    )
+}
+
+fn validate_leaf_map_entry(key: &LeafMapKeyV1, signature_key: &[u8]) -> Result<(), String> {
+    validate_leaf_map_group_id(&key.group_id)?;
+    validate_bounded(
+        signature_key,
+        DEVICE_ROSTER_LEAF_MAP_VALUE_MAX_LEN,
+        "leaf map signature key",
+    )
 }
 
 fn validate_account(account: &AccountEntryV1) -> Result<(), String> {
@@ -344,6 +397,11 @@ pub fn encode_device_roster_v1(roster: &DeviceRosterV1) -> Result<Vec<u8>, Strin
         devices.extend_from_slice(slot);
         encode_device(device, &mut devices);
     }
+    let mut leaf_map = Vec::new();
+    for (key, signature_key) in &roster.leaf_map {
+        encode_leaf_map_key(key, &mut leaf_map);
+        encode_var_bytes(signature_key, &mut leaf_map);
+    }
     let mut rejected_slots = Vec::new();
     for (slot, rejected) in &roster.rejected_slots {
         rejected_slots.extend_from_slice(slot);
@@ -356,6 +414,7 @@ pub fn encode_device_roster_v1(roster: &DeviceRosterV1) -> Result<Vec<u8>, Strin
     }
     let mut out = Vec::new();
     encode_var_bytes(&devices, &mut out);
+    encode_var_bytes(&leaf_map, &mut out);
     encode_var_bytes(&rejected_slots, &mut out);
     encode_var_bytes(&rejected_key_packages, &mut out);
     encode_account(&roster.account, &mut out);
@@ -375,6 +434,13 @@ pub fn encode_device_roster_update_v1(update: &DeviceRosterUpdateV1) -> Result<V
             DeviceRosterOperationV1::RemoveDevice(slot)
             | DeviceRosterOperationV1::RemoveRejectedSlot(slot) => {
                 operations.extend_from_slice(slot);
+            }
+            DeviceRosterOperationV1::SetLeafMapEntry(key, signature_key) => {
+                encode_leaf_map_key(key, &mut operations);
+                encode_var_bytes(signature_key, &mut operations);
+            }
+            DeviceRosterOperationV1::RemoveLeafMapEntry(key) => {
+                encode_leaf_map_key(key, &mut operations);
             }
             DeviceRosterOperationV1::SetRejectedSlot(slot, rejected) => {
                 operations.extend_from_slice(slot);
@@ -415,13 +481,12 @@ fn encode_device(device: &DeviceEntryV1, out: &mut Vec<u8>) {
         DeviceStatusV1::Leaving => 2,
     });
     encode_optional_bytes(device.announced_key_package.as_deref(), out);
-    let mut leaf_map = Vec::new();
-    for (group_id, signature_key) in &device.leaf_map {
-        encode_var_bytes(group_id, &mut leaf_map);
-        encode_var_bytes(signature_key, &mut leaf_map);
-    }
-    encode_var_bytes(&leaf_map, out);
     encode_optional_bytes(device.history_key.as_deref(), out);
+}
+
+fn encode_leaf_map_key(key: &LeafMapKeyV1, out: &mut Vec<u8>) {
+    out.extend_from_slice(&key.slot);
+    encode_var_bytes(&key.group_id, out);
 }
 
 fn encode_rejected_slot(rejected: &RejectedSlotV1, out: &mut Vec<u8>) {
@@ -469,6 +534,7 @@ fn encode_optional_bytes(bytes: Option<&[u8]>, out: &mut Vec<u8>) {
 pub fn decode_device_roster_v1(bytes: &[u8]) -> Result<DeviceRosterV1, String> {
     let mut cursor = bytes;
     let devices_bytes = decode_vector(&mut cursor, "devices")?;
+    let leaf_map_bytes = decode_vector(&mut cursor, "leaf map")?;
     let rejected_slots_bytes = decode_vector(&mut cursor, "rejected slots")?;
     let rejected_key_packages_bytes = decode_vector(&mut cursor, "rejected KeyPackages")?;
     let account = decode_account(&mut cursor)?;
@@ -485,6 +551,12 @@ pub fn decode_device_roster_v1(bytes: &[u8]) -> Result<DeviceRosterV1, String> {
         let slot = decode_slot(&mut items, "device slot")?;
         let device = decode_device(&mut items)?;
         insert_sorted(&mut roster.devices, slot, device, "devices")?;
+    }
+    let mut items = leaf_map_bytes.as_slice();
+    while !items.is_empty() {
+        let key = decode_leaf_map_key(&mut items)?;
+        let signature_key = decode_leaf_map_signature_key(&mut items)?;
+        insert_sorted(&mut roster.leaf_map, key, signature_key, "leaf map")?;
     }
     let mut items = rejected_slots_bytes.as_slice();
     while !items.is_empty() {
@@ -526,24 +598,32 @@ pub fn decode_device_roster_update_v1(bytes: &[u8]) -> Result<DeviceRosterUpdate
             }
             1 => DeviceRosterOperationV1::RemoveDevice(decode_slot(&mut items, "device slot")?),
             2 => {
+                let key = decode_leaf_map_key(&mut items)?;
+                DeviceRosterOperationV1::SetLeafMapEntry(
+                    key,
+                    decode_leaf_map_signature_key(&mut items)?,
+                )
+            }
+            3 => DeviceRosterOperationV1::RemoveLeafMapEntry(decode_leaf_map_key(&mut items)?),
+            4 => {
                 let slot = decode_slot(&mut items, "rejected slot")?;
                 DeviceRosterOperationV1::SetRejectedSlot(slot, decode_rejected_slot(&mut items)?)
             }
-            3 => DeviceRosterOperationV1::RemoveRejectedSlot(decode_slot(
+            5 => DeviceRosterOperationV1::RemoveRejectedSlot(decode_slot(
                 &mut items,
                 "rejected slot",
             )?),
-            4 => {
+            6 => {
                 let key_package_ref = decode_key_package_ref(&mut items)?;
                 DeviceRosterOperationV1::SetRejectedKeyPackage(
                     key_package_ref,
                     decode_rejected_key_package(&mut items)?,
                 )
             }
-            5 => DeviceRosterOperationV1::RemoveRejectedKeyPackage(decode_key_package_ref(
+            7 => DeviceRosterOperationV1::RemoveRejectedKeyPackage(decode_key_package_ref(
                 &mut items,
             )?),
-            6 => DeviceRosterOperationV1::SetAccount(decode_account(&mut items)?),
+            8 => DeviceRosterOperationV1::SetAccount(decode_account(&mut items)?),
             _ => return Err("device roster update has an unknown operation type".into()),
         };
         operations.push(operation);
@@ -594,22 +674,6 @@ fn decode_device(cursor: &mut &[u8]) -> Result<DeviceEntryV1, String> {
     let announced_key_package = decode_optional(cursor, "announced KeyPackageRef", |cursor| {
         decode_key_package_ref(cursor)
     })?;
-    let leaf_map_bytes = decode_vector(cursor, "leaf map")?;
-    let mut leaf_map = BTreeMap::new();
-    let mut items = leaf_map_bytes.as_slice();
-    while !items.is_empty() {
-        let group_id = decode_bounded(
-            &mut items,
-            DEVICE_ROSTER_LEAF_MAP_VALUE_MAX_LEN,
-            "leaf map group id",
-        )?;
-        let signature_key = decode_bounded(
-            &mut items,
-            DEVICE_ROSTER_LEAF_MAP_VALUE_MAX_LEN,
-            "leaf map signature key",
-        )?;
-        insert_sorted(&mut leaf_map, group_id, signature_key, "leaf map")?;
-    }
     let history_key = decode_optional(cursor, "history key", |cursor| {
         decode_bounded(cursor, DEVICE_ROSTER_RESERVED_KEY_MAX_LEN, "history key")
     })?;
@@ -622,9 +686,26 @@ fn decode_device(cursor: &mut &[u8]) -> Result<DeviceEntryV1, String> {
         settings,
         status,
         announced_key_package,
-        leaf_map,
         history_key,
     })
+}
+
+fn decode_leaf_map_key(cursor: &mut &[u8]) -> Result<LeafMapKeyV1, String> {
+    let slot = decode_slot(cursor, "leaf map slot")?;
+    let group_id = decode_bounded(
+        cursor,
+        DEVICE_ROSTER_LEAF_MAP_VALUE_MAX_LEN,
+        "leaf map group id",
+    )?;
+    Ok(LeafMapKeyV1 { slot, group_id })
+}
+
+fn decode_leaf_map_signature_key(cursor: &mut &[u8]) -> Result<Vec<u8>, String> {
+    decode_bounded(
+        cursor,
+        DEVICE_ROSTER_LEAF_MAP_VALUE_MAX_LEN,
+        "leaf map signature key",
+    )
 }
 
 fn decode_rejected_slot(cursor: &mut &[u8]) -> Result<RejectedSlotV1, String> {
@@ -739,8 +820,23 @@ mod tests {
         }
     }
 
-    /// One of everything: two devices, one with every optional field, a
-    /// rejected slot, a rejected KeyPackage and the reserved account fields.
+    fn leaf(slot_byte: u8, group_byte: u8) -> LeafMapKeyV1 {
+        LeafMapKeyV1 {
+            slot: slot(slot_byte),
+            group_id: vec![group_byte; 16],
+        }
+    }
+
+    fn removed() -> RejectedSlotV1 {
+        RejectedSlotV1 {
+            reason: RejectedSlotReasonV1::Removed,
+            rejected_at: 1_700_001_000,
+        }
+    }
+
+    /// One of everything: two devices, one with every optional field,
+    /// leaf-map entries for a device and for a removed slot, a rejected slot,
+    /// a rejected KeyPackage and the reserved account fields.
     fn full_roster() -> DeviceRosterV1 {
         let phone = DeviceEntryV1 {
             label: "Phone".into(),
@@ -755,7 +851,6 @@ mod tests {
             },
             status: DeviceStatusV1::Active,
             announced_key_package: Some(vec![0xaa; 32]),
-            leaf_map: [(vec![0x01; 16], vec![0x02; 32])].into_iter().collect(),
             history_key: None,
         };
         let laptop = DeviceEntryV1 {
@@ -768,15 +863,14 @@ mod tests {
         };
         DeviceRosterV1 {
             devices: [(slot(1), phone), (slot(2), laptop)].into_iter().collect(),
-            rejected_slots: [(
-                slot(9),
-                RejectedSlotV1 {
-                    reason: RejectedSlotReasonV1::Removed,
-                    rejected_at: 1_700_001_000,
-                },
-            )]
+            leaf_map: [
+                (leaf(1, 0x01), vec![0x02; 32]),
+                (leaf(1, 0x05), vec![0x06; 32]),
+                (leaf(9, 0x01), vec![0x07; 32]),
+            ]
             .into_iter()
             .collect(),
+            rejected_slots: [(slot(9), removed())].into_iter().collect(),
             rejected_key_packages: [(
                 vec![0xbb; 32],
                 RejectedKeyPackageV1 {
@@ -794,9 +888,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_roster_is_three_empty_vectors_and_an_empty_account_entry() {
+    fn empty_roster_is_four_empty_vectors_and_an_empty_account_entry() {
         let bytes = encode_device_roster_v1(&DeviceRosterV1::default()).unwrap();
-        assert_eq!(bytes, [0, 0, 0, 0, 0]);
+        assert_eq!(bytes, [0, 0, 0, 0, 0, 0]);
         assert_eq!(
             decode_device_roster_v1(&bytes).unwrap(),
             DeviceRosterV1::default()
@@ -833,7 +927,6 @@ mod tests {
                     },
                     status: DeviceStatusV1::Active,
                     announced_key_package: None,
-                    leaf_map: BTreeMap::new(),
                     history_key: None,
                 },
             )]
@@ -842,7 +935,7 @@ mod tests {
             ..DeviceRosterV1::default()
         };
         let expected = concat!(
-            "38",                                                               // devices<V>: 56 bytes
+            "37",                                                               // devices<V>: 55 bytes
             "1111111111111111111111111111111111111111111111111111111111111111", // slot
             "0550686f6e65",                                                     // label "Phone"
             "02776e",                                                           // client "wn"
@@ -852,8 +945,8 @@ mod tests {
             "05",                                                               // settings
             "00",                                                               // status active
             "00",                                                               // no KeyPackageRef
-            "00",                                                               // leaf_map<V>
             "00",                                                               // no history key
+            "00",                                                               // leaf_map<V>
             "00",                                                               // rejected_slots<V>
             "00",   // rejected_key_packages<V>
             "0000", // account entry
@@ -873,6 +966,31 @@ mod tests {
                 "1111111111111111111111111111111111111111111111111111111111111111", // slot
             )
         );
+        let joined = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetLeafMapEntry(
+            leaf(0x11, 0x01),
+            vec![0x02; 32],
+        )])
+        .unwrap();
+        let joined_bytes = encode_device_roster_update_v1(&joined).unwrap();
+        assert_eq!(
+            hex::encode(&joined_bytes),
+            concat!(
+                "4053",                                                             // operations<V>: 83 bytes
+                "02", // set_leaf_map_entry
+                "1111111111111111111111111111111111111111111111111111111111111111", // slot
+                "1001010101010101010101010101010101", // group_id
+                "200202020202020202020202020202020202020202020202020202020202020202", // signature key
+            )
+        );
+        let next = roster.apply(&joined).unwrap();
+        assert_eq!(
+            apply_device_roster_update_v1(
+                &encode_device_roster_v1(&roster).unwrap(),
+                &joined_bytes
+            )
+            .unwrap(),
+            encode_device_roster_v1(&next).unwrap()
+        );
     }
 
     #[test]
@@ -885,13 +1003,36 @@ mod tests {
         };
         let bytes = encode_device_roster_v1(&two).unwrap();
         // Swap the two device entries, which have the same length. Their
-        // 100-byte vector takes a two-byte length prefix; the two empty
-        // rejection vectors and the empty account entry, four bytes, follow.
-        let entry_len = (bytes.len() - 2 - 4) / 2;
+        // 98-byte vector takes a two-byte length prefix; the empty leaf map,
+        // the two empty rejection vectors and the empty account entry, five
+        // bytes, follow.
+        let entry_len = (bytes.len() - 2 - 5) / 2;
         let mut swapped = bytes[..2].to_vec();
         swapped.extend_from_slice(&bytes[2 + entry_len..2 + 2 * entry_len]);
         swapped.extend_from_slice(&bytes[2..2 + entry_len]);
         swapped.extend_from_slice(&bytes[2 + 2 * entry_len..]);
+        assert!(
+            decode_device_roster_v1(&swapped)
+                .unwrap_err()
+                .contains("sorted and unique")
+        );
+
+        // Two leaf-map entries for one slot, out of group id order.
+        let mut leaves = DeviceRosterV1 {
+            devices: [(slot(1), device("A"))].into_iter().collect(),
+            ..DeviceRosterV1::default()
+        };
+        leaves.leaf_map.insert(leaf(1, 0x01), vec![0x0a; 32]);
+        leaves.leaf_map.insert(leaf(1, 0x02), vec![0x0b; 32]);
+        let bytes = encode_device_roster_v1(&leaves).unwrap();
+        let devices_end = 1 + bytes[0] as usize;
+        // Each entry is slot (32), group id (1 + 16), signature key (1 + 32).
+        let leaf_len = 32 + 17 + 33;
+        let leaves_at = devices_end + 2;
+        let mut swapped = bytes[..leaves_at].to_vec();
+        swapped.extend_from_slice(&bytes[leaves_at + leaf_len..leaves_at + 2 * leaf_len]);
+        swapped.extend_from_slice(&bytes[leaves_at..leaves_at + leaf_len]);
+        swapped.extend_from_slice(&bytes[leaves_at + 2 * leaf_len..]);
         assert!(
             decode_device_roster_v1(&swapped)
                 .unwrap_err()
@@ -948,6 +1089,42 @@ mod tests {
             ..DeviceRosterV1::default()
         };
         assert!(encode_device_roster_v1(&long_label).is_err());
+
+        // A leaf-map entry belongs to a device, or to a slot rejected as
+        // removed whose leaves may still be in chats.
+        let mut roster = DeviceRosterV1 {
+            devices: [(slot(1), device("A"))].into_iter().collect(),
+            leaf_map: [(leaf(1, 0x01), vec![0x0a; 32])].into_iter().collect(),
+            ..DeviceRosterV1::default()
+        };
+        assert!(encode_device_roster_v1(&roster).is_ok());
+        roster.leaf_map.insert(leaf(2, 0x01), vec![0x0b; 32]);
+        assert!(encode_device_roster_v1(&roster).is_err());
+        roster.rejected_slots.insert(
+            slot(2),
+            RejectedSlotV1 {
+                reason: RejectedSlotReasonV1::NotMe,
+                rejected_at: 0,
+            },
+        );
+        assert!(encode_device_roster_v1(&roster).is_err());
+        roster.rejected_slots.insert(slot(2), removed());
+        assert!(encode_device_roster_v1(&roster).is_ok());
+
+        let mut empty_signature_key = roster.clone();
+        empty_signature_key
+            .leaf_map
+            .insert(leaf(1, 0x02), Vec::new());
+        assert!(encode_device_roster_v1(&empty_signature_key).is_err());
+        let mut long_group_id = roster;
+        long_group_id.leaf_map.insert(
+            LeafMapKeyV1 {
+                slot: slot(1),
+                group_id: vec![0x01; 256],
+            },
+            vec![0x0c; 32],
+        );
+        assert!(encode_device_roster_v1(&long_group_id).is_err());
     }
 
     #[test]
@@ -960,11 +1137,22 @@ mod tests {
             ])
             .is_err()
         );
-        // A device and a rejected slot with the same key are different
-        // entries.
+        assert!(
+            DeviceRosterUpdateV1::new(vec![
+                DeviceRosterOperationV1::SetLeafMapEntry(leaf(1, 0x01), vec![0x0a; 32]),
+                DeviceRosterOperationV1::RemoveLeafMapEntry(leaf(1, 0x01)),
+            ])
+            .is_err()
+        );
+        // A device, its leaf-map entries and a rejected slot with the same
+        // slot are different entries. Leaf-map entries sort by slot, then by
+        // group id.
         let update = DeviceRosterUpdateV1::new(vec![
             DeviceRosterOperationV1::SetAccount(AccountEntryV1::default()),
             DeviceRosterOperationV1::RemoveRejectedSlot(slot(1)),
+            DeviceRosterOperationV1::RemoveLeafMapEntry(leaf(2, 0x01)),
+            DeviceRosterOperationV1::RemoveLeafMapEntry(leaf(1, 0x02)),
+            DeviceRosterOperationV1::SetLeafMapEntry(leaf(1, 0x01), vec![0x0a; 32]),
             DeviceRosterOperationV1::RemoveDevice(slot(1)),
         ])
         .unwrap();
@@ -972,9 +1160,12 @@ mod tests {
             update.operations(),
             [
                 DeviceRosterOperationV1::RemoveDevice(_),
+                DeviceRosterOperationV1::SetLeafMapEntry(first, _),
+                DeviceRosterOperationV1::RemoveLeafMapEntry(second),
+                DeviceRosterOperationV1::RemoveLeafMapEntry(third),
                 DeviceRosterOperationV1::RemoveRejectedSlot(_),
                 DeviceRosterOperationV1::SetAccount(_),
-            ]
+            ] if *first == leaf(1, 0x01) && *second == leaf(1, 0x02) && *third == leaf(2, 0x01)
         ));
         let bytes = encode_device_roster_update_v1(&update).unwrap();
         assert_eq!(decode_device_roster_update_v1(&bytes).unwrap(), update);
@@ -993,7 +1184,7 @@ mod tests {
         reversed.extend_from_slice(&in_order[1..34]);
         assert!(decode_device_roster_update_v1(&reversed).is_err());
         let mut unknown_op = in_order;
-        unknown_op[1] = 7;
+        unknown_op[1] = 9;
         assert!(decode_device_roster_update_v1(&unknown_op).is_err());
         assert!(decode_device_roster_update_v1(&[0]).is_err());
     }
@@ -1024,6 +1215,8 @@ mod tests {
 
         for invalid in [
             DeviceRosterOperationV1::RemoveDevice(slot(7)),
+            DeviceRosterOperationV1::RemoveLeafMapEntry(leaf(2, 0x01)),
+            DeviceRosterOperationV1::SetLeafMapEntry(leaf(7, 0x01), vec![0x0a; 32]),
             DeviceRosterOperationV1::RemoveRejectedSlot(slot(7)),
             DeviceRosterOperationV1::RemoveRejectedKeyPackage(vec![0xcc; 32]),
             DeviceRosterOperationV1::SetRejectedSlot(
@@ -1037,5 +1230,63 @@ mod tests {
             let update = DeviceRosterUpdateV1::new(vec![invalid.clone()]).unwrap();
             assert!(prior.apply(&update).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn a_removed_device_keeps_its_leaf_map_entries_only_while_recorded_as_removed() {
+        let prior = full_roster();
+        // Removing slot 1's device alone leaves its leaf-map entries with no
+        // owner.
+        let bare = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::RemoveDevice(slot(1))])
+            .unwrap();
+        assert!(prior.apply(&bare).is_err());
+
+        // Recorded as removed, its entries stay for the chats it is still in.
+        let removed_device = DeviceRosterUpdateV1::new(vec![
+            DeviceRosterOperationV1::RemoveDevice(slot(1)),
+            DeviceRosterOperationV1::SetRejectedSlot(slot(1), removed()),
+        ])
+        .unwrap();
+        let next = prior.apply(&removed_device).unwrap();
+        assert_eq!(next.leaf_map, prior.leaf_map);
+
+        // Rejected as not theirs, its entries must go in the same update.
+        let not_me = RejectedSlotV1 {
+            reason: RejectedSlotReasonV1::NotMe,
+            rejected_at: 0,
+        };
+        let rejected = DeviceRosterUpdateV1::new(vec![
+            DeviceRosterOperationV1::RemoveDevice(slot(1)),
+            DeviceRosterOperationV1::SetRejectedSlot(slot(1), not_me),
+        ])
+        .unwrap();
+        assert!(prior.apply(&rejected).is_err());
+        let rejected_and_cleared = DeviceRosterUpdateV1::new(vec![
+            DeviceRosterOperationV1::RemoveDevice(slot(1)),
+            DeviceRosterOperationV1::RemoveLeafMapEntry(leaf(1, 0x01)),
+            DeviceRosterOperationV1::RemoveLeafMapEntry(leaf(1, 0x05)),
+            DeviceRosterOperationV1::SetRejectedSlot(slot(1), not_me),
+        ])
+        .unwrap();
+        let next = prior.apply(&rejected_and_cleared).unwrap();
+        assert!(next.leaf_map.keys().all(|key| key.slot != slot(1)));
+
+        // Dropping the removed record of slot 9 drops its entries too.
+        assert!(
+            prior
+                .apply(
+                    &DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::RemoveRejectedSlot(
+                        slot(9)
+                    )])
+                    .unwrap()
+                )
+                .is_err()
+        );
+        let forgotten = DeviceRosterUpdateV1::new(vec![
+            DeviceRosterOperationV1::RemoveLeafMapEntry(leaf(9, 0x01)),
+            DeviceRosterOperationV1::RemoveRejectedSlot(slot(9)),
+        ])
+        .unwrap();
+        assert!(prior.apply(&forgotten).is_ok());
     }
 }

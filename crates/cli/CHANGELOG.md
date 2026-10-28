@@ -21,8 +21,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - The engine implements `marmot.account.device-roster.v1` (0x800e), the roster of an account's device group
   (mdk#2628 item 3.1). A group that requires it is a device group. It holds the roster from creation and keeps
   requiring it, and only one account's devices may be members. A roster update is a list of operations that each set
-  or remove one entry: a device keyed by its KeyPackage slot, a rejected slot or a rejected KeyPackage. Every member
-  applies the operations to the parent's roster, and a roster may hold at most 20 devices. Until the component's spec
+  or remove one entry: a device keyed by its KeyPackage slot, a leaf-map entry keyed by a device's slot and a group,
+  a rejected slot or a rejected KeyPackage. Every member applies the operations to the parent's roster. A roster may
+  hold at most 20 devices, and each leaf-map entry belongs to a device or to a slot recorded as removed. Until the component's spec
   is adopted, only test-policy builds may advertise it. A release build can't create or join a device group, and it
   treats roster bytes in other groups as unknown data, so nothing ships the format.
 - The conformance simulator models `marmot.group.account-devices.v1` (0x800d) support per client (mdk#2628). Scenario
