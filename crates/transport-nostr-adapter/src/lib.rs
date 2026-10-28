@@ -2950,9 +2950,14 @@ impl ReplaySupervisor {
                 {
                     // This is a decoded acquired body being discarded, not
                     // an empty cancellation or a missing metadata boundary.
-                    // An owner capture's body is its own re-fetch: the source
-                    // stays unadmitted and its pending obligation still owes it.
-                    if paging.credit.is_none() {
+                    // An owner capture's body is its own re-fetch while its
+                    // source still awaits the owner, which still owes it.
+                    let owed = paging.credit.is_some()
+                        && guard
+                            .account_replay_coverage
+                            .get(&self.account_id)
+                            .is_some_and(|coverage| coverage.capture_still_owed(paging));
+                    if !owed {
                         guard
                             .replay_losses
                             .record(&self.account_id, paging.window.since);
@@ -3738,9 +3743,11 @@ struct HistoryReplay {
     phase: ReplayAdmission,
     claims: HashSet<[u8; 32]>,
     /// Every body this stream claims was fetched by this source's unfinished
-    /// owner capture, whatever other copies of it arrived. The capture's window
-    /// is still owed by its pending recovery obligation, so discarding those
-    /// bodies leaves the source unadmitted and charges no loss.
+    /// owner capture, whatever other copies of it arrived. A cut of that
+    /// capture ([`ReplayAbandon::Cut`]) leaves the source unadmitted with its
+    /// window still owed, so discarding those bodies charges no loss. Any
+    /// other discard, such as a reconnect, refusal or removal that lets the
+    /// source be admitted without the capture, keeps the loss.
     owner_refetch: bool,
     observed: bool,
     deadline: tokio::time::Instant,
@@ -3783,6 +3790,10 @@ enum ReplayAdmission {
 enum ReplayAbandon {
     Unfinished,
     Interrupted,
+    /// The owner capture stopped, failed or was fenced by receiver loss. The
+    /// source stays unadmitted until the owner grants it again, so bodies
+    /// that capture fetched itself are still owed and charge no loss.
+    Cut,
     Lost,
 }
 
@@ -4482,7 +4493,7 @@ impl AccountReplayCoverage {
         let claims = std::mem::take(&mut stream.claims);
         let refetch = std::mem::take(&mut stream.owner_refetch);
         let discarded = self.drop_claims(group_id, claims);
-        if force || (discarded && !refetch) {
+        if force || (discarded && !(refetch && reason == ReplayAbandon::Cut)) {
             self.record_loss(since);
         }
         self.wake_replay();
@@ -5129,6 +5140,9 @@ impl AccountReplayCoverage {
                     &owner,
                     if complete {
                         ReplayAbandon::Unfinished
+                    } else if restart == ReplayStart::Gap {
+                        // Receiver loss leaves the source to the owner.
+                        ReplayAbandon::Cut
                     } else {
                         ReplayAbandon::Interrupted
                     },
@@ -5456,7 +5470,7 @@ impl AccountReplayCoverage {
             })
             .collect::<Vec<_>>();
         for (group_id, owner) in owners {
-            self.abandon_stream(&group_id, &owner, ReplayAbandon::Interrupted);
+            self.abandon_stream(&group_id, &owner, ReplayAbandon::Cut);
         }
         if let Some(replay) = self.replay_mut(id, relay)
             && *replay != RelayReplay::Refused
@@ -5617,6 +5631,18 @@ impl AccountReplayCoverage {
             .is_some_and(|endpoint| endpoint.serial == paging.serial && endpoint.capturing)
     }
 
+    /// The capture is still current, so its stop or failure leaves the source
+    /// incomplete, or it was already stopped incomplete: either way the
+    /// source waits for the owner's next grant.
+    fn capture_still_owed(&self, paging: &ReplayPaging) -> bool {
+        self.capture_current(paging)
+            || self
+                .subscriptions
+                .get(&paging.subscription_id)
+                .and_then(|relays| relays.get(&paging.relay))
+                == Some(&RelayReplay::Incomplete)
+    }
+
     fn start_route(&mut self, paging: &ReplayPaging, window: &ReplayWindow) -> bool {
         if !self.capture_current(paging)
             || self.endpoint_deadlines[&paging.subscription_id][&paging.relay]
@@ -5722,7 +5748,7 @@ impl AccountReplayCoverage {
                 })
                 .collect::<Vec<_>>();
             for (group_id, owner) in owners {
-                self.abandon_stream(&group_id, &owner, ReplayAbandon::Interrupted);
+                self.abandon_stream(&group_id, &owner, ReplayAbandon::Cut);
             }
         }
         self.wake_replay();
@@ -5780,7 +5806,7 @@ impl AccountReplayCoverage {
                             .cloned()
                             .collect::<Vec<_>>();
                         for peer in siblings {
-                            self.abandon_stream(&group_id, &peer, ReplayAbandon::Interrupted);
+                            self.abandon_stream(&group_id, &peer, ReplayAbandon::Cut);
                         }
                     } else {
                         self.abandon_stream(&group_id, &owner, ReplayAbandon::Unfinished);
@@ -8099,6 +8125,88 @@ mod batch_tests {
             Some(&NostrNotificationLossFloor::Since(100)),
             "a REQ-only holder dropping the body last keeps its loss"
         );
+    }
+
+    /// Only a cut leaves the capture's source waiting for the owner. A changed
+    /// connection, a refusal or a removed subscription can let the source be
+    /// admitted without the capture, so dropping its pages there keeps the
+    /// loss. Receiver loss fences the source for the owner and charges none.
+    #[tokio::test(start_paused = true)]
+    async fn capture_pages_keep_loss_unless_the_owner_still_owes_them() {
+        let (tx, _rx) = mpsc::channel(4);
+        let capturing = |coverage: &mut AccountReplayCoverage, id: &str| {
+            coverage.record_eose(id, RelayIndex(1), 0);
+            let paging = paging_for(coverage, id);
+            assert!(coverage.start_route(&paging, &paging.window.per_route()[0]));
+            coverage
+                .stage_delivery(
+                    group_delivery(id, GroupId::new(vec![0; 16]), vec![0; 32], 7),
+                    Some(RelayIndex(2)),
+                    ReplayInput::Page,
+                    &tx,
+                )
+                .unwrap();
+            assert_eq!(coverage.buffered_items, 1);
+        };
+        let charged = |losses: &ReplayLosses| {
+            losses
+                .pending
+                .lock()
+                .unwrap()
+                .get(&MemberId::new(vec![0xA1; 32]))
+                .copied()
+        };
+
+        let (mut coverage, id, losses) = replay_coverage(1);
+        capturing(&mut coverage, &id);
+        coverage.restart_relay(
+            RelayIndex(2),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+        );
+        assert_eq!(coverage.buffered_items, 0);
+        assert_eq!(
+            coverage.subscriptions[&id][&RelayIndex(2)],
+            RelayReplay::Awaiting,
+            "a fresh REQ boundary can admit the source again"
+        );
+        assert_eq!(
+            charged(&losses),
+            Some(NostrNotificationLossFloor::Since(100))
+        );
+
+        let (mut coverage, id, losses) = replay_coverage(1);
+        capturing(&mut coverage, &id);
+        coverage.record_refusal(&id, RelayIndex(2), SubscriptionRefusalDisposition::Dropped);
+        assert_eq!(coverage.buffered_items, 0);
+        assert_eq!(
+            charged(&losses),
+            Some(NostrNotificationLossFloor::Since(100))
+        );
+
+        let (mut coverage, id, losses) = replay_coverage(1);
+        capturing(&mut coverage, &id);
+        coverage.remove_subscription(&id);
+        assert_eq!(coverage.buffered_items, 0);
+        assert_eq!(
+            charged(&losses),
+            Some(NostrNotificationLossFloor::Since(100))
+        );
+
+        let (mut coverage, id, losses) = replay_coverage(1);
+        capturing(&mut coverage, &id);
+        coverage.restart_relay(
+            RelayIndex(2),
+            ReplayRestart::ReceiverLoss,
+            ReplayOrigin::Changed,
+        );
+        assert_eq!(coverage.buffered_items, 0);
+        assert_eq!(
+            coverage.subscriptions[&id][&RelayIndex(2)],
+            RelayReplay::Incomplete,
+            "receiver loss leaves the source to the owner"
+        );
+        assert!(losses.pending.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

@@ -125,11 +125,12 @@ for reconnect/backoff and relay status mechanics.
   stalled. Silence or a terminal refusal alone must not stall a completed peer or turn incomplete coverage
   into a certificate.
   An empty wait must not mint loss. Keep late stored copies countable for backward paging; only actually
-  discarded ciphertext retains a loss floor. An unfinished owner capture's own pages are not: they re-fetch a
-  window its pending obligation still owes, so a cut or failed capture leaves the source unadmitted and mints
-  no loss, which would restart that obligation. That holds when a REQ or a peer also supplied the body. Bodies
-  held from before the capture, bodies only a REQ supplied, and bodies still held after the capture admits its
-  source keep their loss. Same-epoch capture takeover preserves held bodies. Interrupted
+  discarded ciphertext retains a loss floor. An unfinished owner capture's own pages are not when the capture is
+  cut (stopped, failed, its route expired, or fenced by receiver loss): the source stays unadmitted and its
+  pending obligation still owes them, and a loss would restart that obligation. That holds when a REQ or a peer
+  also supplied the body. A reconnect, refusal or removal can admit the source without the capture, so those
+  discards keep their loss, as do bodies held from before the capture, bodies only a REQ supplied, and bodies
+  still held after the capture admits its source. Same-epoch capture takeover preserves held bodies. Interrupted
   multi-tag history discards the affected source's whole MLS-group unit, never releases its newer suffix.
 - Keep admission and all-relay EOSE separate. `take_replay_status` holds a read guard through a synchronous
   cursor seal; import its loss before another await, then drop it. Notify only wakes the router; it never
