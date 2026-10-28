@@ -7854,6 +7854,9 @@ fn publish_client_pending_applied_summary(
 ) {
     let summary = client.take_pending_applied_sync_summary();
     publish_app_runtime_summary_with_v5(client, events, account_id_hex, account_label, &summary);
+    // Startup and reconnect reconcile device-group trust before reaching
+    // here, and no account-level seam follows them until the next command.
+    publish_linked_device_changes(client, events, account_id_hex, account_label);
 }
 
 /// Announce account-level changes. A change in the parked recovery set
@@ -7861,9 +7864,8 @@ fn publish_client_pending_applied_summary(
 /// `GroupStateUpdated` for each group whose own notices appeared or
 /// disappeared, so hosts re-read that group's `GroupRecoveryStatus`. Parking,
 /// un-parking by new evidence and dismissal all surface at the next seam that
-/// calls this; each call is one indexed read of the parked set. A hidden
-/// device-group event or a change of device-group trust since the last call
-/// is one `LinkedDevicesChanged`.
+/// calls this; each call is one indexed read of the parked set. It also
+/// announces linked-device changes ([`publish_linked_device_changes`]).
 fn publish_account_level_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -7872,12 +7874,7 @@ fn publish_account_level_changes(
 ) {
     // Record queued subscription refusals off relay paths.
     client.record_subscription_refusals();
-    if client.take_linked_devices_changed() {
-        let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {
-            account_id_hex: account_id_hex.to_owned(),
-            account_label: account_label.to_owned(),
-        });
-    }
+    publish_linked_device_changes(client, events, account_id_hex, account_label);
     let Some(groups) = client.take_history_notice_changes() else {
         return;
     };
@@ -7887,6 +7884,24 @@ fn publish_account_level_changes(
     });
     for group_id in groups {
         publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
+    }
+}
+
+/// One `LinkedDevicesChanged` for a hidden device-group event or a change of
+/// device-group trust since the last call. Both the account-level seam and
+/// the applied-summary seam drain it, so startup, reconnect and every command
+/// and delivery announce it.
+fn publish_linked_device_changes(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    if client.take_linked_devices_changed() {
+        let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
     }
 }
 

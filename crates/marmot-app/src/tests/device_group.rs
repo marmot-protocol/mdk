@@ -1171,3 +1171,59 @@ async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_not
     cgka_traits::storage::GroupStorage::put_group(&storage, &removed).unwrap();
     assert!(phone.linked_devices().unwrap().is_empty());
 }
+
+/// A restart that settles device-group trust announces it with no command or
+/// delivery after the open: an interrupted creation becomes `created` in the
+/// worker's startup reconcile, and the next seam it reaches says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_that_settles_trust_announces_it() {
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        mut phone,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    assert!(
+        phone_app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .set_device_group_trust(
+                &hex::encode(group.as_slice()),
+                DeviceGroupTrust::Created,
+                DeviceGroupTrust::Creating,
+                None,
+                1,
+            )
+            .unwrap()
+    );
+    drop(phone);
+    let account_id_hex = phone_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let _eose = scripted_eose_pump(phone_app.relay_plane.clone(), relay, every_subscription);
+    let runtime = MarmotAppRuntime::new(phone_app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::LinkedDevicesChanged {
+                    account_id_hex: changed,
+                    ..
+                }) if changed == account_id_hex => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("events closed"),
+            }
+        }
+    })
+    .await
+    .expect("LinkedDevicesChanged");
+    assert_eq!(trust(&phone_app, &group), Some(DeviceGroupTrust::Created));
+    runtime.shutdown().await;
+}

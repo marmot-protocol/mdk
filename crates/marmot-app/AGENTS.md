@@ -72,7 +72,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Read the device roster only through `trusted_device_roster` (the trusted group's decoded roster, or none). Hosts see
   it only as `linked_devices`, this account's own devices; its errors never name the group. The device group's events
   stay hidden, so every hidden device-group event and every change of trust sets `linked_devices_changed`, which the
-  worker's account-level publication seam drains into one payload-free `LinkedDevicesChanged`.
+  worker's account-level and applied-summary seams drain into one payload-free `LinkedDevicesChanged`. Startup and
+  reconnect settle trust with no command after them, so a new seam that settles trust must reach one of those two.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

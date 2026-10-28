@@ -779,8 +779,8 @@ pub struct AppClient {
     /// publication seam so a change raises `HistoryNoticesChanged`.
     pub(crate) history_notice_baseline: Option<history_notices::HistoryNoticeBaseline>,
     /// The linked devices may have changed since hosts last heard: a hidden
-    /// device-group event or a change of trust. Drained at the same seams as
-    /// `history_notice_baseline` into one `LinkedDevicesChanged`.
+    /// device-group event or a change of trust. The worker's account-level
+    /// and applied-summary seams drain it into one `LinkedDevicesChanged`.
     pub(crate) linked_devices_changed: bool,
     /// Account-queue placement counts at this client's previous
     /// `transport_cursor_advanced` row (or its open), so each row reports
