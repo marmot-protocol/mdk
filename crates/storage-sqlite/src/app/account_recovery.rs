@@ -814,12 +814,14 @@ impl SqliteAppStorage {
                 } else {
                     RecoveryLossCause::NotificationConsumer
                 };
+                let goal_floor = loss::goal_floor(&conn, label, cause)?;
+                crate::app::recovery_coverage::uncover_loss_tx(&conn, goal_floor.unwrap_or(0))?;
                 changes.push(RecoveryLossImport {
                     cause,
                     obligation: observe::ticket(&after)?,
                     transition,
                     charged,
-                    goal_floor: loss::goal_floor(&conn, label, cause)?,
+                    goal_floor,
                 });
             }
             Ok(changes)
@@ -868,12 +870,14 @@ impl SqliteAppStorage {
             if transition == RecoveryDemandTransition::Unchanged {
                 return Ok(None);
             }
+            let goal_floor = loss::goal_floor(&conn, label, RecoveryLossCause::Queue)?;
+            crate::app::recovery_coverage::uncover_loss_tx(&conn, goal_floor.unwrap_or(0))?;
             Ok(Some(RecoveryLossImport {
                 cause: RecoveryLossCause::Queue,
                 obligation: observe::ticket(&after)?,
                 transition,
                 charged: i64_to_u64(dropped.saturating_sub(imported.unwrap_or(0)).max(0))?,
-                goal_floor: loss::goal_floor(&conn, label, RecoveryLossCause::Queue)?,
+                goal_floor,
             }))
         })
     }

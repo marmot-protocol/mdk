@@ -2,7 +2,8 @@
 //!
 //! Fills storage's coverage ledger from facts the stack already produces:
 //! live REQ boundaries the adapter admitted, comparison certificates at
-//! settlement, loss imports, epoch gaps and startup history goals. Then it
+//! settlement, epoch gaps and startup history goals. Storage itself un-covers
+//! the ledger inside each loss import's transaction. Then the recorder
 //! compares the ledger with every pending obligation and reports agreement as
 //! aggregate counts. Nothing here schedules, retries or fences recovery, and
 //! every write is best effort: a failure is logged and the recovery step it
@@ -11,8 +12,9 @@ use std::collections::HashSet;
 
 use storage_sqlite::{
     RecoveryCause, RecoveryCoverageProof, RecoveryCoverageSlice, RecoveryDemandTransition,
-    RecoveryLossImport, RecoveryPredicate, SqliteAppStorage, StoredRecoveryScope,
-    TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationRoute,
+    RecoveryLossImport, RecoveryPredicate, RecoveryRevisionFence, RecoveryScopeOutcome,
+    SqliteAppStorage, StoredRecoveryScope, TRANSPORT_RECONCILIATION_RETENTION_SECS,
+    TransportReconciliationRoute,
 };
 
 use super::AppClient;
@@ -76,20 +78,46 @@ fn log_failure(method: &'static str, error: &AppError) {
         "coverage ledger write skipped");
 }
 
-/// Whether the obligation counts the scope proved, by its own predicate.
-fn obligation_holds(scope: &StoredRecoveryScope, predicate: RecoveryPredicate) -> bool {
-    match predicate {
-        RecoveryPredicate::ReplayAdmission => scope.replay_admitted,
-        _ => {
-            !scope.plan.required_endpoints.is_empty()
-                && scope.plan.required_endpoints.iter().all(|required| {
-                    scope.checkpoints.iter().any(|checkpoint| {
-                        &checkpoint.endpoint == required
-                            && checkpoint.exhaustive
-                            && checkpoint.admission_complete
+/// Whether the obligation counts the scope proved, as completion would: its
+/// own predicate over checkpoints captured at the account's current loss,
+/// route and inventory revisions and the obligation's current revision. A
+/// certificate from before newer loss proves nothing any more.
+fn obligation_holds(
+    scope: &StoredRecoveryScope,
+    predicate: RecoveryPredicate,
+    fence: &RecoveryRevisionFence,
+    obligation_revision: u64,
+) -> bool {
+    let current = scope.loss_revision == fence.loss_revision
+        && scope.route_revision == fence.route_revision
+        && scope.inventory_revision == fence.inventory_revision
+        && scope.obligation_revision == obligation_revision;
+    let plan = &scope.plan;
+    current
+        && match predicate {
+            RecoveryPredicate::ReplayAdmission => {
+                scope.replay_admitted && !plan.admitted_endpoints.is_empty()
+            }
+            _ => {
+                !plan.required_endpoints.is_empty()
+                    && plan.required_endpoints.iter().all(|required| {
+                        plan.admitted_endpoints.contains(required)
+                            && scope.checkpoints.iter().any(|checkpoint| {
+                                &checkpoint.endpoint == required
+                                    && checkpoint.outcome == RecoveryScopeOutcome::Covered
+                                    && checkpoint.exhaustive
+                                    && checkpoint.admission_complete
+                            })
                     })
-                })
+            }
         }
+}
+
+fn scope_route(scope: &StoredRecoveryScope) -> Option<TransportReconciliationRoute> {
+    match (scope.plan.route_kind, scope.plan.transport_group_id) {
+        (0, _) => Some(TransportReconciliationRoute::Inbox),
+        (1, Some(id)) => Some(TransportReconciliationRoute::Group(id)),
+        _ => None,
     }
 }
 
@@ -128,11 +156,12 @@ impl AppClient {
         self.app.account_storage(&self.state.label)
     }
 
-    /// A loss import un-covers every current route from the loss's floor
-    /// upward; a loss with no known time un-covers them entirely. Any route
-    /// could have carried a lost delivery or notification, but coverage below
-    /// the floor stays. Every import that changed demand is new evidence, even
-    /// with nothing counted: a notification lag charges no delivery count.
+    /// Storage un-covered every ledger route from the loss's floor upward in
+    /// the import's own transaction. A current route the ledger does not hold
+    /// yet still owes from the floor, so its goal widens here; if this write
+    /// is lost, the pending loss scopes widen it at the next comparison. Every
+    /// import that changed demand is new evidence, even with nothing counted:
+    /// a notification lag charges no delivery count.
     pub(crate) fn record_coverage_loss(&self, imports: &[RecoveryLossImport]) {
         let floors = imports
             .iter()
@@ -150,7 +179,7 @@ impl AppClient {
         if let Err(error) = self.coverage_storage().and_then(|storage| {
             Ok(storage
                 .app_storage()
-                .uncover_recovery_coverage(&routes, floor)?)
+                .widen_recovery_coverage_goals(&routes, floor)?)
         }) {
             log_failure("record_coverage_loss", &error);
         }
@@ -319,9 +348,9 @@ impl AppClient {
         }
     }
 
-    /// Bring the ledger up to date with the live boundaries, epoch-gap goals
-    /// and the retention window, then compare it with every pending
-    /// obligation. Writes only to the ledger.
+    /// Bring the ledger up to date with the live boundaries, the goals of
+    /// pending epoch gaps and loss, and the retention window, then compare it
+    /// with every pending obligation. Writes only to the ledger.
     pub(crate) async fn coverage_shadow_report(
         &self,
         app: &SqliteAppStorage,
@@ -345,13 +374,33 @@ impl AppClient {
             .map(|route| route.route.clone())
             .collect::<Vec<_>>();
         app.widen_recovery_coverage_goals(&gap_routes, floor)?;
+        // Pending loss owes each scope's window: this restores a goal the
+        // import's best-effort widening lost.
+        let mut demand_scopes = Vec::with_capacity(demands.len());
+        for demand in &demands {
+            let scopes = app.recovery_scope_snapshots(demand.ticket.id)?;
+            if matches!(
+                demand.cause,
+                RecoveryCause::QueueLoss | RecoveryCause::NotificationLoss
+            ) {
+                for scope in &scopes {
+                    if let Some(route) = scope_route(scope) {
+                        app.widen_recovery_coverage_goals(
+                            std::slice::from_ref(&route),
+                            scope.plan.since_seconds.unwrap_or(0),
+                        )?;
+                    }
+                }
+            }
+            demand_scopes.push(scopes);
+        }
         app.prune_recovery_coverage(floor)?;
+        let fence = app.recovery_revision_fence()?;
 
         let mut report = CoverageShadowReport::default();
         let mut owed_routes = HashSet::new();
         let mut inbox_owed = false;
-        for demand in &demands {
-            let scopes = app.recovery_scope_snapshots(demand.ticket.id)?;
+        for (demand, scopes) in demands.iter().zip(demand_scopes) {
             if scopes.is_empty() {
                 // Not frozen yet: the demand owes its group's routes, or every
                 // route, but has no window to compare.
@@ -368,11 +417,7 @@ impl AppClient {
                 }
             }
             for scope in scopes {
-                let route = match (scope.plan.route_kind, scope.plan.transport_group_id) {
-                    (0, _) => Some(TransportReconciliationRoute::Inbox),
-                    (1, Some(id)) => Some(TransportReconciliationRoute::Group(id)),
-                    _ => None,
-                };
+                let route = scope_route(&scope);
                 match &route {
                     Some(TransportReconciliationRoute::Inbox) => inbox_owed = true,
                     Some(TransportReconciliationRoute::Group(id)) => {
@@ -390,7 +435,8 @@ impl AppClient {
                     continue;
                 };
                 report.scopes_compared += 1;
-                let since = scope.plan.since_seconds.unwrap_or(0);
+                // An unknown floor owes everything still retained.
+                let since = scope.plan.since_seconds.unwrap_or(floor);
                 let until = scope.plan.until_seconds.min(now);
                 let ledger = app.recovery_coverage_covers(
                     &route,
@@ -398,7 +444,9 @@ impl AppClient {
                     since,
                     until,
                 )?;
-                match (obligation_holds(&scope, demand.predicate), ledger) {
+                let holds =
+                    obligation_holds(&scope, demand.predicate, &fence, demand.ticket.revision);
+                match (holds, ledger) {
                     (false, false) => report.agree_owed += 1,
                     (true, true) => report.agree_covered += 1,
                     (false, true) => report.ledger_ahead += 1,

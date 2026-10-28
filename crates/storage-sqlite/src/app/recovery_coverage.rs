@@ -246,6 +246,38 @@ fn widen_goal(
     Ok(())
 }
 
+/// Account-wide loss from `floor_seconds` upward, inside the transaction that
+/// imports it: every route the ledger holds loses its coverage from the floor
+/// up, and its goal widens to the floor. Routes the ledger does not hold yet
+/// have no coverage to lose; the owner widens their goals afterwards.
+pub(crate) fn uncover_loss_tx(conn: &Connection, floor_seconds: u64) -> StorageResult<()> {
+    let floor = integer(floor_seconds)?;
+    conn.execute_cached(
+        "INSERT INTO account_recovery_coverage_goals (route_kind, route_id, since_seconds)
+         SELECT DISTINCT route_kind, route_id, ?1 FROM account_recovery_coverage WHERE true
+         ON CONFLICT (route_kind, route_id)
+         DO UPDATE SET since_seconds = MIN(since_seconds, excluded.since_seconds)",
+        [floor],
+    )
+    .storage()?;
+    conn.execute_cached(
+        "UPDATE account_recovery_coverage_goals SET since_seconds = ?1 WHERE since_seconds > ?1",
+        [floor],
+    )
+    .storage()?;
+    conn.execute_cached(
+        "DELETE FROM account_recovery_coverage WHERE since_seconds >= ?1",
+        [floor],
+    )
+    .storage()?;
+    conn.execute_cached(
+        "UPDATE account_recovery_coverage SET until_seconds = ?1 - 1 WHERE until_seconds >= ?1",
+        [floor],
+    )
+    .storage()?;
+    Ok(())
+}
+
 impl SqliteAppStorage {
     /// Record covered slices in one transaction. This is the entry point for
     /// every proof, sweep slices included: each slice merges with the same
@@ -817,6 +849,50 @@ mod tests {
         );
         assert_eq!(app.recovery_coverage_goal(&route).unwrap(), Some(200));
         assert_eq!(app.recovery_coverage_goal_routes().unwrap(), vec![route]);
+    }
+
+    #[test]
+    fn importing_loss_uncovers_every_ledger_route_in_its_own_transaction() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let (inbox, group) = (TransportReconciliationRoute::Inbox, group(1));
+        for route in [&inbox, &group] {
+            record(
+                &app,
+                route,
+                RELAY_A,
+                100,
+                900,
+                RecoveryCoverageProof::Comparison,
+                1,
+            );
+        }
+        app.widen_recovery_coverage_goals(std::slice::from_ref(&inbox), 100)
+            .unwrap();
+        app.record_account_delivery_loss_bounded("alice", 41, 3, 1_000, Some(500))
+            .unwrap();
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(imports.len(), 1);
+        for route in [&inbox, &group] {
+            assert_eq!(
+                ranges(&app, route, RELAY_A),
+                vec![(100, 499, RecoveryCoverageProof::Comparison)]
+            );
+        }
+        assert_eq!(app.recovery_coverage_goal(&inbox).unwrap(), Some(100));
+        assert_eq!(app.recovery_coverage_goal(&group).unwrap(), Some(500));
+        // The worker's own observation of a generation imports the same way;
+        // an unknown floor un-covers everything.
+        assert!(
+            app.mark_account_delivery_recovery_observed("alice", 42, 1, None)
+                .unwrap()
+                .is_some()
+        );
+        for route in [&inbox, &group] {
+            assert!(ranges(&app, route, RELAY_A).is_empty());
+            assert_eq!(app.recovery_coverage_goal(route).unwrap(), Some(0));
+        }
     }
 
     #[test]

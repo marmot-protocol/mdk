@@ -508,7 +508,8 @@ in `marmot-app` fills it from facts the owner already has:
 | --- | --- |
 | A live REQ's endpoint admitted and placed its whole original window in the current wire epoch | Live boundary covers `[since, now]` on that route and relay, unless a loss obligation is pending |
 | A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route |
-| A loss import charged new loss | Every current route loses coverage from the loss floor up (all of it when the floor is unknown); goals widen to the floor |
+| A loss import changed demand, including a notification lag that charges no count | In the import's own transaction, every route the ledger holds loses coverage from the loss floor up (all of it when the floor is unknown) and its goal widens to the floor; the recorder then widens the other current routes' goals |
+| A pending queue or notification loss | Each scope's route goal widens to the scope's floor, restoring a goal the best-effort write lost |
 | A startup incremental or explicit history request | Every current route's goal widens to the retained window (explicit: unbounded, pruned to the window) |
 | A pending epoch gap | The group's routes' goals widen to the retained window |
 | Every settlement | Coverage and goals below the retained window are pruned |
@@ -516,22 +517,30 @@ in `marmot-app` fills it from facts the owner already has:
 At settlement the recorder compares the ledger with every pending obligation's scopes and logs
 aggregate counts: scopes owed or proved by both, scopes the obligation still owes that the
 ledger proved (ledger ahead), scopes the obligation proved that the ledger has not (ledger
-behind), and current routes with ledger debt that no pending scope covers. Known-event and
-maintenance-boundary scopes are not comparable. On the normal catch-up path (live boundaries,
+behind), and current routes with ledger debt that no pending scope covers. A scope holds proof
+only as completion would count it: its predicate over checkpoints captured at the account's
+current loss, route and inventory revisions and the obligation's own revision. A scope with no
+floor is owed from the retained window's floor. Known-event and maintenance-boundary scopes are
+not comparable. On the normal catch-up path (live boundaries,
 a bounded loss, a certified pass) the two agree at every step.
 
 Known disagreements, expected until later phases remove their cause:
 
-- **Certificates wiped by an unrelated loss.** A new loss bumps the account-wide loss revision
-  and clears every scope's certificates; the ledger keeps coverage below the loss floor.
-  Scopes whose windows end below the floor show as ledger ahead. Phase 4 deletes the global
-  invalidation.
+- **Certificates voided by an unrelated loss.** A new loss bumps the account-wide loss
+  revision, so no earlier certificate qualifies any more; the ledger keeps coverage below the
+  loss floor. Pending scopes whose windows end below the floor show as ledger ahead. Phase 4
+  deletes the global invalidation.
+- **Route and inventory revisions.** A route-policy change or a released inventory journal
+  bumps an account-wide revision, so pending scopes stop holding proof until the next pass
+  captures it again. The ledger keeps per-relay coverage, so a covered window is ledger ahead
+  meanwhile.
 - **Native goals rewritten per wire generation and process start.** A new generation or session
   nonce writes a fresh `SubscriptionReplay` goal with no proof; the ledger keeps the earlier
   generation's live coverage and any comparison over the same window. Ledger ahead until the
   new generation's boundary is admitted.
 - **Unbounded loss goals.** A loss with no known floor never certifies and parks; the ledger
-  prunes below the retained window, so once that window is covered the ledger is ahead.
+  prunes below the retained window and the comparison owes such a scope from that window's
+  floor, so once the window is covered the ledger is ahead.
 - **Dismissed loss.** A dismissal retires the obligation without coverage. The ledger keeps the
   debt until a live boundary or comparison covers it, counted as unowed debt; for queue loss
   the next live boundary re-covers the range, because queue loss does not start a new wire

@@ -4,12 +4,14 @@
 use std::sync::Arc;
 
 use storage_sqlite::{
-    RecoveryCause, RecoveryCoverageProof, SqliteAccountStorage, TransportReconciliationRoute,
+    RecoveryCause, RecoveryCoverageProof, RecoveryCoverageSlice, SqliteAccountStorage,
+    TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationRoute,
 };
 
 use super::CoverageShadowReport;
 use crate::client::AppClient;
 use crate::client::recovery::AttemptGrant;
+use crate::client::sync::ScriptedComparisons;
 use crate::tests::{
     ScriptedEosePump, ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
     scripted_eose_pump,
@@ -91,8 +93,19 @@ async fn report(fixture: &Fixture) -> CoverageShadowReport {
         .unwrap()
 }
 
+async fn authorize(client: &mut AppClient) -> AttemptGrant {
+    client
+        .authorize_account_recovery(
+            None,
+            marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+        )
+        .await
+        .unwrap()
+        .expect("loss selects a grant")
+}
+
 /// Every compared route's relay answers and certifies it.
-fn certified_routes(grant: &AttemptGrant) -> crate::client::sync::ScriptedComparisons {
+fn certified_routes(grant: &AttemptGrant) -> ScriptedComparisons {
     grant
         .inventory
         .iter()
@@ -135,15 +148,7 @@ async fn ledger_and_obligations_agree_through_a_normal_catch_up() {
     let floor = unix_now_seconds().saturating_sub(30);
     app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
         .unwrap();
-    let grant = fixture
-        .client
-        .authorize_account_recovery(
-            None,
-            marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-        )
-        .await
-        .unwrap()
-        .expect("loss selects a grant");
+    let grant = authorize(&mut fixture.client).await;
     for route in &routes {
         assert!(
             app.recovery_coverage_ranges(route, &relay())
@@ -221,15 +226,7 @@ async fn loss_imported_after_the_grant_froze_keeps_its_debt() {
     let floor = unix_now_seconds().saturating_sub(30);
     app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
         .unwrap();
-    let grant = fixture
-        .client
-        .authorize_account_recovery(
-            None,
-            marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-        )
-        .await
-        .unwrap()
-        .expect("loss selects a grant");
+    let grant = authorize(&mut fixture.client).await;
     // Newer loss, imported while the pass runs, before settlement.
     app.record_account_delivery_loss_bounded("alice", 42, 2, unix_now_seconds(), Some(floor))
         .unwrap();
@@ -320,4 +317,103 @@ async fn notification_lag_uncovers_every_route_from_its_floor() {
                 .is_empty()
         );
     }
+}
+
+/// A certificate captured before newer loss no longer proves anything to the
+/// obligation, and the import un-covered it in the ledger: both owe it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn newer_loss_voids_a_pending_obligations_certificates() {
+    let mut fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let floor = unix_now_seconds().saturating_sub(30);
+    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
+        .unwrap();
+    let grant = authorize(&mut fixture.client).await;
+    // The inbox certifies; the group's relay fails, so the loss stays owed.
+    fixture.client.test_comparison_results = Some(ScriptedComparisons::by_route(|route| {
+        let failed = matches!(route, TransportReconciliationRoute::Group(_));
+        Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: usize::from(!failed),
+                relays_failed: usize::from(failed),
+                failed_endpoints: if failed {
+                    vec![cgka_traits::TransportEndpoint(RELAY.into())]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            },
+            Vec::new(),
+        )))
+    }));
+    fixture
+        .client
+        .run_recovery_grant_for_test(grant)
+        .await
+        .unwrap();
+    assert!(
+        app.pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .any(|demand| demand.cause == RecoveryCause::QueueLoss)
+    );
+    let partial = report(&fixture).await;
+    assert!(partial.agree_covered >= 1, "{partial:?}");
+    assert_eq!(partial.disagreements(), 0, "{partial:?}");
+
+    // Newer loss from the same floor, inside the certified inbox window.
+    app.record_account_delivery_loss_bounded("alice", 42, 2, unix_now_seconds(), Some(floor))
+        .unwrap();
+    fixture.client.synchronize_recovery_loss(&app).unwrap();
+    let voided = report(&fixture).await;
+    assert_eq!(voided.agree_covered, 0, "{voided:?}");
+    assert!(voided.agree_owed >= 2, "{voided:?}");
+    assert_eq!(voided.disagreements(), 0, "{voided:?}");
+}
+
+/// A loss with no known time owes every retained second, not history from
+/// the epoch: once the ledger proves the retained window while the
+/// obligation still owes it, the report says the ledger is ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_loss_floor_is_owed_from_the_retention_floor() {
+    let mut fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), None)
+        .unwrap();
+    let _grant = authorize(&mut fixture.client).await;
+    let loss = app
+        .pending_recovery_demands()
+        .unwrap()
+        .into_iter()
+        .find(|demand| demand.cause == RecoveryCause::QueueLoss)
+        .expect("the loss is owed");
+    assert!(
+        app.recovery_scope_snapshots(loss.ticket.id)
+            .unwrap()
+            .iter()
+            .any(|scope| scope.plan.since_seconds.is_none()),
+        "the loss's scopes have no floor"
+    );
+    let owed = report(&fixture).await;
+    assert!(owed.agree_owed >= 2, "{owed:?}");
+    assert_eq!(owed.disagreements(), 0, "{owed:?}");
+
+    let now = unix_now_seconds();
+    let relay = relay();
+    for route in routes(&fixture.client) {
+        app.record_recovery_coverage(
+            &[RecoveryCoverageSlice {
+                route: &route,
+                relay: &relay,
+                since_seconds: now - TRANSPORT_RECONCILIATION_RETENTION_SECS,
+                until_seconds: now,
+                proof: RecoveryCoverageProof::Comparison,
+            }],
+            now,
+        )
+        .unwrap();
+    }
+    let ahead = report(&fixture).await;
+    assert!(ahead.ledger_ahead >= 2, "{ahead:?}");
+    assert_eq!(ahead.agree_owed, 0, "{ahead:?}");
 }
