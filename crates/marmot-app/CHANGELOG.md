@@ -286,6 +286,14 @@
 
 ### Fixed
 
+- Account recovery no longer retries a native capture the pass cutoff always
+  cuts every ~20 s forever (mdk#2660). A cut capture records no notification
+  loss until its source is readmitted without it, counts nothing toward a
+  native goal's park budget, and live traffic during an attempt no longer
+  resets retry pacing. Any obligation now parks behind the existing "history
+  may be incomplete" notice after 24 attempts in a row without progress,
+  and reconnects or process opens do not reopen it.
+
 - A removed device whose account still has another device in the group is no
   longer treated as a member (mdk#2628). A Welcome that re-adds it now joins
   directly; before, it became a rejoin offer that needed the user's
