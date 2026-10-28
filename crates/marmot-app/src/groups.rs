@@ -2295,7 +2295,7 @@ pub(crate) fn observe_event(
                 outer_transport_at,
                 allow_loopback_http,
             ) else {
-                summary.events.push(event.clone());
+                summary.events.push(host_group_event(event));
                 return None;
             };
             message.authority = *authority;
@@ -2304,7 +2304,7 @@ pub(crate) fn observe_event(
             if !crate::notifications::is_push_gossip_kind(message.kind) {
                 summary.messages.push(message.clone());
             }
-            summary.events.push(event.clone());
+            summary.events.push(host_group_event(event));
             Some(message)
         }
         _ => {
@@ -2323,11 +2323,25 @@ pub(crate) fn observe_event(
 }
 
 /// The copy of an engine event that hosts receive. A departure's removed leaves
-/// are device destinations MDK consumes itself, so no leaf index reaches a host.
-/// Hosts still learn which accounts left, and `LocalGroupCopyTerminated` tells
-/// them when this device's own leaf was removed.
+/// and a message's sender leaf are device destinations MDK consumes itself, so
+/// no leaf index reaches a host. Hosts still learn which accounts left, and
+/// `LocalGroupCopyTerminated` tells them when this device's own leaf was
+/// removed.
 pub(crate) fn host_group_event(event: &GroupEvent) -> GroupEvent {
     match event {
+        GroupEvent::MessageReceived {
+            sender_leaf_index: Some(_),
+            ..
+        } => {
+            let mut event = event.clone();
+            if let GroupEvent::MessageReceived {
+                sender_leaf_index, ..
+            } = &mut event
+            {
+                *sender_leaf_index = None;
+            }
+            event
+        }
         GroupEvent::GroupMemberLeavesRemoved {
             group_id,
             epoch,

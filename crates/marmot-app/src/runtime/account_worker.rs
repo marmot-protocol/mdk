@@ -10303,6 +10303,7 @@ mod tests {
                 group_id,
                 message_id: message_id.clone(),
                 sender: cgka_traits::MemberId::new(vec![0x11; 32]),
+                sender_leaf_index: None,
                 epoch: cgka_traits::EpochId(1),
                 payload: Vec::new(),
                 retention: None,

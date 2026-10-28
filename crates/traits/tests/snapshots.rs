@@ -694,6 +694,7 @@ fn snapshot_group_events() {
             message_id: mid(),
             epoch: EpochId(7),
             sender: mem_id(),
+            sender_leaf_index: None,
             payload: b"hi".to_vec(),
             retention: None,
             encrypted_media_secret: None,
@@ -710,6 +711,7 @@ fn snapshot_group_events() {
             message_id: mid(),
             epoch: EpochId(7),
             sender: mem_id(),
+            sender_leaf_index: None,
             payload: b"hi".to_vec(),
             retention: None,
             encrypted_media_secret: None,
@@ -721,6 +723,7 @@ fn snapshot_group_events() {
         message_id: mid(),
         epoch: EpochId(7),
         sender: mem_id(),
+        sender_leaf_index: None,
         payload: b"hi".to_vec(),
         retention: None,
         encrypted_media_secret: Some(cgka_traits::EncryptedMediaSecret::new(

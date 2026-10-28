@@ -8786,6 +8786,7 @@ mod tests {
                     group_id: group_id.clone(),
                     message_id: sent.reports[0].message_id.clone(),
                     sender: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                    sender_leaf_index: None,
                     epoch: client.runtime.group_record(&group_id).unwrap().epoch,
                     payload,
                     retention: None,

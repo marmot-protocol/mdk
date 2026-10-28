@@ -463,6 +463,7 @@ async fn current_founding_creation_is_immediately_stable_and_survives_restart() 
             message_id,
             epoch: EpochId(1),
             sender: bob.self_id(),
+            sender_leaf_index: Some(1),
             payload: app_payload_for(&bob, b"invitee first message"),
             retention: Some(cgka_traits::AppMessageRetentionDecision::new(
                 1_700_000_000,
@@ -556,6 +557,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
             message_id,
             epoch: EpochId(1),
             sender: alice.self_id(),
+            sender_leaf_index: Some(0),
             payload: app_payload_for(&alice, b"hello through session"),
             retention: Some(cgka_traits::AppMessageRetentionDecision::new(
                 1_700_000_000,
@@ -632,6 +634,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
             message_id,
             epoch: EpochId(1),
             sender: alice.self_id(),
+            sender_leaf_index: Some(0),
             payload: app_payload_for(&alice, b"hello after restart"),
             retention: Some(cgka_traits::AppMessageRetentionDecision::new(
                 1_700_000_000,
