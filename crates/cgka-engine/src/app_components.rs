@@ -1787,6 +1787,14 @@ fn app_component_bytes(mls_group: &MlsGroup, component_id: AppComponentId) -> Op
 }
 
 fn validate_initial_app_component(component: &AppComponentData) -> Result<(), EngineError> {
+    // A no-data component has no entry for a client to create
+    // (app-components/README.md, "Placement"); the engine decides whether a
+    // group requires it.
+    if NO_DATA_APP_COMPONENTS.contains(&component.component_id) {
+        return Err(EngineError::NoDataAppComponent {
+            component_id: component.component_id,
+        });
+    }
     match component.component_id {
         APP_COMPONENTS_COMPONENT_ID
         | SAFE_AAD_COMPONENT_ID
