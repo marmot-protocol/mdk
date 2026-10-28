@@ -389,6 +389,7 @@ pub struct RuntimeSharedServices {
     audit_otlp_sender: Arc<StdMutex<Option<Arc<crate::audit_otlp_sender::AuditOtlpSender>>>>,
     service_endpoints: MarmotServiceEndpoints,
     audit_log_tracker_uploader: Option<AuditLogTrackerUploader>,
+    audit_retention: Option<crate::audit_log::AuditRetentionWorker>,
     /// Test-only barrier the detached post-create-group catch-up waits on, so
     /// integration tests can observe the caller boundary without depending on
     /// scheduler timing. Consulted only with the `test-policy-overrides`
@@ -505,6 +506,7 @@ impl Default for RuntimeSharedServices {
             audit_otlp_sender: Arc::new(StdMutex::new(None)),
             service_endpoints: MarmotServiceEndpoints::default(),
             audit_log_tracker_uploader: None,
+            audit_retention: None,
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-policy-overrides"))]
             next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
@@ -604,6 +606,7 @@ impl RuntimeSharedServices {
             audit_otlp_sender,
             service_endpoints: app.service_endpoints().clone(),
             audit_log_tracker_uploader: Some(audit_log_tracker_uploader),
+            audit_retention: Some(crate::audit_log::AuditRetentionWorker::new(app.clone())),
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-policy-overrides"))]
             next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
@@ -855,6 +858,9 @@ impl RuntimeSharedServices {
     }
 
     async fn shutdown_audit_log_tracker_uploader(&self) {
+        if let Some(retention) = &self.audit_retention {
+            retention.shutdown().await;
+        }
         if let Some(uploader) = &self.audit_log_tracker_uploader {
             uploader.shutdown().await;
         }
@@ -1746,6 +1752,9 @@ impl MarmotAppRuntime {
         let config = result?;
         self.shared.configure_relay_telemetry_exporter(config);
         self.restart_product_worker();
+        if let Some(retention) = &self.shared.audit_retention {
+            retention.start(self.shared.lifecycle());
+        }
         self.schedule_user_directory_subscription_sync().await;
         Ok(())
     }

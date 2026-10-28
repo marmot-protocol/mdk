@@ -5491,6 +5491,45 @@ async fn sync_watching_neg_cap(
     result.map_err(|error| sync_failure(&error, cap_notice))
 }
 
+/// The time-sliced sweep's per-endpoint NEG credit: the same one
+/// reconciliation spends, so the two never exceed a relay's NEG cap together.
+pub(crate) fn sweep_neg_credit(
+    client: &NostrSdkRelayClient,
+    endpoint: &RelayUrl,
+) -> Arc<Semaphore> {
+    client.neg_credit(endpoint)
+}
+
+/// A dry-run NIP-77 comparison against an empty local set: every id the
+/// relay holds for `filter`. Used by the time-sliced sweep for one second.
+pub(crate) async fn neg_sync_dry_run(
+    relay: &Relay,
+    filter: Filter,
+    options: SyncOptions,
+    credits: Arc<Semaphore>,
+    deadline: tokio::time::Instant,
+) -> Result<HashSet<EventId>, crate::sweep::NegFailure> {
+    use crate::sweep::{ClosedReason, NegFailure, UnreachableKind};
+    match sync_watching_neg_cap(relay, filter, Vec::new(), options, credits, deadline).await {
+        Ok(summary) => Ok(summary.remote),
+        Err(NostrReconciliationFailure::NegErr(category)) => {
+            Err(NegFailure::Closed(ClosedReason(category)))
+        }
+        // The cap NOTICE is a transient refusal, waited out like a rate limit.
+        Err(NostrReconciliationFailure::NegCapNotice) => Err(NegFailure::Closed(ClosedReason(
+            Some(TransportEndpointRejectionCategory::RateLimited),
+        ))),
+        Err(
+            NostrReconciliationFailure::FirstReplyTimeout
+            | NostrReconciliationFailure::RouteTimeout,
+        ) => Err(NegFailure::Unreachable(UnreachableKind::TimedOut)),
+        Err(NostrReconciliationFailure::NotOperational | NostrReconciliationFailure::NotInPool) => {
+            Err(NegFailure::Unreachable(UnreachableKind::Disconnected))
+        }
+        Err(_) => Err(NegFailure::Unproven),
+    }
+}
+
 fn is_neg_cap_notice(notification: &nostr_sdk::relay::RelayNotification) -> bool {
     matches!(
         notification,

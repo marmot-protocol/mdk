@@ -3,6 +3,7 @@
 //! Typed variants cover cases the engine can classify. `Backend(String)` is
 //! the fallback for backend failures that do not yet have a narrower variant.
 
+use crate::app_components::AppComponentId;
 use crate::capabilities::GroupCapabilities;
 use crate::types::{EpochId, GroupId, MemberId};
 
@@ -123,6 +124,13 @@ pub enum EngineError {
     /// but omit its identity from Display and diagnostic classification.
     #[error("invalid KeyPackage capabilities: recipient must generate a new conforming KeyPackage")]
     InvalidKeyPackageCapabilities { member: MemberId },
+
+    /// Group creation supplied an entry for a protocol component that carries
+    /// no data at any location, such as `marmot.group.account-devices.v1`.
+    /// The engine alone decides whether a group requires such a component,
+    /// and no client creates an entry under its id. Nothing was created.
+    #[error("group creation cannot supply data for no-data app component {component_id:#06x}")]
+    NoDataAppComponent { component_id: AppComponentId },
 
     /// An application message pinned to `expected` (see
     /// [`SendIntent::AppMessage::expected_epoch`](crate::engine::SendIntent))
@@ -284,6 +292,7 @@ impl EngineError {
             EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
             EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
             EngineError::InvalidKeyPackageCapabilities { .. } => "invalid_key_package_capabilities",
+            EngineError::NoDataAppComponent { .. } => "no_data_app_component",
             EngineError::AppMessageEpochMismatch { .. } => "app_message_epoch_mismatch",
             EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
             EngineError::ForkedEpoch { .. } => "forked_epoch",

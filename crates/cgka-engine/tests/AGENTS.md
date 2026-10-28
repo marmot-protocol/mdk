@@ -170,6 +170,14 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     with no group, Welcome or event left; invitees join the requiring group, a non-admin member then adds and removes
     its own devices, and a device that does not advertise 0x800d cannot be added later, from both sides.
 
+- **File:** `account_devices/device_roster.rs` (test-policy builds only)
+  - **Owns:** `marmot.account.device-roster.v1` (0x800e, mdk#2628 item 3.1): a device group holds its roster from
+    creation; a roster update is a diff every member applies to the parent's roster, and a committer that writes the
+    update's bytes as the state is dropped; the roster's own invariants, leaf-map entries included; every leaf is one
+    account, at creation, on invite, on replay and at join; the roster is required from creation or never, for
+    Commits and standalone proposals; and outside a device group roster bytes are unknown data. The `Parts::app_data_state` override in
+    `account_devices.rs` lets a crafted Commit write resulting bytes of its own.
+
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and
     `RemoveOwnAccountDevices`: the committer's Commit is classified same-account, stamped `ordinary`, carries its

@@ -4,24 +4,28 @@ use cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1;
 use cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID,
-    AppComponentData, AppComponentId, AppComponentSet, GROUP_ADMIN_POLICY_COMPONENT_ID,
-    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-    GROUP_LIFECYCLE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
-    GroupLifecycleV1, GroupProfileV1, MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID,
-    NostrRoutingV1, PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID,
-    decode_components_list, decode_encrypted_media_policy_v1, decode_encrypted_media_policy_v2,
-    decode_group_avatar_url_v1, decode_group_blossom_image_v1, decode_group_lifecycle_v1,
-    decode_group_profile_v1, decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors,
-    encode_components_list, encode_group_lifecycle_v1, encode_group_profile_v1,
+    AppComponentData, AppComponentId, AppComponentSet, DEVICE_ROSTER_COMPONENT_ID,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, GROUP_LIFECYCLE_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupLifecycleV1,
+    GroupProfileV1, MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID, apply_device_roster_update_v1,
+    decode_components_list, decode_device_roster_v1, decode_encrypted_media_policy_v1,
+    decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
+    decode_group_lifecycle_v1, decode_group_profile_v1, decode_nostr_routing_v1,
+    decode_quic_varint, encode_component_vectors, encode_components_list,
+    encode_group_lifecycle_v1, encode_group_profile_v1,
 };
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::ingest::ProposalRejectionCategory;
 use cgka_traits::types::{GroupId, MemberId};
+use openmls::component::ComponentData;
 use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension, Extensions};
 use openmls::group::{
-    GroupContext, MlsGroup, ProcessMessageError, StageCommitError, StagedCommit, ValidationError,
+    AppDataDictionaryUpdater, GroupContext, MlsGroup, ProcessMessageError, StageCommitError,
+    StagedCommit, ValidationError,
 };
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{
@@ -73,6 +77,13 @@ const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 13] = [
     ACCOUNT_DEVICES_COMPONENT_ID,
 ];
 
+/// Whether this build may advertise `marmot.account.device-roster.v1`. Its
+/// wire format is unreleased until its spec lands (mdk#2628 3.1), so only
+/// test-policy builds, which production never enables, implement it. A build
+/// that cannot advertise it can never create or join a device group, and
+/// treats roster bytes in other groups as unknown data.
+const DEVICE_ROSTER_ADVERTISABLE: bool = cfg!(feature = "test-policy-overrides");
+
 /// Refuse to advertise a protocol-owned component this engine does not
 /// implement. Application-owned ids (at or above
 /// `APP_OWNED_APP_COMPONENT_ID_START`) and ids the protocol has not assigned
@@ -81,9 +92,9 @@ pub(crate) fn validate_supported_app_components(
     supported: &AppComponentSet,
 ) -> Result<(), EngineError> {
     for component_id in &supported.ids {
-        if PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(component_id)
-            && !ADVERTISABLE_PROTOCOL_APP_COMPONENTS.contains(component_id)
-        {
+        let advertisable = ADVERTISABLE_PROTOCOL_APP_COMPONENTS.contains(component_id)
+            || (*component_id == DEVICE_ROSTER_COMPONENT_ID && DEVICE_ROSTER_ADVERTISABLE);
+        if PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(component_id) && !advertisable {
             return Err(EngineError::Other(format!(
                 "engine cannot advertise protocol app component {component_id:#06x}: \
                  it does not implement it"
@@ -201,6 +212,13 @@ pub(crate) fn app_data_dictionary_extension_for_group(
         if !seen_initial.insert(component.component_id) {
             return Err(EngineError::Other(
                 "group creation request contains duplicate app components".into(),
+            ));
+        }
+        // A roster entry in a group that does not require it would carry a
+        // device-group marker's data without its rules.
+        if component.component_id == DEVICE_ROSTER_COMPONENT_ID {
+            return Err(EngineError::Other(
+                "group creation request cannot carry an optional device roster".into(),
             ));
         }
         validate_initial_app_component(component)?;
@@ -571,6 +589,40 @@ fn authorize_proposal(
                         "account_devices_app_data_update"
                     }));
                 }
+                // device-roster: a group requires the roster from creation or
+                // never, and a roster update applies to the source state.
+                let roster_required = group_requires_device_roster(mls_group).map_err(|_| {
+                    StandaloneProposalRejection::invalid("proposal_group_state_invalid")
+                })?;
+                if let AppDataUpdateOperation::Update(data) = update.operation()
+                    && update.component_id() == APP_COMPONENTS_COMPONENT_ID
+                    && AppComponentSet::from(decode_components_list(data.as_slice()).map_err(
+                        |_| StandaloneProposalRejection::invalid("app_data_update_payload_invalid"),
+                    )?)
+                    .contains(DEVICE_ROSTER_COMPONENT_ID)
+                        != roster_required
+                {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "app_components_change_device_roster_requirement",
+                    ));
+                }
+                if update.component_id() == DEVICE_ROSTER_COMPONENT_ID {
+                    // device-roster-v1.md, "Removal": a device group keeps
+                    // its roster, so no Commit can carry this removal.
+                    if roster_required
+                        && matches!(update.operation(), AppDataUpdateOperation::Remove)
+                    {
+                        return Err(StandaloneProposalRejection::invalid("device_roster_remove"));
+                    }
+                    resolved_app_data_update(
+                        roster_required,
+                        app_component_bytes(mls_group, DEVICE_ROSTER_COMPONENT_ID),
+                        update,
+                    )
+                    .map_err(|_| {
+                        StandaloneProposalRejection::invalid("device_roster_update_invalid")
+                    })?;
+                }
             }
         }
         Proposal::GroupContextExtensions(update) => {
@@ -581,6 +633,17 @@ fn authorize_proposal(
             }
             let proposed_required =
                 validate_group_context_extension_proposal(mls_group, profile, update.extensions())?;
+            if standalone
+                && profile == ProtocolProfile::Current
+                && proposed_required.contains(DEVICE_ROSTER_COMPONENT_ID)
+                    != group_requires_device_roster(mls_group).map_err(|_| {
+                        StandaloneProposalRejection::invalid("proposal_group_state_invalid")
+                    })?
+            {
+                return Err(StandaloneProposalRejection::invalid(
+                    "group_context_extensions_change_device_roster_requirement",
+                ));
+            }
             // account-devices-v1.md, "Removal": a group that requires the
             // component keeps requiring it.
             if standalone
@@ -704,6 +767,11 @@ fn validate_group_context_extension_proposal(
                 "group_context_extensions_not_supported_by_all_members",
             )
         },
+    )?;
+    // A roster the proposed state requires must be valid now, as every other
+    // known component's bytes must; unknown data elsewhere stays opaque.
+    validate_device_roster_state(extensions, &required_components, leaves.iter()).map_err(
+        |_| StandaloneProposalRejection::invalid("group_context_extensions_device_roster_invalid"),
     )?;
     Ok(required_components)
 }
@@ -890,14 +958,14 @@ pub(crate) fn validate_app_component_integrity_for_staged_commit(
     }
 
     // This commit's AppDataUpdate operations by component id: the exact set of
-    // resulting values a changed entry is allowed to take. `None` is a Remove.
-    let mut update_ops: BTreeMap<AppComponentId, Vec<Option<&[u8]>>> = BTreeMap::new();
+    // resulting values a changed entry is allowed to take, resolved against
+    // the parent as every path resolves them. `None` is a Remove.
+    let roster_required = group_requires_device_roster(mls_group)?;
+    let mut update_ops: BTreeMap<AppComponentId, Vec<Option<Vec<u8>>>> = BTreeMap::new();
     for queued in staged.queued_proposals() {
         if let Proposal::AppDataUpdate(update) = queued.proposal() {
-            let op = match update.operation() {
-                AppDataUpdateOperation::Update(data) => Some(data.as_slice()),
-                AppDataUpdateOperation::Remove => None,
-            };
+            let parent_bytes = current.and_then(|dict| dict.get(&update.component_id()));
+            let op = resolved_app_data_update(roster_required, parent_bytes, update)?;
             update_ops
                 .entry(update.component_id())
                 .or_default()
@@ -917,7 +985,7 @@ pub(crate) fn validate_app_component_integrity_for_staged_commit(
         }
         let update_backed = update_ops
             .get(&component_id)
-            .is_some_and(|ops| ops.contains(&after));
+            .is_some_and(|ops| ops.iter().any(|op| op.as_deref() == after));
         if !update_backed {
             return Err(EngineError::Other(format!(
                 "commit is invalid: resulting GroupContext changes app component \
@@ -944,7 +1012,8 @@ pub(crate) fn validate_current_profile_group_invariants(
         validate_current_profile_group_context(group.extensions(), "group state")?;
     let leaves = ratchet_tree_leaves(group.export_ratchet_tree())?;
     validate_resulting_leaf_capabilities(leaves.iter(), group.extensions(), &required_components)?;
-    validate_account_devices_state(group.extensions(), &required_components, &leaves)
+    validate_account_devices_state(group.extensions(), &required_components, &leaves)?;
+    validate_device_roster_state(group.extensions(), &required_components, &leaves)
 }
 
 /// Receiving-flow step 7 (`protocol-core/joining.md`) for the state a Welcome
@@ -985,6 +1054,8 @@ pub(crate) fn validate_current_profile_invariants_for_staged_commit(
     validate_resulting_leaf_capabilities(leaves.iter(), extensions, &required_components)?;
     validate_account_devices_transition(group, staged, &required_components)?;
     validate_account_devices_state(extensions, &required_components, &leaves)?;
+    validate_device_roster_transition(group, &required_components)?;
+    validate_device_roster_state(extensions, &required_components, &leaves)?;
     validate_group_lifecycle_transition(group, staged, committer_index)
 }
 
@@ -1002,6 +1073,134 @@ pub(crate) fn group_requires_account_devices(group: &MlsGroup) -> Result<bool, E
 /// `marmot.group.account-devices.v1`, which defines none.
 fn carries_account_devices_data(dictionary: Option<&AppDataDictionaryExtension>) -> bool {
     dictionary.is_some_and(|ext| ext.dictionary().contains(&ACCOUNT_DEVICES_COMPONENT_ID))
+}
+
+/// Whether `group` requires `marmot.account.device-roster.v1`, which marks
+/// it as a device group. A group on the legacy profile never does, as for
+/// account-devices.
+pub(crate) fn group_requires_device_roster(group: &MlsGroup) -> Result<bool, EngineError> {
+    if crate::account_identity_proof::protocol_profile_of_group(group)? == ProtocolProfile::Legacy {
+        return Ok(false);
+    }
+    Ok(required_app_components_of_group(group)?.contains(DEVICE_ROSTER_COMPONENT_ID))
+}
+
+/// The resulting GroupContext bytes of one AppDataUpdate operation, given the
+/// parent's bytes for its component. `None` removes the entry.
+///
+/// Every other v1 component's update replaces its state whole. While the
+/// parent requires the device roster, a roster update is a diff applied to the
+/// parent's roster instead. Before a group requires the roster, its bytes are
+/// unknown data and replace whole like any other's. Every send, inbound and
+/// replay path resolves updates here, so all of them compute the same state.
+pub(crate) fn resolved_app_data_update(
+    roster_required: bool,
+    parent_bytes: Option<&[u8]>,
+    update: &AppDataUpdateProposal,
+) -> Result<Option<Vec<u8>>, EngineError> {
+    let AppDataUpdateOperation::Update(data) = update.operation() else {
+        return Ok(None);
+    };
+    if roster_required && update.component_id() == DEVICE_ROSTER_COMPONENT_ID {
+        let prior = parent_bytes.ok_or_else(|| {
+            EngineError::Other(
+                "invalid device roster state: the required roster has no GroupContext state".into(),
+            )
+        })?;
+        return apply_device_roster_update_v1(prior, data.as_slice())
+            .map(Some)
+            .map_err(|error| {
+                EngineError::Serialize(format!("invalid device roster update: {error}"))
+            });
+    }
+    Ok(Some(data.as_slice().to_vec()))
+}
+
+/// Mirror `updates` into `updater` as resulting GroupContext bytes, each
+/// resolved by [`resolved_app_data_update`] against the parent bytes the
+/// updater holds. `roster_required` is whether the parent requires the
+/// device roster ([`group_requires_device_roster`]).
+pub(crate) fn apply_app_data_updates<'a>(
+    roster_required: bool,
+    updater: &mut AppDataDictionaryUpdater<'_>,
+    updates: impl IntoIterator<Item = &'a AppDataUpdateProposal>,
+) -> Result<(), EngineError> {
+    for update in updates {
+        let component_id = update.component_id();
+        match resolved_app_data_update(roster_required, updater.old_value(component_id), update)? {
+            Some(data) => updater.set(ComponentData::from_parts(component_id, data.into())),
+            None => updater.remove(&component_id),
+        }
+    }
+    Ok(())
+}
+
+/// The state rules of `marmot.account.device-roster.v1`, for a state whose
+/// required list is `required`. They apply only while that list contains the
+/// component; before that, roster bytes are unknown data.
+///
+/// - The roster decodes canonically and keeps its own invariants (at most
+///   [`MAX_LEAVES_PER_ACCOUNT`] devices, no slot both a device and rejected).
+///   That its entry is present is the generic required-state check.
+/// - Every leaf is the same account: a device group holds only the devices of
+///   one account.
+fn validate_device_roster_state<'a>(
+    extensions: &Extensions<GroupContext>,
+    required: &AppComponentSet,
+    leaves: impl IntoIterator<Item = &'a LeafNode>,
+) -> Result<(), EngineError> {
+    if !required.contains(DEVICE_ROSTER_COMPONENT_ID) {
+        return Ok(());
+    }
+    let bytes = extensions
+        .app_data_dictionary()
+        .and_then(|dictionary| dictionary.dictionary().get(&DEVICE_ROSTER_COMPONENT_ID))
+        .ok_or_else(|| {
+            EngineError::Other(
+                "invalid device roster state: the required roster has no GroupContext state".into(),
+            )
+        })?;
+    decode_device_roster_v1(bytes)
+        .map_err(|error| EngineError::Serialize(format!("invalid device roster state: {error}")))?;
+    let mut account: Option<Vec<u8>> = None;
+    for leaf in leaves {
+        let identity = BasicCredential::try_from(leaf.credential().clone())
+            .map_err(|_| {
+                EngineError::Other(
+                    "invalid device roster state: a leaf has no basic credential".into(),
+                )
+            })?
+            .identity()
+            .to_vec();
+        match &account {
+            None => account = Some(identity),
+            Some(account) if *account != identity => {
+                return Err(EngineError::Other(
+                    "invalid device roster state: a device group holds another account's leaf"
+                        .into(),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The Commit rule of `marmot.account.device-roster.v1`: a group requires the
+/// roster from its creation or never. A Commit may neither start nor stop
+/// requiring it, whoever commits it.
+fn validate_device_roster_transition(
+    parent: &MlsGroup,
+    resulting_required: &AppComponentSet,
+) -> Result<(), EngineError> {
+    if group_requires_device_roster(parent)?
+        != resulting_required.contains(DEVICE_ROSTER_COMPONENT_ID)
+    {
+        return Err(EngineError::Other(
+            "commit is invalid: a group requires the device roster from creation or never".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The state rules of `marmot.group.account-devices.v1`, for a state whose
@@ -1787,6 +1986,14 @@ fn app_component_bytes(mls_group: &MlsGroup, component_id: AppComponentId) -> Op
 }
 
 fn validate_initial_app_component(component: &AppComponentData) -> Result<(), EngineError> {
+    // A no-data component has no entry for a client to create
+    // (app-components/README.md, "Placement"); the engine decides whether a
+    // group requires it.
+    if NO_DATA_APP_COMPONENTS.contains(&component.component_id) {
+        return Err(EngineError::NoDataAppComponent {
+            component_id: component.component_id,
+        });
+    }
     match component.component_id {
         APP_COMPONENTS_COMPONENT_ID
         | SAFE_AAD_COMPONENT_ID
@@ -1808,6 +2015,9 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
         GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => {
             validate_encrypted_media_policy_v2(&component.data)
         }
+        DEVICE_ROSTER_COMPONENT_ID => decode_device_roster_v1(&component.data)
+            .map(|_| ())
+            .map_err(|e| EngineError::Serialize(format!("invalid device roster state: {e}"))),
         _ => Ok(()),
     }
 }
@@ -1876,11 +2086,24 @@ pub(crate) fn validate_app_data_update_batch<'a>(
     mls_group: &MlsGroup,
     updates: impl IntoIterator<Item = &'a AppDataUpdateProposal>,
 ) -> Result<(), EngineError> {
+    let updates = updates.into_iter().collect::<Vec<_>>();
     validate_app_data_update_batch_against(
         required_app_components_of_group(mls_group)?,
         crate::account_identity_proof::protocol_profile_of_group(mls_group)?,
-        updates,
-    )
+        updates.iter().copied(),
+    )?;
+    // A roster diff is valid only against the parent it applies to.
+    let roster_required = group_requires_device_roster(mls_group)?;
+    for update in updates {
+        if update.component_id() == DEVICE_ROSTER_COMPONENT_ID {
+            resolved_app_data_update(
+                roster_required,
+                app_component_bytes(mls_group, DEVICE_ROSTER_COMPONENT_ID),
+                update,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Validate the parts of an AppDataUpdate operation that are decidable before
@@ -2128,6 +2351,16 @@ mod tests {
                 )
             });
         }
+    }
+
+    #[test]
+    fn the_device_roster_is_advertisable_only_in_test_policy_builds() {
+        // Its wire format is unreleased until its spec lands (mdk#2628 3.1).
+        let supported = AppComponentSet::new([DEVICE_ROSTER_COMPONENT_ID]);
+        assert_eq!(
+            validate_supported_app_components(&supported).is_ok(),
+            cfg!(feature = "test-policy-overrides")
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub(crate) mod local_submissions;
 pub(crate) mod media_catalog;
 pub(crate) mod message_drafts;
 pub(crate) mod pending_welcome_delivery;
+pub(crate) mod recovery_coverage;
 pub(crate) mod recovery_health;
 pub(crate) mod storage_compaction;
 pub(crate) mod timeline;

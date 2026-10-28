@@ -83,7 +83,7 @@ impl transport_nostr_peeler::MarmotNostrSigner for OnceSigner {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_inbox_demux() {
     use cgka_traits::{GroupId, GroupRecoveryBody, GroupRecoveryMessage, PeeledContent};
     use nostr::prelude::Keys;

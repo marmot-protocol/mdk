@@ -4,8 +4,8 @@
 
 ### Breaking changes
 
-- Migration 0123 advances account storage to schema 123 after the upstream
-  migrations through 0122. It adds the protocol-owned `cgka_group_rejoin`
+- Migration 0124 advances account storage to schema 124 after the upstream
+  recovery-coverage migration 0123. It adds the protocol-owned `cgka_group_rejoin`
   journal for finite authenticated rejoin episodes, per-member Commit cooldowns
   and durable publication ownership. Older binaries reject
   the upgraded database; deleting a group also deletes its recovery jobs.

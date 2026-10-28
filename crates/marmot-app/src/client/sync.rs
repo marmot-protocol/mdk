@@ -5712,6 +5712,8 @@ impl AppClient {
             },
             reassessed,
         );
+        self.observe_recovery_coverage(&app, grant, &comparison_outcomes)
+            .await;
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }

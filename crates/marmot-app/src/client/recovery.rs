@@ -933,6 +933,7 @@ impl AppClient {
         let storage = self.app.account_storage(&self.state.label)?;
         let app = storage.app_storage();
         self.synchronize_recovery_loss(&app)?;
+        self.record_native_coverage(&app).await;
         self.observe_recovery_route_policy()?;
         for demand in app
             .pending_recovery_demands()?

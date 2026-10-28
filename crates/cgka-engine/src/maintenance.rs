@@ -7,23 +7,136 @@
 //! record in one transaction, and the own-leaf hash reads the MLS group.
 //! Source-bound member recovery additionally owns an engine-side Preparing
 //! descriptor before staging; only Prepared publications may escape to callers.
+//! Restored own checkpoints also retain a mandatory rotation obligation here:
+//! their application sender ratchet may already have been used before rewind.
 
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
-use cgka_traits::engine::KeyPackage;
+use cgka_traits::engine::{KeyPackage, SendIntent, SendResult};
 use cgka_traits::error::EngineError;
 use cgka_traits::group_recovery::GroupRecoverySource;
 use cgka_traits::maintenance::{
-    KeyPackageLifecycleState, MaintenancePhase, PendingKeyPackageReplacement,
-    RetainedKeyPackagePrivateMaterial, TransportFanoutTarget,
+    KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, MaintenanceTrigger,
+    PendingKeyPackageReplacement, RetainedKeyPackagePrivateMaterial, TransportFanoutTarget,
 };
-use cgka_traits::storage::StorageProvider;
+use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::Timestamp;
-use cgka_traits::types::{EpochId, GroupId, MemberId};
-use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use openmls::prelude::{MlsGroup, MlsMessageBodyIn, MlsMessageIn};
 use openmls_traits::OpenMlsProvider as _;
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as _};
+use web_time::{SystemTime, UNIX_EPOCH};
+
+const REPLAY_ROTATION_PREFIX: &[u8] = b"marmot-replay-rotation-v1/";
+
+fn replay_rotation_id(group_id: &GroupId, group: &MlsGroup) -> MessageId {
+    let mut hash = Sha256::new();
+    hash.update(REPLAY_ROTATION_PREFIX);
+    hash.update((group_id.as_slice().len() as u64).to_be_bytes());
+    hash.update(group_id.as_slice());
+    let epoch = group.epoch().as_u64().to_be_bytes();
+    hash.update(epoch);
+    hash.update(group.epoch_authenticator().as_slice());
+    // Maintenance ids are opaque byte strings, not transport event ids.
+    // Retention can read this local epoch without loading old key material.
+    let mut id = Vec::with_capacity(REPLAY_ROTATION_PREFIX.len() + 8 + 32);
+    id.extend_from_slice(REPLAY_ROTATION_PREFIX);
+    id.extend_from_slice(&epoch);
+    id.extend_from_slice(&hash.finalize());
+    MessageId::new(id)
+}
+
+/// The caller has already pruned exact checkpoints at this same boundary.
+/// Never prune a marker whose epoch can still be installed by replay.
+pub(crate) fn prune_replay_rotations<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    oldest_retained_epoch: u64,
+) -> Result<(), StorageError> {
+    let Some(maintenance) = storage.maintenance_storage() else {
+        return Ok(());
+    };
+    for obligation in maintenance.list_maintenance_obligations_for_group(group_id)? {
+        let Some(suffix) = obligation
+            .id
+            .as_slice()
+            .strip_prefix(REPLAY_ROTATION_PREFIX)
+        else {
+            continue;
+        };
+        if suffix.len() != 8 + 32 {
+            continue;
+        }
+        let mut epoch = [0; 8];
+        epoch.copy_from_slice(&suffix[..8]);
+        if u64::from_be_bytes(epoch) < oldest_retained_epoch {
+            maintenance.delete_maintenance_obligation(&obligation.id)?;
+        }
+    }
+    Ok(())
+}
+
+/// Called only by canonical apply, inside its rollback unit, never by probes.
+/// Keep the obligation even after completion: revisiting this epoch must not
+/// reuse its sender ratchet. Ordinary phase changes cannot release this gate.
+pub(crate) fn require_replay_rotation<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    group: &MlsGroup,
+) -> Result<(), EngineError> {
+    let maintenance = storage
+        .maintenance_storage()
+        .ok_or_else(|| EngineError::Backend("maintenance storage is unavailable".into()))?;
+    let id = replay_rotation_id(group_id, group);
+    if maintenance.maintenance_obligation(&id)?.is_some() {
+        return Ok(());
+    }
+    let leaf = group
+        .own_leaf_node()
+        .ok_or_else(|| EngineError::Backend("group has no local leaf".into()))?
+        .tls_serialize_detached()
+        .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+    let now = Timestamp(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    );
+    maintenance.put_maintenance_obligation(&MaintenanceObligation {
+        id,
+        group_id: group_id.clone(),
+        trigger: MaintenanceTrigger::Manual,
+        phase: MaintenancePhase::Retry,
+        created_at: now,
+        operational_target_at: None,
+        overdue: false,
+        eose_deadline_at: None,
+        grace_until: None,
+        quiet_since: None,
+        own_leaf_baseline_hash: Some(Sha256::digest(leaf).to_vec()),
+        sampled_jitter_ms: 0,
+        not_before: None,
+        attempt_count: 0,
+        semantic_rearm_count: 0,
+        last_failure_code: None,
+    })?;
+    Ok(())
+}
+
+pub(crate) fn replay_rotation_required<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    group: &MlsGroup,
+) -> Result<bool, EngineError> {
+    // Such a backend cannot successfully install an own checkpoint above.
+    let Some(maintenance) = storage.maintenance_storage() else {
+        return Ok(false);
+    };
+    Ok(maintenance
+        .maintenance_obligation(&replay_rotation_id(group_id, group))?
+        .is_some())
+}
 
 impl<S: StorageProvider> Engine<S> {
     /// Record a fully validated, unexposed recovery before OpenMLS can stage it.
@@ -131,6 +244,54 @@ impl<S: StorageProvider> Engine<S> {
             Ok::<_, EngineError>(())
         })?;
         Ok(evolution)
+    }
+
+    pub(crate) fn needs_replay_rotation(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        let group = self
+            .take_mls_group(group_id)?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let result = replay_rotation_required(&self.storage, group_id, &group);
+        self.return_unmodified_mls_group(group_id, group);
+        result
+    }
+
+    pub(crate) async fn stage_replay_rotation(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        if self
+            .epoch_manager
+            .state(group_id)
+            .is_some_and(|state| !state.is_stable())
+            || self.leave_in_progress(group_id)?
+            || self.disbanding_in_progress(group_id)?
+            || !self.needs_replay_rotation(group_id)?
+        {
+            return Ok(false);
+        }
+        let SendResult::GroupEvolution {
+            msg,
+            pending,
+            welcomes,
+        } = self
+            .do_send_ready(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await?
+        else {
+            return Err(EngineError::Backend(
+                "replay rotation produced no commit".into(),
+            ));
+        };
+        self.auto_publish_buf.push_back(cgka_traits::AutoPublish {
+            msg,
+            pending,
+            welcomes,
+        });
+        Ok(true)
     }
 
     pub(crate) fn maintenance_storage(

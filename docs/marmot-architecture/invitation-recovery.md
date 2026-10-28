@@ -128,9 +128,9 @@ it from a Welcome. They use the account inbox, not the broken group's encryption
 Kind `1159` is proposed, not allocated; the wire contract and older-client rollout questions are tracked in
 [marmot#451](https://github.com/marmot-protocol/marmot/issues/451).
 
-Migration 0123 adds the protocol-owned `cgka_group_rejoin` journal and gates older writers. Its number must be
-rechecked against the in-flight history-recovery migrations when rebasing. Retry reservations precede directory
-and network work. One recipient episode permits 32 reservations across nonce rotation, request expiry, phase
+Migration 0124 follows the recovery-coverage ledger's migration 0123. It adds the protocol-owned `cgka_group_rejoin`
+journal and gates older writers. Retry reservations precede directory and network work. One recipient episode
+permits 32 reservations across nonce rotation, request expiry, phase
 changes, cancellation and reopen. Exhaustion durably parks the episode rather than rotating forever. A changed
 known admin set, a newer native epoch or authenticated newer coordinator epoch, or explicit user retry rearms it;
 elapsed time and restart do not.

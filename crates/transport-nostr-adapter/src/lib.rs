@@ -79,6 +79,7 @@ mod replay_admission;
 mod replay_ingress;
 #[cfg(feature = "sdk")]
 mod sdk_client;
+pub mod sweep;
 mod telemetry;
 
 pub use acquisition::{

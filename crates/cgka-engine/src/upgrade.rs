@@ -15,10 +15,9 @@ use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId};
-use openmls::component::ComponentData;
 use openmls::extensions::{Extension, Extensions, RequiredCapabilitiesExtension};
 use openmls::group::MlsGroup;
-use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
+use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{ExtensionType, ProposalType};
 use tls_codec::Serialize as _;
 
@@ -160,6 +159,7 @@ impl<S: StorageProvider> Engine<S> {
                     _ => None,
                 }),
         )?;
+        let roster_required = crate::app_components::group_requires_device_roster(&mls_group)?;
         let mut commit_builder = mls_group.commit_builder();
         if let Some(new_extensions) = new_extensions {
             commit_builder = commit_builder
@@ -177,14 +177,11 @@ impl<S: StorageProvider> Engine<S> {
             )
             .map_err(|e| EngineError::Backend(format!("upgrade load_psks: {e:?}")))?;
         let mut app_data = builder.app_data_dictionary_updater();
-        for proposal in builder.app_data_update_proposals() {
-            if let AppDataUpdateOperation::Update(data) = proposal.operation() {
-                app_data.set(ComponentData::from_parts(
-                    proposal.component_id(),
-                    data.clone(),
-                ));
-            }
-        }
+        crate::app_components::apply_app_data_updates(
+            roster_required,
+            &mut app_data,
+            builder.app_data_update_proposals(),
+        )?;
         builder.with_app_data_dictionary_updates(app_data.changes());
         let commit_bundle = builder
             .build(

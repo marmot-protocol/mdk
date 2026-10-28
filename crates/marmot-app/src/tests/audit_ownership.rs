@@ -153,3 +153,33 @@ async fn finishing_the_audit_log_closes_it_for_every_clone() {
         "no row of the finished session follows its stop row"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_session_and_live_toggle_register_the_writer_for_retention() {
+    let (_dir, app) = audited_alice("wss://audit-retention.example").await;
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("retention", &[]).await.unwrap();
+    let path = client.audit.audit_log_path().unwrap();
+    let age = || {
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap()
+    };
+    age();
+    assert!(app.expire_audit_file(&path).unwrap());
+    let before = std::fs::metadata(&path).unwrap().len();
+    client.record_epoch_stall_backfill_escalated(&group, 7, 3);
+    assert!(std::fs::metadata(&path).unwrap().len() > before);
+    client.set_audit_recording(false);
+    age();
+    assert!(app.expire_audit_file(&path).unwrap());
+    client.set_audit_recording(true);
+    age();
+    assert!(app.expire_audit_file(&path).unwrap());
+    let before = std::fs::metadata(&path).unwrap().len();
+    client.record_epoch_stall_backfill_escalated(&group, 8, 3);
+    assert!(std::fs::metadata(&path).unwrap().len() > before);
+}

@@ -3053,3 +3053,253 @@ fn only_a_v5_recorder_writes_a_publish_event_age() {
         .expect("the v5 recorder writes the outcome");
     assert_eq!(row["event"]["event_age_secs"], 5_700);
 }
+
+#[test]
+fn daily_rotation_seals_before_new_rows_and_preserves_headers_and_identity() {
+    let dir = TempDir::new().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"a".repeat(32));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "a".repeat(32), None, v5_test_producer())
+            .unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: AuditSourceContext::default(),
+        },
+    ));
+    let before = fs::read(&path).unwrap();
+    let last = v5_rows(&path).pop().unwrap();
+    recorder.inner.lock().unwrap().active_started_at =
+        SystemTime::now() - AUDIT_LOG_SEGMENT_MAX_AGE;
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::RecorderHealth {
+            serialization_failures: 0,
+            write_failures: 0,
+            flush_failures: 0,
+        },
+    ));
+    let segments = segment_paths(&path);
+    assert_eq!(segments.len(), 1);
+    assert_eq!(fs::read(&segments[0]).unwrap(), before);
+    let after = v5_rows(&path);
+    assert_eq!(after[0]["event"]["type"], "source_context");
+    assert_eq!(after[0]["session_id"], last["session_id"]);
+    assert_eq!(
+        after[0]["seq"].as_str().unwrap().parse::<u64>().unwrap(),
+        last["seq"].as_str().unwrap().parse::<u64>().unwrap() + 1
+    );
+}
+
+#[test]
+fn daily_rotation_uses_the_first_row_after_repeated_reopens() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    {
+        let _recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    }
+    let mut rows: Vec<serde_json::Value> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    rows[0]["wall_time_ms"] = serde_json::json!(1);
+    let old = rows
+        .into_iter()
+        .map(|r| serde_json::to_string(&r).unwrap() + "\n")
+        .collect::<String>();
+    fs::write(&path, &old).unwrap();
+    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    assert_eq!(segment_paths(&path).len(), 1);
+    assert_eq!(fs::read_to_string(&segment_paths(&path)[0]).unwrap(), old);
+    assert!(recorder.is_enabled());
+}
+
+#[test]
+fn file_expiry_protects_a_stuck_writer_and_does_not_charge_record_failures() {
+    let dir = TempDir::new().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"a".repeat(32));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "a".repeat(32), None, v5_test_producer())
+            .unwrap();
+    let closed = segment_path(&path, 1);
+    fs::write(&closed, b"old").unwrap();
+    {
+        let mut inner = recorder.inner.lock().unwrap();
+        inner.writer_needs_seal = true;
+    }
+    let before = recorder.health_snapshot();
+    assert!(
+        recorder
+            .expire_file_before(&closed, u64::MAX, &mut |p| fs::remove_file(p)
+                .map(|()| true))
+            .unwrap()
+    );
+    assert!(
+        !recorder
+            .expire_file_before(&path, u64::MAX, &mut |p| fs::remove_file(p).map(|()| true))
+            .unwrap()
+    );
+    assert_eq!(recorder.health_snapshot(), before);
+    assert!(path.exists());
+}
+
+#[test]
+fn daily_rotation_precedes_a_quiet_stop_without_inventing_another_session() {
+    let dir = TempDir::new().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"a".repeat(32));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "a".repeat(32), None, v5_test_producer())
+            .unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: AuditSourceContext::default(),
+        },
+    ));
+    let original = fs::read(&path).unwrap();
+    let session = v5_rows(&path)[0]["session_id"].clone();
+    recorder.inner.lock().unwrap().active_started_at =
+        SystemTime::now() - AUDIT_LOG_SEGMENT_MAX_AGE;
+    recorder.finish_v5_recording(crate::v5::RecordingStopReason::CleanRuntimeShutdown);
+    assert_eq!(fs::read(&segment_paths(&path)[0]).unwrap(), original);
+    let after = v5_rows(&path);
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0]["event"]["type"], "source_context");
+    assert_eq!(after[1]["event"]["type"], "recording_session_stopped");
+    assert_eq!(after[1]["session_id"], session);
+}
+
+#[test]
+fn daily_rotation_seals_a_failed_source_prefix_before_the_next_actual_row() {
+    let dir = TempDir::new().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"a".repeat(32));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "a".repeat(32), None, v5_test_producer())
+            .unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: AuditSourceContext::default(),
+        },
+    ));
+    let original = fs::read(&path).unwrap();
+    {
+        let mut inner = recorder.inner.lock().unwrap();
+        inner.active_started_at = SystemTime::now() - AUDIT_LOG_SEGMENT_MAX_AGE;
+        inner.fail_next_partial_write = true;
+    }
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::RecorderHealth {
+            serialization_failures: 0,
+            write_failures: 0,
+            flush_failures: 0,
+        },
+    ));
+    let after = v5_rows(&path);
+    assert_eq!(after.last().unwrap()["event"]["type"], "recorder_health");
+    assert_eq!(segment_paths(&path).len(), 2);
+    assert_eq!(fs::read(&segment_paths(&path)[0]).unwrap(), original);
+    assert!(recorder.health_snapshot().write_failures > 0);
+}
+
+#[test]
+fn daily_rotation_does_not_seal_a_repeated_header_without_an_actual_row() {
+    let dir = TempDir::new().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"a".repeat(32));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "a".repeat(32), None, v5_test_producer())
+            .unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: AuditSourceContext::default(),
+        },
+    ));
+    {
+        let mut inner = recorder.inner.lock().unwrap();
+        recorder.roll_into_segment(&mut inner).unwrap();
+        assert_eq!(inner.active_bytes, inner.repeated_source_bytes);
+        inner.active_started_at = SystemTime::now() - AUDIT_LOG_SEGMENT_MAX_AGE * 35;
+        recorder.try_roll_segment(&mut inner, Instant::now());
+    }
+    assert_eq!(segment_paths(&path).len(), 1);
+    let health = recorder.health_snapshot();
+    assert!(
+        recorder
+            .expire_file_before(&path, u64::MAX, &mut |closed| fs::remove_file(closed)
+                .map(|()| true))
+            .unwrap()
+    );
+    assert_eq!(recorder.health_snapshot(), health);
+    assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    assert!(
+        !recorder
+            .expire_file_before(&path, u64::MAX, &mut |_| panic!("empty live file"))
+            .unwrap()
+    );
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::RecorderHealth {
+            serialization_failures: 0,
+            write_failures: 0,
+            flush_failures: 0,
+        },
+    ));
+    assert_eq!(segment_paths(&path).len(), 1);
+    assert!(
+        recorder
+            .inner
+            .lock()
+            .unwrap()
+            .active_started_at
+            .elapsed()
+            .unwrap()
+            < Duration::from_secs(3)
+    );
+}
+
+#[test]
+fn file_expiry_protects_the_segment_owned_after_failed_roll_compensation() {
+    let dir = TempDir::new().unwrap();
+    let path = default_v5_jsonl_path(dir.path(), &"a".repeat(32));
+    let recorder =
+        JsonlRecorder::open_v5_with_account_ref(&path, "a".repeat(32), None, v5_test_producer())
+            .unwrap();
+    recorder.inner.lock().unwrap().active_bytes = AUDIT_LOG_SEGMENT_MAX_BYTES;
+    recorder.fail_segment_reopen.store(true, Ordering::Relaxed);
+    recorder.fail_segment_restore.store(true, Ordering::Relaxed);
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::RecorderHealth {
+            serialization_failures: 0,
+            write_failures: 0,
+            flush_failures: 0,
+        },
+    ));
+    let actual = recorder.inner.lock().unwrap().writer_path.clone();
+    assert_ne!(actual, path);
+    assert!(fs::metadata(&actual).unwrap().len() > 0);
+    let health = recorder.health_snapshot();
+    assert!(
+        recorder
+            .expire_file_before(&actual, u64::MAX, &mut |closed| {
+                assert_ne!(closed, path);
+                assert!(path.exists()); // Fresh writer already owns a different inode.
+                fs::remove_file(closed).map(|()| true)
+            })
+            .unwrap()
+    );
+    assert_eq!(recorder.health_snapshot(), health);
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::RecorderHealth {
+            serialization_failures: 0,
+            write_failures: 0,
+            flush_failures: 0,
+        },
+    ));
+    assert!(!actual.exists());
+    assert!(fs::metadata(path).unwrap().len() > 0);
+}

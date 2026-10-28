@@ -516,6 +516,11 @@ real founding, publication, receipt, peel, join and checkpoint boundaries. The
 cargo test -p marmot-app --lib audit_v5_probe -- --nocapture --test-threads=1
 ```
 
+Local forensic files expire automatically 30 days after their last write, including files that have not been
+uploaded. Daily rotation keeps roughly 30 days of history with up to one extra day. Cleanup runs on exclusive app
+open and hourly across every account and failed-wipe remnant, even with recording or uploads disabled. Legacy files
+age out without rewriting their contents. The separate key-reveal security log is excluded.
+
 ## Run the tests
 
 ```sh

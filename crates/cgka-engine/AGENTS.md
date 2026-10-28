@@ -60,9 +60,9 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `disband.rs` | Durable terminal group-disband workflow |
 | `own_commit_intent.rs` | `OwnCommitIntent` records and re-issue of own commits superseded by branch selection (mdk#1734) |
 | `own_account_devices.rs` | `SendIntent::AddOwnAccountDevices` / `RemoveOwnAccountDevices`: a by-value same-account Commit that leaves the proposal store alone, refused unless the classifier calls it same-account (so only while the group requires 0x800d); no `OwnCommitIntent` re-issue |
-| `maintenance.rs` | KeyPackage replacement staging and promotion (OpenMLS material and the lifecycle record in one transaction) and the own-leaf hash. Scheduling and the other account records live above the engine; it adds no storage forwards for them (mdk#2602) |
+| `maintenance.rs` | KeyPackage replacement staging and promotion (OpenMLS material and the lifecycle record in one transaction), the own-leaf hash, and mandatory sender-ratchet rotation after own-checkpoint installation. Replay rotation uses a durable Manual obligation whose phase cannot release the restored epoch's application-send gate; its private epoch-bound id is pruned only after exact checkpoints at the same horizon. Ordinary scheduling and other account records live above the engine; it adds no storage forwards for them (mdk#2602) |
 | `group_authority.rs` | Advisory live-engine authority facts for conversation capture; mutations still validate authority |
-| `app_components.rs` | `app_data_dictionary` helpers, LeafNode/group `app_components` bytes, group profile and admin-policy bytes, the resulting-state check every send path and replay call (`validate_current_profile_invariants_for_staged_commit`, including the account-devices rules) and its join-time twin (`validate_joined_group_invariants`), the Welcome author check, standalone proposal admission |
+| `app_components.rs` | `app_data_dictionary` helpers, LeafNode/group `app_components` bytes, group profile and admin-policy bytes, the resulting-state check every send path and replay call (`validate_current_profile_invariants_for_staged_commit`, including the account-devices and device-roster rules) and its join-time twin (`validate_joined_group_invariants`), the Welcome author check, standalone proposal admission, and `resolved_app_data_update` / `apply_app_data_updates`, the one place every send, inbound and replay path turns an AppDataUpdate into resulting GroupContext bytes (whole replacement, except the device roster's diff) |
 | `commit_class.rs` | The one Commit classifier (self-update, SelfRemove-only, same-account, admin-required) read from the parent state. Replay, every send path's own check (`authorize_own_staged_commit`) and the publish stamp call it; the class decides both whether an admin must commit and the branch priority (`privileged` exactly for admin-required). Same-account exists only while the parent requires 0x800d |
 | `account_identity_proof.rs` | Legacy LeafNode identity-proof extension + current app-data component; strict profile classification (mixed rejected) |
 | `app_payload.rs` | `validate_app_payload_for_sender`: `MarmotAppEvent` sender validation |
@@ -115,7 +115,9 @@ Load-bearing departures from the original plan; each is also documented at its s
    `ADVERTISABLE_PROTOCOL_APP_COMPONENTS`. A component joins that list only once the engine enforces every rule of it,
    because a group may require what its members advertise. Advertising never changes an existing group: upgrades
    require a component only when asked and never add account-devices (0x800d). Creation requires account-devices,
-   unasked, exactly when the creator's leaf and every founding KeyPackage advertise it (`group_lifecycle.rs`).
+   unasked, exactly when the creator's leaf and every founding KeyPackage advertise it (`group_lifecycle.rs`). The
+   device roster (0x800e, mdk#2628 3.1) is advertisable only in `test-policy-overrides` builds until its spec is
+   adopted (`DEVICE_ROSTER_ADVERTISABLE`), so no release build creates or joins a device group.
 
 ## Publish-before-apply
 
@@ -381,8 +383,8 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   type.** Pre-parse persists (peel failure, non-MLS or Welcome body in a group envelope) stamp `current_epoch`. The
   convergence door stamps the projected `source_epoch`; direct ingest stamps the commit's wire epoch (always below
   `current_epoch` there, since `commit_should_enter_convergence` routes every commit at or above the live epoch into
-  convergence). `distributed_convergence.rs` and `openmls_projection.rs`'s own-checkpoint prefix
-  (`resulting_epoch = record.epoch + 1`) both read rows this way. Hazard from a device-epoch stamp (derived from
+  convergence). `distributed_convergence.rs` and `openmls_projection.rs`'s canonical apply-start calculation
+  both read rows this way. Hazard from a device-epoch stamp (derived from
   `apply_start_epoch_for_canonicalization_result`, not pinned by a test): a direct-path row becomes the first
   non-prefix commit, `apply_start_epoch >= current_epoch`, `rewind_to_retained_anchor` stays false, and replay runs
   against live state (`WrongEpoch`, failed apply, rollback). The stamp is a stored-input shape, not a verdict. Forensics
