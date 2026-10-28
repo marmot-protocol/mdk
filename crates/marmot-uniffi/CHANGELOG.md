@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- `MarmotKitError` adds `GroupRecoveryUnsettled { group_id_hex }` and
+  `GroupRecoverySourceMismatch { group_id_hex }`. The former waits for the
+  source group to settle; the latter requires a fresh authenticated challenge,
+  never a blind retry of the same grant. Update exhaustive host error handling.
+
 - `MarmotKitError` adds `MediaReferenceStaleEpoch { source_epoch, current_epoch }`
   and `MediaReferenceEpochUnsettled { source_epoch }`. They replace the
   generic `InvalidMediaReference` for these two cases: the first means the

@@ -27,6 +27,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("cgka_features", Side::Protocol),
     ("cgka_group_evolutions", Side::Protocol),
     ("cgka_group_maintenance", Side::Protocol),
+    ("cgka_group_recovery", Side::Protocol),
     ("cgka_group_snapshots", Side::Protocol),
     ("cgka_group_state_checkpoints", Side::Protocol),
     ("cgka_groups", Side::Protocol),

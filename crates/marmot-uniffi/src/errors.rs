@@ -374,6 +374,12 @@ pub enum MarmotKitError {
     /// repair arrives on a remote member's schedule.
     #[error("group {group_id_hex} is unrecoverable and needs to be re-joined before sending")]
     GroupUnrecoverableRepairRequired { group_id_hex: String },
+    /// Recovery waits for the coordinator's source group to settle.
+    #[error("group recovery requires a settled source")]
+    GroupRecoveryUnsettled { group_id_hex: String },
+    /// Recovery must restart its authenticated challenge, not retry the grant.
+    #[error("group recovery requires a fresh challenge")]
+    GroupRecoverySourceMismatch { group_id_hex: String },
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
     /// The account worker is completing an exclusive catch-up and definitely
@@ -666,6 +672,14 @@ impl From<&AppError> for MarmotKitError {
 impl MarmotKitError {
     fn from_engine_error(value: &EngineError) -> Self {
         match value {
+            EngineError::GroupRecoveryUnsettled { group_id } => Self::GroupRecoveryUnsettled {
+                group_id_hex: hex::encode(group_id.as_slice()),
+            },
+            EngineError::GroupRecoverySourceMismatch { group_id } => {
+                Self::GroupRecoverySourceMismatch {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                }
+            }
             EngineError::UnknownGroup(group_id) => Self::UnknownGroup {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
@@ -936,6 +950,27 @@ mod tests {
     // message was not accepted at all. Flattened into `Runtime` the host cannot
     // tell it from any other failure without string-parsing, and cannot explain
     // to the user why the group stopped accepting messages.
+    #[test]
+    fn recovery_error_retry_meaning() {
+        let group_id = cgka_traits::GroupId::new(vec![0x33; 16]);
+        let expected = hex::encode(group_id.as_slice());
+        let unsettled = MarmotKitError::from_engine_error(&EngineError::GroupRecoveryUnsettled {
+            group_id: group_id.clone(),
+        });
+        let changed =
+            MarmotKitError::from_engine_error(&EngineError::GroupRecoverySourceMismatch {
+                group_id,
+            });
+        assert!(!unsettled.to_string().contains(&expected));
+        assert!(!changed.to_string().contains(&expected));
+        assert!(
+            matches!(unsettled, MarmotKitError::GroupRecoveryUnsettled { group_id_hex } if group_id_hex == expected)
+        );
+        assert!(
+            matches!(changed, MarmotKitError::GroupRecoverySourceMismatch { group_id_hex } if group_id_hex == expected)
+        );
+    }
+
     #[test]
     fn queued_outbound_at_capacity_crosses_ffi_as_typed_variant() {
         let group_id = cgka_traits::GroupId::new(vec![0x33; 16]);

@@ -33,6 +33,19 @@ pub const KIND_NIP59_GIFT_WRAP: u64 = 1059;
 /// Marmot welcome rumor kind inside the NIP-59 seal.
 pub const KIND_MARMOT_WELCOME_RUMOR: u16 = 444;
 
+/// MDK-private recovery control rumor kind, carried only inside NIP-59.
+/// This is an MDK extension, NOT a Marmot-standard kind allocation. The
+/// version is bound by the matching outer and authenticated inner tags.
+pub const KIND_MDK_GROUP_RECOVERY_RUMOR: u16 = 21159;
+
+/// Strict single routing tag for the MDK-private recovery extension.
+pub const GROUP_RECOVERY_PROTOCOL_TAG: &str = "mdk_group_recovery";
+/// Supported MDK-private recovery wire protocol version.
+pub const GROUP_RECOVERY_PROTOCOL_VERSION: &str = "1";
+
+/// Bound applied before parsing or decrypting a private recovery gift wrap.
+pub const MAX_GROUP_RECOVERY_EVENT_BYTES: usize = 512 * 1024;
+
 /// Source label carried by [`cgka_traits::transport::TransportMessage`] values
 /// produced here.
 pub const NOSTR_SOURCE: &str = "nostr";

@@ -440,6 +440,29 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) fn parse_key_package(&self, kp: &KeyPackage) -> Result<MlsKeyPackage, EngineError> {
         parse_invitation_key_package(kp)
     }
+
+    pub(crate) fn parse_group_key_package(
+        &self,
+        kp: &KeyPackage,
+        profile: ProtocolProfile,
+        required: &cgka_traits::capabilities::GroupCapabilities,
+    ) -> Result<MlsKeyPackage, EngineError> {
+        let parsed = self.parse_key_package(kp)?;
+        if kp.protocol_profile != profile {
+            return Err(EngineError::InvalidAccountIdentityProof(format!(
+                "cannot invite a {:?} KeyPackage into a {:?} group",
+                kp.protocol_profile, profile,
+            )));
+        }
+        let had = crate::capabilities::capabilities_of_key_package(&parsed);
+        if !required.missing_from(&had).is_empty() {
+            return Err(EngineError::MissingRequiredCapabilities {
+                required: Box::new(required.clone()),
+                had: Box::new(had),
+            });
+        }
+        Ok(parsed)
+    }
 }
 
 fn parse_invitation_key_package(kp: &KeyPackage) -> Result<MlsKeyPackage, EngineError> {

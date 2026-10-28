@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Append `MARMOT_STATUS_GROUP_RECOVERY_UNSETTLED` (110) and
+  `MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH` (111), preserving all previous
+  status values. The first waits for a settled source; the second restarts the
+  authenticated challenge rather than retrying the same grant. Use matching
+  regenerated headers and libraries.
+
 - Add `MARMOT_STATUS_MEDIA_REFERENCE_STALE_EPOCH` (108): the group left the
   epoch an attachment was encrypted under, so upload it again; and
   `MARMOT_STATUS_MEDIA_REFERENCE_EPOCH_UNSETTLED` (109): the group's epoch is

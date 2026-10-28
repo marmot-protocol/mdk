@@ -10,6 +10,7 @@
 use crate::engine::WelcomeMetadata;
 use crate::error::PeelerError;
 use crate::group_context::GroupContextSnapshot;
+use crate::group_recovery::{AuthenticatedGroupRecovery, GroupRecoveryMessage};
 use crate::ingest::PeeledMessage;
 use crate::transport::{EncryptedPayload, TransportMessage};
 use crate::types::MemberId;
@@ -119,6 +120,21 @@ pub trait TransportPeeler: Send + Sync {
     ) -> Result<PeeledMessage, PeelerError>;
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError>;
+
+    /// Authenticate private recovery control using the account signer, never
+    /// the untrusted outer routing discriminator or ephemeral carrier author.
+    async fn peel_group_recovery(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<AuthenticatedGroupRecovery, PeelerError>;
+
+    /// Wrap recovery control to one account's ordinary inbox, independently of
+    /// group exporter keys. Callers persist these exact bytes for retry.
+    async fn wrap_group_recovery(
+        &self,
+        message: &GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError>;
 
     async fn wrap_group_message(
         &self,

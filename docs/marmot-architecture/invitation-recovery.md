@@ -1,4 +1,4 @@
-# Superseded invitation recovery
+# Invitation and Unrecoverable group recovery
 
 When a locally published invite loses branch selection, its Welcome may already have installed the losing branch
 on the recipient. The inviter's success report does not prove that the invitation survived convergence (#1735).
@@ -74,3 +74,55 @@ journey with recipient reopen before and after consent, refusal of self-promoted
 stale-token rejection, content-based decline, persisted retry exhaustion, and SQLCipher upgrade/reopen and evidence
 bounds. Protocol bootstrap trust is documented in the canonical specification's
 [joining contract](https://github.com/marmot-protocol/marmot/blob/master/protocol-core/joining.md).
+
+## Automatic rejoin of an Unrecoverable copy
+
+The account worker automatically requests a fresh group copy when both the durable group record and native epoch
+state are `Unrecoverable`. The account signer, persisted MLS device signer and frozen local copy must remain
+available. A recovery warning, unreadable message, higher peer epoch or incoming request never creates this authority.
+Usable forks still require the explicit rejoin consent described above. Removed, leaving, disbanding and disbanded
+copies cannot request automatic reentry.
+
+The halted device contacts one known admin account at a time through its advertised inbox. A healthy current admin
+finds the device's current leaf by its persisted signing-key hash and challenges that exact leaf on its settled
+branch. The frozen device's old leaf position is not identity: a prior replacement may have moved it even when its
+Welcome was lost. A removed signing key cannot select a new device that reused the same position.
+The recipient publishes a fresh compatible KeyPackage,
+retains its publication event reference, and signs a grant with its existing MLS device key. The grant binds the
+group, coordinator, nonce, expiry, source epoch/authenticator hash, exact leaf/hash, device-key hash and complete
+KeyPackage. Possessing the account key or copying a sibling's public KeyPackage is insufficient to replace that
+sibling. A healthy admin device on the same account may coordinate; its own leaf is never a replacement target.
+
+The coordinator revalidates current membership, admin authority, source state, package compatibility and device
+proof immediately before staging one atomic remove-and-add Commit. It preserves account admin roles and unrelated
+device leaves. The ordinary publish-before-apply path confirms the Commit before releasing its fresh Welcome.
+The existing authenticated Welcome repair installs the copy on the running recipient, preserves stored application
+history and retires obsolete convergence residue. It cannot reconstruct messages whose epoch secrets were pruned.
+
+A delayed Welcome can heal the recipient while another recovery grant is already in flight. If that replacement
+then removes its old leaf, the ordinary trusted-removal retry installs the queued Welcome after the native copy
+becomes inactive, even if the account remains in the roster. A durable removal marker alone never bypasses
+consent for a usable native copy.
+
+These controls are an MDK-private NIP-59 extension: outer kind `1059`, inner rumor kind `21159`, with exactly one
+`["mdk_group_recovery", "1"]` tag on both. They use the account inbox, not the broken group's encryption context,
+and create no chat entries. They are not a Marmot-standard kind allocation.
+
+Migration 0120 adds the protocol-owned `cgka_group_recovery` journal and gates older writers. Retry reservations
+precede directory/network work; cancellation and reopen keep their deadlines and exact authored packets. Requests
+expire after ten minutes; delays are 5, 15, 30, 60 and then 120 seconds, revisited by ordinary worker maintenance.
+Expiry rotates to the next known admin. The runtime admits at most 64 recipient jobs per account, 256 coordinator
+jobs per account and 16 per group; compatible grants batch at most 16 recipients per turn. Capacity refusal never
+evicts an active grant. Paused maintenance, frozen cursor mode and closed storage suppress automatic execution.
+
+Recovery evolution ownership is durable before MLS staging. A crash in unexposed preparation atomically abandons
+the pending Commit and staged Welcomes. A prepared publication resumes its original Commit, pending reference and
+linked Welcomes; expiry cannot discard publication already owned by that lifecycle. No relay acknowledgement is
+invented after failure. A reachable eligible admin, compatible implementations, fresh material and eventual network
+delivery remain prerequisites.
+Existing membership-profile cutover rules still apply: a current-profile coordinator cannot recover a leaf in a
+legacy group.
+
+`MarmotAppRuntime` drives this automatically. Lower-level Rust hosts drive `prepare_group_recovery`, resolve only
+the returned members' safe inbox routes, then call `advance_group_recovery` in their existing account loop. Both
+methods belong to the same runtime owner; preparation durably reserves each turn before cancellable lookup work.

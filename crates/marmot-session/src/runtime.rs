@@ -1,6 +1,8 @@
 //! Account-device runtime: drives session effects through transport publish,
 //! confirmation, and rollback, and the effect aggregates it produces.
 
+mod group_recovery;
+
 /// Closed timing boundaries; callbacks receive no delivery or identity data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccountIngestPhase {
@@ -459,6 +461,7 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// error. Never set by production code.
     finish_stage_failure: Option<cgka_traits::MessageId>,
     publication_progress: PublicationProgressSlot,
+    recovery_turn: Vec<storage_sqlite::GroupRecoveryRecord>,
 }
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
@@ -518,6 +521,7 @@ where
             detached_welcome_publishes: HashSet::new(),
             finish_stage_failure: None,
             publication_progress: Arc::new(std::sync::Mutex::new(None)),
+            recovery_turn: Vec::new(),
         }
     }
 
@@ -3359,6 +3363,19 @@ where
         if delivery.account_id != self.session.self_id() {
             return Err(AccountError::WrongAccountDelivery);
         }
+        if matches!(
+            delivery.message.envelope,
+            TransportEnvelope::GroupRecovery { .. }
+        ) {
+            let started = Instant::now();
+            let ingested = self.ingest_group_recovery(&delivery.message).await;
+            observe(
+                AccountIngestPhase::Engine,
+                started.elapsed(),
+                ingested.is_ok(),
+            );
+            return ingested;
+        }
         let started = Instant::now();
         let ingested = self.session.ingest_delivery(delivery).await;
         observe(
@@ -3592,6 +3609,7 @@ where
             let outcome = fanout.outcome();
             if outcome.outstanding_targets > 0
                 || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                || !fanout.pending_post_confirmation_welcomes().is_empty()
             {
                 let fanout_group = fanout.group_id().cloned();
                 let status =
@@ -4468,7 +4486,8 @@ where
             let wire = publish_wire_metadata(&fanout.exact_message);
             let artifact_kind = match &fanout.exact_message.envelope {
                 TransportEnvelope::Welcome { .. } => Some(MessageArtifactKind::Welcome),
-                TransportEnvelope::GroupMessage { .. } => None,
+                TransportEnvelope::GroupMessage { .. }
+                | TransportEnvelope::GroupRecovery { .. } => None,
             };
             let target_kind = publish_target_kind(&fanout.target).to_string();
             let publish_context = AuditEventContext {
@@ -5262,7 +5281,9 @@ where
         // transport envelope alone, so it is left unattributed here.
         let artifact_kind = match &message.envelope {
             TransportEnvelope::Welcome { .. } => Some(MessageArtifactKind::Welcome),
-            TransportEnvelope::GroupMessage { .. } => None,
+            TransportEnvelope::GroupMessage { .. } | TransportEnvelope::GroupRecovery { .. } => {
+                None
+            }
         };
         let mut publish_context = context.unwrap_or_default();
         publish_context.operation_id = Some(format!("publish-{msg_id_hex}"));
@@ -6223,6 +6244,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
     matches!(
         intent,
         SendIntent::Invite { .. }
+            | SendIntent::RecoverMembers { .. }
             | SendIntent::RemoveMembers { .. }
             | SendIntent::SelfUpdate { .. }
             | SendIntent::UpdateAppComponents { .. }
@@ -6262,7 +6284,7 @@ fn classify_prepared_session_send(
 fn welcome_recipient(message: &TransportMessage) -> Option<MemberId> {
     match &message.envelope {
         TransportEnvelope::Welcome { recipient } => Some(recipient.clone()),
-        TransportEnvelope::GroupMessage { .. } => None,
+        TransportEnvelope::GroupMessage { .. } | TransportEnvelope::GroupRecovery { .. } => None,
     }
 }
 
@@ -6283,7 +6305,7 @@ fn publish_wire_metadata(message: &TransportMessage) -> AuditTransportWire {
         TransportEnvelope::GroupMessage { transport_group_id } => {
             Some(hex::encode(transport_group_id))
         }
-        TransportEnvelope::Welcome { .. } => None,
+        TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => None,
     };
     AuditTransportWire {
         transport: Some(message.source.0.clone()),

@@ -1,5 +1,6 @@
 use crate::{
-    EXPIRATION_TAG, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE, KIND_NIP59_GIFT_WRAP, NOSTR_SOURCE,
+    EXPIRATION_TAG, GROUP_RECOVERY_PROTOCOL_TAG, GROUP_RECOVERY_PROTOCOL_VERSION, GROUP_TAG,
+    KIND_MARMOT_GROUP_MESSAGE, KIND_NIP59_GIFT_WRAP, MAX_GROUP_RECOVERY_EVENT_BYTES, NOSTR_SOURCE,
     NostrPeelerError, RECIPIENT_TAG,
 };
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
@@ -48,17 +49,33 @@ impl NostrTransportEvent {
             },
             KIND_NIP59_GIFT_WRAP => {
                 let recipient = self.single_tag_value(RECIPIENT_TAG)?;
-                TransportEnvelope::Welcome {
-                    recipient: MemberId::new(decode_hex_exact("recipient p tag", recipient, 32)?),
+                let recipient = MemberId::new(decode_hex_exact("recipient p tag", recipient, 32)?);
+                if self.is_group_recovery()? {
+                    if self.content.len() > MAX_GROUP_RECOVERY_EVENT_BYTES {
+                        return Err(NostrPeelerError::Malformed(
+                            "recovery carrier exceeds limit".into(),
+                        ));
+                    }
+                    TransportEnvelope::GroupRecovery { recipient }
+                } else {
+                    TransportEnvelope::Welcome { recipient }
                 }
             }
             other => return Err(NostrPeelerError::UnsupportedKind(other)),
         };
 
+        let payload =
+            serde_json::to_vec(self).map_err(|e| NostrPeelerError::Malformed(e.to_string()))?;
+        if matches!(envelope, TransportEnvelope::GroupRecovery { .. })
+            && payload.len() > MAX_GROUP_RECOVERY_EVENT_BYTES
+        {
+            return Err(NostrPeelerError::Malformed(
+                "recovery carrier exceeds limit".into(),
+            ));
+        }
         Ok(TransportMessage {
             id,
-            payload: serde_json::to_vec(self)
-                .map_err(|e| NostrPeelerError::Malformed(e.to_string()))?,
+            payload,
             timestamp: Timestamp(self.created_at),
             // Kind 445 MUST NOT carry any tag other than h/expiration
             // (transports/nostr.md). The peeler no longer extracts `e` causal
@@ -67,6 +84,24 @@ impl NostrTransportEvent {
             source: TransportSource(NOSTR_SOURCE.into()),
             envelope,
         })
+    }
+
+    /// Classify the unauthenticated routing hint, requiring exactly one marker
+    /// with exactly the supported version. Authentication happens on peeling.
+    pub(crate) fn is_group_recovery(&self) -> Result<bool, NostrPeelerError> {
+        let mut tags = self.tags.iter().filter(|tag| {
+            tag.first()
+                .is_some_and(|name| name == GROUP_RECOVERY_PROTOCOL_TAG)
+        });
+        let Some(tag) = tags.next() else {
+            return Ok(false);
+        };
+        if tags.next().is_some() || tag.len() != 2 || tag[1] != GROUP_RECOVERY_PROTOCOL_VERSION {
+            return Err(NostrPeelerError::Malformed(
+                "invalid recovery protocol tag".into(),
+            ));
+        }
+        Ok(true)
     }
 
     /// Validate the adopted exact kind-445 tag shape and return its Nostr

@@ -410,7 +410,10 @@ fn transport_reconciliation_record(
     delivery: &cgka_traits::TransportDelivery,
 ) -> Option<(TransportReconciliationRoute, TransportReconciliationItem)> {
     let route = match &delivery.message.envelope {
-        TransportEnvelope::Welcome { recipient } if recipient == account_id => {
+        TransportEnvelope::Welcome { recipient }
+        | TransportEnvelope::GroupRecovery { recipient }
+            if recipient == account_id =>
+        {
             TransportReconciliationRoute::Inbox
         }
         TransportEnvelope::GroupMessage { transport_group_id }
@@ -3838,6 +3841,10 @@ impl AppClient {
             &delivery.message.envelope,
             TransportEnvelope::Welcome { .. }
         );
+        let group_recovery = matches!(
+            &delivery.message.envelope,
+            TransportEnvelope::GroupRecovery { .. }
+        );
         let probe_receive = if welcome && (client.audit_v5_enabled() || cfg!(test)) {
             client
                 .audit_v5_probe
@@ -3904,10 +3911,18 @@ impl AppClient {
         let observation = client.app.product_analytics.begin(
             if welcome {
                 crate::ProductFamily::Welcome
+            } else if group_recovery {
+                crate::ProductFamily::Recovery
             } else {
                 crate::ProductFamily::MessageProcessing
             },
-            if welcome { "process" } else { "receive" },
+            if welcome {
+                "process"
+            } else if group_recovery {
+                "unrecoverable"
+            } else {
+                "receive"
+            },
             crate::ProductUnit::Attempt,
         );
         let telemetry = client.runtime_telemetry.clone();

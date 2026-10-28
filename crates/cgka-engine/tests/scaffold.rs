@@ -37,6 +37,25 @@ struct StubPeeler;
 
 #[async_trait]
 impl TransportPeeler for StubPeeler {
+    async fn peel_group_recovery(
+        &self,
+        _msg: &TransportMessage,
+    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, PeelerError> {
+        Err(PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        Err(PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         _msg: &TransportMessage,

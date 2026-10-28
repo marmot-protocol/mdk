@@ -2065,6 +2065,7 @@ impl<S: StorageProvider> Engine<S> {
         self.auto_publish_buf.push_back(AutoPublish {
             msg: wrapped,
             pending: pending_ref,
+            welcomes: Vec::new(),
         });
         pending_commit_guard.disarm();
         Ok(true)

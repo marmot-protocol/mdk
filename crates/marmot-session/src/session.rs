@@ -266,12 +266,13 @@ impl SessionConfig {
 }
 
 pub struct AccountDeviceSession {
-    engine: Engine<SqliteAccountStorage>,
+    pub(super) engine: Engine<SqliteAccountStorage>,
     /// A clone of the engine's connection. The account records live here,
     /// not behind engine forwards; a group-scoped one asks
     /// [`Engine::check_group_live`] first, so only the engine decides
     /// whether a group is live (mdk#2602).
-    storage: SqliteAccountStorage,
+    pub(super) storage: SqliteAccountStorage,
+    pub(super) recovery_peeler: Arc<dyn TransportPeeler>,
     /// The audit log's one recorder. The engine holds a clone from build, and
     /// the runtime and the app take their own from [`Self::audit_recorder`].
     audit: SharedRecorder,
@@ -496,6 +497,7 @@ impl AccountDeviceSession {
             .map_or_else(SharedRecorder::disabled, SharedRecorder::new);
         builder = builder.recorder(Box::new(audit.clone()));
         let mut engine = builder.build()?;
+        let recovery_peeler = engine.transport_peeler();
         if config.protocol_profile == ProtocolProfile::Current {
             let retirement = engine.retire_non_current_key_packages()?;
             tracing::info!(
@@ -550,6 +552,7 @@ impl AccountDeviceSession {
         Ok(Self {
             engine,
             storage: maintenance_storage,
+            recovery_peeler,
             audit,
             open_timings,
         })
@@ -1626,10 +1629,19 @@ impl AccountDeviceSession {
             }
         }
         for auto in self.engine.drain_auto_publish() {
-            effects.publish.push(PublishWork::AutoPublish {
-                msg: auto.msg,
-                pending: auto.pending,
-            });
+            let work = if auto.welcomes.is_empty() {
+                PublishWork::AutoPublish {
+                    msg: auto.msg,
+                    pending: auto.pending,
+                }
+            } else {
+                PublishWork::GroupEvolution {
+                    msg: auto.msg,
+                    pending: auto.pending,
+                    welcomes: auto.welcomes,
+                }
+            };
+            effects.publish.push(work);
         }
         for msg in self.engine.drain_auto_proposals() {
             effects.publish.push(PublishWork::Proposal {
@@ -1657,6 +1669,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
     match intent {
         SendIntent::AppMessage { .. } => "app_message",
         SendIntent::Invite { .. } => "invite",
+        SendIntent::RecoverMembers { .. } => "recover_members",
         SendIntent::RemoveMembers { .. } => "remove_members",
         SendIntent::Leave { .. } => "leave",
         SendIntent::SelfUpdate { .. } => "self_update",

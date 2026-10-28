@@ -430,6 +430,10 @@ fn encode_transport_message(
             out.push(1);
             encode_var_bytes(recipient.as_slice(), out, "welcome recipient")?;
         }
+        TransportEnvelope::GroupRecovery { recipient } => {
+            out.push(2);
+            encode_var_bytes(recipient.as_slice(), out, "group recovery recipient")?;
+        }
     }
     Ok(())
 }
@@ -625,6 +629,9 @@ impl<'a> Decoder<'a> {
             },
             1 => TransportEnvelope::Welcome {
                 recipient: MemberId::new(self.var_bytes("welcome recipient")?),
+            },
+            2 => TransportEnvelope::GroupRecovery {
+                recipient: MemberId::new(self.var_bytes("group recovery recipient")?),
             },
             value => {
                 return Err(invalid(format!(
@@ -839,6 +846,9 @@ mod stored_payload_codec_tests {
             source_epoch_authenticator: "source-authenticator".to_owned(),
         };
         let values = [
+            StoredMessagePayload::RawTransport(transport(TransportEnvelope::GroupRecovery {
+                recipient: MemberId::new(vec![0xef; 32]),
+            })),
             StoredMessagePayload::RawTransport(group_message.clone()),
             StoredMessagePayload::OutboundWelcome(welcome.clone()),
             StoredMessagePayload::StagedInviteWelcome {
@@ -881,6 +891,36 @@ mod stored_payload_codec_tests {
             hex::encode(value.encode().unwrap()),
             "4d444b4d5000020201aa02bbcc00000000000000070001780001dd"
         );
+    }
+
+    #[test]
+    fn v2_recovery_envelope_tags() {
+        for (envelope, expected) in [
+            (
+                TransportEnvelope::Welcome {
+                    recipient: MemberId::new(vec![0xdd]),
+                },
+                "4d444b4d5000020201aa02bbcc00000000000000070001780101dd",
+            ),
+            (
+                TransportEnvelope::GroupRecovery {
+                    recipient: MemberId::new(vec![0xdd]),
+                },
+                "4d444b4d5000020201aa02bbcc00000000000000070001780201dd",
+            ),
+        ] {
+            let value = StoredMessagePayload::OpenMlsWire(TransportMessage {
+                id: MessageId::new([0xaa]),
+                payload: vec![0xbb, 0xcc],
+                timestamp: Timestamp(7),
+                causal_deps: Vec::new(),
+                source: TransportSource("x".to_owned()),
+                envelope,
+            });
+            let encoded = hex::decode(expected).unwrap();
+            assert_eq!(value.encode().unwrap(), encoded);
+            assert_eq!(StoredMessagePayload::decode(&encoded).unwrap(), value);
+        }
     }
 
     #[test]

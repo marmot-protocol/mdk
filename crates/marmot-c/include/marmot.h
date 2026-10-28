@@ -237,6 +237,14 @@ enum MarmotStatus
    * sync and send again (mdk#2158).
    */
   MARMOT_STATUS_MEDIA_REFERENCE_EPOCH_UNSETTLED = 109,
+  /**
+   * Recovery waits for the source group to settle.
+   */
+  MARMOT_STATUS_GROUP_RECOVERY_UNSETTLED = 110,
+  /**
+   * Restart the authenticated recovery challenge; do not retry the grant.
+   */
+  MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH = 111,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

@@ -7969,7 +7969,8 @@ impl TransportRoutingPolicy for AppTransportRouting {
     ) -> Result<TransportPublishTarget, TransportRoutingError> {
         let state = self.read();
         match &message.envelope {
-            TransportEnvelope::Welcome { recipient } => {
+            TransportEnvelope::Welcome { recipient }
+            | TransportEnvelope::GroupRecovery { recipient } => {
                 let endpoints = state
                     .inbox_routes
                     .get(recipient)

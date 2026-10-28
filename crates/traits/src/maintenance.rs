@@ -163,6 +163,11 @@ pub enum GroupEvolutionSemantic {
     },
     Invite,
     RemoveMembers,
+    /// Exact source-bound grants replaced together by one remove-and-add commit.
+    RecoverMembers {
+        request_ids: Vec<[u8; 32]>,
+        source_authenticator_hash: [u8; 32],
+    },
     UpdateAppComponents,
     LegacyRecovery,
 }

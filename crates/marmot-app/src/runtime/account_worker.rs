@@ -7922,6 +7922,8 @@ mod tests {
     use std::sync::Arc;
 
     #[cfg(feature = "test-policy-overrides")]
+    mod automatic_group_recovery_tests;
+    #[cfg(feature = "test-policy-overrides")]
     mod integrated_recovery_acceptance_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod local_submission_queue_tests;

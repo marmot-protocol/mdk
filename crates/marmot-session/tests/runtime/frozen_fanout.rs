@@ -2204,3 +2204,485 @@ async fn secondary_retry_yield_preserves_exact_fanout_and_required_quorum() {
         );
     }
 }
+
+fn recovery_inbox_delivery(account_id: MemberId, message: TransportMessage) -> TransportDelivery {
+    TransportDelivery {
+        account_id,
+        group_id_hint: None,
+        message,
+        received_at: Timestamp(0),
+        source: TransportDeliverySource {
+            transport: TransportSource("recovery-test".into()),
+            plane: TransportDeliveryPlane::AccountInbox,
+            endpoint: None,
+            subscription_id: None,
+            wire: None,
+        },
+    }
+}
+
+#[tokio::test]
+async fn recovery_live_cancel_resume() {
+    assert_recovery_cancel(RecoveryCancelPoint::Commit).await;
+}
+
+#[tokio::test]
+async fn recovery_welcome_cancel() {
+    assert_recovery_cancel(RecoveryCancelPoint::Welcome).await;
+}
+
+#[tokio::test]
+async fn recovery_lost_welcome() {
+    let mut peers = recovery_peers().await;
+    let old_leaf = peers.recipient.own_leaf_index(&peers.group).unwrap();
+    exchange_recovery(&mut peers).await;
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let bob_id = peers.recipient.self_id();
+    let current = peers
+        .coordinator
+        .canonical_group_membership(&peers.group)
+        .unwrap();
+    let moved_leaf = current
+        .member_leaves
+        .iter()
+        .find(|leaf| leaf.member == bob_id)
+        .unwrap()
+        .leaf_index;
+    assert_ne!(moved_leaf, old_leaf);
+    // The acknowledged Welcome is lost before the offline device sees it.
+    let lost = peers
+        .adapter
+        .publishes()
+        .into_iter()
+        .find(|attempt| matches!(attempt.message.envelope, TransportEnvelope::Welcome { .. }))
+        .unwrap()
+        .message;
+    peers.wall.set(peers.wall.now().0 + 1_200);
+    exchange_recovery(&mut peers).await;
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let replacement = peers
+        .adapter
+        .publishes()
+        .into_iter()
+        .rfind(|attempt| matches!(attempt.message.envelope, TransportEnvelope::Welcome { .. }))
+        .unwrap()
+        .message;
+    assert_ne!(replacement.id, lost.id);
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id, replacement))
+        .await
+        .unwrap();
+    assert!(
+        !peers
+            .recipient
+            .group_record(&peers.group)
+            .unwrap()
+            .unrecoverable
+    );
+    assert_eq!(
+        peers.recipient.session().epoch(&peers.group).unwrap(),
+        peers.coordinator.session().epoch(&peers.group).unwrap()
+    );
+    assert_recovery_chat(
+        &mut peers.coordinator,
+        &peers.adapter,
+        &mut peers.recipient,
+        &peers.group,
+    )
+    .await;
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryCancelPoint {
+    Commit,
+    Welcome,
+}
+
+#[tokio::test]
+async fn recovery_heal_race() {
+    let mut peers = recovery_peers().await;
+    exchange_recovery(&mut peers).await;
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let first = peers
+        .adapter
+        .publishes()
+        .into_iter()
+        .find(|attempt| matches!(attempt.message.envelope, TransportEnvelope::Welcome { .. }))
+        .unwrap()
+        .message;
+    peers.wall.set(peers.wall.now().0 + 1_200);
+    exchange_recovery(&mut peers).await;
+    let bob = peers.recipient.self_id();
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob.clone(), first))
+        .await
+        .unwrap();
+    assert!(
+        !peers
+            .recipient
+            .group_record(&peers.group)
+            .unwrap()
+            .unrecoverable
+    );
+    // Its second grant was already delivered before the first Welcome healed it.
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let attempts = peers.adapter.publishes();
+    let commit = attempts
+        .iter()
+        .rfind(|attempt| {
+            matches!(
+                attempt.message.envelope,
+                TransportEnvelope::GroupMessage { .. }
+            )
+        })
+        .unwrap()
+        .message
+        .clone();
+    let welcome = attempts
+        .into_iter()
+        .rfind(|attempt| matches!(attempt.message.envelope, TransportEnvelope::Welcome { .. }))
+        .unwrap()
+        .message;
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob, welcome))
+        .await
+        .unwrap();
+    peers.recipient.session_mut().ingest(commit).await.unwrap();
+    if let Some(delay) = peers
+        .recipient
+        .session_mut()
+        .prepare_convergence_cutoff_delay_ms(&peers.group)
+        .unwrap()
+    {
+        tokio::time::sleep(Duration::from_millis(delay.saturating_add(1))).await;
+        peers
+            .recipient
+            .advance_convergence(&peers.group)
+            .await
+            .unwrap();
+    }
+    peers
+        .recipient
+        .retry_rejoins_after_trusted_removal()
+        .await
+        .unwrap();
+    assert!(!peers.recipient.group_record(&peers.group).unwrap().removed);
+    assert_eq!(
+        peers.recipient.session().epoch(&peers.group).unwrap(),
+        peers.coordinator.session().epoch(&peers.group).unwrap()
+    );
+    assert_recovery_chat(
+        &mut peers.coordinator,
+        &peers.adapter,
+        &mut peers.recipient,
+        &peers.group,
+    )
+    .await;
+}
+
+impl RecoveryCancelPoint {
+    fn matches_artifact(self, message: &TransportMessage) -> bool {
+        matches!(
+            (self, &message.envelope),
+            (Self::Commit, TransportEnvelope::GroupMessage { .. })
+                | (Self::Welcome, TransportEnvelope::Welcome { .. })
+        )
+    }
+}
+
+type RecoveryRuntime =
+    AccountDeviceRuntime<RecordingAdapter, StaticTransportRouting, RecordingKeyPackages>;
+
+struct RecoveryPeers {
+    coordinator: RecoveryRuntime,
+    recipient: RecoveryRuntime,
+    adapter: RecordingAdapter,
+    bob_adapter: RecordingAdapter,
+    wall: Arc<TestWallClock>,
+    group: GroupId,
+    before: cgka_traits::EpochId,
+    _dir: tempfile::TempDir,
+}
+
+async fn recovery_peers() -> RecoveryPeers {
+    use cgka_traits::storage::GroupStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
+    let bob_path = dir.path().join("bob.sqlite");
+    let mut bob_device = Device::open(bob_path.clone(), &key, b"cancel-bob").await;
+    let filler = Device::open(dir.path().join("filler.sqlite"), &key, b"cancel-filler").await;
+    let bob_id = bob_device.runtime.self_id();
+    let mut alice = nostr_device_session(dir.path().join("alice.sqlite"), &key, b"cancel-alice");
+    let alice_id = alice.self_id();
+    let (group, welcomes) = create_group(
+        &mut alice,
+        &[&filler.key_package, &bob_device.key_package],
+        "cancel recovery",
+    )
+    .await;
+    let welcome = welcomes
+        .iter()
+        .find(|message| {
+            matches!(&message.envelope,
+        TransportEnvelope::Welcome { recipient } if recipient == &bob_id)
+        })
+        .unwrap();
+    bob_device.ingest(welcome).await;
+    alice.mark_sent_welcome_delivered(&welcome.id).unwrap();
+    // A lower vacant slot makes recovery move the target's current leaf.
+    evolve(
+        &mut alice,
+        SendIntent::RemoveMembers {
+            group_id: group.clone(),
+            members: vec![filler.runtime.self_id()],
+        },
+    )
+    .await;
+    let before = alice.epoch(&group).unwrap();
+    drop(bob_device);
+    let store = storage_sqlite::SqliteAccountStorage::open_encrypted(
+        &bob_path,
+        &SqlCipherKey::new(key.as_secret_str()).unwrap(),
+    )
+    .unwrap();
+    let mut frozen = store.get_group(&group).unwrap();
+    frozen.unrecoverable = true;
+    store.put_group(&frozen).unwrap();
+    drop(store);
+    let bob = nostr_device_session(bob_path, &key, b"cancel-bob");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let wall = Arc::new(TestWallClock::new(now));
+    let group_endpoint = TransportEndpoint("wss://recovery-group.example".into());
+    let inbox = TransportEndpoint("wss://recovery-inbox.example".into());
+    let routing = StaticTransportRouting::new(vec![inbox.clone()])
+        .key_package_endpoints(vec![inbox.clone()])
+        .with_group_route(group.clone(), vec![0x5a; 32], vec![group_endpoint.clone()])
+        .with_inbox_route(alice_id.clone(), vec![inbox.clone()])
+        .with_inbox_route(bob_id.clone(), vec![inbox.clone()]);
+    let adapter = RecordingAdapter::default();
+    let bob_adapter = RecordingAdapter::default();
+    let coordinator = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        routing.clone(),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    let recipient = AccountDeviceRuntime::new(
+        bob,
+        bob_adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    RecoveryPeers {
+        _dir: dir,
+        coordinator,
+        recipient,
+        adapter,
+        bob_adapter,
+        wall,
+        group,
+        before,
+    }
+}
+
+async fn exchange_recovery(peers: &mut RecoveryPeers) {
+    let RecoveryPeers {
+        coordinator,
+        recipient,
+        adapter,
+        bob_adapter,
+        ..
+    } = peers;
+    let alice_id = coordinator.self_id();
+    let bob_id = recipient.self_id();
+    assert_eq!(
+        recipient.prepare_group_recovery().unwrap(),
+        vec![alice_id.clone()]
+    );
+    recipient.advance_group_recovery().await.unwrap();
+    let request = bob_adapter.publishes().last().unwrap().message.clone();
+    let received = coordinator
+        .ingest_delivery(&recovery_inbox_delivery(alice_id.clone(), request))
+        .await
+        .unwrap();
+    assert!(
+        matches!(received.outcome, cgka_traits::IngestOutcome::Processed),
+        "current device remains eligible after its old leaf position changes"
+    );
+    coordinator.prepare_group_recovery().unwrap();
+    coordinator.advance_group_recovery().await.unwrap();
+    let challenge = adapter.publishes().last().unwrap().message.clone();
+    recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id.clone(), challenge))
+        .await
+        .unwrap();
+    recipient.prepare_group_recovery().unwrap();
+    recipient.advance_group_recovery().await.unwrap();
+    let grant = bob_adapter.publishes().last().unwrap().message.clone();
+    coordinator
+        .ingest_delivery(&recovery_inbox_delivery(alice_id.clone(), grant))
+        .await
+        .unwrap();
+    coordinator.prepare_group_recovery().unwrap();
+}
+
+async fn assert_recovery_cancel(point: RecoveryCancelPoint) {
+    let mut peers = recovery_peers().await;
+    exchange_recovery(&mut peers).await;
+    let RecoveryPeers {
+        _dir,
+        mut coordinator,
+        mut recipient,
+        adapter,
+        wall,
+        group,
+        before,
+        ..
+    } = peers;
+    let bob_id = recipient.self_id();
+    let now = wall.now().0;
+    let group_endpoint = TransportEndpoint("wss://recovery-group.example".into());
+    let inbox = TransportEndpoint("wss://recovery-inbox.example".into());
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let endpoint = match point {
+        RecoveryCancelPoint::Commit => group_endpoint,
+        RecoveryCancelPoint::Welcome => inbox,
+    };
+    *adapter.inner.endpoint_gate.lock().unwrap() = Some((endpoint, gate));
+    let mut publication = Box::pin(coordinator.advance_group_recovery());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            _ = async {
+                while !adapter.publishes().iter().any(|attempt| point.matches_artifact(&attempt.message)) {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+            result = &mut publication => panic!("publication must remain in flight: {result:?}"),
+        }
+    }).await.unwrap();
+    drop(publication);
+    let original = adapter
+        .publishes()
+        .into_iter()
+        .find(|attempt| {
+            matches!(
+                attempt.message.envelope,
+                TransportEnvelope::GroupMessage { .. }
+            )
+        })
+        .unwrap()
+        .message;
+    let interrupted = adapter
+        .publishes()
+        .into_iter()
+        .find(|attempt| point.matches_artifact(&attempt.message))
+        .unwrap()
+        .message;
+    recipient
+        .session_mut()
+        .ingest(original.clone())
+        .await
+        .unwrap();
+    assert!(recipient.group_record(&group).unwrap().unrecoverable);
+    let fanouts = coordinator.outbound_fanouts().unwrap();
+    match point {
+        RecoveryCancelPoint::Commit => {
+            assert!(
+                fanouts
+                    .iter()
+                    .any(|fanout| matches!(fanout.mls_state(), FanoutMlsState::Pending(_)))
+            );
+            assert!(!adapter.publishes().iter().any(|attempt| matches!(
+                attempt.message.envelope,
+                TransportEnvelope::Welcome { .. }
+            )));
+        }
+        RecoveryCancelPoint::Welcome => {
+            assert!(fanouts.iter().any(|fanout| matches!(
+                fanout.mls_state(),
+                FanoutMlsState::Confirmed
+            )
+                && !fanout.pending_post_confirmation_welcomes().is_empty()));
+        }
+    }
+
+    *adapter.inner.endpoint_gate.lock().unwrap() = None;
+    // Authorization may expire after staging; a possibly exposed Commit still
+    // owns its exact retry and Welcome on this same live runtime.
+    wall.set(now + 1_200);
+    coordinator.prepare_group_recovery().unwrap();
+    let resumed = coordinator.advance_group_recovery().await.unwrap();
+    if matches!(point, RecoveryCancelPoint::Commit) {
+        assert!(matches!(
+            resumed.pending.as_slice(),
+            [PendingResolution::Confirmed { .. }]
+        ));
+    }
+    let attempts = adapter.publishes();
+    let retried = attempts
+        .iter()
+        .filter(|attempt| point.matches_artifact(&attempt.message))
+        .collect::<Vec<_>>();
+    assert_eq!(retried.len(), 2);
+    assert_eq!(retried[1].message, interrupted);
+    let welcome = attempts
+        .iter()
+        .find(|attempt| matches!(attempt.message.envelope, TransportEnvelope::Welcome { .. }))
+        .unwrap()
+        .message
+        .clone();
+    recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id, welcome))
+        .await
+        .unwrap();
+    assert!(!recipient.group_record(&group).unwrap().unrecoverable);
+    assert!(recipient.session().epoch(&group).unwrap() > before);
+    assert_eq!(
+        recipient.session().epoch(&group).unwrap(),
+        coordinator.session().epoch(&group).unwrap()
+    );
+    assert_recovery_chat(&mut coordinator, &adapter, &mut recipient, &group).await;
+}
+
+async fn assert_recovery_chat(
+    coordinator: &mut RecoveryRuntime,
+    adapter: &RecordingAdapter,
+    recipient: &mut RecoveryRuntime,
+    group: &GroupId,
+) {
+    let alice_id = coordinator.self_id();
+    let payload = app_payload_for(
+        &hex::encode(alice_id.as_slice()),
+        b"chat after cancelled recovery",
+    );
+    coordinator
+        .send(SendIntent::AppMessage {
+            group_id: group.clone(),
+            expected_epoch: None,
+            payload: payload.clone(),
+        })
+        .await
+        .unwrap();
+    let message = adapter.publishes().last().unwrap().message.clone();
+    let received = recipient.session_mut().ingest(message).await.unwrap();
+    assert!(received.effects.events.iter().any(|event| matches!(event,
+        GroupEvent::MessageReceived { group_id, sender, payload: actual, .. }
+            if group_id == group && sender == &alice_id && actual == &payload)));
+}

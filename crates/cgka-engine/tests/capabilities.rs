@@ -61,6 +61,25 @@ fn hash_id(bytes: &[u8]) -> MessageId {
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
+    async fn peel_group_recovery(
+        &self,
+        _msg: &cgka_traits::TransportMessage,
+    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,

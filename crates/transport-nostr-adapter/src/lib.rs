@@ -53,7 +53,7 @@ fn inbound_wire_metadata(
         TransportEnvelope::GroupMessage { transport_group_id } => {
             Some(hex::encode(transport_group_id))
         }
-        TransportEnvelope::Welcome { .. } => None,
+        TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => None,
     };
     let is_gift_wrap = event.kind == KIND_NIP59_GIFT_WRAP;
     TransportWireMetadata {
@@ -6684,7 +6684,8 @@ impl AdapterState {
                     })
                     .collect()
             }
-            TransportEnvelope::Welcome { recipient } => {
+            TransportEnvelope::Welcome { recipient }
+            | TransportEnvelope::GroupRecovery { recipient } => {
                 // #698/#752: parse the inbound endpoint once (not per candidate,
                 // not per account) and match against pre-canonicalized inbox
                 // endpoints, mirroring the group arm above.
@@ -6713,8 +6714,8 @@ impl AdapterState {
 /// from the last-seen transport timestamp would therefore permanently skip any
 /// welcome published while this device was offline whose tweak landed before
 /// the cursor. Widen the inbox window by the full tweak range; re-delivered
-/// wraps are deduplicated by seen-event ids downstream, and only welcomes
-/// travel as gift wraps so the re-fetch volume stays small.
+/// wraps are deduplicated by seen-event ids downstream. Private recovery
+/// control shares this account inbox and the same widened replay window.
 pub const NIP59_TIMESTAMP_TWEAK_SECS: u64 = 172_800;
 
 fn inbox_since(since: Option<Timestamp>) -> Option<Timestamp> {

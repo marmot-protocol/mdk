@@ -304,6 +304,8 @@ impl RetainedRelaySubject {
     fn class_for(&self, artifact: &SubjectOutboundArtifact) -> ScenarioTransportClass {
         if artifact.kind == SubjectOutboundKind::Welcome {
             ScenarioTransportClass::Welcome
+        } else if artifact.kind == SubjectOutboundKind::GroupRecovery {
+            ScenarioTransportClass::GroupRecovery
         } else {
             self.semantic_classes
                 .get(&artifact.outbound_id)

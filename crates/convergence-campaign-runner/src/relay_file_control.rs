@@ -25,6 +25,7 @@ const CONTROL_SECRET: &str = "control-secret";
 enum RelayPublicationClassV1 {
     GroupMessage,
     Welcome,
+    GroupRecovery,
     Other,
 }
 
@@ -39,7 +40,21 @@ impl RelayPublicationV1 {
         let class = if event.kind == Kind::MlsGroupMessage {
             RelayPublicationClassV1::GroupMessage
         } else if event.kind == Kind::GiftWrap {
-            RelayPublicationClassV1::Welcome
+            let mut recovery_tags = event.tags.iter().filter(|tag| {
+                tag.as_slice()
+                    .first()
+                    .is_some_and(|name| name == "mdk_group_recovery")
+            });
+            let marker = recovery_tags.next();
+            if marker.is_some_and(|tag| tag.as_slice() == ["mdk_group_recovery", "1"])
+                && recovery_tags.next().is_none()
+            {
+                RelayPublicationClassV1::GroupRecovery
+            } else if marker.is_none() {
+                RelayPublicationClassV1::Welcome
+            } else {
+                RelayPublicationClassV1::Other
+            }
         } else {
             RelayPublicationClassV1::Other
         };
@@ -355,6 +370,13 @@ fn relay_visibility_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_control_not_welcome() {
+        let recovery = publication("opaque", RelayPublicationClassV1::GroupRecovery);
+        assert!(!recovery.is_addressable(false));
+        assert!(!recovery.is_addressable(true));
+    }
 
     fn publication(event_token: &str, class: RelayPublicationClassV1) -> RelayPublicationV1 {
         RelayPublicationV1 {

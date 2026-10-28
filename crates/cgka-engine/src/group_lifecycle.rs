@@ -1237,9 +1237,8 @@ impl<S: StorageProvider> Engine<S> {
                         .iter()
                         .any(|member| &member.id == self.identity.self_id());
                     if self_is_recorded_member && !group.unrecoverable {
-                        // A fork can have advanced beyond the replacement epoch.
-                        // Epoch ordering never grants consent: every distinct fully
-                        // validated Welcome only offers explicit branch replacement.
+                        // A usable fork can be newer than the replacement.
+                        // Epoch ordering never grants replacement authority.
                         let old = MlsGroup::load(
                             provider.storage(),
                             &openmls::group::GroupId::from_slice(group_id.as_slice()),
@@ -1249,13 +1248,24 @@ impl<S: StorageProvider> Engine<S> {
                         if old.pending_commit().is_some() {
                             return Err(rejoin_confirmation_required());
                         }
-                        let token = Sha256::digest(old.epoch_authenticator().as_slice()).to_vec();
-                        if let Some((expected_group, expected_token)) = consent {
-                            if expected_group != &group_id || expected_token != token {
-                                return Err(rejoin_confirmation_required());
+                        // An atomic remove/add can leave this account on the
+                        // roster while its old native copy is inactive. The
+                        // trusted-removal retry owns that reentry, not consent
+                        // to discard a still-usable fork.
+                        let trusted_removal = group.removed && !old.is_active();
+                        if trusted_removal && consent.is_some() {
+                            return Err(rejoin_confirmation_required());
+                        }
+                        if !trusted_removal {
+                            let token =
+                                Sha256::digest(old.epoch_authenticator().as_slice()).to_vec();
+                            if let Some((expected_group, expected_token)) = consent {
+                                if expected_group != &group_id || expected_token != token {
+                                    return Err(rejoin_confirmation_required());
+                                }
+                            } else {
+                                confirmation_token = Some(token);
                             }
-                        } else {
-                            confirmation_token = Some(token);
                         }
                     }
                     if consent.is_some() && (!self_is_recorded_member || group.unrecoverable) {

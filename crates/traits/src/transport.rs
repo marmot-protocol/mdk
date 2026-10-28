@@ -46,6 +46,9 @@ pub enum TransportEnvelope {
     /// Welcome addressed to a specific member. `recipient` is matched against
     /// `CgkaEngine::self_id`.
     Welcome { recipient: MemberId },
+    /// Private recovery control addressed through the ordinary account inbox.
+    /// This routing hint is not proof of the inner sender or authorization.
+    GroupRecovery { recipient: MemberId },
 }
 
 /// Opaque ciphertext + authenticated-data pair ready to be wrapped by a

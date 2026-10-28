@@ -181,7 +181,8 @@ impl AppClient {
         Ok(())
     }
 
-    /// Retry durable invitation work without replacing an already-observed result.
+    /// Retry durable invitation and halted-copy work without replacing an
+    /// already-observed maintenance or convergence result.
     pub(crate) async fn recover_superseded_invites_best_effort(&mut self) {
         if self.recover_superseded_invites().await.is_err() {
             tracing::warn!(
@@ -190,6 +191,62 @@ impl AppClient {
                 "invitation recovery failed; durable work remains pending"
             );
         }
+        if self.advance_auto_recovery().await.is_err() {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "advance_auto_recovery",
+                "automatic group recovery deferred; durable work remains pending"
+            );
+        }
+    }
+
+    /// Run one durable recovery turn under the ordinary account-worker owner.
+    /// The runtime reserves bounded lookup work before any cancellable I/O and
+    /// owns authentication, retry pacing, membership checks and publication.
+    async fn advance_auto_recovery(&mut self) -> Result<(), AppError> {
+        if self.runtime.maintenance_is_paused()
+            || self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+        {
+            return Ok(());
+        }
+        self.app.ensure_storage_open("automatic group recovery")?;
+        let peers = self.runtime.prepare_group_recovery()?;
+        let directory = self.app.directory();
+        for peer in peers {
+            let member = hex::encode(peer.as_slice());
+            // This resolver follows advertised outboxes and applies the same
+            // host-safety policy as ordinary member discovery. A failed lookup
+            // is not success: advance retains and paces the durable job.
+            if directory
+                .resolve_account_relay_list_status_for_account_id(
+                    &member,
+                    self.app.relay_endpoints(),
+                )
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            self.refresh_member_inbox_routes(std::iter::once(member.as_str()))?;
+        }
+        if self.runtime.maintenance_is_paused()
+            || self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+        {
+            return Ok(());
+        }
+        self.app.ensure_storage_open("automatic group recovery")?;
+        let effects = self.runtime.advance_group_recovery().await?;
+        if effects.events.is_empty()
+            && effects.failed_app_messages.is_empty()
+            && effects.published_app_messages.is_empty()
+        {
+            self.remember_published_reports(&effects);
+            return Ok(());
+        }
+        // Reuse native maintenance projection, group-route refresh and buffered
+        // summaries; control envelopes themselves never become chat entries.
+        self.observe_native_membership_effects(&effects).await?;
+        Ok(())
     }
 
     pub(crate) async fn recover_superseded_invites(&mut self) -> Result<(), AppError> {

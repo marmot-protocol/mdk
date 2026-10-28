@@ -835,6 +835,11 @@ impl<S: StorageProvider> Engine<S> {
                 self.ingest_group_message(msg, transport_group_id.clone())
                     .await?
             }
+            TransportEnvelope::GroupRecovery { .. } => {
+                return Err(EngineError::Other(
+                    "group recovery belongs to the account runtime".into(),
+                ));
+            }
         };
 
         let retryable_unpersisted = self
@@ -873,6 +878,9 @@ impl<S: StorageProvider> Engine<S> {
             return self.do_request_disband(group_id);
         }
         if let Some(reason) = self.outbound_queue_reason(&group_id, &intent).await? {
+            if matches!(&intent, SendIntent::RecoverMembers { .. }) {
+                return Err(EngineError::GroupRecoveryUnsettled { group_id });
+            }
             // Retention re-encrypts the payload under the drain-time epoch.
             // A payload pinned to one epoch (an encrypted-media reference,
             // whose key the recipient derives from the delivering message's
@@ -972,7 +980,10 @@ impl<S: StorageProvider> Engine<S> {
         // One record read serves this gate and the two terminal gates below.
         let group = self.stored_group_record(&group_id)?;
         if self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
-            && matches!(intent, SendIntent::Invite { .. })
+            && matches!(
+                intent,
+                SendIntent::Invite { .. } | SendIntent::RecoverMembers { .. }
+            )
         {
             // An Invite needs the record to read its profile; an unknown group
             // fails here with the storage error the direct read used to raise.
@@ -1030,6 +1041,14 @@ impl<S: StorageProvider> Engine<S> {
                     reason: "leave requested",
                 },
             ));
+        }
+        if matches!(intent, SendIntent::RecoverMembers { .. })
+            && !self
+                .epoch_manager
+                .state(&group_id)
+                .is_some_and(|state| state.is_stable())
+        {
+            return Err(EngineError::GroupRecoveryUnsettled { group_id });
         }
         Ok(group_id)
     }
@@ -3690,6 +3709,9 @@ impl<S: StorageProvider> Engine<S> {
         intent: SendIntent,
         reissue_attempts: u32,
     ) -> Result<QueuedOutboundIntent, EngineError> {
+        if matches!(&intent, SendIntent::RecoverMembers { .. }) {
+            return Err(EngineError::GroupRecoveryUnsettled { group_id });
+        }
         let created_at_ms = self.convergence_now_ms();
         let existing_count = self.storage.list_queued_outbound_intents(&group_id)?.len();
         // Refuse before serializing or writing anything. The caller persists
@@ -3989,7 +4011,9 @@ fn record_group_id(msg: &TransportMessage) -> GroupId {
         TransportEnvelope::GroupMessage { transport_group_id } => {
             GroupId::new(transport_group_id.clone())
         }
-        TransportEnvelope::Welcome { .. } => GroupId::new(Vec::new()),
+        TransportEnvelope::Welcome { .. } | TransportEnvelope::GroupRecovery { .. } => {
+            GroupId::new(Vec::new())
+        }
     }
 }
 
@@ -4023,6 +4047,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
     match intent {
         SendIntent::AppMessage { group_id, .. }
         | SendIntent::Invite { group_id, .. }
+        | SendIntent::RecoverMembers { group_id, .. }
         | SendIntent::RemoveMembers { group_id, .. }
         | SendIntent::Leave { group_id }
         | SendIntent::SelfUpdate { group_id }
@@ -4041,6 +4066,7 @@ pub(crate) fn is_admin_group_state_intent(intent: &SendIntent) -> bool {
     matches!(
         intent,
         SendIntent::Invite { .. }
+            | SendIntent::RecoverMembers { .. }
             | SendIntent::RemoveMembers { .. }
             | SendIntent::UpdateAppComponents { .. }
             | SendIntent::UpdateGroupData { .. }
@@ -4162,6 +4188,26 @@ mod deferred_peel_accounting_tests {
         struct OpaquePeeler;
         #[async_trait::async_trait]
         impl TransportPeeler for OpaquePeeler {
+            async fn peel_group_recovery(
+                &self,
+                _msg: &cgka_traits::TransportMessage,
+            ) -> Result<cgka_traits::AuthenticatedGroupRecovery, cgka_traits::PeelerError>
+            {
+                Err(cgka_traits::PeelerError::Malformed(
+                    "pass-through fixture has no authenticated account channel".into(),
+                ))
+            }
+
+            async fn wrap_group_recovery(
+                &self,
+                _message: &cgka_traits::GroupRecoveryMessage,
+                _recipient: &cgka_traits::MemberId,
+            ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+                Err(cgka_traits::PeelerError::Malformed(
+                    "pass-through fixture has no authenticated account channel".into(),
+                ))
+            }
+
             async fn peel_group_message(
                 &self,
                 _: &TransportMessage,
@@ -4205,7 +4251,7 @@ mod deferred_peel_accounting_tests {
         if let SendResult::GroupCreated { pending, .. } = created {
             engine.confirm_published(pending).await.unwrap();
         }
-        engine.peeler = Box::new(OpaquePeeler);
+        engine.peeler = std::sync::Arc::new(OpaquePeeler);
         let mut ids = Vec::new();
         for index in 0..65u8 {
             let id = MessageId::new(vec![255 - index; 32]);

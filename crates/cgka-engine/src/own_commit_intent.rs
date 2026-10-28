@@ -82,6 +82,7 @@ impl<S: StorageProvider> Engine<S> {
                 ))
             }
             SendIntent::AppMessage { .. }
+            | SendIntent::RecoverMembers { .. }
             | SendIntent::Leave { .. }
             | SendIntent::SelfUpdate { .. }
             | SendIntent::EnableDisbanding { .. }

@@ -165,6 +165,9 @@ impl TransportPublishRequest {
             (
                 TransportEnvelope::Welcome {
                     recipient: msg_recipient,
+                }
+                | TransportEnvelope::GroupRecovery {
+                    recipient: msg_recipient,
                 },
                 TransportPublishTarget::Inbox {
                     recipient: target_recipient,
@@ -1203,6 +1206,7 @@ fn envelope_label(envelope: &TransportEnvelope) -> &'static str {
     match envelope {
         TransportEnvelope::GroupMessage { .. } => "group",
         TransportEnvelope::Welcome { .. } => "welcome",
+        TransportEnvelope::GroupRecovery { .. } => "group_recovery",
     }
 }
 
@@ -1544,6 +1548,25 @@ mod tests {
             restored.pending_kind(),
             Some(FanoutPendingKind::GroupEvolution)
         );
+    }
+
+    #[test]
+    fn recovery_inbox_match() {
+        let recipient = MemberId::new(vec![0xE5; 32]);
+        let mut request = fanout_request();
+        request.message.envelope = TransportEnvelope::GroupRecovery {
+            recipient: recipient.clone(),
+        };
+        assert!(request.validate_envelope_matches_target().is_err());
+        request.target = TransportPublishTarget::Inbox {
+            recipient,
+            endpoints: vec![TransportEndpoint("wss://one.example".into())],
+        };
+        assert!(request.validate_envelope_matches_target().is_ok());
+        if let TransportPublishTarget::Inbox { recipient, .. } = &mut request.target {
+            *recipient = MemberId::new(vec![0xE6; 32]);
+        }
+        assert!(request.validate_envelope_matches_target().is_err());
     }
 
     #[test]

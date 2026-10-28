@@ -171,6 +171,10 @@ pub enum MarmotStatus {
     /// The group's epoch is unsettled, so an attachment cannot be sent yet;
     /// sync and send again (mdk#2158).
     MediaReferenceEpochUnsettled = 109,
+    /// Recovery waits for the source group to settle.
+    GroupRecoveryUnsettled = 110,
+    /// Restart the authenticated recovery challenge; do not retry the grant.
+    GroupRecoverySourceMismatch = 111,
 }
 
 thread_local! {
@@ -326,6 +330,10 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
             MarmotStatus::GroupUnrecoverableRepairRequired
         }
         MarmotKitError::AccountWorkerBusy => MarmotStatus::AccountWorkerBusy,
+        MarmotKitError::GroupRecoveryUnsettled { .. } => MarmotStatus::GroupRecoveryUnsettled,
+        MarmotKitError::GroupRecoverySourceMismatch { .. } => {
+            MarmotStatus::GroupRecoverySourceMismatch
+        }
         MarmotKitError::AccountWorkerResponseTimedOut => {
             MarmotStatus::AccountWorkerResponseTimedOut
         }
@@ -562,6 +570,12 @@ mod tests {
             MarmotKitError::GroupUnrecoverableRepairRequired {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::GroupRecoveryUnsettled {
+                group_id_hex: "aa".into(),
+            },
+            MarmotKitError::GroupRecoverySourceMismatch {
+                group_id_hex: "aa".into(),
+            },
             MarmotKitError::Runtime {
                 details: "d".into(),
             },
@@ -570,7 +584,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            100,
+            102,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);

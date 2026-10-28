@@ -319,6 +319,21 @@ struct ClaimlessPeeler(transport_nostr_peeler::NostrMlsPeeler);
 
 #[async_trait]
 impl TransportPeeler for ClaimlessPeeler {
+    async fn peel_group_recovery(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, PeelerError> {
+        self.0.peel_group_recovery(msg).await
+    }
+
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.wrap_group_recovery(message, recipient).await
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,

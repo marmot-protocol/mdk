@@ -352,6 +352,7 @@ impl TransportBus {
                         broadcast_welcomes || recipient == ident
                     }
                     TransportEnvelope::GroupMessage { .. } => true,
+                    TransportEnvelope::GroupRecovery { recipient } => recipient == ident,
                 };
                 if deliver {
                     inner.mailboxes.get_mut(cid).unwrap().push(msg.clone());
@@ -593,6 +594,9 @@ fn transport_class_matches(
 ) -> bool {
     match class {
         ScenarioTransportClass::Welcome => matches!(envelope, TransportEnvelope::Welcome { .. }),
+        ScenarioTransportClass::GroupRecovery => {
+            matches!(envelope, TransportEnvelope::GroupRecovery { .. })
+        }
         ScenarioTransportClass::GroupMessage => {
             matches!(envelope, TransportEnvelope::GroupMessage { .. })
         }
@@ -619,6 +623,7 @@ fn targets_client(
     }
     match &in_flight.msg.envelope {
         TransportEnvelope::GroupMessage { .. } => true,
+        TransportEnvelope::GroupRecovery { recipient } => recipient == identity,
         TransportEnvelope::Welcome { recipient } => {
             matches!(
                 policy,
@@ -673,6 +678,28 @@ fn take_batch(queue: &mut Vec<InFlight>, policy: &DeliveryPolicy, n: usize) -> V
 mod tests {
     use super::*;
     use cgka_traits::transport::{Timestamp, TransportSource};
+
+    #[test]
+    fn recovery_is_private() {
+        let bus = TransportBus::ordered();
+        let sender = bus.attach(MemberId::new(vec![1; 32]));
+        let recipient = MemberId::new(vec![2; 32]);
+        let addressed = bus.attach(recipient.clone());
+        let unrelated = bus.attach(MemberId::new(vec![3; 32]));
+        let message = TransportMessage {
+            id: MessageId::new(vec![4; 32]),
+            payload: vec![5],
+            timestamp: Timestamp(1),
+            causal_deps: Vec::new(),
+            source: TransportSource("test".into()),
+            envelope: TransportEnvelope::GroupRecovery { recipient },
+        };
+        bus.send(sender, message.clone());
+        bus.deliver_all();
+        assert_eq!(bus.mailbox(addressed), vec![message]);
+        assert!(bus.mailbox(unrelated).is_empty());
+        assert!(bus.mailbox(sender).is_empty());
+    }
 
     #[test]
     fn forensic_outbound_capture_is_bounded_at_emission_time() {

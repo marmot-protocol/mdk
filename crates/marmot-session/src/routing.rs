@@ -100,7 +100,8 @@ impl TransportRoutingPolicy for StaticTransportRouting {
         message: &TransportMessage,
     ) -> Result<TransportPublishTarget, TransportRoutingError> {
         match &message.envelope {
-            TransportEnvelope::Welcome { recipient } => {
+            TransportEnvelope::Welcome { recipient }
+            | TransportEnvelope::GroupRecovery { recipient } => {
                 let endpoints = self
                     .inbox_routes
                     .get(recipient)

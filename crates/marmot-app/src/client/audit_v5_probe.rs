@@ -134,6 +134,21 @@ impl TransportPeeler for ProbePeeler {
         result.map(|(peeled, _)| peeled)
     }
 
+    async fn peel_group_recovery(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, PeelerError> {
+        self.inner.peel_group_recovery(msg).await
+    }
+
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.wrap_group_recovery(message, recipient).await
+    }
+
     async fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,

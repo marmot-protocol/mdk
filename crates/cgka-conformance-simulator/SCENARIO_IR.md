@@ -1,5 +1,10 @@
 # Scenario IR and authoring semantics
 
+Transport fault selectors classify authenticated recovery control as
+`group_recovery`, distinct from both `welcome` and `group_message`. The packet
+bus delivers recovery only to its named account, even when the test policy
+broadcasts Welcomes. Recovery control is not MLS projection input.
+
 The simulator has two deliberately separate inputs:
 
 - `ScenarioSpec` v2 and v3 are canonical adapter-neutral JSON IRs. Both contain only a linear sequence of executable

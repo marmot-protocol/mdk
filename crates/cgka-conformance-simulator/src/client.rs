@@ -596,6 +596,19 @@ mod tests {
         struct OpaquePeeler(NostrMlsPeeler);
         #[async_trait::async_trait]
         impl TransportPeeler for OpaquePeeler {
+            async fn peel_group_recovery(
+                &self,
+                msg: &TransportMessage,
+            ) -> Result<cgka_traits::AuthenticatedGroupRecovery, PeelerError> {
+                self.0.peel_group_recovery(msg).await
+            }
+            async fn wrap_group_recovery(
+                &self,
+                message: &cgka_traits::GroupRecoveryMessage,
+                recipient: &MemberId,
+            ) -> Result<TransportMessage, PeelerError> {
+                self.0.wrap_group_recovery(message, recipient).await
+            }
             async fn peel_group_message(
                 &self,
                 _: &TransportMessage,
@@ -1469,6 +1482,19 @@ struct WelcomeWrapRefusalPeeler {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl TransportPeeler for WelcomeWrapRefusalPeeler {
+    async fn peel_group_recovery(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<cgka_traits::AuthenticatedGroupRecovery, PeelerError> {
+        self.inner.peel_group_recovery(msg).await
+    }
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.wrap_group_recovery(message, recipient).await
+    }
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -3039,8 +3065,17 @@ impl HarnessClient {
             };
             self.publish_commit_scenario_input(&routed, auto.pending)
                 .await;
-            self.remember_pending_publication(auto.pending, std::iter::once(routed.id.clone()));
+            self.remember_pending_publication(
+                auto.pending,
+                auto.welcomes
+                    .iter()
+                    .map(|welcome| welcome.id.clone())
+                    .chain(std::iter::once(routed.id.clone())),
+            );
             self.remember_pending_confirmation(auto.pending, std::iter::once(routed.id.clone()));
+            for welcome in auto.welcomes {
+                self.bus.send(self.bus_id, welcome);
+            }
             self.bus.send(self.bus_id, routed);
         }
         let proposals = self.engine_mut().drain_auto_proposals();
@@ -3356,6 +3391,9 @@ impl HarnessClient {
                 .ok_or_else(|| "must create or join a group first".to_owned())?,
             TransportEnvelope::Welcome { .. } => {
                 return Err("welcomes do not carry MLS group-message bytes".into());
+            }
+            TransportEnvelope::GroupRecovery { .. } => {
+                return Err("group recovery does not carry MLS group-message bytes".into());
             }
         };
         let ctx = self
