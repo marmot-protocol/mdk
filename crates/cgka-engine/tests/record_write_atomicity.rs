@@ -43,6 +43,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
+#[path = "record_write_atomicity/convergence_pass_retry.rs"]
+mod convergence_pass_retry;
 mod support;
 use support::proof_signer;
 
