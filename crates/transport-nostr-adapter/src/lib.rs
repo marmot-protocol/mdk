@@ -3737,9 +3737,10 @@ struct ReplayOwner {
 struct HistoryReplay {
     phase: ReplayAdmission,
     claims: HashSet<[u8; 32]>,
-    /// Every claim came from this source's owner capture pages. That capture
-    /// re-fetches a window its still-pending recovery obligation owes, so
-    /// discarding its bodies leaves the source unadmitted and charges no loss.
+    /// Every body this stream claims was fetched by this source's unfinished
+    /// owner capture, whatever other copies of it arrived. The capture's window
+    /// is still owed by its pending recovery obligation, so discarding those
+    /// bodies leaves the source unadmitted and charges no loss.
     owner_refetch: bool,
     observed: bool,
     deadline: tokio::time::Instant,
@@ -4583,7 +4584,7 @@ impl AccountReplayCoverage {
                 .get_mut(owner.as_ref().expect("historical owner"))
                 .expect("tracked source");
             stream.observed = true;
-            // A REQ copy is original input, not the owner's re-fetch.
+            // A body only a REQ copy supplied is original input, not the owner's re-fetch.
             stream.owner_refetch = false;
             stream.claims.insert(id)
         } else {
@@ -8005,6 +8006,98 @@ mod batch_tests {
                 .get(&MemberId::new(vec![0xA1; 32])),
             Some(&NostrNotificationLossFloor::Since(100)),
             "a body a finished capture still holds keeps its loss"
+        );
+    }
+
+    /// A body the unfinished capture fetched itself discards without loss even
+    /// when a REQ copy, on this relay or a peer, also supplied it: the capture's
+    /// source stays unadmitted and re-fetches it. When a REQ-only holder drops
+    /// the body last, its loss stands.
+    #[tokio::test(start_paused = true)]
+    async fn captured_body_with_other_copies_stays_owed() {
+        let group = GroupId::new(vec![0; 16]);
+        let (tx, _rx) = mpsc::channel(8);
+        let stage = |coverage: &mut AccountReplayCoverage, id: &str, relay, input| {
+            coverage
+                .stage_delivery(
+                    group_delivery(id, group.clone(), vec![0; 32], 7),
+                    Some(RelayIndex(relay)),
+                    input,
+                    &tx,
+                )
+                .unwrap();
+        };
+        let owed = |coverage: &AccountReplayCoverage, id: &str| {
+            !coverage.endpoint_deadlines[id][&RelayIndex(2)].boundary_admitted
+                && coverage.subscriptions[id][&RelayIndex(2)] == RelayReplay::Incomplete
+        };
+
+        // The relay's own REQ copy of a body its capture already fetched.
+        let (mut coverage, id, losses) = replay_coverage(1);
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        let paging = paging_for(&mut coverage, &id);
+        assert!(coverage.start_route(&paging, &paging.window.per_route()[0]));
+        stage(&mut coverage, &id, 2, ReplayInput::Page);
+        stage(&mut coverage, &id, 2, ReplayInput::History);
+        coverage.stop_capture(&id, RelayIndex(2));
+        assert_eq!(coverage.buffered_items, 0);
+        assert!(losses.pending.lock().unwrap().is_empty());
+        assert!(
+            owed(&coverage, &id),
+            "the capture's source still owes the body"
+        );
+
+        // A peer's REQ copy, dropped first, then the capture is cut.
+        let (mut coverage, id, losses) = replay_coverage(1);
+        stage(&mut coverage, &id, 1, ReplayInput::History);
+        let paging = paging_for(&mut coverage, &id);
+        assert!(coverage.start_route(&paging, &paging.window.per_route()[0]));
+        stage(&mut coverage, &id, 2, ReplayInput::Page);
+        coverage.restart_relay(
+            RelayIndex(1),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+        );
+        assert_eq!(
+            coverage.buffered_items, 1,
+            "the capture still holds the body"
+        );
+        coverage.stop_capture(&id, RelayIndex(2));
+        assert_eq!(coverage.buffered_items, 0);
+        assert!(losses.pending.lock().unwrap().is_empty());
+        assert!(
+            owed(&coverage, &id),
+            "the capture's source still owes the body"
+        );
+        assert_eq!(
+            coverage.subscriptions[&id][&RelayIndex(1)],
+            RelayReplay::Awaiting,
+            "the peer's restarted REQ owes it too"
+        );
+
+        // The capture is cut first; the peer's REQ copy is dropped last.
+        let (mut coverage, id, losses) = replay_coverage(1);
+        stage(&mut coverage, &id, 1, ReplayInput::History);
+        let paging = paging_for(&mut coverage, &id);
+        assert!(coverage.start_route(&paging, &paging.window.per_route()[0]));
+        stage(&mut coverage, &id, 2, ReplayInput::Page);
+        coverage.stop_capture(&id, RelayIndex(2));
+        assert_eq!(coverage.buffered_items, 1, "the peer still holds the body");
+        assert!(losses.pending.lock().unwrap().is_empty());
+        coverage.restart_relay(
+            RelayIndex(1),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+        );
+        assert_eq!(coverage.buffered_items, 0);
+        assert_eq!(
+            losses
+                .pending
+                .lock()
+                .unwrap()
+                .get(&MemberId::new(vec![0xA1; 32])),
+            Some(&NostrNotificationLossFloor::Since(100)),
+            "a REQ-only holder dropping the body last keeps its loss"
         );
     }
 
