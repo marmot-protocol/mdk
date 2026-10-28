@@ -32,6 +32,11 @@ use crate::{MarmotApp, config};
 
 mod legacy_cleanup;
 pub(crate) use legacy_cleanup::cleanup_legacy_audit_logs;
+mod retention;
+pub(crate) use retention::{AuditRetentionWorker, cleanup_expired_audit_logs};
+
+pub(crate) type AuditRecorderSlot =
+    std::sync::Arc<std::sync::Mutex<Option<marmot_forensics::WeakRecorder>>>;
 
 const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
 /// Always-on, append-only per-account key-reveal audit log (mdk#543).
@@ -251,6 +256,20 @@ impl<'a> From<&'a AuditLogFile> for ListedAuditFile<'a> {
 }
 
 impl MarmotApp {
+    pub(crate) fn audit_recorder_slot(&self, label: &str) -> AuditRecorderSlot {
+        let mut recorders = self
+            .audit_recorders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        recorders.retain(|_, slot| {
+            std::sync::Arc::strong_count(slot) > 1
+                || slot.try_lock().map_or(true, |state| {
+                    state.as_ref().is_some_and(|weak| weak.upgrade().is_some())
+                })
+        });
+        recorders.entry(label.to_owned()).or_default().clone()
+    }
+
     pub fn audit_log_settings(&self) -> Result<AuditLogSettings, AppError> {
         Ok(audit_log_settings_from_storage(
             self.shared_storage()?.audit_log_settings()?,

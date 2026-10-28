@@ -56,6 +56,11 @@ pub(crate) async fn send_audit_otlp_once_for_app(
     if !app.audit_log_settings()?.enabled {
         return Ok(AuditOtlpAttemptOutcome::Cancelled);
     }
+    let directory = blocking_app_task({
+        let directory = app.account_dir(&account.label);
+        move || Ok(std::fs::canonicalize(directory)?)
+    })
+    .await?;
     // A scheduled pass may have captured this sender before a host changes
     // configuration. Hold the config lock through reservation so either its
     // attempt is fenced by mutate_all or it never starts under an old sender.
@@ -72,11 +77,13 @@ pub(crate) async fn send_audit_otlp_once_for_app(
         app.audit_export_lifecycle.reserve(
             &account.account_id_hex,
             crate::wiring::audit_destination(sender),
+            &directory,
         )
     } else {
         app.audit_export_lifecycle.reserve(
             &account.account_id_hex,
             crate::wiring::audit_destination(sender),
+            &directory,
         )
     };
     let Some(attempt) = attempt else {
@@ -101,7 +108,17 @@ pub(crate) async fn send_audit_otlp_once_for_app(
                         .join("audit-otlp-delivery-v5");
                     let mut local =
                         LocalAuditDelivery::open(active, state_dir, attempt.destination())?;
-                    Ok(Some(local.prepare_once()?))
+                    let preparation = local.prepare_once()?;
+                    if let Preparation::Batch(batch) = &preparation {
+                        let source =
+                            local
+                                .prepared_source_identity(&batch.token)
+                                .ok_or_else(|| {
+                                    AppError::AuditLogUpload("prepared audit source missing".into())
+                                })?;
+                        app.audit_export_lifecycle.prepared_source(&attempt, source);
+                    }
+                    Ok(Some(preparation))
                 })?
                 .flatten();
             Ok((attempt, preparation))

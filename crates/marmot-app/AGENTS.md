@@ -194,10 +194,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and retries like any other rejection.
   Shutdown cancels pending or in-flight automatic work; unacknowledged files remain on disk.
   Tests may shorten the window per runtime via `test-policy-overrides`; paused-clock tests pin the production default.
-  Retention/deletion of v4 sealed segments is mdk#1014, not this contract.
+  `audit_log/retention.rs` owns the fixed 30-day local forensic retention policy, independently of uploads and consent.
+  Sweep metadata on exclusive-root startup and hourly across accounts and failed-wipe remnants, independent of
+  account workers. Use a size-one candidate queue and per-file storage admission. Retire through local delivery before
+  unlinking; drain directory-local cursor work, cancel only a prepared attempt owning that inode and block new
+  reservations for that directory. Other uploads must remain valid; never globally fence orphan/tombstone cleanup;
+  never rewrite rows or unlink the actual live inode. Serialize the weak registry with writer creation and let the
+  recorder recheck metadata and protect its canonical/actual backing paths under its own lock.
 - Keep the upload checkpoint's cost proportional to the account's *live* audit files, not to its history. `retain_present`
-  prunes entries for files that are gone, so the sidecar is O(live `audit-*.jsonl` files) — but nothing deletes sealed
-  segments (mdk#1014), so that bound grows with cumulative audit volume, and each tracker run stats every file and
+  prunes entries for files that are gone, so the sidecar is O(live `audit-*.jsonl` files). Retention deletes expired
+  segments, and each tracker run stats every file and
   rewrites the whole sidecar. Do not add a per-upload or per-line entry, and do not treat the sidecar as durable state:
   losing it costs one repeat transfer per file and nothing else.
 - A file above `AUDIT_LOG_UPLOAD_MAX_BYTES` has no app-level transfer path. `post_audit_log_file` enforces the same

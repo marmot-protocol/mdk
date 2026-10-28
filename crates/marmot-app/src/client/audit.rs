@@ -527,8 +527,12 @@ impl AppClient {
     /// `enabled`, or a no-op recorder when off. The swap closes any file the
     /// prior recorder held before it returns, so no session reopen is required.
     pub(crate) fn set_audit_recording(&mut self, enabled: bool) {
+        let slot = self.app.audit_recorder_slot(&self.state.label);
+        let mut registration = slot.lock().unwrap_or_else(|p| p.into_inner());
         let recorder = self.app.build_audit_recorder(&self.state.label, enabled);
         self.audit.swap(recorder);
+        *registration = Some(self.audit.downgrade());
+        drop(registration);
         if enabled {
             if self.audit_v5_enabled() && self.audit_v5_probe.is_none() {
                 self.audit_v5_probe = Some(super::audit_v5_probe::WelcomeProbe::live());
