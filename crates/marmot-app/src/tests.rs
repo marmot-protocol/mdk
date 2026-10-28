@@ -1565,7 +1565,9 @@ pub(crate) async fn client_on_app_relay_plane(app: &MarmotApp, label: &str) -> c
 /// signal itself. The pump reports EOSE for every subscription the relay has accepted
 /// and `accept` selects, on every endpoint it was issued to, and keeps doing so
 /// as later subscriptions are registered. Repeat reports are ignored by the
-/// adapter, so this is safe to run for the whole test.
+/// adapter, so this is safe to run for the whole test, but each still takes
+/// the adapter's state lock, which can defer a cursor seal
+/// ([`LiveCursorFixture::stop_eose_pump`]).
 pub(crate) struct ScriptedEosePump(tokio::task::JoinHandle<()>);
 
 impl Drop for ScriptedEosePump {
@@ -13612,6 +13614,17 @@ impl LiveCursorFixture {
             _eose: eose,
             _dir: dir,
         }
+    }
+
+    /// Stop the scripted EOSE pump, which [`Self::open`] leaves running after
+    /// every subscription is past end-of-stored-events. A cursor seal reads
+    /// replay admission without waiting and defers its commit while the
+    /// adapter's state lock is contended, and each of the pump's repeat
+    /// reports takes that lock. A test that asserts what one commit persists
+    /// stops it first; a REQ issued afterwards never reaches EOSE.
+    pub(crate) async fn stop_eose_pump(&mut self) {
+        self._eose.0.abort();
+        let _ = (&mut self._eose.0).await;
     }
 
     pub(crate) fn persisted(&self) -> Option<u64> {

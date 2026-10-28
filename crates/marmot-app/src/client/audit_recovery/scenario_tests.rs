@@ -470,6 +470,9 @@ async fn new_loss_during_a_pass_supersedes_it() {
 fn cursor_rows_record_settled_advances_and_only_large_live_promotions() {
     crate::tests::run_composed_app_runtime_test("recovery-audit-cursor", || async {
         let mut fixture = crate::tests::LiveCursorFixture::open_audited().await;
+        // Each step asserts what one commit persisted, and nothing below
+        // issues a REQ.
+        fixture.stop_eose_pump().await;
         let cursor_before = fixture.cursor_before;
         // A live promotion within the rebuild lookback writes no row.
         let near = fixture
@@ -508,20 +511,21 @@ fn cursor_rows_record_settled_advances_and_only_large_live_promotions() {
             .relay_plane
             .route_account_delivery_for_test(exposed);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            // Live promotion replaced the REQ; its current peers must finish too.
-            while fixture.client.adapter.delivery_loss_blocks_cursor()
-                || !fixture
-                    .client
-                    .adapter
-                    .account_subscription_eose()
-                    .await
-                    .complete()
-            {
+            while fixture.client.adapter.delivery_loss_blocks_cursor() {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the spill is durable and the replacement replay is ready");
+        .expect("the spill is durable");
+        assert!(
+            fixture
+                .client
+                .adapter
+                .account_subscription_eose()
+                .await
+                .complete(),
+            "no REQ was issued after the pump stopped"
+        );
         fixture.client.synchronize_native_replay().await.unwrap();
 
         // A drain checkpoint records its advance with that count.
