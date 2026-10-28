@@ -317,7 +317,8 @@ pub enum MarmotEvent {
         account_label: *mut c_char,
     },
     /// The account's linked devices may have changed; re-read
-    /// `marmot_linked_devices`. Carries no device or group identities, and
+    /// `marmot_linked_devices`. Also fires once each time the account's
+    /// worker opens or reconnects. Carries no device or group identities, and
     /// may fire with no visible change.
     LinkedDevicesChanged {
         account_id_hex: *mut c_char,

@@ -984,7 +984,8 @@ the device group this device trusts, for a Devices screen:
 - The list is empty until this device trusts a device group (a single-device account has none), and in every release
   build until the roster's spec lands.
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
-  device or group identities and may fire with no visible change.
+  device or group identities. It also fires once each time the account's worker opens or reconnects, so it may fire
+  with no visible change.
 
 ## History may be incomplete notices
 

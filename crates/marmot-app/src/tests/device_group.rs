@@ -866,6 +866,8 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
     } = phone_and_laptop().await;
     let phone_slot = stable_slot(&phone_app);
     let laptop_slot = stable_slot(&laptop_app);
+    // An open owes hosts one announcement; reading raises none.
+    assert!(phone.take_linked_devices_changed());
     assert!(phone.linked_devices().unwrap().is_empty());
     assert!(!phone.take_linked_devices_changed());
     laptop
@@ -1045,7 +1047,7 @@ async fn device_groups_off_list_no_devices() {
     .with_test_relay_client(relay);
     let mut phone = phone_app.client("alice").await.unwrap();
     assert!(phone.linked_devices().unwrap().is_empty());
-    phone.linked_devices_changed = true;
+    assert!(phone.linked_devices_changed);
     assert!(!phone.take_linked_devices_changed());
 }
 
@@ -1077,10 +1079,11 @@ async fn the_runtime_announces_a_device_group_join_and_lists_its_devices() {
         every_subscription,
     );
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
+    let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
-    let mut events = runtime.subscribe();
     assert!(runtime.linked_devices("alice").await.unwrap().is_empty());
+    next_linked_devices_changed(&mut events, &account_id_hex).await;
 
     phone.dev_create_device_group(link).await.unwrap();
     // Separate apps share no live relay: route the founding Welcome in.
@@ -1106,23 +1109,7 @@ async fn the_runtime_announces_a_device_group_join_and_lists_its_devices() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match events.recv().await {
-                Ok(MarmotAppEvent::LinkedDevicesChanged {
-                    account_id_hex: changed,
-                    account_label,
-                }) if changed == account_id_hex && account_label == "alice" => break,
-                Ok(MarmotAppEvent::GroupJoined { .. }) => {
-                    panic!("the device group reached the host")
-                }
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("events closed"),
-            }
-        }
-    })
-    .await
-    .expect("LinkedDevicesChanged");
+    next_linked_devices_changed(&mut events, &account_id_hex).await;
 
     let devices = runtime.linked_devices("alice").await.unwrap();
     assert_eq!(
@@ -1174,7 +1161,7 @@ async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_not
 
 /// A restart that settles device-group trust announces it with no command or
 /// delivery after the open: an interrupted creation becomes `created` in the
-/// worker's startup reconcile, and the next seam it reaches says so.
+/// worker's startup reconcile, and the end of startup says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_that_settles_trust_announces_it() {
     let Devices {
@@ -1210,13 +1197,64 @@ async fn a_restart_that_settles_trust_announces_it() {
     let runtime = MarmotAppRuntime::new(phone_app.clone());
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    next_linked_devices_changed(&mut events, &account_id_hex).await;
+    assert_eq!(trust(&phone_app, &group), Some(DeviceGroupTrust::Created));
+    runtime.shutdown().await;
+}
+
+/// A reconnect opens a new client, which announces once with no command or
+/// delivery after it. A reconnect attempt that settles trust and then fails
+/// transport drops its client, flag and all; the client that replaces it
+/// cannot see that change, so every open announces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_announces_again() {
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        mut phone,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    phone.dev_create_device_group(link).await.unwrap();
+    drop(phone);
+    let account_id_hex = phone_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let _eose = scripted_eose_pump(phone_app.relay_plane.clone(), relay, every_subscription);
+    let runtime = MarmotAppRuntime::new(phone_app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    next_linked_devices_changed(&mut events, &account_id_hex).await;
+    assert_eq!(runtime.linked_devices("alice").await.unwrap().len(), 2);
+
+    runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_consumer_exit_for_test();
+    next_linked_devices_changed(&mut events, &account_id_hex).await;
+    assert_eq!(runtime.linked_devices("alice").await.unwrap().len(), 2);
+    runtime.shutdown().await;
+}
+
+/// Waits for the account's next `LinkedDevicesChanged`. The device group's own
+/// events must never reach the host meanwhile.
+async fn next_linked_devices_changed(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    account_id_hex: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             match events.recv().await {
                 Ok(MarmotAppEvent::LinkedDevicesChanged {
                     account_id_hex: changed,
-                    ..
-                }) if changed == account_id_hex => break,
+                    account_label,
+                }) if changed == account_id_hex && account_label == "alice" => break,
+                Ok(MarmotAppEvent::GroupJoined { .. }) => {
+                    panic!("the device group reached the host")
+                }
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("events closed"),
             }
@@ -1224,6 +1262,4 @@ async fn a_restart_that_settles_trust_announces_it() {
     })
     .await
     .expect("LinkedDevicesChanged");
-    assert_eq!(trust(&phone_app, &group), Some(DeviceGroupTrust::Created));
-    runtime.shutdown().await;
 }

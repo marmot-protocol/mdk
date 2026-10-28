@@ -2047,7 +2047,8 @@ impl MarmotApp {
             pending_group_projection_updates: std::collections::HashSet::new(),
             pending_recovery_status_updates: std::collections::HashSet::new(),
             history_notice_baseline: None,
-            linked_devices_changed: false,
+            // A fresh client cannot know what hosts last read.
+            linked_devices_changed: true,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),

@@ -1543,7 +1543,8 @@ pub enum MarmotAppEvent {
     },
     /// The account's linked devices may have changed: re-read
     /// `linked_devices`. The device group's own events never reach hosts, so
-    /// this is their only cue. Carries no device or group identities, and may
+    /// this is their only cue. Also fires once each time the account's worker
+    /// opens or reconnects. Carries no device or group identities, and may
     /// fire with no visible change.
     LinkedDevicesChanged {
         account_id_hex: String,

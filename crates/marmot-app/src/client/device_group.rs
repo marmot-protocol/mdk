@@ -585,7 +585,7 @@ impl AppClient {
     }
 
     /// Whether the linked devices may have changed since the last call. Set
-    /// by every hidden device-group event and every change of trust.
+    /// at open and by every hidden device-group event and change of trust.
     pub(crate) fn take_linked_devices_changed(&mut self) -> bool {
         std::mem::take(&mut self.linked_devices_changed) && self.app.device_groups_enabled()
     }

@@ -406,7 +406,8 @@ the device group this device trusts (mdk#2628): this device first (`is_this_devi
 its KeyPackage slot (`slot_id_hex`, the handle device actions take), label, client and platform, who linked it, its
 `LinkedDeviceStatus` and its settings. It is empty until this device trusts a device group, and in every release build
 until the roster's spec lands. The device group's own events never reach hosts; `MarmotAppEvent::LinkedDevicesChanged`
-says to re-read, and may fire with no visible change.
+says to re-read. It also fires once each time the account's worker opens or reconnects, so it may fire with no visible
+change.
 
 ## History may be incomplete notices
 
