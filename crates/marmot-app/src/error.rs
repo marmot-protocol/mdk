@@ -139,6 +139,10 @@ pub enum AppError {
     /// The creator is already an MLS member and cannot be added again.
     #[error("group members must not include the creator")]
     GroupCreateIncludesCreator,
+    /// An invite named the inviter's own account. A device never adds its own
+    /// account's other devices from published KeyPackages (mdk#2628 D14).
+    #[error("invited members must not include the inviter")]
+    GroupInviteIncludesInviter,
     #[error("unknown local group")]
     UnknownGroup(String),
     /// Invite acceptance requires a current, non-terminal membership projection
@@ -567,6 +571,7 @@ impl AppError {
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
             Self::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
             Self::GroupCreateIncludesCreator => "group_create_includes_creator",
+            Self::GroupInviteIncludesInviter => "group_invite_includes_inviter",
             Self::UnknownGroup(_) => "unknown_group",
             Self::GroupInviteNotPending => "group_invite_not_pending",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",

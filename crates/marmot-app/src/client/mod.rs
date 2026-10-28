@@ -2940,6 +2940,18 @@ impl AppClient {
             key_packages,
             stats,
         } = key_packages?;
+        // A device never adds its own account's other devices from published
+        // KeyPackages (mdk#2628 D14). Refuse the inviter's account, under any
+        // alias, before anything is staged or published. Receivers still
+        // accept an admin's own-account Add; this is a sender rule.
+        let inviter = self.app.account_home().account(&self.state.label)?;
+        for package in &key_packages {
+            let metadata = marmot_session::key_package_metadata(package)
+                .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+            if metadata.credential_identity_hex == inviter.account_id_hex {
+                return Err(AppError::GroupInviteIncludesInviter);
+            }
+        }
 
         let mut initial_admins = Vec::with_capacity(initial_admin_refs.len());
         for admin in initial_admin_refs {

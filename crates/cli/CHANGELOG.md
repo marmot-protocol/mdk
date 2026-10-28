@@ -44,6 +44,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   advertise 0x800d yet, so nothing changes in practice. The simulator's account-devices vectors follow: the activation
   vectors give one founder support only after creation, the removal race runs in a group that requires 0x800d from its
   founding, and `account-devices-founding/v1` covers creation.
+- Inviting now refuses the inviter's own account, under any alias, with `GroupInviteIncludesInviter` before anything
+  is staged or published, as creating a group already did (mdk#2628). An admin never adds its own account's other
+  devices from published KeyPackages. Receivers still accept such an Add from another client.
 - Creating a group or inviting adds every device of each recipient account (mdk#2628, mdk#1696): every valid,
   compatible KeyPackage published in the last 30 days, at most 20, or the single best one when none is that recent.
   `key-package` lookup returns the best of the same selection and no longer prefers a package by its `client` tag.
