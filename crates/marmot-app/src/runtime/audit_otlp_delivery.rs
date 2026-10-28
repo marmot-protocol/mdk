@@ -76,13 +76,13 @@ pub(crate) async fn send_audit_otlp_once_for_app(
         }
         app.audit_export_lifecycle.reserve(
             &account.account_id_hex,
-            sender.destination(),
+            crate::wiring::audit_destination(sender),
             &directory,
         )
     } else {
         app.audit_export_lifecycle.reserve(
             &account.account_id_hex,
-            sender.destination(),
+            crate::wiring::audit_destination(sender),
             &directory,
         )
     };

@@ -57,10 +57,7 @@ const NO_DATA_APP_COMPONENTS: [AppComponentId; 1] = [ACCOUNT_DEVICES_COMPONENT_I
 /// its KeyPackages and leaves. A protocol id outside this list is refused by
 /// [`validate_supported_app_components`]: advertising a component tells other
 /// clients this one enforces its rules, and a group may then require it.
-///
-/// `marmot.group.account-devices.v1` is enforced but not advertised until
-/// MDK ships every rule it needs (mdk#2628, item 2.2).
-const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 12] = [
+const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 13] = [
     APP_COMPONENTS_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
@@ -73,6 +70,7 @@ const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 12] = [
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_LIFECYCLE_COMPONENT_ID,
+    ACCOUNT_DEVICES_COMPONENT_ID,
 ];
 
 /// Refuse to advertise a protocol-owned component this engine does not
@@ -81,12 +79,11 @@ const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 12] = [
 /// stay the host's business.
 pub(crate) fn validate_supported_app_components(
     supported: &AppComponentSet,
-    allow_account_devices: bool,
 ) -> Result<(), EngineError> {
     for component_id in &supported.ids {
-        let advertisable = ADVERTISABLE_PROTOCOL_APP_COMPONENTS.contains(component_id)
-            || (allow_account_devices && *component_id == ACCOUNT_DEVICES_COMPONENT_ID);
-        if PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(component_id) && !advertisable {
+        if PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(component_id)
+            && !ADVERTISABLE_PROTOCOL_APP_COMPONENTS.contains(component_id)
+        {
             return Err(EngineError::Other(format!(
                 "engine cannot advertise protocol app component {component_id:#06x}: \
                  it does not implement it"

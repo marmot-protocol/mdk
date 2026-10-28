@@ -22,9 +22,9 @@ use crate::groups::{
 use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
-    AccountState, AppError, AppMessageProjection, AppPerformanceTelemetry, ClassifiedSyncFailure,
-    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
-    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
+    AccountState, AppError, AppMessageProjection, ClassifiedSyncFailure, SDK_DRAIN_WAIT,
+    SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
+    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, observer::PerformanceRecorder, unix_now_seconds,
 };
 use marmot_forensics::{
     AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillExecutionSeam,
@@ -1673,7 +1673,7 @@ impl AppClient {
 
     pub(crate) async fn prepare_transport_with_telemetry(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) -> Result<(), AppError> {
         self.prepare_transport_for_sync(telemetry)
             .await
@@ -1682,7 +1682,7 @@ impl AppClient {
 
     async fn prepare_transport_for_sync(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) -> Result<(), (SyncFailureStage, AppError)> {
         // Failed/cancelled activation must retain a retry intent for scheduled work.
         self.pending_runtime_group_subscription_refresh = true;
@@ -1761,7 +1761,7 @@ impl AppClient {
 
     pub(crate) async fn sync_with_stage_telemetry(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
         mode: SyncMode,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         match self.sync_inner(telemetry, mode).await {
@@ -1798,7 +1798,7 @@ impl AppClient {
     /// maintenance, only drains: the worker's own job serves its debt.
     async fn sync_inner(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
         mode: SyncMode,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let routing_changed = self.refresh_sync_routes().map_err(|error| {
@@ -1944,7 +1944,7 @@ impl AppClient {
     /// for the worker's next recovery job instead of spending a reservation.
     pub(crate) async fn prepare_sync_grant(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
         explicit: bool,
         credit_available: bool,
     ) -> Result<Option<AttemptGrant>, AppError> {
@@ -1958,7 +1958,7 @@ impl AppClient {
     /// Record a startup or explicit caller's comparison request.
     fn request_sync_comparison(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
         explicit: bool,
     ) -> Result<(), AppError> {
         if self.app.cursor_persistence() == CursorPersistence::Advance
@@ -1975,7 +1975,7 @@ impl AppClient {
     /// Select the grant a sync's job runs, under the credit it holds.
     async fn select_sync_grant(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
         explicit: bool,
     ) -> Result<Option<AttemptGrant>, AppError> {
         let mut caller = ExplicitRecoveryPermit::default();
@@ -1997,7 +1997,7 @@ impl AppClient {
     /// without touching these subscriptions.
     pub(crate) async fn activate_live_transport(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) -> Result<(), ClassifiedSyncFailure> {
         if self.app.cursor_persistence() == CursorPersistence::Frozen {
             self.adapter.require_fresh_activation().await;
@@ -7684,7 +7684,7 @@ mod runtime_group_subscription_refresh_tests {
 
     use super::{SyncCheckpointError, SyncSummary};
     use crate::tests::ScriptedPushRelayClient;
-    use crate::{AppPerformanceTelemetry, MarmotApp};
+    use crate::{MarmotApp, observer::PerformanceRecorder};
     use marmot_account::AccountHome;
 
     /// A send can release a peer's route update without changing membership.
@@ -7912,7 +7912,7 @@ mod runtime_group_subscription_refresh_tests {
                     .with_test_relay_client(relay.clone());
                 let mut client = app.client("alice").await.unwrap();
                 client.prepare_transport().await.unwrap();
-                let telemetry = AppPerformanceTelemetry::default();
+                let telemetry = PerformanceRecorder::default();
                 let group = client
                     .create_group_with_options_and_telemetry(
                         "retry",
@@ -8203,7 +8203,7 @@ mod runtime_group_subscription_refresh_tests {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         client
             .create_group_with_options_and_telemetry(
                 "catch-up retry intent",
@@ -8259,7 +8259,7 @@ mod runtime_group_subscription_refresh_tests {
                 .with_test_relay_client(relay.clone());
             let mut client = app.client("alice").await.unwrap();
             client.prepare_transport().await.unwrap();
-            let telemetry = AppPerformanceTelemetry::default();
+            let telemetry = PerformanceRecorder::default();
             let created = client
                 .create_group_with_options_and_telemetry(
                     "command observation",
@@ -8398,7 +8398,7 @@ mod runtime_group_subscription_refresh_tests {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         // The managed-runtime create, which defers the relay-side subscription
         // install to a later refresh (the worker performs it after replying).
         // The second group is that outstanding install: the drained disband

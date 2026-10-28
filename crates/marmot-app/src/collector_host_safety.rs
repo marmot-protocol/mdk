@@ -17,7 +17,7 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Applies the process network proxy policy to an HTTP client builder.
-pub(crate) type HttpClientBuilder =
+pub type HttpClientBuilder =
     fn(reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder, &'static str>;
 
 /// The process SOCKS5 policy every collector client is built through. `marmot-app` hands in
@@ -26,7 +26,7 @@ pub(crate) type HttpClientBuilder =
 static HTTP_BUILDER: OnceLock<HttpClientBuilder> = OnceLock::new();
 
 /// Hands in the process proxy policy. Only the first call takes effect.
-pub(crate) fn hand_in_http_builder(builder: HttpClientBuilder) {
+pub fn hand_in_http_builder(builder: HttpClientBuilder) {
     let _ = HTTP_BUILDER.set(builder);
 }
 

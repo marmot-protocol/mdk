@@ -23,7 +23,7 @@ const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
 // The whole-file Goggles endpoint accepts the historical v4 contract only.
 // New v5 records use the separately configured, explicit OTLP delivery path.
 const GOGGLES_UPLOAD_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
-pub(crate) const AUDIT_LOG_UPLOAD_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub const AUDIT_LOG_UPLOAD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const AUDIT_LOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) static AUDIT_UPLOAD_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
     let schema = serde_json::from_str(include_str!(
@@ -39,7 +39,7 @@ pub(crate) static AUDIT_UPLOAD_SCHEMA: LazyLock<jsonschema::Validator> = LazyLoc
 /// `From<AuditUploadError> for AppError` restores the variant, message and
 /// `privacy_safe_kind` the upload built before it had its own type.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum AuditUploadError {
+pub enum AuditUploadError {
     #[error("invalid audit log file: {0}")]
     InvalidAuditLogFile(String),
     #[error("audit log upload failed: {0}")]
@@ -50,7 +50,7 @@ pub(crate) enum AuditUploadError {
 
 /// What the endpoint made of one complete snapshot. `marmot-app` adds the
 /// path it opened to report the public upload result.
-pub(crate) struct AuditSnapshotReceipt {
+pub struct AuditSnapshotReceipt {
     pub status: u16,
     pub bytes_sent: u64,
     pub observed_bytes: u64,
@@ -59,7 +59,7 @@ pub(crate) struct AuditSnapshotReceipt {
 }
 
 /// One snapshot's upload, short of a request failure.
-pub(crate) enum AuditSnapshotPost {
+pub enum AuditSnapshotPost {
     Uploaded(AuditSnapshotReceipt),
     Ineligible {
         observed_bytes: u64,
@@ -92,7 +92,7 @@ fn audit_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
     Some(delay.min(Duration::from_secs(5 * 60)))
 }
 
-pub(crate) struct AuditUploadSnapshot {
+pub struct AuditUploadSnapshot {
     pub body: Vec<u8>,
     pub observed_bytes: u64,
     pub modified_at_ms: Option<u64>,
@@ -101,7 +101,7 @@ pub(crate) struct AuditUploadSnapshot {
 
 impl AuditUploadSnapshot {
     /// Capture from a file `marmot-app` has already validated and opened.
-    pub(crate) async fn capture(file: tokio::fs::File) -> Result<Self, AuditUploadError> {
+    pub async fn capture(file: tokio::fs::File) -> Result<Self, AuditUploadError> {
         let metadata = file.metadata().await?;
         let observed_bytes = metadata.len();
         if observed_bytes > AUDIT_LOG_UPLOAD_MAX_BYTES {
@@ -158,7 +158,7 @@ impl AuditUploadSnapshot {
     }
 }
 
-pub(crate) fn invalid_audit_upload() -> AuditUploadError {
+pub fn invalid_audit_upload() -> AuditUploadError {
     // Never expose schema validation errors: they can contain the rejected data.
     AuditUploadError::InvalidAuditLogFile(
         "only valid v4 forensic audit records may be uploaded".into(),
@@ -168,7 +168,7 @@ pub(crate) fn invalid_audit_upload() -> AuditUploadError {
 /// What the tracker already did with one audit file.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AuditUploadOutcome {
+pub enum AuditUploadOutcome {
     /// The endpoint accepted the file's whole content.
     Uploaded,
     /// The tracker will not re-post this file's content: it is over the local
@@ -187,7 +187,7 @@ pub(crate) enum AuditUploadOutcome {
 /// An audit file as the account's listing saw it: the checkpoint's key and the
 /// metadata its entries are compared against.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ListedAuditFile<'a> {
+pub struct ListedAuditFile<'a> {
     pub file_name: &'a str,
     pub size_bytes: u64,
     pub modified_at_ms: Option<u64>,
@@ -219,7 +219,7 @@ pub(crate) struct AuditUploadCheckpointEntry {
 /// a line. That is why it is a plain sidecar rather than a migration in the
 /// account database.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub(crate) struct AuditUploadCheckpoint {
+pub struct AuditUploadCheckpoint {
     #[serde(default)]
     files: std::collections::BTreeMap<String, AuditUploadCheckpointEntry>,
 }
@@ -227,7 +227,7 @@ pub(crate) struct AuditUploadCheckpoint {
 impl AuditUploadCheckpoint {
     /// What the tracker already did with `file`, if its content is unchanged
     /// since then.
-    pub(crate) fn acknowledged<'a>(
+    pub fn acknowledged<'a>(
         &self,
         file: impl Into<ListedAuditFile<'a>>,
     ) -> Option<AuditUploadOutcome> {
@@ -242,7 +242,7 @@ impl AuditUploadCheckpoint {
 
     /// Record an oversized/ineligible-file verdict or an accepted complete snapshot.
     /// Successful uploads are checked against enumeration before checkpointing.
-    pub(crate) fn acknowledge<'a>(
+    pub fn acknowledge<'a>(
         &mut self,
         file: impl Into<ListedAuditFile<'a>>,
         acknowledged_bytes: u64,
@@ -262,10 +262,7 @@ impl AuditUploadCheckpoint {
     /// Drop entries for files that are no longer on disk, so the sidecar stays
     /// bounded by the account's live audit files. Returns whether anything
     /// changed.
-    pub(crate) fn retain_present<'a>(
-        &mut self,
-        present: impl IntoIterator<Item = &'a str>,
-    ) -> bool {
+    pub fn retain_present<'a>(&mut self, present: impl IntoIterator<Item = &'a str>) -> bool {
         let present: std::collections::BTreeSet<&str> = present.into_iter().collect();
         let before = self.files.len();
         self.files.retain(|name, _| present.contains(name.as_str()));
@@ -275,7 +272,7 @@ impl AuditUploadCheckpoint {
 
 /// Milliseconds since the Unix epoch. The listing and the snapshot both use it,
 /// so a checkpoint entry's mtime compares equal to an unchanged file's.
-pub(crate) fn system_time_ms(time: SystemTime) -> Option<u64> {
+pub fn system_time_ms(time: SystemTime) -> Option<u64> {
     time.duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
@@ -288,7 +285,7 @@ pub(crate) fn audit_upload_host_is_retired(host: &str) -> bool {
         .any(|retired| host.eq_ignore_ascii_case(retired))
 }
 
-pub(crate) fn validate_audit_upload_endpoint(
+pub fn validate_audit_upload_endpoint(
     endpoint: &str,
     authorization_bearer_token: Option<&str>,
 ) -> Result<String, AuditUploadError> {
@@ -327,7 +324,7 @@ pub(crate) fn validate_audit_upload_endpoint(
 /// Post one captured snapshot to an endpoint that passed
 /// [`validate_audit_upload_endpoint`]. An empty complete-line prefix is
 /// deferred without an HTTP request.
-pub(crate) async fn post_audit_upload_snapshot(
+pub async fn post_audit_upload_snapshot(
     snapshot: AuditUploadSnapshot,
     endpoint: &str,
     authorization_bearer_token: Option<&str>,

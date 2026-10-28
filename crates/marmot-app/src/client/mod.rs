@@ -57,12 +57,12 @@ use crate::{
     AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupAdminPolicyComponent,
     AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageComponent,
     AppGroupImageInput, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
-    AppGroupRecord, AppInitialGroupImage, AppPerformanceTelemetry, AppPreparedGroupImageUpload,
+    AppGroupRecord, AppInitialGroupImage, AppPreparedGroupImageUpload,
     AppPreparedGroupImageUploadState, AppQuarantinedGroup, AppRoutingState, AppRuntime,
     AppTransportRouting, CanonicalCreatedGroup, GroupInviteDeclineResult, MarmotApp,
     MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
-    SelfMembership, SendSummary, unix_now_seconds,
+    SelfMembership, SendSummary, observer::PerformanceRecorder, unix_now_seconds,
 };
 
 mod audit;
@@ -524,7 +524,7 @@ impl EncryptedMediaDownloadHttp {
     /// reviewed aggregate phase histograms.
     pub(crate) async fn run(
         self,
-        telemetry: Option<AppPerformanceTelemetry>,
+        telemetry: Option<PerformanceRecorder>,
     ) -> Result<MediaDownloadResult, AppError> {
         download_encrypted_media_with_transport(
             self.reference,
@@ -732,8 +732,8 @@ pub struct AppClient {
         Arc<crate::runtime::account_worker::recovery_credits::RecoveryCreditPool>,
     pub(super) comparison_startup_requested: bool,
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
-    pub(crate) runtime_telemetry: Option<AppPerformanceTelemetry>,
-    pub(crate) send_telemetry: Option<AppPerformanceTelemetry>,
+    pub(crate) runtime_telemetry: Option<PerformanceRecorder>,
+    pub(crate) send_telemetry: Option<PerformanceRecorder>,
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
     /// This client's own clone of the engine's connection, for storage-only
@@ -1218,7 +1218,7 @@ fn pinned_media_send_error(
 }
 
 fn record_app_performance(
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     operation: AppPerformanceOperation,
     duration: Duration,
     success: bool,
@@ -1383,7 +1383,7 @@ impl AppClient {
         if !self
             .maintenance_observation_generation
             .as_ref()
-            .is_some_and(crate::DiagnosticsPermit::valid)
+            .is_some_and(crate::observer::permit_valid)
         {
             previous = Default::default();
         }
@@ -1391,21 +1391,21 @@ impl AppClient {
         let product_observation = self
             .app
             .product_analytics
-            .begin(
+            .operation(
                 crate::ProductFamily::Maintenance,
                 "self_update",
                 crate::ProductUnit::Attempt,
             )
-            .map(crate::ProductObservation::counts_only);
+            .map(crate::observer::ProductOperation::counts_only);
         let key_package_observation = self
             .app
             .product_analytics
-            .begin(
+            .operation(
                 crate::ProductFamily::Maintenance,
                 "key_package",
                 crate::ProductUnit::Attempt,
             )
-            .map(crate::ProductObservation::counts_only);
+            .map(crate::observer::ProductOperation::counts_only);
         let sweep = self.app.product_analytics.begin(
             crate::ProductFamily::Maintenance,
             "sweep",
@@ -1490,18 +1490,18 @@ impl AppClient {
         if let Some(observation) = self
             .app
             .product_analytics
-            .begin(
+            .operation(
                 crate::ProductFamily::KeyPackage,
                 "retire",
                 crate::ProductUnit::Transition,
             )
-            .map(crate::ProductObservation::counts_only)
+            .map(crate::observer::ProductOperation::counts_only)
         {
             // Use the sweep's generation, not a grant made while it was awaiting I/O.
             if self
                 .maintenance_observation_generation
                 .as_ref()
-                .is_some_and(crate::DiagnosticsPermit::valid)
+                .is_some_and(crate::observer::permit_valid)
             {
                 observation.count(
                     "success",
@@ -2075,7 +2075,7 @@ impl AppClient {
         name: &str,
         member_refs: &[&str],
         options: AppCreateGroupOptions,
-        telemetry: &AppPerformanceTelemetry,
+        telemetry: &PerformanceRecorder,
     ) -> Result<CanonicalCreatedGroup, AppError> {
         self.create_group_with_options_and_optional_telemetry(
             name,
@@ -2092,7 +2092,7 @@ impl AppClient {
         member_refs: &[&str],
         options: AppCreateGroupOptions,
         upload_id: &str,
-        telemetry: &AppPerformanceTelemetry,
+        telemetry: &PerformanceRecorder,
     ) -> Result<CanonicalCreatedGroup, AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let record = storage
@@ -2170,7 +2170,7 @@ impl AppClient {
         name: &str,
         member_refs: &[&str],
         options: AppCreateGroupOptions,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) -> Result<CanonicalCreatedGroup, AppError> {
         let mut options = options;
         let initial_image = options.initial_image.take();
@@ -2190,7 +2190,7 @@ impl AppClient {
         member_refs: &[&str],
         options: AppCreateGroupOptions,
         initial_image: Option<InitialGroupImageSource>,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) -> Result<CanonicalCreatedGroup, AppError> {
         let AppCreateGroupOptions {
             description,
@@ -2743,7 +2743,7 @@ impl AppClient {
     /// `AccountGroupReadSnapshot`, mdk#1161).
     pub(crate) fn group_read_snapshot_with_stage_telemetry(
         &self,
-        telemetry: &crate::app_telemetry::AppPerformanceTelemetry,
+        telemetry: &crate::observer::PerformanceRecorder,
     ) -> Result<GroupReadSnapshot, AppError> {
         self.group_read_snapshot_inner(Some(telemetry))
     }
@@ -2754,7 +2754,7 @@ impl AppClient {
 
     fn group_read_snapshot_inner(
         &self,
-        telemetry: Option<&crate::app_telemetry::AppPerformanceTelemetry>,
+        telemetry: Option<&crate::observer::PerformanceRecorder>,
     ) -> Result<GroupReadSnapshot, AppError> {
         if cfg!(feature = "test-policy-overrides")
             && self.app.config.dev_force_group_read_snapshot_failure
@@ -2895,7 +2895,7 @@ impl AppClient {
         group_id: &GroupId,
         member_refs: &[&str],
         initial_admin_refs: &[&str],
-        telemetry: &AppPerformanceTelemetry,
+        telemetry: &PerformanceRecorder,
     ) -> Result<SendSummary, AppError> {
         self.invite_members_with_optional_telemetry(
             group_id,
@@ -2911,7 +2911,7 @@ impl AppClient {
         group_id: &GroupId,
         member_refs: &[&str],
         initial_admin_refs: &[&str],
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
         self.ensure_group_change_admitted(group_id)?;
@@ -2943,6 +2943,18 @@ impl AppClient {
             key_packages,
             stats,
         } = key_packages?;
+        // A device never adds its own account's other devices from published
+        // KeyPackages (mdk#2628 D14). Refuse the inviter's account, under any
+        // alias, before anything is staged or published. Receivers still
+        // accept an admin's own-account Add; this is a sender rule.
+        let inviter = self.app.account_home().account(&self.state.label)?;
+        for package in &key_packages {
+            let metadata = marmot_session::key_package_metadata(package)
+                .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+            if metadata.credential_identity_hex == inviter.account_id_hex {
+                return Err(AppError::GroupInviteIncludesInviter);
+            }
+        }
 
         let mut initial_admins = Vec::with_capacity(initial_admin_refs.len());
         for admin in initial_admin_refs {
@@ -7185,12 +7197,12 @@ impl AppClient {
         let observation = self
             .app
             .product_analytics
-            .begin(
+            .operation(
                 crate::ProductFamily::Welcome,
                 "publish",
                 crate::ProductUnit::Transition,
             )
-            .map(crate::ProductObservation::counts_only);
+            .map(crate::observer::ProductOperation::counts_only);
         if storage.take_pending_welcome_delivery(message_id_hex)?
             && let Some(observation) = observation
         {
@@ -7303,7 +7315,7 @@ impl AppClient {
     /// callers still await it so existing tests keep a complete delivery path.
     pub(crate) async fn drive_unpublished_welcome_delivery(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) {
         let Some(work) = self.unpublished_welcome_delivery.take() else {
             return;

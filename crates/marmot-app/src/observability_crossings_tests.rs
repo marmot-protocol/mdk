@@ -73,6 +73,7 @@ const MOVING_SET: &[&str] = &[
     "observer",
     "product_analytics",
     "relay_telemetry_export",
+    "wiring",
 ];
 
 /// Crates the new crate must not depend on (#2627, "The crate's dependencies"): `marmot-app`,

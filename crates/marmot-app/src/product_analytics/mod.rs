@@ -23,9 +23,13 @@ mod builtins;
 mod catalogue;
 pub use builtins::approved_host_product_schemas;
 pub use catalogue::*;
+pub(crate) mod consent;
 #[cfg(feature = "product-analytics-export")]
 mod delivery;
 pub(crate) mod observed;
+pub(crate) mod recording;
+use consent::ReceiptRevisions;
+use recording::StorageFailureKind;
 #[cfg(test)]
 mod tests;
 
@@ -589,15 +593,6 @@ impl ProductAnalytics {
         s.settings = receipt;
         s.diagnostic_id = diagnostic_id;
         s.granted_at = self.clock.monotonic();
-    }
-    /// Take the consent lock for a consent change: restoring the saved receipt, or saving a new
-    /// one. Hold it across the whole change. The state lock is taken inside it, as `configure`
-    /// takes it: consent, then state.
-    pub(crate) fn consent_change(&self) -> ConsentChange<'_> {
-        ConsentChange {
-            collector: self,
-            _consent: self.consent_lock.lock().unwrap_or_else(|e| e.into_inner()),
-        }
     }
     /// Whether a granted receipt saved under `saved` must be accepted again: this process failed
     /// to persist consent, or the receipt's policy, registry or scope revision is not this
@@ -1441,55 +1436,6 @@ impl ProductAnalytics {
     }
 }
 
-/// The revisions a usage-diagnostics receipt is granted under: the consent policy, the product
-/// event registry and the export scope.
-pub(crate) struct ReceiptRevisions {
-    pub policy: String,
-    pub registry: String,
-    pub scope: String,
-}
-
-/// What a new receipt records: this collector's revisions, and when it was made.
-pub(crate) struct ReceiptStamp {
-    pub revisions: ReceiptRevisions,
-    pub updated_at_ms: i64,
-}
-
-/// The consent lock, held across a consent change. Failing closed, reopening after a durable
-/// write and stamping a new receipt are steps of a change, so only this guard offers them.
-pub(crate) struct ConsentChange<'a> {
-    collector: &'a ProductAnalytics,
-    _consent: std::sync::MutexGuard<'a, ()>,
-}
-
-impl ConsentChange<'_> {
-    /// Refuse permits until a durable write and its receipt reload succeed.
-    pub(crate) fn fail_closed(&self) {
-        self.collector.lock().persistence_failed = true;
-    }
-    /// The durable write and its receipt reload succeeded.
-    pub(crate) fn persisted(&self) {
-        self.collector.lock().persistence_failed = false;
-    }
-    /// This collector's revisions and the wall clock, read under one state lock.
-    pub(crate) fn receipt_stamp(&self) -> ReceiptStamp {
-        let s = self.collector.lock();
-        ReceiptStamp {
-            revisions: ReceiptRevisions {
-                policy: USAGE_DIAGNOSTICS_POLICY.into(),
-                registry: s.registry_revision.clone(),
-                scope: s.scope.clone(),
-            },
-            updated_at_ms: self
-                .collector
-                .clock
-                .wall_seconds()
-                .saturating_mul(1000)
-                .min(i64::MAX as u64) as i64,
-        }
-    }
-}
-
 impl std::fmt::Debug for ProductAnalytics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProductAnalytics").finish_non_exhaustive()
@@ -1613,32 +1559,6 @@ impl Drop for ProductObservation {
         }
     }
 }
-/// A storage failure the collector counts, by the class of the error behind it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StorageFailureKind {
-    Busy,
-    Corruption,
-    Capacity,
-}
-impl StorageFailureKind {
-    /// The counted kind of a sync error class; other classes are not storage failures.
-    pub(crate) const fn from_sync_class(class: crate::SyncErrorClass) -> Option<Self> {
-        match class {
-            crate::SyncErrorClass::StorageBusy => Some(Self::Busy),
-            crate::SyncErrorClass::StorageCorruption => Some(Self::Corruption),
-            crate::SyncErrorClass::StorageCapacity => Some(Self::Capacity),
-            _ => None,
-        }
-    }
-    /// The storage operation it is counted under.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Busy => "busy",
-            Self::Corruption => "corruption",
-            Self::Capacity => "capacity",
-        }
-    }
-}
 impl ProductAnalytics {
     /// Called only at a canonical failing command boundary, with its admission generation and
     /// the storage failure its error counts as, if any. `marmot-app` converts its errors
@@ -1685,41 +1605,6 @@ impl ProductAnalytics {
     }
 }
 
-pub(crate) struct ProductBacklogSource {
-    id: u64,
-    collector: ProductAnalytics,
-}
-impl ProductBacklogSource {
-    pub(crate) fn sample(
-        &self,
-        permit: &DiagnosticsPermit,
-        family: ProductFamily,
-        operation: &str,
-        count: u64,
-    ) {
-        self.collector
-            .backlog(permit, self.id, family, operation, count);
-    }
-}
-impl Drop for ProductBacklogSource {
-    fn drop(&mut self) {
-        let mut state = self.collector.lock();
-        for values in state.backlog.values_mut() {
-            values.remove(&self.id);
-        }
-        state.backlog.retain(|_, values| !values.is_empty());
-    }
-}
-impl ProductAnalytics {
-    pub(crate) fn backlog_source(&self) -> ProductBacklogSource {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        ProductBacklogSource {
-            id: NEXT.fetch_add(1, Ordering::Relaxed),
-            collector: self.clone(),
-        }
-    }
-}
-
 #[cfg(all(test, feature = "product-analytics-export"))]
 impl ProductAnalytics {
     pub(crate) fn test_payloads(&self) -> Vec<serde_json::Value> {
@@ -1741,6 +1626,6 @@ impl ProductAnalytics {
 }
 
 #[cfg(all(test, feature = "product-analytics-export"))]
-pub(crate) fn test_product_collector() -> ProductAnalytics {
-    tests::configured().0
+pub(crate) fn test_product_collector() -> crate::observer::ProductRecorder {
+    tests::configured().0.into()
 }

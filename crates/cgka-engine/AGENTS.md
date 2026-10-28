@@ -46,7 +46,7 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `capability_manager.rs` | `feature_status`, `upgradeable_capabilities` (read from every current leaf), own-leaf and added-leaf profile checks |
 | `leaf_advertisement.rs` | What the own leaf advertises: `own_leaf_refresh_extensions` (a self-update re-advertises every supported component, keeping every other leaf byte), `own_leaf_missing_app_components` (stale only when a self-update would change the leaf), per-component leaf-support blockers |
 | `key_package.rs` | `fresh_key_package`, KeyPackage parse-time lifetime / OpenMLS accepted-range checks (refresh scheduling is a higher-layer concern) |
-| `group_lifecycle.rs` | `do_create_group`, `do_join_welcome`, `retry_rejoins_after_trusted_removal` |
+| `group_lifecycle.rs` | `do_create_group` (on the current profile it requires account-devices exactly when its own leaf and every founding KeyPackage advertise it, mdk#2628 item 2.3), `do_join_welcome`, `retry_rejoins_after_trusted_removal` |
 | `message_processor/` | `mod.rs`: entry points (`do_ingest`, `do_send`, convergence/queue drains, `replay_buffered_messages`), shared helpers, re-exports. `ingest.rs`: inbound path, peel/snapshot recovery, `convergence_ingest_outcome`. `send.rs`: `do_send_*` incl. `do_send_invite` / `do_send_leave`, MIP-03 guards. `store.rs`: durable persistence, dedup classification, stored-message transitions, `retire_raw_wrapper`. `application_replay.rs`: bounded background drain of retained canonical applications |
 | `message_disposition.rs` | Closed classification of why a raw inbound message was not applied; shared by both seams and the deferred-peel lifecycle |
 | `epoch_manager.rs` | Only mutator of `EpochState`; `PendingMeta` (group_id + prior_epoch + kind) |
@@ -112,8 +112,10 @@ Load-bearing departures from the original plan; each is also documented at its s
 7. **Two-layer addressing.** `StaleReason::NotForThisClient` is engine-layer identity filtering as well as transport
    defense.
 8. **Advertise only what the engine implements.** `EngineBuilder::build` refuses a protocol-owned component id outside
-   `ADVERTISABLE_PROTOCOL_APP_COMPONENTS`. Account-devices (0x800d) is enforced but stays refused until mdk#2628 item
-   2.2; tests opt in with `allow_account_devices_advertising_for_tests`.
+   `ADVERTISABLE_PROTOCOL_APP_COMPONENTS`. A component joins that list only once the engine enforces every rule of it,
+   because a group may require what its members advertise. Advertising never changes an existing group: upgrades
+   require a component only when asked and never add account-devices (0x800d). Creation requires account-devices,
+   unasked, exactly when the creator's leaf and every founding KeyPackage advertise it (`group_lifecycle.rs`).
 
 ## Publish-before-apply
 

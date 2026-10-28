@@ -1,3 +1,5 @@
+#[cfg(feature = "test-policy-overrides")]
+mod account_devices_advertising;
 mod audit_ownership;
 #[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;
@@ -357,7 +359,7 @@ fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
             crate::client::PreparedGroupImageUploadStart::Complete(_)
         ));
 
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = crate::observer::PerformanceRecorder::default();
         let group_id = client
             .create_group_with_prepared_initial_image_and_telemetry(
                 "prepared image",
@@ -421,7 +423,7 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
             .unwrap()
             .unwrap()
             .component_data;
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = crate::observer::PerformanceRecorder::default();
 
         // Simulate the narrow crash window: MLS creation is canonical, but
         // consumption fails and the best-effort app projection is absent.
@@ -7278,12 +7280,19 @@ async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     );
     assert!(result.profile.is_some());
     assert_eq!(result.readiness, AccountSetupReadiness::LocalReady);
-    assert_eq!(
-        runtime
+    // The background setup task records its publication phase on its own
+    // schedule; it can trail the worker's blocked KeyPackage publish.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime
             .account_setup_readiness(&result.account.account_id_hex)
-            .unwrap(),
-        AccountSetupReadiness::Publishing
-    );
+            .unwrap()
+            != AccountSetupReadiness::Publishing
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background setup must report publication while it is blocked");
     let lifecycle = app
         .account_storage(&result.account.label)
         .unwrap()
@@ -8244,6 +8253,47 @@ async fn key_package_cutover_retains_current_cache_without_scheduling_replacemen
         !app.retire_cached_non_current_key_package(&account.label)
             .await,
         "current cache must not enter the strict cutover replacement path"
+    );
+    assert!(record_path.exists());
+    assert!(!app.key_package_cutover_replacement_pending(&account.label));
+}
+
+/// A published current-profile KeyPackage that predates a newly supported
+/// component is still joinable: the runtime replaces it in its slot and keeps
+/// its key for the grace, so the cutover cleanup must not delete it first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn key_package_cutover_leaves_a_cache_missing_a_new_component_to_slot_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("before-account-devices").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let before_account_devices = app
+        .supported_app_component_ids()
+        .into_iter()
+        .filter(|id| *id != cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID)
+        .collect();
+    let published =
+        fresh_key_package_with_components(&app, &account, false, before_account_devices).await;
+    let metadata = cgka_engine::key_package::key_package_metadata(&published).unwrap();
+    let record_path = app.key_package_record_path(&account.label);
+    write_json(
+        &record_path,
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex,
+            key_package_id: "published-slot".into(),
+            key_package_ref_hex: metadata.key_package_ref_hex,
+            key_package_event_id: "33".repeat(32),
+            published_at: 1,
+            key_package_hex: hex::encode(published.bytes()),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !app.retire_cached_non_current_key_package(&account.label)
+            .await,
+        "a joinable KeyPackage is replaced in its slot, never deleted first"
     );
     assert!(record_path.exists());
     assert!(!app.key_package_cutover_replacement_pending(&account.label));

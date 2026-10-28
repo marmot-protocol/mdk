@@ -101,6 +101,19 @@
 
 ### Changed
 
+- MDK now advertises `marmot.group.account-devices.v1` (0x800d) (mdk#2628).
+  New KeyPackages list it. A device whose published KeyPackage does not
+  replaces it in the same slot at its next maintenance, holding the old one's
+  key for 24 hours as after any refresh. Its leaf in each group it is already
+  in gains the component through the randomized refresh of stale leaves: each
+  group draws its own time within five days, and the refresh is an ordinary
+  self-update that keeps every component the group requires. Under the
+  engine's creation rule, a group founded only by devices that advertise
+  0x800d now requires it, so a device on an older build can't be invited into
+  it. Upgrades never add it to an existing group, and the same-account send
+  intents stay out of the app API. A device that advertises it can join a
+  group that requires it, and a device that does not can still be invited into
+  any group that does not.
 - Creating a group or inviting adds every device of each recipient account
   (mdk#2628, mdk#1696). The directory reads an account's KeyPackages together
   with its KeyPackage deletion requests, then selects every valid, compatible
@@ -259,6 +272,12 @@
 - `marmot_app::product_analytics::configure_product_analytics_from_environment`
   no longer resolves (mdk#2627). Hosts call the same function as
   `marmot_app::configure_product_analytics_from_environment`, as before.
+- `MarmotApp`'s `DirectoryObserver` implementation records directory
+  operations through a `marmot-app` type that wraps `ProductObservation`, so
+  the impl survives the collector's move to its own crate (mdk#2627). Its
+  `Observation` associated type is that wrapper, and `ProductObservation` no
+  longer implements `DirectoryObservation`. Directory operations record
+  exactly as before.
 - Collector clients (relay-telemetry export, product analytics, the audit
   upload and `AuditOtlpSender`) take the process SOCKS5 policy from the first
   `MarmotApp` the process builds (mdk#2627). Before one exists they build no

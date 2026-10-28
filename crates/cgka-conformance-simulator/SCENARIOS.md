@@ -101,15 +101,27 @@ These are the scenarios another implementation should be able to load from JSON 
 - Pressure: same-epoch invite commit race.
 - Expected: one invite branch wins branch selection, the other is parked off the canonical branch, and active clients converge on the same member set with a settled convergence decision recorded.
 
+### `account-devices-founding/v1`
+
+- File: `vectors/account-devices-founding.v1.json`
+- Setup: an explicit topology gives Bob two devices (`bob-phone`, `bob-laptop`) and Alice one, all supporting
+  `marmot.group.account-devices.v1` (0x800d). Alice creates the group with both of Bob's devices; nothing asks for
+  0x800d. Bob's laptop, which is not an admin, then removes his phone (`remove_own_account_devices`).
+- Pressure: the creator's rule that a new group requires 0x800d when every founding leaf supports it, the joiners'
+  acceptance of that state, and a same-account Commit in the first epoch after founding.
+- Expected: Alice and Bob's laptop reach the same exact state at epoch 2 with two leaves, a state that requires 0x800d
+  and satisfies its rules, and nothing is left pending.
+
 ### `account-devices-activation/v1`
 
 - File: `vectors/account-devices-activation.v1.json`
-- Setup: an explicit topology gives Alice two devices (`alice-phone`, `alice-laptop`) and Bob one, all supporting
-  `marmot.group.account-devices.v1` (0x800d). Alice's phone creates the group and then sends the Commit that makes it
-  require 0x800d.
+- Setup: an explicit topology gives Alice two devices (`alice-phone`, `alice-laptop`) and Bob one. Alice's devices
+  support `marmot.group.account-devices.v1` (0x800d) from the start and Bob's only after Alice's phone creates the
+  group, so the group does not require it. Bob gains support and self-updates, and Alice's phone sends the Commit that
+  makes the group require 0x800d.
 - Pressure: the activation Commit through the normal publication, transport and apply path, with two leaves of one
   account in the group.
-- Expected: all three clients reach the same exact state at epoch 2, that state requires 0x800d and satisfies its
+- Expected: all three clients reach the same exact state at epoch 3, that state requires 0x800d and satisfies its
   state rules, and nothing is left pending.
 
 ### `account-devices-activation-needs-support/v1`
@@ -125,11 +137,12 @@ These are the scenarios another implementation should be able to load from JSON 
 ### `account-devices-activation-loses-to-unsupported-invite/v1`
 
 - File: `vectors/account-devices-activation-loses-to-unsupported-invite.v1.json`
-- Setup: Alice and Bob, both admins that support 0x800d, commit from the same epoch: Alice activates 0x800d while Bob
-  invites Carol, who doesn't support it.
+- Setup: Alice and Bob are both admins. Bob gains support for 0x800d after the group is created and self-updates, so
+  the group doesn't require it. From the same epoch, Alice activates 0x800d while Bob invites Carol, who doesn't
+  support it.
 - Pressure: activation racing a branch that adds a leaf that doesn't advertise the component. Both commits are
   privileged, so the authenticated committer bytes decide the race; here Bob's invite wins.
-- Expected: Alice, Bob and Carol reach the same exact state at epoch 2 with three members, a state that doesn't require
+- Expected: Alice, Bob and Carol reach the same exact state at epoch 3 with three members, a state that doesn't require
   0x800d; Alice and Bob record a settled `tip_committer` decision, Alice's losing activation leaves no pending work, and
   a fresh activation attempt is refused while Carol lacks support.
 
@@ -138,7 +151,7 @@ These are the scenarios another implementation should be able to load from JSON 
 - File: `vectors/account-devices-activation-wins-over-unsupported-invite.v1.json`
 - Setup: the same race with the roles swapped: Bob activates 0x800d while Alice invites Carol.
 - Pressure: the same race, with the activation branch winning branch selection.
-- Expected: Alice and Bob reach the same exact state at epoch 2 with two members, a state that requires 0x800d and
+- Expected: Alice and Bob reach the same exact state at epoch 3 with two members, a state that requires 0x800d and
   satisfies its rules, with a settled `tip_committer` decision. Alice's losing invite is not retried and leaves no
   pending work. As in `concurrent-invite-fork-recovery/v1`, Carol's Welcome belongs to the losing branch and Carol is
   not run.
@@ -146,13 +159,13 @@ These are the scenarios another implementation should be able to load from JSON 
 ### `account-devices-own-device-removal-loses-to-admin-remove/v1`
 
 - File: `vectors/account-devices-own-device-removal-loses-to-admin-remove.v1.json`
-- Setup: Alice's phone and laptop and Bob are in a group that requires 0x800d, with Alice an admin. From the same
-  parent, the phone removes Bob, a Commit that needs an admin, while the laptop removes the phone, a same-account
-  Commit (`remove_own_account_devices`).
+- Setup: Alice's phone and laptop and Bob are in a group that requires 0x800d from its founding, with Alice an admin.
+  From the same parent, the phone removes Bob, a Commit that needs an admin, while the laptop removes the phone, a
+  same-account Commit (`remove_own_account_devices`).
 - Pressure: two devices of one account race. Both Commits share a committer, so only their priority classes separate
   them: the Remove of Bob is `privileged` and the same-account Remove is `ordinary`, whoever commits it.
 - Expected: both of Alice's devices select the Remove of Bob with a settled `tip_priority` decision and reach the same
-  exact state at epoch 3 with two leaves, a state that requires 0x800d and satisfies its rules, and no pending work.
+  exact state at epoch 2 with two leaves, a state that requires 0x800d and satisfies its rules, and no pending work.
   Bob is removed and not observed. A rule that gave the same-account Commit the admin class would leave the digest to
   decide.
 

@@ -1530,7 +1530,7 @@ async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh
     ));
     capture.state.lock().unwrap().pending = Some(checkpoint);
     let reader = Reader {
-        telemetry: f.runtime.shared.app_performance_telemetry().clone(),
+        telemetry: f.runtime.shared.observer.performance().clone(),
         authority_ready: None,
         send_ready: None,
         app: f.app.clone(),
@@ -2038,7 +2038,7 @@ fn return_to_latest_reuses_checkpoint_when_background_presentation_is_cancelled(
             assert!(capture.state.lock().unwrap().latest.is_none());
             // Any fallback worker read stays blocked, like relay publication.
             f.mode.store(5, Ordering::SeqCst);
-            let telemetry = f.runtime.shared.app_performance_telemetry().clone();
+            let telemetry = f.runtime.shared.observer.performance().clone();
             let reader = Reader {
                 telemetry: telemetry.clone(),
                 authority_ready: None,
@@ -2411,7 +2411,7 @@ async fn assert_hot_checkpoints_do_not_postpone_refresh(prior_not_ready: bool) {
         epoch.clone(),
         query.clone(),
     ));
-    let telemetry = f.runtime.shared.app_performance_telemetry().clone();
+    let telemetry = f.runtime.shared.observer.performance().clone();
     let not_ready_count = || {
         telemetry
             .snapshot()

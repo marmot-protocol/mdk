@@ -550,12 +550,14 @@ impl RuntimeSharedServices {
     }
 
     fn for_app(app: &MarmotApp) -> Self {
-        app.product_analytics.telemetry_origin(
+        crate::wiring::telemetry_origin(
+            &app.product_analytics,
             app.service_endpoints()
                 .relay_telemetry_otlp_endpoint
                 .as_deref(),
         );
-        app.product_analytics.silence(
+        crate::wiring::silence(
+            &app.product_analytics,
             app.config.usage_diagnostics_silent
                 || app.config.cursor_persistence == crate::CursorPersistence::Frozen,
         );
@@ -620,7 +622,7 @@ impl RuntimeSharedServices {
     }
 
     pub fn app_performance_telemetry(&self) -> AppPerformanceTelemetry {
-        self.observer.performance().clone()
+        AppPerformanceTelemetry::clone(self.observer.performance())
     }
 
     pub fn agent_streams(&self) -> AgentStreamWatchManager {
@@ -733,7 +735,8 @@ impl RuntimeSharedServices {
                 crate::RelayTelemetryExporter::new(&self.relay_plane, config, permit)
             {
                 let shutdown = self.lifecycle.subscribe_shutdown();
-                let app_performance_telemetry = self.observer.performance().clone();
+                let app_performance_telemetry =
+                    AppPerformanceTelemetry::clone(self.observer.performance());
                 let handle = executor
                     .spawn(exporter.run_with_app_performance(shutdown, app_performance_telemetry));
                 *self
@@ -1643,7 +1646,7 @@ impl MarmotAppRuntime {
     /// Record the fixed app-performance sample for the UniFFI
     /// `groupDetails` DTO builder.
     pub fn record_group_details_read(&self, duration: Duration, success: bool) {
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupDetailsRead,
             duration,
             success,
@@ -1653,7 +1656,7 @@ impl MarmotAppRuntime {
     /// Record the fixed app-performance sample for the UniFFI combined
     /// conversation snapshot builder.
     pub fn record_group_conversation_snapshot_read(&self, duration: Duration, success: bool) {
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupConversationSnapshotRead,
             duration,
             success,
@@ -1663,7 +1666,7 @@ impl MarmotAppRuntime {
     /// Record the fixed app-performance sample for the UniFFI single chat-list
     /// row read.
     pub fn record_chat_list_row_read(&self, duration: Duration, success: bool) {
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::ChatListRowRead,
             duration,
             success,
@@ -1673,7 +1676,7 @@ impl MarmotAppRuntime {
     /// Record the fixed app-performance sample for the UniFFI existing
     /// direct-conversation lookup.
     pub fn record_existing_direct_conversation_read(&self, duration: Duration, success: bool) {
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::ExistingDirectConversationRead,
             duration,
             success,
@@ -1714,7 +1717,8 @@ impl MarmotAppRuntime {
             self.shared.lifecycle().ensure_running()?;
             let app = self.accounts.app.clone();
             blocking_app_task(move || app.warm_directory_storage()).await?;
-            self.shared.observer.product().telemetry_origin(
+            crate::wiring::telemetry_origin(
+                self.shared.observer.product(),
                 self.shared
                     .relay_telemetry_runtime_config()
                     .otlp_endpoint
@@ -1740,7 +1744,7 @@ impl MarmotAppRuntime {
             Ok(config)
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::AppStart,
             started_at.elapsed(),
             result.is_ok(),
@@ -1757,7 +1761,7 @@ impl MarmotAppRuntime {
 
     async fn schedule_user_directory_subscription_sync(&self) {
         let directory_sync = self.ensure_directory_sync_worker().await;
-        let telemetry = self.shared.app_performance_telemetry();
+        let telemetry = self.shared.observer.performance().clone();
         let handle = tokio::spawn(async move {
             let started_at = Instant::now();
             let result = directory_sync.request_rebuild_and_wait().await;
@@ -2220,7 +2224,7 @@ impl MarmotAppRuntime {
     ) -> Result<AppGroupRoster, AppError> {
         let started_at = Instant::now();
         let result = self.accounts.group_roster(account_ref, group_id).await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupRosterRead,
             started_at.elapsed(),
             result.is_ok(),
@@ -2999,7 +3003,7 @@ impl MarmotAppRuntime {
         let mut status = self.shared.observer.product().status();
         status.telemetry = if self.shared.observer.product().permit().is_none() {
             crate::DiagnosticsExporterStatus::Disabled
-        } else if self.shared.observer.product().telemetry_rejected() {
+        } else if crate::wiring::telemetry_rejected(self.shared.observer.product()) {
             crate::DiagnosticsExporterStatus::ConfigurationRejected
         } else if !cfg!(feature = "otlp-export") {
             crate::DiagnosticsExporterStatus::UnsupportedBuild
@@ -3008,12 +3012,12 @@ impl MarmotAppRuntime {
             .app
             .relay_telemetry_settings()
             .is_ok_and(|settings| {
-                settings
-                    .export_config_with_runtime_and_endpoints(
+                transport_nostr::RelayExportGate::export_allowed(
+                    &settings.export_config_with_runtime_and_endpoints(
                         self.shared.relay_telemetry_runtime_config(),
                         self.shared.service_endpoints(),
-                    )
-                    .export_allowed()
+                    ),
+                )
             })
         {
             crate::DiagnosticsExporterStatus::Ready
@@ -3037,15 +3041,10 @@ impl MarmotAppRuntime {
             let Some(executor) = self.shared.diagnostics_executor() else {
                 return;
             };
-            *worker = Some(
-                executor.spawn(
-                    self.shared
-                        .observer
-                        .product()
-                        .clone()
-                        .run(self.shared.relay_plane().clone()),
-                ),
-            );
+            *worker = Some(executor.spawn(crate::wiring::delivery_worker(
+                self.shared.observer.product(),
+                self.shared.relay_plane().clone(),
+            )));
         }
     }
 
@@ -3090,7 +3089,7 @@ impl MarmotAppRuntime {
             .and_then(|v| url::Url::parse(v).ok())
             .map(|v| v.origin().ascii_serialization())
             .unwrap_or_default();
-        self.shared.observer.product().configure(config, origin)?;
+        crate::wiring::configure(self.shared.observer.product(), config, origin)?;
         if self.shared.lifecycle().is_running() {
             self.accounts.app.restore_usage_diagnostics()?;
         }
@@ -3165,7 +3164,7 @@ impl MarmotAppRuntime {
         if self.is_stopping() {
             return;
         }
-        self.shared.observer.product().seal_partial();
+        crate::wiring::seal_partial(self.shared.observer.product());
         self.shared.observer.product().flush().await;
     }
 
@@ -3186,7 +3185,8 @@ impl MarmotAppRuntime {
         outcome: crate::HostPerformanceOutcome,
     ) {
         self.shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .record_host_performance(operation, duration, outcome);
     }
 
@@ -3198,7 +3198,7 @@ impl MarmotAppRuntime {
     /// group, message, relay, URL, pubkey, payload, or key material — the same
     /// posture as the opt-in OTLP export.
     pub fn app_performance_snapshot(&self) -> crate::AppPerformanceSnapshot {
-        self.shared.app_performance_telemetry().snapshot()
+        self.shared.observer.performance().snapshot()
     }
 
     /// Deprecated consent control: use `set_usage_diagnostics_consent` instead.
@@ -3230,12 +3230,12 @@ impl MarmotAppRuntime {
             resource.service_instance_id =
                 self.accounts.app.telemetry_install_id().unwrap_or_default();
         }
-        let config = config
-            .normalize()
+        let config = crate::wiring::normalize_runtime_config(config)
             .map_err(AppError::InvalidRelayTelemetrySettings)?;
         self.shared
             .set_relay_telemetry_runtime_config(config.clone());
-        self.shared.observer.product().telemetry_origin(
+        crate::wiring::telemetry_origin(
+            self.shared.observer.product(),
             config.otlp_endpoint.as_deref().or(self
                 .shared
                 .service_endpoints
@@ -3245,7 +3245,7 @@ impl MarmotAppRuntime {
         if self.shared.lifecycle().is_running() {
             self.accounts.app.restore_usage_diagnostics()?;
         }
-        self.shared.observer.product().clear_telemetry_rejection();
+        crate::wiring::clear_telemetry_rejection(self.shared.observer.product());
         self.refresh_diagnostics_exporters()?;
         Ok(self.shared.relay_telemetry_runtime_config())
     }
@@ -5628,7 +5628,7 @@ impl MarmotAppRuntime {
         let identity_result = self
             .accounts
             .create_nostr_account_from_setup(&effective_request);
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::AccountSetupIdentityLocal,
             identity_started.elapsed(),
             identity_result.is_ok(),
@@ -5648,7 +5648,7 @@ impl MarmotAppRuntime {
         }
         let storage_started = Instant::now();
         let storage_result = self.accounts.app.account_storage(&account.label);
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::AccountSetupStorageLocal,
             storage_started.elapsed(),
             storage_result.is_ok(),
@@ -5685,7 +5685,7 @@ impl MarmotAppRuntime {
             }
             Ok::<_, AppError>(profile)
         })();
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::AccountSetupProfileLocal,
             profile_started.elapsed(),
             profile_result.is_ok(),
@@ -5736,7 +5736,7 @@ impl MarmotAppRuntime {
             }
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::AccountSetupKeyPackageLocal,
             key_package_started.elapsed(),
             key_package_result.is_ok(),
@@ -5764,7 +5764,7 @@ impl MarmotAppRuntime {
                     .reconcile_for_account(&account.account_id_hex)
                     .await
             };
-            self.shared.app_performance_telemetry().record(
+            self.shared.observer.performance().record(
                 AppPerformanceOperation::AccountSetupLocalReadyHandoff,
                 handoff_started_at.elapsed(),
                 handoff_result.is_ok(),
@@ -5804,7 +5804,7 @@ impl MarmotAppRuntime {
         let result = self
             .create_or_import_account_network_ready(context.request())
             .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::AccountSetupNetworkReady,
             started_at.elapsed(),
             result.is_ok(),
@@ -5840,7 +5840,7 @@ impl MarmotAppRuntime {
                 let result = manager
                     .create_or_import_account_network_ready(context.request())
                     .await;
-                manager.shared.app_performance_telemetry().record(
+                manager.shared.observer.performance().record(
                     AppPerformanceOperation::AccountSetupNetworkReady,
                     started_at.elapsed(),
                     result.is_ok(),
@@ -6039,9 +6039,9 @@ impl MarmotAppRuntime {
             crate::ProductUnit::Attempt,
             Some(started_at.elapsed()),
         );
-        self.shared.observer.product().seal_partial();
+        crate::wiring::seal_partial(self.shared.observer.product());
         self.shared.observer.product().flush().await;
-        self.shared.observer.product().revoke_memory();
+        crate::wiring::revoke_memory(self.shared.observer.product());
         self.restart_product_worker();
         tracing::debug!(
             target: "marmot_app::runtime",
@@ -6133,9 +6133,9 @@ impl MarmotAppRuntime {
             });
         }
 
-        self.shared.observer.product().seal_partial();
+        crate::wiring::seal_partial(self.shared.observer.product());
         self.shared.observer.product().flush().await;
-        self.shared.observer.product().revoke_memory();
+        crate::wiring::revoke_memory(self.shared.observer.product());
         self.restart_product_worker();
         let graceful_wait = self.shutdown_grace_wait();
         if timeout(graceful_wait, self.shutdown()).await.is_err() {
@@ -6520,7 +6520,8 @@ impl AccountManager {
         let (_report_fence, _) = self.fence_moderation_reports(account_ref).await;
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
@@ -6617,7 +6618,8 @@ impl AccountManager {
     ) -> Result<(), AppError> {
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
@@ -6739,7 +6741,8 @@ impl AccountManager {
         let (_report_fence, report_purge) = self.fence_moderation_reports(account_ref).await;
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
@@ -6799,7 +6802,8 @@ impl AccountManager {
     ) -> Result<ManagedAccount, AppError> {
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
@@ -6833,7 +6837,8 @@ impl AccountManager {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
@@ -6855,7 +6860,8 @@ impl AccountManager {
     ) -> Result<(), AppError> {
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
@@ -7009,7 +7015,7 @@ impl AccountManager {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .allows(&account.account_id_hex, tokio::time::Instant::now())
                     {
-                        self.shared.app_performance_telemetry().record_runtime(
+                        self.shared.observer.performance().record_runtime(
                             RuntimeOp::AccountStartupRetrySuppressed,
                             Duration::ZERO,
                             TelemetryOutcome::NotReady,
@@ -7034,7 +7040,7 @@ impl AccountManager {
                     let account_id = account.account_id_hex.clone();
                     let (ready_tx, ready_rx) = oneshot::channel();
                     let startup_progress =
-                        AccountStartupProgress::new(self.shared.app_performance_telemetry());
+                        AccountStartupProgress::new(self.shared.observer.performance().clone());
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
                     let handle = spawn_app_runtime_account_worker(
@@ -7140,13 +7146,11 @@ impl AccountManager {
                         }
                     }
                 }
-                self.shared
-                    .app_performance_telemetry()
-                    .record_classified_result(
-                        AppPerformanceOperation::AccountOpen,
-                        account_open_elapsed,
-                        classification,
-                    );
+                self.shared.observer.performance().record_classified_result(
+                    AppPerformanceOperation::AccountOpen,
+                    account_open_elapsed,
+                    classification,
+                );
                 if let Err(error) = outcome {
                     self.startup_retries
                         .lock()
@@ -7165,7 +7169,7 @@ impl AccountManager {
             Ok(report)
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::AccountReconcile,
             started_at.elapsed(),
             result
@@ -7178,7 +7182,8 @@ impl AccountManager {
     pub async fn restart_account(&self, account_id_hex: &str) -> Result<(), AppError> {
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
@@ -7207,7 +7212,8 @@ impl AccountManager {
     pub async fn catch_up_accounts(&self) -> Result<CatchUpAccountsSummary, AppError> {
         let observation = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::CatchUpRequested);
         let started_at = Instant::now();
         let result = async {
@@ -7223,16 +7229,14 @@ impl AccountManager {
             })
         }
         .await;
-        self.shared
-            .app_performance_telemetry()
-            .record_classified_result(
-                AppPerformanceOperation::AccountCatchUp,
-                started_at.elapsed(),
-                result
-                    .as_ref()
-                    .err()
-                    .map(account_catch_up_metric_classification),
-            );
+        self.shared.observer.performance().record_classified_result(
+            AppPerformanceOperation::AccountCatchUp,
+            started_at.elapsed(),
+            result
+                .as_ref()
+                .err()
+                .map(account_catch_up_metric_classification),
+        );
         observation.finish_app(&result);
         result
     }
@@ -7523,7 +7527,8 @@ impl AccountManager {
         account: AccountSummary,
     ) -> Result<(mpsc::Sender<AccountWorkerCommand>, Arc<Semaphore>), AppError> {
         self.shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .measure_app(RuntimeOp::WorkerAcquire, async {
                 if !account.can_sign() {
                     return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
@@ -7640,7 +7645,7 @@ impl AccountManager {
                 // Advisory: bounded so a stalled indexer cannot hang import or
                 // reactivation, exactly like the external-signer login path.
                 bounded_advisory_step(
-                    &self.shared.app_performance_telemetry(),
+                    self.shared.observer.performance(),
                     ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
                     "import_directory_preflight",
                     self.preflight_existing_account_directory(
@@ -7776,7 +7781,7 @@ impl AccountManager {
             // follow list and profile locally. Only imported/existing accounts
             // need a directory refresh here.
             let _ = bounded_advisory_step(
-                &self.shared.app_performance_telemetry(),
+                self.shared.observer.performance(),
                 ACCOUNT_SETUP_ADVISORY_WAIT,
                 "import_directory_refresh",
                 self.app.directory().refresh_user_directory_for_account_id(
@@ -7918,7 +7923,7 @@ impl AccountManager {
         // Discovery is advisory (its error path already proceeds without it),
         // so a stalled indexer must not hold the whole login hostage.
         let recent_relay_lists = bounded_advisory_step(
-            &self.shared.app_performance_telemetry(),
+            self.shared.observer.performance(),
             ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
             "login_directory_preflight",
             self.preflight_existing_account_directory(
@@ -7988,7 +7993,7 @@ impl AccountManager {
 
         // Single-hop advisory refresh keeps the shorter profile-refresh bound.
         let _ = bounded_advisory_step(
-            &self.shared.app_performance_telemetry(),
+            self.shared.observer.performance(),
             ACCOUNT_SETUP_ADVISORY_WAIT,
             "login_directory_refresh",
             self.app.directory().refresh_user_directory_for_account_id(
@@ -8191,12 +8196,12 @@ impl AccountManager {
             .await
         {
             Ok(publication) => {
-                self.shared.app_performance_telemetry().record(
+                self.shared.observer.performance().record(
                     AppPerformanceOperation::AccountBootstrapRelayAndFollowPublish,
                     publication.relay_and_follow_duration,
                     true,
                 );
-                self.shared.app_performance_telemetry().record(
+                self.shared.observer.performance().record(
                     AppPerformanceOperation::AccountDefaultProfilePublish,
                     publication.default_profile_duration,
                     true,
@@ -8205,12 +8210,12 @@ impl AccountManager {
             }
             Err(error) => {
                 let elapsed = publish_started_at.elapsed();
-                self.shared.app_performance_telemetry().record(
+                self.shared.observer.performance().record(
                     AppPerformanceOperation::AccountBootstrapRelayAndFollowPublish,
                     elapsed,
                     false,
                 );
-                self.shared.app_performance_telemetry().record(
+                self.shared.observer.performance().record(
                     AppPerformanceOperation::AccountDefaultProfilePublish,
                     elapsed,
                     false,
@@ -8272,7 +8277,7 @@ impl AccountManager {
                     status
                 } else {
                     match bounded_advisory_step(
-                        &self.shared.app_performance_telemetry(),
+                        self.shared.observer.performance(),
                         ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
                         "import_relay_list_status",
                         self.app
@@ -8724,7 +8729,8 @@ impl AccountManager {
         }
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);

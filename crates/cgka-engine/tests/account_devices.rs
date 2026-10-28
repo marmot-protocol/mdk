@@ -21,12 +21,6 @@
 //! replay, a crafted standalone proposal is rejected at ingest, and a joiner
 //! refuses a crafted Welcome). Before a group requires 0x800d, its data is
 //! accepted like any unknown component's, and only an admin's Welcome joins.
-//! The builder only lets these tests advertise 0x800d through the test-only
-//! escape hatch, so the file needs one of the test features.
-#![cfg(any(
-    feature = "test-policy-overrides",
-    feature = "test-conformance-snapshot"
-))]
 
 use async_trait::async_trait;
 use cgka_engine::account_identity_proof::account_identity_proof_component;
@@ -84,6 +78,9 @@ use support::proof_signer;
 
 #[path = "account_devices/send_intents.rs"]
 mod send_intents;
+
+#[path = "account_devices/creation.rs"]
+mod creation;
 
 const ACCOUNT_DEVICES: Feature = Feature("account-devices");
 
@@ -224,7 +221,6 @@ fn device(account: &[u8], advertises_account_devices: bool) -> Device {
         .protocol_profile(ProtocolProfile::Current)
         .feature_registry(registry())
         .supported_app_components(supported)
-        .allow_account_devices_advertising_for_tests()
         .peeler(Box::<MockPeeler>::default())
         .build()
         .unwrap();
@@ -252,8 +248,34 @@ fn requires_account_devices(engine: &Engine<SqliteAccountStorage>, gid: &GroupId
     required(engine, gid).contains(ACCOUNT_DEVICES_COMPONENT_ID)
 }
 
-/// `alice` founds a group with `members`, requiring 0x800d when `require` is
-/// set, and each of `joiners` joins from the Welcome at the same index.
+/// `creator` founds a group with `members` through the engine alone: no
+/// required feature or component from the host decides whether it requires
+/// 0x800d. Returns the founding Welcomes, one per KeyPackage in order.
+async fn create(
+    creator: &mut Device,
+    members: Vec<KeyPackage>,
+    initial_admins: Vec<MemberId>,
+) -> Result<(GroupId, Vec<TransportMessage>), EngineError> {
+    let (gid, created) = creator
+        .engine
+        .create_group(CreateGroupRequest {
+            name: "account-devices".into(),
+            description: String::new(),
+            members,
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins,
+        })
+        .await?;
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
+        panic!("current-profile founding group")
+    };
+    Ok((gid, welcomes))
+}
+
+/// `alice` founds a group with `members` and each of `joiners` joins from the
+/// Welcome at the same index. The group requires 0x800d when `require` is set;
+/// see [`found_group_with_admins`].
 async fn found_group(
     alice: &mut Device,
     members: Vec<KeyPackage>,
@@ -264,34 +286,42 @@ async fn found_group(
 }
 
 /// [`found_group`] with `initial_admins` besides `alice`.
+///
+/// Creation requires 0x800d by itself when `alice` and every founder advertise
+/// it (mdk#2628 item 2.3), so `require` needs every founder to. Without
+/// `require`, a device that does not advertise it is founded with the others
+/// and removed right after, which is how a group whose members all advertise
+/// 0x800d comes not to require it.
 async fn found_group_with_admins(
     alice: &mut Device,
-    members: Vec<KeyPackage>,
+    mut members: Vec<KeyPackage>,
     require: bool,
     initial_admins: Vec<MemberId>,
     joiners: &mut [&mut Device],
 ) -> GroupId {
-    let (gid, created) = alice
-        .engine
-        .create_group(CreateGroupRequest {
-            name: "account-devices".into(),
-            description: String::new(),
-            members,
-            required_features: if require {
-                vec![ACCOUNT_DEVICES]
-            } else {
-                vec![]
-            },
-            app_components: vec![],
-            initial_admins,
-        })
-        .await
-        .unwrap();
-    let SendResult::FoundingGroupCreated { welcomes } = created else {
-        panic!("current-profile founding group")
-    };
+    let mut outsider = None;
+    if !require {
+        let mut device = device(b"outsider", false);
+        members.push(device.engine.fresh_key_package().await.unwrap());
+        outsider = Some(device.engine.self_id());
+    }
+    let (gid, welcomes) = create(alice, members, initial_admins).await.unwrap();
     for (joiner, welcome) in joiners.iter_mut().zip(welcomes) {
         joiner.engine.join_welcome(welcome).await.unwrap();
+    }
+    if let Some(outsider) = outsider {
+        let remove = send_commit(
+            alice,
+            SendIntent::RemoveMembers {
+                group_id: gid.clone(),
+                members: vec![outsider],
+            },
+            &gid,
+        )
+        .await;
+        for joiner in joiners.iter_mut() {
+            assert_accepted(joiner, &remove, &gid).await;
+        }
     }
     assert_eq!(requires_account_devices(&alice.engine, &gid), require);
     gid
@@ -854,15 +884,18 @@ fn try_build(supported: Vec<u16>) -> Result<Engine<SqliteAccountStorage>, Engine
 #[test]
 fn builder_refuses_protocol_components_the_engine_does_not_implement() {
     let defaults: Vec<_> = default_group_components().into_iter().collect();
-    for unimplemented in [ACCOUNT_DEVICES_COMPONENT_ID, SAFE_AAD_COMPONENT_ID] {
-        let mut supported = defaults.clone();
-        supported.push(unimplemented);
-        let error = try_build(supported).err().expect("the builder refuses");
-        assert!(
-            error.to_string().contains("does not implement it"),
-            "unexpected error: {error}"
-        );
-    }
+    let mut supported = defaults.clone();
+    supported.push(SAFE_AAD_COMPONENT_ID);
+    let error = try_build(supported).err().expect("the builder refuses");
+    assert!(
+        error.to_string().contains("does not implement it"),
+        "unexpected error: {error}"
+    );
+    // The engine enforces every account-devices rule, so any build may
+    // advertise it (mdk#2628, item 2.2).
+    let mut supported = defaults.clone();
+    supported.push(ACCOUNT_DEVICES_COMPONENT_ID);
+    try_build(supported).expect("account-devices is advertisable");
     // App-owned ids are the host's to advertise.
     let mut supported = defaults;
     supported.push(0xf001);
@@ -929,30 +962,6 @@ async fn account_devices_data_is_unknown_data_before_activation() {
 }
 
 // ── Activation and support ──────────────────────────────────────────────────
-
-#[tokio::test]
-async fn creation_requires_account_devices_only_when_every_founder_advertises_it() {
-    let mut alice = device(b"alice", true);
-    let mut bob = device(b"bob", true);
-    let bob_kp = bob.engine.fresh_key_package().await.unwrap();
-    let gid = found_group(&mut alice, vec![bob_kp], true, &mut [&mut bob]).await;
-    assert!(requires_account_devices(&bob.engine, &gid));
-
-    let mut carol = device(b"carol", false);
-    let carol_kp = carol.engine.fresh_key_package().await.unwrap();
-    let refused = alice
-        .engine
-        .create_group(CreateGroupRequest {
-            name: "unsupported".into(),
-            description: String::new(),
-            members: vec![carol_kp],
-            required_features: vec![ACCOUNT_DEVICES],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await;
-    assert!(refused.is_err(), "a non-advertising founder is refused");
-}
 
 #[tokio::test]
 async fn upgrade_never_requires_account_devices() {
@@ -1165,6 +1174,11 @@ async fn leaf_data_from_an_update_path_is_rejected_once_required() {
 
 // ── Leaf limit ──────────────────────────────────────────────────────────────
 
+/// The resulting-state refusal of an account over the leaf limit.
+fn limit_error() -> String {
+    format!("an account holds more than {MAX_LEAVES_PER_ACCOUNT} leaves")
+}
+
 #[tokio::test]
 async fn an_account_holds_at_most_the_leaf_limit() {
     let mut alice = device(b"alice", true);
@@ -1181,20 +1195,11 @@ async fn an_account_holds_at_most_the_leaf_limit() {
         .chain((0..MAX_LEAVES_PER_ACCOUNT).map(|_| sibling_key_package(&bob_kp, b"bob")))
         .collect();
     let (at_limit, extra_bob) = over_limit.split_at(over_limit.len() - 1);
-    let limit_error = format!("an account holds more than {MAX_LEAVES_PER_ACCOUNT} leaves");
+    let limit_error = limit_error();
 
-    // Founding one leaf over the limit is refused.
-    let refused = alice
-        .engine
-        .create_group(CreateGroupRequest {
-            name: "over the limit".into(),
-            description: String::new(),
-            members: over_limit.clone(),
-            required_features: vec![ACCOUNT_DEVICES],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await;
+    // Founding one leaf over the limit is refused
+    // (`creation::a_founding_add_over_the_leaf_limit_is_refused_before_any_welcome`).
+    let refused = create(&mut alice, over_limit.clone(), vec![]).await;
     assert!(refused.unwrap_err().to_string().contains(&limit_error));
 
     // At the limit the group is valid; one more leaf is not.
@@ -1288,7 +1293,6 @@ async fn legacy_groups_are_not_subject_to_the_rules() {
             .account_identity_proof_signer(proof_signer(account))
             .feature_registry(registry())
             .supported_app_components(supported)
-            .allow_account_devices_advertising_for_tests()
             .peeler(Box::<MockPeeler>::default())
             .build()
             .unwrap();
