@@ -722,7 +722,8 @@ impl AccountRecoveryOwner {
         // Native goals have no upper bound: live traffic is their input too.
         // Only input created before this attempt started can be what the
         // attempt acquired, so later live messages cannot reset pacing.
-        let started = grant.reservation.recorded_at_ms / 1000;
+        // Event times are whole seconds, so the starting second is excluded.
+        let started = (grant.reservation.recorded_at_ms / 1000).saturating_sub(1);
         let admission = Arc::new(RecoveryAdmissionSnapshot {
             scopes: grant
                 .plan
@@ -4243,6 +4244,10 @@ mod tests {
                 .unwrap()
         };
         assert!(!observe(started + 1), "live input during the attempt");
+        assert!(
+            !observe(started),
+            "live input later in the attempt's starting second"
+        );
         assert_eq!(
             storage
                 .app_storage()
@@ -4252,6 +4257,11 @@ mod tests {
             2
         );
         assert!(observe(started - 1), "history the attempt acquired");
+        assert_eq!(
+            storage.app_storage().count_recovery_attempt(id).unwrap(),
+            2,
+            "account-wide pacing progress does not restart an obligation's attempt count"
+        );
     }
 
     #[test]

@@ -682,7 +682,6 @@ impl SqliteAppStorage {
             {
                 return Ok(false);
             }
-            plan::reset_recovery_attempts(&conn, &expected.obligations)?;
             conn.execute_cached(
                 "UPDATE account_recovery_state SET retry_ordinal=1,retry_recorded_at_ms=?1,
                  retry_delay_ms=?2,retry_not_before_ms=?3 WHERE singleton=1",

@@ -124,22 +124,6 @@ const RECOVERY_PARK_AFTER_UNSERVED_PASSES: u64 = 6;
 /// the retry pacing cap this is about an hour and a half of retrying.
 pub const RECOVERY_PARK_AFTER_ATTEMPTS: u64 = 24;
 
-/// Clear the attempt count of every listed obligation that made progress.
-pub(super) fn reset_recovery_attempts(
-    conn: &rusqlite::Connection,
-    obligations: &[([u8; 16], u64)],
-) -> StorageResult<()> {
-    for (id, _) in obligations {
-        conn.execute_cached(
-            "UPDATE account_recovery_obligations SET recovery_attempts=0
-             WHERE id=?1 AND recovery_attempts!=0",
-            [id.as_slice()],
-        )
-        .storage()?;
-    }
-    Ok(())
-}
-
 /// What one comparison pass did for one compared scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryPassProgress {
@@ -1224,8 +1208,14 @@ impl SqliteAppStorage {
                     params![obligation_id.as_slice(), sqlite_integer(scope_id)?, payload],
                 ).storage()?;
             }
+            // Only this obligation's own scope progress restarts its count.
+            // Account-wide pacing resets say nothing about which one progressed.
             if progressed {
-                reset_recovery_attempts(&conn, &selected.obligations)?;
+                conn.execute_cached(
+                    "UPDATE account_recovery_obligations SET recovery_attempts=0
+                     WHERE id=?1 AND recovery_attempts!=0",
+                    [obligation_id.as_slice()],
+                ).storage()?;
             }
             let (predicate, cause, dismissed): (i64, i64, Option<Vec<u8>>) = conn.query_row_cached(
                 "SELECT predicate, cause, dismissed_scopes FROM account_recovery_obligations WHERE id = ?1",
