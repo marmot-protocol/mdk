@@ -225,9 +225,7 @@ impl RelayCapsCache {
         if let Some(slot) = slots.get(key) {
             return slot.clone();
         }
-        if slots.len() >= MAX_CACHED_RELAYS {
-            evict_one(&mut slots);
-        }
+        while slots.len() >= MAX_CACHED_RELAYS && evict_one(&mut slots) {}
         slots.entry(key.to_owned()).or_default().clone()
     }
 }
@@ -241,20 +239,22 @@ fn log_unknown(failure: Nip11Failure) {
     );
 }
 
-/// Drops the idle entry due soonest, or an idle empty one. An entry a caller
-/// holds is never dropped; when every entry is held, the map grows by one.
-fn evict_one(slots: &mut HashMap<String, Slot>) {
+/// Drops the idle entry due soonest, or an idle empty one, and says whether
+/// it dropped one. An entry is idle when the map holds its only reference:
+/// slots are handed out only under the map lock, so no caller can be about
+/// to use it. When every entry is held the map grows past the bound, and the
+/// next insert after those callers finish shrinks it back.
+fn evict_one(slots: &mut HashMap<String, Slot>) -> bool {
     let victim = slots
         .iter()
+        .filter(|(_, slot)| Arc::strong_count(slot) == 1)
         .filter_map(|(endpoint, slot)| {
             let cached = slot.try_lock().ok()?;
             Some((cached.as_ref().map(|entry| entry.fresh_until), endpoint))
         })
         .min_by_key(|(fresh_until, _)| *fresh_until)
         .map(|(_, endpoint)| endpoint.clone());
-    if let Some(endpoint) = victim {
-        slots.remove(&endpoint);
-    }
+    victim.is_some_and(|endpoint| slots.remove(&endpoint).is_some())
 }
 
 #[cfg(test)]

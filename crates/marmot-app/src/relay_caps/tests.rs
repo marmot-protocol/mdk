@@ -353,14 +353,28 @@ fn a_full_cache_drops_the_idle_entry_due_soonest() {
             }))),
         );
     }
-    let held = slots["b"].clone();
-    let _guard = held.try_lock().unwrap();
+    // A caller handed "b" but not yet locking it still holds it.
+    let _about_to_lock = slots["b"].clone();
 
-    evict_one(&mut slots);
+    assert!(evict_one(&mut slots));
 
     let mut left = slots.keys().cloned().collect::<Vec<_>>();
     left.sort();
     assert_eq!(left, ["a", "b"]);
+}
+
+#[test]
+fn a_cache_overfilled_by_held_entries_shrinks_back_once_they_are_released() {
+    let cache = cache_with(no_dns());
+    let held = (0..MAX_CACHED_RELAYS + 3)
+        .map(|relay| cache.slot(&format!("relay-{relay}")))
+        .collect::<Vec<_>>();
+    assert_eq!(cache.slots.lock().unwrap().len(), MAX_CACHED_RELAYS + 3);
+
+    drop(held);
+    let _next = cache.slot("relay-next");
+
+    assert_eq!(cache.slots.lock().unwrap().len(), MAX_CACHED_RELAYS);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
