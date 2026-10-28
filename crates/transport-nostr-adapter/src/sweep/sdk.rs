@@ -25,10 +25,13 @@ use super::{
 use crate::NostrSdkRelayClient;
 use crate::sdk_client::{neg_sync_dry_run, sweep_neg_credit};
 
-/// Bytes one slice reply may carry. A full wok page is 5,000 events.
-const SLICE_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Default bytes one reply may carry. A full wok page is 5,000 events.
+const REPLY_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Ids per exact-id REQ when the relay publishes no cap.
 const DEFAULT_IDS_PER_REQUEST: usize = 500;
+/// `limit` on a one-second NIP-77 comparison, well under strfry's NEG ceiling
+/// (5,000,000). A set that fills it may hide more ids, so it proves nothing.
+const SECOND_NEG_LIMIT: usize = 100_000;
 
 pub struct SdkSweepRelay {
     client: Client,
@@ -36,6 +39,7 @@ pub struct SdkSweepRelay {
     caps: RelayCaps,
     neg_credit: Arc<Semaphore>,
     request_timeout: Duration,
+    reply_max_bytes: usize,
 }
 
 impl SdkSweepRelay {
@@ -52,12 +56,21 @@ impl SdkSweepRelay {
             endpoint,
             caps,
             request_timeout,
+            reply_max_bytes: REPLY_MAX_BYTES,
         }
+    }
+
+    /// Event JSON bytes one reply may carry. A slice over it is split, as a
+    /// full reply is.
+    pub fn with_reply_max_bytes(mut self, bytes: usize) -> Self {
+        self.reply_max_bytes = bytes.max(1);
+        self
     }
 
     /// One bounded REQ to this relay, closed at EOSE.
     async fn acquire(&self, filter: Filter, max_items: usize) -> Option<RelayAcquisition> {
-        let limits = AcquisitionLimits::new(1, max_items, SLICE_MAX_BYTES, self.request_timeout);
+        let limits =
+            AcquisitionLimits::new(1, max_items, self.reply_max_bytes, self.request_timeout);
         let target = ReqTarget::manual([(self.endpoint.clone(), vec![filter])]);
         let handle = self.client.acquire_events(target, limits).await.ok()?;
         let mut report = handle.finish().await.ok()?;
@@ -140,7 +153,7 @@ impl SweepRelay for SdkSweepRelay {
         let deadline = tokio::time::Instant::now() + self.request_timeout;
         let ids = match neg_sync_dry_run(
             &relay,
-            route.second_filter(second, second),
+            route.second_filter(second, second).limit(SECOND_NEG_LIMIT),
             options,
             self.neg_credit.clone(),
             deadline,
@@ -152,16 +165,26 @@ impl SweepRelay for SdkSweepRelay {
             Err(NegFailure::Unreachable(kind)) => return SecondReply::Unreachable(kind),
             Err(NegFailure::Unproven) => return SecondReply::Unproven,
         };
+        if ids.len() >= SECOND_NEG_LIMIT {
+            return SecondReply::Unproven;
+        }
         let mut wanted = ids.into_iter().collect::<Vec<EventId>>();
         wanted.sort();
         let per_request = cap
             .map_or(DEFAULT_IDS_PER_REQUEST, |cap| cap as usize)
             .max(1);
         let mut events = Vec::with_capacity(wanted.len());
-        for chunk in wanted.chunks(per_request) {
+        let mut pending = wanted
+            .chunks(per_request)
+            .rev()
+            .map(<[EventId]>::to_vec)
+            .collect::<Vec<_>>();
+        while let Some(chunk) = pending.pop() {
+            // An explicit limit, so a relay's default page cannot short the chunk.
             let filter = route
                 .second_filter(second, second)
-                .ids(chunk.iter().copied());
+                .ids(chunk.iter().copied())
+                .limit(chunk.len());
             let Some(reply) = self.acquire(filter, chunk.len().saturating_add(1)).await else {
                 return SecondReply::Unreachable(UnreachableKind::Disconnected);
             };
@@ -169,6 +192,14 @@ impl SweepRelay for SdkSweepRelay {
                 Ok(()) => {}
                 Err(FailedEnd::Closed(reason)) => return SecondReply::Closed(reason),
                 Err(FailedEnd::Unreachable(kind)) => return SecondReply::Unreachable(kind),
+                // Large events can outgrow the byte budget: split the chunk
+                // and ask again. One id that still does not fit stays unproven.
+                Err(FailedEnd::Cut) if chunk.len() > 1 => {
+                    let (older, newer) = chunk.split_at(chunk.len() / 2);
+                    pending.push(newer.to_vec());
+                    pending.push(older.to_vec());
+                    continue;
+                }
                 Err(FailedEnd::Cut) => return SecondReply::Unproven,
             }
             let asked = chunk.iter().copied().collect::<HashSet<_>>();

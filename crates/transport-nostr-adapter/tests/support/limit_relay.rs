@@ -101,6 +101,10 @@ pub struct LimitConfig {
     pub max_tag_keys_per_filter: usize,
     /// Clamp each ordinary REQ filter's `limit` (absent or larger) to this.
     pub req_limit_clamp: Option<u64>,
+    /// `limit` given to an ordinary REQ filter that names none, before the
+    /// clamp (wok: NIP-11 `default_limit` below `max_limit`). `None` leaves it
+    /// to the clamp.
+    pub req_default_limit: Option<u64>,
     /// Live NEG sessions per connection (a separate counter from REQs).
     pub max_neg_sessions: usize,
     /// Phantom NEG sessions every connection starts with, to pre-fill the cap.
@@ -121,6 +125,7 @@ impl Default for LimitConfig {
             allowed_kinds: Some(PRODUCTION_ALLOWED_KINDS.into_iter().collect()),
             max_tag_keys_per_filter: 3,
             req_limit_clamp: Some(REQ_LIMIT_CLAMP),
+            req_default_limit: None,
             max_neg_sessions: 200,
             neg_prefilled_sessions: 0,
             neg_counts_toward_limit: false,
@@ -706,6 +711,12 @@ fn inspect_client_frame(
                     let mut frame = frame;
                     let mut clamped = false;
                     for filter in frame.iter_mut().skip(2) {
+                        if let Some(default) = config.req_default_limit
+                            && filter.get("limit").is_none()
+                        {
+                            filter["limit"] = Value::from(default);
+                            clamped = true;
+                        }
                         let limit = filter.get("limit").and_then(Value::as_u64);
                         shared.stats.max_req_limit_seen =
                             shared.stats.max_req_limit_seen.max(limit.unwrap_or(0));

@@ -47,22 +47,25 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_limits(LimitConfig::default()).await
+    }
+
+    async fn with_limits(config: LimitConfig) -> Self {
         let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
             events: true,
-            max_events: Some(8_192),
+            max_events: Some(16_384),
         });
         let upstream = LocalRelay::new(
             RelayBuilder::default()
                 .database(database.clone())
                 .rate_limit(RateLimit {
-                    notes_per_minute: 8_192,
+                    notes_per_minute: 16_384,
                     ..RateLimit::default()
                 })
                 .default_filter_limit(100_000),
         );
         upstream.run().await.unwrap();
-        let limit =
-            LimitRelay::start(upstream.url().await.to_string(), LimitConfig::default()).await;
+        let limit = LimitRelay::start(upstream.url().await.to_string(), config).await;
         let sdk = NostrSdkRelayClient::from_builder(Client::builder());
         sdk.client().add_relay(limit.url()).await.unwrap();
         sdk.client().connect().await;
@@ -264,5 +267,52 @@ async fn rate_limited_closed_is_waited_out() {
     .await;
     assert_eq!(report.end, SweepEnd::Finished, "{report:?}");
     assert_eq!(report.stats.rate_limited_waits, 3);
+    assert_once_in_order(&sink, &wanted);
+}
+
+/// wok's marmot preset: cap 5,000, default page 500. A saturated second over
+/// the cap goes through NIP-77 and exact-id REQs, which must name their limit
+/// or the default page shorts them; and a small byte budget splits id chunks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saturated_second_over_a_default_page_and_byte_budget() {
+    let fixture = Fixture::with_limits(LimitConfig {
+        req_limit_clamp: Some(5_000),
+        req_default_limit: Some(500),
+        ..LimitConfig::default()
+    })
+    .await;
+    let keys = Keys::generate();
+    let burst = T0 + 3_600;
+    let mut events = (0..300)
+        .map(|n| group_event(&keys, GROUP, T0 + 1 + (n as u64) * 200, n))
+        .collect::<Vec<_>>();
+    events.extend((0..5_200).map(|n| group_event(&keys, GROUP, burst, 1_000 + n)));
+    let wanted = events.iter().map(|event| event.id).collect();
+    fixture.store(&events).await;
+    let relay = SdkSweepRelay::new(
+        &fixture.sdk,
+        RelayUrl::parse(&fixture.limit.url()).unwrap(),
+        RelayCaps::from_nip11_json(
+            r#"{"supported_nips":[1,11,42,67,77],"limitation":{"max_limit":5000,"default_limit":500}}"#,
+        )
+        .unwrap(),
+        Duration::from_secs(20),
+    )
+    // About 1,000 of these events: a 5,000-id chunk has to split.
+    .with_reply_max_bytes(400 * 1_000);
+    let mut sink = Sink::default();
+    let report = run_sweep(
+        request(range()),
+        &relay,
+        &mut sink,
+        &MemoryStore::default(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.end, SweepEnd::Finished, "{report:?}");
+    assert_eq!(report.stats.saturated_seconds, 1);
+    assert!(report.covered.iter().any(|slice| slice.since == burst
+        && slice.proof == SliceProof::Negentropy
+        && slice.events == 5_200));
     assert_once_in_order(&sink, &wanted);
 }

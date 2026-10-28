@@ -161,8 +161,9 @@ for reconnect/backoff and relay status mechanics.
   and reports it; it never picks routes, relays or retries. Cover a slice only on proof (NIP-67 `finish`, a reply
   below the NIP-11 cap counting every EVENT the relay sent, or below a full reply from a relay with no published cap;
   `more` always splits). Count proofs hold only for kinds everyone may read: strfry spends its cap on events it
-  withholds. Do not sweep a restricted-read kind without another proof, admit before saving the cursor, and never count a refusal, rate limit or unreachable relay
-  as an empty page. `SdkSweepRelay` dials nothing: its endpoint must already be in the client's pool.
+  withholds; do not sweep a restricted-read kind without another proof. Admit before saving the cursor,
+  and never count a refusal, rate limit or unreachable relay as an empty page. `SdkSweepRelay` gives every NIP-77
+  comparison and ids REQ an explicit `limit`, and a comparison that fills it proves nothing. `SdkSweepRelay` dials nothing: its endpoint must already be in the client's pool.
 - Keep real relay clients behind `NostrRelayClient`.
 - Both SDK consumers enter through `dispatch_sdk_replay`; `dispatch_sdk_notification` is its private payload handler.
   Observe and admit a raw group copy from one validated/decoded transport message, outside the state write lock.
