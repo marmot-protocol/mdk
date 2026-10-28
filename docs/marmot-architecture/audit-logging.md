@@ -1414,7 +1414,7 @@ Files are sorted by app account label, then file name.
 ### Segment rotation
 
 The recorder seals the active file into an immutable segment once new event bytes, excluding the repeated source
-prefix, reach `AUDIT_LOG_SEGMENT_MAX_BYTES` (1 MiB) and
+prefix, reach `AUDIT_LOG_SEGMENT_MAX_BYTES` (1 MiB), or a day elapses before the next row, and
 continues into a fresh file at the same path. Segments are named `audit-<engine_id>-v4-seg<NNNNNN>.jsonl`, so they are
 still enumerated by `audit_log_files()` and sort ahead of the active file.
 
@@ -1437,21 +1437,29 @@ still enumerated by `audit_log_files()` and sort ahead of the active file.
 
 ### Local retention
 
-MDK keeps a fixed 30-day diagnostic history without a user setting. Exclusive-root startup sweeps reserved v4/v5
-files in account directories and failed-wipe remnants before exposing the app, including dormant accounts. Running
-account workers sweep on their first maintenance tick and hourly afterwards, independently of recording consent,
-upload configuration and upload success. Paused or suspended processes sweep on their next eligible tick or open.
+MDK expires closed forensic files 30 days after their last filesystem write, without a user setting. Recorders seal
+at 1 MiB or before the first row after a day, whichever comes first, preserving original bytes, inode identity,
+session, sequence and the repeated source header. Daily files therefore keep roughly 30 days of history, with up to
+one extra day plus the hourly sweep delay. Reopening uses the bounded first row to preserve the age boundary across
+short sessions. A quiet shutdown rolls before its stop row rather than refreshing an old file's retention clock.
+Legacy files are not split or rewritten; they age out 30 days after their last write.
 
-The cutoff uses each row's `wall_time_ms`, with records exactly at the cutoff retained. Mixed-age files retain the
-original bytes of recent records; fully expired closed files are removed. Replacements are staged owner-only and
-renamed atomically. Live pruning holds the recorder lock, adopts the replacement writer, and preserves session,
-sequence and health counters. Delivery is fenced before mutation, so a late HTTP response cannot acknowledge an
-expired generation; the v5 cursor discovers changed inodes as missing-source coverage on its next pass. This can
-replay retained rows and never proves that expired rows were uploaded.
+Exclusive-root startup sweeps account directories and failed-wipe remnants using filenames and metadata only.
+An installation-wide hourly worker also covers signed-out/dormant accounts and remnants created after launch,
+independently of recording consent, upload configuration and upload success. Its metadata scanner has a size-one
+path queue and owns no recorder or storage guard. Each unlink is admitted separately; shutdown cancels the walk
+without waiting for payload copying or holding account commands behind a full sweep.
 
-Only the reserved `audit-<32 lowercase hex>-v4/v5[-seg<index>].jsonl` families are swept. Symlinks are not followed,
-and the separate always-on key-reveal security log is excluded. Malformed, oversized or incomplete rows without a
-usable timestamp remain untouched. Failures are nonfatal and retried at the next sweep or open.
+Only the reserved `audit-<32 lowercase hex>-v4/v5[-seg<index>].jsonl` families are swept. Symlinks are not followed;
+custom names, databases and the always-on key-reveal security log are excluded. Empty or malformed reserved files
+expire by the same metadata policy. Failures are isolated per file/account, nonfatal and retried on the next sweep
+or open. Whole-file deletion needs no staging space, so it can free space on a full disk.
+
+A weak recorder registry serializes writer creation and expiry. The live recorder rechecks each candidate under
+its writer lock and protects both its canonical path and its actual writer path after failed roll compensation.
+Outstanding v5 delivery is fenced only for expiry candidates; acknowledged sealed files can disappear without
+replays or false gaps. Delivery drops retired, gap-free acknowledged journals, while retaining real gaps and
+unaccepted extents. Retention never claims expired data reached a receiver.
 
 ### Explicit upload
 

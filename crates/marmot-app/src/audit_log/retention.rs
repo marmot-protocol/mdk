@@ -1,16 +1,18 @@
-//! Fixed local diagnostic history; independent of recording consent and upload.
+//! Whole-file forensic expiry, independent of recording consent and upload.
 
+use crate::runtime::RuntimeLifecycle;
+use crate::{AppError, MarmotApp};
+use marmot_forensics::ForensicRecorder;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use marmot_forensics::ForensicRecorder;
-
-use crate::{AppError, MarmotApp};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 const AUDIT_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-pub(crate) const AUDIT_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const AUDIT_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 fn cutoff_ms(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH)
@@ -21,99 +23,303 @@ fn cutoff_ms(now: SystemTime) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-/// Exclusive-root startup only: there are no live writers or export attempts.
-/// Include dormant accounts and failed-wipe remnants even with consent off.
+/// Exclusive-root startup only. This reads metadata, never audit payloads.
 pub(crate) fn cleanup_expired_audit_logs(root: &Path) {
     let cutoff = cutoff_ms(SystemTime::now());
     let mut failed = 0;
-    for container in ["accounts", ".wipe-tombstones"] {
-        let path = root.join(container);
-        let result = (|| {
-            match fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Ok(metadata) if metadata.is_dir() => {}
-                _ => return Err(io::Error::other("unexpected audit container")),
-            }
-            for entry in fs::read_dir(path)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir()
-                    && prune_account(&entry.path(), cutoff, None).is_err()
+    scan_root(
+        root,
+        cutoff,
+        || false,
+        |path| {
+            failed += usize::from(
+                marmot_forensics::NoopRecorder
+                    .expire_file_before(&path, cutoff)
+                    .is_err(),
+            );
+            true
+        },
+    );
+    report_failures(failed);
+}
+
+/// One installation-wide worker, independent of signed-in account workers.
+/// Its scan has a size-one path queue and reads metadata only. File mutations
+/// acquire storage admission for one file, never across the directory walk.
+#[derive(Clone)]
+pub(crate) struct AuditRetentionWorker(Arc<WorkerOwner>);
+struct WorkerOwner {
+    app: MarmotApp,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+impl Drop for WorkerOwner {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .task
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+    }
+}
+impl AuditRetentionWorker {
+    pub(crate) fn new(app: MarmotApp) -> Self {
+        Self(Arc::new(WorkerOwner {
+            app,
+            task: Mutex::new(None),
+        }))
+    }
+    pub(crate) fn start(&self, lifecycle: RuntimeLifecycle) {
+        self.start_with_interval(lifecycle, AUDIT_RETENTION_SWEEP_INTERVAL);
+    }
+
+    fn start_with_interval(&self, lifecycle: RuntimeLifecycle, period: Duration) {
+        let mut task = self.0.task.lock().unwrap_or_else(|p| p.into_inner());
+        if task.as_ref().is_some_and(|t| !t.is_finished()) || lifecycle.is_stopping() {
+            return;
+        }
+        let app = self.0.app.clone();
+        *task = Some(tokio::spawn(async move {
+            let mut stopping = lifecycle.subscribe_shutdown();
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // Exclusive open just swept; don't scan twice at launch.
+            loop {
+                tokio::select! { biased;
+                    _ = stopping.changed() => break,
+                    _ = tick.tick() => {}
+                }
+                if lifecycle.is_stopping()
+                    || app
+                        .storage_closed
+                        .load(std::sync::atomic::Ordering::Acquire)
                 {
-                    failed += 1;
+                    break;
+                }
+                let (sender, mut candidates) = mpsc::channel(1);
+                let root = app.root.clone();
+                let scanner_lifecycle = lifecycle.clone();
+                // The scanner holds no app, recorder, database or storage guard.
+                let scanner = tokio::task::spawn_blocking(move || {
+                    scan_root(
+                        &root,
+                        cutoff_ms(SystemTime::now()),
+                        || scanner_lifecycle.is_stopping(),
+                        |path| sender.blocking_send(path).is_ok(),
+                    );
+                });
+                loop {
+                    let path = tokio::select! { biased;
+                        _ = stopping.changed() => return,
+                        path = candidates.recv() => match path { Some(path) => path, None => break },
+                    };
+                    if lifecycle.is_stopping()
+                        || app
+                            .storage_closed
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return;
+                    }
+                    let candidate_app = app.clone();
+                    let candidate_lifecycle = lifecycle.clone();
+                    // This is only a metadata check and one unlink. Shutdown
+                    // can never wait for payload copying or a directory walk.
+                    let result = crate::blocking_app_task(move || {
+                        if candidate_lifecycle.is_stopping() {
+                            return Ok(false);
+                        }
+                        candidate_app.expire_audit_file(&path)
+                    })
+                    .await;
+                    report_failures(usize::from(result.is_err()));
+                }
+                if scanner.await.is_err() {
+                    report_failures(1);
                 }
             }
-            Ok::<_, io::Error>(())
-        })();
-        failed += usize::from(result.is_err());
+        }));
+    }
+    pub(crate) async fn shutdown(&self) {
+        let task = self.0.task.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl MarmotApp {
+    pub(crate) fn expire_audit_file(&self, path: &Path) -> Result<bool, AppError> {
+        let _storage = self.begin_storage_open("audit retention")?;
+        let Some(account) = path.parent() else {
+            return Ok(false);
+        };
+        let Some(container) = account.parent() else {
+            return Ok(false);
+        };
+        if !fs::symlink_metadata(container)?.is_dir()
+            || !fs::symlink_metadata(account)?.is_dir()
+            || !is_expired(path, cutoff_ms(SystemTime::now()))?
+        {
+            return Ok(false);
+        }
+        // AccountHome may use /var while recorders use /private/var. Reject
+        // links at the mutable levels first, then normalize both sides of
+        // the writer-path comparison so expiry cannot orphan a live inode.
+        let root = fs::canonicalize(&self.root)?;
+        let container = fs::canonicalize(container)?;
+        let accounts = root.join("accounts");
+        if container != accounts && container != root.join(".wipe-tombstones") {
+            return Ok(false);
+        }
+        let path = fs::canonicalize(path)?;
+        let label = account.file_name().and_then(|s| s.to_str());
+        let slot = if container == accounts {
+            label.map(|label| self.audit_recorder_slot(label))
+        } else {
+            None
+        };
+        let registration = slot
+            .as_ref()
+            .map(|slot| slot.lock().unwrap_or_else(|p| p.into_inner()));
+        let recorder = registration
+            .as_ref()
+            .and_then(|registration| registration.as_ref())
+            .and_then(|weak| weak.upgrade());
+        let owner = if container == accounts {
+            label.and_then(|l| self.account_home().account(l).ok())
+        } else {
+            None
+        };
+        // Fence only actual candidates. Unreadable/signed-out account records
+        // and failed wipes still expire, using the conservative global fence.
+        let _mutation = match owner {
+            Some(account) => self
+                .audit_export_lifecycle
+                .mutate_account(&account.account_id_hex),
+            None => self.audit_export_lifecycle.mutate_all(),
+        };
+        let cutoff = cutoff_ms(SystemTime::now());
+        Ok(match recorder {
+            Some(recorder) => recorder.expire_file_before(&path, cutoff)?,
+            None => marmot_forensics::NoopRecorder.expire_file_before(&path, cutoff)?,
+        })
+    }
+}
+
+fn scan_root(
+    root: &Path,
+    cutoff: u64,
+    stopped: impl Fn() -> bool,
+    mut candidate: impl FnMut(PathBuf) -> bool,
+) {
+    let mut failed = 0;
+    for name in ["accounts", ".wipe-tombstones"] {
+        if stopped() {
+            break;
+        }
+        let container = root.join(name);
+        match fs::symlink_metadata(&container) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Ok(m) if m.is_dir() => {}
+            _ => {
+                failed += 1;
+                continue;
+            }
+        }
+        let entries = match fs::read_dir(&container) {
+            Ok(e) => e,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+        for entry in entries {
+            if stopped() {
+                break;
+            }
+            let result = (|| {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    let mut accepting = true;
+                    scan_expired(&entry.path(), cutoff, &stopped, |path| {
+                        accepting = candidate(path);
+                        accepting
+                    })?;
+                    if !accepting {
+                        return Ok(false);
+                    }
+                }
+                Ok::<_, io::Error>(true)
+            })();
+            match result {
+                Ok(false) => return,
+                Err(_) => failed += 1,
+                _ => {}
+            }
+        }
     }
     report_failures(failed);
 }
 
-impl MarmotApp {
-    pub(crate) fn prune_account_audit_logs(
-        &self,
-        label: &str,
-        recorder: &marmot_forensics::SharedRecorder,
-    ) -> Result<(), AppError> {
-        let _storage = self.begin_storage_open("audit retention")?;
-        let account = self.account_home().account(label)?;
-        let _mutation = self
-            .audit_export_lifecycle
-            .mutate_account(&account.account_id_hex);
-        let cutoff = cutoff_ms(SystemTime::now());
-        recorder.prune_before(cutoff)?;
-        let active = recorder.audit_log_path();
-        // The recorder owns its entire segment family, including the actual
-        // writer path after failed rename compensation; never unlink those
-        // files from the generic closed-file pass.
-        prune_account(&self.account_dir(label), cutoff, active.as_deref())?;
-        Ok(())
+fn scan_expired(
+    account: &Path,
+    cutoff: u64,
+    stopped: impl Fn() -> bool,
+    mut candidate: impl FnMut(PathBuf) -> bool,
+) -> io::Result<()> {
+    if !fs::symlink_metadata(account)?.is_dir() {
+        return Err(io::Error::other("unexpected audit directory"));
     }
-}
-
-fn prune_account(account: &Path, cutoff: u64, live: Option<&Path>) -> io::Result<()> {
     let mut failed = 0;
     for entry in fs::read_dir(account)? {
+        if stopped() {
+            break;
+        }
         let result = (|| {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                return Ok(());
-            };
-            if name
-                .strip_suffix("-retention")
-                .is_some_and(is_retained_audit_file)
-                && entry.file_type()?.is_file()
-            {
-                // Remove an interrupted atomic replacement even if its source
-                // was subsequently deleted through the host's file UI.
-                fs::remove_file(entry.path())?;
-                return Ok(());
+            let path = entry?.path();
+            if is_expired(&path, cutoff)? && !candidate(path) {
+                return Ok(false);
             }
-            if !is_retained_audit_file(name) || !entry.file_type()?.is_file() {
-                return Ok(());
-            }
-            if let Some(stem) = live.and_then(|p| p.file_stem()).and_then(|s| s.to_str())
-                && (name == format!("{stem}.jsonl") || name.starts_with(&format!("{stem}-seg")))
-            {
-                return Ok(());
-            }
-            marmot_forensics::audit::prune_jsonl_file_before(&entry.path(), cutoff)?;
-            Ok::<_, io::Error>(())
+            Ok::<_, io::Error>(true)
         })();
-        failed += usize::from(result.is_err());
+        match result {
+            Ok(false) => break,
+            Err(_) => failed += 1,
+            _ => {}
+        }
     }
-    if failed > 0 {
-        report_failures(failed);
-        return Err(io::Error::other("audit retention incomplete"));
-    }
+    report_failures(failed);
     Ok(())
+}
+
+fn is_expired(path: &Path, cutoff: u64) -> io::Result<bool> {
+    if !path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_retained_audit_file)
+    {
+        return Ok(false);
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        other => other?,
+    };
+    Ok(metadata.is_file()
+        && metadata
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            < u128::from(cutoff))
 }
 
 fn report_failures(failed: usize) {
     if failed > 0 {
-        tracing::warn!(target: "marmot_app::audit_log", method = "prune_audit_logs",
-            failed, "audit retention incomplete; will retry on next sweep or open");
+        tracing::warn!(target: "marmot_app::audit_log", method = "expire_audit_logs",
+        failed, "audit retention incomplete; will retry on next sweep or open");
     }
 }
 
@@ -150,19 +356,31 @@ fn is_retained_audit_file(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    fn age(path: &Path, time: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(time))
+            .unwrap();
+    }
     #[test]
-    fn audit_retention_runs_on_exclusive_open_with_recording_disabled() {
+    fn audit_retention_cleans_dormant_accounts_and_wipe_remnants_on_exclusive_open() {
         let root = tempfile::tempdir().unwrap();
         let home = marmot_account::AccountHome::open(root.path());
         home.create_account("alice").unwrap();
-        let name = format!("audit-{}-v4.jsonl", "a".repeat(32));
-        let path = home.account_dir("alice").join(name);
-        let recent = format!(
-            "{{\"wall_time_ms\":{}}}\n",
-            cutoff_ms(SystemTime::now()) + 60_000
-        );
-        fs::write(&path, format!("{{\"wall_time_ms\":1}}\n{recent}")).unwrap();
+        let account = home.account_dir("alice");
+        let old = format!("audit-{}-v4-seg000001.jsonl", "a".repeat(32));
+        let recent = format!("audit-{}-v5.jsonl", "b".repeat(32));
+        fs::write(account.join(&old), b"old unreadable payload").unwrap();
+        age(&account.join(&old), UNIX_EPOCH);
+        fs::write(account.join(&recent), b"recent").unwrap();
+        fs::write(account.join("audit-key-reveal.jsonl"), b"security").unwrap();
+        age(&account.join("audit-key-reveal.jsonl"), UNIX_EPOCH);
+        let tombstone = root.path().join(".wipe-tombstones/remnant");
+        fs::create_dir_all(&tombstone).unwrap();
+        fs::write(tombstone.join(&old), b"old").unwrap();
+        age(&tombstone.join(&old), UNIX_EPOCH);
         let app = MarmotApp::try_with_relays_and_account_home_and_config(
             root.path(),
             Vec::new(),
@@ -171,100 +389,145 @@ mod tests {
         )
         .unwrap();
         assert!(!app.audit_log_settings().unwrap().enabled);
-        assert_eq!(fs::read_to_string(path).unwrap(), recent);
+        assert!(!account.join(&old).exists());
+        assert!(!tombstone.join(&old).exists());
+        assert_eq!(fs::read(account.join(recent)).unwrap(), b"recent");
+        assert!(account.join("audit-key-reveal.jsonl").exists());
     }
-
     #[test]
-    fn audit_retention_fences_delivery_and_preserves_live_recording() {
+    fn audit_retention_keeps_boundary_and_fences_only_expired_candidates() {
         let root = tempfile::tempdir().unwrap();
         let home = marmot_account::AccountHome::open(root.path());
         let account = home.create_account("alice").unwrap();
         let app = MarmotApp::with_relays_and_account_home(root.path(), Vec::new(), home);
         let path = app
             .account_dir("alice")
-            .join(format!("audit-{}-v5.jsonl", "a".repeat(32)));
-        fs::write(&path, b"{\"wall_time_ms\":1}\n").unwrap();
-        let audit = marmot_forensics::SharedRecorder::new(Box::new(
-            marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
-                &path,
-                "a".repeat(32),
-                None,
-                super::super::audit_v5_producer(),
-            )
-            .unwrap(),
-        ));
-        let before = fs::read(&path).unwrap();
+            .join(format!("audit-{}-v4.jsonl", "a".repeat(32)));
+        fs::write(&path, b"old").unwrap();
+        age(&path, UNIX_EPOCH + Duration::from_millis(100));
+        assert!(!is_expired(&path, 100).unwrap());
+        assert!(is_expired(&path, 101).unwrap());
+        age(&path, SystemTime::now());
         let attempt = app
             .audit_export_lifecycle
             .reserve(&account.account_id_hex, "test")
             .unwrap();
-        app.prune_account_audit_logs("alice", &audit).unwrap();
-        assert!(app.audit_export_lifecycle.admit(&attempt, || ()).is_none());
-        assert_eq!(
-            fs::read(&path).unwrap(),
-            before[b"{\"wall_time_ms\":1}\n".len()..]
-        );
-        audit.record(marmot_forensics::AuditRecord::new(
-            None,
-            marmot_forensics::AuditEventKind::RecorderHealth {
-                serialization_failures: 0,
-                write_failures: 0,
-                flush_failures: 0,
-            },
-        ));
-        assert!(
-            fs::metadata(path).unwrap().len()
-                > (before.len() - b"{\"wall_time_ms\":1}\n".len()) as u64
-        );
-        app.close_storage().unwrap();
-        assert!(app.prune_account_audit_logs("alice", &audit).is_err());
-    }
 
+        assert!(!app.expire_audit_file(&path).unwrap());
+        assert!(app.audit_export_lifecycle.admit(&attempt, || ()).is_some());
+        age(&path, UNIX_EPOCH);
+        assert!(app.expire_audit_file(&path).unwrap());
+        assert!(app.audit_export_lifecycle.admit(&attempt, || ()).is_none());
+        app.close_storage().unwrap();
+        assert!(app.expire_audit_file(&path).is_err());
+    }
+    #[cfg(unix)]
     #[test]
-    fn audit_retention_cleans_dormant_accounts_and_wipe_remnants_without_following_links() {
+    fn audit_retention_never_follows_links_or_removes_custom_names() {
         let root = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         let name = format!("audit-{}-v5.jsonl", "a".repeat(32));
-        fs::write(external.path().join(&name), b"{\"wall_time_ms\":1}\n").unwrap();
-        for container in ["accounts", ".wipe-tombstones"] {
-            let account = root.path().join(container).join("dormant");
-            fs::create_dir_all(&account).unwrap();
-            fs::write(account.join(&name), b"{\"wall_time_ms\":1}\n").unwrap();
-            fs::write(
-                account.join(format!("{name}-retention")),
-                b"interrupted copy",
-            )
-            .unwrap();
-            let v4_segment = format!("audit-{}-v4-seg000001.jsonl", "b".repeat(32));
-            fs::write(account.join(v4_segment), b"{\"wall_time_ms\":1}\n").unwrap();
-            fs::write(
-                account.join("audit-key-reveal.jsonl"),
-                b"{\"wall_time_ms\":1}\n",
-            )
-            .unwrap();
-            fs::write(
-                account.join("audit-custom.jsonl"),
-                b"{\"wall_time_ms\":1}\n",
-            )
-            .unwrap();
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(external.path(), root.path().join(container).join("linked"))
-                .unwrap();
-        }
+        let target = external.path().join(&name);
+        fs::write(&target, b"keep").unwrap();
+        age(&target, UNIX_EPOCH);
+        fs::create_dir_all(root.path().join("accounts/real")).unwrap();
+        std::os::unix::fs::symlink(external.path(), root.path().join("accounts/linked")).unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join("accounts/real").join(&name)).unwrap();
+        let custom = root.path().join("accounts/real/audit-custom.jsonl");
+        fs::write(&custom, b"keep").unwrap();
+        age(&custom, UNIX_EPOCH);
         cleanup_expired_audit_logs(root.path());
+        assert!(target.exists());
+        assert!(custom.exists());
+    }
+    #[test]
+    fn audit_retention_protects_live_files_without_keeping_recorders_alive() {
+        let root = tempfile::tempdir().unwrap();
+        let home = marmot_account::AccountHome::open(root.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relays_and_account_home(root.path(), Vec::new(), home);
+        let slot = app.audit_recorder_slot("alice");
+        let recorder = marmot_forensics::SharedRecorder::new(
+            app.open_audit_recorder("alice", &app.member_id("alice").unwrap())
+                .unwrap(),
+        );
+        *slot.lock().unwrap() = Some(recorder.downgrade());
+        let active = recorder.audit_log_path().unwrap();
+        age(&active, UNIX_EPOCH);
+        assert!(!app.expire_audit_file(&active).unwrap());
+        let listed = app.account_dir("alice").join(active.file_name().unwrap());
+        assert!(!app.expire_audit_file(&listed).unwrap());
+        let old = app
+            .account_dir("alice")
+            .join(format!("audit-{}-v4-seg000001.jsonl", "b".repeat(32)));
+        fs::write(&old, b"expired").unwrap();
+        age(&old, UNIX_EPOCH);
+        assert!(app.expire_audit_file(&old).unwrap());
+        drop(recorder);
+        assert!(slot.lock().unwrap().as_ref().unwrap().upgrade().is_none());
+        assert!(app.expire_audit_file(&active).unwrap());
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_retention_background_sweeps_new_dormant_and_failed_wipe_directories_and_stops() {
+        let root = tempfile::tempdir().unwrap();
+        let home = marmot_account::AccountHome::open(root.path());
+        let app = MarmotApp::with_relays_and_account_home(root.path(), Vec::new(), home);
+        let lifecycle = crate::runtime::RuntimeSharedServices::default().lifecycle();
+        let worker = AuditRetentionWorker::new(app.clone());
+        worker.start_with_interval(lifecycle.clone(), Duration::from_millis(10));
+        let mut files = Vec::new();
         for container in ["accounts", ".wipe-tombstones"] {
-            let account = root.path().join(container).join("dormant");
-            assert!(!account.join(&name).exists());
-            assert!(!account.join(format!("{name}-retention")).exists());
-            assert!(
-                !account
-                    .join(format!("audit-{}-v4-seg000001.jsonl", "b".repeat(32)))
-                    .exists()
-            );
-            assert!(account.join("audit-key-reveal.jsonl").exists());
-            assert!(account.join("audit-custom.jsonl").exists());
+            let account = root.path().join(container).join("late-dormant");
+            fs::create_dir_all(&account).unwrap();
+            let path = account.join(format!("audit-{}-v5.jsonl", "a".repeat(32)));
+            fs::write(&path, b"old").unwrap();
+            age(&path, UNIX_EPOCH);
+            files.push(path);
         }
-        assert!(external.path().join(name).exists());
-        assert_eq!(cutoff_ms(UNIX_EPOCH + AUDIT_RETENTION), 0);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while files.iter().any(|p| p.exists()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        lifecycle.begin_shutdown();
+        worker.shutdown().await;
+        app.close_storage().unwrap();
+        fs::write(&files[0], b"old").unwrap();
+        age(&files[0], UNIX_EPOCH);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(files[0].exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_retention_scanner_cancels_when_its_bounded_queue_closes() {
+        let root = tempfile::tempdir().unwrap();
+        let account = root.path().join("accounts/alice");
+        fs::create_dir_all(&account).unwrap();
+        for index in 0..100 {
+            let path = account.join(format!("audit-{}-v5-seg{index:06}.jsonl", "a".repeat(32)));
+            fs::write(&path, b"old").unwrap();
+            age(&path, UNIX_EPOCH);
+        }
+        let (sender, mut receiver) = mpsc::channel(1);
+        let scan_root_path = root.path().to_owned();
+        let scanner = tokio::task::spawn_blocking(move || {
+            scan_root(
+                &scan_root_path,
+                u64::MAX,
+                || false,
+                |path| sender.blocking_send(path).is_ok(),
+            )
+        });
+        receiver.recv().await.unwrap();
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(3), scanner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read_dir(account).unwrap().count(), 100); // Scanner never deletes.
     }
 }

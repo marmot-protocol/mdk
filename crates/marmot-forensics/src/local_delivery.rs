@@ -613,6 +613,19 @@ impl LocalAuditDelivery {
                 changed = true;
             }
         }
+        // Expiry of an acknowledged sealed file is not missing evidence.
+        // Forget only retired, gap-free journals; retain every actual gap and
+        // unaccepted extent. Otherwise normal daily expiry accumulates a
+        // permanent journal for every file this device has ever uploaded.
+        let gap_generations: std::collections::HashSet<_> =
+            self.state.gaps.iter().map(|gap| gap.generation).collect();
+        let before = self.state.journals.len();
+        self.state.journals.retain(|journal| {
+            !journal.missing
+                || journal.acknowledged < journal.observed_len
+                || gap_generations.contains(&journal.generation)
+        });
+        changed |= before != self.state.journals.len();
         if changed {
             self.publish()?;
         }
@@ -1819,5 +1832,38 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("size limit"));
+    }
+    #[test]
+    fn acknowledged_daily_file_expiry_keeps_cursor_bounded_without_replays_or_false_gaps() {
+        let (dir, active, state_dir, mut recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        for index in 0..1000 {
+            let sealed = dir
+                .path()
+                .join(format!("audit-engine-abc-v4-seg{index:06}.jsonl"));
+            // The recorder is not used while the test simulates its atomic
+            // daily rename. Reopen restores the actual writer for each turn.
+            drop(recorder);
+            fs::rename(&active, &sealed).unwrap();
+            let next = JsonlRecorder::open(&active, "engine-abc".into()).unwrap();
+            drain(&mut worker, &mut sink);
+            let batches_before = sink.batches.len();
+            fs::remove_file(&sealed).unwrap();
+            drain(&mut worker, &mut sink);
+            assert_eq!(sink.batches.len(), batches_before);
+            assert!(worker.gaps().is_empty());
+            assert_eq!(worker.state.journals.len(), 1);
+            assert!(
+                fs::metadata(state_dir.join("local-delivery.json"))
+                    .unwrap()
+                    .len()
+                    < 4096
+            );
+            // Keep one recorder binding across iterations without leaving an
+            // old descriptor alive during the next rename.
+            recorder = next;
+        }
     }
 }

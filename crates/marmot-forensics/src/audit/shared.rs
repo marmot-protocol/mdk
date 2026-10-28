@@ -1,7 +1,7 @@
 //! One recorder handle for every owner of an account-device's audit log.
 
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use super::{AuditRecord, AuditRecorderHealthSnapshot, ForensicRecorder, NoopRecorder};
 
@@ -21,7 +21,20 @@ pub struct SharedRecorder {
     inner: Arc<RwLock<Box<dyn ForensicRecorder>>>,
 }
 
+/// A registry reference that never extends a recorder's file lifetime.
+#[derive(Clone)]
+pub struct WeakRecorder(Weak<RwLock<Box<dyn ForensicRecorder>>>);
+
+impl WeakRecorder {
+    pub fn upgrade(&self) -> Option<SharedRecorder> {
+        self.0.upgrade().map(|inner| SharedRecorder { inner })
+    }
+}
+
 impl SharedRecorder {
+    pub fn downgrade(&self) -> WeakRecorder {
+        WeakRecorder(Arc::downgrade(&self.inner))
+    }
     pub fn new(recorder: Box<dyn ForensicRecorder>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(recorder)),
@@ -117,8 +130,8 @@ impl ForensicRecorder for SharedRecorder {
         self.read().rotate()
     }
 
-    fn prune_before(&self, cutoff_ms: u64) -> std::io::Result<()> {
-        self.read().prune_before(cutoff_ms)
+    fn expire_file_before(&self, path: &std::path::Path, cutoff_ms: u64) -> std::io::Result<bool> {
+        self.read().expire_file_before(path, cutoff_ms)
     }
 }
 

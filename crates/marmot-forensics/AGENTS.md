@@ -15,8 +15,10 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   `AUDIT_LOG_SEGMENT_MAX_BYTES` is a rename into an `audit-*-seg<NNNNNN>.jsonl` sibling that deletes and truncates
   nothing; `seq`, the recorder session id, and health counters carry across the boundary and no `recorder_started` row
   is written. Each fresh segment repeats the latest explicit `source_context` with a fresh sequence number; ordinary
-  events and sealed bytes remain unchanged during rotation. The app supplies retention cutoffs to `prune_before`;
-  prune under the writer lock, preserve retained bytes and adopt the new inode without resetting session or sequence.
+  events and sealed bytes remain unchanged during rotation. Also roll before the first row after a day (including
+  a quiet stop); preserve the age boundary across reopen. The app supplies expiry cutoffs to `expire_file_before`;
+  check under the writer lock and protect both the canonical path and the actual writer path after failed compensation.
+  Maintenance must not invoke uncertain-writer recovery or charge failed record attempts.
   Destructive `rotate()` — which discards the current file — stays a
   separate, explicit operation.
 - Retry failed segment rolls after bounded backoff, without requiring a recorder restart or destructive rotation.
