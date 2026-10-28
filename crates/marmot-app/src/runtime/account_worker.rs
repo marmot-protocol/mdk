@@ -1851,6 +1851,7 @@ async fn run_app_runtime_account_worker(
     let product_backlog = shared.observer.product().backlog_source();
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut next_audit_retention = Instant::now();
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
     let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
@@ -2978,6 +2979,16 @@ async fn run_app_runtime_account_worker(
                 // would then have to wait out.
                 if lifecycle.is_stopping() {
                     continue 'worker;
+                }
+                if Instant::now() >= next_audit_retention {
+                    next_audit_retention = Instant::now() + crate::audit_log::AUDIT_RETENTION_SWEEP_INTERVAL;
+                    let app = app.clone();
+                    let label = account_label.clone();
+                    let audit = client.audit.clone();
+                    if crate::blocking_app_task(move || app.prune_account_audit_logs(&label, &audit)).await.is_err() {
+                        tracing::warn!(target: "marmot_app::audit_log", method = "prune_audit_logs",
+                            "audit retention deferred until next sweep");
+                    }
                 }
                 if comparison_recovery.is_some() {
                     continue 'worker;

@@ -1433,7 +1433,25 @@ still enumerated by `audit_log_files()` and sort ahead of the active file.
   reopen renames the segment back to the active path and recording continues into the same file. The recorder then stops
   attempting rolls for a 30-second backoff before retrying, so transient `ENOSPC`/`EMFILE` errors cost a delayed roll,
   not a session with rotation disabled.
-- Retention, deletion, and disk bounding of sealed segments are out of scope here; they belong to mdk#1014.
+- Segment rotation itself retains all bytes; the local retention sweep below expires old records.
+
+### Local retention
+
+MDK keeps a fixed 30-day diagnostic history without a user setting. Exclusive-root startup sweeps reserved v4/v5
+files in account directories and failed-wipe remnants before exposing the app, including dormant accounts. Running
+account workers sweep on their first maintenance tick and hourly afterwards, independently of recording consent,
+upload configuration and upload success. Paused or suspended processes sweep on their next eligible tick or open.
+
+The cutoff uses each row's `wall_time_ms`, with records exactly at the cutoff retained. Mixed-age files retain the
+original bytes of recent records; fully expired closed files are removed. Replacements are staged owner-only and
+renamed atomically. Live pruning holds the recorder lock, adopts the replacement writer, and preserves session,
+sequence and health counters. Delivery is fenced before mutation, so a late HTTP response cannot acknowledge an
+expired generation; the v5 cursor discovers changed inodes as missing-source coverage on its next pass. This can
+replay retained rows and never proves that expired rows were uploaded.
+
+Only the reserved `audit-<32 lowercase hex>-v4/v5[-seg<index>].jsonl` families are swept. Symlinks are not followed,
+and the separate always-on key-reveal security log is excluded. Malformed, oversized or incomplete rows without a
+usable timestamp remain untouched. Failures are nonfatal and retried at the next sweep or open.
 
 ### Explicit upload
 
@@ -1528,7 +1546,7 @@ Nested directories are not traversed, and files outside the leased root are not 
 a scan/deletion failure does not prevent startup or processing
 other accounts/files, and a later exclusive-root open retries. Logs contain only deleted/failed counts. Remaining
 legacy files still fail the v4 upload gate. Cleanup does not rewrite the upload-checkpoint sidecar; the tracker
-retains its existing pruning behavior. This retirement does not introduce ongoing v4 retention limits.
+retains its existing pruning behavior. Ongoing v4/v5 expiry is owned by the separate local retention sweep.
 There is no date-based sunset: direct upgrades from old builds, restored backups, and previous deletion failures
 can reintroduce legacy files later. Removing the scan requires an explicit change to those upgrade/restore guarantees.
 
@@ -1622,13 +1640,11 @@ it, plus whether that was an accepted upload, a file above the request ceiling, 
   instead of failing on every trigger. It never blocks the files behind it.
 - There is no app-level escape hatch for a file above the ceiling. `post_audit_log_file` enforces the same limit before
   it opens a request body, so an oversized legacy audit file is not transferable through any app API: it stays on disk
-  for local handling. Goggles must reject legacy schemas even through other upload paths. Deleting it is
-  mdk#1014's contract. Segment rotation is what keeps any newly produced file well under the ceiling, so this is an
-  upgrade-path condition only.
+  for local handling until its records expire through local retention. Goggles must reject legacy schemas even through
+  other upload paths. Segment rotation keeps newly produced files below the ceiling, so this is an upgrade-path condition.
 - The sidecar is bounded by the account's *live* audit files, not by its upload history: entries for files that are gone
-  are pruned each run. Because sealed segments are never deleted (mdk#1014), that bound still grows with cumulative
-  audit volume — each tracker run stats every enumerated file and rewrites the whole sidecar. Both costs are linear in
-  file count and small next to the HTTP request each run already makes.
+  are pruned each run. Local retention removes expired segments; each tracker run stats every enumerated file and
+  rewrites the whole sidecar. Both costs are linear in file count and small next to the HTTP request each run makes.
 
 The runtime has a coalescing uploader queue of size `1`: triggers arriving while an update is scheduled or running
 collapse into exactly one follow-up run, and two updates never upload concurrently. It schedules tracker updates after

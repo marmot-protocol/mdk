@@ -32,6 +32,8 @@ use crate::{MarmotApp, config};
 
 mod legacy_cleanup;
 pub(crate) use legacy_cleanup::cleanup_legacy_audit_logs;
+mod retention;
+pub(crate) use retention::{AUDIT_RETENTION_SWEEP_INTERVAL, cleanup_expired_audit_logs};
 
 const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
 /// Always-on, append-only per-account key-reveal audit log (mdk#543).

@@ -15,7 +15,9 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   `AUDIT_LOG_SEGMENT_MAX_BYTES` is a rename into an `audit-*-seg<NNNNNN>.jsonl` sibling that deletes and truncates
   nothing; `seq`, the recorder session id, and health counters carry across the boundary and no `recorder_started` row
   is written. Each fresh segment repeats the latest explicit `source_context` with a fresh sequence number; ordinary
-  events and sealed bytes remain unchanged. Retention and disk bounding of sealed segments belong to mdk#1014. Destructive `rotate()` — which discards the current file — stays a
+  events and sealed bytes remain unchanged during rotation. The app supplies retention cutoffs to `prune_before`;
+  prune under the writer lock, preserve retained bytes and adopt the new inode without resetting session or sequence.
+  Destructive `rotate()` — which discards the current file — stays a
   separate, explicit operation.
 - Retry failed segment rolls after bounded backoff, without requiring a recorder restart or destructive rotation.
   A failed flush must not seal buffered data. Preserve the actual writer path if rename compensation fails.

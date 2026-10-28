@@ -1761,6 +1761,7 @@ impl MarmotApp {
         let root = root.as_ref().to_path_buf();
         let lease = MarmotRootRuntimeLease::try_acquire(&root)?;
         audit_log::cleanup_legacy_audit_logs(&root);
+        audit_log::cleanup_expired_audit_logs(&root);
         let app =
             Self::with_relays_and_account_home_and_config(&root, relay_urls, account_home, config);
         *app.root_runtime_lease

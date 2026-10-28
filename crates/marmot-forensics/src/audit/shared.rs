@@ -116,6 +116,10 @@ impl ForensicRecorder for SharedRecorder {
     fn rotate(&self) -> std::io::Result<()> {
         self.read().rotate()
     }
+
+    fn prune_before(&self, cutoff_ms: u64) -> std::io::Result<()> {
+        self.read().prune_before(cutoff_ms)
+    }
 }
 
 #[cfg(test)]

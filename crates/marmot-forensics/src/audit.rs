@@ -33,6 +33,7 @@ use sha2::{Digest, Sha256};
 
 mod recovery;
 mod refusal;
+mod retention;
 mod shared;
 pub use recovery::{
     EoseRepairReceiver, EoseRepairTrigger, RECOVERY_AUDIT_MAX_ENDPOINTS,
@@ -44,6 +45,7 @@ pub use refusal::{
     SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES, SubscriptionRefusalCategory, SubscriptionRefusalEntry,
     SubscriptionRefusalOutcome, SubscriptionRefusalRoute,
 };
+pub use retention::prune_jsonl_file_before;
 pub use shared::SharedRecorder;
 
 pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
@@ -70,7 +72,7 @@ pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
 ///   still exceed the ceiling and are rejected by the upload size gate.
 ///
 /// Smaller segments would cut the residual further but multiply file count
-/// (segments are never deleted here — retention is mdk#1014); larger ones
+/// (the app owns the retention cutoff); larger ones
 /// re-inflate the residual. 1 MiB is the balance point.
 pub const AUDIT_LOG_SEGMENT_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -1640,6 +1642,13 @@ pub trait ForensicRecorder: Send + Sync {
     fn rotate(&self) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// Expire local rows before a Unix-millisecond cutoff without replacing
+    /// this recording session. Callers must fence concurrent delivery first.
+    /// Non-file recorders have nothing to expire.
+    fn prune_before(&self, _cutoff_ms: u64) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Default recorder. Drops every event without observable side effects.
@@ -1664,6 +1673,8 @@ pub struct JsonlRecorder {
     /// reopens the same path, so this is held outside the mutex.
     path: PathBuf,
     inner: Mutex<JsonlInner>,
+    /// Serialize sweeps without holding the recording lock across sealed files.
+    retention: Mutex<()>,
     /// Test seam: forces [`Self::reopen_active`] to fail, so the compensating
     /// rename-back in [`Self::roll_into_segment`] — the only step that must
     /// undo an applied rename — has a deterministic red. One-shot. There is no
@@ -1709,8 +1720,8 @@ struct JsonlInner {
     /// segment. Scanned once when absent and advanced after each sealed
     /// segment; the `exists()` probe in [`JsonlRecorder::next_segment_path`]
     /// stays the authority that no roll ever overwrites a segment, so a stale
-    /// or absent hint costs a gap in the numbering at worst. Unbounded segment
-    /// counts are mdk#1014's to bound.
+    /// or absent hint costs a gap in the numbering at worst. The app owns
+    /// the retention cutoff for old segments.
     next_segment_index: Option<u32>,
     /// Most recently explicitly recorded `AuditEventKind::SourceContext`.
     /// Retained even when the best-effort write fails so a later successful
@@ -1851,6 +1862,7 @@ impl JsonlRecorder {
         };
         let recorder = Self {
             path: path.clone(),
+            retention: Mutex::new(()),
             inner: Mutex::new(JsonlInner {
                 writer: Some(BufWriter::new(file)),
                 seq: 0,
@@ -2071,6 +2083,56 @@ impl ForensicRecorder for JsonlRecorder {
 
     fn audit_log_path(&self) -> Option<PathBuf> {
         Some(self.path.clone())
+    }
+
+    fn prune_before(&self, cutoff_ms: u64) -> std::io::Result<()> {
+        let _retention = self.retention.lock().unwrap_or_else(|p| p.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Preserve uncertain writes through the existing compensated seal
+        // before pruning. The account sweep will visit any resulting segment.
+        self.ensure_safe_writer(&mut inner)?;
+        inner.writer.as_mut().expect("active writer").flush()?;
+        if let Some((file, len)) = retention::retained_file(&inner.writer_path, cutoff_ms)? {
+            inner.active_bytes = len;
+            inner.writer = Some(BufWriter::new(file));
+            inner.repeated_source_bytes = 0;
+        }
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let prefix = format!("{}-seg", segment_base_name(&self.path));
+        let mut sealed = Vec::new();
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let Some(index) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(&prefix))
+                .and_then(|name| name.strip_suffix(".jsonl"))
+            else {
+                continue;
+            };
+            if index.len() >= 6
+                && index.bytes().all(|b| b.is_ascii_digit())
+                && index.parse::<u32>().is_ok()
+                && entry.file_type()?.is_file()
+                && path != inner.writer_path
+            {
+                sealed.push(path);
+            }
+        }
+        // These files were sealed while holding the writer lock and cannot
+        // become live again. Do not stall recording while reading old segments.
+        drop(inner);
+        let mut failure = None;
+        for path in sealed {
+            if let Err(error) = retention::prune_jsonl_file_before(&path, cutoff_ms) {
+                failure = Some(error);
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn rotate(&self) -> std::io::Result<()> {
@@ -2529,9 +2591,8 @@ impl JsonlRecorder {
     /// Nothing is deleted or truncated: the rename hands the *same inode* — and
     /// therefore every recorded byte — to the segment name. Only the latest
     /// source context is repeated, with a fresh sequence, in the new file.
-    /// Ordinary events are never replayed. Retention and disk bounding
-    /// of the sealed segments are deliberately out of scope here; they belong to
-    /// mdk#1014.
+    /// Ordinary events are never replayed. Retention runs separately through
+    /// `prune_before`, with the cutoff supplied by the app.
     ///
     /// Rotation is transparent to consumers on purpose: `seq`, the recorder
     /// session id, and the health counters carry across the boundary and no
