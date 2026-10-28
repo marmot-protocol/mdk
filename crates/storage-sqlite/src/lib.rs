@@ -119,6 +119,9 @@ pub use app::transport::prepared_group_image_upload::{
     MAX_CONSUMED_PREPARED_GROUP_IMAGE_UPLOADS, PreparedGroupImageUploadRecord,
     PreparedGroupImageUploadState,
 };
+pub use app::recovery_coverage::{
+    RecoveryCoverageProof, RecoveryCoverageProved, RecoveryCoverageRange, RecoveryCoverageSlice,
+};
 pub use app::transport::transport_reconciliation::{
     TRANSPORT_RECONCILIATION_MAX_ITEMS_PER_ROUTE, TRANSPORT_RECONCILIATION_RETENTION_SECS,
     TransportReconciliationInventory, TransportReconciliationItem, TransportReconciliationRoute,

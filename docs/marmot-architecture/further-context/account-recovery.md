@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-10-21
+updated: 2026-10-28
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -495,6 +495,53 @@ instant a raised cursor commits, and making it durable takes its own write. It i
 hand-off window the overflow tier has. The fence holds every later commit until the write
 settles, and the startup comparison over the retained window still finds what a stop there
 would lose.
+
+### 7. Coverage ledger (shadow mode)
+
+mdk#2660 replaces the obligations with a coverage ledger. Phase 2 adds the ledger beside
+them without changing behavior. Storage keeps, per route (the inbox or a group's transport
+route) and relay, the `created_at` ranges proved complete and how each was proved, plus each
+route's goal floor. Debt is the goal minus what every certifying relay covers. The recorder
+in `marmot-app` fills it from facts the owner already has:
+
+| Fact | Ledger effect |
+| --- | --- |
+| A live REQ's endpoint admitted and placed its whole original window in the current wire epoch | Live boundary covers `[since, now]` on that route and relay, unless a loss obligation is pending |
+| A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route |
+| A loss import charged new loss | Every current route loses coverage from the loss floor up (all of it when the floor is unknown); goals widen to the floor |
+| A startup incremental or explicit history request | Every current route's goal widens to the retained window (explicit: unbounded, pruned to the window) |
+| A pending epoch gap | The group's routes' goals widen to the retained window |
+| Every settlement | Coverage and goals below the retained window are pruned |
+
+At settlement the recorder compares the ledger with every pending obligation's scopes and logs
+aggregate counts: scopes owed or proved by both, scopes the obligation still owes that the
+ledger proved (ledger ahead), scopes the obligation proved that the ledger has not (ledger
+behind), and current routes with ledger debt that no pending scope covers. Known-event and
+maintenance-boundary scopes are not comparable. On the normal catch-up path (live boundaries,
+a bounded loss, a certified pass) the two agree at every step.
+
+Known disagreements, expected until later phases remove their cause:
+
+- **Certificates wiped by an unrelated loss.** A new loss bumps the account-wide loss revision
+  and clears every scope's certificates; the ledger keeps coverage below the loss floor.
+  Scopes whose windows end below the floor show as ledger ahead. Phase 4 deletes the global
+  invalidation.
+- **Native goals rewritten per wire generation and process start.** A new generation or session
+  nonce writes a fresh `SubscriptionReplay` goal with no proof; the ledger keeps the earlier
+  generation's live coverage and any comparison over the same window. Ledger ahead until the
+  new generation's boundary is admitted.
+- **Unbounded loss goals.** A loss with no known floor never certifies and parks; the ledger
+  prunes below the retained window, so once that window is covered the ledger is ahead.
+- **Dismissed loss.** A dismissal retires the obligation without coverage. The ledger keeps the
+  debt until a live boundary or comparison covers it, counted as unowed debt; for queue loss
+  the next live boundary re-covers the range, because queue loss does not start a new wire
+  generation.
+- **Relay caps are not checked.** The adapter reports an admitted boundary, not how many
+  stored events the relay returned against its cap, so a silently capped live REQ counts as
+  covered. Phase 3 reads NIP-11 `max_limit` and counts each slice.
+- **Required relays only.** A certificate is recorded for the route's required relays, and a
+  scope is compared on its required relays; a scope with none is not comparable. Live
+  boundaries are recorded for every endpoint that admitted one.
 
 ## What gets deleted
 

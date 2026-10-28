@@ -27,7 +27,7 @@ pub enum TransportReconciliationRoute {
 }
 
 impl TransportReconciliationRoute {
-    fn storage_key(&self) -> (i64, &[u8]) {
+    pub(crate) fn storage_key(&self) -> (i64, &[u8]) {
         match self {
             Self::Inbox => (INBOX_ROUTE_KIND, &[]),
             Self::Group(route_id) => (GROUP_ROUTE_KIND, route_id),

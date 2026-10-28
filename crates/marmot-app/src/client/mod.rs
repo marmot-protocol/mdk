@@ -77,6 +77,7 @@ mod projection;
 mod push;
 mod receipts;
 pub(crate) mod recovery;
+mod recovery_coverage;
 mod retention;
 mod sync;
 #[cfg(test)]

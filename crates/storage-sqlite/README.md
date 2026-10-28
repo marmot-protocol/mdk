@@ -248,6 +248,15 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   flag, preserving populated obligations, loss evidence, retry state, receipts, maintenance, inventory, and cursors.
   Unexpected duplicate explicit rows make migration fail atomically; no demand is silently discarded. Later
   migrations add stall observations, recovery comparison, the loss `created_at` bound, and history notices.
+- **Coverage ledger (`recovery_coverage.rs`, migration 0123, mdk#2660).** Per route (the inbox or a group's transport
+  route) and relay, the inclusive `created_at` ranges proved complete, each with its proof (live boundary, comparison
+  certificate, sweep slice, re-check), plus each route's goal floor. `record_recovery_coverage` is the one write entry
+  point for a covered `(route, relay, since, until, proof)` slice; it merges overlapping or touching ranges of the same
+  route, relay and proof and keeps the oldest proof time. Coverage on a route is what every given relay covers, merged
+  across proofs. Debt is the goal floor up to a caller-given time minus that coverage; a route without a goal owes
+  nothing. `uncover_recovery_coverage` drops only the given routes' coverage from a loss floor upward and widens their
+  goals to it. `prune_recovery_coverage` drops coverage below the retention floor and raises goals to it. The ledger
+  is in shadow mode: no obligation, retry, fence or schedule reads it.
 
 ## Tests and benchmarks
 

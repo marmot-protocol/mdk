@@ -279,6 +279,12 @@ pub fn same_relay(left: &str, right: &str) -> bool {
         )
 }
 
+/// One spelling per relay, so endpoint strings from different layers can key
+/// one ledger row: the parsed URL, or the trimmed input when it does not parse.
+pub fn canonical_relay(endpoint: &str) -> String {
+    RelayUrl::parse(endpoint.trim()).map_or_else(|_| endpoint.trim().to_owned(), |url| url.to_string())
+}
+
 /// The endpoints whose comparison certifies a recovery scope, chosen from the
 /// ones recovery may contact (`admitted`): the route's operated relays. Any
 /// other relay is best effort and never blocks completion. A route with no
