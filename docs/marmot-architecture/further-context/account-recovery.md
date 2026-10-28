@@ -91,7 +91,15 @@ The simulator comes first; Jeff validates on a phone.
      retry pacing reaches its cap. A quiet comparison starts this count over. Offline
      passes, local deadline cuts, unsupported backends and refused admission count nothing.
      A relay that answered but could not hand over a claimed event, or whose events were
-     not durably admitted, still answered and can spend the quiet budget.
+     not durably admitted, still answered and can spend the quiet budget. An owner capture
+     the cutoff cancelled, or one gone stale, is a local deadline cut too: it counts
+     nothing toward a native goal's budget, though pacing still backs off.
+   - As a safety net, an obligation also parks after 24 reserved attempts in a row without
+     progress (mdk#2660), whatever its streaks say. Progress on any scope, or the obligation
+     completing or being retired, starts the count over. A native goal's re-arm for a new
+     wire generation, a process open and a route-policy change keep both the count and a
+     goal this cap parked; new loss or epoch evidence gets it one more attempt. Hitting the
+     cap is logged as its own `park_capped_recovery` warning.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
    a cap.
 3. **Required relays are the relays we operate.** `MarmotDeployment::recovery_operated_relays`
@@ -130,6 +138,8 @@ process-monotonic wire generation to identify the current goal. It freezes sourc
 comparison job and uses that job's recovery credit and cancellation.
 Native capture and comparison run concurrently under that grant's cutoff. A quiet native REQ cannot consume
 the whole pass before comparison starts; both remain owned until cancellation and IO cleanup finish.
+A native goal's window has no upper bound, but only input created before the attempt started can reset retry
+pacing, so live traffic during an attempt cannot hold the backoff at its floor.
 Neither the adapter nor the relay plane selects retries or runs a quiet-period repair timer.
 
 All native group input, including local publication fanout and post-EOSE live tails, uses the owner's ordered admission path rather than
@@ -695,8 +705,9 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   gaps retain separate loss evidence. A capture cut by its comparison deadline, or failed,
   discards its own pages without new loss: they re-fetch a window the pending obligation
   still owes, and a new loss would wipe that obligation's scope certificates so it could
-  never finish. A reconnect, refusal or removal that discards them keeps the loss, since
-  the source can then be admitted without the capture. See design section 0 for the
+  never finish. That loss is deferred on the source, not dropped: a finished capture clears
+  it, and a reconnect, refusal, removal or execution failure records it, since the source
+  can then be admitted or retired without the capture. See design section 0 for the
   limited native predicate.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
