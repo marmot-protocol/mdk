@@ -84,6 +84,16 @@ equality, and backends without mutation tracking use the synchronous evaluator. 
 scratch work while durable input remains available. Explicit-time convergence entry points and foreground preflight
 keep their existing semantics.
 
+**Own-commit recovery.** Selection and application reconstruct confirmed local commits through the same
+commit-addressed checkpoints, including local commits after remote commits. Before restoring a checkpoint, replay
+authenticates its public commit against the reconstructed source state and checks the checkpoint's resulting epoch
+and authenticator. This also covers pathless public commits. Own private commits are refused: OpenMLS's
+`OwnPrivateMessage` classification does not authenticate their content or source context. Bounded background
+advances can settle retained public branches without reopening the engine. A missing own checkpoint blocks
+reconstruction; the convergence coordinator reports a durable `Unrecoverable` halt rather than silently losing that
+branch. Recovery still requires retained source state; neither a checkpoint nor a peer's higher epoch recovers pruned
+keys.
+
 **Buffered application handoff.** A frozen convergence batch can advance one epoch beyond its admission ceiling.
 Already-unwrapped applications at that new tip remain durable input even when no commit can open another pass.
 Background advancement drains them against the stable canonical state after convergence and deferred peeling finish,
