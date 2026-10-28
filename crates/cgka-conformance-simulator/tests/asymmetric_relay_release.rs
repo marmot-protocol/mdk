@@ -25,8 +25,11 @@ use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::MessageId;
 
-/// marmot-app's `EPOCH_STALL_BACKFILL_THRESHOLD`: undecryptable events at one
-/// stalled epoch before the app arms an account-wide full-history backfill.
+/// Events the gap-commit test defers. Eight is marmot-app's crate-private
+/// `EPOCH_STALL_BACKFILL_THRESHOLD` when this was written: that many
+/// undecryptable events at one epoch arm an account-wide full-history backfill.
+/// These tests run the engine only, so they pin the deferral, not the app's
+/// threshold.
 const STALL_BACKFILL_THRESHOLD: usize = 8;
 /// The engine's past-epoch window (`DEFAULT_MAX_PAST_EPOCHS`).
 const PAST_EPOCHS: usize = 5;

@@ -672,7 +672,8 @@ These are real simulator scenarios that are still tied to Rust harness details.
   commit A lacks, a rival commit at the same epoch, or the longer branch of a partition fork.
 - Expected: a late application message opens up to five epochs back and not six; a late sender message opens up to 99
   generations behind that sender's last decrypted message and not 100; every A event behind a commit only B holds is
-  deferred (eight are enough to arm the app's stall backfill) and opens once the commit arrives; a late rival commit,
+  deferred and opens once the commit arrives (the test defers eight, marmot-app's stall-backfill threshold when written;
+  the app layer itself is not exercised); a late rival commit,
   and a fork whose losing branch is five commits deep, are adjudicated as the online members did.
 - Sweeps: ignored tests walk each window and assert where it flips, including the sender ratchet's 1,000-generation
   forward distance, the deferred-peel row cap (with `test-policy-overrides`), and chain recovery stranding events 32
