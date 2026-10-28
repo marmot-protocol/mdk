@@ -468,10 +468,12 @@ async fn new_loss_during_a_pass_supersedes_it() {
 
 #[test]
 fn cursor_rows_record_settled_advances_and_only_large_live_promotions() {
-    crate::tests::run_composed_app_runtime_test("recovery-audit-cursor", || async {
+    // Each step asserts what one commit persisted, and a seal that finds the
+    // adapter's state lock taken defers its commit. On one thread no other
+    // task runs between a commit's readiness read and its seal.
+    crate::tests::run_composed_app_runtime_test_on_one_thread("recovery-audit-cursor", || async {
         let mut fixture = crate::tests::LiveCursorFixture::open_audited().await;
-        // Each step asserts what one commit persisted, and nothing below
-        // issues a REQ.
+        // Nothing below issues a REQ.
         fixture.stop_eose_pump().await;
         let cursor_before = fixture.cursor_before;
         // A live promotion within the rebuild lookback writes no row.

@@ -13619,9 +13619,11 @@ impl LiveCursorFixture {
     /// Stop the scripted EOSE pump, which [`Self::open`] leaves running after
     /// every subscription is past end-of-stored-events. A cursor seal reads
     /// replay admission without waiting and defers its commit while the
-    /// adapter's state lock is contended, and each of the pump's repeat
-    /// reports takes that lock. A test that asserts what one commit persists
-    /// stops it first; a REQ issued afterwards never reaches EOSE.
+    /// adapter's state lock is taken, and each of the pump's repeat reports
+    /// takes that lock. A REQ issued afterwards never reaches EOSE. Other
+    /// tasks, such as the replay supervisor, still take the lock, so a test
+    /// that asserts what one commit persists also runs on one thread, where
+    /// none of them runs between the commit's readiness read and its seal.
     pub(crate) async fn stop_eose_pump(&mut self) {
         self._eose.0.abort();
         let _ = (&mut self._eose.0).await;
