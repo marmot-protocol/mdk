@@ -371,14 +371,14 @@ async fn newer_loss_voids_a_pending_obligations_certificates() {
     assert_eq!(voided.disagreements(), 0, "{voided:?}");
 }
 
-/// A loss with no known time owes every retained second, not history from
-/// the epoch: once the ledger proves the retained window while the
-/// obligation still owes it, the report says the ledger is ahead.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unknown_loss_floor_is_owed_from_the_retention_floor() {
+/// A loss with no known time, or one older than the retained window, owes
+/// every retained second, not history the ledger has pruned: once the ledger
+/// proves the retained window while the obligation still owes it, the report
+/// says the ledger is ahead.
+async fn retained_window_proof_puts_the_ledger_ahead(floor: Option<u64>) {
     let mut fixture = fixture().await;
     let app = fixture.storage.app_storage();
-    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), None)
+    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), floor)
         .unwrap();
     let _grant = authorize(&mut fixture.client).await;
     let loss = app
@@ -387,12 +387,16 @@ async fn unknown_loss_floor_is_owed_from_the_retention_floor() {
         .into_iter()
         .find(|demand| demand.cause == RecoveryCause::QueueLoss)
         .expect("the loss is owed");
+    let retained = unix_now_seconds() - TRANSPORT_RECONCILIATION_RETENTION_SECS;
     assert!(
         app.recovery_scope_snapshots(loss.ticket.id)
             .unwrap()
             .iter()
-            .any(|scope| scope.plan.since_seconds.is_none()),
-        "the loss's scopes have no floor"
+            .any(|scope| scope
+                .plan
+                .since_seconds
+                .is_none_or(|since| since < retained)),
+        "the loss's scopes start below the retained window"
     );
     let owed = report(&fixture).await;
     assert!(owed.agree_owed >= 2, "{owed:?}");
@@ -416,4 +420,15 @@ async fn unknown_loss_floor_is_owed_from_the_retention_floor() {
     let ahead = report(&fixture).await;
     assert!(ahead.ledger_ahead >= 2, "{ahead:?}");
     assert_eq!(ahead.agree_owed, 0, "{ahead:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_loss_floor_is_owed_from_the_retention_floor() {
+    retained_window_proof_puts_the_ledger_ahead(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loss_floor_older_than_retention_is_owed_from_the_retention_floor() {
+    let floor = unix_now_seconds() - TRANSPORT_RECONCILIATION_RETENTION_SECS - 86_400;
+    retained_window_proof_puts_the_ledger_ahead(Some(floor)).await;
 }

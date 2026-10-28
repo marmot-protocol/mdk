@@ -519,8 +519,8 @@ aggregate counts: scopes owed or proved by both, scopes the obligation still owe
 ledger proved (ledger ahead), scopes the obligation proved that the ledger has not (ledger
 behind), and current routes with ledger debt that no pending scope covers. A scope holds proof
 only as completion would count it: its predicate over checkpoints captured at the account's
-current loss, route and inventory revisions and the obligation's own revision. A scope with no
-floor is owed from the retained window's floor. Known-event and maintenance-boundary scopes are
+current loss, route and inventory revisions and the obligation's own revision. A scope whose
+floor is unknown or older than the retained window is owed from that window's floor. Known-event and maintenance-boundary scopes are
 not comparable. On the normal catch-up path (live boundaries,
 a bounded loss, a certified pass) the two agree at every step.
 
@@ -539,8 +539,9 @@ Known disagreements, expected until later phases remove their cause:
   generation's live coverage and any comparison over the same window. Ledger ahead until the
   new generation's boundary is admitted.
 - **Unbounded loss goals.** A loss with no known floor never certifies and parks; the ledger
-  prunes below the retained window and the comparison owes such a scope from that window's
-  floor, so once the window is covered the ledger is ahead.
+  prunes below the retained window and the comparison owes such a scope, or one whose floor
+  is older than the window, from that window's floor, so once the window is covered the
+  ledger is ahead.
 - **Dismissed loss.** A dismissal retires the obligation without coverage. The ledger keeps the
   debt until a live boundary or comparison covers it, counted as unowed debt; for queue loss
   the next live boundary re-covers the range, because queue loss does not start a new wire

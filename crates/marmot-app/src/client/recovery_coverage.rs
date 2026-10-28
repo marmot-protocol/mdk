@@ -435,8 +435,9 @@ impl AppClient {
                     continue;
                 };
                 report.scopes_compared += 1;
-                // An unknown floor owes everything still retained.
-                let since = scope.plan.since_seconds.unwrap_or(floor);
+                // The ledger keeps nothing below the retained window: an
+                // older or unknown floor owes everything still retained.
+                let since = scope.plan.since_seconds.unwrap_or(floor).max(floor);
                 let until = scope.plan.until_seconds.min(now);
                 let ledger = app.recovery_coverage_covers(
                     &route,
