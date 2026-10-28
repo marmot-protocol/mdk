@@ -23717,6 +23717,90 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_convergence_pass_owes_hosts_one_notice_per_change() {
+    use cgka_traits::convergence_pass::{
+        ConvergencePassPhase, ConvergencePassRetry, ConvergencePassStep, DurableConvergencePass,
+    };
+    use cgka_traits::storage::ConvergencePassStorage;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("parked", &[]).await.unwrap();
+    let epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    assert!(client.take_convergence_park_notices().is_empty());
+    // A frozen batch whose budget ran out (mdk#2684), however it got there.
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .put_convergence_pass(&DurableConvergencePass {
+            group_id: group_id.clone(),
+            generation: 1,
+            phase: ConvergencePassPhase::Frozen,
+            base_epoch: cgka_traits::EpochId(epoch),
+            clock_instance_id: 0,
+            opened_monotonic_ms: 0,
+            quiescence_deadline_monotonic_ms: 0,
+            absolute_deadline_monotonic_ms: 0,
+            opened_wall_ms: 0,
+            quiescence_deadline_wall_ms: 0,
+            absolute_deadline_wall_ms: 0,
+            members: Vec::new(),
+            frozen_at_wall_ms: Some(0),
+            cutoff_cause: None,
+            fairness_slot_available: false,
+            retry: Some(ConvergencePassRetry {
+                failed_attempts: 12,
+                failed_step: ConvergencePassStep::Apply,
+                next_attempt_monotonic_ms: 0,
+                next_attempt_wall_ms: 0,
+                parked_at_wall_ms: Some(0),
+            }),
+        })
+        .unwrap();
+
+    let mut notices = Vec::new();
+    for _ in 0..2 {
+        assert!(matches!(
+            client.convergence_schedule_state(&group_id).unwrap(),
+            crate::ConvergenceScheduleState::Idle
+        ));
+        notices.push(client.take_convergence_park_notices());
+    }
+    assert_eq!(
+        notices,
+        [vec![group_id.clone()], Vec::new()],
+        "the park is announced once, whichever schedule read sees it"
+    );
+    assert!(
+        client
+            .group_mls_state(&group_id)
+            .unwrap()
+            .convergence_parked
+    );
+
+    storage.delete_convergence_pass(&group_id).unwrap();
+    let mut notices = Vec::new();
+    for _ in 0..2 {
+        client.convergence_schedule_state(&group_id).unwrap();
+        notices.push(client.take_convergence_park_notices());
+    }
+    assert_eq!(
+        notices,
+        [vec![group_id.clone()], Vec::new()],
+        "leaving the park is announced once too"
+    );
+    assert!(
+        !client
+            .group_mls_state(&group_id)
+            .unwrap()
+            .convergence_parked
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn voluntary_left_classification_survives_reopen_but_resets_on_rejoin() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())

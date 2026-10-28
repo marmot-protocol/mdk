@@ -210,13 +210,18 @@ pub(crate) fn normalize_convergence_pass_for_runtime(
     }
     if pass.phase != ConvergencePassPhase::Collecting {
         // A frozen batch keeps one process-local instant: the next attempt
-        // after a failure. Rebase it like the cutoffs below.
+        // after a failure. Rebase it from its wall twin, never waiting longer
+        // than the delay that failure was granted, so a wall clock stepped
+        // back cannot stretch the backoff.
         let Some(retry) = pass.retry.as_mut() else {
             return false;
         };
-        retry.next_attempt_monotonic_ms = now
-            .monotonic_ms
-            .saturating_add(retry.next_attempt_wall_ms.saturating_sub(now.wall_ms));
+        let remaining = retry
+            .next_attempt_wall_ms
+            .saturating_sub(now.wall_ms)
+            .min(convergence_pass_retry_delay_ms(retry.failed_attempts));
+        retry.next_attempt_monotonic_ms = now.monotonic_ms.saturating_add(remaining);
+        retry.next_attempt_wall_ms = now.wall_ms.saturating_add(remaining);
         pass.clock_instance_id = convergence_clock_instance_id;
         return true;
     }

@@ -774,6 +774,11 @@ pub struct AppClient {
     pub(crate) pending_group_projection_updates: HashSet<String>,
     /// Recovery status has its own notification queue; saving a projection must not consume it.
     pub(crate) pending_recovery_status_updates: HashSet<GroupId>,
+    /// Groups whose convergence pass hosts were last told is parked (mdk#2684).
+    /// A park or an un-park against this set owes the host a group-state notice.
+    pub(crate) announced_convergence_parks: HashSet<GroupId>,
+    /// Groups owed that notice; the account worker publishes them each turn.
+    pub(crate) pending_convergence_park_notices: HashSet<GroupId>,
     /// The parked recovery set as last announced to hosts ("history may be
     /// incomplete"): one small entry per parked occurrence, compared at each
     /// publication seam so a change raises `HistoryNoticesChanged`.
@@ -3506,6 +3511,8 @@ impl AppClient {
         self.pending_local_group_deletion_frontier_clears
             .remove(&group_hex);
         self.pending_recovery_status_updates.remove(group_id);
+        self.announced_convergence_parks.remove(group_id);
+        self.pending_convergence_park_notices.remove(group_id);
         self.pending_projection_updates
             .retain(|update| update.group_id_hex != group_hex);
         self.pending_welcome_delivery_events

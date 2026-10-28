@@ -209,11 +209,16 @@ impl FailingCatchUp {
     /// Drop Carol's engine and open a new one on the same storage, on a new
     /// process-local clock whose wall time has moved on by `elapsed_wall_ms`.
     fn restart(&mut self, elapsed_wall_ms: u64) {
+        let wall_ms = self.clock.now().wall_ms.saturating_add(elapsed_wall_ms);
+        self.restart_at_wall(wall_ms);
+    }
+
+    /// [`Self::restart`] onto an arbitrary wall time, earlier ones included.
+    fn restart_at_wall(&mut self, wall_ms: u64) {
         // Hydration writes no failed batch; keep its record writes out of
         // the attempt count.
         let armed = self.fault.remaining();
         self.fault.arm(0);
-        let wall_ms = self.clock.now().wall_ms.saturating_add(elapsed_wall_ms);
         self.clock = ManualConvergenceClock::new(7_000, wall_ms);
         self.carol = build_carol(
             &self.label,
@@ -512,6 +517,16 @@ async fn a_failed_pass_keeps_its_backoff_and_park_across_a_restart() {
     case.clock.advance_ms(remaining);
     assert!(case.attempt().is_err());
     assert_eq!(case.retry().unwrap().failed_attempts, 3);
+
+    // A wall clock stepped back an hour across a restart waits no longer than
+    // the delay the failure was granted.
+    let third_delay = 4 * CONVERGENCE_PASS_RETRY_BASE_MS;
+    let wall_ms = case.clock.now().wall_ms - 60 * 60 * 1_000;
+    case.restart_at_wall(wall_ms);
+    assert_eq!(case.scheduled_delay_ms(), Some(third_delay));
+    case.clock.advance_ms(third_delay);
+    assert!(case.attempt().is_err());
+    assert_eq!(case.retry().unwrap().failed_attempts, 4);
 
     case.fail_until_parked();
     let failures = ALWAYS - case.fault.remaining();

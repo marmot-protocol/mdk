@@ -2045,6 +2045,8 @@ impl MarmotApp {
             pending_seen_event_count: 0,
             pending_group_projection_updates: std::collections::HashSet::new(),
             pending_recovery_status_updates: std::collections::HashSet::new(),
+            announced_convergence_parks: std::collections::HashSet::new(),
+            pending_convergence_park_notices: std::collections::HashSet::new(),
             history_notice_baseline: None,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),

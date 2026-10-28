@@ -2122,6 +2122,16 @@ async fn run_app_runtime_account_worker(
         );
         schedule_push_work_after_turn(&mut client, &mut scheduled_push_retry, &command_tx);
         schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+        // Whichever seam parked or woke a convergence pass (mdk#2684), its
+        // schedule read above queued the notice.
+        for group_id in client.take_convergence_park_notices() {
+            publish_app_runtime_group_state_updated(
+                &events,
+                &account_id_hex,
+                &account_label,
+                &group_id,
+            );
+        }
         let ready_command =
             ready_command_index(&pending, &media_http, comparison_recovery.is_some());
         #[cfg(test)]
@@ -2505,15 +2515,10 @@ async fn run_app_runtime_account_worker(
                                             account_error_message("scheduled convergence failed", &err),
                                         );
                                         // A failure that spent the pass's budget
-                                        // parks it (mdk#2684); hosts re-read the
-                                        // group to show that.
-                                        if client.convergence_pass_parked(&group_id).unwrap_or(false) {
-                                            publish_app_runtime_group_state_updated(
-                                                &events,
-                                                &account_id_hex,
-                                                &account_label,
-                                                &group_id,
-                                            );
+                                        // parks it (mdk#2684); the next turn
+                                        // tells hosts to re-read the group.
+                                        if let Ok(parked) = client.convergence_pass_parked(&group_id) {
+                                            client.note_convergence_park(&group_id, parked);
                                         }
                                     }
                                 }

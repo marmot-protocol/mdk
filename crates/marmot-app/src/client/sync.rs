@@ -891,6 +891,26 @@ impl AppClient {
         Ok(self.runtime.convergence_pass_parked(group_id)?)
     }
 
+    /// Record whether `group_id`'s convergence pass is parked, owing hosts a
+    /// group-state notice when that changed since they last heard (mdk#2684).
+    /// Every entry point that can spend the budget re-reads the schedule, so
+    /// the notice does not depend on which one parked it.
+    pub(crate) fn note_convergence_park(&mut self, group_id: &cgka_traits::GroupId, parked: bool) {
+        let changed = if parked {
+            self.announced_convergence_parks.insert(group_id.clone())
+        } else {
+            self.announced_convergence_parks.remove(group_id)
+        };
+        if changed {
+            self.pending_convergence_park_notices
+                .insert(group_id.clone());
+        }
+    }
+
+    pub(crate) fn take_convergence_park_notices(&mut self) -> Vec<cgka_traits::GroupId> {
+        self.pending_convergence_park_notices.drain().collect()
+    }
+
     /// Engine-derived convergence scheduling state for one group.
     ///
     /// Errors propagate: a storage or engine failure must schedule a retry at
@@ -906,6 +926,8 @@ impl AppClient {
             return Ok(ConvergenceScheduleState::Idle);
         }
         let convergence_delay = self.runtime.prepare_convergence_cutoff_delay_ms(group_id)?;
+        let parked = self.runtime.convergence_pass_parked(group_id)?;
+        self.note_convergence_park(group_id, parked);
         match convergence_delay {
             Some(0) => Ok(ConvergenceScheduleState::Ready),
             Some(remaining_ms) => {
@@ -920,7 +942,7 @@ impl AppClient {
                 }
             }
             None => {
-                if self.runtime.convergence_pass_parked(group_id)? {
+                if parked {
                     // A parked pass waits for new input or an explicit retry
                     // and gates every other arm below (mdk#2684). Waking it
                     // would only re-read the park; already-staged
