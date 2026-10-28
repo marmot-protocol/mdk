@@ -1010,9 +1010,10 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// A failed batch is resolved from the same members on every attempt, so a
     /// deterministic failure repeats until the input changes. A commit or a
-    /// proposal from the pass's horizon or beyond is such a change; an
+    /// proposal that the reseeded batch would hold is such a change; an
     /// application is not, or a busy group's traffic would keep a failing batch
-    /// retrying. Reopening is the stale-base discard's repair: the batch holds no
+    /// retrying, and neither is input outside the pass's horizon, which the
+    /// reseed leaves out. Reopening is the stale-base discard's repair: the batch holds no
     /// canonical state, and its members reseed into a collecting pass with a
     /// fresh failure count. Returns whether a pass was reopened.
     fn reopen_failed_convergence_pass_for_input(
@@ -1037,16 +1038,29 @@ impl<S: StorageProvider> Engine<S> {
             .base_epoch
             .0
             .saturating_sub(policy.convergence.max_rewind_commits);
+        let ceiling = pass
+            .base_epoch
+            .0
+            .saturating_add(policy.convergence.max_rewind_commits);
         if !matches!(
             candidate.member.role,
             ConvergencePassMemberRole::CommitEdge | ConvergencePassMemberRole::ProposalDependency
         ) || candidate.member.source_epoch < floor
+            || candidate.member.source_epoch > ceiling
         {
             return Ok(false);
         }
         let (members, has_trigger) =
             self.seed_convergence_pass_members(&pass.group_id, pass.base_epoch, policy)?;
-        if members.is_empty() || !has_trigger {
+        // Input the new batch would not hold leaves it as the failed one, so
+        // it must not buy a fresh budget.
+        if !members
+            .iter()
+            .any(|member| &member.message_id == message_id)
+        {
+            return Ok(false);
+        }
+        if !has_trigger {
             self.storage
                 .delete_convergence_pass(&pass.group_id)
                 .map_err(storage_projection_error)?;

@@ -123,7 +123,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     keeps live rows, queued intents and pending app output on SQLite and on the generic rewind, including when a
     write fails part way through the generic one (mdk#2330). `record_write_atomicity/convergence_pass_retry.rs`: a
     frozen batch whose apply keeps failing backs off and parks after its budget, reopens on a commit it does not hold
-    but not on application traffic, takes one explicit retry, and keeps its count, delay and park across a restart
+    but not on application traffic or input beyond its horizon, takes one explicit retry, and keeps its count, delay and park across a restart
     (mdk#2684)
 
 - **File:** `apply_history_cost.rs`

@@ -88,6 +88,7 @@ struct FailingCatchUp {
     audit_path: PathBuf,
     _audit_dir: tempfile::TempDir,
     group_id: GroupId,
+    alice: cgka_engine::Engine<SqliteAccountStorage>,
     invite_david: TransportMessage,
     app_at_two: TransportMessage,
     invite_eve: TransportMessage,
@@ -161,6 +162,7 @@ async fn failing_catch_up(label: &str) -> FailingCatchUp {
         audit_path,
         _audit_dir: audit_dir,
         group_id,
+        alice,
         invite_david,
         app_at_two,
         invite_eve,
@@ -412,6 +414,29 @@ async fn new_commit_input_reopens_a_parked_pass_and_an_application_does_not() {
         ]
     );
     assert_eq!(case.carol.epoch(&case.group_id).unwrap(), EpochId(3));
+}
+
+#[tokio::test]
+async fn input_beyond_the_pass_horizon_leaves_a_parked_pass_parked() {
+    let mut case = failing_catch_up("retry-horizon").await;
+    case.fault.arm(ALWAYS);
+    case.fail_until_parked();
+    case.fault.arm(0);
+
+    // Alice is at epoch 3. Her commit from epoch 7 lies past the horizon of
+    // Carol's epoch-1 batch, so a reseed would leave it out and rebuild the
+    // same failing batch.
+    let mut far_commit = None;
+    for _ in 3..=7 {
+        far_commit = Some(next_routed_commit(&mut case.alice, &case.group_id).await);
+    }
+    let far_commit = far_commit.unwrap();
+    case.carol.ingest(far_commit).await.unwrap();
+
+    assert!(case.carol.convergence_pass_parked(&case.group_id).unwrap());
+    let retry = case.retry().unwrap();
+    assert_eq!(retry.failed_attempts, CONVERGENCE_PASS_PARK_AFTER_FAILURES);
+    assert!(retry.is_parked());
 }
 
 #[tokio::test]

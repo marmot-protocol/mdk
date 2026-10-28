@@ -302,7 +302,7 @@
 - A convergence pass that fails after its decision no longer replays its
   batch on every scheduled advance, send and inbound commit (mdk#2684). Each
   failed attempt waits 1 s, doubling to 5 min, before the next; after 12 in a
-  row the pass parks until a commit or proposal it does not hold arrives or
+  row the pass parks until a commit or proposal it can take in arrives or
   the user retries. Count, delay and park survive a restart. Live application
   traffic does not wake it, and other groups keep their turns meanwhile.
 
