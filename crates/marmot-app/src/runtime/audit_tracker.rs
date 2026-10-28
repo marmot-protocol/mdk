@@ -10,11 +10,10 @@ use tokio::task::JoinHandle;
 
 use super::{AuditOtlpAttemptOutcome, send_audit_otlp_once_for_app};
 use super::{RuntimeLifecycle, runtime_shutdown_requested, wait_for_runtime_shutdown};
-use crate::audit_log::{
-    AUDIT_LOG_UPLOAD_MAX_BYTES, AuditOtlpTrackerResult, AuditUploadAttempt, AuditUploadOutcome,
-};
+use crate::audit_log::{AuditOtlpTrackerResult, AuditUploadAttempt};
 use crate::audit_otlp_sender::AuditOtlpSendResult;
 use crate::audit_otlp_sender::AuditOtlpSender;
+use crate::audit_upload::{AUDIT_LOG_UPLOAD_MAX_BYTES, AuditUploadOutcome};
 use crate::{
     AppError, AuditLogFile, AuditLogTrackerConfig, AuditLogTrackerUpdateResult, MarmotApp,
 };
@@ -549,9 +548,8 @@ async fn post_audit_log_tracker_update(
                 // and keep going so it never wedges the other files.
                 //
                 // There is no app-level escape hatch: `post_audit_log_file`
-                // enforces the same ceiling before it opens a body
-                // (`audit_log.rs`, pinned by
-                // `post_audit_log_file_rejects_oversized_files_before_upload`),
+                // enforces the same ceiling before it reads a body
+                // (`AuditUploadSnapshot::capture` in `audit_upload.rs`),
                 // so a file this size is not transferable through any app API.
                 // It stays on disk for manual handling, and deleting it belongs
                 // to mdk#1014.

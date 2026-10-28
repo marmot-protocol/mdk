@@ -126,6 +126,31 @@ components than the build supports:
 Maintenance only refreshes leaves. Requiring a component in a group is a separate admin step, and nothing here does
 it.
 
+## This device's KeyPackage slot
+
+Each device keeps one KeyPackage in its own slot and replaces it in place
+(`foundation/key-packages.md`, "Refreshing a slot"):
+
+- **Lifetime.** A fresh KeyPackage is valid for 30 days plus an hour of clock-skew margin. Receivers still accept the
+  84-day validity limit, so KeyPackages from other clients keep working.
+- **When it is replaced.** After a Welcome consumes it, when the KeyPackage no longer advertises what this build
+  supports, and at least every 7 days while the runtime runs, always before it expires. The weekly refresh is due at a
+  random time 6 to 7 days after publication, stored with the lifecycle so a restart keeps it. `run_due_maintenance`
+  does the work; account open does not wait for it.
+- **Superseded KeyPackages.** An inviter may already hold the old KeyPackage, so its private key stays for 24 hours
+  after the replacement's publication is confirmed, or until it expires if that is sooner. A KeyPackage a Welcome
+  consumed is kept for 24 hours after it was replaced, without waiting for a confirmed replacement. A retained
+  KeyPackage keeps its publication id, so a Welcome must still name it.
+- **Artifacts it can no longer send.** A publisher reports a signed KeyPackage it will never send (for example one an
+  earlier build signed with a client name over 64 bytes) as `artifact_unusable`. The runtime then replaces it with a
+  freshly signed KeyPackage in the same slot instead of retrying it until it expires. Each build does this at most
+  once, so a publisher that refuses its own artifacts cannot make it generate a KeyPackage per attempt.
+- **Stopping publication.** At sign-out, `withdraw_key_package_slot` asks the slot's relays to delete it, naming only
+  this device's slot, so the account's other devices keep theirs. The runtime records the withdrawal before sending it
+  and publishes nothing more into the slot. A request no relay accepts is undone and returned as an error. The next
+  runtime for the account republishes into the slot with a newer timestamp; a replacement prepared before the
+  withdrawal is never published after it.
+
 ## KeyPackage generator upgrades
 
 The lifecycle records the KeyPackage generator revision independently of app versions. Records written before revision
@@ -136,7 +161,7 @@ Embedders that use `AccountDeviceRuntime` directly must drive maintenance themse
 - Fresh private material, its revision, and replacement intent are stored atomically before signing/publication.
 - Only a relay acknowledgement promotes the current revision; remaining targets keep their existing fanout retries.
 - An old pending replacement is superseded with a strictly newer authoring timestamp in the same stable slot. Its
-  private bundle is retained until expiry, because publication may already have occurred.
+  private bundle is retained like any superseded KeyPackage, because publication may already have occurred.
 - Previous unused current bundles keep their existing expiry/consumption policy.
 - Ordinary releases do not bump the generator revision.
 - Paused maintenance can finish a prepared current-revision publication, but waits for resume before replacing an
@@ -169,12 +194,14 @@ steps, bypass required publication barriers, or guarantee zero network delay or 
 
 ```sh
 cargo test -p marmot-session
+cargo test -p marmot-session --features test-policy-overrides   # also groups that require account-devices
 ```
 
 - `tests/runtime.rs` plus `tests/runtime/` — the account-device runtime over a real session and a scripted transport:
   transport activation, KeyPackage publication, rotation and retention, Welcome publication, durable maintenance,
   publish confirmation and rollback, frozen fanouts and relay retries, KeyPackage generator upgrades, app-component
-  migration, and each device of an account joining only through the Welcome delivery that names its own KeyPackage.
+  migration, and each device of an account joining only through the Welcome delivery that names its own KeyPackage,
+  including, in a group that requires account-devices, a Welcome from another device of the account.
 - `tests/session_lifecycle.rs` — encrypted open/create/confirm/close/reopen, Welcome and app-message ingest,
   auto-publish and SelfRemove re-proposal work, convergence releasing queued outbound work, disband requests, compact authority
   capture, the account records' liveness gate and closed-store failures, KeyPackage cutover on open, and the legacy-row

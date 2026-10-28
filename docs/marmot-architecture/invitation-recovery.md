@@ -108,7 +108,7 @@ These controls are an MDK-private NIP-59 extension: outer kind `1059`, inner rum
 `["mdk_group_recovery", "1"]` tag on both. They use the account inbox, not the broken group's encryption context,
 and create no chat entries. They are not a Marmot-standard kind allocation.
 
-Migration 0120 adds the protocol-owned `cgka_group_recovery` journal and gates older writers. Retry reservations
+Migration 0123 adds the protocol-owned `cgka_group_recovery` journal and gates older writers. Retry reservations
 precede directory/network work; cancellation and reopen keep their deadlines and exact authored packets. Requests
 expire after ten minutes; delays are 5, 15, 30, 60 and then 120 seconds, revisited by ordinary worker maintenance.
 Expiry rotates to the next known admin. The runtime admits at most 64 recipient jobs per account, 256 coordinator

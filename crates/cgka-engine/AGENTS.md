@@ -43,7 +43,7 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `provider.rs` | Ad-hoc `OpenMlsProvider` adapter composed from crypto + storage |
 | `feature_registry.rs` | Runtime feature → capability-requirement registry |
 | `capabilities.rs` | `cgka_traits::Capability` ↔ OpenMLS `Capabilities` translation |
-| `capability_manager.rs` | `feature_status`, `upgradeable_capabilities`, write-through per-leaf cache population |
+| `capability_manager.rs` | `feature_status`, `upgradeable_capabilities` (read from every current leaf), own-leaf and added-leaf profile checks |
 | `leaf_advertisement.rs` | What the own leaf advertises: `own_leaf_refresh_extensions` (a self-update re-advertises every supported component, keeping every other leaf byte), `own_leaf_missing_app_components` (stale only when a self-update would change the leaf), per-component leaf-support blockers |
 | `key_package.rs` | `fresh_key_package`, KeyPackage parse-time lifetime / OpenMLS accepted-range checks (refresh scheduling is a higher-layer concern) |
 | `group_lifecycle.rs` | `do_create_group`, `do_join_welcome`, `retry_rejoins_after_trusted_removal` |
@@ -59,9 +59,11 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `update_group_data.rs` | `SendIntent::UpdateGroupData`: stages an `AppDataUpdate` for `marmot.group.profile.v1`; admin-policy and routing updates are out of scope |
 | `disband.rs` | Durable terminal group-disband workflow |
 | `own_commit_intent.rs` | `OwnCommitIntent` records and re-issue of own commits superseded by branch selection (mdk#1734) |
+| `own_account_devices.rs` | `SendIntent::AddOwnAccountDevices` / `RemoveOwnAccountDevices`: a by-value same-account Commit that leaves the proposal store alone, refused unless the classifier calls it same-account (so only while the group requires 0x800d); no `OwnCommitIntent` re-issue |
 | `maintenance.rs` | KeyPackage replacement staging and promotion (OpenMLS material and the lifecycle record in one transaction) and the own-leaf hash. Scheduling and the other account records live above the engine; it adds no storage forwards for them (mdk#2602) |
 | `group_authority.rs` | Advisory live-engine authority facts for conversation capture; mutations still validate authority |
-| `app_components.rs` | `app_data_dictionary` helpers, LeafNode/group `app_components` bytes, group profile and admin-policy bytes |
+| `app_components.rs` | `app_data_dictionary` helpers, LeafNode/group `app_components` bytes, group profile and admin-policy bytes, the resulting-state check every send path and replay call (`validate_current_profile_invariants_for_staged_commit`, including the account-devices rules) and its join-time twin (`validate_joined_group_invariants`), the Welcome author check, standalone proposal admission |
+| `commit_class.rs` | The one Commit classifier (self-update, SelfRemove-only, same-account, admin-required) read from the parent state. Replay, every send path's own check (`authorize_own_staged_commit`) and the publish stamp call it; the class decides both whether an admin must commit and the branch priority (`privileged` exactly for admin-required). Same-account exists only while the parent requires 0x800d |
 | `account_identity_proof.rs` | Legacy LeafNode identity-proof extension + current app-data component; strict profile classification (mixed rejected) |
 | `app_payload.rs` | `validate_app_payload_for_sender`: `MarmotAppEvent` sender validation |
 | `group_context_view.rs` | `GroupContext` snapshot view; `exporter_secret(label, length)` returns `None` rather than truncating |
@@ -98,10 +100,10 @@ Load-bearing departures from the original plan; each is also documented at its s
    `crates/traits/src/engine.rs::SendResult`.
 3. **`CreateGroupRequest::initial_admins: Vec<MemberId>`** bootstraps multi-admin groups so admins can later
    self-remove (MIP-03 "not the last admin"). The creator is implicitly an admin.
-4. **The per-leaf capability cache is required for correctness.** `MlsGroup::public_group()` is `pub(crate)`, so there
-   is no public way to reach a specific leaf's capabilities. The cache is populated from KeyPackages we handle (invite
-   parses, `StagedCommit::add_proposals`) plus `MlsGroup::own_leaf_node()`. Read `capability_manager.rs` before
-   changing it.
+4. **Member capabilities come from the tree, not a cache.** `feature_status` and `upgradeable_capabilities` read every
+   current leaf through `MlsGroup::export_ratchet_tree`, plus the leaves a pending own commit adds (as `members()`
+   projects them). Members support a capability only when every leaf advertises it, so one device of an account never
+   stands in for a sibling (mdk#2628 D10). Read `capability_manager.rs` before changing it.
 5. **Group state is app-component state.** New groups never create or read the legacy `marmot_group_data` extension;
    the engine writes `app_data_dictionary`, advertises component ids in LeafNode `app_components`, records required ids
    in GroupContext `app_components`, and reads admin/profile state from component bytes.
@@ -109,6 +111,9 @@ Load-bearing departures from the original plan; each is also documented at its s
    strict-fails non-32-byte member identities at admin-set time.
 7. **Two-layer addressing.** `StaleReason::NotForThisClient` is engine-layer identity filtering as well as transport
    defense.
+8. **Advertise only what the engine implements.** `EngineBuilder::build` refuses a protocol-owned component id outside
+   `ADVERTISABLE_PROTOCOL_APP_COMPONENTS`. Account-devices (0x800d) is enforced but stays refused until mdk#2628 item
+   2.2; tests opt in with `allow_account_devices_advertising_for_tests`.
 
 ## Publish-before-apply
 
@@ -116,7 +121,7 @@ Load-bearing departures from the original plan; each is also documented at its s
 merge until `CgkaEngine::confirm_published`; `CgkaEngine::publish_failed` discards via
 `MlsGroup::clear_pending_commit` + Marmot re-derive. Auto-publish work carries a `PendingStateRef` and uses the same
 lifecycle. While an evolution is pending, the Marmot record holds the _projected post-merge_ `members` so `members()`
-and `feature_status` reflect it. Current-profile `do_create_group` is the founding exception (deviation 2): it publishes
+and `feature_status` count the leaves it adds. Current-profile `do_create_group` is the founding exception (deviation 2): it publishes
 no ordinary group commit and persists each Welcome as independent retryable work. Tests: `tests/publish_lifecycle.rs`,
 `tests/group_creation.rs`, `tests/invite_leave.rs`.
 
@@ -233,9 +238,9 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   unresolved *commits* below the new copy's `MlsGroup::epoch()`. Bound it by locally derived authenticated epochs only,
   keep it to commits (prior-interval applications may still decrypt, which is why a replacement Welcome records
   `join_epoch = 0`), and never move it to a seam that reads inbound claims.
-- **Commit-derived group records and capability caches are atomic with the MLS apply.** Every durable projection of an
-  accepted commit (Marmot group record, capabilities from added KeyPackages, post-path self-capability refresh) shares
-  the transaction that mutates OpenMLS state, and every projection read/write error propagates. On a failed direct
+- **Commit-derived group records are atomic with the MLS apply.** Every durable projection of an accepted commit (the
+  Marmot group record and its mirrored required capabilities and components) shares the transaction that mutates
+  OpenMLS state, and every projection read/write error propagates. On a failed direct
   apply, release its unowned recovery snapshot and schedule the retained commit for stored convergence; redelivery
   deduplicates against the retained content row and cannot repair the apply.
 - **Hydration quarantine is enforced through `Engine::ensure_group_live`** (mdk#364 / #365). Every public accessor that
@@ -455,7 +460,8 @@ From the 2026-05-09 engine audit and follow-ups. Grep the rule when touching the
 | No `MessageReceived` with an empty/unresolvable sender on either seam (direct: `Failed`; replay: `Ignored`; `emit_application_replay_events` skips empty senders as a backstop) | `app_payload::tests`; `tests/distributed_convergence.rs::terminal_undecryptable_app_emits_invalidation_without_message_received` |
 | `EpochManager::confirm_publish` / `rollback_publish` / `begin_pending` run the fallible transition before mutating maps (mdk#146); auto-commit ingest staging requires `EpochState::is_stable` | `epoch_manager::tests::begin_pending_failure_leaves_state_intact`, `begin_pending_success_records_all_bookkeeping` |
 | `convergence_ingest_outcome` reports `Stale` for terminal dispositions and `Buffered` only for retryable ones. A future-epoch app message whose commit hasn't arrived gets an explicit `deferred` disposition, is not marked seen, and emits no `AppMessageInvalidated` (mdk#144); legacy results encoding it as `UndecryptableInCanonicalState` keep the `Retryable` compatibility path. At or below the tip it is terminal and emits invalidation (mdk#995), but only from a pass that selected a branch; otherwise it is deferred `NoCanonicalBranchSelected` | `tests/distributed_convergence.rs::future_epoch_app_message_stays_deferred_until_commit_arrives`, `::terminal_undecryptable_app_emits_invalidation_without_message_received` |
-| `cache_self_capabilities` errors `EngineError::Backend` if `own_leaf_node()` disagrees with `self_id` | existing cache tests |
+| `capability_manager::check_own_leaf` errors `EngineError::Backend` if `own_leaf_node()` disagrees with `self_id` | structural |
+| Capability answers count every current leaf: one device of an account that lacks a capability withholds it, whatever its siblings advertise, on every member and after restart (mdk#2628 D10) | `tests/capabilities.rs::a_device_that_lacks_a_capability_withholds_it_until_its_leaf_advertises_it`, `::removing_the_device_that_lacks_a_capability_makes_it_available` |
 | `do_join_welcome` rejects a repeated Welcome via `seen_message_ids` and stored-message state | `tests/group_creation.rs::join_welcome_called_twice_for_same_welcome_errors_on_second_call` |
 | `FeatureRegistry::register` warns on a conflicting duplicate (last write wins) | tracing audit |
 | Replay swallows only `ProcessMessageError::ValidationError` for application messages; `LibraryError` and structural failures propagate | replay tests |

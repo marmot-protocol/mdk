@@ -48,12 +48,25 @@ impl Device {
         self.client.sync().await.unwrap();
     }
 
+    /// This device can fetch from now on and has settled, so it announces as
+    /// soon as it owes one. The scripted relay sends no EOSE, so its own
+    /// catch-up never shows as run.
+    pub(super) async fn can_fetch(&mut self) {
+        self.client.test_push_device_can_fetch = Some(true);
+        self.client.push_announce_timing.catch_up_settle = std::time::Duration::ZERO;
+        self.client.advance_push_join_windows().await;
+    }
+
     pub(super) async fn join(&mut self, relay: &ScriptedPushRelayClient, group: &GroupId) {
         self.receive(relay).await;
         self.client.accept_group_invite(group).unwrap();
     }
 
-    fn register(&self, raw_token: &str, server: &nostr::prelude::Keys) -> PushRegistration {
+    pub(super) fn register(
+        &self,
+        raw_token: &str,
+        server: &nostr::prelude::Keys,
+    ) -> PushRegistration {
         let app = &self.client.app;
         app.set_native_push_enabled(&self.label, true).unwrap();
         app.upsert_push_registration(
@@ -74,7 +87,7 @@ impl Device {
             .unwrap()
     }
 
-    async fn share(&mut self) -> PushRegistrationShareOutcome {
+    pub(super) async fn share(&mut self) -> PushRegistrationShareOutcome {
         self.client.share_push_registration().await.unwrap()
     }
 
@@ -225,6 +238,8 @@ impl Fixture {
             .await
             .unwrap();
         bob.join(&relay, &group).await;
+        // The creator's catch-up has run by the time it shares.
+        alice.can_fetch().await;
         alice.register("alice-token", &server);
         bob.register("bob-token", &server);
         assert_eq!(alice.share().await.succeeded_groups, 1);

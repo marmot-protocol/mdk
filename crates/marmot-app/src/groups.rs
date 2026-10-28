@@ -169,15 +169,16 @@ pub struct AppGroupRecord {
     pub archived: bool,
     #[serde(default)]
     pub pending_confirmation: bool,
-    /// Current locally observed MLS roster size. `None` only for legacy
-    /// projections that have not yet been hydrated by an upgraded runtime.
+    /// Number of member accounts in the locally observed MLS roster; an
+    /// account with several devices in the group counts once. `None` only for
+    /// legacy projections that have not yet been hydrated by an upgraded runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_count: Option<u64>,
-    /// Hex member ids when this group is currently a Direct conversation
-    /// (empty name, roster size 2). Persisted as the peer-keyed reuse index.
+    /// Hex account ids when this group is currently a Direct conversation
+    /// (empty name, two member accounts). Persisted as the peer-keyed reuse index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_member_ids_hex: Option<Vec<String>>,
-    /// Current authoritative two-member roster, including explicitly named groups.
+    /// Current authoritative two-account roster, including explicitly named groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation_member_ids_hex: Option<Vec<String>>,
     /// Whether the local account is still a member of this group, and if not,
@@ -241,11 +242,50 @@ impl From<ProtocolProfile> for AppProtocolProfile {
     }
 }
 
+/// One member account of a group. An account with several devices in the
+/// group has one leaf per device but still one record here.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupMemberRecord {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
+    /// How many of this account's devices (current leaves) are in the group.
+    #[serde(default = "one_device")]
+    pub device_count: u32,
+}
+
+fn one_device() -> u32 {
+    1
+}
+
+/// Group the engine's per-leaf roster by account, in first-leaf order, with
+/// each account's leaf count (spec `foundation/identity.md`, "Devices").
+/// Every projection a host sees counts and lists these accounts, never leaves.
+pub(crate) fn member_accounts(members: &[cgka_traits::group::Member]) -> Vec<(MemberId, u32)> {
+    let mut accounts: Vec<(MemberId, u32)> = Vec::with_capacity(members.len());
+    let mut positions: HashMap<&MemberId, usize> = HashMap::with_capacity(members.len());
+    for member in members {
+        match positions.entry(&member.id) {
+            std::collections::hash_map::Entry::Occupied(position) => {
+                let devices = &mut accounts[*position.get()].1;
+                *devices = devices.saturating_add(1);
+            }
+            std::collections::hash_map::Entry::Vacant(position) => {
+                position.insert(accounts.len());
+                accounts.push((member.id.clone(), 1));
+            }
+        }
+    }
+    accounts
+}
+
+/// Number of distinct member accounts in a per-leaf roster.
+pub(crate) fn member_account_count(members: &[cgka_traits::group::Member]) -> usize {
+    members
+        .iter()
+        .map(|member| &member.id)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
 }
 
 /// Lightweight local roster projection for one group.
@@ -267,6 +307,8 @@ pub struct AppGroupMlsState {
     pub protocol_profile: AppProtocolProfile,
     pub lifecycle_state: AppGroupLifecycleState,
     pub epoch: u64,
+    /// Number of member accounts. An account with several devices in the
+    /// group counts once.
     pub member_count: usize,
     #[serde(default)]
     pub unrecoverable: bool,
@@ -316,6 +358,9 @@ pub struct AppGroupRosterMember {
     pub is_self: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// How many of this account's devices (current leaves) are in the group.
+    #[serde(default = "one_device")]
+    pub device_count: u32,
 }
 
 /// Lightweight membership projection for roster screens and change detection.
@@ -329,6 +374,7 @@ pub struct AppGroupRoster {
     /// display-name changes do not.
     pub roster_revision: u64,
     pub self_membership: SelfMembership,
+    /// Number of member accounts, one per entry in `members`.
     pub member_count: usize,
     pub lifecycle_state: AppGroupLifecycleState,
 }
@@ -357,6 +403,7 @@ pub(crate) fn app_group_roster_from_session(
                 is_admin: admin_ids.contains(&member.member_id_hex),
                 is_self: member.member_id_hex == my_account_id_hex,
                 display_name: display_names.get(&member.member_id_hex).cloned(),
+                device_count: member.device_count,
             }
         })
         .collect();
@@ -757,7 +804,7 @@ impl AppGroupRecord {
         if let Some(group) = group {
             record.protocol_profile = group.protocol_profile.into();
             record.nostr_routing_last_epoch = group.epoch.0;
-            record.member_count = u64::try_from(group.members.len()).ok();
+            record.member_count = u64::try_from(member_account_count(&group.members)).ok();
             record.unrecoverable = group.unrecoverable;
             record.disbanded = group.disbanded.is_some();
             record.set_direct_member_ids_from_roster(&group.members);
@@ -798,7 +845,7 @@ impl AppGroupRecord {
         self.profile = projection.profile.clone();
         if let Some(group) = projection.group_metadata {
             self.protocol_profile = group.protocol_profile.into();
-            self.member_count = u64::try_from(group.members.len()).ok();
+            self.member_count = u64::try_from(member_account_count(&group.members)).ok();
             self.unrecoverable = group.unrecoverable;
             self.disbanded = group.disbanded.is_some();
             self.set_direct_member_ids_from_roster(&group.members);
@@ -809,19 +856,19 @@ impl AppGroupRecord {
         &mut self,
         members: &[cgka_traits::group::Member],
     ) {
-        self.presentation_member_ids_hex = (members.len() == 2
-            && members
+        // Two accounts make a two-person roster however many devices either
+        // of them has in the group.
+        let accounts = member_accounts(members);
+        self.presentation_member_ids_hex = (accounts.len() == 2
+            && accounts.iter().all(|(id, _)| id.as_slice().len() == 32))
+        .then(|| {
+            let mut ids: Vec<_> = accounts
                 .iter()
-                .all(|member| member.id.as_slice().len() == 32)
-            && members[0].id != members[1].id)
-            .then(|| {
-                let mut ids: Vec<_> = members
-                    .iter()
-                    .map(|member| hex::encode(member.id.as_slice()))
-                    .collect();
-                ids.sort_unstable();
-                ids
-            });
+                .map(|(id, _)| hex::encode(id.as_slice()))
+                .collect();
+            ids.sort_unstable();
+            ids
+        });
         self.direct_member_ids_hex = if self.profile.name.trim().is_empty() {
             self.presentation_member_ids_hex.clone()
         } else {
@@ -2269,9 +2316,30 @@ pub(crate) fn observe_event(
                     GroupConfirmationProjection::Preserve,
                 );
             }
-            summary.events.push(event.clone());
+            summary.events.push(host_group_event(event));
             None
         }
+    }
+}
+
+/// The copy of an engine event that hosts receive. A departure's removed leaves
+/// are device destinations MDK consumes itself, so no leaf index reaches a host.
+/// Hosts still learn which accounts left, and `LocalGroupCopyTerminated` tells
+/// them when this device's own leaf was removed.
+pub(crate) fn host_group_event(event: &GroupEvent) -> GroupEvent {
+    match event {
+        GroupEvent::GroupMemberLeavesRemoved {
+            group_id,
+            epoch,
+            departed_members,
+            ..
+        } => GroupEvent::GroupMemberLeavesRemoved {
+            group_id: group_id.clone(),
+            epoch: *epoch,
+            leaves: Vec::new(),
+            departed_members: departed_members.clone(),
+        },
+        event => event.clone(),
     }
 }
 
@@ -2967,6 +3035,7 @@ mod group_roster_api_tests {
             member_id_hex: self_id.to_owned(),
             account: Some("alice".to_owned()),
             local: true,
+            device_count: 1,
         }];
         let mls_state = AppGroupMlsState {
             group_id_hex: record.group_id_hex.clone(),
@@ -2999,5 +3068,59 @@ mod group_roster_api_tests {
         assert!(roster.members[0].is_admin);
         assert!(roster.members[0].is_self);
         assert_eq!(roster.members[0].display_name.as_deref(), Some("Alice"));
+    }
+
+    fn leaves(accounts: &[u8]) -> Vec<cgka_traits::group::Member> {
+        accounts
+            .iter()
+            .map(|account| cgka_traits::group::Member {
+                id: MemberId::new(vec![*account; 32]),
+                credential: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn member_accounts_list_each_account_once_with_its_devices() {
+        let members = leaves(&[0xaa, 0xbb, 0xbb, 0xcc, 0xaa]);
+        assert_eq!(
+            member_accounts(&members),
+            vec![
+                (MemberId::new(vec![0xaa; 32]), 2),
+                (MemberId::new(vec![0xbb; 32]), 2),
+                (MemberId::new(vec![0xcc; 32]), 1),
+            ]
+        );
+        assert_eq!(member_account_count(&members), 3);
+    }
+
+    /// Two accounts are a two-person roster however many devices either has;
+    /// one account on two devices is not.
+    #[test]
+    fn two_person_roster_follows_accounts_not_leaves() {
+        let pair = Some(vec!["aa".repeat(32), "bb".repeat(32)]);
+        for roster in [
+            &[0xaa, 0xbb][..],
+            &[0xaa, 0xbb, 0xbb],
+            &[0xaa, 0xaa, 0xbb],
+            &[0xbb, 0xaa, 0xbb, 0xaa],
+        ] {
+            let mut record = test_record();
+            record.profile.name = String::new();
+            record.set_direct_member_ids_from_roster(&leaves(roster));
+            assert_eq!(record.presentation_member_ids_hex, pair, "{roster:?}");
+            assert_eq!(record.direct_member_ids_hex, pair, "{roster:?}");
+        }
+        for roster in [
+            &[0xaa, 0xaa][..],
+            &[0xaa, 0xbb, 0xcc],
+            &[0xaa, 0xbb, 0xbb, 0xcc],
+        ] {
+            let mut record = test_record();
+            record.profile.name = String::new();
+            record.set_direct_member_ids_from_roster(&leaves(roster));
+            assert_eq!(record.presentation_member_ids_hex, None, "{roster:?}");
+            assert_eq!(record.direct_member_ids_hex, None, "{roster:?}");
+        }
     }
 }

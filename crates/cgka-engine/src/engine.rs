@@ -399,6 +399,7 @@ pub struct EngineBuilder<S: StorageProvider> {
         Option<Arc<dyn crate::account_identity_proof::AccountIdentityProofSigner>>,
     registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
+    allow_account_devices_advertising: bool,
     new_protocol_profile: ProtocolProfile,
     allow_legacy_compatibility_profile: bool,
     peeler: Option<Box<dyn TransportPeeler>>,
@@ -424,6 +425,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             account_identity_proof_signer: None,
             registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
+            allow_account_devices_advertising: false,
             new_protocol_profile: ProtocolProfile::Current,
             allow_legacy_compatibility_profile: false,
             peeler: None,
@@ -460,11 +462,27 @@ impl<S: StorageProvider> EngineBuilder<S> {
         self
     }
 
+    /// Component ids this engine advertises in its KeyPackages and leaves.
+    /// [`Self::build`] refuses a protocol-owned id the engine does not
+    /// implement.
     pub fn supported_app_components(
         mut self,
         components: impl IntoIterator<Item = AppComponentId>,
     ) -> Self {
         self.supported_app_components = AppComponentSet::new(components);
+        self
+    }
+
+    /// Let [`Self::supported_app_components`] include
+    /// `marmot.group.account-devices.v1`, which the engine enforces but does
+    /// not advertise yet (mdk#2628, item 2.2). Test and conformance builds
+    /// only, so they can model groups that require it.
+    #[cfg(any(
+        feature = "test-policy-overrides",
+        feature = "test-conformance-snapshot"
+    ))]
+    pub fn allow_account_devices_advertising_for_tests(mut self) -> Self {
+        self.allow_account_devices_advertising = true;
         self
     }
 
@@ -588,6 +606,10 @@ impl<S: StorageProvider> EngineBuilder<S> {
                 "max_past_epochs must equal the pinned v1 app-message window".into(),
             ));
         }
+        crate::app_components::validate_supported_app_components(
+            &self.supported_app_components,
+            self.allow_account_devices_advertising,
+        )?;
         let identity_bytes = self
             .identity_bytes
             .ok_or_else(|| EngineError::Other("identity bytes are required".into()))?;
@@ -1298,9 +1320,10 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Compute per-message recipient expectations for a completed send/create,
     /// derived from authenticated membership: the main message (commit, app
-    /// message, or proposal) targets all OTHER current group members; each
-    /// welcome targets only its added member. Recipients are represented only by
-    /// salted member refs and aggregate counts.
+    /// message, or proposal) targets all OTHER current group members, each
+    /// account once however many devices it has; each welcome targets only its
+    /// added member. Recipients are represented only by salted member refs and
+    /// aggregate counts.
     fn recipient_expectation_records(
         &self,
         group_id: &GroupId,
@@ -1331,7 +1354,12 @@ impl<S: StorageProvider> Engine<S> {
         if let Some((msg, artifact_kind)) = main {
             let self_id = self.identity.self_id();
             let members = self.do_members(group_id).unwrap_or_default();
-            let others: Vec<_> = members.iter().filter(|m| &m.id != self_id).collect();
+            let mut others = Vec::new();
+            for member in &members {
+                if &member.id != self_id && !others.contains(&&member.id) {
+                    others.push(&member.id);
+                }
+            }
             rows.push((
                 hex::encode(msg.id.as_slice()),
                 RecipientExpectation {
@@ -1341,7 +1369,7 @@ impl<S: StorageProvider> Engine<S> {
                     basis_commit_id: None,
                     expected_member_refs: others
                         .iter()
-                        .map(|m| crate::audit_helpers::member_ref_hex(&m.id))
+                        .map(|id| crate::audit_helpers::member_ref_hex(id))
                         .collect(),
                     expected_count: Some(others.len() as u64),
                 },
@@ -2545,11 +2573,7 @@ impl<S: StorageProvider> Engine<S> {
         provider: &crate::provider::EngineOpenMlsProvider<'_, S>,
         stored_message_records: &[cgka_traits::message::MessageRecord],
     ) -> Result<Option<LeaveRequest>, StorageError> {
-        let self_is_still_member = group
-            .members
-            .iter()
-            .any(|member| &member.id == self.identity.self_id());
-        if !self_is_still_member {
+        if !crate::identity::local_copy_is_member(group, self.identity.self_id()) {
             self.storage.clear_leave_request(group_id)?;
             return Ok(None);
         }
@@ -2684,11 +2708,7 @@ impl<S: StorageProvider> Engine<S> {
         provider: &crate::provider::EngineOpenMlsProvider<'_, S>,
         stored_message_records: &[cgka_traits::message::MessageRecord],
     ) -> Result<bool, cgka_traits::storage::StorageError> {
-        if !group
-            .members
-            .iter()
-            .any(|member| &member.id == self.identity.self_id())
-        {
+        if !crate::identity::local_copy_is_member(group, self.identity.self_id()) {
             return Ok(false);
         }
 

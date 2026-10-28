@@ -32,10 +32,17 @@ tracing.workspace = true
 # This crate's own integration tests reach the session accessors.
 marmot-session = { workspace = true, features = ["test-support"] }
 nostr.workspace = true
+# A same-account Add in a group that does not require account-devices is
+# built with raw OpenMLS, because the engine refuses to send one.
+openmls.workspace = true
+openmls_basic_credential.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_traits.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+tls_codec.workspace = true
 tokio.workspace = true
 transport-nostr-adapter.workspace = true
 transport-nostr-peeler.workspace = true

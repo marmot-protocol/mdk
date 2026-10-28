@@ -83,7 +83,10 @@ mod sync;
 mod upload_cleanup_tests;
 
 use epoch_stall::EpochStallDetector;
+pub(crate) use push::PushFetchClock;
 use push::notification_trigger_for_intent;
+#[cfg(all(test, feature = "test-policy-overrides"))]
+pub(crate) use push::{AcceptedPushAnnounce, PushAnnounceTiming};
 #[cfg(test)]
 pub(crate) use sync::ScriptedComparisons;
 #[cfg(test)]
@@ -810,6 +813,16 @@ pub struct AppClient {
     /// epoch that Commit started from, whose owed push snapshot failed to
     /// record; the account worker retries them.
     pub(super) pending_own_add_push_snapshots: HashMap<GroupId, u64>,
+    /// How long this device's push join windows last, and how often it
+    /// announces in a group it sends to.
+    pub(super) push_announce_timing: push::PushAnnounceTiming,
+    /// The time during which this device could fetch, as this client has
+    /// seen it; only that time counts toward a push join window.
+    pub(super) push_fetch_clock: push::PushFetchClock,
+    /// Groups where the runtime accepted a push announce into the outbox
+    /// without publishing it. This client sends no other there until the
+    /// outbox publishes or drops it, or a Welcome opens a new window.
+    pub(super) accepted_push_announces: HashMap<GroupId, push::AcceptedPushAnnounce>,
     /// App-visible outputs ingested during a sync whose account-projection
     /// checkpoint failed. A retained client keeps the matching projected state
     /// and outbox acknowledgements, then returns this summary after its next
@@ -905,6 +918,16 @@ pub struct AppClient {
     /// Unit-test fault injection that fails every drained-batch checkpoint.
     #[cfg(test)]
     pub(crate) fail_drained_effect_checkpoints: bool,
+    /// Push gossip events this client sent and the runtime accepted, in order.
+    #[cfg(test)]
+    pub(crate) test_sent_push_gossip: Vec<(GroupId, MarmotInnerEvent)>,
+    /// Whether this device can fetch, for tests whose scripted relay sends no
+    /// EOSE. `None` reads the relays.
+    #[cfg(test)]
+    pub(crate) test_push_device_can_fetch: Option<bool>,
+    /// Tests fail every write of an owed push announce.
+    #[cfg(test)]
+    pub(crate) test_fail_push_announce_owed_write: bool,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
@@ -937,10 +960,14 @@ pub struct AppClient {
     /// retirement, for the retry path its callers depend on.
     #[cfg(test)]
     pub(crate) fail_next_terminal_recovery_retire: bool,
-    /// Temporary history subscriptions, floored at each copy's Welcome, installed
-    /// only while a post-join maintenance obligation waits for its first relay EOSE.
+    /// Temporary history subscriptions, floored at each copy's Welcome. One
+    /// lives while the group's post-join history fetch is owed, and while a
+    /// post-join maintenance obligation waits for its first relay EOSE.
     pub(crate) post_join_maintenance_subscriptions:
         HashMap<GroupId, (String, cgka_traits::TransportGroupSubscription)>,
+    /// The history fetch each live post-join session serves, by subscription
+    /// id. Pruned to the live sessions on every post-join pass.
+    pub(crate) post_join_history_sessions: HashMap<String, recovery::PostJoinHistorySession>,
     /// Per-group (in-memory) epoch at which the warm pass last confirmed the
     /// authoritative encrypted-media component is NOT required. A group's
     /// signed component can only change with a commit, and a commit always
@@ -1540,9 +1567,11 @@ impl AppClient {
 
     /// Request, poll, and retire temporary post-join full-history
     /// subscriptions. The recovery job installs a requested one under its
-    /// grant; this pass observes its first boundary. A restart reconstructs
-    /// this ephemeral map from durable CatchUp obligations; the EOSE deadline
-    /// itself remains persisted.
+    /// grant; this pass observes its first boundary. A group keeps its
+    /// subscription while its post-join history fetch is owed, which no commit
+    /// ends, and while a post-join obligation waits for its first EOSE. A
+    /// restart reconstructs this ephemeral map from owed fetches and durable
+    /// CatchUp obligations; the obligation's EOSE deadline remains persisted.
     pub(crate) async fn advance_post_join_maintenance_subscriptions(
         &mut self,
     ) -> Result<(), AppError> {
@@ -1573,11 +1602,12 @@ impl AppClient {
                     .maintenance_observations
                     .remove(&group_id);
             }
+            self.retain_live_post_join_history_sessions();
             return Ok(());
         }
         let storage = self.app.account_storage(&self.state.label)?;
         let app = storage.app_storage();
-        let active_jobs = storage
+        let mut active_jobs = storage
             .list_maintenance_obligations()?
             .into_iter()
             .filter(|job| {
@@ -1590,17 +1620,12 @@ impl AppClient {
                     )
             })
             .map(|job| {
-                serde_json::to_vec(&(job.id.as_slice(), job.semantic_rearm_count))
+                maintenance_recovery_job(&job.id, job.semantic_rearm_count)
                     .map(|key| (key, job.group_id.as_slice().to_vec()))
-                    .map_err(|_| {
-                        cgka_traits::storage::StorageError::Serialization(
-                            "invalid maintenance recovery identity".into(),
-                        )
-                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        app.retain_recovery_maintenance_jobs(&active_jobs)?;
-        let mut waiting = HashSet::new();
+        let mut waits = Vec::new();
+        let mut fetch_jobs = HashMap::new();
 
         for group in self.state.groups.clone() {
             let group_id = match hex::decode(&group.group_id_hex) {
@@ -1618,18 +1643,28 @@ impl AppClient {
             // Only the group's obligations: the full status also decodes every
             // transport fanout in the account, which made this loop quadratic
             // in the number of groups (mdk#2110).
-            let obligations = match self.runtime.maintenance_obligations_for_group(&group_id) {
-                Ok(obligations) => obligations,
-                Err(_error) => {
-                    tracing::warn!(
-                        target: "marmot_app::maintenance",
-                        method = "advance_post_join_maintenance_subscriptions",
-                        error_kind = "maintenance_status_unavailable",
-                        "skipping unavailable post-join maintenance group"
-                    );
-                    continue;
-                }
+            let (Ok(obligations), Ok(fetch)) = (
+                self.runtime.maintenance_obligations_for_group(&group_id),
+                self.runtime.post_join_history_fetch(&group_id),
+            ) else {
+                tracing::warn!(
+                    target: "marmot_app::maintenance",
+                    method = "advance_post_join_maintenance_subscriptions",
+                    error_kind = "maintenance_status_unavailable",
+                    "skipping unavailable post-join maintenance group"
+                );
+                continue;
             };
+            // A copy this device has left, or that was disbanded, fetches
+            // nothing more.
+            let fetch = fetch
+                .filter(|fetch| fetch.completion.is_none())
+                .filter(|_| {
+                    !self
+                        .runtime
+                        .group_record(&group_id)
+                        .is_ok_and(|record| record.is_terminal())
+                });
             let prerequisite = obligations.iter().find(|obligation| {
                 obligation.trigger == cgka_traits::MaintenanceTrigger::PostJoin
                     && matches!(
@@ -1639,9 +1674,47 @@ impl AppClient {
                             | cgka_traits::MaintenancePhase::Grace
                     )
             });
-            let Some(prerequisite) = prerequisite else {
-                continue;
+            // An owed fetch owns its session's recovery job: the one its
+            // obligation had in CatchUp, whatever commits, or a superseded
+            // self-update's re-arm, have done to that obligation since. Only a
+            // Quiet obligation is ever re-armed. An early-phase obligation,
+            // even an earlier copy's after a replacement Welcome, keeps the
+            // session alive but never picks its job.
+            let fetch_job = fetch
+                .as_ref()
+                .map(|fetch| maintenance_recovery_job(&fetch.obligation_id, 0))
+                .transpose()?;
+            let job = match (&fetch_job, prerequisite) {
+                (Some(fetch_job), _) => fetch_job.clone(),
+                (None, Some(prerequisite)) => {
+                    maintenance_recovery_job(&prerequisite.id, prerequisite.semantic_rearm_count)?
+                }
+                (None, None) => continue,
             };
+            if let Some(fetch_job) = fetch_job {
+                fetch_jobs.insert(group_id.as_slice().to_vec(), fetch_job);
+            }
+            waits.push(PostJoinWait {
+                group_id,
+                job,
+                fetch: fetch.map(|fetch| fetch.obligation_id),
+                obligation_waits: prerequisite.is_some(),
+            });
+        }
+        // A group with an owed fetch keeps only the fetch's demand.
+        active_jobs.retain(|(_, group)| !fetch_jobs.contains_key(group));
+        active_jobs.extend(fetch_jobs.into_iter().map(|(group, job)| (job, group)));
+        app.retain_recovery_maintenance_jobs(&active_jobs)?;
+        let live_demands = if self.post_join_history_sessions.is_empty() {
+            Vec::new()
+        } else {
+            app.recovery_revision_fence()?.obligations
+        };
+        let mut waiting = HashSet::new();
+        let mut ended_jobs = Vec::new();
+
+        for wait in waits {
+            let group_id = wait.group_id;
             waiting.insert(group_id.clone());
 
             if let Some((subscription, _)) = self.post_join_maintenance_subscriptions.get(&group_id)
@@ -1656,29 +1729,77 @@ impl AppClient {
                     .maintenance_observations
                     .remove(&group_id);
             }
+            // A session installed for an earlier copy's fetch cannot end the
+            // fetch a replacement Welcome started: its REQ ran before that
+            // copy existed. Nor can one whose demand is gone before its
+            // boundary qualified, as when a grant selected before that Welcome
+            // installed it under the earlier job: no checkpoint qualifies it.
+            let demand_live = self
+                .recovery_owner
+                .maintenance_observations
+                .get(&group_id)
+                .is_some_and(|observation| {
+                    live_demands.iter().any(|(id, _)| *id == observation.id)
+                });
+            if let Some(fetch) = &wait.fetch
+                && let Some((subscription, _)) = self
+                    .post_join_maintenance_subscriptions
+                    .get(&group_id)
+                    .cloned()
+                && self
+                    .post_join_history_sessions
+                    .get(&subscription)
+                    .is_none_or(|session| {
+                        session.fetch != *fetch || (!session.boundary && !demand_live)
+                    })
+            {
+                if let Err(_error) = self
+                    .adapter
+                    .remove_group_maintenance_subscription(&subscription)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "subscription_remove_failed",
+                        "could not remove superseded post-join maintenance subscription"
+                    );
+                    continue;
+                }
+                self.post_join_maintenance_subscriptions.remove(&group_id);
+                self.recovery_owner
+                    .maintenance_observations
+                    .remove(&group_id);
+            }
             if !self
                 .post_join_maintenance_subscriptions
                 .contains_key(&group_id)
             {
-                let job = serde_json::to_vec(&(
-                    prerequisite.id.as_slice(),
-                    prerequisite.semantic_rearm_count,
-                ))
-                .map_err(|_| {
-                    cgka_traits::storage::StorageError::Serialization(
-                        "invalid maintenance recovery identity".into(),
-                    )
-                })?;
                 let ticket = app.request_recovery(
                     storage_sqlite::RecoveryRequest::MaintenanceBoundary {
-                        job_id: &job,
+                        job_id: &wait.job,
                         group_id: group_id.as_slice(),
                     },
                     unix_now_seconds().saturating_mul(1000),
                 )?;
                 app.restore_recovery_maintenance_session(ticket)?;
             }
-            self.observe_post_join_recovery_boundary(&group_id).await?;
+            let boundary = self.observe_post_join_recovery_boundary(&group_id).await?;
+            if let Some(fetch) = &wait.fetch
+                && self
+                    .settle_post_join_history_fetch(&group_id, fetch, boundary)
+                    .await?
+                && !wait.obligation_waits
+            {
+                waiting.remove(&group_id);
+                ended_jobs.push(wait.job);
+            }
+        }
+        // A fetch that ended at its deadline leaves its boundary request
+        // unmet; nothing asks for it any more.
+        if !ended_jobs.is_empty() {
+            active_jobs.retain(|(job, _)| !ended_jobs.contains(job));
+            app.retain_recovery_maintenance_jobs(&active_jobs)?;
         }
 
         let stale = self
@@ -1710,6 +1831,7 @@ impl AppClient {
                 .maintenance_observations
                 .remove(&group_id);
         }
+        self.retain_live_post_join_history_sessions();
         Ok(())
     }
 
@@ -1741,6 +1863,17 @@ impl AppClient {
         // publisher imports only the legacy JSON `d` slot, then performs the
         // recorded upgrade replacement under that same slot.
         Ok(self.runtime.publish_fresh_key_package().await?)
+    }
+
+    /// Ask the relays to stop serving this device's KeyPackage slot before it
+    /// signs out; other devices' slots are never named. Returns how many
+    /// relays accepted, or 0 when this device never published into the slot.
+    /// Afterwards this client publishes no KeyPackage.
+    pub async fn withdraw_key_package_slot(&mut self) -> Result<usize, AppError> {
+        // Current kind 10002 write relays; the runtime adds every relay the
+        // slot was published to.
+        self.refresh_routing()?;
+        Ok(self.runtime.withdraw_key_package_slot().await?)
     }
 
     /// Fetch current relay KeyPackages for the composition roster without
@@ -2259,11 +2392,12 @@ impl AppClient {
         if !optional_app_components.is_empty() {
             changed_fields.push("image");
         }
+        // The people added, not their devices' KeyPackages.
         let mut audit_context = Self::local_human_action_context(
             "create_group",
             changed_fields,
             touched_components,
-            Some(members.len() as u64),
+            Some(resolved.stats.unique_members as u64),
         );
 
         request.members = members;
@@ -2417,12 +2551,11 @@ impl AppClient {
                 let group_record = self
                     .state_group_record(group_id)
                     .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?;
-                let member_ids_hex = self
-                    .runtime
-                    .members(group_id)?
-                    .into_iter()
-                    .map(|member| hex::encode(member.id.as_slice()))
-                    .collect();
+                let member_ids_hex =
+                    crate::groups::member_accounts(&self.runtime.members(group_id)?)
+                        .into_iter()
+                        .map(|(member_id, _)| hex::encode(member_id.as_slice()))
+                        .collect();
                 Ok(crate::AppGroupMemberIds {
                     group_id_hex: hex::encode(group_id.as_slice()),
                     member_ids_hex,
@@ -2453,20 +2586,21 @@ impl AppClient {
         group_id: &GroupId,
         profiles: &HashMap<String, String>,
     ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
-        Ok(self
-            .runtime
-            .members(group_id)?
-            .into_iter()
-            .map(|member| {
-                let member_id_hex = hex::encode(member.id.as_slice());
-                let account = profiles.get(&member_id_hex).cloned();
-                AppGroupMemberRecord {
-                    member_id_hex,
-                    local: account.is_some(),
-                    account,
-                }
-            })
-            .collect())
+        Ok(
+            crate::groups::member_accounts(&self.runtime.members(group_id)?)
+                .into_iter()
+                .map(|(member_id, device_count)| {
+                    let member_id_hex = hex::encode(member_id.as_slice());
+                    let account = profiles.get(&member_id_hex).cloned();
+                    AppGroupMemberRecord {
+                        member_id_hex,
+                        local: account.is_some(),
+                        account,
+                        device_count,
+                    }
+                })
+                .collect(),
+        )
     }
 
     pub fn group_mls_state(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
@@ -2544,7 +2678,7 @@ impl AppClient {
             protocol_profile: group.protocol_profile.into(),
             lifecycle_state,
             epoch: group.epoch.0,
-            member_count: group.members.len(),
+            member_count: crate::groups::member_account_count(&group.members),
             unrecoverable: group.unrecoverable,
             required_app_components: group
                 .required_capabilities
@@ -2795,15 +2929,17 @@ impl AppClient {
                 &requirements,
                 nostr_directory::MemberResolutionPurpose::Commit,
             )
-            .await
-            .map(|resolved| resolved.key_packages);
+            .await;
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupInviteKeyPackageLookup,
             key_package_started_at.elapsed(),
             key_packages.is_ok(),
         );
-        let key_packages = key_packages?;
+        let nostr_directory::ResolvedMemberKeyPackages {
+            key_packages,
+            stats,
+        } = key_packages?;
 
         let mut initial_admins = Vec::with_capacity(initial_admin_refs.len());
         for admin in initial_admin_refs {
@@ -2826,11 +2962,12 @@ impl AppClient {
             affected_fields.push("admins");
             affected_components.push(GROUP_ADMIN_POLICY_COMPONENT_ID);
         }
+        // The people invited, not their devices' KeyPackages.
         let audit_context = Self::local_human_action_context(
             "invite_members",
             affected_fields,
             affected_components,
-            Some(key_packages.len() as u64),
+            Some(stats.unique_members as u64),
         );
 
         let pre_send_sync_started_at = Instant::now();
@@ -3319,6 +3456,7 @@ impl AppClient {
         self.pending_push_leaf_reconciliations.remove(group_id);
         self.pending_member_add_push_shares.remove(group_id);
         self.pending_own_add_push_snapshots.remove(group_id);
+        self.accepted_push_announces.remove(group_id);
         self.app.presentation_signals.wake();
         // Deletion already committed. A failed transport refresh must not make
         // the caller believe the group still exists; ordinary maintenance retries.
@@ -3573,8 +3711,10 @@ impl AppClient {
     ///
     /// For each row carrying `'member'`, it asks the engine for the group's
     /// roster (`runtime.members`, sourced from the hydrated Marmot record's
-    /// post-merge member set) and plans `Removed` only when the local account id
-    /// is absent. A pending publication, engine error, or malformed id aborts
+    /// post-merge member set) and plans `Removed` only when this device's own
+    /// leaf is gone: the local account id is absent, or the engine has marked
+    /// the copy removed while a sibling device keeps the account on the
+    /// roster. A pending publication, engine error, or malformed id aborts
     /// before any plan is written, so uncertainty never suppresses. The work is
     /// gated behind a once-only account-import marker, so subsequent opens are
     /// a single marker read and the hot path stays projection-only.
@@ -3625,8 +3765,12 @@ impl AppClient {
             // (unknown/quarantined group, partially-missing live state), abort
             // the whole pass before writing anything. The preserving defaults
             // remain and the unset marker makes the next open retry.
-            let members = match self.runtime.members(&group_id) {
-                Ok(members) => members,
+            let roster = self
+                .runtime
+                .members(&group_id)
+                .and_then(|members| Ok((members, self.runtime.group_record(&group_id)?.removed)));
+            let (members, copy_removed) = match roster {
+                Ok(roster) => roster,
                 Err(error) => {
                     tracing::warn!(
                         target: "marmot_app::client",
@@ -3640,7 +3784,7 @@ impl AppClient {
             };
             reconciliation.push((
                 group_id_hex,
-                local_account_removed_from_roster(&members, &local_account_id_hex),
+                copy_removed || local_account_removed_from_roster(&members, &local_account_id_hex),
             ));
         }
         for (group_id_hex, removed) in reconciliation {
@@ -3698,9 +3842,9 @@ impl AppClient {
                     continue;
                 }
             };
-            let member_ids_hex = members
-                .iter()
-                .map(|member| hex::encode(member.id.as_slice()).to_ascii_lowercase())
+            let member_ids_hex = crate::groups::member_accounts(&members)
+                .into_iter()
+                .map(|(member_id, _)| hex::encode(member_id.as_slice()).to_ascii_lowercase())
                 .collect::<Vec<_>>();
             storage.fill_unindexed_direct_conversation_members(&group_id_hex, &member_ids_hex)?;
         }
@@ -4796,6 +4940,14 @@ impl AppClient {
             )
             .await;
             self.remember_message_notification_sent(group_id, &app_event_id);
+        }
+        if should_project_locally {
+            self.note_push_announce_after_send(group_id);
+        }
+        #[cfg(test)]
+        if !should_project_locally {
+            self.test_sent_push_gossip
+                .push((group_id.clone(), event.clone()));
         }
         Ok((
             event,
@@ -7472,6 +7624,29 @@ impl AppClient {
     }
 }
 
+/// A group the post-join pass keeps a history subscription for.
+struct PostJoinWait {
+    group_id: GroupId,
+    /// The recovery job its session is requested under.
+    job: Vec<u8>,
+    /// Its owed post-join history fetch.
+    fetch: Option<cgka_traits::MessageId>,
+    /// A post-join obligation still waits for its first EOSE.
+    obligation_waits: bool,
+}
+
+/// The recovery job identity of a post-join obligation's boundary session.
+fn maintenance_recovery_job(
+    obligation_id: &cgka_traits::MessageId,
+    semantic_rearm_count: u32,
+) -> Result<Vec<u8>, cgka_traits::storage::StorageError> {
+    serde_json::to_vec(&(obligation_id.as_slice(), semantic_rearm_count)).map_err(|_| {
+        cgka_traits::storage::StorageError::Serialization(
+            "invalid maintenance recovery identity".into(),
+        )
+    })
+}
+
 fn maintenance_run_summary_from_account(
     summary: cgka_traits::MaintenanceRunSummary,
 ) -> crate::MaintenanceRunSummary {
@@ -7868,6 +8043,53 @@ mod self_membership_backfill_tests {
             !app.account_import_marker("alice", crate::SELF_MEMBERSHIP_BACKFILL_MARKER)
                 .unwrap(),
             "pending projection must leave the marker unset for retry",
+        );
+    }
+
+    /// A removed copy backfills as removed even while its account stays on the
+    /// roster: another device of the account can keep a leaf after this
+    /// device's own leaf is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removed_copy_with_its_account_on_the_roster_backfills_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let removed = client.create_group("removed device", &[]).await.unwrap();
+        let live = client.create_group("live device", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .app_storage()
+            .reset_direct_conversation_members_backfill(crate::SELF_MEMBERSHIP_BACKFILL_MARKER)
+            .unwrap();
+        let mut record = storage.get_group(&removed).unwrap();
+        record.removed = true;
+        assert!(
+            record
+                .members
+                .iter()
+                .any(|member| member.id == client.runtime.self_id())
+        );
+        storage.put_group(&record).unwrap();
+
+        client.backfill_self_membership_once().unwrap();
+
+        for (group_id, membership) in [
+            (&removed, SelfMembership::Removed),
+            (&live, SelfMembership::Member),
+        ] {
+            assert_eq!(
+                app.stored_group_self_membership("alice", &hex::encode(group_id.as_slice()))
+                    .unwrap(),
+                Some(membership)
+            );
+        }
+        assert!(
+            app.account_import_marker("alice", crate::SELF_MEMBERSHIP_BACKFILL_MARKER)
+                .unwrap()
         );
     }
 

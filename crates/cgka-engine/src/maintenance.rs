@@ -143,11 +143,15 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Atomically generate a private KeyPackage bundle and persist the
     /// replacement lifecycle intent that owns it.
+    ///
+    /// The replacement is due for its own refresh `refresh_after_secs` after
+    /// `authored_created_at`, its publication time, or at its `not_after` if
+    /// that is earlier.
     pub fn stage_key_package_replacement(
         &mut self,
         state: &mut KeyPackageLifecycleState,
         authored_created_at: Timestamp,
-        refresh_lead_secs: u64,
+        refresh_after_secs: u64,
         targets: Vec<TransportFanoutTarget>,
     ) -> Result<KeyPackage, EngineError> {
         let (staged, key_package) = self.storage.with_transaction(|storage| {
@@ -156,7 +160,9 @@ impl<S: StorageProvider> Engine<S> {
             let mut staged = state.clone();
             // An older pending artifact may have reached a relay even without
             // a recorded ACK. Retain its private material when superseding it;
-            // the replacement and this ownership transfer commit together.
+            // the replacement and this ownership transfer commit together. Its
+            // grace period starts once a replacement is confirmed, or now if a
+            // Welcome already consumed it (mdk#2352).
             if let Some(previous) = staged.pending_replacement.take() {
                 staged
                     .retained_private_material
@@ -167,6 +173,7 @@ impl<S: StorageProvider> Engine<S> {
                         replaced_at: authored_created_at,
                         consumed: previous.consumed_at.is_some(),
                         authored_event_id: previous.signed_event.map(|event| event.id),
+                        awaiting_confirmed_replacement: previous.consumed_at.is_none(),
                     });
             }
             staged.pending_replacement = Some(PendingKeyPackageReplacement {
@@ -177,7 +184,12 @@ impl<S: StorageProvider> Engine<S> {
                 authored_created_at,
                 not_before: Timestamp(metadata.not_before),
                 not_after: Timestamp(metadata.not_after),
-                refresh_at: Timestamp(metadata.not_after.saturating_sub(refresh_lead_secs)),
+                refresh_at: Timestamp(
+                    authored_created_at
+                        .0
+                        .saturating_add(refresh_after_secs)
+                        .min(metadata.not_after),
+                ),
                 signed_event: None,
                 targets,
                 attempt_count: 0,

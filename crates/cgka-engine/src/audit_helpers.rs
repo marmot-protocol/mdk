@@ -137,6 +137,8 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
         SendIntent::Invite { .. } => "invite",
         SendIntent::RecoverMembers { .. } => "recover_members",
         SendIntent::RemoveMembers { .. } => "remove_members",
+        SendIntent::AddOwnAccountDevices { .. } => "add_own_account_devices",
+        SendIntent::RemoveOwnAccountDevices { .. } => "remove_own_account_devices",
         SendIntent::Leave { .. } => "leave",
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
@@ -157,6 +159,8 @@ pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId 
         | SendIntent::Invite { group_id, .. }
         | SendIntent::RecoverMembers { group_id, .. }
         | SendIntent::RemoveMembers { group_id, .. }
+        | SendIntent::AddOwnAccountDevices { group_id, .. }
+        | SendIntent::RemoveOwnAccountDevices { group_id, .. }
         | SendIntent::Leave { group_id }
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }

@@ -2118,6 +2118,33 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn withdraw_key_package_slot(&self, account_ref: &str) -> Result<usize, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve(account_ref)?;
+        if account.signed_out && account.can_sign() {
+            // A signed-out account runs no worker, so nothing else publishes
+            // into its slot: open its session for the withdrawal alone. The
+            // session is exclusive, so no worker opens it until this closes.
+            self.ensure_worker_reaped(&account.account_id_hex).await?;
+            let mut client = self
+                .app
+                .local_client_with_relay_plane(
+                    &account.label,
+                    &self.app.relay_plane,
+                    Some(self.shared.lifecycle()),
+                )
+                .await?;
+            return client.withdraw_key_package_slot().await;
+        }
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::WithdrawKeyPackageSlot { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn key_package_maintenance_status(
         &self,
         account_ref: &str,

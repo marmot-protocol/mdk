@@ -350,6 +350,14 @@ mod tests {
             last_own_leaf_rotation_at: Some(Timestamp(11)),
             next_periodic_rotation_at: Some(Timestamp(12)),
             leaf_refresh_due_at: Some(Timestamp(13)),
+            post_join_history: Some(cgka_traits::maintenance::PostJoinHistoryFetch {
+                obligation_id: mid(9),
+                deadline_at: Some(Timestamp(14)),
+                completion: Some(cgka_traits::maintenance::PostJoinHistoryFetchCompletion {
+                    outcome: cgka_traits::maintenance::PostJoinHistoryFetchOutcome::Fetched,
+                    completed_at_ms: 15_000,
+                }),
+            }),
         };
         store.put_group_maintenance(&state).unwrap();
         let obligation = MaintenanceObligation {

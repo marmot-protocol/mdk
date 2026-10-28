@@ -4,6 +4,7 @@ use marmot_session::AccountError;
 
 use crate::MissingRelayListKind;
 use crate::app_telemetry::{SyncErrorClass, SyncFailureClassification};
+use crate::audit_upload::AuditUploadError;
 pub use nostr_directory::error::MissingKeyPackageReason;
 use nostr_directory::error::{
     DirectoryError, ResourceError, sqlite_error_kind, storage_error_kind,
@@ -471,6 +472,19 @@ impl From<AppError> for DirectoryError {
     fn from(error: AppError) -> Self {
         let kind = error.privacy_safe_kind();
         Self::Resource(ResourceError::from_app(error, kind))
+    }
+}
+
+/// The audit upload's errors convert back to the `AppError` they replaced: the
+/// same variant, message and `privacy_safe_kind` as before the upload had its
+/// own type.
+impl From<AuditUploadError> for AppError {
+    fn from(error: AuditUploadError) -> Self {
+        match error {
+            AuditUploadError::InvalidAuditLogFile(value) => Self::InvalidAuditLogFile(value),
+            AuditUploadError::AuditLogUpload(value) => Self::AuditLogUpload(value),
+            AuditUploadError::Io(value) => Self::Io(value),
+        }
     }
 }
 
@@ -1241,5 +1255,126 @@ mod directory_error_tests {
             AppError::from(carried),
             AppError::AccountHome(AccountHomeError::UnknownAccount(label)) if label == "alice"
         ));
+    }
+}
+
+#[cfg(test)]
+mod audit_upload_error_tests {
+    //! `AuditUploadError` converts back to the `AppError` the audit upload
+    //! built before it had its own type.
+
+    use super::AppError;
+    use crate::audit_upload::{
+        AUDIT_LOG_UPLOAD_MAX_BYTES, AuditUploadError, AuditUploadSnapshot, invalid_audit_upload,
+        validate_audit_upload_endpoint,
+    };
+
+    /// Every failure the upload half builds, each with the `AppError` the
+    /// upload built for it before. Steps a test can reach run for real; the
+    /// request and response failures need a network, so they are written out.
+    async fn cases() -> Vec<(AuditUploadError, AppError)> {
+        let endpoint = |endpoint: &str, token: Option<&str>| {
+            validate_audit_upload_endpoint(endpoint, token).unwrap_err()
+        };
+        let retired = transport_nostr::retired_relay_hosts()
+            .into_iter()
+            .next()
+            .expect("centralized retired host list");
+        let oversized = tempfile::tempfile().unwrap();
+        oversized.set_len(AUDIT_LOG_UPLOAD_MAX_BYTES + 1).unwrap();
+        let oversized = AuditUploadSnapshot::capture(tokio::fs::File::from_std(oversized))
+            .await
+            .err()
+            .expect("over the upload ceiling");
+        let io = || std::io::Error::other("disk");
+        let upload = |message: &str| {
+            (
+                AuditUploadError::AuditLogUpload(message.to_owned()),
+                AppError::AuditLogUpload(message.to_owned()),
+            )
+        };
+        vec![
+            // Endpoint validation.
+            (
+                endpoint("   ", Some("token")),
+                AppError::AuditLogUpload("forensic upload endpoint is empty".to_owned()),
+            ),
+            (
+                endpoint("https://collector.example:0/ingest", Some("token")),
+                AppError::AuditLogUpload("forensic upload endpoint is invalid".to_owned()),
+            ),
+            (
+                endpoint("http://collector.example/ingest", Some("token")),
+                AppError::AuditLogUpload(
+                    "forensic upload endpoint must be https, or loopback http for local testing"
+                        .to_owned(),
+                ),
+            ),
+            (
+                endpoint(&format!("https://{retired}/ingest"), Some("token")),
+                AppError::AuditLogUpload("forensic upload endpoint is not allowed".to_owned()),
+            ),
+            (
+                endpoint("https://collector.example/ingest", None),
+                AppError::AuditLogUpload(
+                    "forensic upload endpoint requires an authorization bearer token unless it is loopback"
+                        .to_owned(),
+                ),
+            ),
+            // Snapshot capture and v4 eligibility.
+            (
+                oversized,
+                AppError::AuditLogUpload(format!(
+                    "audit log exceeds {} byte upload limit",
+                    AUDIT_LOG_UPLOAD_MAX_BYTES
+                )),
+            ),
+            (AuditUploadError::Io(io()), AppError::Io(io())),
+            (
+                invalid_audit_upload(),
+                AppError::InvalidAuditLogFile(
+                    "only valid v4 forensic audit records may be uploaded".into(),
+                ),
+            ),
+            // The validation worker, the network deadline, resolution and
+            // pinning, and the request.
+            upload("audit validation worker failed"),
+            upload("request timed out"),
+            upload("request failed"),
+            upload("HTTP 503"),
+            upload("connection failed"),
+            upload("invalid response body"),
+        ]
+    }
+
+    /// Fails to compile when a variant is added without a case above.
+    fn covered(error: &AuditUploadError) {
+        match error {
+            AuditUploadError::InvalidAuditLogFile(_)
+            | AuditUploadError::AuditLogUpload(_)
+            | AuditUploadError::Io(_) => {}
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_audit_upload_error_converts_to_the_app_error_it_replaced() {
+        for (upload_error, expected) in cases().await {
+            covered(&upload_error);
+            let message = upload_error.to_string();
+            let converted = AppError::from(upload_error);
+            assert_eq!(
+                std::mem::discriminant(&converted),
+                std::mem::discriminant(&expected),
+                "{converted:?} is not the variant of {expected:?}"
+            );
+            assert_eq!(converted.to_string(), expected.to_string());
+            assert_eq!(
+                message,
+                expected.to_string(),
+                "upload message for {expected:?}"
+            );
+            assert_eq!(converted.privacy_safe_kind(), expected.privacy_safe_kind());
+            assert_eq!(format!("{converted:?}"), format!("{expected:?}"));
+        }
     }
 }

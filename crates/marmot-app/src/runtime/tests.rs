@@ -650,28 +650,6 @@ fn generated_setup_context_round_trips_inbox_relays_and_reads_legacy_contexts() 
     assert_eq!(legacy.request().default_relays, request.default_relays);
 }
 
-#[test]
-fn generated_account_birth_marks_cutover_scan_complete_before_session_open() {
-    let directory = tempfile::tempdir().unwrap();
-    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
-    let runtime = MarmotAppRuntime::new(app.clone());
-
-    let (account, private_key_import) = runtime
-        .accounts
-        .create_nostr_account_from_setup(&AccountSetupRequest::default())
-        .unwrap();
-
-    assert!(private_key_import.is_none());
-    assert!(app.key_package_cutover_scan_complete(&account.label));
-    assert!(
-        !app.account_home()
-            .account_dir(&account.label)
-            .join(crate::SESSION_DB_FILE)
-            .exists(),
-        "the scan marker must be durable before any session can open"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_import_relay_discovery_does_not_publish_default_lists() {
     let directory = tempfile::tempdir().unwrap();
@@ -3689,8 +3667,6 @@ async fn catch_up_error_from_ready_account_takes_precedence_over_sibling_backoff
 
 #[test]
 fn key_package_deletion_relay_failures_dedupe_privacy_safe_publish_endpoint_categories() {
-    use crate::KeyPackageDeletionResult;
-
     let hostile_summary = "publish failed: https://evil.example/nip42";
     let hostile_reason = "blocked: attacker-controlled suffix at wss://leak.example";
     let transport_error =
@@ -3716,18 +3692,8 @@ fn key_package_deletion_relay_failures_dedupe_privacy_safe_publish_endpoint_cate
     let wipe_reason = wipe_failure_reason(&err);
     assert_eq!(wipe_reason, "relay rejected event (blocked)");
     assert!(!wipe_reason.contains("evil.example"));
-
-    let (deleted, failures) =
-        relay_failures_from_key_package_deletion_results(vec![KeyPackageDeletionResult {
-            event_id_hex: "11".repeat(32),
-            result: Err(err),
-        }]);
-    assert_eq!(deleted, 0);
-    assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].reason, "relay rejected event (blocked)");
-    assert!(!failures[0].reason.contains("evil.example"));
-    assert!(!failures[0].reason.contains("leak.example"));
-    assert!(!failures[0].reason.contains("attacker-controlled"));
+    assert!(!wipe_reason.contains("leak.example"));
+    assert!(!wipe_reason.contains("attacker-controlled"));
 }
 
 // Overflows the event broadcast without yielding so the timeline forwarder

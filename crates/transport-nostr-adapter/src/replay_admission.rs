@@ -106,25 +106,7 @@ impl ReplayRequestView<'_> {
                         .iter()
                         .any(|delivery| delivery.group_id_hint.is_none())
             }
-            ReplayScope::Groups(_) => {
-                self.coverage
-                    .request_groups
-                    .get(self.id)
-                    .is_some_and(|groups| {
-                        !groups.is_empty()
-                            && groups.iter().all(|id| {
-                                self.coverage.groups.get(id).is_some_and(|group| {
-                                    self.coverage.group_ready(group)
-                                        && group.events.is_empty()
-                                        && group.placements == 0
-                                        && !self.coverage.native_group_pending(id)
-                                        && !self.coverage.outbox.iter().any(|delivery| {
-                                            delivery.group_id_hint.as_ref() == Some(id)
-                                        })
-                                })
-                            })
-                    })
-            }
+            ReplayScope::Groups(_) => self.coverage.request_groups_placed(self.id),
         }
     }
 
@@ -140,6 +122,29 @@ impl ReplayRequestView<'_> {
                         .values()
                         .all(|replay| *replay == RelayReplay::Refused)
             })
+    }
+}
+
+impl AccountReplayCoverage {
+    /// Every MLS group request `id` routes has reached durable placement and
+    /// ordinary native admission: nothing for those groups is buffered, queued
+    /// natively, pinned or waiting in the outbox.
+    pub(super) fn request_groups_placed(&self, id: &str) -> bool {
+        self.request_groups.get(id).is_some_and(|groups| {
+            !groups.is_empty()
+                && groups.iter().all(|group_id| {
+                    self.groups.get(group_id).is_some_and(|group| {
+                        self.group_ready(group)
+                            && group.events.is_empty()
+                            && group.placements == 0
+                            && !self.native_group_pending(group_id)
+                            && !self
+                                .outbox
+                                .iter()
+                                .any(|delivery| delivery.group_id_hint.as_ref() == Some(group_id))
+                    })
+                })
+        })
     }
 }
 

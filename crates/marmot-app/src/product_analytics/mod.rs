@@ -1,6 +1,7 @@
 //! Opt-in, bounded product observations. No account, message or transport identities enter this module.
 
-use crate::{AppError, MarmotApp};
+use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -24,6 +25,7 @@ pub use builtins::approved_host_product_schemas;
 pub use catalogue::*;
 #[cfg(feature = "product-analytics-export")]
 mod delivery;
+pub(crate) mod observed;
 #[cfg(test)]
 mod tests;
 
@@ -240,10 +242,11 @@ impl ProductAnalyticsRuntimeConfig {
             }
         }
         if let Some(endpoint) = &self.events_endpoint {
-            let url =
-                crate::config::parse_relay_telemetry_endpoint(endpoint).ok_or_else(invalid)?;
+            let url = crate::export_config::parse_relay_telemetry_endpoint(endpoint)
+                .ok_or_else(invalid)?;
             if url.query().is_some()
-                || (crate::config::endpoint_host_is_loopback(endpoint) && !self.allow_loopback)
+                || (crate::export_config::endpoint_host_is_loopback(endpoint)
+                    && !self.allow_loopback)
             {
                 return Err(invalid());
             }
@@ -395,8 +398,26 @@ impl AnalyticsClock for SystemClock {
         self.0.elapsed()
     }
     fn uuid(&self) -> String {
-        crate::generate_telemetry_install_id()
+        generate_telemetry_install_id()
     }
+}
+
+/// A random version-4 UUID: the telemetry install id `marmot-app` persists, and this collector's
+/// session and batch ids.
+pub(crate) fn generate_telemetry_install_id() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let encoded = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &encoded[0..8],
+        &encoded[8..12],
+        &encoded[12..16],
+        &encoded[16..20],
+        &encoded[20..32]
+    )
 }
 
 /// Captures the grant; clones cannot become valid again after revocation.
@@ -434,7 +455,7 @@ pub struct ProductAnalytics {
     inner: Arc<Mutex<State>>,
     clock: Arc<dyn AnalyticsClock>,
     generation: Arc<AtomicU64>,
-    pub(crate) telemetry_rejected: Arc<AtomicBool>,
+    telemetry_rejected: Arc<AtomicBool>,
     #[cfg_attr(not(feature = "product-analytics-export"), allow(dead_code))]
     send_lock: Arc<tokio::sync::Mutex<()>>,
     consent_lock: Arc<Mutex<()>>,
@@ -509,10 +530,6 @@ impl Default for ProductAnalytics {
     }
 }
 impl ProductAnalytics {
-    fn fail_closed(&self) {
-        self.lock().persistence_failed = true;
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -572,6 +589,32 @@ impl ProductAnalytics {
         s.settings = receipt;
         s.diagnostic_id = diagnostic_id;
         s.granted_at = self.clock.monotonic();
+    }
+    /// Take the consent lock for a consent change: restoring the saved receipt, or saving a new
+    /// one. Hold it across the whole change. The state lock is taken inside it, as `configure`
+    /// takes it: consent, then state.
+    pub(crate) fn consent_change(&self) -> ConsentChange<'_> {
+        ConsentChange {
+            collector: self,
+            _consent: self.consent_lock.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+    /// Whether a granted receipt saved under `saved` must be accepted again: this process failed
+    /// to persist consent, or the receipt's policy, registry or scope revision is not this
+    /// collector's.
+    pub(crate) fn requires_acceptance(&self, saved: &ReceiptRevisions) -> bool {
+        let s = self.lock();
+        s.persistence_failed
+            || saved.policy != USAGE_DIAGNOSTICS_POLICY
+            || saved.registry != s.registry_revision
+            || saved.scope != s.scope
+    }
+    /// Whether an OTLP collector rejected relay telemetry under the current grant.
+    pub(crate) fn telemetry_rejected(&self) -> bool {
+        self.telemetry_rejected.load(Ordering::Acquire)
+    }
+    pub(crate) fn clear_telemetry_rejection(&self) {
+        self.telemetry_rejected.store(false, Ordering::Release);
     }
     pub(crate) fn configure(
         &self,
@@ -1087,12 +1130,8 @@ impl ProductAnalytics {
         }
         self.accumulate(&mut s, ProductFamily::Sync.as_str(), props);
         if let Some(failure) = failure {
-            let operation = match failure.error_class {
-                crate::SyncErrorClass::StorageBusy => Some("busy"),
-                crate::SyncErrorClass::StorageCorruption => Some("corruption"),
-                crate::SyncErrorClass::StorageCapacity => Some("capacity"),
-                _ => None,
-            };
+            let operation = StorageFailureKind::from_sync_class(failure.error_class)
+                .map(StorageFailureKind::as_str);
             if let Some(operation) = operation {
                 self.accumulate(
                     &mut s,
@@ -1365,7 +1404,7 @@ impl ProductAnalytics {
             .await;
         }
     }
-    pub(crate) async fn run(self, relay_plane: crate::MarmotRelayPlane) {
+    pub(crate) async fn run(self, relay_plane: transport_nostr::MarmotRelayPlane) {
         let Some(permit) = self.permit() else {
             return;
         };
@@ -1402,116 +1441,52 @@ impl ProductAnalytics {
     }
 }
 
-fn receipt_from_stored(
-    r: &storage_sqlite::StoredUsageDiagnosticsSettings,
-) -> UsageDiagnosticsSettings {
-    UsageDiagnosticsSettings {
-        decision: match r.decision {
-            1 => UsageDiagnosticsDecision::Declined,
-            2 => UsageDiagnosticsDecision::Granted,
-            _ => UsageDiagnosticsDecision::AcceptanceRequired,
-        },
-        policy_revision: r.policy_revision.clone(),
-        registry_revision: r.registry_revision.clone(),
-        updated_at_ms: r.updated_at_ms,
-        previously_enabled: r.previously_enabled,
-    }
+/// The revisions a usage-diagnostics receipt is granted under: the consent policy, the product
+/// event registry and the export scope.
+pub(crate) struct ReceiptRevisions {
+    pub policy: String,
+    pub registry: String,
+    pub scope: String,
 }
 
-impl MarmotApp {
-    /// Opaque, revocable grant for direct diagnostic exporter integrations.
-    pub fn usage_diagnostics_permit(&self) -> Result<DiagnosticsPermit, AppError> {
-        self.product_analytics
-            .permit()
-            .ok_or_else(|| ProductAnalyticsError::ConsentRequired.into())
-    }
+/// What a new receipt records: this collector's revisions, and when it was made.
+pub(crate) struct ReceiptStamp {
+    pub revisions: ReceiptRevisions,
+    pub updated_at_ms: i64,
+}
 
-    pub fn usage_diagnostics_settings(&self) -> Result<UsageDiagnosticsSettings, AppError> {
-        let r = self.shared_storage()?.usage_diagnostics_settings()?;
-        let mut receipt = receipt_from_stored(&r);
-        let state = self.product_analytics.lock();
-        if receipt.decision == UsageDiagnosticsDecision::Granted
-            && (state.persistence_failed
-                || r.policy_revision != USAGE_DIAGNOSTICS_POLICY
-                || r.registry_revision != state.registry_revision
-                || r.scope_revision != state.scope)
-        {
-            receipt.decision = UsageDiagnosticsDecision::AcceptanceRequired;
+/// The consent lock, held across a consent change. Failing closed, reopening after a durable
+/// write and stamping a new receipt are steps of a change, so only this guard offers them.
+pub(crate) struct ConsentChange<'a> {
+    collector: &'a ProductAnalytics,
+    _consent: std::sync::MutexGuard<'a, ()>,
+}
+
+impl ConsentChange<'_> {
+    /// Refuse permits until a durable write and its receipt reload succeed.
+    pub(crate) fn fail_closed(&self) {
+        self.collector.lock().persistence_failed = true;
+    }
+    /// The durable write and its receipt reload succeeded.
+    pub(crate) fn persisted(&self) {
+        self.collector.lock().persistence_failed = false;
+    }
+    /// This collector's revisions and the wall clock, read under one state lock.
+    pub(crate) fn receipt_stamp(&self) -> ReceiptStamp {
+        let s = self.collector.lock();
+        ReceiptStamp {
+            revisions: ReceiptRevisions {
+                policy: USAGE_DIAGNOSTICS_POLICY.into(),
+                registry: s.registry_revision.clone(),
+                scope: s.scope.clone(),
+            },
+            updated_at_ms: self
+                .collector
+                .clock
+                .wall_seconds()
+                .saturating_mul(1000)
+                .min(i64::MAX as u64) as i64,
         }
-        Ok(receipt)
-    }
-    pub(crate) fn stored_usage_diagnostics_settings(
-        &self,
-    ) -> Result<UsageDiagnosticsSettings, AppError> {
-        let r = self.shared_storage()?.usage_diagnostics_settings()?;
-        Ok(receipt_from_stored(&r))
-    }
-
-    pub(crate) fn restore_usage_diagnostics(&self) -> Result<(), AppError> {
-        let _consent = self
-            .product_analytics
-            .consent_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let restored = (|| {
-            let receipt = self.usage_diagnostics_settings()?;
-            let id = self
-                .shared_storage()?
-                .telemetry_install_id()?
-                .unwrap_or_default();
-            Ok::<_, AppError>((receipt, id))
-        })();
-        match restored {
-            Ok((receipt, id)) => {
-                self.product_analytics.set_receipt(receipt, id);
-                Ok(())
-            }
-            Err(error) => {
-                self.product_analytics.revoke_memory();
-                self.product_analytics.fail_closed();
-                Err(error)
-            }
-        }
-    }
-
-    pub fn set_usage_diagnostics_consent(
-        &self,
-        enabled: bool,
-    ) -> Result<UsageDiagnosticsSettings, AppError> {
-        let _consent = self
-            .product_analytics
-            .consent_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let old_id = if enabled && self.product_analytics.permit().is_some() {
-            self.telemetry_install_id().ok()
-        } else {
-            None
-        };
-        self.product_analytics.revoke_memory();
-        // Fail closed until the complete durable write and receipt reload succeed.
-        self.product_analytics.lock().persistence_failed = true;
-        let storage = self.shared_storage()?;
-        let mut r = storage.usage_diagnostics_settings()?;
-        let state = self.product_analytics.lock();
-        r.decision = if enabled { 2 } else { 1 };
-        r.policy_revision = USAGE_DIAGNOSTICS_POLICY.into();
-        r.registry_revision = state.registry_revision.clone();
-        r.scope_revision = state.scope.clone();
-        r.updated_at_ms = self
-            .product_analytics
-            .clock
-            .wall_seconds()
-            .saturating_mul(1000)
-            .min(i64::MAX as u64) as i64;
-        drop(state);
-        let id = enabled.then(|| old_id.unwrap_or_else(crate::generate_telemetry_install_id));
-        storage.set_usage_diagnostics_settings(&r, id.as_deref())?;
-        let receipt = self.stored_usage_diagnostics_settings()?;
-        self.product_analytics.lock().persistence_failed = false;
-        self.product_analytics
-            .set_receipt(receipt.clone(), id.unwrap_or_default());
-        Ok(receipt)
     }
 }
 
@@ -1638,26 +1613,52 @@ impl Drop for ProductObservation {
         }
     }
 }
+/// A storage failure the collector counts, by the class of the error behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StorageFailureKind {
+    Busy,
+    Corruption,
+    Capacity,
+}
+impl StorageFailureKind {
+    /// The counted kind of a sync error class; other classes are not storage failures.
+    pub(crate) const fn from_sync_class(class: crate::SyncErrorClass) -> Option<Self> {
+        match class {
+            crate::SyncErrorClass::StorageBusy => Some(Self::Busy),
+            crate::SyncErrorClass::StorageCorruption => Some(Self::Corruption),
+            crate::SyncErrorClass::StorageCapacity => Some(Self::Capacity),
+            _ => None,
+        }
+    }
+    /// The storage operation it is counted under.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Corruption => "corruption",
+            Self::Capacity => "capacity",
+        }
+    }
+}
 impl ProductAnalytics {
-    /// Called only at a canonical failing command boundary, with its admission generation.
-    pub(crate) fn storage_failure(&self, permit: Option<&DiagnosticsPermit>, error: &AppError) {
+    /// Called only at a canonical failing command boundary, with its admission generation and
+    /// the storage failure its error counts as, if any. `marmot-app` converts its errors
+    /// (`app_outcome`); a forwarded sync failure counts as none, since the sync completion
+    /// observation already owns it.
+    pub(crate) fn storage_failure(
+        &self,
+        permit: Option<&DiagnosticsPermit>,
+        failure: impl Into<Option<StorageFailureKind>>,
+    ) {
         let Some(permit) = permit else {
             return;
         };
-        // A forwarded sync failure is already owned by the sync completion observation.
-        if matches!(error, AppError::AccountCatchUp(_)) {
+        let Some(failure) = failure.into() else {
             return;
-        }
-        let operation = match error.sync_error_class() {
-            crate::app_telemetry::SyncErrorClass::StorageBusy => "busy",
-            crate::app_telemetry::SyncErrorClass::StorageCorruption => "corruption",
-            crate::app_telemetry::SyncErrorClass::StorageCapacity => "capacity",
-            _ => return,
         };
         self.observe_count(
             permit,
             ProductFamily::Storage,
-            operation,
+            failure.as_str(),
             "failure",
             ProductUnit::Attempt,
             1,
@@ -1731,56 +1732,15 @@ impl ProductAnalytics {
     }
 }
 
+#[cfg(test)]
+impl ProductAnalytics {
+    /// Whether the collector holds a complete delivery configuration.
+    pub(crate) fn config_ready(&self) -> bool {
+        self.lock().config.ready()
+    }
+}
+
 #[cfg(all(test, feature = "product-analytics-export"))]
 pub(crate) fn test_product_collector() -> ProductAnalytics {
     tests::configured().0
-}
-
-/// Configure optional headless-host analytics from its environment. Invalid analytics
-/// settings never prevent the host from opening or disable its diagnostic pipeline.
-pub fn configure_product_analytics_from_environment(
-    runtime: &crate::MarmotAppRuntime,
-    host_surface: &str,
-) {
-    configure_product_analytics_from_values(runtime, host_surface, |name| std::env::var(name).ok());
-}
-
-fn configure_product_analytics_from_values(
-    runtime: &crate::MarmotAppRuntime,
-    host_surface: &str,
-    get: impl Fn(&str) -> Option<String>,
-) {
-    let endpoint = get("MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT");
-    let key = get("MARMOT_PRODUCT_ANALYTICS_APP_KEY");
-    if endpoint.is_none() && key.is_none() {
-        return;
-    }
-    let config = ProductAnalyticsRuntimeConfig {
-        events_endpoint: endpoint,
-        app_key: key,
-        operator: get("MARMOT_PRODUCT_ANALYTICS_OPERATOR").unwrap_or_default(),
-        allow_loopback: get("MARMOT_PRODUCT_ANALYTICS_ALLOW_LOOPBACK").as_deref() == Some("1"),
-        registry: Vec::new(),
-        metadata: ProductAnalyticsMetadata {
-            app_version: env!("CARGO_PKG_VERSION").into(),
-            os_family: std::env::consts::OS.into(),
-            os_major_version: String::new(),
-            device_class: "headless".into(),
-            host_surface: host_surface.into(),
-            environment: get("MARMOT_PRODUCT_ANALYTICS_ENVIRONMENT")
-                .unwrap_or_else(|| "development".into()),
-            is_debug: cfg!(debug_assertions),
-        },
-    };
-    if runtime
-        .set_product_analytics_runtime_config(config)
-        .is_err()
-    {
-        tracing::warn!(
-            target: "marmot_app::product_analytics",
-            method = "configure_product_analytics_from_environment",
-            error_code = "invalid_product_analytics_configuration",
-            "optional product analytics configuration rejected"
-        );
-    }
 }

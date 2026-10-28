@@ -153,7 +153,50 @@ impl NostrKeyPackagePublication {
             created_at,
         ))
     }
+
+    /// Whether a prepared, signed `event` is exactly the event this
+    /// publication describes at the event's own `created_at`: same author,
+    /// kind, tags and content. Only such an event is ever sent, so one that
+    /// does not match, for example because an earlier build signed it under
+    /// rules this one no longer accepts, can never be published.
+    pub fn matches_prepared_event(
+        &self,
+        event: &NostrTransportEvent,
+    ) -> Result<bool, TransportAdapterError> {
+        let expected = self.to_event_at(event.created_at)?;
+        Ok(event.sig.is_some()
+            && event.pubkey == expected.pubkey
+            && event.kind == expected.kind
+            && event.tags == expected.tags
+            && event.content == expected.content
+            && event.created_at == expected.created_at)
+    }
 }
+
+/// The unsigned kind 5 request asking relays to stop serving one KeyPackage
+/// slot: exactly one `a` tag, `30443:<lowercase hex author>:<d>` with no relay
+/// hint, and one `k` tag. Relays drop every publication in the slot up to
+/// `created_at`.
+pub fn key_package_slot_deletion_event(
+    account_id: &MemberId,
+    slot_id: &str,
+    created_at: u64,
+) -> NostrTransportEvent {
+    let author = hex::encode(account_id.as_slice());
+    let address = format!("{KIND_MARMOT_KEY_PACKAGE}:{author}:{slot_id}");
+    NostrTransportEvent::new_unsigned_at(
+        author,
+        KIND_EVENT_DELETION,
+        vec![
+            vec!["a".to_owned(), address],
+            vec!["k".to_owned(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+        ],
+        String::new(),
+        created_at,
+    )
+}
+
+const KIND_EVENT_DELETION: u64 = 5;
 
 #[derive(Clone)]
 pub struct NostrKeyPackagePublisher {
@@ -197,14 +240,7 @@ impl NostrKeyPackagePublisher {
         publication: &NostrKeyPackagePublication,
         event: &NostrTransportEvent,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
-        let expected = publication.to_event_at(event.created_at)?;
-        if event.sig.is_none()
-            || event.pubkey != expected.pubkey
-            || event.kind != expected.kind
-            || event.tags != expected.tags
-            || event.content != expected.content
-            || event.created_at != expected.created_at
-        {
+        if !publication.matches_prepared_event(event)? {
             return Err(TransportAdapterError::Publish(
                 "prepared KeyPackage event does not match publication".into(),
             ));
@@ -307,6 +343,23 @@ mod tests {
                 "0x8001".to_string(),
                 "0x8003".to_string(),
                 "0x8004".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn slot_deletion_names_only_the_slot_address_and_kind() {
+        let account_id = MemberId::new(vec![0xAB; 32]);
+        let event = key_package_slot_deletion_event(&account_id, "slot-1", 1_700_000_000);
+        assert_eq!(event.kind, 5);
+        assert_eq!(event.pubkey, "ab".repeat(32));
+        assert_eq!(event.created_at, 1_700_000_000);
+        assert_eq!(event.content, "");
+        assert_eq!(
+            event.tags,
+            vec![
+                vec!["a".to_owned(), format!("30443:{}:slot-1", "ab".repeat(32))],
+                vec!["k".to_owned(), "30443".to_owned()],
             ]
         );
     }

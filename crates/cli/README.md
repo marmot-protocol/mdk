@@ -301,6 +301,10 @@ the events this device sent. They do not prove that any other member has process
 are queryable after the command returns and after a restart: `groups disband-status`, `groups recovery-status`,
 `groups pending-welcomes`, and `groups maintenance-status`.
 
+**Members are accounts.** `groups members`, `groups show` and `groups management` list each member account once, even
+when it has several devices in the group. Each `members` entry carries `device_count`, how many of that account's
+devices are in the group, and member counts, admin counts and the last-admin check count accounts.
+
 **Invites.** `groups invites` lists groups still awaiting local confirmation. `groups accept` clears that pending state;
 `groups decline` leaves and archives the auto-joined pending group.
 

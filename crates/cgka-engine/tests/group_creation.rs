@@ -2601,6 +2601,28 @@ async fn create_group_rejects_expired_invitee_keypackage() {
 }
 
 #[tokio::test]
+async fn fresh_key_package_lasts_thirty_days_and_invitees_may_last_eighty_four() {
+    let mut bob = build_client(b"bob", selfremove_registry());
+    // The publishing target: 30 days plus an hour of clock-skew margin
+    // (foundation/key-packages.md, "Refreshing a slot").
+    let published = key_package_metadata(&bob.fresh_key_package().await.unwrap()).unwrap();
+    assert_eq!(published.not_after - published.not_before, 2_595_600);
+
+    // A receiver keeps the 84-day validity limit, so a longer range from
+    // another client still validates.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let longest = key_package_with_account_identity_proof_and_lifetime(
+        b"carol-84-days",
+        Lifetime::init(now - 3_600, now - 3_600 + 7_261_200),
+    );
+    let accepted = key_package_metadata(&longest).expect("a KeyPackage at the validity limit");
+    assert_eq!(accepted.not_after - accepted.not_before, 7_261_200);
+}
+
+#[tokio::test]
 async fn create_group_rejects_invitee_keypackage_with_excessive_lifetime_range() {
     let mut alice = build_client(b"alice", selfremove_registry());
     let now = std::time::SystemTime::now()
@@ -3887,6 +3909,89 @@ async fn audit_log_records_welcome_recipient_expectation() {
         app_message.recipient_scope,
         RecipientScope::AllOtherCurrentGroupMembers
     ));
+    assert_eq!(app_message.expected_count, Some(1));
+    assert_eq!(app_message.expected_member_refs.len(), 1);
+}
+
+/// An account with several devices is one recipient of the main message: its
+/// ref appears once and the count is of accounts, not leaves.
+#[tokio::test]
+async fn audit_log_recipient_expectation_counts_each_account_once() {
+    use marmot_forensics::{AuditEvent, AuditEventKind, MessageArtifactKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let recorder =
+        marmot_forensics::JsonlRecorder::open(&path, "test-engine-devices".to_string()).unwrap();
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .peeler(Box::new(MockPeeler::default()))
+        .recorder(Box::new(recorder))
+        .build()
+        .expect("build alice with recorder");
+    let mut bob_phone = build_client(b"bob", FeatureRegistry::new());
+    let mut bob_laptop = build_client(b"bob", FeatureRegistry::new());
+    let (gid, result) = alice
+        .create_group_with_audit_context(
+            CreateGroupRequest {
+                name: "g".into(),
+                description: String::new(),
+                members: vec![
+                    bob_phone.fresh_key_package().await.unwrap(),
+                    bob_laptop.fresh_key_package().await.unwrap(),
+                ],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            },
+            None,
+        )
+        .await
+        .expect("create group with both of bob's devices");
+    let SendResult::GroupCreated { pending, welcomes } = result else {
+        panic!("expected GroupCreated")
+    };
+    assert_eq!(welcomes.len(), 2);
+    alice.confirm_published(pending).await.unwrap();
+    let payload = app_payload_for(&alice, b"hello");
+    alice
+        .send_with_audit_context(
+            cgka_traits::engine::SendIntent::AppMessage {
+                group_id: gid.clone(),
+                payload,
+                expected_epoch: None,
+            },
+            None,
+        )
+        .await
+        .expect("send app message");
+    drop(alice);
+
+    let events: Vec<AuditEvent> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let expectations: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AuditEventKind::RecipientExpectation { expectation, .. } => Some(expectation),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        expectations
+            .iter()
+            .filter(|e| e.artifact_kind == MessageArtifactKind::Welcome)
+            .count(),
+        2
+    );
+    let app_message = expectations
+        .iter()
+        .find(|e| e.artifact_kind == MessageArtifactKind::ApplicationMessage)
+        .expect("app message recipient_expectation recorded");
     assert_eq!(app_message.expected_count, Some(1));
     assert_eq!(app_message.expected_member_refs.len(), 1);
 }

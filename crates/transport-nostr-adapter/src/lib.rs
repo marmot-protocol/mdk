@@ -90,6 +90,7 @@ pub use acquisition::{
 pub use key_package::{
     CLIENT_NAME_MAX_BYTES, CLIENT_TAG, KIND_MARMOT_KEY_PACKAGE, NostrKeyPackagePublication,
     NostrKeyPackagePublisher, is_valid_client_name, key_package_client_name,
+    key_package_slot_deletion_event,
 };
 pub use relay_list::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind,
@@ -1527,6 +1528,20 @@ impl NostrTransportAdapter {
             }
         }
         state.sync.subscription_any_eose(subscription_id)
+    }
+
+    /// Whether everything a live group subscription has delivered so far has
+    /// left the adapter: each of its groups is ready, and holds nothing
+    /// buffered, queued natively, pinned or in the outbox. Under a registered
+    /// [`ReplayIngress`], whose frames are acknowledged only after ingest, that
+    /// means ingested. Unknown or retired subscriptions return `None`.
+    pub async fn subscription_placed(&self, subscription_id: &str) -> Option<bool> {
+        let state = self.state.read().await;
+        state
+            .account_replay_coverage
+            .values()
+            .find(|coverage| coverage.subscriptions.contains_key(subscription_id))
+            .map(|coverage| coverage.request_groups_placed(subscription_id))
     }
 
     /// Session-bound EOSE for one caller-supplied endpoint. Unknown or retired

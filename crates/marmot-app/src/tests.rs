@@ -10,7 +10,11 @@ mod key_package_inventory;
 mod key_package_relay_lists;
 mod key_package_selection;
 mod message_journeys;
+#[cfg(feature = "test-policy-overrides")]
+mod multi_device_members;
 mod publication_progress;
+#[cfg(feature = "test-policy-overrides")]
+mod push_announce;
 #[cfg(feature = "test-policy-overrides")]
 mod push_snapshot;
 #[cfg(feature = "test-policy-overrides")]
@@ -573,6 +577,8 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     failing_endpoint: std::sync::Mutex<Option<String>>,
     failing_endpoint_kind: std::sync::Mutex<Option<u64>>,
     fetch_gate_kind: std::sync::Mutex<Option<u64>>,
+    /// Answer every deletion proof with nothing, as a relay that lost them.
+    pub(crate) empty_deletion_proofs: std::sync::atomic::AtomicBool,
     fetch_gate: std::sync::Mutex<
         Option<(
             std::sync::Arc<tokio::sync::Notify>,
@@ -609,6 +615,37 @@ impl MemberResolutionDirectoryFetcher {
     }
 }
 
+/// The KeyPackage query of a KeyPackage read, checking that the read also
+/// asks for the authors' KeyPackage deletion requests.
+fn key_package_read(
+    request: &transport_nostr::DirectoryFetchRequest,
+) -> &transport_nostr::DirectoryEventQuery {
+    assert_eq!(request.queries.len(), 2, "{:?}", request.queries);
+    let packages = request
+        .queries
+        .iter()
+        .find(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap();
+    assert!(request.queries.iter().any(|query| {
+        query.kind == 5
+            && query.authors == packages.authors
+            && query.reference == Some(('k', KIND_MARMOT_KEY_PACKAGE.to_string()))
+    }));
+    packages
+}
+
+/// Whether a fixture knob set for `kind` applies to `query`. A kind 5 knob
+/// targets deletion proofs, not the deletion read sent with every KeyPackage
+/// fetch.
+fn targets_kind(query: &transport_nostr::DirectoryEventQuery, kind: Option<u64>) -> bool {
+    Some(query.kind) == kind
+        && (query.kind != 5
+            || query
+                .reference
+                .as_ref()
+                .is_none_or(|(name, _)| *name != 'k'))
+}
+
 #[async_trait]
 impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher {
     async fn fetch_directory_events(
@@ -618,10 +655,11 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         self.requests.lock().unwrap().push(request.clone());
         let gate = {
             let mut fetch_gate = self.fetch_gate.lock().unwrap();
+            let gate_kind = *self.fetch_gate_kind.lock().unwrap();
             if request
                 .queries
                 .iter()
-                .any(|query| Some(query.kind) == *self.fetch_gate_kind.lock().unwrap())
+                .any(|query| targets_kind(query, gate_kind))
             {
                 fetch_gate.take()
             } else {
@@ -670,6 +708,16 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
                 .any(|endpoint| endpoint.0 == stalled)
         }) {
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if self
+            .empty_deletion_proofs
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && request
+                .queries
+                .iter()
+                .all(|query| targets_kind(query, Some(5)))
+        {
+            return Ok(Vec::new());
         }
         let single_author_only = self.key_packages_only_in_single_author.lock().unwrap();
         let multi_author_only = self.key_packages_only_in_multi_author.lock().unwrap();
@@ -745,7 +793,7 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
                     || request
                         .queries
                         .iter()
-                        .any(|query| Some(query.kind) == incomplete_kind))
+                        .any(|query| targets_kind(query, incomplete_kind)))
                     && request
                         .endpoints
                         .iter()
@@ -2372,6 +2420,62 @@ async fn recovery_warning_is_hidden_for_terminal_groups_but_not_repairable_group
             "terminal verdicts suppress the warning; repairable halts do not"
         );
     }
+}
+
+/// A current-epoch message from another device of this account proves the
+/// group is healthy, exactly like one from another account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sibling_device_message_clears_the_recovery_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("sibling recovery", &[]).await.unwrap();
+    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .record_recovery_evidence(
+            &[storage_sqlite::StoredEpochStallEvidence {
+                group_id_hex: hex::encode(group_id.as_slice()),
+                stalled_epoch: epoch.0,
+                fruitless_completions: 3,
+                fruitless_reported: true,
+                last_arm_at_ms: 1,
+            }],
+            3,
+        )
+        .unwrap();
+    assert!(
+        client
+            .group_recovery_status(&group_id)
+            .unwrap()
+            .automatic_recovery_failed
+    );
+
+    let effects = marmot_session::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
+            authority: None,
+            group_id: group_id.clone(),
+            message_id: cgka_traits::MessageId::new(vec![0xa2; 32]),
+            sender: client.runtime.self_id(),
+            epoch,
+            payload: Vec::new(),
+            retention: None,
+            encrypted_media_secret: None,
+        }],
+        ..Default::default()
+    };
+    client.observe_recovery_health(&effects).unwrap();
+    assert!(
+        !client
+            .group_recovery_status(&group_id)
+            .unwrap()
+            .automatic_recovery_failed
+    );
 }
 
 /// A tracked group stalled below the arm threshold, so `mark_replayed` is the
@@ -9572,7 +9676,7 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
         1,
         "prewarmed routes should avoid repeating discovery"
     );
-    assert_eq!(requests[0].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+    key_package_read(&requests[0]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9735,7 +9839,7 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(
         requests.len(),
         3,
-        "prewarm needs discovery, outbox and package batches, without preference refetches"
+        "prewarm needs discovery, outbox and package batches, without single-author reads"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert!(
@@ -9755,10 +9859,12 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
             .iter()
             .all(|query| query.authors.len() == 8)
     );
-    assert_eq!(requests[2].queries.len(), 1);
-    assert_eq!(requests[2].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
-    assert_eq!(requests[2].queries[0].authors.len(), 8);
-    assert_eq!(requests[2].queries[0].limit, 8 * 12);
+    let packages = key_package_read(&requests[2]);
+    assert_eq!(packages.authors.len(), 8);
+    assert_eq!(
+        packages.limit,
+        transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT
+    );
     drop(requests);
 
     for account in &accounts {
@@ -9781,7 +9887,7 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
         12,
-        "create reuses discovery routes but adds a package batch and eight preference refetches"
+        "create reuses discovery routes but adds a package batch and eight single-author reads"
     );
 }
 
@@ -9851,7 +9957,7 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
         "discovery covers the outbox; prewarm adds only the package batch"
     );
     assert_eq!(requests[0].queries.len(), 2);
-    assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+    key_package_read(&requests[1]);
     assert_eq!(
         app.directory()
             .resolve_member_key_packages(&members)
@@ -9863,7 +9969,7 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
         5,
-        "create adds the package batch and two preference refetches, without relay discovery"
+        "create adds the package batch and two single-author reads, without relay discovery"
     );
 }
 
@@ -16256,6 +16362,66 @@ async fn a_drained_member_departure_removes_that_members_group_push_tokens() {
             .collect::<HashSet<_>>(),
         HashSet::from([staying]),
         "a drained departure must drop the departed member's push records and keep the rest"
+    );
+}
+
+/// A device departure reaches hosts without leaf indexes. MDK still drops the
+/// removed device's push record; hosts learn only which accounts left, and an
+/// account whose other device stays has not left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_departure_event_carries_no_leaf_index() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://device-departure.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("device departure", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let peer = nostr::prelude::Keys::generate().public_key().to_hex();
+    for leaf in [1, 2] {
+        app.upsert_group_push_token(
+            "alice",
+            &drained_seam_push_token(&group_id_hex, &peer, leaf),
+        )
+        .unwrap();
+    }
+
+    let effects = marmot_session::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            leaves: vec![cgka_traits::engine::GroupMemberLeaf {
+                member: MemberId::new(hex::decode(&peer).unwrap()),
+                leaf_index: 1,
+            }],
+            departed_members: vec![],
+        }],
+        ..Default::default()
+    };
+    let summary = client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+
+    let remaining = app.group_push_tokens("alice", &group_id_hex).unwrap();
+    assert_eq!(
+        remaining
+            .iter()
+            .map(|token| token.leaf_index)
+            .collect::<Vec<_>>(),
+        vec![2],
+        "only the removed device's push record is dropped"
+    );
+    assert_eq!(
+        summary.events,
+        vec![cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
+            group_id,
+            epoch: cgka_traits::EpochId(1),
+            leaves: vec![],
+            departed_members: vec![],
+        }]
     );
 }
 
@@ -23132,6 +23298,111 @@ async fn dev_maintenance_timing_reaches_the_account_runtime_only_in_test_policy_
         expected,
         "the override must reach the runtime that schedules rotations only in test-policy builds"
     );
+}
+
+/// Two runtimes built from one app share its collector side: consent, and the product events
+/// either records. Each keeps its own performance recorder and snapshot (#2627).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtimes_from_one_app_share_consent_and_product_events_but_not_performance() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let first = app.runtime();
+    let second = app.runtime();
+    first
+        .set_product_analytics_runtime_config(ProductAnalyticsRuntimeConfig {
+            events_endpoint: Some("https://analytics.example/api/v0/events".into()),
+            app_key: Some("A-SH-test".into()),
+            operator: "test".into(),
+            allow_loopback: false,
+            registry: vec![],
+            metadata: ProductAnalyticsMetadata {
+                app_version: "1.0".into(),
+                os_family: "linux".into(),
+                os_major_version: "6".into(),
+                device_class: "desktop".into(),
+                host_surface: "native".into(),
+                environment: "staging".into(),
+                is_debug: true,
+            },
+        })
+        .unwrap();
+
+    first.set_usage_diagnostics_consent(true).unwrap();
+    assert_eq!(
+        second.usage_diagnostics_status().consent,
+        UsageDiagnosticsDecision::Granted
+    );
+
+    let frame_draw = |runtime: &MarmotAppRuntime| {
+        runtime
+            .app_performance_snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimePerformanceOperation::HostFrameDraw)
+            .unwrap()
+            .started
+    };
+    first.record_host_performance(
+        HostPerformanceOperation::FrameDraw,
+        Duration::from_millis(3),
+        HostPerformanceOutcome::Success,
+    );
+    assert_eq!((frame_draw(&first), frame_draw(&second)), (1, 0));
+
+    #[cfg(feature = "product-analytics-export")]
+    {
+        let first_sync =
+            first.begin_product_operation(ProductFamily::Sync, "full_history", ProductUnit::Action);
+        first_sync.unwrap().finish("success");
+        let second_schedule = second.begin_product_operation(
+            ProductFamily::Notification,
+            "schedule",
+            ProductUnit::Attempt,
+        );
+        second_schedule.unwrap().finish("failure");
+        // A runtime's performance recorder forwards readiness to the shared collector. The
+        // collector drops a sample longer than consent has been granted, so this one is empty.
+        second.record_host_performance(
+            HostPerformanceOperation::ForegroundLocalReady,
+            Duration::ZERO,
+            HostPerformanceOutcome::Success,
+        );
+        // Sealing also adds the window's coverage row, which carries no outcome.
+        let mut recorded: Vec<_> = app
+            .product_analytics
+            .test_payloads()
+            .iter()
+            .filter_map(|row| {
+                let props = &row["props"];
+                Some((
+                    row["eventName"].as_str()?.to_owned(),
+                    props["operation"].as_str()?.to_owned(),
+                    props["outcome"].as_str()?.to_owned(),
+                ))
+            })
+            .collect();
+        recorded.sort();
+        let expected = [
+            ("mdk_notification_summary", "schedule", "failure"),
+            ("mdk_runtime_summary", "readiness", "success"),
+            ("mdk_sync_summary", "full_history", "success"),
+        ]
+        .map(|(event, operation, outcome)| (event.into(), operation.into(), outcome.into()));
+        assert_eq!(recorded, expected);
+    }
+
+    second.set_usage_diagnostics_consent(false).unwrap();
+    assert_eq!(
+        first.usage_diagnostics_status().consent,
+        UsageDiagnosticsDecision::Declined
+    );
+    assert!(
+        first
+            .begin_product_operation(ProductFamily::Sync, "full_history", ProductUnit::Action)
+            .is_none()
+    );
+    first.shutdown().await;
+    second.shutdown().await;
 }
 
 #[cfg(feature = "product-analytics-export")]

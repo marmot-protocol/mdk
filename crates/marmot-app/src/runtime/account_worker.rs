@@ -654,6 +654,11 @@ pub(crate) enum AccountWorkerCommand {
     RotateKeyPackage {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
+    /// Delete this device's KeyPackage slot before sign-out tears the worker
+    /// down. Answers with the number of relays that accepted.
+    WithdrawKeyPackageSlot {
+        respond: oneshot::Sender<Result<usize, AppError>>,
+    },
     KeyPackageMaintenanceStatus {
         respond: oneshot::Sender<Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError>>,
     },
@@ -1537,7 +1542,7 @@ async fn run_app_runtime_account_worker(
                                         send_message_on_worker(
                                             &mut client, enqueued_at, queued, group_id, payload, respond,
                                             &events, &account_id_hex, &account_label, &shared,
-                                            shared.product_analytics.permit(),
+                                            shared.observer.product().permit(),
                                         ).await;
                                         publish_client_pending_applied_summary(
                                             &mut client, &events, &account_id_hex, &account_label,
@@ -1750,7 +1755,7 @@ async fn run_app_runtime_account_worker(
     let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
     let (media_http_worker_lifetime, _) = watch::channel(());
     let media_http = MediaHttpContext {
-        product: shared.product_analytics.clone(),
+        product: shared.observer.product().clone(),
         tx: media_http_tx,
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
@@ -1843,7 +1848,7 @@ async fn run_app_runtime_account_worker(
     schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
 
     let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();
-    let product_backlog = shared.product_analytics.backlog_source();
+    let product_backlog = shared.observer.product().backlog_source();
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
@@ -2433,7 +2438,7 @@ async fn run_app_runtime_account_worker(
                                         // complete and let that job settle the
                                         // still-durable recovery debt.
                                         let backfill_armed = client.has_pending_epoch_backfill();
-                                        let observation = backfill_armed.then(|| shared.product_analytics.begin(
+                                        let observation = backfill_armed.then(|| shared.observer.product().begin(
                                             crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
                                         )).flatten();
                                         let backfill_result = if comparison_recovery.is_some() {
@@ -2996,7 +3001,7 @@ async fn run_app_runtime_account_worker(
                     &mut attachment_admission,
                 );
                 if client.key_package_maintenance_requires_catch_up() {
-                    let observation = shared.product_analytics.begin(
+                    let observation = shared.observer.product().begin(
                         crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
                     );
                     let catch_up = timeout(
@@ -3073,12 +3078,19 @@ async fn run_app_runtime_account_worker(
                         }
                     }
                 }
+                // A join window ends once T has been counted since its join
+                // completed, which only time passing shows; the tick counts
+                // it and notices joins that completed.
+                client.advance_push_join_windows().await;
+                if client.has_due_push_announce() {
+                    scheduled_push_retry.observe_pending(true, &command_tx);
+                }
                 scheduled_runtime_group_subscription_refresh.observe_pending(
                     client.has_pending_runtime_group_subscription_refresh(),
                     &command_tx,
                 );
                 let backfill_armed = client.has_pending_epoch_backfill();
-                let observation = backfill_armed.then(|| shared.product_analytics.begin(
+                let observation = backfill_armed.then(|| shared.observer.product().begin(
                     crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
                 )).flatten();
                 let backfill_result = match start_pending_recovery_job(
@@ -3255,7 +3267,7 @@ async fn start_receive_recovery(
     let backfill_armed = client.has_pending_epoch_backfill();
     let observation = backfill_armed
         .then(|| {
-            context.shared.product_analytics.begin(
+            context.shared.observer.product().begin(
                 crate::ProductFamily::Recovery,
                 "backfill",
                 crate::ProductUnit::Attempt,
@@ -3322,7 +3334,7 @@ async fn finish_periodic_maintenance_after_recovery(
             account_error_message("post-join maintenance subscription failed", &err),
         );
     }
-    let backlog_permit = shared.product_analytics.permit();
+    let backlog_permit = shared.observer.product().permit();
     match client.run_due_maintenance().await {
         Ok(summary) => {
             if let Some(permit) = &backlog_permit {
@@ -4441,7 +4453,8 @@ async fn complete_media_http(
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
                     "attachment completion failed; durable lease permits recovery");
             }
-            shared.attachment_updates.send_modify(|_| {});
+            // The attempt ended without a body: failed, retrying, cancelled or parked.
+            shared.attachment_updates.state_changed();
             drop(background_permit);
         }
         MediaHttpCompletion::AttachmentRetained {
@@ -4452,7 +4465,8 @@ async fn complete_media_http(
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
                     "attachment completion failed; durable lease permits recovery");
             }
-            shared.attachment_updates.send_modify(|_| {});
+            // The body was published (Ready) or the attempt ended without it.
+            shared.attachment_updates.state_changed();
             drop(background_permit);
         }
         MediaHttpCompletion::Avatar { job, result } => {
@@ -4750,7 +4764,7 @@ fn respond_diagnosed<T>(
     result: Result<T, AppError>,
 ) -> Result<(), Result<T, AppError>> {
     if let Err(error) = &result {
-        shared.product_analytics.storage_failure(permit, error);
+        shared.observer.product().storage_failure(permit, error);
     }
     respond.send(result)
 }
@@ -4803,7 +4817,7 @@ fn account_worker_command_future<'a>(
         media_http,
         scheduled_convergence,
     } = context;
-    let storage_permit = shared.product_analytics.permit();
+    let storage_permit = shared.observer.product().permit();
     match command {
         AccountWorkerCommand::ConnectivityRestored { respond } => Box::pin(async move {
             let result = client.note_connectivity_restored().map(|_| ());
@@ -6298,6 +6312,11 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
+        AccountWorkerCommand::WithdrawKeyPackageSlot { respond } => Box::pin(async move {
+            let result = client.withdraw_key_package_slot().await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::KeyPackageMaintenanceStatus { respond } => Box::pin(async move {
             let _ = respond_diagnosed(
                 shared,
@@ -6734,17 +6753,22 @@ fn push_registration_retry_delay(attempt: u32) -> Duration {
 }
 
 /// Arm the push retry for the work a worker turn left: a member add on any
-/// ingest or send path that queued a share or owed a snapshot, or an owed
-/// snapshot that its group's state no longer holds back. What holds one back
-/// (hydration, a queued invite, a disband, a block) changes only through
-/// account work, so checking after every turn notices it without polling.
+/// ingest or send path that queued a share or owed a snapshot, a sent message
+/// that owes the periodic announce, or an owed snapshot or announce that its
+/// group's state no longer holds back. What holds one back (hydration, a
+/// queued invite, a disband, a block) changes only through account work, so
+/// checking after every turn notices it without polling. A join window
+/// ending is noticed by the maintenance tick.
 fn schedule_push_work_after_turn(
     client: &mut AppClient,
     scheduled: &mut ScheduledPushRegistrationRetry,
     commands: &mpsc::Sender<AccountWorkerCommand>,
 ) {
     client.retry_pending_member_add_push_shares();
-    if client.take_queued_push_registration_share() || client.has_due_push_snapshot() {
+    if client.take_queued_push_registration_share()
+        || client.has_due_push_snapshot()
+        || client.has_due_push_announce()
+    {
         scheduled.observe_pending(true, commands);
     }
 }
@@ -7426,7 +7450,7 @@ async fn run_pending_epoch_backfill_reporting_arm(
     let backfill_armed = client.has_pending_epoch_backfill();
     let observation = backfill_armed
         .then(|| {
-            shared.product_analytics.begin(
+            shared.observer.product().begin(
                 crate::ProductFamily::Recovery,
                 "backfill",
                 crate::ProductUnit::Attempt,
@@ -10390,6 +10414,52 @@ mod tests {
         schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
         tokio::task::yield_now().await;
         assert!(!client.has_due_push_snapshot());
+    }
+
+    /// A group message sent where this device has never announced owes the
+    /// periodic announce once the device can fetch, and the turn that sent it
+    /// arms the push retry that sends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sent_message_owing_the_periodic_announce_arms_the_push_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let mut client = app.client(&account.label).await.unwrap();
+        let group = client.create_group("periodic announce", &[]).await.unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        // The scripted relay sends no EOSE.
+        client.test_push_device_can_fetch = Some(true);
+        client.push_announce_timing.catch_up_settle = Duration::ZERO;
+        client.advance_push_join_windows().await;
+        let (commands, mut received) = mpsc::channel(2);
+        let mut scheduled = ScheduledPushRegistrationRetry::new();
+        schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
+        assert!(!scheduled.is_armed(), "nothing is owed before a send");
+
+        client.send(&group, b"first message").await.unwrap();
+        schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
+        assert!(scheduled.is_armed());
+        let AccountWorkerCommand::RetryPushRegistration { respond } =
+            received.recv().await.unwrap()
+        else {
+            panic!("an owed announce must enqueue a push retry")
+        };
+        let pending = client
+            .retry_pending_push_registration_shares_best_effort()
+            .await;
+        assert!(!pending);
+        let _ = respond.send(pending);
+        assert!(
+            app.group_push_gossip_state(&account.label, &group_hex)
+                .unwrap()
+                .and_then(|state| state.last_announced_at_ms)
+                .is_some()
+        );
+        assert!(!client.has_due_push_announce());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

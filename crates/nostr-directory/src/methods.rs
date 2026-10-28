@@ -22,8 +22,8 @@ use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, O
 use super::resources::DirectoryResources;
 use crate::ids::parse_account_id_hex;
 use crate::published_records::{
-    fresh_or_cached_key_package, fresh_relay_list_status_from_records,
-    latest_fresh_key_package_from_records, merge_relay_list_status, relay_list_queries,
+    fresh_or_cached_key_package, fresh_relay_list_status_from_records, key_package_queries,
+    merge_relay_list_status, relay_list_queries, select_key_packages_from_records,
 };
 use crate::records::{
     CachedIdentityProjection, CurrentFollowList, FetchedFollowList, MAX_CACHED_IDENTITY_PAGE_SIZE,
@@ -574,11 +574,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .relay_plane
             .fetch_directory_events_with_completion(
                 source_relays.clone(),
-                vec![DirectoryEventQuery::new(
-                    KIND_MARMOT_KEY_PACKAGE,
-                    vec![account_id_hex.to_owned()],
-                    12,
-                )],
+                key_package_queries(vec![account_id_hex.to_owned()]),
             )
             .await
             .map_err(|error| {
@@ -614,6 +610,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 discovery: &discovery_relays,
                 requirements: None,
                 cached_target,
+                wanted: 1,
             })
             .await?;
         let cached_entry = cached_entry.filter(|entry| {
@@ -624,13 +621,13 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .is_none_or(|cached| evidence.allows_cached(cached))
             })
         });
-        let selection = latest_fresh_key_package_from_records(
+        let selection = select_key_packages_from_records(
             account_id_hex,
-            records.records,
+            &records.records,
             records.freshness,
-            &self.config.key_package_client_preference,
+            None,
         )?;
-        let from_cache = selection.value.is_none();
+        let from_cache = selection.value.is_empty();
         let mut fetched = fresh_or_cached_key_package(account_id_hex, selection, cached_entry)?;
         // Without a fresh selection, only a successful cache fallback reaches this point.
         let source = if from_cache { "cache" } else { "network" };

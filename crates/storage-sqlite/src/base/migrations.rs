@@ -252,8 +252,14 @@ mod migration_0117_push_token_reshare_repair;
 mod migration_0118_push_token_gossip_state;
 #[path = "migrations/0119_push_snapshot_owed.rs"]
 mod migration_0119_push_snapshot_owed;
-#[path = "migrations/0120_group_recovery.rs"]
-mod migration_0120_group_recovery;
+#[path = "migrations/0120_member_count_accounts.rs"]
+mod migration_0120_member_count_accounts;
+#[path = "migrations/0121_drop_member_capabilities.rs"]
+mod migration_0121_drop_member_capabilities;
+#[path = "migrations/0122_push_join_window.rs"]
+mod migration_0122_push_join_window;
+#[path = "migrations/0123_group_recovery.rs"]
+mod migration_0123_group_recovery;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -991,9 +997,27 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 120,
-        name: "0120_group_recovery",
+        name: "0120_member_count_accounts",
         suspend_foreign_keys: &[],
-        apply: migration_0120_group_recovery::apply,
+        apply: migration_0120_member_count_accounts::apply,
+    },
+    Migration {
+        version: 121,
+        name: "0121_drop_member_capabilities",
+        suspend_foreign_keys: &[],
+        apply: migration_0121_drop_member_capabilities::apply,
+    },
+    Migration {
+        version: 122,
+        name: "0122_push_join_window",
+        suspend_foreign_keys: &[],
+        apply: migration_0122_push_join_window::apply,
+    },
+    Migration {
+        version: 123,
+        name: "0123_group_recovery",
+        suspend_foreign_keys: &[],
+        apply: migration_0123_group_recovery::apply,
     },
 ];
 
@@ -3883,7 +3907,6 @@ mod tests {
         for (table, column) in [
             ("cgka_messages", "group_id"),
             ("cgka_queued_outbound", "group_id"),
-            ("cgka_member_capabilities", "group_id"),
             ("cgka_convergence_policies", "group_id"),
             ("cgka_member_validation_cache", "group_id"),
             ("cgka_group_snapshots", "group_id"),
@@ -4064,11 +4087,6 @@ mod tests {
             "INSERT INTO cgka_queued_outbound (id, group_id, created_at_ms, record)
              VALUES (?1, ?2, 0, ?3)",
             params![vec![0x02_u8; 4], orphan_group, vec![0xAA_u8]],
-        ));
-        assert_foreign_key_error(conn.execute(
-            "INSERT INTO cgka_member_capabilities (group_id, member_id, capabilities)
-             VALUES (?1, ?2, ?3)",
-            params![orphan_group, vec![0x03_u8; 4], vec![0xAA_u8]],
         ));
         assert_foreign_key_error(conn.execute(
             "INSERT INTO cgka_convergence_policies (group_id, policy)

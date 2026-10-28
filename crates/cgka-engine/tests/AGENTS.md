@@ -54,7 +54,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** Invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
 
 - **File:** `capabilities.rs`
-  - **Owns:** `feature_status`, capability cache, capability matrix
+  - **Owns:** `feature_status` and `upgradeable_capabilities` read from every leaf (several devices per account
+    included), KeyPackage-based `constructable_capabilities`, capability matrix
 
 - **File:** `leaf_advertisement.rs`
   - **Owns:** Own-leaf re-advertisement on self-update (peer acceptance), and staleness reported only while a refresh
@@ -105,8 +106,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150)
 
 - **File:** `record_write_atomicity.rs`
-  - **Owns:** Group-projection atomicity under injected record/cache write failures (mdk#333, mdk#794), one test per
-    seam that projects the record plus inbound capability-cache coverage. No torn record or capability cache,
+  - **Owns:** Group-projection atomicity under injected record write failures (mdk#333, mdk#794), one test per
+    seam that projects the record. No torn record,
     orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
     stored convergence so it is eventually applied. Also owns the snapshot-guard durability pair: a guard whose
@@ -150,6 +151,24 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `update_group_data.rs`
   - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh
+
+- **File:** `account_devices.rs`
+  - **Owns:** The `marmot.group.account-devices.v1` (0x800d) rules in groups that require it: no data, support, the
+    per-account leaf limit, never un-require, and Welcome acceptance. Each rule is checked by the committer, by replay
+    of a raw OpenMLS commit, at ingest for standalone proposals, and by the joiner of a raw OpenMLS Welcome, which
+    applies the state rules and the GroupInfo rule and accepts a Welcome from its own account; before activation, and on
+    the legacy profile, 0x800d data stays unknown data and only an admin's Welcome joins. Also same-account Commits
+    (mdk#2628 item 2.1c): which shapes a non-admin may commit, from both sides; the stamp's priority equal to replay's
+    for every class; and races settled the same way on every client. Needs `test-policy-overrides` or
+    `test-conformance-snapshot`.
+
+- **File:** `account_devices/send_intents.rs`
+  - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and
+    `RemoveOwnAccountDevices`: the committer's Commit is classified same-account, stamped `ordinary`, carries its
+    proposals by value and leaves the proposal store alone; each refusal publishes and changes nothing; every member
+    and sibling accepts, an added device joins through its Welcome and a removed one sees its removal; restart treats
+    them like an Invite and a removal; and fair scheduling gives a queued one the attempt an admin intent gets, never a
+    self-update or a Leave, and only while the group requires 0x800d.
 
 - **File:** `epoch_sealed_transport.rs`
   - **Owns:** Engine behavior under production transport visibility via `support::epoch_sealed_peeler` — the sealing

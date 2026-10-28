@@ -823,7 +823,7 @@ fn defer_event_projection(
         cgka_traits::engine::GroupEvent::MessageReceived { .. }
             | cgka_traits::engine::GroupEvent::GroupJoined { .. }
     ) {
-        summary.events.push(event.clone());
+        summary.events.push(crate::groups::host_group_event(event));
     }
     true
 }
@@ -2396,6 +2396,7 @@ impl AppClient {
         self.remember_pending_convergence_groups(effects);
         self.remember_published_reports(effects);
         self.note_superseded_intent_reports(effects);
+        self.settle_accepted_push_announces(effects);
         self.enqueue_effect_projection(effects, source_message_id_hex, received_at, drained);
     }
 

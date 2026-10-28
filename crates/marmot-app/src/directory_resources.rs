@@ -60,7 +60,6 @@ impl MarmotApp {
                 .collect(),
             default_relays: self.relay_endpoints(),
             max_future_skew: self.config.directory_max_future_skew,
-            key_package_client_preference: self.deployment().key_package_client_preference.clone(),
             open_ranking: self.deployment().open_ranking.clone(),
             fallback_seeds: self.config.directory_search_fallback_seeds.clone(),
             http_builder: crate::network_proxy::http_builder,

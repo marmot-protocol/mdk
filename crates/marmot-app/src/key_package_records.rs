@@ -43,10 +43,9 @@ use transport_nostr_peeler::NostrTransportEvent;
 // tests below still cover the rest through `super::*`.
 #[cfg(test)]
 pub(crate) use nostr_directory::{
-    fresh_or_cached_key_package, latest_fresh_key_package_from_records,
-    preferred_fresh_key_package_from_records, relay_list_queries, relay_list_status_from_records,
+    fresh_or_cached_key_package, relay_list_queries, relay_list_status_from_records,
     require_key_package_tag, require_multi_value_key_package_tag_matches,
-    validated_cached_key_package,
+    select_key_packages_from_records, validated_cached_key_package,
 };
 pub(crate) use nostr_directory::{
     key_package_from_hex_with_optional_source, key_package_from_record,
@@ -940,6 +939,7 @@ mod tests {
             replaced_at: Timestamp(1),
             consumed: false,
             authored_event_id: None,
+            awaiting_confirmed_replacement: false,
         }];
 
         assert_eq!(

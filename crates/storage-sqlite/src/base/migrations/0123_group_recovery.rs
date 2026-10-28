@@ -1,4 +1,4 @@
-//! Migration 0120: bounded durable authenticated group-recovery handshakes.
+//! Migration 0123: bounded durable authenticated group-recovery handshakes.
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;
@@ -36,7 +36,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         let index = MIGRATIONS
             .iter()
-            .position(|migration| migration.version == 120)
+            .position(|migration| migration.version == 123)
             .unwrap();
         run(&mut connection, &MIGRATIONS[..index]).unwrap();
         let group = sample_group(gid(1), 23, 2);
@@ -72,8 +72,8 @@ mod tests {
         assert!(matches!(
             run(&mut connection, &MIGRATIONS[..index]),
             Err(StorageError::UnsupportedSchemaVersion {
-                found: 120,
-                latest_supported: 119
+                found: 123,
+                latest_supported: 122
             })
         ));
         assert_eq!(run_all(&mut connection).unwrap(), 0);

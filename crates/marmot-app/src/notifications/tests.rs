@@ -1390,6 +1390,175 @@ fn push_gossip_lists_split_worst_case_entries_by_size_and_count() {
     );
 }
 
+/// An announce carries the sender's own records and names, each once, its
+/// own records, then the held records and tombstones they do not replace. A
+/// record whose stored digest does not verify is left out; a tombstone without
+/// its removal proof is still named.
+#[test]
+fn push_announce_names_what_the_sender_holds() {
+    let owner = Keys::generate();
+    let other = Keys::generate();
+    let sender = owner.public_key().to_hex();
+    let group_id_hex = hex::encode([0xEF; 16]);
+    let server = "cd".repeat(32);
+    let now = unix_now_ms();
+    let own = signed_token_record(&owner, &group_id_hex, 1, &server, now);
+    let replaced = signed_token_record(&owner, &group_id_hex, 1, &server, now - 1);
+    let held = signed_token_record(&other, &group_id_hex, 2, &server, now);
+    let mut unverified = stored_token(&signed_token_record(&other, &group_id_hex, 3, &server, now));
+    unverified.record_digest = None;
+    let removal = signed_removal_record(&other, &group_id_hex, 4, &server, now);
+    let mut unsigned = stored_tombstone(
+        &group_id_hex,
+        &signed_removal_record(&other, &group_id_hex, 5, &server, now),
+    );
+    unsigned.removal = None;
+    let replaced_removal = signed_removal_record(&owner, &group_id_hex, 1, &server, now - 2);
+    let element = |digest: String| push_have_element(&digest).unwrap();
+
+    let announce = push_announce(
+        std::slice::from_ref(&own),
+        &[
+            stored_token(&held),
+            stored_token(&replaced),
+            unverified,
+            stored_token(&held),
+        ],
+        &[
+            stored_tombstone(&group_id_hex, &removal),
+            stored_tombstone(&group_id_hex, &replaced_removal),
+            unsigned.clone(),
+        ],
+        &sender,
+        16,
+    )
+    .unwrap();
+    let payload: PushTokenAnnouncePayload = serde_json::from_str(&announce.content).unwrap();
+    assert_eq!(payload.v, PUSH_VERSION);
+    assert_eq!(
+        payload.tokens,
+        vec![PushTokenGossipEntry::from_record(&own)]
+    );
+    assert_eq!(
+        payload.have,
+        vec![
+            element(own.record_digest().unwrap()),
+            element(held.record_digest().unwrap()),
+            element(removal.record_digest(&group_id_hex).unwrap()),
+            element(unsigned.record_digest.clone()),
+        ]
+    );
+    assert!(payload.have.iter().all(|element| element.len() == 12));
+    assert_eq!(
+        (announce.listed, announce.unlisted, announce.unknown_digests),
+        (4, 0, 1)
+    );
+
+    // A device with no record of its own announces `tokens: []`.
+    let empty = push_announce(&[], &[], &[], &sender, 16).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&empty.content).unwrap(),
+        serde_json::json!({"v": PUSH_VERSION, "tokens": [], "have": []})
+    );
+}
+
+/// A sender that holds more than fits names the prefix that keeps the
+/// carrying group message within 64 KiB, own records first.
+#[test]
+fn push_announce_names_a_prefix_that_fits_64_kib() {
+    let owner = Keys::generate();
+    let sender = owner.public_key().to_hex();
+    for group_id_len in [16, 32, 255] {
+        let group_id_hex = hex::encode(vec![0xEF; group_id_len]);
+        let own = signed_token_record(&owner, &group_id_hex, 1, &"cd".repeat(32), 100);
+        let tombstones = (0..5_000_u64)
+            .map(|index| StoredPushTokenTombstone {
+                record_digest: hex::encode(Sha256::digest(index.to_be_bytes())),
+                removal: None,
+            })
+            .collect::<Vec<_>>();
+        let announce = push_announce(
+            std::slice::from_ref(&own),
+            &[],
+            &tombstones,
+            &sender,
+            group_id_len,
+        )
+        .unwrap();
+        assert_eq!(announce.listed + announce.unlisted, 5_001);
+        assert!(announce.unlisted > 0);
+        let payload: PushTokenAnnouncePayload = serde_json::from_str(&announce.content).unwrap();
+        assert_eq!(payload.have.len(), announce.listed);
+        assert!(payload.have.len() <= PUSH_MAX_HAVE_ENTRIES);
+        assert_eq!(
+            payload.have[0],
+            push_have_element(&own.record_digest().unwrap()).unwrap()
+        );
+        let published = |content: String| {
+            list_published_len(
+                crate::messages::AppMessageIntent::PushTokenUpdate { content },
+                &sender,
+                group_id_len,
+            )
+        };
+        let len = published(announce.content.clone());
+        assert!(len <= lists::PUSH_GOSSIP_EVENT_MAX_BYTES, "{len} bytes");
+        let mut grown = payload;
+        grown
+            .have
+            .push(push_have_element(&tombstones[4_999].record_digest).unwrap());
+        assert!(
+            published(serde_json::to_string(&grown).unwrap()) > lists::PUSH_GOSSIP_EVENT_MAX_BYTES,
+            "the next element would not fit"
+        );
+    }
+}
+
+/// Inbound kind 447 decoding ignores `have`, whatever it holds, and applies
+/// the announce's `tokens` as a self-update.
+#[test]
+fn inbound_announce_applies_its_tokens_and_ignores_have() {
+    let owner = Keys::generate();
+    let group_id_hex = hex::encode([0xEF; 16]);
+    let record = signed_token_record(&owner, &group_id_hex, 1, &"cd".repeat(32), unix_now_ms());
+    let entry = serde_json::to_value(PushTokenGossipEntry::from_record(&record)).unwrap();
+    let element = push_have_element(&record.record_digest().unwrap()).unwrap();
+    for have in [
+        serde_json::json!([element]),
+        serde_json::json!(["not base64", 7, null]),
+        serde_json::json!("not an array"),
+        serde_json::Value::Array(vec![serde_json::json!(element); PUSH_MAX_HAVE_ENTRIES + 1]),
+    ] {
+        let content =
+            serde_json::json!({"v": PUSH_VERSION, "tokens": [entry], "have": have}).to_string();
+        let PushGossipAction::Upsert(records) = verify_push_gossip_for_profile(
+            parse_push_gossip(
+                MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+                &group_id_hex,
+                &content,
+            )
+            .unwrap(),
+            &group_id_hex,
+            &[owner.public_key().to_hex()],
+            ProtocolProfile::Current,
+        ) else {
+            panic!("an announce upserts its tokens");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].owner_sig, record.owner_sig);
+    }
+    let request = serde_json::json!({"v": PUSH_VERSION, "tokens": [], "have": []}).to_string();
+    assert_eq!(
+        parse_push_gossip(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+            &group_id_hex,
+            &request
+        )
+        .unwrap(),
+        PushGossipAction::Upsert(Vec::new())
+    );
+}
+
 #[test]
 fn mixed_entry_permutations_apply_the_same_valid_winner() {
     let owner = Keys::generate();

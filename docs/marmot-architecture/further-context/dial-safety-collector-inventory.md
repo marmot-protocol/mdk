@@ -1,7 +1,7 @@
 ---
 title: "Dial Safety Collector Inventory"
 created: 2026-09-15
-updated: 2026-10-09
+updated: 2026-10-27
 tags: [marmot, security, network, ssrf, collector, audit]
 status: current-implementation
 ---
@@ -18,7 +18,7 @@ workspace HTTP client has been audited.
 `crates/marmot-app/src/collector_host_safety.rs` is the default-build chokepoint for
 OTLP export, product analytics, and forensic audit-log POST uploads.
 
-- Parse the configured URL with `config::parse_relay_telemetry_endpoint` before DNS.
+- Parse the configured URL with `export_config::parse_relay_telemetry_endpoint` before DNS.
   Reject missing hosts, unusable ports, userinfo, fragments, unsupported schemes, and
   nonlocal HTTP.
 - Preserve the configured hostname, port, path, and query. Never rewrite the URL to a
@@ -46,7 +46,7 @@ OTLP export, product analytics, and forensic audit-log POST uploads.
 
 ## Forensic audit upload
 
-`crates/marmot-app/src/audit_log.rs` uses the same helper after snapshot capture and
+`crates/marmot-app/src/audit_upload.rs` uses the same helper after snapshot capture and
 v4 eligibility. It adds:
 
 - retired-host rejection at the configured-URL gate, including case and trailing-root-dot
@@ -54,8 +54,9 @@ v4 eligibility. It adds:
 - a 60-second request-level override and enclosing network-attempt deadline so explicit
   DNS cannot outlive the audit budget;
 - bearer auth and the existing source headers only after validation and pinning;
-- context-free `AppError::AuditLogUpload` messages or a numeric HTTP status, without
-  endpoint, address, auth, header, or body material.
+- context-free `AuditLogUpload` messages or a numeric HTTP status, without endpoint,
+  address, auth, header, or body material; `marmot-app` reports them as
+  `AppError::AuditLogUpload`.
 
 See [Forensic Audit Logging Inventory](../audit-logging.md) for the upload contract,
 checkpointing, and header set.

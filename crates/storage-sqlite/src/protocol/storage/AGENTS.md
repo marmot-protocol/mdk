@@ -15,7 +15,7 @@ Map for Marmot engine-side SQLite tables (the `cgka_traits` storage traits). App
 | `snapshots.rs`, `snapshots/` | Snapshot capture, rollback, listing, release, checkpoints, replay fingerprints; see its local `AGENTS.md`. |
 | `outbound.rs` | `OutboundIntentStorage` / `OutboundFanoutStorage`: durable queued outbound intents and fanouts. |
 | `welcomes.rs` | Pending Welcome put/list/take. |
-| `capabilities.rs` | Feature registry and per-member capability cache. |
+| `capabilities.rs` | Feature registry. Members' capabilities are read from the MLS tree, never stored. |
 | `member_validation_cache.rs` | `MemberValidationCacheStorage`. |
 | `convergence_policy.rs` | Opaque per-group convergence policy bytes. |
 | `convergence_passes.rs` | `ConvergencePassStorage`: durable bounded convergence passes. |

@@ -5,7 +5,7 @@
 //! signing key.
 
 use cgka_traits::error::EngineError;
-use cgka_traits::group::ProtocolProfile;
+use cgka_traits::group::{Group, ProtocolProfile};
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, StorageProvider as CgkaStorageProvider, StorageResult,
 };
@@ -254,6 +254,15 @@ pub(crate) fn local_leaf_is_active(group: &MlsGroup, identity: &MemberId) -> boo
             BasicCredential::try_from(leaf.credential().clone())
                 .is_ok_and(|credential| credential.identity() == identity.as_slice())
         })
+}
+
+/// Whether this device's local copy is still a member: its removal is not realized and the
+/// record lists its account. `removed` is set exactly when this device's own leaf leaves,
+/// while a sibling device's leaf keeps the account on the roster, so the roster alone never
+/// answers this. A copy whose leaf is gone but whose removal is not yet realized still
+/// counts, so realization can read its leave request.
+pub(crate) fn local_copy_is_member(record: &Group, identity: &MemberId) -> bool {
+    !record.removed && record.members.iter().any(|member| &member.id == identity)
 }
 
 #[cfg(test)]

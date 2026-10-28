@@ -16,6 +16,18 @@ pub struct KeyPackagePublication {
     pub endpoints: Vec<TransportEndpoint>,
 }
 
+/// A request to stop serving this device's slot at sign-out
+/// (`foundation/key-packages.md`, "Stopping publication").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPackageSlotWithdrawal {
+    pub account_id: MemberId,
+    /// This device's slot, the only one the request may name.
+    pub slot_id: String,
+    /// Every publication in the slot up to this time is withdrawn.
+    pub created_at: Timestamp,
+    pub endpoints: Vec<TransportEndpoint>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KeyPackagePublishReceipt {
     pub accepted: Vec<TransportEndpoint>,
@@ -29,11 +41,17 @@ pub struct KeyPackagePublishReceipt {
 /// its private bundle remain durable in either case until acknowledgement or
 /// MLS lifetime expiry; this bit only distinguishes safe regeneration before
 /// exposure from an ambiguous publication that must retry identical bytes.
+///
+/// `artifact_unusable` means the publisher will never send these signed
+/// bytes, for example because they were signed by an earlier build under rules
+/// this one no longer accepts. Retrying them cannot succeed, so the runtime
+/// replaces the KeyPackage with a freshly signed one instead (mdk#2628, D8).
 #[derive(Debug, thiserror::Error)]
 #[error("key package publication failed: {message}")]
 pub struct KeyPackagePublishError {
     pub message: String,
     pub externally_exposed: bool,
+    pub artifact_unusable: bool,
 }
 
 impl KeyPackagePublishError {
@@ -42,6 +60,7 @@ impl KeyPackagePublishError {
         Self {
             message: message.into(),
             externally_exposed: false,
+            artifact_unusable: false,
         }
     }
 
@@ -51,6 +70,17 @@ impl KeyPackagePublishError {
         Self {
             message: message.into(),
             externally_exposed: true,
+            artifact_unusable: false,
+        }
+    }
+
+    /// The publisher refused the signed artifact before sending it and will
+    /// refuse it on every retry.
+    pub fn unusable_artifact(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            externally_exposed: false,
+            artifact_unusable: true,
         }
     }
 }
@@ -82,6 +112,17 @@ pub trait KeyPackagePublisher: Send + Sync {
         publication: &KeyPackagePublication,
         artifact: &SignedPublicationArtifact,
     ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError>;
+
+    /// Ask the transport to stop serving `withdrawal.slot_id` and nothing
+    /// else. The receipt lists the endpoints that accepted the request.
+    async fn withdraw_key_package_slot(
+        &self,
+        _withdrawal: &KeyPackageSlotWithdrawal,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        Err(KeyPackagePublishError::unexposed(
+            "this publisher cannot withdraw a KeyPackage slot",
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -112,6 +153,16 @@ impl KeyPackagePublisher for NoopKeyPackagePublisher {
     ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
         Ok(KeyPackagePublishReceipt {
             accepted: publication.endpoints.clone(),
+            failed: Vec::new(),
+        })
+    }
+
+    async fn withdraw_key_package_slot(
+        &self,
+        withdrawal: &KeyPackageSlotWithdrawal,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        Ok(KeyPackagePublishReceipt {
+            accepted: withdrawal.endpoints.clone(),
             failed: Vec::new(),
         })
     }

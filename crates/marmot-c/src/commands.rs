@@ -563,8 +563,8 @@ c_cmd! {
 
     /// Non-destructive sign-out: deactivate the account on this device,
     /// keeping local state so it can sign back in later. When
-    /// `delete_key_packages` is true, relay-published KeyPackages get
-    /// NIP-09 deletions. Free with `marmot_sign_out_outcome_free`.
+    /// `delete_key_packages` is true, this device's KeyPackage slot gets a
+    /// NIP-09 deletion. Free with `marmot_sign_out_outcome_free`.
     async fn marmot_sign_out(account_ref: str, delete_key_packages: flag) -> rec(MarmotSignOutOutcome) = sign_out;
 
     /// Retry onboarding against explicitly selected discovery relays.

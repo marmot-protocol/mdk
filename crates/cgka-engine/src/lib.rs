@@ -30,6 +30,7 @@
 //! - [`capability_manager`], [`capabilities`], [`upgrade`] - capability policy.
 //! - [`auto_committer`] - SelfRemove auto-commit eligibility policy.
 //! - [`app_components`] - Marmot app-component state in `app_data_dictionary`.
+//! - [`commit_class`] - the one class that decides a Commit's authority and priority.
 
 pub mod account_identity_proof;
 pub mod app_components;
@@ -41,6 +42,7 @@ pub(crate) mod bounded_id_set;
 pub mod canonicalization;
 pub mod capabilities;
 pub mod capability_manager;
+pub mod commit_class;
 #[cfg(feature = "test-conformance-snapshot")]
 pub mod conformance_snapshot;
 pub mod convergence;
@@ -66,6 +68,7 @@ pub(crate) mod message_disposition;
 pub mod message_processor;
 pub(crate) mod mls_group_cache;
 pub mod openmls_projection;
+mod own_account_devices;
 pub mod own_commit_intent;
 pub mod pending_commit_guard;
 pub mod provider;

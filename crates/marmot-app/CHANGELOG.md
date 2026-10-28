@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `MarmotDeployment::key_package_client_preference` and
+  `KeyPackageClientPreference` are removed (mdk#2628). The KeyPackage `client`
+  tag no longer ranks invite candidates; it is still published when
+  `key_package_client_name` is set.
+
 ### Added
 
 - Account workers automatically rejoin durably and natively `Unrecoverable`
@@ -23,9 +30,81 @@
   entries. A device that holds neither sends nothing. The owed snapshot is
   recorded before the invite's Commit is staged or queued, so a restart still
   sends it once the Commit merges, and a Commit that rolls back owes none.
+- Devices now send push announces (mdk#2611): a kind 447 whose `have` names,
+  by the first 8 bytes of each record digest, every token record and tombstone
+  the device holds in the group, so members can later send it what it lacks.
+  An announce carries the device's own current records, or `tokens: []`, and
+  `have` lists as many as fit 4,096 elements and the 64 KiB message size, own
+  records first. Records whose stored digest does not verify are left out.
+  A device announces:
+  - once its join window in a group ends, when two minutes during which it
+    could fetch have passed since its join completed (the group stable and
+    its post-join history fetch ended), whether or not a snapshot came;
+  - instead of a plain self-update when it shares a new or changed record of
+    its own after the window, which a group's creator never has; and
+  - with the next group message it sends there once seven days have passed
+    since its last announce, or when it has never announced there.
+
+  A device can fetch while a relay is connected and its client's catch-up has
+  run: every endpoint of the account's live subscriptions has served its
+  stored history, or, five minutes after the client opened, any subscription
+  has been served by one. No announce goes out until the client has watched
+  the device able to fetch for 15 seconds; a record changed before then is
+  shared in a plain self-update and announced after. Inside the window, and
+  when re-sharing an unchanged record after a member add, a device shares in
+  plain self-updates, with no `have`. The window opens when a Welcome
+  installs the group and survives a restart. Every other announce owed is
+  stored before it is sent, so one the outbox drops, or one deferred until
+  the catch-up has run, is still sent after a restart; a published announce
+  built since settles it, and a new Welcome drops it. When the join window
+  or the device's stored records cannot be read, or the announce a new or
+  changed record owes cannot be recorded, nothing is sent in that group: the
+  share stays pending and its retry decides again. Only a published announce
+  counts: one left in the outbox counts once the outbox publishes it, and no
+  other is sent in that group meanwhile. Incoming announces are
+  applied as before, as a self-update or a request.
+
+  Known limits, each costing at most a stale or repeated announce:
+  - whether a device can fetch is judged for the whole account, not per
+    group, so a group whose relays are unreachable still counts window time;
+  - after the five-minute timeout, the catch-up counts as run once any
+    subscription was served, so an announce may name less than a slow relay
+    would have brought;
+  - an announce held in the outbox when the client restarts is owed again,
+    so the outbox may publish it as well as its replacement.
 
 ### Changed
 
+- Creating a group or inviting adds every device of each recipient account
+  (mdk#2628, mdk#1696). The directory reads an account's KeyPackages together
+  with its KeyPackage deletion requests, then selects every valid, compatible
+  KeyPackage published in the last 30 days, at most 20, or the single best one
+  when none is that recent. A publication slot contributes at most one, and a
+  KeyPackage a deletion request covers, by slot address or event id, is
+  skipped. A lookup reads up to one relay page of 500 of an account's
+  KeyPackages and 500 of its deletion requests; a relay that returns a full
+  page of either leaves the lookup incomplete, since what lies past it may
+  change the selection. Every device is sought, not guaranteed: a device
+  whose KeyPackage no relay returns is left out, and inviting the account
+  again adds it. An invite adds only devices not already in the group, and
+  one that would add none still fails.
+  KeyPackages not marked last-resort rank first, then the most
+  recently published, then the lower KeyPackageRef; one device publishing in
+  several slots counts once. One Commit adds the account, with one Welcome
+  rumor per KeyPackage, and the roster lists each added device while that
+  Commit awaits publication. Reissuing a lost invite leaves out a device that
+  has not yet replaced the KeyPackage the lost invite consumed, while another
+  device of its account can still join. A lost invite that cannot re-add every
+  device it added, including a new device of an account already in the group,
+  is reported as a conflict that needs a new invite, never as applied. The
+  creator's own other devices stay out of a new group.
+  `ResolvedMemberKeyPackages::key_packages` lists each account's
+  KeyPackages best first. Directory lookup returns the best of the same
+  selection. Within one slot, a tie on `created_at` now goes to the lower
+  event id, as NIP-01 says, where it went to the higher. Create and invite now
+  read each recipient account on its own on every deployment, White Noise's
+  included: a read bounded across accounts cannot prove that it saw every
+  slot.
 - MDK now treats data under app component id `0x800a` like any id the
   registry does not assign, where it used to reject it (mdk#2628). `0x800a`
   was the draft multi-device join authorization, which the registry withdrew
@@ -35,6 +114,17 @@
   refuses every id below the application range.
   `cgka_traits::app_components::MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID`
   is removed.
+- Member projections count accounts, not leaves (mdk#2628). An account
+  with several devices holds one leaf per device in a group. `members`,
+  `group_roster`, the group member-id page and the conversation snapshot now
+  list each account once, with `device_count` on `AppGroupMemberRecord` and
+  `AppGroupRosterMember`. `member_count` on `AppGroupRecord`,
+  `AppGroupMlsState` and `AppGroupRoster` counts accounts. A chat between two
+  accounts stays direct, in the chat list, direct-chat reuse and its title
+  and avatar, whatever devices either person uses. Groups where every account
+  has one device look as before. The v5 audit group baseline also counts
+  accounts and no longer reports an account's second device as an invalid
+  member identity.
 - `cgka-session` is now `marmot-session`, which also takes the account-device
   runtime from `marmot-account` (mdk#2602). `cgka_session::*` and the
   runtime's `marmot_account::*` paths, such as `AccountDeviceRuntime`,
@@ -82,12 +172,44 @@
   value and later values are ignored. More than one `client` tag, or a missing,
   empty or over-long name, reads as no tag and never rejects the KeyPackage.
   A signed retry whose stored tag that reader rejects is not resent, and
-  `NostrKeyPackagePublication` refuses an out-of-bounds `client_name`.
-  Known limitation: suppose a host configured a name over 64 bytes, and a
-  KeyPackage signed before this change has not reached any relay. That
-  KeyPackage keeps retrying without being sent until it expires (up to 84
-  days). Hosts that configure `whitenoise` or `White Noise Android` are
-  unaffected.
+  `NostrKeyPackagePublication` refuses an out-of-bounds `client_name`. Such a
+  KeyPackage, signed before this change with a name over 64 bytes, is
+  replaced by a freshly signed one in the same slot.
+- Each device keeps its KeyPackage slot fresh (mdk#2628). A new KeyPackage
+  is valid for 30 days plus an hour, down from 84 days; KeyPackages from
+  other clients are still accepted up to 84 days. The session runtime
+  replaces the KeyPackage after a Welcome consumes it, when it no longer
+  advertises what the build supports, and at least every 7 days while it
+  runs, at a stored random time 6 to 7 days after publication. A superseded
+  KeyPackage no Welcome consumed keeps its private key for 24 hours after the
+  replacement's publication is confirmed, or until it expires if sooner;
+  these used to be kept until they expired, and ones retained before this
+  release keep that bound until a replacement is confirmed. Consumed ones
+  keep the 24-hour rule from mdk#2352.
+  `CONSUMED_KEY_PACKAGE_RETENTION_SECS` is now
+  `KEY_PACKAGE_REPLACEMENT_GRACE_SECS`, and retained records carry
+  `awaiting_confirmed_replacement`. A `KeyPackagePublisher` reports a signed
+  KeyPackage it will never send with `KeyPackagePublishError::unusable_artifact`
+  (`artifact_unusable`), and the runtime replaces it with a freshly signed
+  one in the same slot instead of retrying it until it expires, at most once
+  per build (`KeyPackageLifecycleState::unusable_artifact_replaced_by`).
+  `NostrKeyPackagePublication::matches_prepared_event` is the check the Nostr
+  publishers use.
+- Sign-out and wipe delete only this device's KeyPackage slot (mdk#1697,
+  mdk#2628). They used to delete every KeyPackage event of the account found
+  on its relays, which took the account's other devices' KeyPackages with
+  them. The device now sends one kind 5 naming the slot (an `a` tag
+  `30443:<account>:<slot>` and a `k` tag `30443`) to the relays the slot was
+  published to, and publishes nothing into it afterwards; wiping an account
+  that is already signed out sends it too. `key_packages_deleted`
+  on `SignOutOutcome` and `WipeOutcome` is `1` when a relay accepted the
+  deletion, otherwise `0`. A deletion no relay accepted is reported in
+  `key_package_failures` and leaves the slot as it was. A device that runs
+  again republishes into its slot (`KeyPackageLifecycleState::slot_withdrawn_at`
+  records the withdrawal). Account open no longer scans the relays for the
+  account's KeyPackages in other slots to delete. `KeyPackagePublisher::withdraw_key_package_slot`
+  with `KeyPackageSlotWithdrawal` sends the request, and
+  `transport_nostr_adapter::key_package_slot_deletion_event` builds it.
 - A device joins a group only through the Welcome delivery that names one of
   its own KeyPackages (mdk#2628). Welcomes are gift-wrapped to the account, so
   each device of an account receives the delivery for every device an inviter
@@ -101,9 +223,33 @@
   delivery stays confirmable. KeyPackage lifecycle records now keep the
   publication id of each replaced KeyPackage. Packages replaced before this
   release have none, so a Welcome that opens with one of them still joins.
+- Hosts no longer receive leaf indexes (mdk#2628).
+  `GroupEvent::GroupMemberLeavesRemoved` in `SyncSummary.events` and
+  `RuntimeGroupEvent` now always carries empty `leaves`; MDK still reads them
+  itself to drop removed devices' push records. Hosts learn which accounts
+  left from `departed_members` and `GroupStateChanged`, and that this device
+  was removed from `LocalGroupCopyTerminated`. MarmotKit and the C ABI
+  already left the leaves out.
+- `marmot_app::product_analytics::configure_product_analytics_from_environment`
+  no longer resolves (mdk#2627). Hosts call the same function as
+  `marmot_app::configure_product_analytics_from_environment`, as before.
+- Collector clients (relay-telemetry export, product analytics, the audit
+  upload and `AuditOtlpSender`) take the process SOCKS5 policy from the first
+  `MarmotApp` the process builds (mdk#2627). Before one exists they build no
+  HTTP client, so an `AuditOtlpSender::send` made that early returns
+  `Unknown` without dialing. Every send through a runtime is unchanged.
 
 ### Fixed
 
+- A removed device whose account still has another device in the group is no
+  longer treated as a member (mdk#2628). A Welcome that re-adds it now joins
+  directly; before, it became a rejoin offer that needed the user's
+  confirmation. Reopening it drops a leave request it can never send, and the
+  one-time self-membership backfill records it as `Removed`. A current-epoch
+  message from another device of the same account now clears the recovery
+  warning, as one from any other member does. Groups where every account has
+  one device behave as before, and removing an account still removes all its
+  devices in one Commit.
 - Push triggers carry one fresh random padding chunk per gift wrap
   (mdk#2605). Senders reuse each recipient's stored token ciphertext, so
   repeat triggers to the same recipients were byte-identical and
@@ -141,6 +287,14 @@
   second. A `next()` call cancelled by its caller, such as a C timeout, no
   longer loses a frame that was waiting out that window: the next call
   delivers it (#2157).
+- Attachment transfer subscriptions read at most four times a second while
+  transfers only report progress, however many downloads run at once. Since
+  #2311 any progress write in the runtime made every open subscription read
+  again at the 25 ms floor, so with several concurrent downloads each read up
+  to forty times a second while still delivering four frames. Workers now
+  report state changes apart from progress: only a row appearing, disappearing
+  or entering another transfer state is read at the floor and delivered at
+  once (#2157).
 
 ## 0.14.0 - 2026-10-23
 

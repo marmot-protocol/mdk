@@ -112,6 +112,58 @@ pub struct GroupMaintenanceState {
     /// is current. Independent of periodic enrollment.
     #[serde(default)]
     pub leaf_refresh_due_at: Option<Timestamp>,
+    /// The temporary history fetch of a copy installed from a Welcome. A
+    /// replacement Welcome rewrites this whole state, so it starts a new fetch.
+    /// `None` for a created group and for copies joined before fetches were
+    /// recorded.
+    #[serde(default)]
+    pub post_join_history: Option<PostJoinHistoryFetch>,
+}
+
+/// A joined copy's fetch of the group messages its delivery endpoints hold from
+/// its Welcome on. Once a relay reaches end-of-stored-events it lasts until this
+/// device has processed what the fetch delivered; until then it lasts until its
+/// deadline. Commits end neither: the post-join self-update, whose obligation
+/// commits move to its quiet window, is separate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostJoinHistoryFetch {
+    /// The post-join obligation created with this copy. Identifies the fetch,
+    /// so work for an earlier copy of the group cannot complete it.
+    pub obligation_id: MessageId,
+    /// When the fetch's current subscription stops waiting for its first
+    /// end-of-stored-events. Set at each installation: a restart or a lost
+    /// subscription resumes the fetch with a fresh one.
+    pub deadline_at: Option<Timestamp>,
+    /// `None` while the fetch is owed.
+    pub completion: Option<PostJoinHistoryFetchCompletion>,
+}
+
+impl PostJoinHistoryFetch {
+    pub fn new(obligation_id: MessageId) -> Self {
+        Self {
+            obligation_id,
+            deadline_at: None,
+            completion: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostJoinHistoryFetchCompletion {
+    pub outcome: PostJoinHistoryFetchOutcome,
+    /// Milliseconds since the Unix epoch.
+    pub completed_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostJoinHistoryFetchOutcome {
+    /// This device has fetched and processed the group messages its delivery
+    /// endpoints hold from its join epoch on.
+    Fetched,
+    /// No relay reached end-of-stored-events before the deadline. Messages may
+    /// be missing.
+    DeadlineExpired,
 }
 
 /// Restart-safe semantic intent.  Wall-clock deadlines and sampled jitter are
@@ -268,20 +320,28 @@ pub struct PendingKeyPackageReplacement {
     pub consumed_at: Option<Timestamp>,
 }
 
-/// How long a consumed KeyPackage's private material outlives confirmed
-/// publication of its replacement. An inviter that fetched the old publication
-/// before the replacement reached it can still be joined (mdk#2344).
-pub const CONSUMED_KEY_PACKAGE_RETENTION_SECS: u64 = 24 * 60 * 60;
+/// The replacement grace period: how long a superseded KeyPackage's private
+/// material outlives confirmed publication of its replacement, consumed or
+/// not. An inviter that fetched the old publication just before the
+/// replacement reached it can still be joined (mdk#2344,
+/// `foundation/key-packages.md`, "Refreshing a slot").
+pub const KEY_PACKAGE_REPLACEMENT_GRACE_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredRetainedKeyPackagePrivateMaterial")]
 pub struct RetainedKeyPackagePrivateMaterial {
     pub key_package: KeyPackage,
     pub key_package_ref: Vec<u8>,
     pub not_after: Timestamp,
+    /// When the package was replaced, which starts the grace period: when
+    /// publication of the replacement was confirmed, or for a pending
+    /// replacement superseded before that, when the next one was staged.
+    /// While [`Self::awaiting_confirmed_replacement`] holds, confirmation
+    /// moves it.
     pub replaced_at: Timestamp,
-    /// A successfully processed Welcome consumed this package, so its private
-    /// material is deleted [`CONSUMED_KEY_PACKAGE_RETENTION_SECS`] after
-    /// `replaced_at`, or at `not_after` if that is earlier.
+    /// A successfully processed Welcome consumed this package, so it is
+    /// deleted [`KEY_PACKAGE_REPLACEMENT_GRACE_SECS`] after `replaced_at`
+    /// without waiting for a confirmed replacement (mdk#2352).
     #[serde(default)]
     pub consumed: bool,
     /// The id of the signed publication that carried this package. Missing on
@@ -289,22 +349,67 @@ pub struct RetainedKeyPackagePrivateMaterial {
     /// superseded before it was signed.
     #[serde(default)]
     pub authored_event_id: Option<MessageId>,
+    /// A pending replacement superseded this unconsumed package before any
+    /// replacement was confirmed, so the grace period has not started.
+    /// Promotion of the next confirmed replacement starts it, and a Welcome
+    /// consuming the package ends the wait.
+    ///
+    /// Records written before this flag keep the bound they had then: an
+    /// unconsumed package decodes as awaiting, so `not_after` bounds it until
+    /// a replacement is confirmed, and a consumed one already counts its grace
+    /// period from `replaced_at`.
+    pub awaiting_confirmed_replacement: bool,
+}
+
+/// The stored form of [`RetainedKeyPackagePrivateMaterial`], which tells a
+/// record written before `awaiting_confirmed_replacement` from one that says
+/// `false`.
+#[derive(Deserialize)]
+struct StoredRetainedKeyPackagePrivateMaterial {
+    key_package: KeyPackage,
+    key_package_ref: Vec<u8>,
+    not_after: Timestamp,
+    replaced_at: Timestamp,
+    #[serde(default)]
+    consumed: bool,
+    #[serde(default)]
+    authored_event_id: Option<MessageId>,
+    #[serde(default)]
+    awaiting_confirmed_replacement: Option<bool>,
+}
+
+impl From<StoredRetainedKeyPackagePrivateMaterial> for RetainedKeyPackagePrivateMaterial {
+    fn from(stored: StoredRetainedKeyPackagePrivateMaterial) -> Self {
+        Self {
+            key_package: stored.key_package,
+            key_package_ref: stored.key_package_ref,
+            not_after: stored.not_after,
+            replaced_at: stored.replaced_at,
+            consumed: stored.consumed,
+            authored_event_id: stored.authored_event_id,
+            awaiting_confirmed_replacement: stored
+                .awaiting_confirmed_replacement
+                .unwrap_or(!stored.consumed),
+        }
+    }
 }
 
 impl RetainedKeyPackagePrivateMaterial {
-    /// When the private material must be deleted.
+    /// When the private material must be deleted: at the end of the grace
+    /// period, [`KEY_PACKAGE_REPLACEMENT_GRACE_SECS`] after `replaced_at`, or
+    /// at `not_after` if that is earlier. Until a replacement is confirmed,
+    /// only `not_after` bounds an unconsumed package.
     pub fn delete_at(&self) -> Timestamp {
-        if self.consumed {
-            Timestamp(
-                self.not_after.0.min(
-                    self.replaced_at
-                        .0
-                        .saturating_add(CONSUMED_KEY_PACKAGE_RETENTION_SECS),
-                ),
-            )
-        } else {
-            self.not_after
+        if self.awaiting_confirmed_replacement && !self.consumed {
+            return self.not_after;
         }
+        Timestamp(
+            self.not_after.0.min(
+                self.replaced_at
+                    .0
+                    .saturating_add(KEY_PACKAGE_REPLACEMENT_GRACE_SECS),
+            ),
+        )
     }
 }
 
@@ -347,13 +452,26 @@ pub struct KeyPackageLifecycleState {
     #[serde(default)]
     pub last_consumed_at: Option<Timestamp>,
     /// Prior packages remain decryptable after their replacement so an invite
-    /// already in flight can still be processed: unconsumed ones until their
-    /// MLS lifetime expires, consumed ones for
-    /// [`CONSUMED_KEY_PACKAGE_RETENTION_SECS`]. See
-    /// [`RetainedKeyPackagePrivateMaterial::delete_at`].
+    /// already in flight can still be processed, for
+    /// [`KEY_PACKAGE_REPLACEMENT_GRACE_SECS`] after the replacement is
+    /// confirmed. See [`RetainedKeyPackagePrivateMaterial::delete_at`].
     #[serde(default)]
     pub retained_private_material: Vec<RetainedKeyPackagePrivateMaterial>,
     pub pending_replacement: Option<PendingKeyPackageReplacement>,
+    /// The build that last replaced a KeyPackage because the publisher
+    /// refused its signed bytes as unusable (mdk#2628, D8). Each build does so
+    /// at most once, so a publisher that refuses what this build signs cannot
+    /// make it generate a KeyPackage per attempt, while a later build can
+    /// still replace one an earlier build signed.
+    #[serde(default)]
+    pub unusable_artifact_replaced_by: Option<String>,
+    /// When this device asked its relays to delete its slot at sign-out
+    /// (`foundation/key-packages.md`, "Stopping publication"). Relays drop
+    /// every publication in the slot up to this time, so the next one must be
+    /// newer and is due as soon as the device runs again. Confirmed
+    /// publication of that newer one clears it.
+    #[serde(default)]
+    pub slot_withdrawn_at: Option<Timestamp>,
 }
 
 impl KeyPackageLifecycleState {
@@ -379,6 +497,8 @@ impl KeyPackageLifecycleState {
             last_consumed_at: None,
             retained_private_material: Vec::new(),
             pending_replacement: None,
+            unusable_artifact_replaced_by: None,
+            slot_withdrawn_at: None,
         }
     }
 
@@ -450,6 +570,7 @@ impl KeyPackageLifecycleState {
             .find(|material| material.key_package_ref == key_package_ref)
         {
             material.consumed = true;
+            material.awaiting_confirmed_replacement = false;
             return true;
         }
         if let Some(pending) = self
@@ -509,7 +630,7 @@ pub struct GroupMaintenanceStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONSUMED_KEY_PACKAGE_RETENTION_SECS, KeyPackageLifecycleState, MaintenancePhase,
+        KEY_PACKAGE_REPLACEMENT_GRACE_SECS, KeyPackageLifecycleState, MaintenancePhase,
         PendingKeyPackageReplacement, RetainedKeyPackagePrivateMaterial,
     };
     use crate::engine::KeyPackage;
@@ -524,25 +645,47 @@ mod tests {
             replaced_at: Timestamp(1_000),
             consumed,
             authored_event_id: None,
+            awaiting_confirmed_replacement: false,
         }
     }
 
     #[test]
-    fn retained_key_package_deletion_bound_depends_on_consumption() {
-        let retention_end = 1_000 + CONSUMED_KEY_PACKAGE_RETENTION_SECS;
+    fn retained_key_package_is_deleted_when_the_grace_period_or_lifetime_ends() {
+        let grace_end = 1_000 + KEY_PACKAGE_REPLACEMENT_GRACE_SECS;
+        for consumed in [false, true] {
+            assert_eq!(
+                retained(grace_end + 10, consumed).delete_at(),
+                Timestamp(grace_end),
+                "consumed: {consumed}"
+            );
+            assert_eq!(
+                retained(grace_end - 10, consumed).delete_at(),
+                Timestamp(grace_end - 10),
+                "the KeyPackage lifetime still bounds it; consumed: {consumed}"
+            );
+        }
+        // Until a replacement is confirmed the grace period has not started.
+        let mut awaiting = retained(grace_end + 10, false);
+        awaiting.awaiting_confirmed_replacement = true;
+        assert_eq!(awaiting.delete_at(), Timestamp(grace_end + 10));
+    }
+
+    #[test]
+    fn a_consumed_key_package_does_not_wait_for_a_confirmed_replacement() {
+        let grace_end = 1_000 + KEY_PACKAGE_REPLACEMENT_GRACE_SECS;
+        let mut lifecycle = KeyPackageLifecycleState::slot_only("slot".into());
+        let mut awaiting = retained(grace_end + 10, false);
+        awaiting.awaiting_confirmed_replacement = true;
+        lifecycle.retained_private_material = vec![awaiting];
         assert_eq!(
-            retained(retention_end + 10, false).delete_at(),
-            Timestamp(retention_end + 10)
+            lifecycle.retained_private_material[0].delete_at(),
+            Timestamp(grace_end + 10)
         );
-        assert_eq!(
-            retained(retention_end + 10, true).delete_at(),
-            Timestamp(retention_end)
-        );
-        assert_eq!(
-            retained(retention_end - 10, true).delete_at(),
-            Timestamp(retention_end - 10),
-            "the KeyPackage lifetime still bounds consumed material"
-        );
+        // A Welcome consuming it keeps the grace period from `replaced_at`.
+        lifecycle.record_consumed_key_package(&[2], Timestamp(2_000));
+        let consumed = &lifecycle.retained_private_material[0];
+        assert!(consumed.consumed && !consumed.awaiting_confirmed_replacement);
+        assert_eq!(consumed.delete_at(), Timestamp(grace_end));
     }
 
     fn pending(key_package_ref: Vec<u8>) -> PendingKeyPackageReplacement {
@@ -648,6 +791,35 @@ mod tests {
         value.as_object_mut().unwrap().remove("consumed");
         let decoded: RetainedKeyPackagePrivateMaterial = serde_json::from_value(value).unwrap();
         assert!(!decoded.consumed);
+    }
+
+    #[test]
+    fn retained_key_package_records_written_before_the_confirmation_flag_keep_their_bound() {
+        let legacy = |consumed| {
+            let mut value = serde_json::to_value(retained(1_000_000, consumed)).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("awaiting_confirmed_replacement");
+            serde_json::from_value::<RetainedKeyPackagePrivateMaterial>(value).unwrap()
+        };
+        // An unconsumed package was kept until it expired, and its replacement
+        // may not be confirmed yet.
+        let unconsumed = legacy(false);
+        assert!(unconsumed.awaiting_confirmed_replacement);
+        assert_eq!(unconsumed.delete_at(), Timestamp(1_000_000));
+        // A consumed one was already deleted a day after `replaced_at`.
+        let consumed = legacy(true);
+        assert!(!consumed.awaiting_confirmed_replacement);
+        assert_eq!(
+            consumed.delete_at(),
+            Timestamp(1_000 + KEY_PACKAGE_REPLACEMENT_GRACE_SECS)
+        );
+        // A record that says `false` is not legacy.
+        let written = retained(1_000_000, false);
+        let decoded: RetainedKeyPackagePrivateMaterial =
+            serde_json::from_value(serde_json::to_value(&written).unwrap()).unwrap();
+        assert_eq!(decoded, written);
     }
 
     #[test]

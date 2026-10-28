@@ -143,14 +143,17 @@ pub enum SendIntent {
         expected_epoch: Option<EpochId>,
     },
     /// Invite new members via their KeyPackages.
+    ///
+    /// A package from a device already in the group, or a second package
+    /// from one device, is skipped; an invite that adds no device fails.
     Invite {
         group_id: GroupId,
         key_packages: Vec<KeyPackage>,
         /// Admins granted in the same invite commit as the Adds.
         ///
-        /// Each id must be among the invited members. Empty keeps the
-        /// add-only commit. The current admin set is preserved and these
-        /// invitees are appended.
+        /// Each id must be an invited account with no device already in the
+        /// group. Empty keeps the add-only commit. The current admin set is
+        /// preserved and these invitees are appended.
         #[serde(default)]
         initial_admins: Vec<MemberId>,
     },
@@ -165,6 +168,31 @@ pub enum SendIntent {
     RemoveMembers {
         group_id: GroupId,
         members: Vec<MemberId>,
+    },
+    /// Add devices of this device's own account, without admin authority, in
+    /// a group that requires `marmot.group.account-devices.v1`
+    /// (account-devices-v1.md, "Same-account operations").
+    ///
+    /// The caller supplies every KeyPackage: each must belong to this
+    /// device's account, advertise everything the group requires, and keep
+    /// the account within the leaf limit. The caller must have authenticated
+    /// each one as a device its user approved; the engine never selects an
+    /// own-account KeyPackage itself ("Sender rules"). Each added device gets
+    /// its own Welcome, as an [`Self::Invite`]'s devices do.
+    AddOwnAccountDevices {
+        group_id: GroupId,
+        key_packages: Vec<KeyPackage>,
+    },
+    /// Remove other devices of this device's own account, without admin
+    /// authority, in a group that requires
+    /// `marmot.group.account-devices.v1`.
+    ///
+    /// Each device is named by its leaf's signature key, the
+    /// [`Member::credential`](crate::group::Member) bytes reported for that
+    /// leaf. This device leaves through [`Self::Leave`] instead.
+    RemoveOwnAccountDevices {
+        group_id: GroupId,
+        leaf_signature_keys: Vec<Vec<u8>>,
     },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
@@ -598,6 +626,9 @@ pub enum GroupEvent {
     GroupMemberLeavesRemoved {
         group_id: GroupId,
         epoch: EpochId,
+        /// Removed device destinations, for MDK's own push-token cleanup.
+        /// `marmot-app` empties this list before hosts receive the event, so
+        /// no leaf index reaches a host.
         leaves: Vec<GroupMemberLeaf>,
         /// Accounts with no surviving leaf. Only these lose their tombstones.
         departed_members: Vec<MemberId>,

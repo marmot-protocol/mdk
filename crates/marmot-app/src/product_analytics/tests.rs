@@ -1,4 +1,7 @@
 use super::*;
+#[cfg(feature = "product-analytics-export")]
+use crate::AppError;
+use crate::MarmotApp;
 #[derive(Default)]
 pub(super) struct FakeClock {
     wall: AtomicU64,
@@ -1059,30 +1062,6 @@ fn saved_permission_is_inspectable_without_loading_the_export_destination() {
             .begin_product_operation(ProductFamily::Runtime, "startup", ProductUnit::Attempt)
             .is_none()
     );
-}
-
-#[test]
-fn invalid_optional_host_environment_preserves_an_existing_diagnostic_grant() {
-    for (operator, environment) in [("", "staging"), ("operator", "invalid")] {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = crate::MarmotApp::with_relay(tmp.path(), "wss://relay.example");
-        let runtime = app.clone().runtime();
-        runtime.set_usage_diagnostics_consent(true).unwrap();
-        let before = runtime.stored_usage_diagnostics_settings().unwrap();
-        let permit = app.usage_diagnostics_permit().unwrap();
-        configure_product_analytics_from_values(&runtime, "agent", |name| match name {
-            "MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT" => {
-                Some("https://analytics.example/api/v0/events".into())
-            }
-            "MARMOT_PRODUCT_ANALYTICS_APP_KEY" => Some("A-SH-secret".into()),
-            "MARMOT_PRODUCT_ANALYTICS_OPERATOR" => Some(operator.into()),
-            "MARMOT_PRODUCT_ANALYTICS_ENVIRONMENT" => Some(environment.into()),
-            _ => None,
-        });
-        assert!(permit.valid());
-        assert_eq!(runtime.stored_usage_diagnostics_settings().unwrap(), before);
-        assert!(!app.product_analytics.lock().config.ready());
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

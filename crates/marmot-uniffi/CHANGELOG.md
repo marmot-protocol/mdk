@@ -9,6 +9,13 @@
   source group to settle; the latter requires a fresh authenticated challenge,
   never a blind retry of the same grant. Update exhaustive host error handling.
 
+- `MarmotDeploymentFfi` drops `key_package_preferred_clients` and
+  `key_package_last_clients` (mdk#2628): the KeyPackage `client` tag no longer
+  ranks invite candidates. Remove them from any record a host builds field by
+  field and regenerate bindings with the matching native library; hosts that
+  start from `marmot_deployment_white_noise()` or `marmot_deployment_neutral()`
+  only regenerate.
+
 - `MarmotKitError` adds `MediaReferenceStaleEpoch { source_epoch, current_epoch }`
   and `MediaReferenceEpochUnsettled { source_epoch }`. They replace the
   generic `InvalidMediaReference` for these two cases: the first means the
@@ -19,6 +26,17 @@
 
 ### Changed
 
+- Creating a group or inviting adds every device of each recipient account
+  (mdk#2628, mdk#1696): every valid, compatible KeyPackage published in the
+  last 30 days, at most 20, or the single best one when none is that recent.
+  See the README's KeyPackage selection section.
+- Group member rows are accounts, not devices (mdk#2628). `group_members`,
+  `group_details`, `group_roster`, `group_member_ids_page` and
+  `group_conversation_snapshot` list an account with several devices in the
+  group once, and `AppGroupMemberRecordFfi` and `GroupMemberDetailsFfi` gain
+  `device_count` (binding default 1). `member_count`, admin counts and
+  `is_last_admin` count accounts, and a chat between two accounts stays direct
+  whatever devices either person uses.
 - `AttachmentTransferSubscription.next()` returns a replacement that changes a
   row's transfer state as soon as the engine reports it; progress-only
   replacements still arrive at most four per second. A host that polled

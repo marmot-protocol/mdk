@@ -199,7 +199,8 @@ c_mirror! {
 }
 
 c_mirror! {
-    /// Per-relay KeyPackage deletion (or discovery) failure.
+    /// KeyPackage slot deletion failure. `event_id_hex` is empty when the
+    /// deletion targeted the whole slot.
     MarmotRelayFailure from RelayFailureFfi {
         str event_id_hex,
         str reason,
@@ -222,7 +223,8 @@ c_mirror! {
         /// Active MLS groups this account successfully left.
         copy groups_left: u32,
         vec group_leave_failures/group_leave_failures_len: MarmotGroupLeaveFailure,
-        /// Relay-published KeyPackage events successfully deleted.
+        /// `1` when a relay accepted the deletion of this device's
+        /// KeyPackage slot, otherwise `0`.
         copy key_packages_deleted: u32,
         vec key_package_failures/key_package_failures_len: MarmotRelayFailure,
         rec local_cleanup: MarmotLocalCleanupReport,
@@ -233,8 +235,9 @@ c_mirror! {
     /// Structured result of the non-destructive sign-out.
     MarmotSignOutOutcome from SignOutOutcomeFfi,
     free marmot_sign_out_outcome_free {
-        /// Relay-published KeyPackage events successfully deleted. `0`
-        /// when KeyPackage deletion was not requested.
+        /// `1` when a relay accepted the deletion of this device's
+        /// KeyPackage slot, otherwise `0` (always `0` when deletion was not
+        /// requested).
         copy key_packages_deleted: u32,
         vec key_package_failures/key_package_failures_len: MarmotRelayFailure,
         rec local_cleanup: MarmotLocalCleanupReport,

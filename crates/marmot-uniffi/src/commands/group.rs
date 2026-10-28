@@ -616,7 +616,8 @@ impl Marmot {
         normalize_member_ref_ffi(&member_ref)
     }
 
-    /// Membership roster for `group_id_hex`.
+    /// Membership roster for `group_id_hex`: one row per member account, with
+    /// how many of its devices are in the group.
     pub async fn group_members(
         &self,
         account_ref: String,
@@ -631,9 +632,9 @@ impl Marmot {
     ///
     /// This is the chat-projection companion read: it is one worker command,
     /// performs no profile enrichment, and fails the whole page if any group
-    /// is unknown or quarantined. Each row includes member and admin
-    /// identifiers so recipient-selection screens do not need a per-group
-    /// `group_roster` fanout.
+    /// is unknown or quarantined. Each row includes member account and admin
+    /// identifiers, each account once, so recipient-selection screens do not
+    /// need a per-group `group_roster` fanout.
     pub async fn group_member_ids_page(
         &self,
         account_ref: String,
@@ -657,7 +658,8 @@ impl Marmot {
             .collect())
     }
 
-    /// Group plus enriched member rows for detail screens.
+    /// Group plus enriched member rows for detail screens, one per member
+    /// account.
     pub async fn group_details(
         &self,
         account_ref: String,
@@ -680,7 +682,8 @@ impl Marmot {
         group_conversation_snapshot_for(self, &account_ref, &group_id).await
     }
 
-    /// Lightweight membership roster projection for membership screens.
+    /// Lightweight membership roster projection for membership screens: one
+    /// entry per member account, and `member_count` counts accounts.
     pub async fn group_roster(
         &self,
         account_ref: String,

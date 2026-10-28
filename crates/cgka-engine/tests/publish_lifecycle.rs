@@ -20,11 +20,10 @@ use cgka_engine::message_processor::MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP;
 use cgka_engine::{EngineBuilder, ManualConvergenceClock};
 use cgka_traits::EngineError;
 use cgka_traits::OutboundFanout;
-use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::Group;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
 use cgka_traits::maintenance::{
@@ -1494,22 +1493,6 @@ impl CapabilityStorage for FaultStorage {
     ) -> StorageResult<Option<CapabilityRequirement>> {
         self.inner.feature_requirement(feature)
     }
-    fn save_member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member: &Member,
-        capabilities: GroupCapabilities,
-    ) -> StorageResult<()> {
-        self.inner
-            .save_member_capabilities(group_id, member, capabilities)
-    }
-    fn member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member_id: &MemberId,
-    ) -> StorageResult<Option<GroupCapabilities>> {
-        self.inner.member_capabilities(group_id, member_id)
-    }
 }
 
 impl ConvergencePolicyStorage for FaultStorage {
@@ -1903,6 +1886,8 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
         last_consumed_at: None,
         retained_private_material: Vec::new(),
         pending_replacement: None,
+        unusable_artifact_replaced_by: None,
+        slot_withdrawn_at: None,
     };
 
     lifecycle_fault.arm(1);
@@ -1944,6 +1929,10 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
     assert_eq!(
         state.retained_private_material[0].key_package,
         old_state.pending_replacement.unwrap().key_package
+    );
+    assert!(
+        state.retained_private_material[0].awaiting_confirmed_replacement,
+        "no replacement is confirmed yet, so the superseded bundle's grace has not started"
     );
     assert_eq!(handle.stored_key_package_bundles().unwrap().len(), 2);
 }

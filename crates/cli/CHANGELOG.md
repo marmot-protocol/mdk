@@ -18,9 +18,48 @@ versioning through the workspace version in the root `Cargo.toml`.
   `diagnostic_status`. `--json` prints the same checks with stable ids. The output names no paths, account ids,
   public keys, relay URLs or tokens, and the command exits nonzero when a check fails. A passing doctor does not show
   that messages are delivered.
+- The conformance simulator models `marmot.group.account-devices.v1` (0x800d) support per client (mdk#2628). Scenario
+  IR v3 gains `set_account_devices_support`, `require_account_devices` and `expect_require_account_devices_error`, and
+  vectors gain an `account_devices_state` expectation that checks the component's state rules on a client's exact
+  state. Four vectors cover activation, activation refused while a member lacks support, and activation racing an
+  invite of a member without support, with each side winning once.
+- The engine gains two send intents for a device's own account in a group that requires
+  `marmot.group.account-devices.v1` (0x800d) (mdk#2628). `SendIntent::AddOwnAccountDevices` adds devices of the
+  sender's account from KeyPackages the caller supplies and sends one Welcome rumor per KeyPackage, as an invite does.
+  `SendIntent::RemoveOwnAccountDevices` removes other devices of the account, named by leaf signature key. Each sends
+  a same-account Commit with nothing else in it and leaves pending proposals alone. Anything else is refused before
+  anything is published or changed, including every request in a group that does not require 0x800d. A queued one
+  gets the preparation attempt after a convergence pass that admin intents get; self-updates and Leave still don't.
+  marmot-app does not expose them and MDK does not advertise 0x800d yet, so nothing changes in practice. The
+  simulator's `remove_own_account_devices` now sends the Remove intent.
 
 ### Changed
 
+- Creating a group or inviting adds every device of each recipient account (mdk#2628, mdk#1696): every valid,
+  compatible KeyPackage published in the last 30 days, at most 20, or the single best one when none is that recent.
+  `key-package` lookup returns the best of the same selection and no longer prefers a package by its `client` tag.
+- `groups members`, `groups show` and `groups management` list each member account once, even when it has several
+  devices in the group, and each `members` entry gains `device_count` (mdk#2628). Member counts, admin counts and the
+  last-admin check count accounts, and a chat between two accounts stays direct whatever devices either person uses.
+- MDK now enforces `marmot.group.account-devices.v1` (0x800d) in groups that require it (mdk#2628). In such a group
+  nothing carries data for it (GroupContext, leaves, added KeyPackages) and no AppDataUpdate targets it, every leaf
+  supports it, no account holds more than 20 leaves, and the group never stops requiring it. A Commit or standalone
+  proposal that breaks a rule is rejected. MDK does not advertise 0x800d yet, so it cannot be in such a group; groups
+  that don't require it behave as before, and data under 0x800d there is still unknown data. The engine builder now
+  refuses to advertise a protocol component id the engine does not implement, such as SafeAAD (0x0002) and 0x800d.
+- In a group that requires `marmot.group.account-devices.v1` (0x800d), a device now joins through a Welcome from
+  another device of its own account, as it does through an admin's (mdk#2628). The joiner applies the component's
+  state rules to the group it joins, as members do to every Commit, and rejects a Welcome whose GroupInfo carries data
+  under 0x800d. In any other group only an admin's Welcome joins, as before. Nothing sends such a Welcome yet, and MDK
+  does not advertise 0x800d, so nothing changes in practice.
+- In a group that requires `marmot.group.account-devices.v1` (0x800d), a device may now commit adds and removes of its
+  own account's devices without being an admin (mdk#2628). The Commit must carry them by value and nothing else, and a
+  Commit that also touches another account, carries a proposal by reference or changes group state still needs an
+  admin. Such a Commit has ordinary branch priority whoever commits it, so an admin's Remove beats an admin's add of
+  their own device. One classifier now decides authorization and priority at replay, on every send path and in the
+  publish stamp. Groups that don't require 0x800d behave exactly as before; MDK does not advertise 0x800d yet.
+  Scenario IR v3 gains `remove_own_account_devices`, and a vector races two devices of one account: an admin's
+  Remove of another member beats the other device's same-account Remove on every client.
 - JSON error codes now depend on what an error is, not on which MDK layers wrapped it (mdk#2602). Two codes change.
   A storage failure from the account session or the engine now always reports `engine_error`. Before, some paths
   reported `command_failed`. An external-signer rejection now reports `command_failed`, with
@@ -33,6 +72,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `groups management` and the TUI group detail screen offer no member actions on a device that was removed while another
+  device of its account stays in the group (mdk#2628). Both used to read that account's roster entry as this device, so
+  the TUI could mark it "(you)" and refuse to leave as the group's only admin.
 - `wn-agent` no longer replaces an imported identity's published relay lists on its first start (mdk#2550). With no
   cached copy of the account's kind 10002 or 10050 list, it published a new list naming only its own relays. It now
   reads the published lists from its relays and adopts them. It publishes a list only when every relay answered and

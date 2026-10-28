@@ -4,6 +4,25 @@
 
 ### Breaking changes
 
+- Migration 0123 advances account storage to schema 123 after the upstream
+  migrations through 0122. It adds the protocol-owned `cgka_group_recovery`
+  journal for durable authenticated recovery handshakes. Older binaries reject
+  the upgraded database; deleting a group also deletes its recovery jobs.
+- Migration 0121 advances account storage to schema 121 (mdk#2628). It drops
+  `cgka_member_capabilities`, the engine's per-account capability cache: with
+  several devices per account, one device's capabilities stood in for all of
+  them, so a capability could be offered as an upgrade while a device lacked
+  it. The engine now reads each current leaf's capabilities from the MLS tree,
+  and every member computes the same answer, a Welcome joiner included.
+  `CapabilityStorage` loses `save_member_capabilities` and
+  `member_capabilities`. Snapshots and checkpoints keep their v2 layout: the
+  retired list is written empty, and rows in older snapshots are skipped.
+- Migration 0120 advances account storage to schema 120 (mdk#2628).
+  `account_groups.member_count` now counts member accounts, so an account
+  with several devices in a group counts once and a chat between two
+  accounts is `Direct`. The migration rewrites rows whose engine record lists
+  an account more than once, with the peer index and presentation members
+  their accounts make; every other row already counted accounts.
 - Migration 0117 advances account storage to schema 117 on first open; older
   binaries reject the upgraded database. It queues the current push
   registration once for every joined group while native push is on, so
@@ -16,6 +35,12 @@
   `snapshot_owed_after_epoch` to `group_push_gossip_state`, which existing
   rows leave NULL, and a partial index over the rows that owe one.
   `AccountGroupPushGossipState` gains the matching field.
+- Migration 0122 advances account storage to schema 122 (mdk#2611). It adds
+  `joining_since_ms` to `group_push_gossip_state`, which existing rows leave
+  NULL, with a partial index over the rows that have it,
+  `join_window_counted_ms`, which they leave 0, and `announce_owed_at_ms`,
+  which they leave NULL, with a partial index over the rows that have it.
+  `AccountGroupPushGossipState` gains the matching fields.
 - `apply_group_push_token_tombstone` takes an `AccountGroupPushTokenTombstone`
   instead of eight arguments, and stores its optional removal proof.
 
@@ -37,6 +62,18 @@
   `replace_group_push_snapshot_owed` keep the push snapshot this device owes a
   group after a Commit of its own adds leaves: the latest source epoch wins,
   and replacing or settling it needs the epoch it still holds.
+- Saving the projection opens this device's push join window in a group when a
+  Welcome installs or replaces its copy there: `joining_since_ms` records the
+  time, and an earlier join time and its counted window time are dropped. A
+  group this device created has no window. `joining_group_push_gossip_states`
+  lists the open windows, `count_push_join_window_time` adds time to every one
+  whose join has completed, and `record_group_push_gossip_announce` closes one.
+- `record_group_push_announce_owed` and `owed_group_push_announce_states` keep
+  the other announces this device owes a group. Each new debt raises the
+  stored value past the last, even if the clock went back, and returns it.
+  `record_group_push_gossip_announce` now also takes the owed value the
+  published announce was built under, and settles the debt only while it
+  still holds that value; a new Welcome drops it.
 
 ## 0.14.0 - 2026-10-23
 

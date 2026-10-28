@@ -1,7 +1,6 @@
 use super::format as snapshot_format;
 use super::rows::{
-    GroupStateCheckpoint, MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage,
-    OrderedQueuedOutbound, Snapshot,
+    GroupStateCheckpoint, OpenMlsValueSnapshot, OrderedMessage, OrderedQueuedOutbound, Snapshot,
 };
 #[cfg(feature = "test-conformance-replay")]
 use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
@@ -176,7 +175,6 @@ fn restore_snapshot(
             queued_outbound(conn, group_id, snapshot_queued)?;
         }
     }
-    member_capabilities(conn, group_id, &snapshot.member_caps)?;
     convergence_policy(conn, group_id, snapshot.convergence_policy.as_deref())?;
     validated_tree_marker(conn, group_id, snapshot.validated_tree_marker.as_deref())?;
     openmls_values(conn, mls_group_key, &snapshot.openmls_values)
@@ -189,7 +187,6 @@ pub(super) fn restore_group_state(
 ) -> StorageResult<()> {
     let mls_group_key = mls_group_key(group_id)?;
     group(conn, group_id, &checkpoint.group)?;
-    member_capabilities(conn, group_id, &checkpoint.member_caps)?;
     validated_tree_marker(conn, group_id, checkpoint.validated_tree_marker.as_deref())?;
     openmls_values(conn, &mls_group_key, &checkpoint.openmls_values)
 }
@@ -263,31 +260,6 @@ fn queued_outbound(
                 queued.record.group_id.as_slice(),
                 created_at_to_i64(queued.record.created_at_ms)?,
                 serialize(&queued.record)?
-            ],
-        )
-        .storage()?;
-    }
-    Ok(())
-}
-
-fn member_capabilities(
-    conn: &rusqlite::Connection,
-    group_id: &GroupId,
-    member_caps: &[MemberCapabilitiesSnapshot],
-) -> StorageResult<()> {
-    conn.execute_cached(
-        "DELETE FROM cgka_member_capabilities WHERE group_id = ?1",
-        params![group_id.as_slice()],
-    )
-    .storage()?;
-    for caps in member_caps {
-        conn.execute_cached(
-            "INSERT INTO cgka_member_capabilities (group_id, member_id, capabilities)
-             VALUES (?1, ?2, ?3)",
-            params![
-                group_id.as_slice(),
-                caps.member_id.as_slice(),
-                serialize(&caps.capabilities)?
             ],
         )
         .storage()?;

@@ -839,3 +839,175 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
     bob_app.relay_plane.shutdown().await;
     alice_app.relay_plane.shutdown().await;
 }
+
+/// A member that was offline joins from a Welcome made before a message, and
+/// another member commits after the join but before the joiner's post-join
+/// history REQ is installed. The live group REQ resumes from the account
+/// cursor, after the message, so only the post-join REQ, floored at the
+/// Welcome, can bring that message. The commit must not cancel it.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commit_before_the_post_join_req_still_delivers_the_joiners_history() {
+    use transport_nostr::MarmotRelayPlane;
+    let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let config = || crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    marmot_account::AccountHome::open(alice_dir.path())
+        .create_account("alice")
+        .unwrap();
+    let bob = marmot_account::AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+
+    // Bob publishes a KeyPackage, settles his cold-start history, and leaves.
+    {
+        let setup = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config());
+        let mut client = crate::tests::client_on_app_relay_plane(&setup, "bob").await;
+        client.publish_key_package().await.unwrap();
+        client.sync().await.unwrap();
+        drop(client);
+        setup.relay_plane.shutdown().await;
+    }
+
+    // Alice invites Bob, then writes to the group before he is back.
+    let alice_app =
+        crate::MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config());
+    let mut alice = crate::tests::client_on_app_relay_plane(&alice_app, "alice").await;
+    let group = alice
+        .create_group_with_options(
+            "before bob returns",
+            &[bob.account_id_hex.as_str()],
+            crate::AppCreateGroupOptions {
+                relays: Some(vec![url.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    alice
+        .send(&group, b"sent while bob was away")
+        .await
+        .unwrap();
+    let sent_at = crate::unix_now_seconds();
+
+    // Bob returns with a one-second rebuild lookback and a cursor past the
+    // message, so his live REQs start after it.
+    let resume_at = sent_at + 2;
+    while crate::unix_now_seconds() < resume_at + 1 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut bob_app = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url, config());
+    bob_app.relay_plane =
+        MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(1), true);
+    let mut state = bob_app.load_state("bob").unwrap();
+    state.last_transport_timestamp = Some(resume_at);
+    bob_app.save_state(&state).unwrap();
+    let mut bob_client = crate::tests::client_on_app_relay_plane(&bob_app, "bob").await;
+    bob_client.prepare_transport().await.unwrap();
+    timeout(Duration::from_secs(20), async {
+        while bob_client.runtime.group_record(&group).is_err() {
+            bob_client.next_event().await.unwrap();
+        }
+    })
+    .await
+    .expect("Bob joins from the Welcome");
+    let bob_has_message = |app: &crate::MarmotApp| {
+        app.messages("bob")
+            .unwrap()
+            .iter()
+            .any(|message| message.plaintext == "sent while bob was away")
+    };
+    assert!(
+        !bob_has_message(&bob_app),
+        "no live REQ reaches back to the message"
+    );
+
+    // Alice renames the group. Bob's live REQ brings the commit before his
+    // post-join REQ is installed.
+    alice
+        .update_group_profile(&group, Some("renamed after bob joined"), None)
+        .await
+        .unwrap();
+    let renamed_epoch = alice.runtime.group_record(&group).unwrap().epoch;
+    timeout(Duration::from_secs(20), async {
+        while bob_client.runtime.group_record(&group).unwrap().epoch < renamed_epoch {
+            bob_client.next_event().await.unwrap();
+        }
+    })
+    .await
+    .expect("Bob applies the live commit");
+    assert!(bob_client.post_join_maintenance_subscriptions.is_empty());
+
+    // The maintenance tick runs after the cold-start comparison's paced retry
+    // deadline; move the owner clock there instead of waiting.
+    let bob_storage = bob_app.account_storage("bob").unwrap();
+    bob_client
+        .recovery_owner
+        .test_advance_to_retry(&bob_storage);
+    bob_client
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    if let Some(grant) = bob_client
+        .authorize_account_recovery(
+            None,
+            marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+        )
+        .await
+        .unwrap()
+    {
+        bob_client.run_recovery_grant_for_test(grant).await.unwrap();
+    }
+    let delivered = timeout(Duration::from_secs(10), async {
+        while !bob_has_message(&bob_app) {
+            match timeout(Duration::from_millis(500), bob_client.next_event()).await {
+                Ok(summary) => {
+                    summary.unwrap();
+                }
+                Err(_) => {
+                    bob_client
+                        .advance_post_join_maintenance_subscriptions()
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        delivered.is_ok(),
+        "the post-join REQ brings the message sent before Bob joined"
+    );
+    let completion = timeout(Duration::from_secs(10), async {
+        loop {
+            bob_client
+                .advance_post_join_maintenance_subscriptions()
+                .await
+                .unwrap();
+            if let Some(completion) = bob_client
+                .runtime
+                .post_join_history_fetch(&group)
+                .unwrap()
+                .expect("a joined copy owes its history fetch")
+                .completion
+            {
+                return completion;
+            }
+            if let Ok(summary) = timeout(Duration::from_millis(500), bob_client.next_event()).await
+            {
+                summary.unwrap();
+            }
+        }
+    })
+    .await
+    .expect("the post-join REQ's end of stored events ends the fetch");
+    assert_eq!(
+        completion.outcome,
+        cgka_traits::PostJoinHistoryFetchOutcome::Fetched
+    );
+    assert!(bob_client.post_join_maintenance_subscriptions.is_empty());
+    bob_app.relay_plane.shutdown().await;
+    alice_app.relay_plane.shutdown().await;
+}

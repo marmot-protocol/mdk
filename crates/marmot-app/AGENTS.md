@@ -34,7 +34,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (timeline/group projection accessors, the `*_for_group` component reads, the
   kind-1210 group-system row synthesis, and the local-send projection helpers), `receipts.rs` (the synchronized
   transport receipt view, release-journal consumption, and seen-index maintenance), `push.rs` (push-token registration
-  and notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, the
+  and gossip, with announces and join windows in `push/announce.rs`, and notification-trigger publishing),
+  `retention.rs` (the engine-owned retention sweep policy, the
   storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `history_notices.rs` ("history may be incomplete"
   notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
   in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
@@ -129,9 +130,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   messages, app events, push registrations, telemetry/audit settings) in `src/conversions.rs`. They hold no `MarmotApp`
   state.
 - Keep the forensic audit-log feature in `src/audit_log.rs`: the `AuditLog*` DTOs, salted-hash identity derivation,
-  the per-attempt pinned upload path, the per-account upload checkpoint (`audit-upload-checkpoint.json`), and the
-  `MarmotApp` methods for audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and
-  HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
+  the per-account upload checkpoint file (`audit-upload-checkpoint.json`), and the `MarmotApp` methods for audit
+  settings, recorder open/build, file enumeration, path validation/resolution/removal, and upload. Audit-log unit tests
+  live in its own `#[cfg(test)] mod tests`.
+- Keep the v4 upload's HTTP half in `src/audit_upload.rs`: snapshot capture, the checkpoint record, endpoint validation
+  with its retired-host check, the per-attempt pinned request and the response handling. It opens no files:
+  `audit_log.rs` validates and opens each audit file and reads and writes the checkpoint file, then hands it the open
+  file or the record. It returns `AuditUploadError`; `From<AuditUploadError> for AppError` in `src/error.rs` restores
+  the variant, message and `privacy_safe_kind` the upload reported before it had its own type, and
+  `error::audit_upload_error_tests` covers every failure.
 - Keep the bounded live v5 Welcome capture in `src/client/audit_v5_probe.rs`. It records actual retained founding
   preparation, receipt/peel, app join/checkpoint, and bounded stored-group snapshots through the installed recorder;
   tests retain an in-memory probe for focused product-boundary assertions. Do not infer ACKs, recipient joins, or
@@ -335,6 +342,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   route first in the routing table (`replace_group_routes` preserves the caller's order; a new lead is a change): the
   adapter reads the lead as the route that resumes from the cursor. A locally deleted group lists its current route
   first too, never its frontier copy. See `docs/marmot-architecture/further-context/account-recovery.md` section 5.
+- Keep the post-join history fetch's lifetime apart from the PostJoin obligation's phase (mdk#2626).
+  `advance_post_join_maintenance_subscriptions` keeps a group's session while its fetch is owed, whatever phase commits
+  moved the obligation to, and ends the fetch only through `settle_post_join_history_fetch`: `Fetched` needs the
+  session's qualified boundary, open native ingress and the adapter's placement verdict for that subscription, and
+  the deadline expires only a session whose boundary has not qualified. While a fetch is owed, its session is
+  requested and retained under the fetch's job alone; an early-phase obligation (a re-armed one, or an earlier copy's
+  after a replacement Welcome) keeps the session alive but never picks its job. A session installed for another fetch
+  id (an earlier copy), or whose demand is gone before its boundary qualified, never ends the current one. The fetch never moves the obligation, so self-update timing stays the
+  obligation's own.
 - Keep `MarmotAppRuntime::shutdown_and_close` the one terminal teardown for hosts whose process can be suspended: it
   closes admission, closes every SQLite database and releases the root runtime lease first, then gives graceful worker
   cleanup a bounded budget. The terminal operation must outlive cancellation of its caller. `shutdown` alone does not
@@ -364,7 +380,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
   the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default
   build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
-  every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. Explicit SOCKS5 routing
+  every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. It builds every collector
+  client through the `http_builder` that both `MarmotApp` constructors hand in (`hand_in_http_builder`); before that
+  it builds none, so nothing dials. Endpoint parsers and the exporters' resolved config live in `export_config.rs`;
+  `config.rs` keeps the settings that resolve against `MarmotServiceEndpoints`. Explicit SOCKS5 routing
   must send the validated IP rather than delegate HTTP DNS to the proxy. Build every relay client with
   `network_proxy::nostr_builder()` (in `transport-nostr`, its own `nostr_builder()`, which calls the same adapter
   builder; that crate's `clippy.toml` holds the same ban) and every HTTP client through `network_proxy::http_builder()`; `clippy.toml` rejects
@@ -394,7 +413,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
   stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `app_telemetry.rs` +
   `app_telemetry/` (aggregate app-performance telemetry; same privacy model as relay telemetry), `product_analytics/`
-  (opt-in bounded product observations; export behind `product-analytics-export`), `projection.rs` (legacy account
+  (opt-in bounded product observations; export behind `product-analytics-export`), `usage_diagnostics.rs`
+  (`MarmotApp`'s usage-diagnostics consent persistence and the headless-host analytics configuration; it reaches the
+  product collector only through its methods, consent lock before state lock), `projection.rs` (legacy account
   projection import), `messages/` (`AppMessageIntent` and custom-event intents), `local_open_test_gate.rs` and
   `test_support.rs` (test-only gates/helpers).
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),

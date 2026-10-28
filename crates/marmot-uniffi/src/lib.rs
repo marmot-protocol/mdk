@@ -221,8 +221,8 @@ pub struct MarmotOptions {
     #[uniffi(default = None)]
     pub moderation_report_config: Option<ModerationReportConfigFfi>,
     /// Deployment services: recovery relays, discovery indexers, media and
-    /// image servers, Open Ranking, KeyPackage client preference, moderation
-    /// label namespace and keychain service. Required, with no default, so a
+    /// image servers, Open Ranking, moderation label namespace and keychain
+    /// service. Required, with no default, so a
     /// host can't silently open a different keychain service: White Noise
     /// apps pass `marmot_deployment_white_noise()`.
     pub deployment: MarmotDeploymentFfi,

@@ -16,7 +16,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [service endpoint defaults](#service-endpoint-defaults)
 - Accounts and identity: [interactive account onboarding](#interactive-account-onboarding),
   [identity references and profiles](#identity-references-and-profiles),
-  [KeyPackage inventory](#keypackage-inventory), [KeyPackage client preference](#keypackage-client-preference),
+  [KeyPackage inventory](#keypackage-inventory), [KeyPackage selection](#keypackage-selection),
   [invitation lookup outcomes](#invitation-lookup-outcomes),
   [public Nostr event verification](#public-nostr-event-verification),
   [public event previews](#public-event-previews)
@@ -25,7 +25,8 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
-  [device-local membership events](#device-local-membership-events), [group reporting](#group-reporting),
+  [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
+  [group reporting](#group-reporting),
   [moderation reports to the operator](#moderation-reports-to-the-operator),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
 - Media: [file-backed media upload](#file-backed-media-upload),
@@ -294,8 +295,7 @@ and `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars>
 Every constructor requires a `MarmotDeploymentFfi`: `MarmotOptions.deployment` has no default, and the other
 constructors take it as their last argument. It holds the services a deployment's users rely on: the
 recovery-operated relays, discovery indexers, new-group media servers, group- and profile-image servers, Open
-Ranking, the KeyPackage client preference, the moderation label namespace, and the keychain service used when no
-`secretStore` is given. Start from `marmotDeploymentWhiteNoise()` or `marmotDeploymentNeutral()` and change what
+Ranking, the moderation label namespace, and the keychain service used when no `secretStore` is given. Start from `marmotDeploymentWhiteNoise()` or `marmotDeploymentNeutral()` and change what
 differs. White Noise apps pass `marmotDeploymentWhiteNoise()` in every entry point, including background and
 notification-extension runtimes. Never change `keychainService` for an existing install: secrets stored under the old
 name are stranded.
@@ -304,8 +304,8 @@ Nothing an unset value configures falls back to White Noise's services. With no 
 carry no encrypted-media component and stay text-only. With no group-image server, setting or fetching an encrypted
 group image fails; with no profile-image server, `uploadProfileImage` needs an explicit server. No recovery relays
 means every route's history needs all its relays to certify, no discovery indexers means onboarding searches the
-discovery relays the host passes plus the account's declared relays, no Open Ranking turns that directory-search tier off, no KeyPackage client
-preference leaves candidates unranked by client tag, and no moderation label namespace leaves reporting unconfigured. The neutral keychain service
+discovery relays the host passes plus the account's declared relays, no Open Ranking turns that directory-search tier off, and no moderation label namespace leaves reporting
+unconfigured. The neutral keychain service
 is `org.marmot-protocol.mdk`.
 
 ```swift
@@ -687,46 +687,23 @@ remains retained. Empty bootstrap relays remain network-enabled. After a
 mutation, re-read the local inventory instead of applying an out-of-order
 refresh.
 
-## KeyPackage client preference
+## KeyPackage selection
 
-Invitation discovery temporarily ranks KeyPackages by the deployment's client preference:
-`keyPackagePreferredClients` first, then untagged/other clients, then `keyPackageLastClients`.
-White Noise's deployment prefers `whitenoise` and ranks `amethyst` last; `marmotDeploymentNeutral()` sets no
-preference. Names are trimmed and matched case-insensitively, exactly (not by
-substring). A package with more than one `client` tag, or whose tag's first value is
-missing, empty or over 64 bytes, ranks as untagged; values after the name are ignored.
-These are advisory labels, never proof of a particular application.
-Only valid packages compatible with the proposed/existing group qualify. Within a
-tier, the existing recency order applies. A last-ranked client remains selectable when no
-higher-priority compatible package is available. A replacement in a publication
-slot supersedes the old package before ranking; one package per account is selected.
-The ranking comes from the [deployment](#deployment); the publication label is set separately (see
-[runtime options](#runtime-options-and-client-label)).
-Compatibility alone cannot identify a client that publishes usable packages but does not process Welcomes.
+Creating a group or inviting adds every device of each recipient account, and the group shows the account as one
+member with its `deviceCount`. MDK reads the account's KeyPackages and KeyPackage deletion requests from relays, then
+adds every valid, compatible package published in the last 30 days, at most 20 per account; with none that recent, it
+adds the single best valid one. Each publication slot (`d` tag) contributes at most one package: the slot's newest
+publication supersedes older ones even when it is invalid or deleted, so an older package never comes back. A package
+a deletion request covers, by slot address or by event id, is skipped. Packages not marked last-resort rank first,
+then the most recently published, then the lower KeyPackageRef. Packages sharing a leaf signature key (one device
+publishing in several slots) count once. The `client` tag never affects selection; it is only a publication label
+(see [runtime options](#runtime-options-and-client-label)).
 
-Client ranking and slot supersession also apply to directory lookup (including
-`wn-cli key-package`) and composition prewarm, without target-group requirements. A
-malformed current publication never revives an older package in the same slot.
-If no usable slot remains, prewarm reports failure while retaining successfully
-discovered routes for other members. Its success must not imply readiness based
-on superseded material. Bounded batch results are not exhaustive, so rejected
-candidates still permit a per-account fallback fetch. A lower-priority batch
-winner during create/invite also triggers that fetch to look for a preferred slot omitted by a relay's
-batch limit, even if it returned fewer records than requested: relays may impose
-lower caps. Already observed replacements remain authoritative during the refetch.
-This adds a per-author request for each lower-priority batch winner. A preferred-client
-winner already has the highest tier in a newest-first prefix, so it skips that
-request. Both paths remain bounded discovery: neither guarantees completeness
-when a relay omits newer events instead of returning a newest-first prefix.
-If that supplementary fetch fails, a still-valid, compatible package from the
-current batch remains usable; previously cached packages are never substituted.
-Prewarm skips preference-only refetches because it only checks existence.
-Prewarm checks discovery readiness only; it has no proposed group configuration
-and does not guarantee capability compatibility. Final creation/invitation checks
-the actual group's requirements. Device-aware delivery in
-[MDK #1696](https://github.com/marmot-protocol/mdk/issues/1696) is the intended
-replacement for this temporary client ranking.
-
+Directory lookup (including `wn-cli key-package`) returns the best package of the same selection. Composition prewarm
+checks existence from a batched read. Create and invite read each account on its own, because a read bounded across
+accounts cannot prove that it saw every slot. If that read fails, valid, compatible packages from the batch remain
+usable; previously cached packages are never substituted. Prewarm has no proposed group configuration, so it does not
+guarantee capability compatibility; creation and invitation check the actual group's requirements.
 
 ## Invitation lookup outcomes
 
@@ -887,6 +864,16 @@ notification effects before host delivery; these events create no system row.
 Use them to refresh presentation, and handle the new variants when regenerating
 Swift/Kotlin bindings. Retained-history engine rollback is separate from automatic
 terminal-copy recovery through the managed scheduler.
+
+## Members are accounts
+
+An account can have several devices in one group, each its own MLS leaf. Member
+rows, rosters, member-id pages and conversation snapshots list each account once,
+and `member_count`, admin counts, last-admin checks and direct-chat detection count
+accounts: a 1:1 chat stays a 1:1 whatever devices either person uses. A member row's
+`device_count` is how many of that account's devices are in the group; nothing else
+about another account's devices reaches the bindings. A group-system row marks only
+an account's first device joining or its last device leaving.
 
 ## Group-system previews
 

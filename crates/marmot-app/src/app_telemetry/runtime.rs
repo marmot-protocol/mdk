@@ -157,13 +157,27 @@ struct OperationState {
     duration: DurationHistogram,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Success,
     Failure,
     Cancelled,
     Timeout,
     NotReady,
+}
+
+impl Outcome {
+    /// What a finished result records: success, or the outcome its error converts into.
+    /// `marmot-app` converts its own errors (`app_outcome`); recording never names them.
+    pub(crate) fn of<T, E>(result: &Result<T, E>) -> Self
+    where
+        for<'e> Self: From<&'e E>,
+    {
+        match result {
+            Ok(_) => Self::Success,
+            Err(error) => Self::from(error),
+        }
+    }
 }
 
 impl OperationState {
@@ -320,13 +334,11 @@ impl Observation {
     pub(crate) fn finish(mut self, outcome: Outcome) {
         self.complete(outcome);
     }
-    pub(crate) fn finish_app<T>(self, result: &Result<T, crate::AppError>) {
-        self.finish(match result {
-            Ok(_) => Outcome::Success,
-            Err(crate::AppError::AccountWorkerResponseTimedOut) => Outcome::Timeout,
-            Err(crate::AppError::AccountWorkerBusy) => Outcome::NotReady,
-            Err(_) => Outcome::Failure,
-        });
+    pub(crate) fn finish_app<T, E>(self, result: &Result<T, E>)
+    where
+        for<'e> Outcome: From<&'e E>,
+    {
+        self.finish(Outcome::of(result));
     }
     fn complete(&mut self, outcome: Outcome) {
         if self.finished {
@@ -353,11 +365,14 @@ impl Drop for Observation {
 }
 
 impl AppPerformanceTelemetry {
-    pub(crate) async fn measure_app<T>(
+    pub(crate) async fn measure_app<T, E>(
         &self,
         operation: RuntimePerformanceOperation,
-        work: impl std::future::Future<Output = Result<T, crate::AppError>>,
-    ) -> Result<T, crate::AppError> {
+        work: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, E>
+    where
+        for<'e> Outcome: From<&'e E>,
+    {
         let observation = self.observe(operation);
         let result = work.await;
         observation.finish_app(&result);

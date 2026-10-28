@@ -676,14 +676,16 @@ enum LeaveGateCheck {
     DrainComplete,
 }
 
-struct AdminReservation {
+struct FairnessReservation {
     available: bool,
+    account_devices_required: bool,
 }
 
-impl AdminReservation {
+impl FairnessReservation {
     fn load<S: StorageProvider>(
         engine: &Engine<S>,
         group_id: &GroupId,
+        queued: &[QueuedOutboundIntent],
     ) -> Result<Self, EngineError> {
         let available = engine
             .storage
@@ -692,7 +694,12 @@ impl AdminReservation {
                 pass.phase == cgka_traits::ConvergencePassPhase::Completed
                     && pass.fairness_slot_available
             });
-        Ok(Self { available })
+        let account_devices_required =
+            available && engine.fair_scheduling_requires_account_devices(group_id, queued)?;
+        Ok(Self {
+            available,
+            account_devices_required,
+        })
     }
 
     fn is_available(&self) -> bool {
@@ -700,7 +707,7 @@ impl AdminReservation {
     }
 
     fn permits(&self, intent: &SendIntent) -> bool {
-        !self.available || is_admin_group_state_intent(intent)
+        !self.available || is_fair_scheduled_intent(intent, self.account_devices_required)
     }
 
     fn consume_if_dormant<S: StorageProvider>(
@@ -723,12 +730,12 @@ impl AdminReservation {
         queued: &[QueuedOutboundIntent],
     ) {
         if self.available
-            && queued
-                .iter()
-                .any(|record| is_admin_group_state_intent(&record.intent))
+            && queued.iter().any(|record| {
+                is_fair_scheduled_intent(&record.intent, self.account_devices_required)
+            })
         {
             // Diagnostic only: the completed-pass boundary is being held for a
-            // queued admin group-state intent while retained inbound waits.
+            // queued admin or same-account intent while retained inbound waits.
             engine.engine_metrics.note_admin_reservation_hold();
         }
     }
@@ -1103,11 +1110,12 @@ impl<S: StorageProvider> Engine<S> {
 
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
         let mut drained = Vec::new();
-        let mut reservation = AdminReservation::load(self, group_id)?;
+        let mut reservation = FairnessReservation::load(self, group_id, &queued)?;
         reservation.consume_if_dormant(self, group_id)?;
         reservation.observe_hold(self, &queued);
-        // A persisted fairness slot orders one already-queued administrative
-        // evolution before automatic SelfRemove or leave-maintenance mutation.
+        // A persisted fairness slot orders one already-queued admin or
+        // same-account evolution before automatic SelfRemove or
+        // leave-maintenance mutation.
         if !reservation.is_available()
             && self
                 .run_drain_maintenance(group_id, now_ms, LeaveGateCheck::Required)
@@ -1215,8 +1223,8 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         if reservation.consume_ungranted(self, group_id)? {
-            // No already-queued admin group-state intent was eligible for the
-            // fairness attempt. Do not let unrelated app/leave/maintenance
+            // No already-queued admin or same-account intent was eligible for
+            // the fairness attempt. Do not let unrelated app/leave/maintenance
             // work hold the next inbound generation indefinitely.
             if self
                 .run_drain_maintenance(group_id, now_ms, LeaveGateCheck::DrainComplete)
@@ -4049,6 +4057,8 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::Invite { group_id, .. }
         | SendIntent::RecoverMembers { group_id, .. }
         | SendIntent::RemoveMembers { group_id, .. }
+        | SendIntent::AddOwnAccountDevices { group_id, .. }
+        | SendIntent::RemoveOwnAccountDevices { group_id, .. }
         | SendIntent::Leave { group_id }
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
@@ -4059,20 +4069,56 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
 }
 
 /// Single classification chokepoint for the convergence.md one-attempt
-/// reservation: only an admin-authorized local group-state evolution may hold
-/// the completed-pass boundary open (marmot#375). Queued application messages
-/// must never park pass admission.
-pub(crate) fn is_admin_group_state_intent(intent: &SendIntent) -> bool {
-    matches!(
-        intent,
+/// reservation (marmot#375, mdk#2628 D6): only a local group-state evolution
+/// that needs admin or same-account authority may hold the completed-pass
+/// boundary open. A same-account intent counts only while the group requires
+/// account-devices (`account_devices_required`), so a group that does not
+/// require it reserves the slot for exactly the admin kinds. Self-updates,
+/// leaves and queued application messages must never park pass admission.
+pub(crate) fn is_fair_scheduled_intent(
+    intent: &SendIntent,
+    account_devices_required: bool,
+) -> bool {
+    match intent {
         SendIntent::Invite { .. }
-            | SendIntent::RecoverMembers { .. }
-            | SendIntent::RemoveMembers { .. }
-            | SendIntent::UpdateAppComponents { .. }
-            | SendIntent::UpdateGroupData { .. }
-            | SendIntent::EnableDisbanding { .. }
-            | SendIntent::Disband { .. }
-    )
+        | SendIntent::RecoverMembers { .. }
+        | SendIntent::RemoveMembers { .. }
+        | SendIntent::UpdateAppComponents { .. }
+        | SendIntent::UpdateGroupData { .. }
+        | SendIntent::EnableDisbanding { .. }
+        | SendIntent::Disband { .. } => true,
+        SendIntent::AddOwnAccountDevices { .. } | SendIntent::RemoveOwnAccountDevices { .. } => {
+            account_devices_required
+        }
+        SendIntent::AppMessage { .. }
+        | SendIntent::Leave { .. }
+        | SendIntent::SelfUpdate { .. } => false,
+    }
+}
+
+impl<S: StorageProvider> Engine<S> {
+    /// The `account_devices_required` answer [`is_fair_scheduled_intent`]
+    /// needs for `queued`. The group is read only when a same-account intent
+    /// is queued, so other queues never pay for it.
+    pub(crate) fn fair_scheduling_requires_account_devices(
+        &self,
+        group_id: &GroupId,
+        queued: &[QueuedOutboundIntent],
+    ) -> Result<bool, EngineError> {
+        if !queued.iter().any(|record| {
+            matches!(
+                record.intent,
+                SendIntent::AddOwnAccountDevices { .. }
+                    | SendIntent::RemoveOwnAccountDevices { .. }
+            )
+        }) {
+            return Ok(false);
+        }
+        self.with_mls_group(
+            group_id,
+            crate::app_components::group_requires_account_devices,
+        )
+    }
 }
 
 #[cfg(test)]

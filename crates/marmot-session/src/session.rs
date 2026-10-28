@@ -104,6 +104,8 @@ pub struct SessionConfig {
     recorder: Option<Box<dyn ForensicRecorder>>,
     maintenance_sources: Option<(Arc<dyn WallClock>, Arc<dyn MaintenanceRandom>)>,
     defer_group_hydration: bool,
+    #[cfg(feature = "test-policy-overrides")]
+    allow_account_devices_advertising: bool,
 }
 
 /// Where [`AccountDeviceSession::open`] gets its database connection.
@@ -176,6 +178,8 @@ impl SessionConfig {
             recorder: None,
             maintenance_sources: None,
             defer_group_hydration: false,
+            #[cfg(feature = "test-policy-overrides")]
+            allow_account_devices_advertising: false,
         }
     }
 
@@ -217,6 +221,15 @@ impl SessionConfig {
         components: impl IntoIterator<Item = AppComponentId>,
     ) -> Self {
         self.supported_app_components = AppComponentSet::new(components);
+        self
+    }
+
+    /// Let [`Self::supported_app_components`] include
+    /// `marmot.group.account-devices.v1`, which the engine enforces but does
+    /// not advertise yet (mdk#2628, item 2.2). Test builds only.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn allow_account_devices_advertising_for_tests(mut self) -> Self {
+        self.allow_account_devices_advertising = true;
         self
     }
 
@@ -488,6 +501,12 @@ impl AccountDeviceSession {
             }
             builder
         };
+        #[cfg(feature = "test-policy-overrides")]
+        let builder = if config.allow_account_devices_advertising {
+            builder.allow_account_devices_advertising_for_tests()
+        } else {
+            builder
+        };
         let mut builder = builder.peeler(config.peeler);
         if let Some((wall_clock, maintenance_random)) = config.maintenance_sources {
             builder = builder.maintenance_sources(wall_clock, maintenance_random);
@@ -618,15 +637,24 @@ impl AccountDeviceSession {
         &mut self,
         state: &mut KeyPackageLifecycleState,
         authored_created_at: cgka_traits::Timestamp,
-        refresh_lead_secs: u64,
+        refresh_after_secs: u64,
         targets: Vec<TransportFanoutTarget>,
     ) -> SessionResult<KeyPackage> {
         Ok(self.engine.stage_key_package_replacement(
             state,
             authored_created_at,
-            refresh_lead_secs,
+            refresh_after_secs,
             targets,
         )?)
+    }
+
+    pub fn key_package_advertises_current_capabilities(
+        &self,
+        key_package: &KeyPackage,
+    ) -> SessionResult<bool> {
+        Ok(self
+            .engine
+            .key_package_advertises_current_capabilities(key_package)?)
     }
 
     pub fn promote_key_package_lifecycle(
@@ -1671,6 +1699,8 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::Invite { .. } => "invite",
         SendIntent::RecoverMembers { .. } => "recover_members",
         SendIntent::RemoveMembers { .. } => "remove_members",
+        SendIntent::AddOwnAccountDevices { .. } => "add_own_account_devices",
+        SendIntent::RemoveOwnAccountDevices { .. } => "remove_own_account_devices",
         SendIntent::Leave { .. } => "leave",
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",

@@ -512,11 +512,18 @@ impl PrevalidatedOwnCommits {
 ///
 /// Checkpoint identity and resulting epoch authentication are filled in by the
 /// confirm path after the commit is merged.
+///
+/// `parent` is the group the commit is staged on, still at the commit's
+/// source epoch: the same candidate parent state every receiver classifies the
+/// commit against on replay, so the stamped priority equals theirs.
 pub(crate) fn own_commit_stamp(
+    parent: &MlsGroup,
     staged: &openmls::group::StagedCommit,
     committer: MemberId,
 ) -> Result<cgka_traits::message::OwnCommitConvergenceStamp, cgka_traits::error::EngineError> {
-    let priority = crate::app_components::commit_ordering_priority_for_staged(staged);
+    let priority =
+        crate::commit_class::classify_staged_commit(parent, staged, Some(parent.own_leaf_index()))?
+            .priority();
     let mut consumed_proposal_refs = staged
         .queued_proposals()
         .map(|proposal| tls_hex(proposal.proposal_reference_ref()))
@@ -3248,12 +3255,9 @@ fn update_group_record_from_replay<S: StorageProvider>(
     {
         group.required_capabilities = required_capabilities_from_group(&mls_group);
         crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
-        crate::capability_manager::cache_own_capabilities_from_group(storage, group_id, &mls_group)
-            .map_err(|e| {
-                OpenMlsProjectionError::Replay(format!(
-                    "refresh post-replay self capabilities: {e}"
-                ))
-            })?;
+        crate::capability_manager::check_own_leaf_of_group(&mls_group).map_err(|e| {
+            OpenMlsProjectionError::Replay(format!("check post-replay own leaf: {e}"))
+        })?;
     }
 
     storage
@@ -3959,33 +3963,45 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         rejection_category: None,
                     });
                 }
-                if let Err(rejection) =
-                    crate::app_components::authorize_staged_commit_proposals(&mls_group, &staged)
-                {
-                    return Err(OpenMlsProjectionError::InvalidCommit {
-                        message_id,
-                        reason: crate::app_components::proposal_rejection_category_tag(
-                            rejection.category,
-                        )
-                        .to_string(),
-                        rejection_category: Some(rejection.category),
-                    });
-                }
-                if let Err(err) = crate::app_components::require_admin_for_staged_commit(
+                // One class decides this Commit's authority and its branch
+                // priority, from the same parent state the committer stamped
+                // it against.
+                let class = match crate::commit_class::authorize_staged_commit(
                     &mls_group,
                     group_id,
+                    sender_leaf_index,
                     sender_id.as_ref(),
                     &staged,
                 ) {
-                    return match err {
-                        cgka_traits::error::EngineError::NotGroupAdmin { .. } => {
-                            Err(OpenMlsProjectionError::UnauthorizedCommit { message_id })
-                        }
-                        other => Err(OpenMlsProjectionError::Replay(format!(
+                    Ok(class) => class,
+                    Err(crate::commit_class::CommitAuthorityError::ParentState(err)) => {
+                        return Err(OpenMlsProjectionError::InvalidCommit {
+                            message_id,
+                            reason: format!("commit class: {err}"),
+                            rejection_category: Some(
+                                cgka_traits::ingest::ProposalRejectionCategory::InvalidEncoding,
+                            ),
+                        });
+                    }
+                    Err(crate::commit_class::CommitAuthorityError::Proposal(category)) => {
+                        return Err(OpenMlsProjectionError::InvalidCommit {
+                            message_id,
+                            reason: crate::app_components::proposal_rejection_category_tag(
+                                category,
+                            )
+                            .to_string(),
+                            rejection_category: Some(category),
+                        });
+                    }
+                    Err(crate::commit_class::CommitAuthorityError::NotAdmin) => {
+                        return Err(OpenMlsProjectionError::UnauthorizedCommit { message_id });
+                    }
+                    Err(crate::commit_class::CommitAuthorityError::Other(other)) => {
+                        return Err(OpenMlsProjectionError::Replay(format!(
                             "admin check: {other:?}"
-                        ))),
-                    };
-                }
+                        )));
+                    }
+                };
                 if let Err(err) =
                     crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
                         &mls_group, group_id, &staged,
@@ -4021,7 +4037,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 let sender = sender_id
                     .as_ref()
                     .expect("authenticated sender checked above");
-                let priority = crate::app_components::commit_ordering_priority_for_staged(&staged);
+                let priority = class.priority();
                 let committer = sender.as_slice().to_vec();
                 // foundation/identity.md: deferred commits replayed during
                 // convergence are an inbound credential ingress too. Reject
@@ -4088,15 +4104,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map(|proposal| tls_hex(proposal.proposal_reference_ref()))
                     .collect::<Result<Vec<_>, _>>()?;
                 consumed_proposal_refs.sort();
-                // Mirror direct ingest: the staged commit is the only public
-                // source for newly added members' KeyPackage capabilities.
-                // The outer canonicalization transaction rolls these writes
-                // back with the merge, record, and dispositions.
-                crate::capability_manager::cache_from_staged_commit(storage, group_id, &staged)
+                // Mirror direct ingest: check each added leaf's proof profile
+                // before the merge consumes the staged commit.
+                crate::capability_manager::check_added_leaf_profiles(storage, group_id, &staged)
                     .map_err(|e| {
-                        OpenMlsProjectionError::Replay(format!(
-                            "cache replayed Add capabilities: {e}"
-                        ))
+                        OpenMlsProjectionError::Replay(format!("check replayed Add leaves: {e}"))
                     })?;
                 let activity_before = retain_replayed_anchors
                     .map(|_| group_activity::GroupActivitySnapshot::capture(&mls_group));

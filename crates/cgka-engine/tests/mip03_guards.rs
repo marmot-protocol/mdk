@@ -7,8 +7,8 @@
 //! tracking rather than by OpenMLS alone.
 
 use async_trait::async_trait;
-use cgka_engine::app_components::staged_commit_requires_admin;
 use cgka_engine::canonicalization::{CanonicalizationPolicy, DroppedMessageReason};
+use cgka_engine::commit_class::classify_staged_commit;
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
@@ -384,7 +384,10 @@ fn requires_admin_for_proposals(
         .stage_commit(&provider)
         .expect("stage commit");
     let staged = mls_group.pending_commit().expect("pending commit staged");
-    let requires_admin = staged_commit_requires_admin(staged);
+    let requires_admin =
+        classify_staged_commit(mls_group, staged, Some(mls_group.own_leaf_index()))
+            .expect("classify the staged commit")
+            .requires_admin();
     mls_group
         .clear_pending_commit(provider.storage())
         .expect("clear pending commit");
@@ -1476,7 +1479,9 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
         "the staged commit should consume only SelfRemove proposals"
     );
     assert!(
-        !staged_commit_requires_admin(staged),
+        !classify_staged_commit(&mls_group, staged, Some(mls_group.own_leaf_index()))
+            .expect("classify the staged commit")
+            .requires_admin(),
         "a SelfRemove-only commit must be allowed for non-admins"
     );
 }

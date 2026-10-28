@@ -1213,6 +1213,7 @@ fn group_account_records(
         last_own_leaf_rotation_at: Some(Timestamp(10)),
         next_periodic_rotation_at: Some(Timestamp(1_000)),
         leaf_refresh_due_at: None,
+        post_join_history: None,
     };
     let obligation = MaintenanceObligation {
         id: record_id("obligation", group_id),
@@ -1446,6 +1447,8 @@ async fn account_records_report_a_closed_store_as_the_engine_storage_failure() {
         last_consumed_at: None,
         retained_private_material: Vec::new(),
         pending_replacement: None,
+        unusable_artifact_replaced_by: None,
+        slot_withdrawn_at: None,
     };
     let fanout_id = record_id("fanout", &group_id);
     let fanout = DurableTransportFanout {

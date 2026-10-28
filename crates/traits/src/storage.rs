@@ -10,10 +10,10 @@
 //! methods in `tokio::task::spawn_blocking`.
 
 use crate::app_components::AppComponentData;
-use crate::capabilities::{CapabilityRequirement, GroupCapabilities};
+use crate::capabilities::CapabilityRequirement;
 use crate::convergence_pass::DurableConvergencePass;
 use crate::engine::{GroupEvent, SendIntent};
-use crate::group::{Group, Member};
+use crate::group::Group;
 use crate::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
     MaintenanceObligation, PeriodicMaintenancePolicy,
@@ -766,11 +766,11 @@ pub trait WelcomeStorage {
 
 // ── CapabilityStorage ───────────────────────────────────────────────────────
 
-/// Feature registry + per-member capability cache.
+/// Feature registry.
 ///
-/// Per-member capabilities can be read live from OpenMLS, but the cache avoids
-/// repeated tree walks, retains capabilities for members who later leave, and
-/// keeps `feature_status` a cheap local lookup.
+/// Members' capabilities are not stored: the engine reads them from each
+/// current leaf of the MLS tree, so every device of an account counts on its
+/// own.
 pub trait CapabilityStorage {
     fn register_feature(
         &self,
@@ -782,19 +782,6 @@ pub trait CapabilityStorage {
         &self,
         feature: &crate::capabilities::Feature,
     ) -> StorageResult<Option<CapabilityRequirement>>;
-
-    fn save_member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member: &Member,
-        capabilities: GroupCapabilities,
-    ) -> StorageResult<()>;
-
-    fn member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member_id: &MemberId,
-    ) -> StorageResult<Option<GroupCapabilities>>;
 }
 
 // ── ConvergencePolicyStorage ────────────────────────────────────────────────

@@ -27,7 +27,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::maintenance::{
     GroupMaintenanceState, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
-    MaintenanceTrigger, PeriodicMaintenancePolicy,
+    MaintenanceTrigger, PeriodicMaintenancePolicy, PostJoinHistoryFetch,
 };
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
@@ -63,6 +63,17 @@ fn persist_new_group_maintenance<S: StorageProvider>(
         maintenance.periodic_maintenance_policy()?,
         PeriodicMaintenancePolicy::EnabledForNewGroups
     );
+    let post_join = post_join.map(|(welcome_id, sampled_jitter_ms)| {
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-post-join-maintenance-v1");
+        hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
+        hasher.update(group_id.as_slice());
+        hasher.update(welcome_id.as_slice());
+        (
+            MessageId::new(hasher.finalize().to_vec()),
+            sampled_jitter_ms,
+        )
+    });
     maintenance.put_group_maintenance(&GroupMaintenanceState {
         group_id: group_id.clone(),
         enrolled_at: Some(enrolled_at),
@@ -70,14 +81,12 @@ fn persist_new_group_maintenance<S: StorageProvider>(
         last_own_leaf_rotation_at: post_join.is_none().then_some(enrolled_at),
         next_periodic_rotation_at: None,
         leaf_refresh_due_at: None,
+        // A joined copy owes its history fetch from the moment it exists.
+        post_join_history: post_join
+            .as_ref()
+            .map(|(obligation_id, _)| PostJoinHistoryFetch::new(obligation_id.clone())),
     })?;
-    if let Some((welcome_id, sampled_jitter_ms)) = post_join {
-        let mut hasher = Sha256::new();
-        hasher.update(b"marmot-post-join-maintenance-v1");
-        hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
-        hasher.update(group_id.as_slice());
-        hasher.update(welcome_id.as_slice());
-        let obligation_id = MessageId::new(hasher.finalize().to_vec());
+    if let Some((obligation_id, sampled_jitter_ms)) = post_join {
         maintenance.put_maintenance_obligation(&MaintenanceObligation {
             id: obligation_id,
             group_id: group_id.clone(),
@@ -537,11 +546,11 @@ impl<S: StorageProvider> Engine<S> {
         //    must exist before `record_sent_message` writes welcome records.
         //
         //    The MLS group is still at epoch 0 pre-merge, but the `members`
-        //    field surfaced via the `CgkaEngine::members` API and walked by
-        //    `feature_status` needs to reflect "who the user thinks is in the
-        //    group" — which includes invitees they just added. On
-        //    `publish_failed` we re-derive from the (still-unmerged) MLS
-        //    state, which naturally rolls the projection back.
+        //    field surfaced via the `CgkaEngine::members` API needs to
+        //    reflect "who the user thinks is in the group" — which includes
+        //    invitees they just added. On `publish_failed` we re-derive from
+        //    the (still-unmerged) MLS state, which naturally rolls the
+        //    projection back.
         let projected_members = projected_members_with_pending(&mls_group, &parsed_kps)?;
         let group_record = Group {
             id: group_id.clone(),
@@ -634,12 +643,12 @@ impl<S: StorageProvider> Engine<S> {
                 self.storage
                     .with_transaction(|storage| -> Result<EpochId, EngineError> {
                         if mls_group.pending_commit().is_some() {
-                            // The capability cache validates every added leaf
-                            // against the persisted group's protocol profile.
-                            // Seed the projected record inside this same
-                            // transaction before inspecting the staged Add;
-                            // it is overwritten with the canonical epoch and
-                            // roster after the merge below.
+                            // The added-leaf check reads the persisted
+                            // group's protocol profile. Seed the projected
+                            // record inside this same transaction before
+                            // inspecting the staged Add; it is overwritten
+                            // with the canonical epoch and roster after the
+                            // merge below.
                             storage.put_group(&group_record)?;
                             {
                                 let staged = mls_group.pending_commit().ok_or_else(|| {
@@ -647,7 +656,7 @@ impl<S: StorageProvider> Engine<S> {
                                         "founding add lost its pending commit".into(),
                                     )
                                 })?;
-                                crate::capability_manager::cache_from_staged_commit(
+                                crate::capability_manager::check_added_leaf_profiles(
                                     storage, &group_id, staged,
                                 )?;
                             }
@@ -689,14 +698,12 @@ impl<S: StorageProvider> Engine<S> {
                                 deferred_peel: None,
                             })?;
                         }
-                        crate::capability_manager::cache_from_key_packages(
+                        crate::capability_manager::check_key_package_profiles(
                             storage,
                             &group_id,
                             &parsed_kps,
                         )?;
-                        crate::capability_manager::cache_self_capabilities(
-                            storage,
-                            &group_id,
+                        crate::capability_manager::check_own_leaf(
                             &mls_group,
                             self.identity.self_id(),
                             self.ciphersuite,
@@ -764,10 +771,12 @@ impl<S: StorageProvider> Engine<S> {
             return Ok((group_id, SendResult::FoundingGroupCreated { welcomes }));
         }
 
-        crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
-        crate::capability_manager::cache_self_capabilities(
+        crate::capability_manager::check_key_package_profiles(
             &self.storage,
             &group_id,
+            &parsed_kps,
+        )?;
+        crate::capability_manager::check_own_leaf(
             &mls_group,
             self.identity.self_id(),
             self.ciphersuite,
@@ -1203,6 +1212,15 @@ impl<S: StorageProvider> Engine<S> {
                     .as_slice()
                     .to_vec(),
             );
+            // Validating the joined state (5b) reads the GroupInfo's own app
+            // data, which OpenMLS drops when it stages the Welcome. Staging
+            // verifies the GroupInfo signature, so a rejected forgery never
+            // reaches that check.
+            let group_info_app_data = processed
+                .unverified_group_info()
+                .extensions()
+                .app_data_dictionary()
+                .cloned();
             // GroupInfo is still unverified here. Every tentative replacement
             // write is rolled back unless OpenMLS and Marmot checks succeed
             // and the local state permits this join.
@@ -1232,6 +1250,11 @@ impl<S: StorageProvider> Engine<S> {
             };
             let (local_state_is_stale, repaired_unrecoverable) = match discarded.as_ref() {
                 Some(group) => {
+                    let copy_is_member =
+                        crate::identity::local_copy_is_member(group, self.identity.self_id());
+                    // A sibling keeps the account on the roster after this
+                    // device's removal. Check native inactivity as well as the
+                    // durable marker before allowing that copy to re-enter.
                     let self_is_recorded_member = group
                         .members
                         .iter()
@@ -1268,7 +1291,7 @@ impl<S: StorageProvider> Engine<S> {
                             }
                         }
                     }
-                    if consent.is_some() && (!self_is_recorded_member || group.unrecoverable) {
+                    if consent.is_some() && (!copy_is_member || group.unrecoverable) {
                         return Err(rejoin_confirmation_required());
                     }
                     // Unrecoverable is the explicit exception: a fully
@@ -1337,8 +1360,11 @@ impl<S: StorageProvider> Engine<S> {
             {
                 return Err(EngineError::InvalidWelcome);
             }
-            crate::app_components::validate_current_profile_group_invariants(&mls_group)
-                .map_err(|_| EngineError::InvalidWelcome)?;
+            crate::app_components::validate_joined_group_invariants(
+                &mls_group,
+                group_info_app_data.as_ref(),
+            )
+            .map_err(|_| EngineError::InvalidWelcome)?;
 
             // Validate every known GroupContext component before any joined
             // state leaves this transaction. Commit ingest validates
@@ -1372,8 +1398,15 @@ impl<S: StorageProvider> Engine<S> {
                 });
             }
 
-            // 5d. The authenticated Welcome sender must be an admin.
-            crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
+            // 5d. The authenticated Welcome sender must be an admin, or a
+            // device of this account in a state that requires
+            // account-devices.
+            crate::app_components::require_welcome_author_authority(
+                &mls_group,
+                &group_id,
+                &welcome_sender_id,
+                self.identity.self_id(),
+            )?;
 
             // 5e. Every advertised admin must have a current member leaf.
             crate::app_components::reject_admins_without_member_leaf(
@@ -1477,9 +1510,7 @@ impl<S: StorageProvider> Engine<S> {
                         },
                     )?;
             }
-            crate::capability_manager::cache_self_capabilities(
-                storage,
-                &group_id,
+            crate::capability_manager::check_own_leaf(
                 &mls_group,
                 self.identity.self_id(),
                 self.ciphersuite,
@@ -1867,11 +1898,12 @@ pub(crate) fn welcome_metadata_for_key_package(
 }
 
 /// Build the projected post-merge member list: existing MLS members + each
-/// invitee whose KeyPackage is being added by the staged commit. Used by
-/// the send paths so `members()` and `feature_status` reflect the user's
-/// intended state during `PendingPublish`. On rollback, the engine simply
-/// calls `marmot_members(&mls_group)` against the still-unmerged group to
-/// discard the projection.
+/// invitee leaf the staged commit adds, one per KeyPackage, so an account's
+/// several devices each keep their entry. Used by the send paths so
+/// `members()` reflects the user's intended state during `PendingPublish`;
+/// `feature_status` counts the same added leaves from the pending commit. On
+/// rollback, the engine simply calls `marmot_members(&mls_group)` against the
+/// still-unmerged group to discard the projection.
 pub(crate) fn projected_members_with_pending(
     group: &MlsGroup,
     invitees: &[openmls::prelude::KeyPackage],
@@ -1879,11 +1911,9 @@ pub(crate) fn projected_members_with_pending(
     let mut out = marmot_members(group);
     for kp in invitees {
         let id = crate::identity::validated_member_id_of_leaf(kp.leaf_node())?;
-        if !out.iter().any(|m| m.id == id) {
-            out.push(Member {
-                id,
-                credential: kp.leaf_node().signature_key().as_slice().to_vec(),
-            });
+        let credential = kp.leaf_node().signature_key().as_slice().to_vec();
+        if !out.iter().any(|m| m.id == id && m.credential == credential) {
+            out.push(Member { id, credential });
         }
     }
     Ok(out)

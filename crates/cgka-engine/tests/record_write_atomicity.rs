@@ -14,9 +14,7 @@ use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::OutboundFanout;
-use cgka_traits::capabilities::{
-    Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
-};
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
     CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest, SendIntent,
     SendResult,
@@ -266,31 +264,6 @@ impl PutGroupFault {
     }
 }
 
-/// One-shot fault that fails the Nth capability-cache write after arming.
-///
-/// Inbound Add commits write the added member first and refresh self second,
-/// which lets the regression fail specifically at the post-merge self-cache
-/// refresh.
-#[derive(Clone, Default)]
-struct CapabilityWriteFault(Arc<AtomicUsize>);
-
-impl CapabilityWriteFault {
-    fn arm_on_call(&self, call: usize) {
-        assert!(call > 0);
-        self.0.store(call, Ordering::SeqCst);
-    }
-
-    fn should_fail(&self) -> bool {
-        matches!(
-            self.0
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    (remaining > 0).then(|| remaining - 1)
-                }),
-            Ok(1)
-        )
-    }
-}
-
 /// One-shot fault that fails the Nth leave-persistence write after arming.
 /// The counter is shared by proposal rows, leave requests, and content-marker
 /// rows so tests can target every write in their required transaction order.
@@ -389,7 +362,6 @@ impl ApplySnapshotCounter {
 struct FaultStorage {
     inner: SqliteAccountStorage,
     fault: PutGroupFault,
-    capability_fault: CapabilityWriteFault,
     leave_write_fault: LeaveWriteFault,
     intent_write_fault: LeaveWriteFault,
     failed_state_fault: FailedStateWriteFault,
@@ -765,27 +737,6 @@ impl CapabilityStorage for FaultStorage {
     ) -> StorageResult<Option<CapabilityRequirement>> {
         self.inner.feature_requirement(feature)
     }
-    fn save_member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member: &Member,
-        capabilities: GroupCapabilities,
-    ) -> StorageResult<()> {
-        if self.capability_fault.should_fail() {
-            return Err(StorageError::Busy(
-                "injected capability-cache write failure".into(),
-            ));
-        }
-        self.inner
-            .save_member_capabilities(group_id, member, capabilities)
-    }
-    fn member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member_id: &MemberId,
-    ) -> StorageResult<Option<GroupCapabilities>> {
-        self.inner.member_capabilities(group_id, member_id)
-    }
 }
 
 impl ConvergencePolicyStorage for FaultStorage {
@@ -934,7 +885,6 @@ fn build_counted_fault_selfremove_client(
     let engine = EngineBuilder::new(FaultStorage {
         inner,
         fault,
-        capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
@@ -1406,41 +1356,10 @@ fn build_release_fault_client(
     let engine = EngineBuilder::new(FaultStorage {
         inner,
         fault: PutGroupFault::default(),
-        capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: insert_fault,
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
         release_fault,
-        preparation_delay: PreparationDelay::default(),
-        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
-        apply_snapshots: ApplySnapshotCounter::default(),
-        termination_fault: LeaveWriteFault::default(),
-        post_commit_disband_read_fault: LeaveWriteFault::default(),
-    })
-    .legacy_compatibility_profile()
-    .identity(pad32(id))
-    .account_identity_proof_signer(proof_signer(id))
-    .feature_registry(selfremove_registry())
-    .peeler(Box::new(MockPeeler))
-    .build()
-    .unwrap();
-    (engine, handle)
-}
-
-fn build_capability_fault_client(
-    id: &[u8],
-    capability_fault: CapabilityWriteFault,
-) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
-    let inner = SqliteAccountStorage::in_memory().unwrap();
-    let handle = inner.clone();
-    let engine = EngineBuilder::new(FaultStorage {
-        inner,
-        fault: PutGroupFault::default(),
-        capability_fault,
-        leave_write_fault: LeaveWriteFault::default(),
-        intent_write_fault: LeaveWriteFault::default(),
-        failed_state_fault: FailedStateWriteFault::default(),
-        release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots: ApplySnapshotCounter::default(),
@@ -1467,7 +1386,6 @@ fn build_leave_write_fault_client(
     let engine = EngineBuilder::new(FaultStorage {
         inner,
         fault: PutGroupFault::default(),
-        capability_fault: CapabilityWriteFault::default(),
         leave_write_fault,
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
@@ -2464,179 +2382,6 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
     );
 }
 
-/// A failure refreshing self capabilities occurs after the MLS merge and group
-/// record write. All inbound projections must roll back together, and the
-/// retained commit must be handed to stored convergence for retry (mdk#794).
-#[tokio::test]
-async fn inbound_self_capability_mirror_failure_rolls_back_and_reschedules() {
-    let alice_fault = CapabilityWriteFault::default();
-    let bob_fault = CapabilityWriteFault::default();
-    let (mut alice, alice_storage) =
-        build_capability_fault_client(b"alice-inbound-cap-atomic", alice_fault.clone());
-    let (mut bob, bob_storage) =
-        build_capability_fault_client(b"bob-inbound-cap-atomic", bob_fault.clone());
-    let mut david = build_selfremove_client(b"david-inbound-cap-atomic");
-    let mut eve = build_selfremove_client(b"eve-inbound-cap-atomic");
-    let david_id = david.self_id();
-    let eve_id = eve.self_id();
-
-    // Alice and Bob are co-admins at epoch 1, so they can publish competing
-    // privileged invite commits from the same source epoch.
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-    let (group_id, create) = alice
-        .create_group(CreateGroupRequest {
-            name: "inbound capability atomicity".into(),
-            description: String::new(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![bob.self_id()],
-        })
-        .await
-        .unwrap();
-    let bob_welcome = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
-            alice.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
-        }
-        other => panic!("expected GroupCreated, got {other:?}"),
-    };
-    bob.join_welcome(bob_welcome).await.unwrap();
-    alice.drain_pending_convergence_groups();
-    bob.drain_pending_convergence_groups();
-
-    let david_kp = david.fresh_key_package().await.unwrap();
-    let eve_kp = eve.fresh_key_package().await.unwrap();
-    let alice_invite = alice
-        .send(SendIntent::Invite {
-            group_id: group_id.clone(),
-            key_packages: vec![david_kp],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    let bob_invite = bob
-        .send(SendIntent::Invite {
-            group_id: group_id.clone(),
-            key_packages: vec![eve_kp],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    let alice_commit = match alice_invite {
-        SendResult::GroupEvolution { msg, pending, .. } => {
-            alice.confirm_published(pending).await.unwrap();
-            msg
-        }
-        other => panic!("expected GroupEvolution, got {other:?}"),
-    };
-    let bob_commit = match bob_invite {
-        SendResult::GroupEvolution { msg, pending, .. } => {
-            bob.confirm_published(pending).await.unwrap();
-            msg
-        }
-        other => panic!("expected GroupEvolution, got {other:?}"),
-    };
-
-    let ordering_key = |committer: MemberId, commit: &TransportMessage| {
-        CommitOrderingKey::from_commit_bytes(
-            EpochId(1),
-            CommitOrderingPriority::Privileged,
-            committer,
-            &commit.payload,
-        )
-    };
-    let bob_wins =
-        ordering_key(bob.self_id(), &bob_commit) < ordering_key(alice.self_id(), &alice_commit);
-    let (loser, loser_storage, loser_fault, winning_commit, winning_invitee) = if bob_wins {
-        (&mut alice, &alice_storage, &alice_fault, bob_commit, eve_id)
-    } else {
-        (&mut bob, &bob_storage, &bob_fault, alice_commit, david_id)
-    };
-    let routed_winner = TransportMessage {
-        envelope: TransportEnvelope::GroupMessage {
-            transport_group_id: group_id.as_slice().to_vec(),
-        },
-        ..winning_commit
-    };
-
-    assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(2));
-    assert!(
-        loser_storage
-            .member_capabilities(&group_id, &winning_invitee)
-            .unwrap()
-            .is_none()
-    );
-
-    // The winning rival routes into distributed convergence like any other
-    // same-epoch fork commit.
-    let ingested = loser.ingest(routed_winner.clone()).await.unwrap();
-    assert!(
-        matches!(ingested, IngestOutcome::Buffered { .. }),
-        "the winning rival must enter convergence, got {ingested:?}"
-    );
-
-    // The added-member cache write is first; fail the self refresh after the
-    // merge and group-record write have both run inside the settling pass's
-    // apply transaction.
-    loser_fault.arm_on_call(2);
-    let faulted = loser.converge_stored_openmls_messages_at(&group_id, u64::MAX);
-    assert!(
-        faulted.is_err(),
-        "self-capability mirror failure must surface from the settling pass, got {faulted:?}"
-    );
-
-    // All inbound projections roll back together: engine and record agree,
-    // and the added-member cache write did not outlive the failed self
-    // refresh.
-    let record = loser_storage.get_group(&group_id).unwrap();
-    assert_eq!(loser.epoch(&group_id).unwrap(), record.epoch);
-    assert_eq!(
-        loser.members(&group_id).unwrap().len(),
-        record.members.len()
-    );
-    assert!(
-        loser_storage
-            .member_capabilities(&group_id, &winning_invitee)
-            .unwrap()
-            .is_none(),
-        "the added-member cache write must roll back with the failed self refresh"
-    );
-
-    // The fault is transient and one-shot: the retained winner lands on the
-    // next pass.
-    loser
-        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
-        .expect("the retry pass settles after the transient fault");
-
-    let record = loser_storage.get_group(&group_id).unwrap();
-    assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(2));
-    assert_eq!(record.epoch, EpochId(2));
-    assert_eq!(loser.members(&group_id).unwrap().len(), 3);
-    assert_eq!(record.members.len(), 3);
-    assert!(
-        loser_storage
-            .member_capabilities(&group_id, &winning_invitee)
-            .unwrap()
-            .is_some(),
-        "stored convergence must rebuild the added member's capability cache"
-    );
-
-    let redelivered = loser.ingest(routed_winner).await;
-    assert!(
-        matches!(
-            redelivered,
-            Ok(IngestOutcome::Ignored {
-                category: InputRejectionCategory::Duplicate
-            })
-        ),
-        "redelivery after convergence recovery must be a duplicate, got {redelivered:?}"
-    );
-}
-
 /// A profile projection failure occurs after the MLS commit is staged. It must
 /// rewind the pending state and clear the staged commit rather than leaving a
 /// projected record that no caller can confirm or roll back (mdk#824).
@@ -2763,7 +2508,6 @@ async fn slow_preparation_case(
     let mut bob = EngineBuilder::new(FaultStorage {
         inner: storage.clone(),
         fault: PutGroupFault::default(),
-        capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
@@ -2838,7 +2582,6 @@ async fn past_peel_backlog_case(
     let mut bob = EngineBuilder::new(FaultStorage {
         inner: storage,
         fault: PutGroupFault::default(),
-        capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
@@ -3200,7 +2943,6 @@ async fn setup_own_intent_fault_case(
     let mut engine = EngineBuilder::new(FaultStorage {
         inner: storage.clone(),
         fault: PutGroupFault::default(),
-        capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: fault,
         failed_state_fault: FailedStateWriteFault::default(),
@@ -3427,7 +3169,6 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
     let mut carol = EngineBuilder::new(FaultStorage {
         inner,
         fault: PutGroupFault::default(),
-        capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: failed_state_fault.clone(),
@@ -3607,7 +3348,6 @@ async fn eviction_realization_retries_all_cleanup_before_announcing_termination(
         let mut bob = EngineBuilder::new(FaultStorage {
             inner,
             fault: PutGroupFault::default(),
-            capability_fault: CapabilityWriteFault::default(),
             leave_write_fault: LeaveWriteFault::default(),
             intent_write_fault: LeaveWriteFault::default(),
             failed_state_fault: FailedStateWriteFault::default(),
@@ -3781,7 +3521,6 @@ async fn assert_convergence_membership_fault(
     let mut bob = EngineBuilder::new(FaultStorage {
         inner,
         fault: PutGroupFault::default(),
-        capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),
@@ -3972,7 +3711,6 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
     let mut bob = EngineBuilder::new(FaultStorage {
         inner,
         fault: PutGroupFault::default(),
-        capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
         intent_write_fault: LeaveWriteFault::default(),
         failed_state_fault: FailedStateWriteFault::default(),

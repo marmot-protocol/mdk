@@ -1980,7 +1980,8 @@ typedef struct MarmotGroupLeaveFailure {
 } MarmotGroupLeaveFailure;
 
 /**
- * Per-relay KeyPackage deletion (or discovery) failure.
+ * KeyPackage slot deletion failure. `event_id_hex` is empty when the
+ * deletion targeted the whole slot.
  */
 typedef struct MarmotRelayFailure {
   char *event_id_hex;
@@ -2009,7 +2010,8 @@ typedef struct MarmotWipeOutcome {
   struct MarmotGroupLeaveFailure *group_leave_failures;
   uintptr_t group_leave_failures_len;
   /**
-   * Relay-published KeyPackage events successfully deleted.
+   * `1` when a relay accepted the deletion of this device's
+   * KeyPackage slot, otherwise `0`.
    */
   uint32_t key_packages_deleted;
   struct MarmotRelayFailure *key_package_failures;
@@ -2022,8 +2024,9 @@ typedef struct MarmotWipeOutcome {
  */
 typedef struct MarmotSignOutOutcome {
   /**
-   * Relay-published KeyPackage events successfully deleted. `0`
-   * when KeyPackage deletion was not requested.
+   * `1` when a relay accepted the deletion of this device's
+   * KeyPackage slot, otherwise `0` (always `0` when deletion was not
+   * requested).
    */
   uint32_t key_packages_deleted;
   struct MarmotRelayFailure *key_package_failures;
@@ -2295,7 +2298,8 @@ typedef struct MarmotMemberRef {
 } MarmotMemberRef;
 
 /**
- * One member row of the group roster.
+ * One member account of the group roster. An account with several
+ * devices in the group is one row.
  */
 typedef struct MarmotAppGroupMemberRecord {
   char *member_id_hex;
@@ -2304,6 +2308,10 @@ typedef struct MarmotAppGroupMemberRecord {
    */
   char *account;
   bool local;
+  /**
+   * How many of this account's devices are in the group.
+   */
+  uint32_t device_count;
 } MarmotAppGroupMemberRecord;
 
 /**
@@ -2438,7 +2446,8 @@ typedef struct MarmotAppGroupRecord {
 } MarmotAppGroupRecord;
 
 /**
- * Enriched member row for group detail screens.
+ * Enriched member row for group detail screens. An account with
+ * several devices in the group is one row.
  */
 typedef struct MarmotGroupMemberDetails {
   char *member_id_hex;
@@ -2448,6 +2457,10 @@ typedef struct MarmotGroupMemberDetails {
   bool is_self;
   char *npub;
   char *display_name;
+  /**
+   * How many of this account's devices are in the group.
+   */
+  uint32_t device_count;
 } MarmotGroupMemberDetails;
 
 /**
@@ -6599,8 +6612,8 @@ MarmotStatus marmot_sign_out_and_wipe(const struct MarmotClient *client,
 /**
  * Non-destructive sign-out: deactivate the account on this device,
  * keeping local state so it can sign back in later. When
- * `delete_key_packages` is true, relay-published KeyPackages get
- * NIP-09 deletions. Free with `marmot_sign_out_outcome_free`.
+ * `delete_key_packages` is true, this device's KeyPackage slot gets a
+ * NIP-09 deletion. Free with `marmot_sign_out_outcome_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -10282,17 +10295,6 @@ MarmotStatus marmot_deployment_set_open_ranking(struct MarmotDeployment *deploym
                                                 const char *search_endpoint,
                                                 const char *const *profile_relays,
                                                 uintptr_t profile_relays_len);
-
-/**
- * Replace the KeyPackage `client` tags ranked first and ranked last.
- * # Safety
- * deployment must be live; each list must point to its length of valid strings (or be NULL with 0).
- */
-MarmotStatus marmot_deployment_set_key_package_client_preference(struct MarmotDeployment *deployment,
-                                                                 const char *const *preferred,
-                                                                 uintptr_t preferred_len,
-                                                                 const char *const *last,
-                                                                 uintptr_t last_len);
 
 /**
  * Set the NIP-32 namespace on moderation report labels; NULL unsets it, and

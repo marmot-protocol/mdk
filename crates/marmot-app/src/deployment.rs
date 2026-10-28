@@ -4,7 +4,7 @@
 //! [`MarmotDeployment::white_noise`] is White Noise's deployment and keeps its
 //! behaviour exactly. [`MarmotDeployment::neutral`] configures none of them.
 
-pub use nostr_directory::config::{KeyPackageClientPreference, OpenRankingProvider};
+pub use nostr_directory::config::OpenRankingProvider;
 
 /// The services and identifiers one deployment's users rely on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,8 +31,6 @@ pub struct MarmotDeployment {
     pub profile_image_endpoint: Option<String>,
     /// Optional Open Ranking discovery tier for directory search.
     pub open_ranking: Option<OpenRankingProvider>,
-    /// How KeyPackage candidates rank by their self-asserted `client` tag.
-    pub key_package_client_preference: KeyPackageClientPreference,
     /// NIP-32 namespace of the origin label on moderation reports. The
     /// operator's report parser matches it. Reporting refuses a destination
     /// while this is unset.
@@ -66,8 +64,6 @@ mod white_noise {
     ];
     pub(super) const PROFILE_IMAGE_SERVER: &str = "https://blossom.primal.net";
     pub(super) const OPEN_RANKING_SEARCH: &str = "https://ranking.vertexlab.io/search/pubkeys";
-    pub(super) const PREFERRED_CLIENTS: &[&str] = &["whitenoise"];
-    pub(super) const LAST_CLIENTS: &[&str] = &["amethyst"];
     pub(super) const MODERATION_LABEL_NAMESPACE: &str = "chat.whitenoise.report";
     pub(super) const KEYCHAIN_SERVICE: &str = "com.marmot.whitenoise";
 }
@@ -87,7 +83,6 @@ impl MarmotDeployment {
             group_image_endpoint: None,
             profile_image_endpoint: None,
             open_ranking: None,
-            key_package_client_preference: KeyPackageClientPreference::default(),
             moderation_label_namespace: None,
             keychain_service: NEUTRAL_KEYCHAIN_SERVICE_NAME.to_owned(),
         }
@@ -106,10 +101,6 @@ impl MarmotDeployment {
                 search_endpoint: white_noise::OPEN_RANKING_SEARCH.to_owned(),
                 profile_relays: vec![white_noise::VERTEX_RELAY.to_owned()],
             }),
-            key_package_client_preference: KeyPackageClientPreference {
-                preferred: owned(white_noise::PREFERRED_CLIENTS),
-                last: owned(white_noise::LAST_CLIENTS),
-            },
             moderation_label_namespace: Some(white_noise::MODERATION_LABEL_NAMESPACE.to_owned()),
             keychain_service: white_noise::KEYCHAIN_SERVICE.to_owned(),
         }
@@ -133,10 +124,6 @@ impl MarmotDeployment {
                 },
             )
         });
-        self.key_package_client_preference.preferred =
-            normalize_list(self.key_package_client_preference.preferred);
-        self.key_package_client_preference.last =
-            normalize_list(self.key_package_client_preference.last);
         self.moderation_label_namespace = trim_optional(self.moderation_label_namespace);
         self.keychain_service = match self.keychain_service.trim() {
             "" => NEUTRAL_KEYCHAIN_SERVICE_NAME.to_owned(),
@@ -262,11 +249,6 @@ mod tests {
             })
         );
         assert_eq!(
-            deployment.key_package_client_preference.preferred,
-            ["whitenoise"]
-        );
-        assert_eq!(deployment.key_package_client_preference.last, ["amethyst"]);
-        assert_eq!(
             deployment.moderation_label_namespace.as_deref(),
             Some("chat.whitenoise.report")
         );
@@ -283,10 +265,6 @@ mod tests {
         assert_eq!(deployment.group_image_endpoint, None);
         assert_eq!(deployment.profile_image_endpoint, None);
         assert_eq!(deployment.open_ranking, None);
-        assert_eq!(
-            deployment.key_package_client_preference,
-            KeyPackageClientPreference::default()
-        );
         assert_eq!(deployment.moderation_label_namespace, None);
         assert_eq!(deployment.keychain_service, NEUTRAL_KEYCHAIN_SERVICE_NAME);
     }
@@ -320,18 +298,6 @@ mod tests {
             blank_keychain.keychain_service,
             NEUTRAL_KEYCHAIN_SERVICE_NAME
         );
-    }
-
-    #[test]
-    fn key_package_preference_ranks_by_client_tag() {
-        let white_noise = MarmotDeployment::white_noise().key_package_client_preference;
-        assert_eq!(white_noise.rank_for_test(Some("WhiteNoise")), 2);
-        assert_eq!(white_noise.rank_for_test(Some(" amethyst ")), 0);
-        assert_eq!(white_noise.rank_for_test(Some("other")), 1);
-        assert_eq!(white_noise.rank_for_test(None), 1);
-        let neutral = KeyPackageClientPreference::default();
-        assert_eq!(neutral.rank_for_test(Some("whitenoise")), 1);
-        assert_eq!(neutral.rank_for_test(Some("amethyst")), 1);
     }
 
     #[test]

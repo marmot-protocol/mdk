@@ -61,12 +61,16 @@ use std::path::{Path, PathBuf};
 use syn::visit::{self, Visit};
 
 /// The code step 6 moves into `marmot-observability` (#2627, "The shape"): the modules that move
-/// whole, by module path. PRs 3 and 4 add the pieces they split out of `audit_log.rs` (the audit
-/// upload half) and `config.rs` (the exporters' resolved config and the endpoint parsers).
+/// whole, by module path. `audit_upload` is the audit upload half PR 3 split out of
+/// `audit_log.rs`; `export_config` is what PR 4 split out of `config.rs` (the exporters' resolved
+/// config and the endpoint parsers).
 const MOVING_SET: &[&str] = &[
     "app_telemetry",
     "audit_otlp_sender",
+    "audit_upload",
     "collector_host_safety",
+    "export_config",
+    "observer",
     "product_analytics",
     "relay_telemetry_export",
 ];

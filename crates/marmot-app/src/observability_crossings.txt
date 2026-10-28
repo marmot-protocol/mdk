@@ -3,31 +3,6 @@
 # edit by hand. Regenerate with:
 #   MARMOT_APP_REGENERATE_CROSSINGS=1 cargo nextest run -p marmot-app --lib -E 'test(observability_crossings)'
 # <production|test> <file under src/> <crossing>
-production app_telemetry.rs crate::sqlcipher::sqlcipher_migration_probe_counters
-production app_telemetry/runtime.rs crate::AppError
-production audit_log.rs field collector_host_safety::PinnedCollector.url
-production audit_otlp_sender.rs crate::audit_log::audit_upload_host_is_retired
-production audit_otlp_sender.rs crate::config
-production collector_host_safety.rs crate::config::endpoint_host_is_loopback
-production collector_host_safety.rs crate::config::parse_relay_telemetry_endpoint
-production collector_host_safety.rs crate::network_proxy::http_builder
-production product_analytics/mod.rs crate::AppError
-production product_analytics/mod.rs crate::MarmotApp
-production product_analytics/mod.rs crate::MarmotAppRuntime
-production product_analytics/mod.rs crate::MarmotRelayPlane
-production product_analytics/mod.rs crate::config::endpoint_host_is_loopback
-production product_analytics/mod.rs crate::config::parse_relay_telemetry_endpoint
-production product_analytics/mod.rs crate::generate_telemetry_install_id
-production product_analytics/mod.rs field product_analytics::ProductAnalytics.clock
-production product_analytics/mod.rs field product_analytics::ProductAnalytics.consent_lock
-production product_analytics/mod.rs field product_analytics::State.persistence_failed
-production product_analytics/mod.rs field product_analytics::State.registry_revision
-production product_analytics/mod.rs field product_analytics::State.scope
-production product_analytics/mod.rs impl MarmotApp
-production product_analytics/mod.rs storage_sqlite::StoredUsageDiagnosticsSettings
-production relay_telemetry_export.rs crate::config::RelayTelemetryExportConfig
-production relay_telemetry_export.rs crate::config::RelayTelemetryResource
-production runtime/mod.rs field product_analytics::ProductAnalytics.telemetry_rejected
 test app_telemetry.rs crate::AccountCatchUpFailure
 test app_telemetry.rs crate::AppError
 test app_telemetry.rs crate::ClassifiedSyncFailure
@@ -36,16 +11,10 @@ test app_telemetry.rs crate::sqlcipher::sqlcipher_migration_probe_counters
 test app_telemetry.rs marmot_session::AccountError
 test app_telemetry/runtime.rs crate::AppError
 test audit_otlp_sender/tests.rs crate::retired_relay_hosts
+test collector_host_safety.rs crate::network_proxy::http_builder
 test collector_host_safety/proxy_tests.rs crate::network_proxy::nostr_builder
-test product_analytics/mod.rs crate::generate_telemetry_install_id
 test product_analytics/tests.rs crate::AccountCatchUpFailure
 test product_analytics/tests.rs crate::AppError
 test product_analytics/tests.rs crate::MarmotApp
-test product_analytics/tests.rs crate::generate_telemetry_install_id
 test product_analytics/tests.rs rusqlite::Connection
 test relay_telemetry_export.rs crate::MarmotRelayPlane
-test relay_telemetry_export.rs crate::config::RelayTelemetryExportConfig
-test relay_telemetry_export.rs crate::config::RelayTelemetryResource
-test relay_telemetry_export.rs crate::config::RelayTelemetryRuntimeConfig
-test relay_telemetry_export/tests.rs crate::config::RelayTelemetryResource
-test relay_telemetry_export/tests.rs crate::config::RelayTelemetryRuntimeConfig

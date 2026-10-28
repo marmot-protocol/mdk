@@ -16,7 +16,7 @@ use cgka_traits::message::OwnApplicationConvergenceStamp;
 use cgka_traits::peeler::GroupMessageMetadata;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
-use cgka_traits::types::{EpochId, GroupId, MemberId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageOut};
@@ -126,6 +126,20 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::RemoveMembers { group_id, members } => {
                 self.do_send_remove_members(group_id, members).await
             }
+            SendIntent::AddOwnAccountDevices {
+                group_id,
+                key_packages,
+            } => {
+                self.do_send_add_own_account_devices(group_id, key_packages)
+                    .await
+            }
+            SendIntent::RemoveOwnAccountDevices {
+                group_id,
+                leaf_signature_keys,
+            } => {
+                self.do_send_remove_own_account_devices(group_id, leaf_signature_keys)
+                    .await
+            }
             SendIntent::Leave { group_id } => self.do_send_leave(group_id).await,
             SendIntent::SelfUpdate { group_id } => self.do_send_self_update(group_id).await,
             SendIntent::UpdateAppComponents { group_id, updates } => {
@@ -234,14 +248,41 @@ impl<S: StorageProvider> Engine<S> {
             &mut required,
             &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
         );
+        // A device already in the group is skipped rather than added again:
+        // its new leaf would repeat a signature key, and OpenMLS refuses the
+        // whole Commit. So is a second package from one device in this invite.
+        let current_members = crate::group_lifecycle::marmot_members(&mls_group);
+        let mut signature_keys = current_members
+            .iter()
+            .map(|member| member.credential.clone())
+            .collect::<HashSet<_>>();
+        let mut source_kps = Vec::with_capacity(key_packages.len());
         let mut parsed_kps = Vec::with_capacity(key_packages.len() + recovery_sources.len());
-        for kp in &key_packages {
-            parsed_kps.push(self.parse_group_key_package(
-                kp,
-                existing.protocol_profile,
-                &required,
-            )?);
+        for kp in key_packages {
+            let parsed = self.parse_key_package(&kp)?;
+            if !signature_keys.insert(parsed.leaf_node().signature_key().as_slice().to_vec()) {
+                continue;
+            }
+            if kp.protocol_profile != existing.protocol_profile {
+                return Err(EngineError::InvalidAccountIdentityProof(format!(
+                    "cannot invite a {:?} KeyPackage into a {:?} group",
+                    kp.protocol_profile, existing.protocol_profile
+                )));
+            }
+            let had = crate::capabilities::capabilities_of_key_package(&parsed);
+            let missing = required.missing_from(&had);
+            if !missing.is_empty() {
+                return Err(EngineError::MissingRequiredCapabilities {
+                    required: Box::new(required),
+                    had: Box::new(had),
+                });
+            }
+            source_kps.push(kp);
+            parsed_kps.push(parsed);
         }
+        // Recovery deliberately reuses the exact removed device's signer.
+        // Never apply ordinary-invite deduplication to these authenticated
+        // replacements: every grant must be validated and staged in full.
         for recovery in &recovery_sources {
             parsed_kps.push(self.validate_recovery_for_group(
                 &group_id,
@@ -251,14 +292,25 @@ impl<S: StorageProvider> Engine<S> {
                 recovery,
             )?);
         }
+        if parsed_kps.is_empty() {
+            return Err(EngineError::Other(
+                "the invite adds no device: each one is already in the group".into(),
+            ));
+        }
+        let key_packages = source_kps;
 
         let mut resulting_admins = Vec::new();
         let mut granted_admin_ids = Vec::new();
         if !initial_admins.is_empty() {
-            let invitee_ids = parsed_kps
-                .iter()
-                .map(|kp| crate::identity::validated_member_id_of_leaf(kp.leaf_node()))
-                .collect::<Result<Vec<_>, _>>()?;
+            // An account that already has a device here is a member, and
+            // granting it admin is a separate action.
+            let mut invitee_ids = Vec::with_capacity(parsed_kps.len());
+            for kp in &parsed_kps {
+                let id = crate::identity::validated_member_id_of_leaf(kp.leaf_node())?;
+                if !current_members.iter().any(|member| member.id == id) {
+                    invitee_ids.push(id);
+                }
+            }
             let current_admins = crate::app_components::admins_of_group(&mls_group)?;
             resulting_admins = current_admins.clone();
             let mut seen_grants = HashSet::new();
@@ -358,6 +410,12 @@ impl<S: StorageProvider> Engine<S> {
         let staged_commit = mls_group
             .pending_commit()
             .ok_or_else(|| EngineError::Backend("invite produced no pending commit".into()))?;
+        crate::commit_class::authorize_own_staged_commit(
+            &mls_group,
+            &group_id,
+            self.identity.self_id(),
+            staged_commit,
+        )?;
         crate::app_components::validate_current_profile_invariants_for_staged_commit(
             &mls_group,
             staged_commit,
@@ -417,56 +475,31 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
         )?;
 
-        let mut welcomes = Vec::with_capacity(parsed_kps.len());
-        let welcome_relays = crate::group_lifecycle::welcome_relays_for_group(&mls_group)?;
-        for (source_kp, parsed_kp) in key_packages
-            .iter()
-            .chain(
-                recovery_sources
-                    .iter()
-                    .map(|recovery| &recovery.key_package),
-            )
-            .zip(parsed_kps.iter())
-        {
-            let recipient = {
-                let bc = BasicCredential::try_from(parsed_kp.leaf_node().credential().clone())
-                    .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
-                MemberId::new(bc.identity().to_vec())
-            };
-            let payload = EncryptedPayload {
-                ciphertext: welcome_bytes.clone(),
-                aad: vec![],
-            };
-            let wrapped = if let Some(metadata) =
-                crate::group_lifecycle::welcome_metadata_for_key_package(
-                    source_kp,
-                    welcome_relays.as_deref(),
-                )? {
-                self.peeler
-                    .wrap_welcome_with_metadata(&payload, &recipient, &metadata)
-                    .await
-            } else {
-                self.peeler.wrap_welcome(&payload, &recipient).await
-            }
-            .map_err(EngineError::Peeler)?;
-            self.record_staged_invite_welcome(
-                &wrapped,
-                &commit_msg.id,
+        let welcomes = self
+            .wrap_staged_welcomes(
+                &mls_group,
                 &group_id,
+                &commit_msg.id,
                 pre_commit_epoch,
-            )?;
-            welcomes.push(wrapped);
-        }
+                &welcome_bytes,
+                &key_packages,
+                &recovery_sources,
+                &parsed_kps,
+            )
+            .await?;
 
-        // Cache invitees' capabilities NOW so `feature_status` reflects the
-        // pending invite immediately. Update the Marmot record with the
-        // projected post-merge member list — `members()` and
-        // `feature_status` walk this list, and users expect the API to
+        // Update the Marmot record with the projected post-merge member
+        // list — `members()` walks this list (and `feature_status` counts the
+        // pending commit's added leaves), and users expect the API to
         // reflect "what I just asked for" while the publish is pending.
         // Epoch stays at the pre-merge value; that updates on confirm.
         // On `publish_failed`, the engine re-derives from the (still-
         // unmerged) MLS state, which naturally drops the projection.
-        crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
+        crate::capability_manager::check_key_package_profiles(
+            &self.storage,
+            &group_id,
+            &parsed_kps,
+        )?;
         let mut group_record = existing;
         if !recovery_sources.is_empty() {
             // Unlike an Add-only invite, the old target leaf must disappear
@@ -557,6 +590,58 @@ impl<S: StorageProvider> Engine<S> {
             welcomes,
             pending: pending_ref,
         })
+    }
+
+    /// Wrap a staged Commit's Welcome once per added KeyPackage, addressed to
+    /// that KeyPackage's account and naming its publication, and record each
+    /// as staged delivery work of `commit_id`. Invites and same-account Adds
+    /// deliver their Welcomes this way (joining.md, "Delivery").
+    /// Parsed packages follow ordinary packages, then recovery packages.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn wrap_staged_welcomes(
+        &mut self,
+        mls_group: &MlsGroup,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+        source_epoch: EpochId,
+        welcome_bytes: &[u8],
+        key_packages: &[cgka_traits::engine::KeyPackage],
+        recovery_sources: &[cgka_traits::group_recovery::GroupMemberRecovery],
+        parsed_kps: &[openmls::prelude::KeyPackage],
+    ) -> Result<Vec<TransportMessage>, EngineError> {
+        let mut welcomes = Vec::with_capacity(parsed_kps.len());
+        let welcome_relays = crate::group_lifecycle::welcome_relays_for_group(mls_group)?;
+        for (index, parsed_kp) in parsed_kps.iter().enumerate() {
+            let source_kp = if index < key_packages.len() {
+                &key_packages[index]
+            } else {
+                &recovery_sources[index - key_packages.len()].key_package
+            };
+            let recipient = {
+                let bc = BasicCredential::try_from(parsed_kp.leaf_node().credential().clone())
+                    .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
+                MemberId::new(bc.identity().to_vec())
+            };
+            let payload = EncryptedPayload {
+                ciphertext: welcome_bytes.to_vec(),
+                aad: vec![],
+            };
+            let wrapped = if let Some(metadata) =
+                crate::group_lifecycle::welcome_metadata_for_key_package(
+                    source_kp,
+                    welcome_relays.as_deref(),
+                )? {
+                self.peeler
+                    .wrap_welcome_with_metadata(&payload, &recipient, &metadata)
+                    .await
+            } else {
+                self.peeler.wrap_welcome(&payload, &recipient).await
+            }
+            .map_err(EngineError::Peeler)?;
+            self.record_staged_invite_welcome(&wrapped, commit_id, group_id, source_epoch)?;
+            welcomes.push(wrapped);
+        }
+        Ok(welcomes)
     }
 
     async fn do_send_remove_members(
@@ -702,6 +787,12 @@ impl<S: StorageProvider> Engine<S> {
         let staged_commit = mls_group
             .pending_commit()
             .ok_or_else(|| EngineError::Backend("remove produced no pending commit".into()))?;
+        crate::commit_class::authorize_own_staged_commit(
+            &mls_group,
+            &group_id,
+            self.identity.self_id(),
+            staged_commit,
+        )?;
         crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
             &mls_group,
             &group_id,
@@ -934,11 +1025,7 @@ impl<S: StorageProvider> Engine<S> {
             }
             Err(e) => return Err(EngineError::Storage(e)),
         };
-        if !group
-            .members
-            .iter()
-            .any(|member| &member.id == self.identity.self_id())
-        {
+        if !crate::identity::local_copy_is_member(&group, self.identity.self_id()) {
             self.clear_leave_request_state(group_id)?;
             return Ok(false);
         }

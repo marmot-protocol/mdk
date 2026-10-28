@@ -747,18 +747,24 @@ impl<S: StorageProvider> Engine<S> {
             && pass.fairness_slot_available
         {
             // The one-attempt reservation (convergence.md, marmot#375) is
-            // scoped to admin-authorized group-state intents. Only such an
-            // intent may hold the boundary open; queued application messages
-            // must never park pass admission — over-broad parking here is the
-            // settling regression fixed by the convergence remediation plan.
+            // scoped to intents that need admin or same-account authority
+            // (mdk#2628 D6). Only such an intent may hold the boundary open;
+            // queued application messages must never park pass admission —
+            // over-broad parking here is the settling regression fixed by the
+            // convergence remediation plan.
             let queued = self
                 .storage
                 .list_queued_outbound_intents(group_id)
                 .map_err(storage_projection_error)?;
-            if queued
-                .iter()
-                .any(|record| crate::message_processor::is_admin_group_state_intent(&record.intent))
-            {
+            let account_devices_required = self
+                .fair_scheduling_requires_account_devices(group_id, &queued)
+                .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?;
+            if queued.iter().any(|record| {
+                crate::message_processor::is_fair_scheduled_intent(
+                    &record.intent,
+                    account_devices_required,
+                )
+            }) {
                 return Ok((Some(pass.clone()), false));
             }
             let mut consumed = pass.clone();

@@ -646,6 +646,20 @@ fn snapshot_send_intents() {
             members: vec![mem_id()],
         }
     );
+    insta::assert_json_snapshot!(
+        "intent_add_own_account_devices",
+        SendIntent::AddOwnAccountDevices {
+            group_id: gid(),
+            key_packages: vec![KeyPackage::new(vec![0xEF; 4])],
+        }
+    );
+    insta::assert_json_snapshot!(
+        "intent_remove_own_account_devices",
+        SendIntent::RemoveOwnAccountDevices {
+            group_id: gid(),
+            leaf_signature_keys: vec![vec![0x5C; 4]],
+        }
+    );
     insta::assert_json_snapshot!("intent_leave", SendIntent::Leave { group_id: gid() });
     insta::assert_json_snapshot!(
         "intent_update_group_data",

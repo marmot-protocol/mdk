@@ -7,6 +7,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- `marmot_deployment_set_key_package_client_preference` is removed
+  (mdk#2628): the KeyPackage `client` tag no longer ranks invite candidates.
+  Drop the call and use matching regenerated headers and libraries.
+
 ### Added
 
 - Append `MARMOT_STATUS_GROUP_RECOVERY_UNSETTLED` (110) and
@@ -24,6 +30,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- Creating a group or inviting adds every device of each recipient account
+  (mdk#2628, mdk#1696): every valid, compatible KeyPackage published in the
+  last 30 days, at most 20, or the single best one when none is that recent.
+- Group member rows are accounts, not devices (mdk#2628).
+  `MarmotAppGroupMemberRecord` and `MarmotGroupMemberDetails` gain
+  `device_count`, and an account with several devices in the group is one
+  row; `member_count`, admin counts and `is_last_admin` count accounts. Use
+  matching regenerated headers and libraries.
 - `marmot_attachment_transfer_subscription_next` returns a replacement that
   changes a row's transfer state as soon as the engine reports it; progress-only
   replacements still arrive at most four per second. A timeout no longer loses

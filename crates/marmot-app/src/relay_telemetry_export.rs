@@ -33,7 +33,7 @@ use transport_nostr_adapter::{DurationHistogramSnapshot, RelayIndex, RelayLabelR
 use crate::app_telemetry::{
     AppPerformanceOperationSnapshot, AppPerformanceSnapshot, SyncFailureClassification,
 };
-use crate::config::RelayTelemetryExportConfig;
+use crate::export_config::RelayTelemetryExportConfig;
 use transport_nostr::{EngineReorgMetrics, MarmotRelayPlane, RelayTelemetryRollup};
 
 #[cfg(feature = "otlp-export")]
@@ -2000,7 +2000,7 @@ mod otlp {
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use prost::Message;
 
-    use crate::config::RelayTelemetryResource;
+    use crate::export_config::RelayTelemetryResource;
 
     use super::host_safety::{self, REQUEST_TIMEOUT};
     use super::{ExportMetricValue, RelayExportError, RelayTelemetryExportBatch};
@@ -2252,7 +2252,7 @@ mod otlp {
     mod tests {
         use super::*;
         use crate::app_telemetry::{SyncErrorClass, SyncFailureClassification, SyncFailureStage};
-        use crate::config::RelayTelemetryResource;
+        use crate::export_config::RelayTelemetryResource;
         use crate::relay_telemetry_export::{
             ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayTelemetryExportBatch,
             metric_names,
@@ -2310,7 +2310,7 @@ mod otlp {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn relay_telemetry_host_safety_incomplete_config_never_resolves_or_sends() {
-            use crate::config::RelayTelemetryExportConfig;
+            use crate::export_config::RelayTelemetryExportConfig;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let complete = RelayTelemetryExportConfig {
                 enabled: true,
@@ -2506,7 +2506,7 @@ mod otlp {
         async fn account_publish_counters_round_trip_as_unlabeled_cumulative_sums() {
             use std::time::UNIX_EPOCH;
 
-            use crate::config::{RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig};
+            use crate::export_config::{RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig};
             use transport_nostr::test_support::{AccountPublishFixture, PublishScript};
 
             let fixture = AccountPublishFixture::activate().await;

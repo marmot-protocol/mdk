@@ -173,7 +173,9 @@ requires acknowledgements from its operational relays.
 
 **Publication.** KeyPackage publication keeps a stable replaceable `d` tag per account and tracks the decoded
 KeyPackage ref separately. Normal publish reuses only a cached current-profile last-resort package; explicit rotate, a
-legacy cache entry, or a lifetime-policy rejection creates a new current-profile package under the same slot.
+legacy cache entry, or a lifetime-policy rejection creates a new current-profile package under the same slot. The
+session runtime refreshes the slot at least weekly, after a consumed Welcome and when supported capabilities change;
+see [marmot-session](../marmot-session/README.md#this-devices-keypackage-slot).
 
 **Inventory.** `account_key_package_records` / `account_key_packages` expose one current relay event per addressable
 slot in the validated fetch window. `account_key_package_relay_events` returns that window's current and superseded
@@ -286,6 +288,13 @@ targets.
 **Welcomes.** Incoming welcomes are joined automatically at the MLS/session layer, then projected as pending local
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a
 leave, clears the pending flag, and archives the local projection so normal chat lists hide it.
+
+**Members are accounts.** An account with several devices holds one MLS leaf per device in a group. Every member
+projection groups leaves by account: member records, rosters, member-id pages and conversation snapshots list each
+account once with its `device_count`, and `member_count`, admin counts and direct-chat detection count accounts. A chat
+between two accounts stays direct, and takes its title and avatar from the other account, whatever devices either
+person uses. Membership rows follow the engine's account-level changes: a second device joining, or one of several
+leaving, makes no row; an account's first device joining or last device leaving does.
 
 **Committed group activity.** Commands and maintenance retain native cleanup and commit activity before subscription
 work can suspend. Manual and scheduled convergence retain subscriber deltas through route refresh, checkpoints,

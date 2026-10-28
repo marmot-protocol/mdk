@@ -186,12 +186,11 @@ mod tests {
         TestGroupState, gid, mid, sample_group, sample_message, sample_queued_intent,
     };
     use crate::{SqliteAccountStorage, TransportReconciliationItem, TransportReconciliationRoute};
-    use cgka_traits::capabilities::GroupCapabilities;
     use cgka_traits::engine::GroupEvent;
     use cgka_traits::group::ProtocolProfile;
     use cgka_traits::storage::{
-        CapabilityStorage, ConvergencePolicyStorage, GroupStorage, MessageStorage,
-        OutboundIntentStorage, StorageError, StorageProvider, TransportGroupRoute,
+        ConvergencePolicyStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
+        StorageError, StorageProvider, TransportGroupRoute,
     };
     use cgka_traits::types::{EpochId, MemberId};
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
@@ -493,9 +492,6 @@ mod tests {
         store
             .put_queued_outbound_intent(&sample_queued_intent(mid(2), group.id.clone()))
             .unwrap();
-        store
-            .save_member_capabilities(&group.id, &group.members[0], GroupCapabilities::default())
-            .unwrap();
         store.put_convergence_policy(&group.id, b"policy").unwrap();
         store.create_group_snapshot(&group.id, "anchor").unwrap();
 
@@ -505,12 +501,6 @@ mod tests {
         assert_eq!(
             store.list_queued_outbound_intents(&group.id).unwrap().len(),
             1
-        );
-        assert!(
-            store
-                .member_capabilities(&group.id, &group.members[0].id)
-                .unwrap()
-                .is_some()
         );
         assert!(store.convergence_policy(&group.id).unwrap().is_some());
         assert_eq!(
@@ -529,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn group_delete_cascades_messages_queued_caps_policy_and_openmls_group_state() {
+    fn group_delete_cascades_messages_queued_policy_and_openmls_group_state() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 0, 1);
         store.put_group(&group).unwrap();
@@ -550,9 +540,6 @@ mod tests {
             .unwrap();
         store
             .put_queued_outbound_intent(&sample_queued_intent(mid(2), group.id.clone()))
-            .unwrap();
-        store
-            .save_member_capabilities(&group.id, &group.members[0], GroupCapabilities::default())
             .unwrap();
         store.put_convergence_policy(&group.id, b"policy").unwrap();
         let mls_group_id = openmls::group::GroupId::from_slice(group.id.as_slice());
@@ -575,12 +562,6 @@ mod tests {
                 .list_queued_outbound_intents(&group.id)
                 .unwrap()
                 .is_empty()
-        );
-        assert!(
-            store
-                .member_capabilities(&group.id, &group.members[0].id)
-                .unwrap()
-                .is_none()
         );
         assert!(store.convergence_policy(&group.id).unwrap().is_none());
         let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();

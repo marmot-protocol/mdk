@@ -5,7 +5,7 @@ use crate::app_telemetry::{
     AppPerformanceOperationSnapshot, AppPerformanceSnapshot, SyncErrorClass,
     SyncFailureClassification, SyncFailureCount, SyncFailureStage,
 };
-use crate::config::{RelayTelemetryResource, RelayTelemetryRuntimeConfig};
+use crate::export_config::{RelayTelemetryResource, RelayTelemetryRuntimeConfig};
 use transport_nostr::{EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup};
 
 use super::*;
