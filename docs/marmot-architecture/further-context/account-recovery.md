@@ -95,9 +95,11 @@ The simulator comes first; Jeff validates on a phone.
      the cutoff cancelled, or one gone stale, is a local deadline cut too: it counts
      nothing toward a native goal's budget, though pacing still backs off.
    - As a safety net, an obligation also parks after 24 reserved attempts in a row without
-     progress (mdk#2660), whatever its streaks say. Progress on any of its own scopes (a
-     native goal's newly admitted source counts), or the obligation completing or being
-     retired, starts the count over. A native goal's re-arm for a new
+     progress (mdk#2660), whatever its streaks say. Progress on any of its own scopes, or
+     the obligation completing or being retired, starts the count over. A re-arm makes a
+     native goal prove its sources' admission again, so only having more of its sources
+     admitted at once than it ever has counts as its progress; that bounds the restarts by
+     its number of sources. A native goal's re-arm for a new
      wire generation, a process open and a route-policy change keep both the count and a
      goal this cap parked; new loss or epoch evidence gets it one more attempt. Hitting the
      cap is logged as its own `park_capped_recovery` warning.

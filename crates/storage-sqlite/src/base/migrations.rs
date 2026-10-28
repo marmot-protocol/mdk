@@ -1705,6 +1705,7 @@ mod tests {
                         rusqlite::types::Value::Null,
                         rusqlite::types::Value::Null,
                         rusqlite::types::Value::Integer(0),
+                        rusqlite::types::Value::Integer(0),
                     ]);
                 }
             }
@@ -1732,7 +1733,7 @@ mod tests {
                 .iter()
                 .cloned()
                 .map(|mut row| {
-                    row.extend([Null, Null, Integer(0)]);
+                    row.extend([Null, Null, Integer(0), Integer(0)]);
                     row
                 })
                 .collect::<Vec<_>>()
@@ -1985,8 +1986,11 @@ mod tests {
                 .map(|mut row| {
                     row.extend(std::iter::repeat_n(rusqlite::types::Value::Null, added));
                     if *table == "account_recovery_obligations" {
-                        // No existing row has counted an attempt.
-                        row.push(rusqlite::types::Value::Integer(0));
+                        // No existing row has counted an attempt or an admission.
+                        row.extend([
+                            rusqlite::types::Value::Integer(0),
+                            rusqlite::types::Value::Integer(0),
+                        ]);
                     }
                     row
                 })

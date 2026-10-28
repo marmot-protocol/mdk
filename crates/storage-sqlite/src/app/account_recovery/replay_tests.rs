@@ -1102,46 +1102,111 @@ fn native_reopen_keeps_floor() {
     reopened.close().unwrap();
 }
 
-/// A newly admitted native scope is the goal's own progress, so it restarts
-/// the attempt count: a goal admitting its sources over many attempts does not
-/// park at the cap. Seeing an admitted scope again is not new progress.
+/// Re-arm the native goal for a new wire generation, install its `sources`
+/// again and admit the first `admitted` of them, as a reconnect would.
+fn rearm_and_admit(
+    app: &SqliteAppStorage,
+    generation: u8,
+    sources: u64,
+    admitted: usize,
+) -> RecoveryDemandTicket {
+    let ticket = native(app, generation);
+    let plans = (0..sources)
+        .map(|id| scope(id, 0, 10 + id, PeerAdmission::Granted))
+        .collect::<Vec<_>>();
+    let (fence, tokens) = prepare(app, ticket, &plans);
+    if admitted > 0 {
+        let checkpoints = tokens[..admitted].iter().map(admission).collect::<Vec<_>>();
+        assert!(
+            !app.checkpoint_replay_admission(
+                &fence,
+                ticket,
+                RecoveryReplayPlacement::Placed,
+                &checkpoints
+            )
+            .unwrap()
+        );
+    }
+    ticket
+}
+
+fn eligibility(app: &SqliteAppStorage, ticket: RecoveryDemandTicket) -> RecoveryEligibility {
+    app.recovery_obligation_status(ticket.id)
+        .unwrap()
+        .unwrap()
+        .eligibility
+}
+
+/// One source admitted and one the cutoff always cuts: re-proving the
+/// admitted one after every re-arm is not progress, so the goal parks at the
+/// cap and a re-arm keeps it parked (mdk#2660).
 #[test]
-fn native_admission_restarts_attempt_count() {
+fn native_cap_parks_one_admitted_one_cut() {
     let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    let ticket = native(&app, 1);
-    let (fence, tokens) = prepare(
-        &app,
-        ticket,
-        &[
-            scope(41, 0, 10, PeerAdmission::Granted),
-            scope(77, 3, 20, PeerAdmission::Granted),
-        ],
-    );
-    for _ in 1..RECOVERY_PARK_AFTER_ATTEMPTS {
-        app.count_recovery_attempt(ticket.id).unwrap();
+    let mut ticket = rearm_and_admit(&app, 1, 2, 1);
+    for attempt in 1..=RECOVERY_PARK_AFTER_ATTEMPTS {
+        assert_eq!(app.count_recovery_attempt(ticket.id).unwrap(), attempt);
+        ticket = rearm_and_admit(&app, attempt as u8 + 1, 2, 1);
     }
     assert!(
-        !app.checkpoint_replay_admission(
-            &fence,
-            ticket,
-            RecoveryReplayPlacement::Placed,
-            &[admission(&tokens[0])]
-        )
-        .unwrap()
+        app.park_capped_recovery_obligation(ticket.id, ticket.revision)
+            .unwrap()
     );
-    assert_eq!(app.count_recovery_attempt(ticket.id).unwrap(), 1);
-    assert!(
-        !app.checkpoint_replay_admission(
-            &fence,
-            ticket,
-            RecoveryReplayPlacement::Placed,
-            &[admission(&tokens[0])]
-        )
-        .unwrap()
-    );
+    let ticket = native(&app, 30);
     assert_eq!(
-        app.count_recovery_attempt(ticket.id).unwrap(),
-        2,
-        "an admitted scope seen again is not new progress"
+        eligibility(&app, ticket),
+        RecoveryEligibility::NeedsDeepRepair
+    );
+}
+
+/// A goal that has one more source admitted on every attempt is progressing,
+/// even across re-arms that make it prove the earlier ones again.
+#[test]
+fn native_cap_spares_a_goal_admitting_more_each_attempt() {
+    let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let sources = RECOVERY_PARK_AFTER_ATTEMPTS + 6;
+    let mut ticket = rearm_and_admit(&app, 1, sources, 0);
+    for admitted in 1..sources as usize {
+        assert_eq!(app.count_recovery_attempt(ticket.id).unwrap(), 1);
+        ticket = rearm_and_admit(&app, admitted as u8 + 1, sources, admitted);
+    }
+    assert!(
+        !app.park_capped_recovery_obligation(ticket.id, ticket.revision)
+            .unwrap()
+    );
+    assert_ne!(
+        eligibility(&app, ticket),
+        RecoveryEligibility::NeedsDeepRepair
+    );
+}
+
+/// Once the cap parks a goal, re-admitting the sources it had stays parked
+/// across re-arms; only more admitted sources than ever reopens it.
+#[test]
+fn native_cap_park_survives_readmission() {
+    let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let mut ticket = rearm_and_admit(&app, 1, 3, 1);
+    for attempt in 1..=RECOVERY_PARK_AFTER_ATTEMPTS {
+        app.count_recovery_attempt(ticket.id).unwrap();
+        ticket = rearm_and_admit(&app, attempt as u8 + 1, 3, 1);
+    }
+    assert!(
+        app.park_capped_recovery_obligation(ticket.id, ticket.revision)
+            .unwrap()
+    );
+    for generation in 30..33 {
+        let ticket = rearm_and_admit(&app, generation, 3, 1);
+        assert_eq!(
+            eligibility(&app, ticket),
+            RecoveryEligibility::NeedsDeepRepair,
+            "re-admission alone does not reopen a capped goal"
+        );
+    }
+    rearm_and_admit(&app, 33, 3, 2);
+    let ticket = native(&app, 34);
+    assert_eq!(
+        eligibility(&app, ticket),
+        RecoveryEligibility::Ready,
+        "a new high is progress"
     );
 }

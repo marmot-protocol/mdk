@@ -331,6 +331,27 @@ pub(super) fn retained_predicate_qualifies(
     scopes_qualify_where(conn, id, predicate, |_| true)
 }
 
+/// How many of an obligation's current scopes hold a replay admission.
+fn admitted_scopes(conn: &Connection, obligation_id: &[u8]) -> StorageResult<u64> {
+    let rows = conn
+        .prepare_cached(
+            "SELECT scope_format, scope_payload FROM account_recovery_scopes
+                 WHERE obligation_id = ?1 AND snapshot_state = 1",
+        )
+        .storage()?
+        .query_map([obligation_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    let mut admitted = 0;
+    for (format, bytes) in rows {
+        admitted += u64::from(decode_scope(format, &bytes)?.replay_admitted);
+    }
+    Ok(admitted)
+}
+
 fn scopes_qualify_where(
     conn: &Connection,
     obligation_id: &[u8],
@@ -1009,7 +1030,6 @@ impl SqliteAppStorage {
             }
             let mut seen = std::collections::BTreeSet::new();
             let mut updates = Vec::with_capacity(checkpoints.len());
-            let mut admitted = false;
             for checkpoint in checkpoints {
                 let token = &checkpoint.token;
                 if token.obligation_id != ticket.id || !seen.insert(token.scope_id) {
@@ -1034,7 +1054,6 @@ impl SqliteAppStorage {
                     return Ok(false);
                 }
                 validate_checkpoints(&payload, &checkpoint.endpoints)?;
-                admitted |= checkpoint.replay_admitted && !payload.replay_admitted;
                 payload.replay_admitted |= checkpoint.replay_admitted;
                 updates.push((token.scope_id, encode_scope(&payload)?));
             }
@@ -1046,12 +1065,14 @@ impl SqliteAppStorage {
                     params![ticket.id.as_slice(), sqlite_integer(scope_id)?, payload],
                 ).storage()?;
             }
-            // A newly admitted scope is the native goal's own progress.
-            if admitted {
+            // A native goal progresses only by having more of its sources
+            // admitted at once than ever before. A re-arm makes it prove the
+            // ones it had again, which is not progress (mdk#2660).
+            if checkpoints.iter().any(|checkpoint| checkpoint.replay_admitted) {
                 conn.execute_cached(
-                    "UPDATE account_recovery_obligations SET recovery_attempts=0
-                     WHERE id=?1 AND recovery_attempts!=0",
-                    [ticket.id.as_slice()],
+                    "UPDATE account_recovery_obligations SET recovery_attempts=0,recovery_admitted_high=?2
+                     WHERE id=?1 AND recovery_admitted_high<?2",
+                    params![ticket.id.as_slice(), sqlite_integer(admitted_scopes(&conn, &ticket.id)?)?],
                 ).storage()?;
             }
             let qualified = placement == RecoveryReplayPlacement::Placed
