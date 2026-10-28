@@ -583,7 +583,7 @@ its next attempt time. Each quantum's outcome is one transaction:
 | Outcome | Unit | Relay | Account budget |
 | --- | --- | --- | --- |
 | Advanced | Active, budget and backoff reset, park dropped | Streak and cooldown reset | Charged |
-| Nothing owed | Reset, unless broken without a probe | — | Refunded |
+| Nothing owed | Re-armed as for Advanced, except that a broken unit without a probe is unchanged and a retired unit stays retired with its backoff reset | — | Refunded |
 | Answered, no progress | Backoff doubles from its base; the budget's last breaks it and parks its debt. A failed probe re-parks under the same revision | Streak and cooldown reset | Charged |
 | Unreachable | Retries after the unreachable delay | Streak +1; cools down after the threshold, each cooldown in a spell doubling | Charged |
 | Rate-limited | — | Cools down | Charged |
@@ -596,8 +596,9 @@ retired span reopens that part whatever the unit's state: an active unit owes it
 debt, a broken one adds it to its park with one probe, and a retired one parks it under a new
 revision with one probe. A failed probe re-parks under the same revision and keeps every parked
 second the relay still does not cover. A relay added
-to a route, a known caps read that differs from what a broken unit was planned with, and
-explicit repair re-arm fully; an unknown caps read is never evidence. Dismissing a route's
+to a route and a known caps read that differs from what a broken unit was planned with re-arm
+it and drop its park; explicit repair re-arms every unit and drops retired spans too, so they
+are owed again. An unknown caps read is never evidence. Dismissing a route's
 notice checks its newest park revision and retires its broken units' parked spans, which are
 never coverage; the units then serve anything else they owe with a fresh budget. Any
 coverage write on a unit's relay trims its parked and retired spans; once

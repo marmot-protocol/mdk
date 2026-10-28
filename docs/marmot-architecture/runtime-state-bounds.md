@@ -297,7 +297,7 @@ loss-generation watermark exception.
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | `account_recovery_units` | One row per (route, relay) the runner has served, like the coverage ledger's rows | Re-armed in place; never grows per attempt |
-| `account_recovery_unit_spans` | Parked spans are the unit's debt at its last park, so no more ranges than its coverage gaps; retired spans add only dismissed debt. Both kinds stay inside the route's goal window, so retention bounds them as it bounds goals | Coverage trims what it proves; re-arm and explicit repair drop both kinds; dismissal turns parked into retired; the retention prune drops both kinds below its floor |
+| `account_recovery_unit_spans` | Parked spans are the unit's debt at its last park, so no more ranges than its coverage gaps; retired spans add only dismissed debt. Both kinds stay inside the route's goal window, so retention bounds them as it bounds goals | Coverage trims what it proves; a re-arm drops parked spans and explicit repair drops both kinds; dismissal turns parked into retired; the retention prune drops both kinds below its floor |
 | `account_recovery_relays` | One row per relay the runner has served | Updated in place |
 | `account_recovery_budget` | At most 61 per-minute rows | Rows older than the rolling hour are deleted on every charge and read |
 | `account_recovery_staged` | Nothing writes it yet; its writer must bound it per group and per account with `staged_recovery_usage` before each fetch | A row leaves once its event is seen, or when it no longer decodes |
