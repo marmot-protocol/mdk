@@ -692,7 +692,10 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   under its existing retry policy and process credit. Captures and delivery draining
   survive notification-worker cancellation; owner cancellation retains credit through IO
   cleanup. Empty expiry creates no loss. Actual discarded ciphertext and real notification
-  gaps retain separate loss evidence. See design section 0 for the limited native predicate.
+  gaps retain separate loss evidence. A capture cut by its comparison deadline, or failed,
+  discards its own pages without new loss: they re-fetch a window the pending obligation
+  still owes, and a new loss would wipe that obligation's scope certificates so it could
+  never finish. See design section 0 for the limited native predicate.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
   startup comparison. Routing is by content, so the router cannot tell an unfloored
