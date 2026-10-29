@@ -50,6 +50,7 @@ pub mod convergence;
 pub mod convergence_clock;
 pub(crate) mod convergence_input;
 mod deadline;
+pub mod device_tag;
 pub mod disband;
 pub mod distributed_convergence;
 pub mod engine;

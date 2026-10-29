@@ -209,6 +209,13 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     fact, not a protocol rule, mdk#2628 D33), which lets a first link's Confirm name the creator's key before the
     group exists.
 
+- **File:** `account_devices/device_tag.rs` (test-policy builds only)
+  - **Owns:** `marmot.member.device-tag.v1` (0x800f, mdk#2628 item 3.1d) through the engine: a member leaf whose tag
+    verifies under a roster device's key reads as that device, against the current tree only; a tag that doesn't
+    open never invalidates a Commit; another account's leaf is unclaimed; a Commit, standalone proposal or Welcome
+    that requires 0x800f is rejected; a GroupContext entry under it is unknown data the engine never writes. The tag
+    crypto and the spec vector are unit-tested in `src/device_tag.rs`.
+
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and
     `RemoveOwnAccountDevices`: the committer's Commit is classified same-account, stamped `ordinary`, carries its

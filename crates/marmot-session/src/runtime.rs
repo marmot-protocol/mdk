@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cgka_traits::AppComponentId;
+use cgka_traits::app_components::{DeviceRosterV1, DeviceTagClaim};
 use cgka_traits::engine::{
     CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage, SendIntent,
     SupersededIntentReport,
@@ -694,6 +695,22 @@ where
 
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> AccountResult<Vec<[u8; 32]>> {
         Ok(self.session.admin_pubkeys(group_id)?)
+    }
+
+    /// Which roster slot the leaf at `leaf_index` belongs to, read from its
+    /// device tag against the device group's current `roster`. `None` when
+    /// `epoch` is not the group's current epoch or no leaf sits at that
+    /// index. See [`cgka_engine::engine::Engine::member_device_tag_claim`].
+    pub fn member_device_tag_claim(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> AccountResult<Option<DeviceTagClaim>> {
+        Ok(self
+            .session
+            .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
     }
 
     pub fn app_component(

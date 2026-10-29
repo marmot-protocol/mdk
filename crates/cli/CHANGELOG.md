@@ -35,6 +35,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   at random. Until the component's spec is adopted, only test-policy builds may advertise it. A release build can't
   create or join a device group, and it treats roster bytes in other groups as unknown data, so nothing ships the
   format.
+- The engine reads device tags (`marmot.member.device-tag.v1`, 0x800f; mdk#2628 item 3.1d), which say which of an
+  account's devices holds a leaf. A tag names the device's roster slot, is signed with that device's tag signature key
+  and is sealed under the roster's tag key, so only the account's devices can read it. Read against the roster, a leaf
+  belongs to a device, to a removed slot, or to no one. A tag that doesn't decode, open or verify reads as no tag and
+  never makes anything invalid. `AccountDeviceRuntime::member_device_tag_claim` reads a member's leaf in the group's
+  current epoch. No group may require 0x800f: a Commit, standalone proposal or Welcome that would is rejected. A
+  GroupContext entry under it is unknown data, which MDK accepts but never writes. No device tags its leaves yet, and
+  the engine refuses to advertise 0x800f.
 - `marmot-app` keeps an account's device group (mdk#2628 item 3.1). A confirmed device link creates it under the
   group id the link chose, and the founding Add takes this account's own device only through the exact confirmed
   KeyPackage. The device that created the group trusts it, and so does a device that joined through the Welcome a

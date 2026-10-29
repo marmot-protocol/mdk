@@ -14,7 +14,9 @@ use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
 use async_trait::async_trait;
 use cgka_traits::OutboundFanout;
-use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
+use cgka_traits::app_components::{
+    AppComponentId, AppComponentSet, DeviceRosterV1, DeviceTagClaim, default_group_components,
+};
 use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
     AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason,
@@ -3431,6 +3433,43 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<R, EngineError> {
         self.ensure_group_live(group_id)?;
         self.with_mls_group(group_id, f)
+    }
+
+    /// Which roster slot the leaf at `leaf_index` belongs to, read from its
+    /// device tag against `roster`, the device group's current roster
+    /// (device-tag-v1.md, "Reading tags").
+    ///
+    /// `None` when `epoch` is not the group's current epoch or no leaf sits
+    /// at that index, so a caller holding an older event never reads a leaf
+    /// that has since changed hands. A leaf of another account reads as
+    /// unclaimed: tags are read only on the reader's own account's leaves.
+    pub fn member_device_tag_claim(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> Result<Option<DeviceTagClaim>, EngineError> {
+        self.with_live_mls_group(group_id, |mls_group| {
+            if mls_group.epoch().as_u64() != epoch.0 {
+                return Ok(None);
+            }
+            let Some(leaf) = mls_group
+                .public_group()
+                .leaf(openmls::prelude::LeafNodeIndex::new(leaf_index))
+            else {
+                return Ok(None);
+            };
+            let own_account = openmls::prelude::BasicCredential::try_from(
+                leaf.credential().clone(),
+            )
+            .is_ok_and(|credential| credential.identity() == self.identity.self_id().as_slice());
+            Ok(Some(if own_account {
+                crate::device_tag::device_tag_claim(leaf, roster)
+            } else {
+                DeviceTagClaim::Unclaimed
+            }))
+        })
     }
 
     /// Return the current Marmot admin policy keys mirrored from signed MLS

@@ -67,6 +67,7 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `app_components.rs` | `app_data_dictionary` helpers, LeafNode/group `app_components` bytes, group profile and admin-policy bytes, the resulting-state check every send path and replay call (`validate_current_profile_invariants_for_staged_commit`, including the account-devices and device-roster rules) and its join-time twin (`validate_joined_group_invariants`), the Welcome author check, standalone proposal admission, and `resolved_app_data_update` / `apply_app_data_updates`, the one place every send, inbound and replay path turns an AppDataUpdate into resulting GroupContext bytes (whole replacement, except the device roster's diff) |
 | `commit_class.rs` | The one Commit classifier (self-update, SelfRemove-only, same-account, admin-required) read from the parent state. Replay, every send path's own check (`authorize_own_staged_commit`) and the publish stamp call it; the class decides both whether an admin must commit and the branch priority (`privileged` exactly for admin-required). Same-account exists only while the parent requires 0x800d. In a device group, `authorize_own_staged_commit` also holds every own Commit that adds a leaf to the link shape: one Add, by value, whose roster entry the same Commit sets for a new slot, announcing it |
 | `account_identity_proof.rs` | Legacy LeafNode identity-proof extension + current app-data component; strict profile classification (mixed rejected) |
+| `device_tag.rs` | Device tags (0x800f, mdk#2628 3.1d): `seal_device_tag` and `device_tag_claim`, which reads a leaf's tag against the device group's roster as a device, a removed slot or unclaimed, never an error; `Engine::member_device_tag_claim` reads a member leaf of the current tree. No group may require 0x800f, and a GroupContext entry under it is unknown data the engine never writes (`NEVER_REQUIRED_APP_COMPONENTS` in `app_components.rs`) |
 | `app_payload.rs` | `validate_app_payload_for_sender`: `MarmotAppEvent` sender validation |
 | `group_context_view.rs` | `GroupContext` snapshot view; `exporter_secret(label, length)` returns `None` rather than truncating |
 | `snapshot_guard.rs` | `SnapshotRollbackGuard` (roll back + release on `Drop`) and `RewindSite`, the closed set of guard sites that `openmls_projection::recover_interrupted_rewind_guard` classifies at open |
@@ -119,7 +120,8 @@ Load-bearing departures from the original plan; each is also documented at its s
    require a component only when asked and never add account-devices (0x800d). Creation requires account-devices,
    unasked, exactly when the creator's leaf and every founding KeyPackage advertise it (`group_lifecycle.rs`). The
    device roster (0x800e, mdk#2628 3.1) is advertisable only in `test-policy-overrides` builds until its spec is
-   adopted (`DEVICE_ROSTER_ADVERTISABLE`), so no release build creates or joins a device group.
+   adopted (`DEVICE_ROSTER_ADVERTISABLE`), so no release build creates or joins a device group. The device tag
+   (0x800f) is not advertisable at all until the engine puts tags in its own leaves.
 
 ## Publish-before-apply
 
