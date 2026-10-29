@@ -463,9 +463,6 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// publishes them (mdk#2628 3.4). The host sets it; `None` publishes as
     /// a device with no device group does.
     key_package_announcement_group: Option<GroupId>,
-    /// The newest publication found in this device's slot that it did not
-    /// make. Until one of its own is newer, maintenance replaces it.
-    foreign_slot_publication_at: Option<Timestamp>,
     maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
     /// Monotonic time each group's own-leaf currency was last read from the
@@ -540,7 +537,6 @@ where
             maintenance_paused: false,
             key_package_slot_withdrawn: false,
             key_package_announcement_group: None,
-            foreign_slot_publication_at: None,
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
             component_migration_checked_at: HashMap::new(),
@@ -956,22 +952,13 @@ where
         &self,
         lifecycle: &KeyPackageLifecycleState,
     ) -> Option<&'static str> {
-        current_key_package_republish_blocker(lifecycle, self.wall_clock.now())
-            .or_else(|| {
-                lifecycle
-                    .current_key_package
-                    .as_ref()
-                    .is_some_and(|current| !self.advertises_current_capabilities(current))
-                    .then_some("advertised_capabilities_changed")
-            })
-            .or_else(|| {
-                // Relays keep the newest publication in a slot, so a foreign
-                // one newer than the current event needs a newer one.
-                lifecycle
-                    .authored_event_created_at
-                    .is_some_and(|created_at| self.foreign_slot_publication_outranks(created_at))
-                    .then_some("foreign_slot_publication")
-            })
+        current_key_package_republish_blocker(lifecycle, self.wall_clock.now()).or_else(|| {
+            lifecycle
+                .current_key_package
+                .as_ref()
+                .is_some_and(|current| !self.advertises_current_capabilities(current))
+                .then_some("advertised_capabilities_changed")
+        })
     }
 
     /// Re-send the exact current durable authored KeyPackage event to the
@@ -1217,12 +1204,10 @@ where
                 .is_none_or(|pending| {
                     pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
                         || withdrawn_with_slot(&lifecycle, pending.authored_created_at)
-                        || self.foreign_slot_publication_outranks(pending.authored_created_at)
                 })
         {
-            // Newer than every publication in the slot, a foreign one
-            // included, and than its withdrawal: relays drop anything up to
-            // that.
+            // Newer than every publication in the slot, and than its
+            // withdrawal: relays drop anything up to that.
             let created_at = Timestamp(
                 lifecycle
                     .authored_event_created_at
@@ -1234,7 +1219,6 @@ where
                             .map(|pending| pending.authored_created_at),
                     )
                     .chain(lifecycle.slot_withdrawn_at)
-                    .chain(self.foreign_slot_publication_at)
                     .max()
                     .map(|previous| previous.0.saturating_add(1))
                     .unwrap_or(now.0)
@@ -1506,9 +1490,6 @@ where
         lifecycle.last_consumed_at = replacement.consumed_at;
         self.session
             .promote_key_package_lifecycle(&retired, &lifecycle)?;
-        if let Some(published_at) = lifecycle.authored_event_created_at {
-            self.note_slot_publication(published_at);
-        }
         Ok(replacement.key_package)
     }
 
@@ -1551,7 +1532,6 @@ where
                 Some(pending) => {
                     pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
                         || withdrawn_with_slot(&lifecycle, pending.authored_created_at)
-                        || self.foreign_slot_publication_outranks(pending.authored_created_at)
                         || pending.signed_event.is_none()
                         || pending
                             .targets
@@ -1570,8 +1550,7 @@ where
     /// other than a Welcome consuming it: there is none, its weekly refresh
     /// is due, the generator policy changed, the capabilities this client
     /// supports changed (`foundation/key-packages.md`, "Refreshing a slot"),
-    /// the slot was withdrawn at sign-out, or the slot holds a newer
-    /// publication this device did not make.
+    /// or the slot was withdrawn at sign-out.
     fn current_key_package_replacement_due(
         &self,
         lifecycle: &KeyPackageLifecycleState,
@@ -1582,9 +1561,6 @@ where
         };
         key_package_refresh_due(lifecycle, now)
             || lifecycle.slot_withdrawn_at.is_some()
-            || lifecycle
-                .authored_event_created_at
-                .is_some_and(|created_at| self.foreign_slot_publication_outranks(created_at))
             || !lifecycle.upgrade_rotation_recorded
             || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
             || !self.advertises_current_capabilities(current)
@@ -1743,16 +1719,13 @@ where
         let Some(key_package) = lifecycle.current_key_package.clone() else {
             return Ok(());
         };
-        // An outranked event is replaced, not resent; an unannounced one
-        // waits for maintenance to announce it.
-        if self.foreign_slot_publication_outranks(artifact.created_at)
-            || !self.key_package_announced(
-                lifecycle
-                    .current_key_package_ref
-                    .as_deref()
-                    .unwrap_or_default(),
-            )?
-        {
+        // An unannounced event waits for maintenance to announce it.
+        if !self.key_package_announced(
+            lifecycle
+                .current_key_package_ref
+                .as_deref()
+                .unwrap_or_default(),
+        )? {
             return Ok(());
         }
         lifecycle.phase = cgka_traits::MaintenancePhase::Fanout;

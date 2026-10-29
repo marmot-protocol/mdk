@@ -16,7 +16,7 @@ use cgka_traits::app_components::{
     DeviceRosterUpdateV1, DeviceSlotId, decode_device_roster_v1, encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
-use cgka_traits::{FanoutMlsState, GroupId, Timestamp, TransportAdapter};
+use cgka_traits::{FanoutMlsState, GroupId, TransportAdapter};
 
 use super::{AccountDeviceEffects, AccountDeviceRuntime, TRACE_TARGET};
 use crate::error::{AccountError, AccountResult};
@@ -54,36 +54,6 @@ where
     /// The device group this device announces its KeyPackages in.
     pub fn key_package_announcement_group(&self) -> Option<&GroupId> {
         self.key_package_announcement_group.as_ref()
-    }
-
-    /// Note that this device's slot holds a publication it did not make, at
-    /// `created_at`. The next KeyPackage it publishes there is newer, so it
-    /// replaces that one, and maintenance publishes it as soon as it can.
-    pub fn supersede_foreign_slot_publication(&mut self, created_at: Timestamp) {
-        tracing::warn!(
-            target: TRACE_TARGET,
-            method = "supersede_foreign_slot_publication",
-            "this device's key package slot holds a publication it did not make; replacing it"
-        );
-        self.foreign_slot_publication_at = Some(
-            self.foreign_slot_publication_at
-                .map_or(created_at, |earlier| earlier.max(created_at)),
-        );
-    }
-
-    /// Whether a publication this device makes at `created_at` still leaves
-    /// a foreign publication newer than its own in the slot.
-    pub(super) fn foreign_slot_publication_outranks(&self, created_at: Timestamp) -> bool {
-        self.foreign_slot_publication_at
-            .is_some_and(|foreign| created_at <= foreign)
-    }
-
-    /// A publication at `created_at` reached a relay: once it is newer than
-    /// the foreign one, that one no longer needs replacing.
-    pub(super) fn note_slot_publication(&mut self, created_at: Timestamp) {
-        if !self.foreign_slot_publication_outranks(created_at) {
-            self.foreign_slot_publication_at = None;
-        }
     }
 
     /// Whether `key_package_ref` may reach this device's slot: no device

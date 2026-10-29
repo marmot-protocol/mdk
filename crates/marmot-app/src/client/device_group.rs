@@ -13,8 +13,7 @@
 //!   exact `KeyPackageRef` a confirmed link names (D14, D21).
 //! - While this device trusts one, it names each KeyPackage in its own roster
 //!   entry before that KeyPackage reaches its slot (3.4). The runtime holds
-//!   publication until the roster does; this module tells it which group, and
-//!   checks this device's slot for a publication it did not make.
+//!   publication until the roster does; this module tells it which group.
 //!
 //! - The host reads the roster only as [`LinkedDevice`]s, this account's own
 //!   devices, from the device group this device trusts. The group's own events
@@ -590,85 +589,6 @@ impl AppClient {
         Ok(())
     }
 
-    /// [`Self::check_own_key_package_slot`] at open and then daily, while
-    /// device groups are on and maintenance runs. A failed read is retried
-    /// within the hour.
-    pub(crate) async fn check_own_key_package_slot_when_due(&mut self) {
-        let now = std::time::Instant::now();
-        if !self.app.device_groups_enabled()
-            || self.runtime.maintenance_is_paused()
-            || self
-                .own_key_package_slot_check_due
-                .is_some_and(|due| now < due)
-        {
-            return;
-        }
-        let next = match self.check_own_key_package_slot().await {
-            Ok(()) => OWN_KEY_PACKAGE_SLOT_CHECK_INTERVAL,
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::client::device_group",
-                    method = "check_own_key_package_slot",
-                    error_kind = error.privacy_safe_kind(),
-                    "could not read this device's key package slot; retrying later"
-                );
-                OWN_KEY_PACKAGE_SLOT_CHECK_RETRY
-            }
-        };
-        self.own_key_package_slot_check_due = Some(now + next);
-    }
-
-    /// Read this device's KeyPackage slot from the relays. When the newest
-    /// publication there is one this device did not make, and at least as
-    /// new as its own, tell the runtime, which replaces it with a newer one,
-    /// announced first like any other.
-    pub(crate) async fn check_own_key_package_slot(&mut self) -> Result<(), AppError> {
-        let Some(lifecycle) = self.runtime.key_package_maintenance_status()? else {
-            return Ok(());
-        };
-        if lifecycle.stable_slot_id.is_empty() {
-            return Ok(());
-        }
-        // The slot is read on its own, and its publications judged by their
-        // signed events alone: a busy account must not page the slot out, and
-        // a publication that is no valid KeyPackage still occupies the slot.
-        let records = self
-            .app
-            .fetch_account_key_package_slot_events(&self.state.label, &lifecycle.stable_slot_id)
-            .await?;
-        let own_events: Vec<String> = lifecycle
-            .authored_event_id
-            .iter()
-            .chain(
-                lifecycle
-                    .pending_replacement
-                    .iter()
-                    .filter_map(|pending| pending.signed_event.as_ref())
-                    .map(|artifact| &artifact.id),
-            )
-            .chain(
-                lifecycle
-                    .retained_private_material
-                    .iter()
-                    .filter_map(|material| material.authored_event_id.as_ref()),
-            )
-            .map(|event_id| hex::encode(event_id.as_slice()))
-            .collect();
-        let own_created_at = lifecycle.authored_event_created_at.map_or(0, |at| at.0);
-        let foreign = records
-            .iter()
-            .map(|record| &record.event)
-            .filter(|event| !own_events.contains(&event.id))
-            .map(|event| event.created_at)
-            .filter(|created_at| *created_at >= own_created_at)
-            .max();
-        if let Some(created_at) = foreign {
-            self.runtime
-                .supersede_foreign_slot_publication(cgka_traits::Timestamp(created_at));
-        }
-        Ok(())
-    }
-
     /// This account's device group, if this device trusts one.
     pub(crate) fn trusted_device_group(&self) -> Result<Option<GroupId>, AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
@@ -782,13 +702,6 @@ fn linked_device(
         keep_while_inactive: entry.settings.keep_while_inactive,
     }
 }
-
-/// How often a device reads its own KeyPackage slot for a publication it did
-/// not make, and how soon it tries again after a failed read.
-const OWN_KEY_PACKAGE_SLOT_CHECK_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(24 * 60 * 60);
-const OWN_KEY_PACKAGE_SLOT_CHECK_RETRY: std::time::Duration =
-    std::time::Duration::from_secs(60 * 60);
 
 fn requires_roster(group: &Group) -> bool {
     group

@@ -1420,128 +1420,15 @@ async fn a_key_package_waits_for_its_announcement() {
     );
 }
 
-/// A KeyPackage in this device's slot that it did not publish, newer than
-/// its own, is replaced by a newer one of its own, announced first.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_foreign_key_package_in_its_own_slot_is_replaced() {
-    let (
-        Devices {
-            _dirs,
-            relay,
-            phone_app,
-            mut laptop,
-            ..
-        },
-        group,
-    ) = linked_devices().await;
-    // Someone holding the account key puts the phone's KeyPackage in the
-    // laptop's slot, newer than the laptop's own.
-    let laptop_slot = own_slot(&laptop);
-    let laptop_published_at = laptop
-        .key_package_maintenance_status()
-        .unwrap()
-        .unwrap()
-        .authored_event_created_at
-        .unwrap()
-        .0;
-    let forged_at = laptop_published_at + 2;
-    publish_as_alice(&relay, &phone_app, &laptop_slot, forged_at, None);
-
-    let before = relay.published_events.lock().unwrap().len();
-    laptop.run_due_maintenance().await.unwrap();
-    let lifecycle = laptop.key_package_maintenance_status().unwrap().unwrap();
-    assert!(lifecycle.authored_event_created_at.unwrap().0 > forged_at);
-    assert_eq!(announced(&laptop, &group, &laptop), current_ref(&laptop));
-    assert_eq!(
-        published_kinds(&relay, before),
-        vec![transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE, 30443]
-    );
-
-    // Its own publication, once newer, is never mistaken for a foreign one.
-    let before = relay.published_events.lock().unwrap().len();
-    laptop.check_own_key_package_slot().await.unwrap();
-    laptop.run_due_maintenance().await.unwrap();
-    assert!(published_kinds(&relay, before).is_empty());
-}
-
-/// The slot check reads the device's own slot, not a page of the account's
-/// KeyPackages, and counts any signed publication there, valid or not.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_malformed_publication_in_its_own_slot_is_replaced_however_busy_the_account() {
-    let (
-        Devices {
-            _dirs,
-            relay,
-            phone_app,
-            mut laptop,
-            ..
-        },
-        group,
-    ) = linked_devices().await;
-    // A relay pages the account's KeyPackages, newest first. Someone holding
-    // the account key fills the laptop's slot with something that is no
-    // KeyPackage, then publishes more than a page of KeyPackages elsewhere.
-    relay.apply_query_limits();
-    let laptop_slot = own_slot(&laptop);
-    let laptop_published_at = laptop
-        .key_package_maintenance_status()
-        .unwrap()
-        .unwrap()
-        .authored_event_created_at
-        .unwrap()
-        .0;
-    let forged_at = laptop_published_at + 2;
-    publish_as_alice(
-        &relay,
-        &phone_app,
-        &laptop_slot,
-        forged_at,
-        Some("not a key package".to_owned()),
-    );
-    for slot in 0..13u8 {
-        publish_as_alice(
-            &relay,
-            &phone_app,
-            &hex::encode([slot; 32]),
-            forged_at + 1,
-            None,
-        );
-    }
-    // A read of the account's KeyPackages no longer reaches the laptop's
-    // slot, not even its own valid publication there.
-    assert!(
-        !laptop
-            .app
-            .fetch_validated_account_key_packages("alice", Vec::new(), "test")
-            .await
-            .unwrap()
-            .iter()
-            .any(|fetched| fetched.key_package_id == laptop_slot)
-    );
-
-    laptop.check_own_key_package_slot().await.unwrap();
-    let before = relay.published_events.lock().unwrap().len();
-    laptop.run_due_maintenance().await.unwrap();
-    let lifecycle = laptop.key_package_maintenance_status().unwrap().unwrap();
-    assert!(lifecycle.authored_event_created_at.unwrap().0 > forged_at);
-    assert_eq!(announced(&laptop, &group, &laptop), current_ref(&laptop));
-    assert_eq!(
-        published_kinds(&relay, before),
-        vec![transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE, 30443]
-    );
-}
-
 /// A host publication that must send a fresh KeyPackage announces that one,
-/// not the current one, and sends it in the same call: on the laptop because
-/// the device group's Welcome consumed its KeyPackage, on the phone because a
-/// newer foreign publication holds its slot.
+/// not the current one, and sends it in the same call: here because the
+/// device group's Welcome consumed the laptop's KeyPackage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_republish_that_needs_a_fresh_key_package_announces_that_one() {
     let (
         Devices {
             _dirs,
             relay,
-            phone_app,
             mut phone,
             mut laptop,
             ..
@@ -1550,20 +1437,7 @@ async fn a_republish_that_needs_a_fresh_key_package_announces_that_one() {
     ) = linked_devices().await;
     assert!(laptop.runtime.key_package_republish_falls_back().unwrap());
     assert_fresh_publication_is_announced(&mut laptop, &relay, &group, 0).await;
-
     assert!(!phone.runtime.key_package_republish_falls_back().unwrap());
-    let forged_at = phone
-        .key_package_maintenance_status()
-        .unwrap()
-        .unwrap()
-        .authored_event_created_at
-        .unwrap()
-        .0
-        + 2;
-    publish_as_alice(&relay, &phone_app, &own_slot(&phone), forged_at, None);
-    phone.check_own_key_package_slot().await.unwrap();
-    assert!(phone.runtime.key_package_republish_falls_back().unwrap());
-    assert_fresh_publication_is_announced(&mut phone, &relay, &group, forged_at).await;
 }
 
 /// One host `publish_key_package` call commits the announcement of a fresh
@@ -1627,48 +1501,4 @@ async fn an_unreadable_device_group_refuses_publication() {
     let before = relay.published_events.lock().unwrap().len();
     assert!(phone.publish_key_package().await.is_err());
     assert!(published_kinds(&relay, before).is_empty());
-}
-
-/// Sign a copy of one of the phone's KeyPackage publications into `slot` at
-/// `created_at` with Alice's key, optionally with other content, and put it on
-/// the relay as if it had been published there.
-fn publish_as_alice(
-    relay: &ScriptedPushRelayClient,
-    phone_app: &MarmotApp,
-    slot: &str,
-    created_at: u64,
-    content: Option<String>,
-) {
-    let account = phone_app.account_home().account("alice").unwrap();
-    let mut template = relay
-        .published_events
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|event| {
-            event.kind == 30443
-                && event.pubkey == account.account_id_hex
-                && event.tags.iter().any(|tag| tag[0] == "d" && tag[1] != slot)
-        })
-        .unwrap()
-        .clone();
-    template.tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = slot.to_owned();
-    let signed = EventBuilder::new(
-        Kind::from(template.kind as u16),
-        content.unwrap_or(template.content),
-    )
-    .tags(
-        template
-            .tags
-            .into_iter()
-            .map(|tag| Tag::parse(tag).unwrap()),
-    )
-    .custom_created_at(NostrTimestamp::from_secs(created_at))
-    .finalize(&phone_app.account_home().load_signing_keys("alice").unwrap())
-    .unwrap();
-    relay
-        .published_events
-        .lock()
-        .unwrap()
-        .push(NostrTransportEvent::from_nostr_event(&signed).unwrap());
 }

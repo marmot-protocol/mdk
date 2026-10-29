@@ -44,9 +44,6 @@ use transport_nostr::DirectorySyncPlan;
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
 pub(crate) const USER_DIRECTORY_SEARCH_MAX_VISITED: usize = 8192;
-/// Publications read from one KeyPackage slot per relay
-/// ([`Directory::fetch_key_package_slot_events_for_account_id`]).
-const KEY_PACKAGE_SLOT_READ_PAGE: usize = 4;
 pub const USER_DIRECTORY_SEARCH_MAX_FRONTIER: usize = 4096;
 
 impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
@@ -850,31 +847,6 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             )
             .await
             .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key packages: {e}")))
-    }
-
-    /// The account's publications in one of its KeyPackage slots, newest
-    /// first per relay. Relays keep one event per slot, so a short page holds
-    /// the newest even from a relay that keeps older ones too.
-    pub async fn fetch_key_package_slot_events_for_account_id(
-        &self,
-        account_id_hex: &str,
-        slot: &str,
-        source_relays: &[TransportEndpoint],
-    ) -> Result<Vec<RelayEventRecord>, DirectoryError> {
-        let public_key =
-            PublicKey::parse(account_id_hex).map_err(|_| DirectoryError::InvalidPublicKey)?;
-        let source_relays = self.directory_source_relays(source_relays);
-        self.relay_plane
-            .fetch_directory_events(
-                source_relays,
-                vec![DirectoryEventQuery::key_package_slot(
-                    &public_key.to_hex(),
-                    slot.to_owned(),
-                    KEY_PACKAGE_SLOT_READ_PAGE,
-                )],
-            )
-            .await
-            .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key package slot: {e}")))
     }
 
     pub(crate) async fn fetch_follow_list_for_account_id(

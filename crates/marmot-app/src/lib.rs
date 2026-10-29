@@ -2106,7 +2106,6 @@ impl MarmotApp {
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
             unpublished_welcome_delivery: None,
-            own_key_package_slot_check_due: None,
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
             pending_recovery_arm_writes: HashMap::new(),
@@ -5548,54 +5547,6 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
         method: &'static str,
     ) -> Result<Vec<nostr_directory::FetchedKeyPackage>, AppError> {
-        let (account_id_hex, source_relays) = self
-            .account_key_package_source_relays(label, bootstrap_relays)
-            .await?;
-        let mut relay_records = self
-            .directory()
-            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
-            .await?;
-        sort_directory_records(&mut relay_records);
-        let mut packages = Vec::new();
-        for record in relay_records {
-            match key_package_from_record(record) {
-                Ok(fetched) => packages.push(fetched),
-                Err(err) => {
-                    tracing::warn!(
-                        target: "marmot_app::key_packages",
-                        method = method,
-                        error_kind = err.privacy_safe_kind(),
-                        "skipping invalid key package event while listing account packages"
-                    );
-                }
-            }
-        }
-        Ok(packages)
-    }
-
-    /// The signed publications in one of the account's KeyPackage slots, read
-    /// from the relays its KeyPackages are listed from. They are not checked
-    /// as KeyPackages: a publication that is not one still occupies the slot.
-    pub(crate) async fn fetch_account_key_package_slot_events(
-        &self,
-        label: &str,
-        slot: &str,
-    ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, AppError> {
-        let (account_id_hex, source_relays) = self
-            .account_key_package_source_relays(label, Vec::new())
-            .await?;
-        Ok(self
-            .directory()
-            .fetch_key_package_slot_events_for_account_id(&account_id_hex, slot, &source_relays)
-            .await?)
-    }
-
-    /// The account id and the relays its KeyPackages are listed from.
-    async fn account_key_package_source_relays(
-        &self,
-        label: &str,
-        bootstrap_relays: Vec<TransportEndpoint>,
-    ) -> Result<(String, Vec<TransportEndpoint>), AppError> {
         let account = self.account_home().account(label)?;
         let account_id_hex = account.account_id_hex;
 
@@ -5644,7 +5595,27 @@ impl MarmotApp {
                 MissingRelayListKind::Nip65,
             ]));
         }
-        Ok((account_id_hex, source_relays))
+
+        let mut relay_records = self
+            .directory()
+            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
+            .await?;
+        sort_directory_records(&mut relay_records);
+        let mut packages = Vec::new();
+        for record in relay_records {
+            match key_package_from_record(record) {
+                Ok(fetched) => packages.push(fetched),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = method,
+                        error_kind = err.privacy_safe_kind(),
+                        "skipping invalid key package event while listing account packages"
+                    );
+                }
+            }
+        }
+        Ok(packages)
     }
 
     pub async fn account_key_package_records(

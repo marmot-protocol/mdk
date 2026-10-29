@@ -556,7 +556,6 @@ pub(crate) struct ScriptedPushRelayClient {
     unavailable_endpoints: std::sync::Mutex<Vec<String>>,
     fail_publish_kind: std::sync::Mutex<Option<u64>>,
     accept_first_endpoint_only: std::sync::atomic::AtomicBool,
-    apply_query_limits: std::sync::atomic::AtomicBool,
     accepted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
@@ -1007,13 +1006,6 @@ impl ScriptedPushRelayClient {
         self.fail_publish_kind.lock().unwrap().take();
     }
 
-    /// Answer each directory query like a relay: its newest `limit` events.
-    #[cfg(feature = "test-policy-overrides")]
-    pub(crate) fn apply_query_limits(&self) {
-        self.apply_query_limits
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
     /// Model one-ack quorum cancellation: multi-endpoint publishes report only
     /// their first endpoint, and the others neither accept nor fail.
     pub(crate) fn accept_first_endpoint_only(&self) {
@@ -1119,32 +1111,12 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
         &self,
         request: transport_nostr::DirectoryFetchRequest,
     ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, String> {
-        let published = self.published_events.lock().unwrap();
-        let mut events = published
+        Ok(self
+            .published_events
+            .lock()
+            .unwrap()
             .iter()
             .filter(|event| request.queries.iter().any(|query| query.matches(event)))
-            .collect::<Vec<_>>();
-        if self
-            .apply_query_limits
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            let mut newest = published.iter().collect::<Vec<_>>();
-            newest.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
-            let pages = request
-                .queries
-                .iter()
-                .flat_map(|query| {
-                    newest
-                        .iter()
-                        .filter(|event| query.matches(event))
-                        .take(query.limit)
-                        .map(|event| &event.id)
-                })
-                .collect::<std::collections::HashSet<_>>();
-            events.retain(|event| pages.contains(&event.id));
-        }
-        Ok(events
-            .into_iter()
             .cloned()
             .map(|event| transport_nostr::DirectoryRelayEventRecord {
                 endpoints: request.endpoints.clone(),

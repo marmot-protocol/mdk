@@ -951,10 +951,6 @@ pub struct AppClient {
     /// Canonical create/invite work whose Welcome fanout has not run yet.
     /// The managed account worker replies first, then drives this delivery.
     pub(crate) unpublished_welcome_delivery: Option<UnpublishedWelcomeDelivery>,
-    /// When maintenance next reads this device's own KeyPackage slot for a
-    /// publication it did not make (mdk#2628 3.4). `None` reads it on the
-    /// first pass after open.
-    pub(crate) own_key_package_slot_check_due: Option<std::time::Instant>,
     /// Per-group detector for the epoch-gap backfill (commit-loss recovery): it
     /// counts the distinct undecryptable messages a group accumulates at a
     /// stalled epoch. Ephemeral session state, like the pending sets above.
@@ -1424,7 +1420,6 @@ impl AppClient {
         );
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
-        self.check_own_key_package_slot_when_due().await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
         let mut activity = self.runtime.take_maintenance_activity();
         activity.absorb(previous);

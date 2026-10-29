@@ -251,15 +251,6 @@ impl DirectoryEventQuery {
         query
     }
 
-    /// One author's publications in one KeyPackage slot, the `d` value of
-    /// kind `30443`. Unlike a read of the author's whole account, a busy
-    /// account cannot page the slot out.
-    pub fn key_package_slot(author: &str, slot: String, limit: usize) -> Self {
-        let mut query = Self::new(KIND_MARMOT_KEY_PACKAGE, vec![author.to_owned()], limit);
-        query.reference = Some(('d', slot));
-        query
-    }
-
     fn validate_reference(&self) -> Result<(), String> {
         let Some((name, value)) = &self.reference else {
             return if self.since.is_none() {
@@ -268,13 +259,6 @@ impl DirectoryEventQuery {
                 Err("invalid directory since constraint".into())
             };
         };
-        if self.kind == KIND_MARMOT_KEY_PACKAGE && *name == 'd' {
-            return if self.authors.len() == 1 && self.since.is_none() && !value.is_empty() {
-                Ok(())
-            } else {
-                Err("invalid key package slot query".into())
-            };
-        }
         if self.kind == 5
             && *name == 'k'
             && self.since.is_none()
@@ -1883,38 +1867,6 @@ mod tests {
                 Some(1),
             ),
         ] {
-            assert!(DirectoryFetchRequest::new(endpoint.clone(), vec![invalid]).is_err());
-        }
-    }
-
-    #[test]
-    fn key_package_slot_query_matches_only_its_author_and_slot() {
-        use nostr_sdk::prelude::{EventBuilder, Keys, Tag};
-        let (alice, bob) = (Keys::generate(), Keys::generate());
-        let author = alice.public_key().to_hex();
-        let slot = "ab".repeat(32);
-        let query = DirectoryEventQuery::key_package_slot(&author, slot.clone(), 4);
-        let endpoint = vec![TransportEndpoint("wss://relay.example".into())];
-        assert!(DirectoryFetchRequest::new(endpoint.clone(), vec![query.clone()]).is_ok());
-        let publication = |keys: &Keys, kind: u16, slot: &str| {
-            EventBuilder::new(Kind::from(kind), "")
-                .tags([Tag::custom("d", [slot])])
-                .finalize(keys)
-                .unwrap()
-        };
-        assert!(validated_directory_event(&publication(&alice, 30443, &slot), &query).is_some());
-        let other_slot = "cd".repeat(32);
-        assert!(
-            validated_directory_event(&publication(&alice, 30443, &other_slot), &query).is_none()
-        );
-        assert!(validated_directory_event(&publication(&bob, 30443, &slot), &query).is_none());
-        assert!(validated_directory_event(&publication(&alice, 1, &slot), &query).is_none());
-        let mut two_authors = query.clone();
-        two_authors.authors.push(bob.public_key().to_hex());
-        let mut bounded = query.clone();
-        bounded.since = Some(1);
-        let empty = DirectoryEventQuery::key_package_slot(&author, String::new(), 4);
-        for invalid in [two_authors, bounded, empty] {
             assert!(DirectoryFetchRequest::new(endpoint.clone(), vec![invalid]).is_err());
         }
     }

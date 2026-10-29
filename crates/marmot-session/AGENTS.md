@@ -30,7 +30,7 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   `PublishFailure`, `PendingResolution`), durable maintenance, and KeyPackage generator upgrades.
   - `runtime/slot_announcement.rs` — the slot-announcement gate (mdk#2628 3.4): while the host names a device group,
     no KeyPackage reaches this device's slot until this device's own roster entry there names it. Maintenance
-    announces first. A foreign publication the host finds in the slot is replaced by a newer one.
+    announces first.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.
