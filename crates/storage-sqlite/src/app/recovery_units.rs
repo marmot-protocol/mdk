@@ -1236,6 +1236,69 @@ impl SqliteAppStorage {
         })
     }
 
+    /// Apply one re-check quantum's outcome to the relay and the account, in
+    /// one transaction. A re-check reads covered and retired ranges, which
+    /// the unit does not owe, so it never touches the unit's retry state: its
+    /// backoff, budget, break and park stay as its debt left them. The pass's
+    /// own progress is [`Self::record_recovery_recheck`]'s.
+    pub fn settle_recovery_recheck(
+        &self,
+        route: &TransportReconciliationRoute,
+        relay: &str,
+        outcome: RecoveryUnitOutcome,
+        policy: &RecoveryUnitPolicy,
+        now_seconds: u64,
+    ) -> StorageResult<()> {
+        use RecoveryUnitOutcome as Outcome;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            ensure_unit_tx(&conn, route, relay)?;
+            ensure_relay_tx(&conn, relay)?;
+            let (kind, id) = route.storage_key();
+            let attempt_minute: Option<i64> = conn
+                .query_row_cached(
+                    "SELECT attempt_minute FROM account_recovery_units
+                     WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3",
+                    params![kind, id, relay],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            conn.execute_cached(
+                "UPDATE account_recovery_units SET attempt_minute = NULL
+                 WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3",
+                params![kind, id, relay],
+            )
+            .storage()?;
+            if let (Some(minute), Outcome::NothingOwed | Outcome::Unanswered | Outcome::LocalFailure) =
+                (attempt_minute, outcome)
+            {
+                budget_add_tx(&conn, i64_to_u64(minute)?, -1, 0)?;
+            }
+            match outcome {
+                Outcome::Advanced | Outcome::NoProgress => relay_answered_tx(&conn, relay)?,
+                Outcome::Unreachable => {
+                    let streak: i64 = conn
+                        .query_row_cached(
+                            "UPDATE account_recovery_relays SET unreachable_streak = unreachable_streak + 1
+                             WHERE relay = ?1 RETURNING unreachable_streak",
+                            [relay],
+                            |row| row.get(0),
+                        )
+                        .storage()?;
+                    if count(streak)? >= policy.cooldown_after_unreachable {
+                        relay_cool_down_tx(&conn, relay, policy, now_seconds)?;
+                    }
+                }
+                Outcome::RateLimited => relay_cool_down_tx(&conn, relay, policy, now_seconds)?,
+                Outcome::NothingOwed
+                | Outcome::Refused
+                | Outcome::Unanswered
+                | Outcome::LocalFailure => {}
+            }
+            Ok(())
+        })
+    }
+
     /// Re-arm one unit fully: a relay was added to its route. A unit that is
     /// not broken is left as it is. Returns whether it was broken.
     pub fn rearm_recovery_unit(
@@ -1480,7 +1543,8 @@ impl SqliteAppStorage {
 
     /// Make the route's re-checks due now, from `from_seconds` when given (an
     /// epoch gap's bound) and from the window floor otherwise. `relay` limits
-    /// it to one relay's unit.
+    /// it to one relay's unit. A pass already due or running keeps whatever
+    /// it would check below `from_seconds`.
     pub fn make_recovery_recheck_due(
         &self,
         route: &TransportReconciliationRoute,
@@ -1490,7 +1554,11 @@ impl SqliteAppStorage {
         let (kind, id) = route.storage_key();
         self.lock()?
             .execute_cached(
-                "UPDATE account_recovery_units SET recheck_position_seconds = ?4,
+                "UPDATE account_recovery_units SET recheck_position_seconds = CASE
+                  WHEN ?4 IS NULL THEN NULL
+                  WHEN recheck_position_seconds IS NOT NULL THEN MIN(recheck_position_seconds, ?4)
+                  WHEN recheck_completed_at_seconds IS NOT NULL THEN ?4
+                  ELSE NULL END,
                  recheck_completed_at_seconds = NULL
                  WHERE route_kind = ?1 AND route_id = ?2 AND (?3 IS NULL OR relay = ?3)",
                 params![kind, id, relay, from_seconds.map(integer).transpose()?],

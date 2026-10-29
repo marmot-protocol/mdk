@@ -289,8 +289,9 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   outcome in one transaction with policy values the caller passes; a unit's debt is the route goal minus that relay's
   coverage, its retired spans and, unless it holds a probe, its parked spans. Parked and retired spans are never
   coverage. `stage_recovery_slice` writes a proven slice's unseen events and its coverage, through the subtracting
-  write, in one transaction, so a crash before settlement refetches nothing; staged rows leave once seen. Nothing
-  schedules on this state yet.
+  write, in one transaction, so a crash before settlement refetches nothing; staged rows leave once seen. A re-check
+  settles through `settle_recovery_recheck`, which charges its relay and the account budget but never touches the
+  unit's retry state. Nothing schedules on this state yet.
 
 ## Tests and benchmarks
 

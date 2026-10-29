@@ -1275,3 +1275,130 @@ fn a_granted_probe_does_not_wait_out_an_old_backoff() {
         assert_eq!(probing.next_attempt_at_seconds, 0);
     }
 }
+
+fn settle_recheck(
+    app: &SqliteAppStorage,
+    route: &TransportReconciliationRoute,
+    relay: &str,
+    outcome: RecoveryUnitOutcome,
+    now: u64,
+) {
+    app.begin_recovery_unit_attempt(route, relay, None, now)
+        .unwrap();
+    app.settle_recovery_recheck(route, relay, outcome, &POLICY, now)
+        .unwrap();
+}
+
+/// A re-check reads ranges the unit does not owe: no outcome touches the
+/// unit's backoff, budget or park, while the relay and the account see it as
+/// they see any quantum.
+#[test]
+fn a_recheck_never_touches_the_units_retry_state() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    settle(&app, &route, RELAY, RecoveryUnitOutcome::NoProgress, NOW);
+    let before = unit(&app, &route, RELAY);
+    for outcome in [
+        RecoveryUnitOutcome::NoProgress,
+        RecoveryUnitOutcome::Advanced,
+        RecoveryUnitOutcome::Refused,
+        RecoveryUnitOutcome::NothingOwed,
+    ] {
+        settle_recheck(&app, &route, RELAY, outcome, NOW + 10);
+    }
+    let after = unit(&app, &route, RELAY);
+    assert_eq!(after.state, RecoveryUnitState::Active);
+    assert_eq!(
+        (
+            after.no_progress,
+            after.backoff_step,
+            after.next_attempt_at_seconds
+        ),
+        (
+            before.no_progress,
+            before.backoff_step,
+            before.next_attempt_at_seconds
+        )
+    );
+    // NothingOwed was refunded; the other three stay charged.
+    assert_eq!(app.recovery_account_usage(NOW + 10).unwrap().attempts, 4);
+
+    for _ in 0..POLICY.cooldown_after_unreachable {
+        settle_recheck(
+            &app,
+            &route,
+            RELAY,
+            RecoveryUnitOutcome::Unreachable,
+            NOW + 20,
+        );
+    }
+    assert!(health(&app, RELAY).cooldown.is_some());
+    assert_eq!(
+        unit(&app, &route, RELAY).next_attempt_at_seconds,
+        before.next_attempt_at_seconds
+    );
+    settle_recheck(
+        &app,
+        &route,
+        OTHER,
+        RecoveryUnitOutcome::RateLimited,
+        NOW + 20,
+    );
+    assert!(health(&app, OTHER).cooldown.is_some());
+    settle_recheck(
+        &app,
+        &route,
+        RELAY,
+        RecoveryUnitOutcome::NoProgress,
+        NOW + 30,
+    );
+    assert_eq!(health(&app, RELAY).unreachable_streak, 0);
+    assert_eq!(health(&app, RELAY).cooldown, None);
+}
+
+/// An epoch gap's bound never narrows a pass that is due or running: it only
+/// moves a finished unit's next pass to start at the bound.
+#[test]
+fn an_epoch_gap_keeps_what_a_due_pass_would_check() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let fresh = group(1);
+    let running = group(2);
+    let finished = group(3);
+    for route in [&fresh, &running, &finished] {
+        app.begin_recovery_unit_attempt(route, RELAY, None, NOW)
+            .unwrap();
+    }
+    app.record_recovery_recheck(&running, RELAY, NOW - 400, false, NOW)
+        .unwrap();
+    app.record_recovery_recheck(&finished, RELAY, 0, true, NOW)
+        .unwrap();
+    for route in [&fresh, &running, &finished] {
+        app.make_recovery_recheck_due(route, None, Some(NOW - 200))
+            .unwrap();
+    }
+    let pass = |route| unit(&app, route, RELAY).recheck;
+    assert_eq!(pass(&fresh), RecoveryRecheckPass::default());
+    assert_eq!(
+        pass(&running),
+        RecoveryRecheckPass {
+            position_seconds: Some(NOW - 400),
+            completed_at_seconds: None,
+        }
+    );
+    assert_eq!(
+        pass(&finished),
+        RecoveryRecheckPass {
+            position_seconds: Some(NOW - 200),
+            completed_at_seconds: None,
+        }
+    );
+    // An earlier bound reaches further back; no bound starts from the floor.
+    app.make_recovery_recheck_due(&finished, Some(RELAY), Some(NOW - 300))
+        .unwrap();
+    assert_eq!(pass(&finished).position_seconds, Some(NOW - 300));
+    app.make_recovery_recheck_due(&finished, Some(RELAY), None)
+        .unwrap();
+    assert_eq!(pass(&finished), RecoveryRecheckPass::default());
+}

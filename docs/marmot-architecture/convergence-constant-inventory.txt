@@ -106,3 +106,8 @@ A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_LOCAL_FAILURE_
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_STAGED_GROUP_EVENTS
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_STAGED_GROUP_BYTES
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_STAGED_ACCOUNT_BYTES
+# A20 is the runner's comparison windows and re-check schedule.
+A20|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_RECHECK_INTERVAL_SECS
+A20|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_RECHECK_AFTER_COOLDOWN_SECS
+A20|crates/transport-nostr-adapter/src/compare/mod.rs|COMPARE_SET_LIMIT
+A20|crates/transport-nostr-adapter/src/compare/mod.rs|COMPARE_IDS_PER_REQUEST

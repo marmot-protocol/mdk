@@ -132,6 +132,11 @@
 
 ### Added
 
+- `settle_recovery_recheck` applies one re-check quantum's outcome to its
+  relay and the account's rolling-hour budget, never to its unit's retry
+  state (mdk#2660 phase 4). `staged_recovery_items` lists the ids and times a
+  route has staged in a range, from every relay. `make_recovery_recheck_due`
+  keeps what a due or running pass would check below an epoch gap's bound.
 - `OpenMlsContentFilter::CommitsAndProposalsBetween` lists only the commits and
   proposals whose MLS epoch falls in a range, plus the rows SQLite cannot
   classify (mdk#2684). A failed convergence batch checks its horizon through it
