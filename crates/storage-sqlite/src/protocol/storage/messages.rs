@@ -554,6 +554,54 @@ impl MessageStorage for SqliteAccountStorage {
         records.into_iter().map(decode_message_columns).collect()
     }
 
+    fn list_commits_and_proposals_inserted_after(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+        after: Option<u64>,
+    ) -> StorageResult<Option<Vec<(u64, MessageRecord)>>> {
+        if states.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let states = states
+            .iter()
+            .map(|state| message_state_to_i64(*state).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // `insert_order` is AUTOINCREMENT, so a new row's is greater than any
+        // row's before it, deleted rows included.
+        let sql = format!(
+            "SELECT insert_order, {MESSAGE_COLUMNS} FROM cgka_messages
+             WHERE group_id = ?1 AND state IN ({states}) AND epoch >= ?2 AND insert_order > ?3
+               AND openmls_content IN (
+                   {OPENMLS_CONTENT_COMMIT}, {OPENMLS_CONTENT_PROPOSAL},
+                   {OPENMLS_CONTENT_PENDING}, {OPENMLS_CONTENT_UNCLASSIFIED}
+               )
+             ORDER BY insert_order"
+        );
+        let after = after.map_or(0, |after| i64::try_from(after).unwrap_or(i64::MAX));
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare_cached(&sql).storage()?;
+        let rows = stmt
+            .query_map(
+                params![group_id.as_slice(), epoch_to_i64(at_or_after_epoch)?, after],
+                |row| Ok((row.get::<_, i64>(0)?, message_columns_at(row, 1)?)),
+            )
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        rows.into_iter()
+            .map(|(insert_order, columns)| {
+                let position = u64::try_from(insert_order).map_err(|_| {
+                    StorageError::Serialization("negative message insert order".to_string())
+                })?;
+                Ok((position, decode_message_columns(columns)?))
+            })
+            .collect::<StorageResult<Vec<_>>>()
+            .map(Some)
+    }
+
     fn visit_messages_in_states(
         &self,
         group_id: &GroupId,

@@ -669,6 +669,9 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
     let current_epoch = engine.epoch_manager.epoch(group_id).unwrap_or_default().0;
     let now = engine.convergence_now();
     let mut pass = engine.storage.convergence_pass(group_id)?;
+    // A failed batch with new selection input reopens at the runtime's next
+    // load of it (mdk#2684), so it is runnable work, not a wait.
+    let mut failed_pass_reopens = false;
     if let Some(active) = pass.as_mut().filter(|pass| pass.is_active()) {
         let policy = engine
             .convergence_policy_for_group(group_id)
@@ -681,6 +684,14 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
             now,
             engine.convergence_clock_instance_id,
         );
+        failed_pass_reopens = active.retry.is_some()
+            && matches!(epoch_state, EpochState::Stable { .. })
+            && engine
+                .failed_convergence_pass_new_input(active, &policy)
+                .map_err(|error| {
+                    EngineError::Backend(format!("read failed pass input for snapshot: {error}"))
+                })?
+                .0;
     }
     let messages = engine.storage.list_messages(group_id, EpochId(0))?;
     let pending_work = capture_pending_work_snapshot_from(
@@ -697,13 +708,14 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
     // A failed batch backs off to its retry time and, parked, waits for new
     // input (mdk#2684). Until then it holds every drain behind it, as the
     // runtime's own readiness reads do.
-    let failed_pass_waiting = pass
-        .as_ref()
-        .filter(|pass| pass.is_active() && pass.phase != ConvergencePassPhase::Collecting)
-        .and_then(|pass| pass.retry.as_ref())
-        .is_some_and(|retry| {
-            retry.is_parked() || retry.next_attempt_monotonic_ms > now.monotonic_ms
-        });
+    let failed_pass_waiting = !failed_pass_reopens
+        && pass
+            .as_ref()
+            .filter(|pass| pass.is_active() && pass.phase != ConvergencePassPhase::Collecting)
+            .and_then(|pass| pass.retry.as_ref())
+            .is_some_and(|retry| {
+                retry.is_parked() || retry.next_attempt_monotonic_ms > now.monotonic_ms
+            });
     if let Some(active) = pass.as_ref().filter(|pass| pass.is_active()) {
         match active.phase {
             ConvergencePassPhase::Collecting => {
@@ -716,6 +728,9 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
             }
             ConvergencePassPhase::Frozen | ConvergencePassPhase::Resolving => {
                 match active.retry.as_ref() {
+                    Some(_) if failed_pass_reopens => {
+                        runnable_work = runnable_work.saturating_add(1);
+                    }
                     Some(retry) if retry.is_parked() => {}
                     Some(retry) if failed_pass_waiting => {
                         next_wake = Some(retry.next_attempt_monotonic_ms);
@@ -729,9 +744,10 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
 
     // `deferred_peel_cutoff_delay_ms` gives deferred rows no wake behind a
     // failed batch unless a deferred-peel generation sweeps first.
-    let deferred_rows_wait = pass
-        .as_ref()
-        .is_some_and(|pass| pass.is_active() && pass.retry.is_some())
+    let deferred_rows_wait = !failed_pass_reopens
+        && pass
+            .as_ref()
+            .is_some_and(|pass| pass.is_active() && pass.retry.is_some())
         && engine.storage.deferred_peel_generation(group_id)?.is_none();
     let mut deferred_normalizations = 0usize;
     for record in messages
@@ -760,10 +776,12 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
             Some(next_wake.map_or(now.monotonic_ms, |current| current.min(now.monotonic_ms)));
     }
 
+    // A due SelfRemove auto-commit stages behind the convergence gate, which a
+    // waiting failed batch holds shut.
     for scheduled in engine
         .scheduled_self_remove_auto_commits
         .values()
-        .filter(|scheduled| scheduled.group_id == *group_id)
+        .filter(|scheduled| !failed_pass_waiting && scheduled.group_id == *group_id)
     {
         if scheduled.due_at_ms <= now.monotonic_ms {
             runnable_work = runnable_work.saturating_add(1);

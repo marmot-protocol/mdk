@@ -116,6 +116,7 @@ mod tests {
             next_attempt_monotonic_ms: 2_048,
             next_attempt_wall_ms: 2_058,
             parked_at_wall_ms: Some(2_058),
+            input_read_through: Some(41),
         });
         store.put_convergence_pass(&pass).unwrap();
         assert_eq!(

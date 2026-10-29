@@ -325,6 +325,90 @@ fn openmls_listing_leaves_out_only_rows_the_filter_excludes() {
     );
 }
 
+/// The convergence check for new selection input behind a failed batch
+/// (mdk#2684) reads commits and proposals by insertion position.
+#[test]
+fn positional_listing_returns_commits_and_proposals_inserted_after_a_position() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut labels = seed_listing_rows(&store);
+    let read = |labels: &[(u8, &'static str)],
+                states: &[MessageState],
+                at_or_after_epoch: u64,
+                after: Option<u64>| {
+        store
+            .list_commits_and_proposals_inserted_after(
+                &gid(1),
+                states,
+                EpochId(at_or_after_epoch),
+                after,
+            )
+            .unwrap()
+            .expect("SQLite keeps insertion positions")
+            .into_iter()
+            .map(|(position, record)| {
+                let label = labels
+                    .iter()
+                    .find(|(id, _)| record.id.as_slice() == [*id; 4])
+                    .unwrap()
+                    .1;
+                (position, label)
+            })
+            .collect::<Vec<_>>()
+    };
+    let label_list = |rows: &[(u64, &'static str)]| -> Vec<&'static str> {
+        rows.iter().map(|(_, label)| *label).collect()
+    };
+
+    // Rows the backend cannot classify come back for the caller to judge.
+    let all = read(&labels, &GRAPH_STATES, 0, None);
+    assert_eq!(
+        label_list(&all),
+        [
+            "commit@2",
+            "proposal@3",
+            "fresh commit@3",
+            "unreadable",
+            "pending app@1"
+        ]
+    );
+    assert!(all.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert_eq!(
+        label_list(&read(&labels, &GRAPH_STATES, 0, Some(all[1].0))),
+        ["fresh commit@3", "unreadable", "pending app@1"]
+    );
+
+    // Rewriting a row keeps its position. A new row takes a greater one than
+    // every row before it, even once the newest of them is gone.
+    let newest = all.last().unwrap().0;
+    store
+        .update_message_state(
+            &MessageId::new(vec![7; 4]),
+            MessageState::ConvergenceDeferred,
+        )
+        .unwrap();
+    assert_eq!(read(&labels, &GRAPH_STATES, 0, Some(all[1].0)), all[2..]);
+    store.delete_message(&MessageId::new(vec![11; 4])).unwrap();
+    store
+        .put_message(&row(
+            12,
+            3,
+            MessageState::Created,
+            wire_payload(private_message(3, PROPOSAL)),
+        ))
+        .unwrap();
+    labels.push((12, "late proposal@3"));
+    let late = read(&labels, &GRAPH_STATES, 0, Some(newest));
+    assert_eq!(label_list(&late), ["late proposal@3"]);
+    assert!(late[0].0 > newest);
+
+    // The row epoch floor and the state list still apply.
+    assert_eq!(
+        label_list(&read(&labels, &[MessageState::Processed], 3, None)),
+        ["proposal@3"]
+    );
+    assert!(read(&labels, &[], 0, None).is_empty());
+}
+
 #[test]
 fn promotion_derives_content_for_rows_written_before_the_columns() {
     let store = SqliteAccountStorage::in_memory().unwrap();

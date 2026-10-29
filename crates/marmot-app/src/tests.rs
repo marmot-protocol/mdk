@@ -23717,7 +23717,7 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
 }
 
 /// Plant a frozen batch whose failure budget ran out (mdk#2684), however it
-/// got there.
+/// got there, and that has already judged every stored input.
 fn plant_parked_convergence_pass(app: &MarmotApp, group_id: &cgka_traits::GroupId, epoch: u64) {
     use cgka_traits::convergence_pass::{
         ConvergencePassPhase, ConvergencePassRetry, ConvergencePassStep, DurableConvergencePass,
@@ -23747,6 +23747,7 @@ fn plant_parked_convergence_pass(app: &MarmotApp, group_id: &cgka_traits::GroupI
                 next_attempt_monotonic_ms: 0,
                 next_attempt_wall_ms: 0,
                 parked_at_wall_ms: Some(0),
+                input_read_through: Some(u64::MAX),
             }),
         })
         .unwrap();

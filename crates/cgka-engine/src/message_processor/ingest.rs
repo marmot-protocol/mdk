@@ -1639,6 +1639,19 @@ impl<S: StorageProvider> Engine<S> {
                     )?;
                 }
                 self.return_mls_group(&group_id, mls_group);
+                // A failed convergence batch reopens on new selection input
+                // when its pass is next loaded (mdk#2684), and a proposal at
+                // the current epoch is stored without loading it. Schedule
+                // that load; a pass that cannot be read gets one too.
+                if self
+                    .storage
+                    .convergence_pass(&group_id)
+                    .map_or(true, |pass| {
+                        pass.is_some_and(|pass| pass.is_active() && pass.retry.is_some())
+                    })
+                {
+                    self.schedule_pending_convergence_group(&group_id);
+                }
                 self.valid_proposal_groups.insert(group_id);
                 reported(IngestOutcome::Processed)
             }

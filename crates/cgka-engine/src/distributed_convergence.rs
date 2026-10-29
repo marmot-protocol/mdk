@@ -254,6 +254,35 @@ enum FrozenPassVerificationError {
     Integrity,
 }
 
+/// What a failed batch's check for new selection input decided.
+enum FailedPassCheck {
+    /// The batch stands as loaded.
+    Kept,
+    /// The batch reopened as this collecting pass, or was dropped because its
+    /// reseed opens none.
+    Reopened(Option<DurableConvergencePass>),
+}
+
+/// The source epoch of a stored commit or proposal row that a reseed would
+/// weigh in branch selection, or `None` for any other row, one that does not
+/// decode among them.
+fn stored_selection_input_epoch(record: &MessageRecord) -> Option<u64> {
+    let payload = StoredMessagePayload::decode(&record.payload).ok()?;
+    let projection = project_mls_message(&payload.as_openmls_wire()?.payload).ok()?;
+    let source_epoch = projection.source_epoch?;
+    let input = ClassifiedConvergenceInput::from_projection(
+        projection.kind,
+        source_epoch,
+        record.state,
+        projection.message_digest,
+    )?;
+    matches!(
+        input.role,
+        ConvergencePassMemberRole::CommitEdge | ConvergencePassMemberRole::ProposalDependency
+    )
+    .then_some(source_epoch)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConvergenceAdmissionOutcome {
     Retained,
@@ -741,9 +770,6 @@ impl<S: StorageProvider> Engine<S> {
             return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         };
         if pass.phase != ConvergencePassPhase::Collecting {
-            if self.reopen_failed_convergence_pass_for_input(&pass, message_id, &policy, now)? {
-                return Ok((ConvergenceAdmissionOutcome::Admitted, true));
-            }
             return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         }
         if pass
@@ -950,6 +976,12 @@ impl<S: StorageProvider> Engine<S> {
                     .put_convergence_pass(&pass)
                     .map_err(storage_projection_error)?;
             }
+            if let FailedPassCheck::Reopened(reopened) =
+                self.reopen_failed_convergence_pass_on_new_input(&mut pass, policy, now)?
+            {
+                let opened = reopened.is_some();
+                return Ok((reopened, opened));
+            }
             return Ok((Some(pass), false));
         }
 
@@ -1010,34 +1042,88 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    /// Reopen a frozen batch that failed, now that `message_id` brings selection
-    /// input it does not hold (mdk#2684).
+    /// Reopen a failed batch once new selection input reaches its group
+    /// (mdk#2684).
     ///
-    /// A failed batch is resolved from the same members on every attempt, so a
-    /// deterministic failure repeats until the input changes. A commit or a
-    /// proposal that the reseeded batch would hold is such a change; an
-    /// application is not, or a busy group's traffic would keep a failing batch
-    /// retrying, and neither is input outside the pass's horizon, which the
-    /// reseed leaves out. Reopening is the stale-base discard's repair: the batch holds no
-    /// canonical state, and its members reseed into a collecting pass with a
-    /// fresh failure count. Returns whether a pass was reopened.
-    fn reopen_failed_convergence_pass_for_input(
+    /// Every runtime load of a pass passes through here, whether the schedule
+    /// read, admission or the convergence gate loads it, so input counts
+    /// however it was stored: a retained commit, a proposal ingested at the
+    /// current epoch, or anything a later path adds. A failed batch is
+    /// resolved from the same members on every attempt, so a deterministic
+    /// failure repeats until the input changes. A commit or a proposal inside
+    /// the pass's horizon that the batch lacks and its reseed holds is such a
+    /// change; an application is not, or a busy group's traffic would keep a
+    /// failing batch retrying, and neither is input the reseed leaves out,
+    /// which would only rebuild the failed batch. Reopening is the stale-base
+    /// discard's repair: the batch holds no canonical state, and its members
+    /// reseed into a collecting pass with a fresh failure count.
+    ///
+    /// The retry record keeps the newest storage position judged against the
+    /// batch, so a load with no commit or proposal stored since reads no rows
+    /// and pays for no reseed.
+    fn reopen_failed_convergence_pass_on_new_input(
         &self,
-        pass: &DurableConvergencePass,
-        message_id: &MessageId,
+        pass: &mut DurableConvergencePass,
         policy: &CanonicalizationPolicy,
         now: ConvergenceTime,
-    ) -> Result<bool, OpenMlsProjectionError> {
-        if pass.retry.is_none()
-            || pass
+    ) -> Result<FailedPassCheck, OpenMlsProjectionError> {
+        if pass.retry.is_none() {
+            return Ok(FailedPassCheck::Kept);
+        }
+        // Reseeding opens a pass, so it waits for the epoch state that may.
+        let epoch_state = self.epoch_manager.state(&pass.group_id);
+        if !(matches!(epoch_state, Some(EpochState::Stable { .. }))
+            || cfg!(feature = "test-policy-overrides") && epoch_state.is_none())
+        {
+            return Ok(FailedPassCheck::Kept);
+        }
+        let (new_input, newest) = self.failed_convergence_pass_new_input(pass, policy)?;
+        if new_input {
+            let (members, has_trigger) =
+                self.seed_convergence_pass_members(&pass.group_id, pass.base_epoch, policy)?;
+            let held: HashSet<&MessageId> = pass
                 .members
                 .iter()
-                .any(|member| &member.message_id == message_id)
-        {
-            return Ok(false);
+                .map(|member| &member.message_id)
+                .collect();
+            if members.iter().any(|member| {
+                matches!(
+                    member.role,
+                    ConvergencePassMemberRole::CommitEdge
+                        | ConvergencePassMemberRole::ProposalDependency
+                ) && !held.contains(&member.message_id)
+            }) {
+                return self.reopen_failed_convergence_pass(
+                    pass,
+                    members,
+                    has_trigger,
+                    policy,
+                    now,
+                );
+            }
         }
-        let Some(candidate) = self.convergence_pass_candidate(message_id)? else {
-            return Ok(false);
+        if let (Some(newest), Some(retry)) = (newest, pass.retry.as_mut())
+            && retry.input_read_through.is_none_or(|seen| seen < newest)
+        {
+            retry.input_read_through = Some(newest);
+            self.storage
+                .put_convergence_pass(pass)
+                .map_err(storage_projection_error)?;
+        }
+        Ok(FailedPassCheck::Kept)
+    }
+
+    /// Whether a commit or a proposal inside a failed batch's horizon that the
+    /// batch lacks was stored after the newest position it has judged, and the
+    /// newest position this read. Reads only; a backend that keeps no positions
+    /// reports new input every time, which costs a reseed per load.
+    pub(crate) fn failed_convergence_pass_new_input(
+        &self,
+        pass: &DurableConvergencePass,
+        policy: &CanonicalizationPolicy,
+    ) -> Result<(bool, Option<u64>), OpenMlsProjectionError> {
+        let Some(retry) = pass.retry.as_ref() else {
+            return Ok((false, None));
         };
         let floor = pass
             .base_epoch
@@ -1047,58 +1133,75 @@ impl<S: StorageProvider> Engine<S> {
             .base_epoch
             .0
             .saturating_add(policy.convergence.max_rewind_commits);
-        if !matches!(
-            candidate.member.role,
-            ConvergencePassMemberRole::CommitEdge | ConvergencePassMemberRole::ProposalDependency
-        ) || candidate.member.source_epoch < floor
-            || candidate.member.source_epoch > ceiling
-        {
-            return Ok(false);
-        }
-        let (members, has_trigger) =
-            self.seed_convergence_pass_members(&pass.group_id, pass.base_epoch, policy)?;
-        // Input the new batch would not hold leaves it as the failed one, so
-        // it must not buy a fresh budget.
-        if !members
+        let Some(rows) = self
+            .storage
+            .list_commits_and_proposals_inserted_after(
+                &pass.group_id,
+                &crate::openmls_projection::OPENMLS_GRAPH_INPUT_STATES,
+                EpochId(floor),
+                retry.input_read_through,
+            )
+            .map_err(storage_projection_error)?
+        else {
+            return Ok((true, None));
+        };
+        let held: HashSet<&MessageId> = pass
+            .members
             .iter()
-            .any(|member| &member.message_id == message_id)
-        {
-            return Ok(false);
-        }
-        if !has_trigger {
-            self.storage
-                .delete_convergence_pass(&pass.group_id)
-                .map_err(storage_projection_error)?;
-        } else {
-            let reopened = self.new_collecting_convergence_pass(
+            .map(|member| &member.message_id)
+            .collect();
+        let new_input = rows.iter().any(|(_, record)| {
+            !held.contains(&record.id)
+                && stored_selection_input_epoch(record)
+                    .is_some_and(|source_epoch| (floor..=ceiling).contains(&source_epoch))
+        });
+        Ok((new_input, rows.last().map(|(position, _)| *position)))
+    }
+
+    fn reopen_failed_convergence_pass(
+        &self,
+        pass: &DurableConvergencePass,
+        members: Vec<ConvergencePassMember>,
+        has_trigger: bool,
+        policy: &CanonicalizationPolicy,
+        now: ConvergenceTime,
+    ) -> Result<FailedPassCheck, OpenMlsProjectionError> {
+        let reopened = has_trigger.then(|| {
+            self.new_collecting_convergence_pass(
                 &pass.group_id,
                 pass.base_epoch,
                 pass.generation.saturating_add(1),
                 members,
                 policy,
                 now,
-            );
-            self.storage
-                .put_convergence_pass(&reopened)
-                .map_err(storage_projection_error)?;
+            )
+        });
+        match reopened.as_ref() {
+            Some(reopened) => self.storage.put_convergence_pass(reopened),
+            None => self.storage.delete_convergence_pass(&pass.group_id),
         }
+        .map_err(storage_projection_error)?;
         self.audit_group(
             &pass.group_id,
             marmot_forensics::AuditEventKind::ConvergenceRunState {
                 phase: ConvergencePhase::Waiting,
                 current_tip_epoch: Some(pass.base_epoch.0),
-                retained_anchor_horizon: Some(floor),
+                retained_anchor_horizon: Some(
+                    pass.base_epoch
+                        .0
+                        .saturating_sub(policy.convergence.max_rewind_commits),
+                ),
                 reason: Some("pass_reopened:new_input".to_string()),
                 error_kind: None,
             },
         );
         tracing::info!(
             target: "cgka_engine::distributed_convergence",
-            method = "reopen_failed_convergence_pass_for_input",
+            method = "reopen_failed_convergence_pass",
             failed_attempts = pass.retry.as_ref().map_or(0, |retry| retry.failed_attempts),
             "new selection input reopened a failed convergence pass"
         );
-        Ok(true)
+        Ok(FailedPassCheck::Reopened(reopened))
     }
 
     fn seed_convergence_pass_members(
@@ -2371,6 +2474,10 @@ impl<S: StorageProvider> Engine<S> {
             next_attempt_monotonic_ms: now.monotonic_ms.saturating_add(retry_after_ms),
             next_attempt_wall_ms: now.wall_ms.saturating_add(retry_after_ms),
             parked_at_wall_ms: parked.then_some(now.wall_ms),
+            input_read_through: pass
+                .retry
+                .as_ref()
+                .and_then(|retry| retry.input_read_through),
         });
         if self.storage.put_convergence_pass(&failed).is_err() {
             tracing::warn!(

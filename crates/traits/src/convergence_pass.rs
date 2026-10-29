@@ -103,6 +103,11 @@ pub struct ConvergencePassRetry {
     /// When the failure budget ran out. A parked pass makes no attempt on its
     /// own.
     pub parked_at_wall_ms: Option<u64>,
+    /// The newest storage insertion position of a commit or proposal already
+    /// judged against this batch, so a check for new selection input reads
+    /// only rows after it. `None` until the first check, which reads them all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_read_through: Option<u64>,
 }
 
 impl ConvergencePassRetry {

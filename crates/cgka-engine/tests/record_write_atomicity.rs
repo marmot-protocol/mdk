@@ -370,6 +370,8 @@ struct PreparationDelay {
     graph_ms: Arc<AtomicUsize>,
     metadata_calls: Arc<AtomicUsize>,
     graph_calls: Arc<AtomicUsize>,
+    /// Rows `list_commits_and_proposals_inserted_after` has returned.
+    positional_rows: Arc<AtomicUsize>,
 }
 
 impl MessageStorage for FaultStorage {
@@ -402,6 +404,24 @@ impl MessageStorage for FaultStorage {
         }
         self.inner
             .list_messages_in_states(group_id, states, at_or_after_epoch)
+    }
+    fn list_commits_and_proposals_inserted_after(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+        after: Option<u64>,
+    ) -> StorageResult<Option<Vec<(u64, MessageRecord)>>> {
+        let rows = self.inner.list_commits_and_proposals_inserted_after(
+            group_id,
+            states,
+            at_or_after_epoch,
+            after,
+        )?;
+        self.preparation_delay
+            .positional_rows
+            .fetch_add(rows.as_ref().map_or(0, Vec::len), Ordering::SeqCst);
+        Ok(rows)
     }
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
         if self.leave_write_fault.should_fail() {

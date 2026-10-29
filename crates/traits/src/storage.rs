@@ -349,6 +349,28 @@ pub trait MessageStorage {
         self.list_messages_in_states(group_id, states, at_or_after_epoch)
     }
 
+    /// Commit and proposal rows for `group_id` in `states` at or after
+    /// `at_or_after_epoch` that were inserted after position `after` (all of
+    /// them when `None`), in insertion order and each with its insertion
+    /// position. `None` when the backend keeps no positions.
+    ///
+    /// A row takes its position when it is first inserted, greater than every
+    /// position before it, and keeps it when rewritten; a snapshot restore puts
+    /// rows back at theirs. A backend may also return rows whose content it
+    /// cannot tell apart, so callers classify each row themselves. Convergence
+    /// keeps the newest position it has read to learn what selection input
+    /// reached a failed batch without rereading the group's history (mdk#2684).
+    fn list_commits_and_proposals_inserted_after(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+        after: Option<u64>,
+    ) -> StorageResult<Option<Vec<(u64, MessageRecord)>>> {
+        let _ = (group_id, states, at_or_after_epoch, after);
+        Ok(None)
+    }
+
     /// Visit matching rows in insertion order (see the trait doc), stopping as
     /// soon as `visitor` returns false. Backends should stream rows so early
     /// termination avoids reading or decoding the remainder. The callback must not call back into storage:
