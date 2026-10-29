@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::sas::RequestBinding;
 use crate::types::{
-    AccountKey, ExchangeKey, KeyPackageEventId, KeyPackageRef, SessionId, SlotId,
+    AccountKey, ExchangeKey, KeyPackageEventId, KeyPackageRef, SessionId, SignatureKey, SlotId,
     valid_group_id_len,
 };
 
@@ -106,8 +106,13 @@ pub enum ConfirmSender {
     /// Covers the new device's exact `KeyPackageRef`, which the receiver
     /// already knows from the request.
     NewDevice,
-    /// Covers the device group the existing device adds the new device to.
-    ExistingDevice { device_group_id: GroupId },
+    /// Covers the device group the existing device adds the new device to,
+    /// and the MLS signature key of the existing device's leaf in it. On a
+    /// first link that is the key it creates the group with.
+    ExistingDevice {
+        device_group_id: GroupId,
+        signature_key: SignatureKey,
+    },
 }
 
 /// Either side: ends a session.
@@ -253,11 +258,15 @@ impl PairingMessage {
                 key: hex::encode(message.key.as_bytes()),
             }),
             Self::Confirm(message) => {
-                let (from, device_group) = match &message.sender {
-                    ConfirmSender::NewDevice => (CONFIRM_FROM_NEW, None),
-                    ConfirmSender::ExistingDevice { device_group_id } => (
+                let (from, device_group, signature_key) = match &message.sender {
+                    ConfirmSender::NewDevice => (CONFIRM_FROM_NEW, None, None),
+                    ConfirmSender::ExistingDevice {
+                        device_group_id,
+                        signature_key,
+                    } => (
                         CONFIRM_FROM_EXISTING,
                         Some(hex::encode(device_group_id.as_slice())),
+                        Some(hex::encode(signature_key.as_slice())),
                     ),
                 };
                 serde_json::to_string(&ConfirmJson {
@@ -265,6 +274,7 @@ impl PairingMessage {
                     session: hex::encode(message.session_id.as_bytes()),
                     from: from.to_owned(),
                     device_group,
+                    signature_key,
                     mac: hex::encode(message.mac),
                 })
             }
@@ -314,15 +324,17 @@ impl PairingMessage {
             }
             KIND_PAIRING_CONFIRM => {
                 let json: ConfirmJson = parse(content)?;
-                let sender = match (json.from.as_str(), json.device_group) {
-                    (CONFIRM_FROM_NEW, None) => ConfirmSender::NewDevice,
-                    (CONFIRM_FROM_EXISTING, Some(device_group)) => {
+                let sender = match (json.from.as_str(), json.device_group, json.signature_key) {
+                    (CONFIRM_FROM_NEW, None, None) => ConfirmSender::NewDevice,
+                    (CONFIRM_FROM_EXISTING, Some(device_group), Some(signature_key)) => {
                         let bytes = hex_bytes(&device_group)?;
                         if !valid_group_id_len(&bytes) {
                             return Err(PairingMessageError::Malformed);
                         }
                         ConfirmSender::ExistingDevice {
                             device_group_id: GroupId::new(bytes),
+                            signature_key: SignatureKey::new(hex_bytes(&signature_key)?)
+                                .ok_or(PairingMessageError::Malformed)?,
                         }
                     }
                     _ => return Err(PairingMessageError::Malformed),
@@ -389,6 +401,12 @@ struct ConfirmJson {
         deserialize_with = "present_string"
     )]
     device_group: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_string"
+    )]
+    signature_key: Option<String>,
     mac: String,
 }
 
@@ -457,15 +475,16 @@ mod tests {
         .to_content()
     }
 
-    fn confirm_json(from: &str, device_group: Option<&str>) -> String {
+    fn confirm_json(from: &str, device_group: Option<&str>, signature_key: Option<&str>) -> String {
         let session = hex_of(1, 32);
         let mac = hex_of(5, 32);
-        match device_group {
-            Some(group) => format!(
-                r#"{{"v":1,"session":"{session}","from":"{from}","device_group":{group},"mac":"{mac}"}}"#
-            ),
-            None => format!(r#"{{"v":1,"session":"{session}","from":"{from}","mac":"{mac}"}}"#),
-        }
+        let group = device_group
+            .map(|group| format!(r#","device_group":{group}"#))
+            .unwrap_or_default();
+        let key = signature_key
+            .map(|key| format!(r#","signature_key":{key}"#))
+            .unwrap_or_default();
+        format!(r#"{{"v":1,"session":"{session}","from":"{from}"{group}{key},"mac":"{mac}"}}"#)
     }
 
     fn cancel_json(reason: &str) -> String {
@@ -500,6 +519,7 @@ mod tests {
                 session_id,
                 sender: ConfirmSender::ExistingDevice {
                     device_group_id: GroupId::new(vec![9; 16]),
+                    signature_key: SignatureKey::new(vec![7; 32]).expect("32 bytes"),
                 },
                 mac: [5; 32],
             }),
@@ -541,15 +561,22 @@ mod tests {
             PairingMessage::from_content(KIND_PAIRING_REQUEST, &padded),
             Err(PairingMessageError::TooLarge)
         );
-        // The largest valid message fits with room to spare.
+        // The largest valid message fits.
         let largest = PairingMessage::Confirm(PairingConfirm {
             session_id: SessionId::new([1; 32]),
             sender: ConfirmSender::ExistingDevice {
                 device_group_id: GroupId::new(vec![9; crate::types::GROUP_ID_MAX_LEN]),
+                signature_key: SignatureKey::new(vec![7; crate::types::SIGNATURE_KEY_MAX_LEN])
+                    .expect("longest key"),
             },
             mac: [5; 32],
         });
-        assert!(largest.to_content().len() < 800);
+        let content = largest.to_content();
+        assert!(content.len() <= MAX_CONTENT_LEN);
+        assert_eq!(
+            PairingMessage::from_content(KIND_PAIRING_CONFIRM, &content),
+            Ok(largest)
+        );
     }
 
     #[test]
@@ -654,24 +681,25 @@ mod tests {
     #[test]
     fn message_confirm_names_a_group_only_from_the_existing_device() {
         let group = format!(r#""{}""#, hex_of(9, 16));
+        let key = format!(r#""{}""#, hex_of(7, 32));
+        let long_group = format!(r#""{}""#, hex_of(9, crate::types::GROUP_ID_MAX_LEN + 1));
+        let long_key = format!(r#""{}""#, hex_of(7, crate::types::SIGNATURE_KEY_MAX_LEN + 1));
         for (content, valid) in [
-            (confirm_json("new_device", None), true),
-            (confirm_json("existing_device", Some(&group)), true),
-            (confirm_json("new_device", Some(&group)), false),
-            (confirm_json("existing_device", None), false),
-            (confirm_json("existing_device", Some("null")), false),
-            (confirm_json("existing_device", Some(r#""""#)), false),
-            (
-                confirm_json(
-                    "existing_device",
-                    Some(&format!(
-                        r#""{}""#,
-                        hex_of(9, crate::types::GROUP_ID_MAX_LEN + 1)
-                    )),
-                ),
-                false,
-            ),
-            (confirm_json("someone_else", None), false),
+            (confirm_json("new_device", None, None), true),
+            (confirm_json("existing_device", Some(&group), Some(&key)), true),
+            (confirm_json("new_device", Some(&group), None), false),
+            (confirm_json("new_device", None, Some(&key)), false),
+            (confirm_json("new_device", Some(&group), Some(&key)), false),
+            (confirm_json("existing_device", None, None), false),
+            (confirm_json("existing_device", Some(&group), None), false),
+            (confirm_json("existing_device", None, Some(&key)), false),
+            (confirm_json("existing_device", Some("null"), Some(&key)), false),
+            (confirm_json("existing_device", Some(&group), Some("null")), false),
+            (confirm_json("existing_device", Some(r#""""#), Some(&key)), false),
+            (confirm_json("existing_device", Some(&group), Some(r#""""#)), false),
+            (confirm_json("existing_device", Some(&long_group), Some(&key)), false),
+            (confirm_json("existing_device", Some(&group), Some(&long_key)), false),
+            (confirm_json("someone_else", None, None), false),
         ] {
             assert_eq!(
                 PairingMessage::from_content(KIND_PAIRING_CONFIRM, &content).is_ok(),

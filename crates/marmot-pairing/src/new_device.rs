@@ -11,11 +11,14 @@ use crate::message::{
 };
 use crate::sas::{
     EphemeralKey, MacItem, MacSender, RequestBinding, SessionBinding, SharedSecret, commitment,
+    device_group_value,
 };
 use crate::session::{
     ConfirmedLink, EndReason, IgnoreReason, PairingError, REQUEST_TTL_SECS, SESSION_TTL_SECS,
 };
-use crate::types::{AccountKey, KeyPackageEventId, KeyPackageRef, SessionId, SlotId};
+use crate::types::{
+    AccountKey, KeyPackageEventId, KeyPackageRef, SessionId, SignatureKey, SlotId,
+};
 
 /// The new device's pairing session.
 ///
@@ -47,7 +50,7 @@ struct Comparing {
     code: SasCode,
     deadline: u64,
     user_confirmed: bool,
-    device_group_id: Option<GroupId>,
+    device_group: Option<(GroupId, SignatureKey)>,
 }
 
 /// What a message did to the session.
@@ -195,11 +198,12 @@ impl NewDevicePairing {
         }
     }
 
-    /// Whether to accept a Welcome into `group_id`: only into the device
-    /// group a verified confirmation named.
-    pub fn accepts_welcome_for(&self, group_id: &GroupId) -> bool {
+    /// Whether to accept a Welcome into `group_id` sent by the leaf with
+    /// `sender_signature_key`: only into the device group a verified
+    /// confirmation named, from the leaf it named.
+    pub fn accepts_welcome_for(&self, group_id: &GroupId, sender_signature_key: &[u8]) -> bool {
         self.linked()
-            .is_some_and(|link| link.allows_welcome_for(group_id))
+            .is_some_and(|link| link.allows_welcome_for(group_id, sender_signature_key))
     }
 
     /// Whether the session still holds a key or a shared secret, for tests.
@@ -277,7 +281,7 @@ impl NewDevicePairing {
             code,
             deadline: now.saturating_add(SESSION_TTL_SECS),
             user_confirmed: false,
-            device_group_id: None,
+            device_group: None,
         }));
         NewDeviceEvent::Reveal(PairingReveal {
             session_id: self.request.session_id,
@@ -287,25 +291,29 @@ impl NewDevicePairing {
     }
 
     fn on_confirm(&mut self, confirm: &PairingConfirm) -> NewDeviceEvent {
-        let ConfirmSender::ExistingDevice { device_group_id } = &confirm.sender else {
+        let ConfirmSender::ExistingDevice {
+            device_group_id,
+            signature_key,
+        } = &confirm.sender
+        else {
             return NewDeviceEvent::Ignored(IgnoreReason::OwnRole);
         };
         let State::Comparing(comparing) = &mut self.state else {
             return NewDeviceEvent::Ignored(IgnoreReason::WrongStep);
         };
-        if comparing.device_group_id.is_some() {
+        if comparing.device_group.is_some() {
             return NewDeviceEvent::Ignored(IgnoreReason::WrongStep);
         }
         if !comparing.shared.verify_mac(
             &comparing.binding,
             MacSender::ExistingDevice,
-            MacItem::DeviceGroupId,
-            device_group_id.as_slice(),
+            MacItem::DeviceGroup,
+            &device_group_value(device_group_id.as_slice(), signature_key.as_slice()),
             &confirm.mac,
         ) {
             return self.end(EndReason::MismatchedConfirm);
         }
-        comparing.device_group_id = Some(device_group_id.clone());
+        comparing.device_group = Some((device_group_id.clone(), signature_key.clone()));
         if comparing.user_confirmed {
             let (confirm, link) = self.confirm_and_link();
             NewDeviceEvent::Linked { confirm, link }
@@ -326,7 +334,7 @@ impl NewDevicePairing {
             return Err(PairingError::WrongStep);
         }
         comparing.user_confirmed = true;
-        if comparing.device_group_id.is_none() {
+        if comparing.device_group.is_none() {
             return Ok(NewDeviceConfirmation::Waiting);
         }
         let (confirm, link) = self.confirm_and_link();
@@ -408,14 +416,16 @@ impl NewDevicePairing {
                 self.request.key_package_ref.as_slice(),
             ),
         };
+        let (device_group_id, welcome_sender_key) = comparing
+            .device_group
+            .clone()
+            .expect("linking needs the existing device's confirmation");
         let link = ConfirmedLink {
             session_id: self.request.session_id,
             key_package_event_id: self.request.key_package_event_id,
             key_package_ref: self.request.key_package_ref.clone(),
-            device_group_id: comparing
-                .device_group_id
-                .clone()
-                .expect("linking needs the existing device's confirmation"),
+            device_group_id,
+            welcome_sender_key,
             existing_device_slot: comparing.binding.existing_device_slot,
         };
         self.state = State::Linked(link.clone());

@@ -3,7 +3,9 @@
 Device pairing for one Marmot account: the short-authentication-string exchange that links a new device to a device
 the account already has. Both screens show the same code only when nobody sat between them, and the user compares the
 codes. It ends in a verified result: the new device's exact `KeyPackageRef`, which the existing device may add to the
-account's device group, and that group's id, the only group whose Welcome the new device accepts.
+account's device group, that group's id, and the MLS signature key of the existing device's leaf in it. The new device
+accepts a Welcome only into that group and only from that leaf. Anyone holding the account key can read the group id,
+but cannot sign as that leaf.
 
 Holding the account key never authenticates a device. Every device of the account, and anyone who has stolen its key,
 can read and send pairing messages. Only the compared code does.
@@ -23,7 +25,8 @@ The construction is Matrix's `m.sas.v1` (`curve25519-hkdf-sha256`, `hkdf-hmac-sh
 3. The new device takes the first answer and sends a **Reveal** with its key. Each side now derives the code from the
    shared secret, the session, the account, the `KeyPackageRef`, the existing device's slot and both keys.
 4. Each user compares the codes and may tap at any time. The existing device's **Confirm** goes first and covers the
-   device group's id. The new device sends its own, covering its `KeyPackageRef`, only once that one has verified.
+   device group's id and its own MLS signature key there. The new device sends its own, covering its `KeyPackageRef`,
+   only once that one has verified.
 5. When the new device's confirmation verifies, both sides hold the same `ConfirmedLink`. If a confirmation is lost,
    nothing is added: the new device never confirms, or the existing device times out and its cancel withdraws the new
    device's link. Either side may send a **Cancel**.

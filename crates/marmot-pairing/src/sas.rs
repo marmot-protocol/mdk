@@ -47,8 +47,28 @@ pub(crate) enum MacSender {
 pub(crate) enum MacItem {
     /// The new device's exact `KeyPackageRef`.
     KeyPackageRef = 1,
-    /// The device-group id the existing device adds the new device to.
-    DeviceGroupId = 2,
+    /// The device group the existing device adds the new device to, and the
+    /// signature key of the existing device's leaf in it
+    /// ([`device_group_value`]).
+    DeviceGroup = 2,
+}
+
+/// The value an existing device's confirmation covers:
+///
+/// ```text
+/// struct {
+///     opaque group_id<V>;
+///     opaque signature_key<V>;
+/// } PairingDeviceGroup;
+/// ```
+///
+/// The signature key binds the Welcome's sender, not just the group id, which
+/// anyone holding the account key can read and found a group under.
+pub(crate) fn device_group_value(group_id: &[u8], signature_key: &[u8]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(group_id.len() + signature_key.len() + 4);
+    put_var_bytes(group_id, &mut value);
+    put_var_bytes(signature_key, &mut value);
+    value
 }
 
 /// What the new device's request names, which its commitment covers.
@@ -252,7 +272,7 @@ pub(crate) fn sas_info(
 ///     opaque account[32];
 ///     opaque key_package_ref<V>;
 ///     opaque existing_device_slot[32];
-///     uint8 item;                   // 1 KeyPackageRef, 2 device-group id
+///     uint8 item;                   // 1 KeyPackageRef, 2 device group
 /// } PairingMacInfo;
 /// ```
 ///

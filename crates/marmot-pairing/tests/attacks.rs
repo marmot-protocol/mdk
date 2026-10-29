@@ -10,13 +10,13 @@ mod common;
 use cgka_traits::GroupId;
 use common::{
     T0, account, confirm_both, deliver_request, device_group, existing, key_package_event_id,
-    key_package_ref, new_device, published, slot, to_comparison,
+    key_package_ref, new_device, published, slot, to_comparison, welcome_signer,
 };
 use marmot_pairing::{
     CancelReason, ConfirmSender, EndReason, ExistingDeviceEvent, ExistingDevicePairing,
     IgnoreReason, KeyPackageRef, NewDeviceConfirmation, NewDeviceEvent, NewDevicePairing,
     PairingConfirm, PairingError, PairingMessage, PairingReveal, PublishedKeyPackage, SessionId,
-    commitment,
+    SignatureKey, commitment,
 };
 
 /// An attacker swaps the existing device's key for its own on the way to the
@@ -61,7 +61,7 @@ fn pairing_attack_substituted_answer_key_shows_different_codes() {
     // out.
     assert_eq!(new.confirm_match(T0), Ok(NewDeviceConfirmation::Waiting));
     let real_confirm = real
-        .confirm_link(&request.session_id, device_group(), T0)
+        .confirm_link(&request.session_id, device_group(), welcome_signer(), T0)
         .expect("tap");
     assert!(matches!(
         new.receive(&PairingMessage::Confirm(real_confirm), T0),
@@ -71,7 +71,7 @@ fn pairing_attack_substituted_answer_key_shows_different_codes() {
         }
     ));
     assert_eq!(real.linked(&request.session_id), None);
-    assert!(!new.accepts_welcome_for(&device_group()));
+    assert!(!new.accepts_welcome_for(&device_group(), welcome_signer().as_slice()));
 }
 
 /// An attacker swaps the new device's key in the reveal. The commitment the
@@ -260,7 +260,7 @@ fn pairing_attack_swapped_key_package_ref_changes_the_code() {
     // real device's KeyPackage.
     assert_eq!(new.confirm_match(T0), Ok(NewDeviceConfirmation::Waiting));
     let confirm = existing
-        .confirm_link(&request.session_id, device_group(), T0)
+        .confirm_link(&request.session_id, device_group(), welcome_signer(), T0)
         .expect("tap");
     assert!(matches!(
         new.receive(&PairingMessage::Confirm(confirm), T0),
@@ -282,11 +282,12 @@ fn pairing_attack_wrong_group_id_fails_the_confirmation() {
     pair.new.confirm_match(T0).expect("tap");
     let mut confirm = pair
         .existing
-        .confirm_link(&session_id, device_group(), T0)
+        .confirm_link(&session_id, device_group(), welcome_signer(), T0)
         .expect("tap");
     let attacker_group = GroupId::new(vec![0x0a; 16]);
     confirm.sender = ConfirmSender::ExistingDevice {
         device_group_id: attacker_group.clone(),
+        signature_key: welcome_signer(),
     };
     assert!(matches!(
         pair.new.receive(&PairingMessage::Confirm(confirm), T0),
@@ -295,8 +296,8 @@ fn pairing_attack_wrong_group_id_fails_the_confirmation() {
             ..
         }
     ));
-    assert!(!pair.new.accepts_welcome_for(&attacker_group));
-    assert!(!pair.new.accepts_welcome_for(&device_group()));
+    assert!(!pair.new.accepts_welcome_for(&attacker_group, welcome_signer().as_slice()));
+    assert!(!pair.new.accepts_welcome_for(&device_group(), welcome_signer().as_slice()));
 }
 
 /// After a link, the new device accepts a Welcome only for the confirmed
@@ -305,7 +306,7 @@ fn pairing_attack_wrong_group_id_fails_the_confirmation() {
 fn pairing_linked_new_device_accepts_only_the_confirmed_group() {
     let mut pair = to_comparison(T0);
     let session_id = pair.session_id();
-    assert!(!pair.new.accepts_welcome_for(&device_group()), "not before");
+    assert!(!pair.new.accepts_welcome_for(&device_group(), welcome_signer().as_slice()), "not before");
     let (_, new_confirm) = confirm_both(&mut pair, T0);
     assert!(matches!(
         pair.existing
@@ -313,8 +314,60 @@ fn pairing_linked_new_device_accepts_only_the_confirmed_group() {
         ExistingDeviceEvent::Linked(_)
     ));
     assert!(pair.existing.linked(&session_id).is_some());
-    assert!(pair.new.accepts_welcome_for(&device_group()));
-    assert!(!pair.new.accepts_welcome_for(&GroupId::new(vec![0x0a; 16])));
+    assert!(pair.new.accepts_welcome_for(&device_group(), welcome_signer().as_slice()));
+    assert!(!pair.new.accepts_welcome_for(&GroupId::new(vec![0x0a; 16]), welcome_signer().as_slice()));
+}
+
+/// Someone holding the account key reads the confirmed group id and swaps in
+/// their own signature key, to send the Welcome into a group of their own
+/// under that id. The confirmation covers the key, so it no longer verifies.
+#[test]
+fn pairing_swapped_welcome_signer_fails_the_confirmation() {
+    let mut pair = to_comparison(T0);
+    let session_id = pair.session_id();
+    pair.new.confirm_match(T0).expect("tap");
+    let mut confirm = pair
+        .existing
+        .confirm_link(&session_id, device_group(), welcome_signer(), T0)
+        .expect("tap");
+    let attacker_signer = SignatureKey::new(vec![0x0a; 32]).expect("32 bytes");
+    confirm.sender = ConfirmSender::ExistingDevice {
+        device_group_id: device_group(),
+        signature_key: attacker_signer.clone(),
+    };
+    assert!(matches!(
+        pair.new.receive(&PairingMessage::Confirm(confirm), T0),
+        NewDeviceEvent::Ended {
+            reason: EndReason::MismatchedConfirm,
+            ..
+        }
+    ));
+    assert!(!pair.new.accepts_welcome_for(&device_group(), attacker_signer.as_slice()));
+    assert!(!pair.new.accepts_welcome_for(&device_group(), welcome_signer().as_slice()));
+}
+
+/// After a link, a Welcome into the confirmed group is accepted only from the
+/// leaf the existing device's confirmation named. Anyone holding the account
+/// key can read the group id and found a group under it, but cannot sign as
+/// that leaf.
+#[test]
+fn pairing_linked_new_device_accepts_only_the_confirmed_sender() {
+    let mut pair = to_comparison(T0);
+    let session_id = pair.session_id();
+    let (_, new_confirm) = confirm_both(&mut pair, T0);
+    assert!(matches!(
+        pair.existing
+            .receive(&PairingMessage::Confirm(new_confirm), T0, T0),
+        ExistingDeviceEvent::Linked(_)
+    ));
+    let link = pair.new.linked().expect("linked").clone();
+    assert_eq!(link.welcome_sender_key, welcome_signer());
+    assert_eq!(
+        pair.existing.linked(&session_id).map(|link| &link.welcome_sender_key),
+        Some(&welcome_signer())
+    );
+    assert!(!pair.new.accepts_welcome_for(&device_group(), &[0x0a; 32]));
+    assert!(!pair.new.accepts_welcome_for(&device_group(), &[]));
 }
 
 /// An attacker that answers first, as itself, gets the new device to show
@@ -377,7 +430,7 @@ fn pairing_attack_replayed_confirmation_from_another_session_fails() {
         "a new session has a new code"
     );
     existing
-        .confirm_link(&request.session_id, device_group(), T0)
+        .confirm_link(&request.session_id, device_group(), welcome_signer(), T0)
         .expect("tap");
     let replayed = PairingConfirm {
         session_id: request.session_id,
@@ -447,7 +500,7 @@ fn pairing_attack_reused_code_after_mismatch_is_refused() {
         }
     );
     assert_eq!(
-        pair.existing.confirm_link(&session_id, device_group(), T0),
+        pair.existing.confirm_link(&session_id, device_group(), welcome_signer(), T0),
         Err(PairingError::WrongStep)
     );
 
