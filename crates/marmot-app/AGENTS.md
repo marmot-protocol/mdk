@@ -84,6 +84,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   opens with it set: a client dropped before a drain (a reconnect attempt whose transport fails) takes its change with
   it, and its replacement cannot see that change. Startup and reconnect settle trust with no command after them, so a
   new seam that settles trust must reach one of those two.
+- Name the device group to tag from (mdk#2628 3.1d) with `sync_device_tag_group`, which picks the same group the
+  announcement does. Naming hydrates it, so never name it at a deferred open's end: the post-hydration reconcile
+  does, as do settling a join, creating a group, maintenance and every KeyPackage publication. Name it before reading
+  whether the current KeyPackage still serves (`key_package_republish_falls_back`), since an untagged one is stale once
+  this device tags. The founder's founding entry carries its own tag signature key; every other device sets its own
+  in maintenance or, before a host KeyPackage publication, through `set_device_tag_key`, once per call, since the
+  runtime stages no KeyPackage while the key is due.
 - The overdue-refresh warning (`key_package_refresh_overdue`) asks the runtime's announcement gate, never a copy of
   the roster. The client recomputes it after each maintenance pass; a change sets
   `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
@@ -254,6 +261,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the window. That time is only a hint: never use it to retire, un-cover or drop debt. It logs aggregate counts only.
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
+- Keep the recovery runner in `src/client/recovery_runner.rs` and its `select`, `quantum`, `policy` and `tails`
+  modules (mdk#2660 phase 4). It is built but not started: nothing outside its tests constructs, wakes or reads it
+  until the switch-over replaces the comparison owner, so do not wire it from `account_worker.rs` or a host surface
+  in passing. Every ledger and retry-state write happens in a worker turn; the credit wait, caps read and sweep run
+  off the worker, and nothing read before the credit wait is planned on. Live tails are a query read fresh in each
+  turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
+  covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
+  reached right after a `rate-limited:` reply settles `RateLimited`. Every event byte a required relay sends is
+  charged to the account's rolling hour, cut and discarded replies included; best-effort relays are never charged.
+  The one uncharged reply is the one in flight when a quantum is cut (mdk#2719). Logs carry aggregates only.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown
@@ -541,7 +558,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
   (runtime-only network approval; never restore it from disk).
 - `src/client/`: `recovery.rs` (recovery grant authorization), `recovery_coverage.rs` (the shadow coverage-ledger
-  recorder and its comparison with pending obligations, mdk#2660), `invite_recovery.rs` (durable invitation recovery),
+  recorder and its comparison with pending obligations, mdk#2660), `recovery_runner.rs` (the per-account recovery
+  runner, not started yet, mdk#2660), `invite_recovery.rs` (durable invitation recovery),
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
   job).

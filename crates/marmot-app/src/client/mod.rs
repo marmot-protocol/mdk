@@ -80,6 +80,7 @@ mod push;
 mod receipts;
 pub(crate) mod recovery;
 mod recovery_coverage;
+mod recovery_runner;
 mod retention;
 pub(crate) mod sign_ins;
 mod sync;
@@ -1443,6 +1444,7 @@ impl AppClient {
         self.drive_sign_ins().await;
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
+        self.sync_device_tag_group()?;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
         self.note_key_package_refresh_overdue();
         let mut activity = self.runtime.take_maintenance_activity();

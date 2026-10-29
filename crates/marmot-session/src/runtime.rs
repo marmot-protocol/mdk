@@ -25,9 +25,10 @@ use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
 use cgka_traits::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
     GroupMaintenanceStatus, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
-    MaintenanceTrigger, PeriodicMaintenancePolicy, PostJoinHistoryFetch,
-    PostJoinHistoryFetchCompletion, PostJoinHistoryFetchOutcome, RetainedKeyPackagePrivateMaterial,
-    SendMaintenanceDisposition, TransportFanoutAttemptState, TransportFanoutTarget,
+    MaintenanceTrigger, PendingKeyPackageReplacement, PeriodicMaintenancePolicy,
+    PostJoinHistoryFetch, PostJoinHistoryFetchCompletion, PostJoinHistoryFetchOutcome,
+    RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition, TransportFanoutAttemptState,
+    TransportFanoutTarget,
 };
 use cgka_traits::storage::DeviceGroupWelcomeExpectation;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -69,6 +70,7 @@ use crate::time::{
 
 mod device_roster;
 pub use device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport};
+mod device_tag_key;
 mod slot_announcement;
 
 const TRACE_TARGET: &str = "marmot_session::runtime";
@@ -470,6 +472,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// What this device says about itself in its roster entry there (mdk#2628
     /// 3.6); every announcement writes it too.
     device_self_report: DeviceSelfReport,
+    /// The device group this device tags its KeyPackages and leaves from
+    /// (mdk#2628 3.1d), as the host last named it to the engine.
+    device_tag_group: Option<GroupId>,
     maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
     /// Monotonic time each group's own-leaf currency was last read from the
@@ -545,6 +550,7 @@ where
             key_package_slot_withdrawn: false,
             key_package_announcement_group: None,
             device_self_report: DeviceSelfReport::default(),
+            device_tag_group: None,
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
             component_migration_checked_at: HashMap::new(),
@@ -701,13 +707,6 @@ where
 
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> AccountResult<Vec<[u8; 32]>> {
         Ok(self.session.admin_pubkeys(group_id)?)
-    }
-
-    /// Tag this device's KeyPackages and leaves from `group_id`'s roster, or
-    /// stop with `None`. See
-    /// [`cgka_engine::engine::Engine::set_device_tag_group`].
-    pub fn set_device_tag_group(&mut self, group_id: Option<GroupId>) -> AccountResult<()> {
-        Ok(self.session.set_device_tag_group(group_id)?)
     }
 
     /// Which roster slot the leaf at `leaf_index` belongs to, read from its
@@ -1204,6 +1203,12 @@ where
             "preparing fresh key package for later publication"
         );
         self.ensure_key_package_slot_not_withdrawn()?;
+        // A KeyPackage staged while this device's tag signature key is due
+        // would go out untagged once the key is set (mdk#2628 3.1d), so it
+        // waits for the key, as publication waits for its announcement.
+        if !self.device_tag_key_settled()? {
+            return Err(AccountError::KeyPackageAnnouncementPending);
+        }
         let now = self.wall_clock.now();
         let mut lifecycle = match self.session.key_package_lifecycle()? {
             Some(state) => state,
@@ -1250,10 +1255,7 @@ where
             || lifecycle
                 .pending_replacement
                 .as_ref()
-                .is_none_or(|pending| {
-                    pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
-                        || withdrawn_with_slot(&lifecycle, pending.authored_created_at)
-                })
+                .is_none_or(|pending| self.pending_replacement_obsolete(&lifecycle, pending))
         {
             // Newer than every publication in the slot, and than its
             // withdrawal: relays drop anything up to that.
@@ -1579,8 +1581,7 @@ where
             None => true,
             Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
                 Some(pending) => {
-                    pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
-                        || withdrawn_with_slot(&lifecycle, pending.authored_created_at)
+                    self.pending_replacement_obsolete(&lifecycle, pending)
                         || pending.signed_event.is_none()
                         || pending
                             .targets
@@ -1613,6 +1614,20 @@ where
             || !lifecycle.upgrade_rotation_recorded
             || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
             || !self.advertises_current_capabilities(current)
+    }
+
+    /// Whether `pending` must be replaced before it is published: built by an
+    /// older generator revision, staged before the slot was withdrawn, or
+    /// built without the capabilities this device now advertises, such as a
+    /// device tag once this device tags (mdk#2628 3.1d).
+    fn pending_replacement_obsolete(
+        &self,
+        lifecycle: &KeyPackageLifecycleState,
+        pending: &PendingKeyPackageReplacement,
+    ) -> bool {
+        pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+            || withdrawn_with_slot(lifecycle, pending.authored_created_at)
+            || !self.advertises_current_capabilities(&pending.key_package)
     }
 
     /// Whether `key_package` advertises what one built now would. A package
@@ -2265,10 +2280,18 @@ where
         // it is where a stranded evolution would otherwise do its damage.
         let superseded = self.reconcile_superseded_maintenance_from_state(now)?;
         output.superseded_intents.extend(superseded);
+        // A device sets its tag signature key before it stages a KeyPackage,
+        // so the KeyPackage is built tagged (mdk#2628 3.1d). Until the merged
+        // roster carries the key, nothing is staged, announced or published.
+        let tag_key = self.set_device_tag_key_for_maintenance(held).await;
+        output.absorb_account_effects(tag_key);
+        let tag_key_settled = self.device_tag_key_settled()?;
         // While a device group is set, its roster names a KeyPackage before
         // it reaches the slot (mdk#2628 3.4), so announce first.
-        let announced = self.announce_key_package_for_maintenance(held).await?;
-        output.absorb_account_effects(announced);
+        if tag_key_settled {
+            let announced = self.announce_key_package_for_maintenance(held).await?;
+            output.absorb_account_effects(announced);
+        }
         // Fanout of an already-acknowledged exact event is publication
         // recovery, not a new preparation, so it continues while paused.
         if self.key_package_has_pending_fanout()? {
@@ -2285,10 +2308,10 @@ where
                 );
             }
         }
-        let key_package_due = self.key_package_network_maintenance_due()?;
+        let key_package_due = tag_key_settled && self.key_package_network_maintenance_due()?;
         // Paused maintenance may finish existing publication intent, but an
-        // obsolete pending generator revision requires fresh private material
-        // and therefore waits for resume like every other new preparation.
+        // obsolete pending replacement requires fresh private material and
+        // therefore waits for resume like every other new preparation.
         let key_package_prepared = self
             .session
             .key_package_lifecycle()?
@@ -2296,10 +2319,7 @@ where
                 lifecycle
                     .pending_replacement
                     .as_ref()
-                    .is_some_and(|pending| {
-                        pending.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
-                            && !withdrawn_with_slot(&lifecycle, pending.authored_created_at)
-                    })
+                    .is_some_and(|pending| !self.pending_replacement_obsolete(&lifecycle, pending))
             });
         if key_package_due && (!self.maintenance_paused || key_package_prepared) {
             let started = self.monotonic_clock.elapsed();

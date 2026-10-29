@@ -728,6 +728,33 @@ refetches nothing: the events are durable and the ledger-derived cursor is past 
 Staging is not admission; a row leaves once its event is in the seen index, or, if it no
 longer decodes, by un-covering its second so it is fetched again.
 
+### 9. The recovery runner (built, not started)
+
+`client/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
+fetches over the ledger and the retry state above. No production path starts it before the
+switch-over, so the comparison job keeps every behavior until then. A unit is one (route,
+required relay) of a group route; a best-effort relay gets one uncharged attempt per new debt.
+One step picks a unit in a worker turn and waits off the worker for one of the process's two
+recovery credits. It then begins: it reads the relay's NIP-11 caps, records known ones, reads
+the live tails again, plans the unit's owed ranges from its ledger cursor, reads the un-cover
+mark and charges the attempt. It sweeps those ranges oldest first under one 10 s deadline,
+stages each proven slice with its coverage through that mark, and applies the outcome table
+above. Progress is newly covered seconds on the unit's own relay, so live traffic, other routes
+and reconnects reset nothing. Every event byte a required relay sends counts toward the
+account's rolling-hour budget, including replies a budget cut short and replies a halving
+discards. The one exception is the reply still in flight when a quantum is cut (mdk#2719).
+
+Debt subtracts the healthy live tails. They are a process-local query that every debt turn
+asks again and nothing keeps across an await, since a tail can lapse with no event when its
+relay disconnects. The runner reads them through the live boundary's own query
+(`AppClient::live_tails`).
+Units are served by class: held groups, then open conversation windows and the inbox, then the
+rest, then best-effort relays. Within a class each eligible unit runs once per round, smallest
+route debt first, so a large group is served every round. The runner sleeps until a bump, a
+hint change, a relay reconnect or its earliest retry time. An explicit pass runs each due unit
+once in place within a budget, as a directly owned client's `sync()` will after the switch-over.
+Its starting values are convergence-ledger decision A19.
+
 ## What gets deleted
 
 Deleted in step 2:

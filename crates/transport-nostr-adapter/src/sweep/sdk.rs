@@ -12,6 +12,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -45,6 +46,8 @@ pub struct SdkSweepRelay {
     eose_hints: Option<Arc<EoseHints>>,
     request_timeout: Duration,
     reply_max_bytes: usize,
+    /// Event bytes read since [`SweepRelay::take_fetched_bytes`] last ran.
+    fetched_bytes: AtomicU64,
 }
 
 impl SdkSweepRelay {
@@ -63,6 +66,7 @@ impl SdkSweepRelay {
             caps,
             request_timeout,
             reply_max_bytes: REPLY_MAX_BYTES,
+            fetched_bytes: AtomicU64::new(0),
         }
     }
 
@@ -80,7 +84,12 @@ impl SdkSweepRelay {
         let target = ReqTarget::manual([(self.endpoint.clone(), vec![filter])]);
         let handle = self.client.acquire_events(target, limits).await.ok()?;
         let mut report = handle.finish().await.ok()?;
-        report.relays.remove(&self.endpoint)
+        let reply = report.relays.remove(&self.endpoint)?;
+        self.fetched_bytes.fetch_add(
+            u64::try_from(reply.received_event_bytes).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        Some(reply)
     }
 }
 
@@ -227,6 +236,10 @@ impl SweepRelay for SdkSweepRelay {
             events.extend(got);
         }
         SecondReply::Complete(events)
+    }
+
+    fn take_fetched_bytes(&self) -> u64 {
+        self.fetched_bytes.swap(0, Ordering::Relaxed)
     }
 }
 
