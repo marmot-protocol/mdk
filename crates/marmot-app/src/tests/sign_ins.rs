@@ -14,6 +14,7 @@ use cgka_traits::app_components::{
     decode_device_roster_v1,
 };
 use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
+use storage_sqlite::SignInAnswer;
 
 fn sign_in_app_at(
     dir: &tempfile::TempDir,
@@ -455,7 +456,8 @@ async fn a_sign_in_that_signs_out_stays_listed() {
 
 /// A device with no device group keeps its rejection and never prompts about
 /// that slot again. When it creates a device group, the founding roster
-/// carries the rejection, and nothing is left to commit.
+/// carries the rejection, and nothing is left to commit. A rejection of the
+/// slot it links ends instead: the user confirmed that link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejection_before_any_device_group_founds_the_roster() {
     let account = Account::new(3, true);
@@ -487,6 +489,12 @@ async fn a_rejection_before_any_device_group_founds_the_roster() {
     );
     let report = phone.check_sign_ins().await.unwrap();
     assert_eq!(report.slots[&tablet_slot], SlotOutcome::Rejected);
+    let laptop_slot = own_slot(&laptop);
+    phone
+        .answer_sign_in(&laptop_slot, SignInResponse::Reject)
+        .await
+        .unwrap();
+    assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
 
     let link = link_for(&laptop_key_package, 0x5a, &phone);
     let group = phone.dev_create_device_group(link).await.unwrap();
@@ -496,23 +504,25 @@ async fn a_rejection_before_any_device_group_founds_the_roster() {
         roster.rejected_slots[&tablet_slot_id].reason,
         RejectedSlotReasonV1::NotMe
     );
+    assert_eq!(roster.rejected_slots.len(), 1);
     // The slot alone: its KeyPackage could be a copy of a real device's.
     assert!(roster.rejected_key_packages.is_empty(), "{roster:?}");
     assert_eq!(roster.devices.len(), 2);
 
+    let before = relay.published_events.lock().unwrap().len();
     phone.commit_sign_in_rejections().await.unwrap();
-    assert!(
-        !storage
-            .sign_in(&tablet_slot)
-            .unwrap()
-            .unwrap()
-            .roster_pending
-    );
+    assert_eq!(relay.published_events.lock().unwrap().len(), before);
+    let tablet_record = storage.sign_in(&tablet_slot).unwrap().unwrap();
+    assert_eq!(tablet_record.answer, SignInAnswer::Rejected);
+    assert!(!tablet_record.roster_pending);
+    let laptop_record = storage.sign_in(&laptop_slot).unwrap().unwrap();
+    assert_eq!(laptop_record.answer, SignInAnswer::Dismissed);
+    assert!(!laptop_record.roster_pending);
     // The laptop it linked is a roster device now, and leaves the list.
     assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
     let report = phone.check_sign_ins().await.unwrap();
     assert_eq!(
-        report.slots[&own_slot(&laptop)],
+        report.slots[&laptop_slot],
         SlotOutcome::KnownDevice {
             announced: Announcement::Matches
         }
@@ -521,7 +531,7 @@ async fn a_rejection_before_any_device_group_founds_the_roster() {
 
 /// Rejecting a sign-in in a device group is one roster commit. A sibling
 /// whose prompt waited for it says it was rejected elsewhere until
-/// dismissed, and never prompts about it again.
+/// dismissed, and prompts about it again only while the roster has lost it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejection_in_the_device_group_reaches_every_sibling() {
     let account = Account::new(3, true);
@@ -608,6 +618,37 @@ async fn a_rejection_in_the_device_group_reaches_every_sibling() {
     assert!(laptop.unrecognized_sign_ins().unwrap().is_empty());
     let report = laptop.check_sign_ins().await.unwrap();
     assert_eq!(report.slots[&tablet_slot], SlotOutcome::Rejected);
+
+    // The roster loses the rejection: the laptop has none of its own, so it
+    // asks again, until the phone, which keeps its rejection, restores it.
+    laptop
+        .commit_device_roster_update(
+            group.clone(),
+            vec![DeviceRosterOperationV1::RemoveRejectedSlot(tablet_slot_id)],
+            "remove_rejected_slot",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed(&mut laptop),
+        [(tablet_slot.clone(), false, UnrecognizedSignInState::Prompt)]
+    );
+    laptop
+        .answer_sign_in(&tablet_slot, SignInResponse::NotNow)
+        .await
+        .unwrap();
+    let mut phone_cursor = 0;
+    deliver_new(&mut phone, relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    phone.commit_sign_in_rejections().await.unwrap();
+    assert!(
+        roster(&phone, &group)
+            .rejected_slots
+            .contains_key(&tablet_slot_id)
+    );
+    deliver_new(&mut laptop, relay, &mut cursor).await;
+    laptop.sync().await.unwrap();
+    assert!(laptop.unrecognized_sign_ins().unwrap().is_empty());
 }
 
 /// A rejection the roster loses after this device settled it is committed

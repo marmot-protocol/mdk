@@ -10,10 +10,11 @@
 //!   from the directory subscription (a nudge only: the check's read is the
 //!   evidence), and when the host asks.
 //! - **Before or after this device.** This device's first check takes a
-//!   baseline: every slot it finds is a device that was here first ("do you
-//!   still have it?"). Every slot first found later is a new sign-in ("Was this
-//!   you?"). Publication times never decide which, since the key holder
-//!   chooses them.
+//!   baseline: every slot its read returns, whether or not the slot counts
+//!   then, is a device that was here first ("do you still have it?"). Every
+//!   other slot is a new sign-in ("Was this you?"). Publication times,
+//!   freshness included, never decide which, since the key holder chooses
+//!   them.
 //! - **Answers.** Not now keeps it listed. Reject records the slot as
 //!   rejected (`not_me`) in the trusted device group's roster, in one commit
 //!   made once that group is quiet. A device with no device group keeps the
@@ -21,6 +22,10 @@
 //!   creates one, and is committed once this device trusts one it joined. A
 //!   slot the roster cannot name (a `d` that is not 32 bytes of lowercase
 //!   hex) is rejected here only. Linking is device pairing's (3.3b).
+//! - **Keeping a rejection.** A device keeps its rejection until the roster
+//!   holds the slot as a device, which means the user confirmed a link of
+//!   it. Until then it commits the rejection again whenever the roster has
+//!   no entry for the slot, and it never replaces an entry.
 //! - **Slots.** A slot is its `d` exactly as published, compared as bytes the
 //!   way relays compare it. A rejection names the slot alone, never its
 //!   KeyPackage, and a rejected KeyPackage never makes another slot rejected:
@@ -28,7 +33,9 @@
 //!   included, into a slot the user rejects. Rejected KeyPackages are Scene
 //!   8's (3.7).
 //! - **Any one device's answer.** A prompt for a slot another device linked or
-//!   rejected stays up, saying so, until dismissed.
+//!   rejected stays up, saying so, until dismissed. That answer holds only
+//!   while the roster does: a sign-in dismissed here is listed again once the
+//!   roster has no entry for its slot.
 //! - **Gone.** A sign-in whose slot a complete read finds empty stays listed,
 //!   marked as no longer signed in.
 //!
@@ -280,6 +287,7 @@ impl AppClient {
         storage.record_sign_in_check(&SignInCheck {
             unrecognized: &unrecognized,
             present_slots: &present,
+            returned_slots: &read.returned_slots,
             complete: read.complete,
             now: unix_now_seconds(),
         })?;
@@ -353,9 +361,18 @@ impl AppClient {
             _ if answered_elsewhere => {
                 return Err(AppError::DeviceGroupRefused("sign_in_answered_elsewhere"));
             }
-            SignInResponse::NotNow => (&[SignInAnswer::Unanswered], SignInAnswer::NotNow),
+            // A dismissed sign-in is listed again once the roster drops the
+            // answer it saw.
+            SignInResponse::NotNow => (
+                &[SignInAnswer::Unanswered, SignInAnswer::Dismissed],
+                SignInAnswer::NotNow,
+            ),
             SignInResponse::Reject => (
-                &[SignInAnswer::Unanswered, SignInAnswer::NotNow],
+                &[
+                    SignInAnswer::Unanswered,
+                    SignInAnswer::NotNow,
+                    SignInAnswer::Dismissed,
+                ],
                 SignInAnswer::Rejected,
             ),
         };
@@ -378,9 +395,9 @@ impl AppClient {
 
     /// Commit every rejection this device made that the trusted device
     /// group's roster lacks, in one roster update, once that group is quiet.
-    /// A rejection the roster records, or of a slot the roster holds as a
-    /// device, is settled here. With no trusted device group, rejections stay
-    /// here.
+    /// A rejection the roster records is settled here, and one of a slot the
+    /// roster holds as a device ends: the user confirmed a link of it. With
+    /// no trusted device group, rejections stay here.
     pub(crate) async fn commit_sign_in_rejections(&mut self) -> Result<(), AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let records = storage.sign_ins()?;
@@ -396,6 +413,17 @@ impl AppClient {
         };
         let mut operations = Vec::new();
         for record in pending {
+            if roster_slot(&record.slot_id_hex)
+                .is_some_and(|slot| roster.devices.contains_key(&slot))
+            {
+                storage.answer_sign_in(
+                    &record.slot_id_hex,
+                    &[SignInAnswer::Rejected],
+                    SignInAnswer::Dismissed,
+                    unix_now_seconds(),
+                )?;
+                continue;
+            }
             match rejected_slot(record, &roster)? {
                 Some((slot, rejected)) => {
                     operations.push(DeviceRosterOperationV1::SetRejectedSlot(slot, rejected));
@@ -575,9 +603,10 @@ fn roster_slot(slot_hex: &str) -> Option<DeviceSlotId> {
         .filter(|slot| hex::encode(slot) == slot_hex)
 }
 
-/// How `record` is listed, if it is. A sign-in this device rejected or
-/// dismissed is not. One another device answered keeps its prompt, saying so,
-/// only while that prompt waited here for a new sign-in. A device that was
+/// How `record` is listed, if it is. A sign-in this device rejected is not,
+/// nor one it dismissed while the roster has an entry for its slot. One
+/// another device answered keeps its prompt, saying so, only while that
+/// prompt waited here for a new sign-in. A device that was
 /// here before this one, or a sign-in this device put off or linked itself,
 /// leaves the list once the roster answers it.
 fn listed_state(
@@ -588,7 +617,20 @@ fn listed_state(
     let waiting = match record.answer {
         SignInAnswer::Unanswered => UnrecognizedSignInState::Prompt,
         SignInAnswer::NotNow => UnrecognizedSignInState::NotNow,
-        SignInAnswer::Rejected | SignInAnswer::Dismissed => return None,
+        SignInAnswer::Rejected => return None,
+        // Another device's answer, or a link that ended this device's
+        // rejection, holds only while the roster does: then ask again.
+        SignInAnswer::Dismissed => {
+            if roster
+                .zip(roster_slot(&record.slot_id_hex))
+                .is_some_and(|(roster, slot)| {
+                    roster.devices.contains_key(&slot) || roster.rejected_slots.contains_key(&slot)
+                })
+            {
+                return None;
+            }
+            UnrecognizedSignInState::Prompt
+        }
     };
     let Some((roster, slot)) = roster.zip(roster_slot(&record.slot_id_hex)) else {
         return Some(waiting);
@@ -608,10 +650,10 @@ fn listed_state(
     Some(waiting)
 }
 
-/// The rejected slot that records `record`'s rejection, if the roster lacks
-/// it and does not hold its slot as a device. A slot the roster holds as a
-/// device was linked: the conflicting answers are Scene 8's (3.7). A slot
-/// the roster cannot name stays rejected here only.
+/// The rejected slot that records `record`'s rejection, if the roster has no
+/// entry for its slot: a rejection never replaces a device or another
+/// rejected slot, a `removed` one included. A slot the roster cannot name
+/// stays rejected here only.
 fn rejected_slot(
     record: &SignInRecord,
     roster: &DeviceRosterV1,
@@ -660,8 +702,6 @@ mod tests {
             signed_in: true,
             answer,
             answered_at: (answer != SignInAnswer::Unanswered).then_some(3),
-            rejected_key_package_ref_hex: (answer == SignInAnswer::Rejected)
-                .then(|| key_package(byte)),
             roster_pending: answer == SignInAnswer::Rejected,
         }
     }
@@ -814,9 +854,16 @@ mod tests {
         assert_eq!(listed(3, Unanswered, true), None);
         assert_eq!(listed(4, NotNow, false), None);
         assert_eq!(listed(3, NotNow, false), None);
-        // Answered here.
+        // Answered here. A dismissal holds only while the roster has an entry
+        // for the slot.
         assert_eq!(listed(5, Rejected, false), None);
         assert_eq!(listed(3, Dismissed, false), None);
+        assert_eq!(listed(4, Dismissed, false), None);
+        assert_eq!(listed(5, Dismissed, false), Some(State::Prompt));
+        assert_eq!(
+            listed_state(&record(3, Dismissed, false), None, Some(&own)),
+            Some(State::Prompt)
+        );
         // Unknown to the roster.
         assert_eq!(listed(5, Unanswered, true), Some(State::Prompt));
         assert_eq!(listed(5, NotNow, false), Some(State::NotNow));

@@ -73,15 +73,16 @@ versioning through the workspace version in the root `Cargo.toml`.
 - A device notices new sign-ins on its account (mdk#2628 item 3.2). It reads every KeyPackage slot of the account at
   open, every six hours and soon after one of the account's KeyPackages arrives live, and keeps what an inviter would
   add: each slot's newest publication, not deleted, valid and fresh, with no cap on how many. A slot that is neither
-  this device's nor in its device group's roster is an unrecognized sign-in. Slots this device's first check found are
-  devices that were there before it; later ones are new sign-ins, whatever their publication times say. Malformed
-  input and client tags never raise one. Rejecting a sign-in records its slot as rejected in the device group's roster
-  in one commit, or keeps it on the device until it has a device group; a device that later creates one founds the
-  roster with it. A rejection the roster loses, to convergence or otherwise, is committed again by each device that
-  made it. A rejection names the slot alone, never its KeyPackage, which may be a copy of a real device's, and a
-  rejected KeyPackage never makes another slot rejected. A sign-in another device answered keeps its prompt, saying
-  so, until dismissed, and one whose slot empties stays listed as no longer signed in. Hosts can't reach it yet, and
-  only test-policy builds run it.
+  this device's nor in its device group's roster is an unrecognized sign-in. Slots this device's first check returned,
+  fresh or not, are devices that were there before it; other slots are new sign-ins, whatever their publication times
+  say. Malformed input and client tags never raise one. Rejecting a sign-in records its slot as rejected in the device
+  group's roster in one commit, or keeps it on the device until it has a device group; a device that later creates one
+  founds the roster with it. Each device keeps its rejections until the roster holds the slot as a device, a link the
+  user confirmed, and commits one again whenever the roster has no entry for the slot; it never replaces an entry. A
+  rejection names the slot alone, never its KeyPackage, which may be a copy of a real device's, and a rejected
+  KeyPackage never makes another slot rejected. A sign-in another device answered keeps its prompt, saying so, until
+  dismissed, and is listed again if the roster loses that answer; one whose slot empties stays listed as no longer
+  signed in. Hosts can't reach it yet, and only test-policy builds run it.
 - `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
   one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
   pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster

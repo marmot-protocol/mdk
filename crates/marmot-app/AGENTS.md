@@ -90,11 +90,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `KeyPackageRefreshOverdueChanged`. It opens set, for the same reason as `linked_devices_changed`.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription only brings a check forward (`SignInNudges`). The
-  first check's baseline, never a publication time, separates devices that were here first from new sign-ins. Rejections
+  first check's baseline, every slot id its read returned whether or not it counted, never a publication time,
+  separates devices that were here first from new sign-ins. Rejections
   are recorded locally first, then committed to the trusted roster only while the device group is quiet
   (`device_group_quiet`); a device with no device group keeps them until `create_device_group` founds the roster with
-  them or it trusts a group it joined. A slot the roster holds as a device is never rejected here. A rejection stays
-  pending until the roster shows it. Every device-group event and every superseded roster update re-arms every rejection
+  them or it trusts a group it joined. A rejection is committed only while the roster has no entry for the slot, and
+  never replaces one; a slot the roster holds as a device ends it, since the user confirmed that link. A rejection stays
+  pending until the roster shows it. A sign-in this device dismissed is listed again once the roster has no entry for
+  its slot. Every device-group event and every superseded roster update re-arms every rejection
   (`rearm_sign_in_rejections`): a rejection settled from another device's commit is lost when that commit loses
   convergence, and only a device that made the rejection restores it. A slot is its `d` as published, compared as bytes;
   one the roster cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a

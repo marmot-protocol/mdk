@@ -197,8 +197,16 @@ async fn the_account_slot_read_keeps_every_valid_slot() {
     let package = device_package(&app, account, true);
     events.push(candidate(account, package.clone(), "first", None, now));
     events.push(candidate(account, package, "copy", None, now - 10));
+    let stale = candidate(
+        account,
+        device_package(&app, account, true),
+        "stale",
+        None,
+        now - KEY_PACKAGE_FRESHNESS.as_secs() - 60,
+    );
     let records = events
         .iter()
+        .chain([&stale])
         .map(|event| RelayEventRecord {
             event: event.clone(),
             endpoints: vec![],
@@ -211,6 +219,10 @@ async fn the_account_slot_read_keeps_every_valid_slot() {
         app.directory().directory_freshness_for_test(),
     );
     assert!(slots.complete && slots.reached);
+    // Every slot the read returned, the stale one included, though only fresh
+    // ones count.
+    assert!(slots.returned_slots.contains("stale"));
+    assert_eq!(slots.returned_slots.len(), events.len() + 1);
     let mut read = slots
         .key_packages
         .into_iter()

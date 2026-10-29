@@ -743,6 +743,10 @@ pub struct AccountKeyPackageSlots {
     /// slot is here: none is capped, or dropped for sharing a signature key
     /// with another.
     pub key_packages: Vec<SlotKeyPackage>,
+    /// The `d` of every KeyPackage publication of the account the read
+    /// returned, whether or not it counts: which slots exist, whatever their
+    /// publications' times.
+    pub returned_slots: BTreeSet<String>,
     /// Every relay reached its end of stored events and no page came back
     /// full, so a slot missing here is not signed in.
     pub complete: bool,
@@ -784,8 +788,18 @@ pub fn account_key_package_slots_from_records(
             SlotKeyPackage { fetched, client }
         })
         .collect();
+    let returned_slots = records
+        .iter()
+        .filter(|record| {
+            record.event.kind == KIND_MARMOT_KEY_PACKAGE && record.event.pubkey == account
+        })
+        .filter_map(|record| record.event.tag_value("d"))
+        .filter(|slot| !slot.is_empty())
+        .map(str::to_owned)
+        .collect();
     AccountKeyPackageSlots {
         key_packages,
+        returned_slots,
         complete,
         reached,
     }

@@ -18,10 +18,10 @@ pub enum SignInAnswer {
     Unanswered,
     /// Listed as unrecognized, with no prompt.
     NotNow,
-    /// Not this account's user. The rejection holds the slot and the
-    /// KeyPackage the sign-in had when it was rejected.
+    /// Not this account's user. The rejection names the slot alone.
     Rejected,
-    /// Answered on another device, and seen here.
+    /// Answered on another device and seen here, or a rejection that a link
+    /// of the slot ended.
     Dismissed,
 }
 
@@ -63,8 +63,6 @@ pub struct SignInRecord {
     pub signed_in: bool,
     pub answer: SignInAnswer,
     pub answered_at: Option<u64>,
-    /// The KeyPackage a rejection rejected.
-    pub rejected_key_package_ref_hex: Option<String>,
     /// A rejection the device group's roster does not record yet.
     pub roster_pending: bool,
 }
@@ -87,6 +85,9 @@ pub struct SignInCheck<'a> {
     /// Every slot the check found a fresh, valid publication in, recognized
     /// or not.
     pub present_slots: &'a BTreeSet<String>,
+    /// Every slot the read returned, whether or not its publication counted.
+    /// The first check keeps them as the baseline.
+    pub returned_slots: &'a BTreeSet<String>,
     /// Whether the read was complete. Only a complete read clears
     /// `signed_in`.
     pub complete: bool,
@@ -95,7 +96,7 @@ pub struct SignInCheck<'a> {
 
 const COLUMNS: &str = "slot_id_hex, before_this_device, client, appeared_at, last_published_at,
      key_package_event_id_hex, key_package_ref_hex, signed_in, answer, answered_at,
-     rejected_key_package_ref_hex, roster_pending";
+     roster_pending";
 
 impl SqliteAppStorage {
     /// When this device's first check took the baseline, if one has.
@@ -112,8 +113,9 @@ impl SqliteAppStorage {
             .transpose()
     }
 
-    /// Record one check: take the baseline if none is taken, so this check's
-    /// new slots are devices that were here before this one; add or refresh
+    /// Record one check: take the baseline if none is taken, so every slot
+    /// this check's read returned is a device that was here before this one,
+    /// whenever it counts; add or refresh
     /// each unrecognized slot; mark every listed slot in `present_slots`, now
     /// recognized or not, as signed in; and, on a complete read, mark every
     /// slot missing from it as no longer signed in. Returns whether anything a
@@ -135,6 +137,14 @@ impl SqliteAppStorage {
                 params![now],
             )
             .storage()?;
+            for slot in check.returned_slots {
+                tx.execute_cached(
+                    "INSERT OR IGNORE INTO account_sign_in_baseline_slots (slot_id_hex)
+                     VALUES (?1)",
+                    params![slot],
+                )
+                .storage()?;
+            }
         }
         let mut changed = false;
         for observed in check.unrecognized {
@@ -220,9 +230,8 @@ impl SqliteAppStorage {
             .transpose()
     }
 
-    /// Move the sign-in's answer from one of `from` to `to`. A rejection
-    /// keeps the slot's current KeyPackage and is pending in the roster.
-    /// Returns whether the answer moved.
+    /// Move the sign-in's answer from one of `from` to `to`. A rejection is
+    /// pending in the roster. Returns whether the answer moved.
     pub fn answer_sign_in(
         &self,
         slot_id_hex: &str,
@@ -247,8 +256,6 @@ impl SqliteAppStorage {
                     "UPDATE account_sign_ins SET
                          answer = ?2,
                          answered_at = ?3,
-                         rejected_key_package_ref_hex = CASE WHEN ?4
-                             THEN key_package_ref_hex ELSE NULL END,
                          roster_pending = ?4
                      WHERE slot_id_hex = ?1 AND answer IN ({from})"
                 ),
@@ -263,9 +270,8 @@ impl SqliteAppStorage {
         Ok(changed != 0)
     }
 
-    /// The device group's roster records this rejection, or never will
-    /// because the roster holds the slot as a device. Returns whether it was
-    /// pending.
+    /// The device group's roster records this rejection, or cannot name its
+    /// slot. Returns whether it was pending.
     pub fn settle_sign_in_rejection(&self, slot_id_hex: &str) -> StorageResult<bool> {
         let changed = self
             .lock()?
@@ -278,9 +284,9 @@ impl SqliteAppStorage {
         Ok(changed != 0)
     }
 
-    /// Check every rejection against the roster again: convergence dropped a
-    /// roster update this device made, which may have carried one. Returns
-    /// how many were settled.
+    /// Check every rejection against the roster again: the device group
+    /// changed, and its roster may have lost one. Returns how many it
+    /// re-armed.
     pub fn rearm_sign_in_rejections(&self) -> StorageResult<usize> {
         self.lock()?
             .execute_cached(
@@ -299,8 +305,11 @@ impl SqliteAppStorage {
 const UPSERT_SIGN_IN: &str = "INSERT INTO account_sign_ins (
          slot_id_hex, before_this_device, client, appeared_at, last_published_at,
          key_package_event_id_hex, key_package_ref_hex, signed_in, answer, answered_at,
-         rejected_key_package_ref_hex, roster_pending)
-     VALUES (?1, ?2, ?3, MIN(?4, ?5), ?4, ?6, ?7, 1, 'none', NULL, NULL, 0)
+         roster_pending)
+     VALUES (
+         ?1,
+         ?2 OR EXISTS(SELECT 1 FROM account_sign_in_baseline_slots WHERE slot_id_hex = ?1),
+         ?3, MIN(?4, ?5), ?4, ?6, ?7, 1, 'none', NULL, 0)
      ON CONFLICT(slot_id_hex) DO UPDATE SET
          appeared_at = MIN(appeared_at, excluded.appeared_at),
          client = CASE WHEN (excluded.last_published_at > last_published_at
@@ -334,7 +343,6 @@ type SignInRow = (
     bool,
     String,
     Option<i64>,
-    Option<String>,
     bool,
 );
 
@@ -351,7 +359,6 @@ fn sign_in_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignInRow> {
         row.get(8)?,
         row.get(9)?,
         row.get(10)?,
-        row.get(11)?,
     ))
 }
 
@@ -367,7 +374,6 @@ fn sign_in_record(
         signed_in,
         answer,
         answered_at,
-        rejected_key_package_ref_hex,
         roster_pending,
     ): SignInRow,
 ) -> StorageResult<SignInRecord> {
@@ -382,7 +388,6 @@ fn sign_in_record(
         signed_in,
         answer: SignInAnswer::parse(&answer)?,
         answered_at: answered_at.map(i64_to_u64).transpose()?,
-        rejected_key_package_ref_hex,
         roster_pending,
     })
 }
@@ -417,6 +422,7 @@ mod tests {
             .record_sign_in_check(&SignInCheck {
                 unrecognized,
                 present_slots: &present,
+                returned_slots: &present,
                 complete,
                 now,
             })
@@ -444,6 +450,37 @@ mod tests {
             [("aa", true), ("bb", false)]
         );
         assert_eq!(store.sign_in_baseline().unwrap(), Some(100));
+    }
+
+    /// A slot the first read returned was here first even when nothing in it
+    /// counted then: freshness is a publication time, which never decides.
+    #[test]
+    fn a_slot_the_first_check_returned_was_here_first_whenever_it_counts() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        assert!(
+            !store
+                .record_sign_in_check(&SignInCheck {
+                    unrecognized: &[],
+                    present_slots: &BTreeSet::new(),
+                    returned_slots: &BTreeSet::from(["aa".to_owned()]),
+                    complete: true,
+                    now: 100,
+                })
+                .unwrap()
+        );
+        assert!(check(
+            &store,
+            &[observed("aa", 150, "e1"), observed("bb", 150, "e2")],
+            true,
+            200
+        ));
+        let rows = store.sign_ins().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.slot_id_hex.as_str(), row.before_this_device))
+                .collect::<Vec<_>>(),
+            [("aa", true), ("bb", false)]
+        );
     }
 
     #[test]
@@ -500,6 +537,7 @@ mod tests {
                 .record_sign_in_check(&SignInCheck {
                     unrecognized: &[],
                     present_slots: &present,
+                    returned_slots: &present,
                     complete: true,
                     now: 300,
                 })
@@ -517,6 +555,7 @@ mod tests {
                 .record_sign_in_check(&SignInCheck {
                     unrecognized: &[],
                     present_slots: &present,
+                    returned_slots: &present,
                     complete: false,
                     now: 700,
                 })
@@ -545,8 +584,7 @@ mod tests {
                 .is_err()
         );
 
-        // A rejection keeps the KeyPackage it rejected, even after the slot
-        // publishes another.
+        // A rejection holds, even after the slot publishes another.
         assert!(
             store
                 .answer_sign_in("aa", &[Unanswered, NotNow], Rejected, 300)
@@ -556,7 +594,6 @@ mod tests {
         let row = store.sign_in("aa").unwrap().unwrap();
         assert_eq!(row.answer, Rejected);
         assert_eq!(row.answered_at, Some(300));
-        assert_eq!(row.rejected_key_package_ref_hex.as_deref(), Some("ref e1"));
         assert_eq!(row.key_package_ref_hex, "ref e2");
         assert!(row.roster_pending);
         assert!(store.settle_sign_in_rejection("aa").unwrap());
