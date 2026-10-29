@@ -1,8 +1,10 @@
 //! The account's device group (mdk#2628 item 3.1): a confirmed link creates
 //! it under the id the link chose, adding only the confirmed KeyPackage. Both
-//! devices trust it, and neither ever projects it as a chat. A device group no
-//! link named stays untrusted and hidden. Pairing does not reach the app yet,
-//! so the test-policy hooks stand in for a confirmed link.
+//! devices trust it, and neither ever projects it as a chat. The new device
+//! joins it only through the Welcome its link waits for, from the leaf the
+//! link names (D28, D30); every other Welcome into the id is refused before
+//! the join. Pairing does not reach the app yet, so the test-policy hooks
+//! stand in for a confirmed link.
 
 use super::canonical_membership::{deliver_new, published_key_package};
 use super::*;
@@ -68,6 +70,7 @@ async fn phone_and_laptop() -> Devices {
             .unwrap()
             .key_package_ref_hex,
         device_group_id: GroupId::new(vec![0x5a; 16]),
+        welcome_sender_key: phone.runtime.own_signature_key(),
     };
     Devices {
         _dirs: dirs,
@@ -121,6 +124,15 @@ fn assert_hidden(app: &MarmotApp, client: &AppClient, group: &GroupId) {
     );
 }
 
+/// The device never joined `group`: its Welcome was refused before the join,
+/// so nothing holds, trusts or projects it.
+fn assert_not_held(app: &MarmotApp, client: &AppClient, group: &GroupId) {
+    assert!(!client.runtime.live_group_ids().unwrap().contains(group));
+    assert!(client.state_group_record(group).is_none());
+    assert_eq!(client.trusted_device_group().unwrap(), None);
+    assert!(app.pending_group_invites("alice").unwrap().is_empty());
+}
+
 /// The existing device creates the device group under the id the link chose,
 /// adding exactly the confirmed KeyPackage. The new device joins through the
 /// Welcome the link named, both devices trust the group, and neither ever
@@ -157,6 +169,9 @@ async fn a_confirmed_link_creates_a_hidden_device_group_both_devices_trust() {
         assert_eq!(roster_devices(client, &group), 2);
         assert_hidden(app, client, &group);
     }
+    // A withdrawal after the join finds the link done and leaves it.
+    assert!(!laptop.dev_withdraw_confirmed_device_link(&group).unwrap());
+    assert_eq!(trust(&laptop_app, &group), Some(DeviceGroupTrust::Linked));
 
     // A roster update reaches the laptop and is never projected either.
     let update = encode_device_roster_update_v1(
@@ -196,11 +211,11 @@ async fn a_confirmed_link_creates_a_hidden_device_group_both_devices_trust() {
     assert_hidden(&laptop_app, &laptop, &group);
 }
 
-/// A Welcome into a device group no confirmed link named installs a group the
-/// device holds but never trusts or projects. A link that names it later,
-/// once its Welcome won the race, makes it the account's.
+/// A Welcome into a device group no confirmed link waits for is refused
+/// before the join, so the device never holds the group, and a link recorded
+/// after it cannot claim a group someone else founded first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_device_group_no_link_named_stays_untrusted_and_hidden() {
+async fn a_device_group_welcome_no_link_waits_for_is_refused() {
     let Devices {
         _dirs,
         relay,
@@ -210,25 +225,173 @@ async fn a_device_group_no_link_named_stays_untrusted_and_hidden() {
         link,
         ..
     } = phone_and_laptop().await;
-    let group = phone.dev_create_device_group(link.clone()).await.unwrap();
+    let group = phone.dev_create_device_group(link).await.unwrap();
     let mut cursor = 0;
     deliver_new(&mut laptop, &relay, &mut cursor).await;
     laptop.sync().await.unwrap();
 
-    assert_eq!(
-        trust(&laptop_app, &group),
-        Some(DeviceGroupTrust::Untrusted)
-    );
-    assert_eq!(laptop.trusted_device_group().unwrap(), None);
-    assert!(laptop.linked_devices().unwrap().is_empty());
-    assert_hidden(&laptop_app, &laptop, &group);
+    assert_eq!(trust(&laptop_app, &group), None);
+    assert_not_held(&laptop_app, &laptop, &group);
+}
 
-    laptop.take_linked_devices_changed();
-    laptop.dev_record_confirmed_device_link(link).unwrap();
+/// Someone holding the account key reads the id a link confirmed and founds
+/// a device group under it first, with the new device's KeyPackage. The new
+/// device refuses that Welcome, whose sender is not the leaf the link names,
+/// and the link still waits for, and joins, the real one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_welcome_from_another_device_is_refused_and_the_real_one_still_joins() {
+    let Devices {
+        _dirs,
+        relay,
+        laptop_app,
+        mut phone,
+        mut laptop,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    let home = laptop_app.account_home();
+    let alice_id = home.account("alice").unwrap().account_id_hex;
+    let secret = home
+        .load_signing_keys("alice")
+        .unwrap()
+        .secret_key()
+        .to_secret_hex();
+    let holder_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(holder_dir.path())
+        .import_account("alice", &secret)
+        .unwrap();
+    let holder_app = device_group_app_at(&holder_dir, relay.clone());
+    remember_test_member_inbox(&holder_app, &alice_id, "wss://relay.example");
+    let mut holder = holder_app.client("alice").await.unwrap();
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
+
+    let forged = holder.dev_create_device_group(link.clone()).await.unwrap();
+    assert_eq!(forged, link.device_group_id);
+    let mut cursor = 0;
+    deliver_new(&mut laptop, &relay, &mut cursor).await;
+    laptop.sync().await.unwrap();
+    assert_eq!(
+        trust(&laptop_app, &forged),
+        Some(DeviceGroupTrust::AwaitingWelcome)
+    );
+    assert_not_held(&laptop_app, &laptop, &forged);
+
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    deliver_new(&mut laptop, &relay, &mut cursor).await;
+    laptop.sync().await.unwrap();
     assert_eq!(trust(&laptop_app, &group), Some(DeviceGroupTrust::Linked));
-    assert_eq!(laptop.trusted_device_group().unwrap(), Some(group));
-    assert!(laptop.take_linked_devices_changed());
-    assert_eq!(laptop.linked_devices().unwrap().len(), 2);
+    assert_eq!(laptop.trusted_device_group().unwrap(), Some(group.clone()));
+    assert_eq!(roster_devices(&laptop, &group), 2);
+    assert_hidden(&laptop_app, &laptop, &group);
+}
+
+/// A link whose wait ran out, or that was withdrawn, joins no Welcome. The
+/// engine stops waiting before the row goes, so the Welcome that comes after
+/// is refused like any other no link waits for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_or_withdrawn_link_joins_no_welcome() {
+    let Devices {
+        _dirs,
+        relay,
+        laptop_app,
+        mut phone,
+        mut laptop,
+        link,
+        ..
+    } = phone_and_laptop().await;
+
+    // The wait counts from when the link was recorded, and an open ends it.
+    let expired = GroupId::new(vec![0x6b; 16]);
+    laptop
+        .dev_record_confirmed_device_link(ConfirmedDeviceLink {
+            device_group_id: expired.clone(),
+            ..link.clone()
+        })
+        .unwrap();
+    assert!(
+        laptop_app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .set_device_group_trust(
+                &hex::encode(expired.as_slice()),
+                DeviceGroupTrust::AwaitingWelcome,
+                DeviceGroupTrust::AwaitingWelcome,
+                None,
+                1,
+            )
+            .unwrap()
+    );
+    drop(laptop);
+    let mut laptop = laptop_app.client("alice").await.unwrap();
+    assert_eq!(trust(&laptop_app, &expired), None);
+    assert!(
+        !laptop
+            .runtime
+            .withdraw_device_group_welcome(&expired)
+            .unwrap(),
+        "the open withdrew the engine's expectation"
+    );
+
+    // A withdrawn link.
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
+    assert!(
+        laptop
+            .dev_withdraw_confirmed_device_link(&link.device_group_id)
+            .unwrap()
+    );
+    assert_eq!(trust(&laptop_app, &link.device_group_id), None);
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    let mut cursor = 0;
+    deliver_new(&mut laptop, &relay, &mut cursor).await;
+    laptop.sync().await.unwrap();
+    assert_eq!(trust(&laptop_app, &group), None);
+    assert_not_held(&laptop_app, &laptop, &group);
+}
+
+/// A waiting row with no engine expectation behind it, as a crash between
+/// a record's two writes leaves, admits nothing. The next open drops it, so
+/// it never refuses a new link until its wait runs out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_row_left_without_its_expectation_is_dropped() {
+    let Devices {
+        _dirs,
+        relay,
+        laptop_app,
+        mut phone,
+        laptop,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    assert!(
+        laptop_app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .insert_device_group(&storage_sqlite::DeviceGroupRecord {
+                group_id_hex: hex::encode(link.device_group_id.as_slice()),
+                trust: DeviceGroupTrust::AwaitingWelcome,
+                key_package_ref_hex: Some(link.key_package_ref_hex.clone()),
+                recorded_at: crate::unix_now_seconds(),
+            })
+            .unwrap()
+    );
+    drop(laptop);
+    let mut laptop = laptop_app.client("alice").await.unwrap();
+    assert_eq!(trust(&laptop_app, &link.device_group_id), None);
+
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    let mut cursor = 0;
+    deliver_new(&mut laptop, &relay, &mut cursor).await;
+    laptop.sync().await.unwrap();
+    assert_eq!(trust(&laptop_app, &group), Some(DeviceGroupTrust::Linked));
 }
 
 /// The founding Add takes only the KeyPackage the link confirmed, and only
@@ -302,6 +465,7 @@ async fn a_device_without_the_roster_takes_no_link() {
         key_package_event_id_hex: "11".repeat(32),
         key_package_ref_hex: "22".repeat(32),
         device_group_id: GroupId::new(vec![0x5a; 16]),
+        welcome_sender_key: client.runtime.own_signature_key(),
     };
     let result = client.dev_create_device_group(link.clone()).await;
     assert!(
@@ -335,6 +499,9 @@ async fn an_interrupted_creation_settles_on_restart() {
         mut laptop,
         link,
     } = phone_and_laptop().await;
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
     let group = phone.dev_create_device_group(link).await.unwrap();
     let storage = phone_app.account_storage("alice").unwrap().app_storage();
     let creating = |id: &GroupId| storage_sqlite::DeviceGroupRecord {
@@ -377,14 +544,14 @@ async fn an_interrupted_creation_settles_on_restart() {
     assert!(phone.state_group_record(&chat).is_some());
 
     // The engine holds the device group as a Welcome installed it: the row
-    // goes, and the group settles as one no link named.
+    // goes, and the group settles as one no row names.
     let mut cursor = 0;
     deliver_new(&mut laptop, &relay, &mut cursor).await;
     laptop.sync().await.unwrap();
     let laptop_storage = laptop_app.account_storage("alice").unwrap().app_storage();
     assert!(
         laptop_storage
-            .delete_device_group(&group_hex, DeviceGroupTrust::Untrusted)
+            .delete_device_group(&group_hex, DeviceGroupTrust::Linked)
             .unwrap()
     );
     assert!(
@@ -445,8 +612,9 @@ async fn an_interrupted_creation_settles_before_hydration() {
 }
 
 /// A join the app never saw, because a crash came between the engine's join
-/// and the app's observation, settles on restart, or at once when the link
-/// arrives after it.
+/// and the app's observation, settles on restart: linked when its link
+/// waited for it, even past the wait, since the engine joins nothing after
+/// it. A link never claims a group the device already holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_join_the_app_never_saw_settles() {
     let Devices {
@@ -498,16 +666,21 @@ async fn a_join_the_app_never_saw_settles() {
         Some(DeviceGroupTrust::Untrusted)
     );
 
-    // The link arrives after a join the app never saw.
-    assert!(
-        storage()
-            .delete_device_group(&group_hex, DeviceGroupTrust::Untrusted)
-            .unwrap()
-    );
+    // A link that names the held group is refused.
     laptop.take_linked_devices_changed();
-    laptop.dev_record_confirmed_device_link(link).unwrap();
-    assert_eq!(trust(&laptop_app, &group), Some(DeviceGroupTrust::Linked));
-    assert!(laptop.take_linked_devices_changed());
+    let result = laptop.dev_record_confirmed_device_link(link);
+    assert!(
+        matches!(
+            result,
+            Err(AppError::DeviceGroupRefused("device_group_exists"))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        trust(&laptop_app, &group),
+        Some(DeviceGroupTrust::Untrusted)
+    );
+    assert!(!laptop.take_linked_devices_changed());
     assert_hidden(&laptop_app, &laptop, &group);
 }
 
@@ -576,20 +749,19 @@ async fn a_link_never_names_a_chat() {
     assert!(laptop.state_group_record(&laptop_chat).is_some());
 }
 
-/// A Welcome into the id a confirmed link named, for a group that does not
-/// require the roster, is no device group. Whether the join is seen live or
-/// only on a restart, the link's waiting row goes and the group projects as
-/// any other, and a later link can still claim the account.
+/// A Welcome into the id a waiting link reserved, for a group that does not
+/// require the roster, is refused: the new device neither joins the chat nor
+/// lists its invite, and the device group's Welcome still joins under the id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_chat_welcome_under_a_linked_id_is_no_device_group() {
+async fn a_chat_welcome_under_a_waiting_link_is_refused() {
     let Devices {
         _dirs,
         relay,
-        phone_app,
         laptop_app,
         mut phone,
         mut laptop,
         link,
+        ..
     } = phone_and_laptop().await;
     let alice_id = laptop_app
         .account_home()
@@ -604,68 +776,29 @@ async fn a_chat_welcome_under_a_linked_id_is_no_device_group() {
     remember_test_member_inbox(&bob_app, &alice_id, "wss://relay.example");
     let mut bob = bob_app.client("bob").await.unwrap();
     let chat = bob.create_group("chat", &[&alice_id]).await.unwrap();
-    for client in [&mut phone, &mut laptop] {
-        client
-            .dev_record_confirmed_device_link(ConfirmedDeviceLink {
-                device_group_id: chat.clone(),
-                ..link.clone()
-            })
-            .unwrap();
-    }
-    let invited = |app: &MarmotApp| {
-        app.pending_group_invites("alice")
-            .unwrap()
-            .iter()
-            .any(|invite| invite.group_id == chat)
+    let link = ConfirmedDeviceLink {
+        device_group_id: chat.clone(),
+        ..link
     };
-
-    // The laptop sees the join live.
-    let mut cursor = 0;
-    deliver_new(&mut laptop, &relay, &mut cursor).await;
-    laptop.sync().await.unwrap();
-    assert_eq!(trust(&laptop_app, &chat), None);
-    assert!(invited(&laptop_app));
     laptop
         .dev_record_confirmed_device_link(link.clone())
         .unwrap();
+
+    let mut cursor = 0;
+    deliver_new(&mut laptop, &relay, &mut cursor).await;
+    laptop.sync().await.unwrap();
     assert_eq!(
-        trust(&laptop_app, &link.device_group_id),
+        trust(&laptop_app, &chat),
         Some(DeviceGroupTrust::AwaitingWelcome)
     );
+    assert_not_held(&laptop_app, &laptop, &chat);
 
-    // The phone's engine joins, and the app never sees it before a restart.
-    let events = relay.published_events.lock().unwrap().clone();
-    for event in events {
-        if event.kind != 1059
-            || !event.tags.iter().any(|tag| {
-                tag.first().is_some_and(|name| name == "p") && tag.get(1) == Some(&alice_id)
-            })
-        {
-            continue;
-        }
-        let _ = phone
-            .runtime
-            .ingest_delivery(&cgka_traits::TransportDelivery {
-                account_id: MemberId::new(hex::decode(&alice_id).unwrap()),
-                group_id_hint: None,
-                message: event.to_transport_message().unwrap(),
-                received_at: cgka_traits::Timestamp(unix_now_seconds()),
-                source: cgka_traits::TransportDeliverySource {
-                    transport: cgka_traits::transport::TransportSource("nostr".into()),
-                    plane: cgka_traits::TransportDeliveryPlane::AccountInbox,
-                    endpoint: None,
-                    subscription_id: None,
-                    wire: None,
-                },
-            })
-            .await;
-    }
-    assert!(phone.runtime.live_group_ids().unwrap().contains(&chat));
-    assert!(phone.state_group_record(&chat).is_none());
-    drop(phone);
-    let phone = phone_app.client("alice").await.unwrap();
-    assert_eq!(trust(&phone_app, &chat), None);
-    assert!(phone.state_group_record(&chat).is_some());
+    assert_eq!(phone.dev_create_device_group(link).await.unwrap(), chat);
+    deliver_new(&mut laptop, &relay, &mut cursor).await;
+    laptop.sync().await.unwrap();
+    assert_eq!(trust(&laptop_app, &chat), Some(DeviceGroupTrust::Linked));
+    assert_eq!(laptop.trusted_device_group().unwrap(), Some(chat.clone()));
+    assert_hidden(&laptop_app, &laptop, &chat);
 }
 
 /// A deferred open holds the device group before hydration gives it a route.

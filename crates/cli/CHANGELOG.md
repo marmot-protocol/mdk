@@ -13,8 +13,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - A new `marmot-pairing` crate implements device pairing's code exchange (mdk#2628): Matrix's `m.sas.v1`
   verification in Marmot encodings, with seven emoji or three numbers to compare, a commitment to the new device's
-  key, and confirmations that cover the new device's exact `KeyPackageRef` and the device group's id. It ends in a
-  verified link and does no I/O. `transport-nostr-adapter` gift-wraps its messages to the account's own key behind
+  key, and confirmations that cover the new device's exact `KeyPackageRef`, the device group's id, and the MLS
+  signature key of the existing device's leaf in it, the only sender whose Welcome the new device accepts. It ends in
+  a verified link and does no I/O. `transport-nostr-adapter` gift-wraps its messages to the account's own key behind
   the `unreleased-device-pairing` feature. Nothing enables that feature, so no release sends pairing messages until
   the pairing spec merges.
 - `wn-agent doctor` checks a standalone connector setup without changing anything (mdk#2570). It prints one line per
@@ -35,7 +36,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 - `marmot-app` keeps an account's device group (mdk#2628 item 3.1). A confirmed device link creates it under the
   group id the link chose, and the founding Add takes this account's own device only through the exact confirmed
   KeyPackage. The device that created the group trusts it, and so does a device that joined through the Welcome a
-  confirmed link named. A Welcome into any other device group installs a group the device holds but never trusts.
+  confirmed link waits for. The new device records what that link expects (the group id, the signature key of the
+  existing device's leaf, and the end of a 10-minute wait) before it confirms, and the engine joins a device group
+  only through a Welcome that matches it, consuming the expectation in the join. Every other device-group Welcome,
+  and any Welcome into a waiting link's group id, is refused before the join with the new
+  `EngineError::UnexpectedDeviceGroupWelcome`, so a group someone else founded under the id can't take it.
+  Storage providers implement the new `DeviceGroupWelcomeStorage` trait for these expectations.
   No device group is ever a chat: it stays out of the chat list, invites, timelines and host events, while its
   relay route stays live. Pairing doesn't reach the app yet, so only test-policy builds reach any of this, through
   `MarmotAppConfig::dev_device_groups` and two hidden hooks.

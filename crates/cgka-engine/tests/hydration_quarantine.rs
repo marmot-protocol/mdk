@@ -13,9 +13,10 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePassStorage, ConvergencePolicyStorage, DisbandCandidate, DisbandCandidateStorage,
-    DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef,
-    GroupStorage, KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
+    ConvergencePassStorage, ConvergencePolicyStorage, DeviceGroupWelcomeExpectation,
+    DeviceGroupWelcomeStorage, DisbandCandidate, DisbandCandidateStorage, DisbandRequest,
+    DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage,
+    KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
     MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
     QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
     WelcomeStorage,
@@ -774,6 +775,24 @@ impl AccountDeviceSignerStorage for FlakyGroupRecordStorage {
         marmot_identity: &MemberId,
     ) -> StorageResult<Option<AccountDeviceSignerBinding>> {
         self.inner.account_device_signer(marmot_identity)
+    }
+}
+
+impl DeviceGroupWelcomeStorage for FlakyGroupRecordStorage {
+    fn put_device_group_welcome_expectation(
+        &self,
+        expectation: &DeviceGroupWelcomeExpectation,
+    ) -> StorageResult<()> {
+        self.inner.put_device_group_welcome_expectation(expectation)
+    }
+    fn device_group_welcome_expectation(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<DeviceGroupWelcomeExpectation>> {
+        self.inner.device_group_welcome_expectation(group_id)
+    }
+    fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool> {
+        self.inner.delete_device_group_welcome_expectation(group_id)
     }
 }
 

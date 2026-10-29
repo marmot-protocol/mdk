@@ -1207,6 +1207,34 @@ pub trait CgkaEngine: Send + Sync {
     /// Stable identity of the local client across every group.
     fn self_id(&self) -> MemberId;
 
+    /// This device's MLS signature public key. In this engine it is the
+    /// `signature_key` of every leaf the device creates, in every group, since
+    /// the signer is made once per account-device and never rotated; the
+    /// protocol does not require that (mdk#2628 D33). So it is also this
+    /// device's leaf key in the device group, which device pairing names in
+    /// the existing device's confirmation even before the group exists
+    /// (mdk#2628 D28).
+    fn own_signature_key(&self) -> Vec<u8>;
+
+    /// Expect the Welcome into the account's device group that a confirmed
+    /// device link names; the new device records it before it sends its own
+    /// confirmation (mdk#2628 D28, D30). Until `expires_at` the engine joins
+    /// `group_id` only through a Welcome into a group that requires the device
+    /// roster, sent by the leaf whose signature key is
+    /// `sender_signature_key`, and that join consumes the expectation. It
+    /// refuses every other Welcome into that group id, and every Welcome into a
+    /// group that requires the device roster that no expectation names, with
+    /// [`EngineError::UnexpectedDeviceGroupWelcome`]. Replaces an earlier
+    /// expectation for the same group.
+    fn expect_device_group_welcome(
+        &mut self,
+        expectation: &crate::storage::DeviceGroupWelcomeExpectation,
+    ) -> Result<(), EngineError>;
+
+    /// Drop the expectation for `group_id`, when its link is withdrawn or its
+    /// wait ends. Whether there was one.
+    fn withdraw_device_group_welcome(&mut self, group_id: &GroupId) -> Result<bool, EngineError>;
+
     /// Produce a fresh KeyPackage suitable for publishing to a KeyPackage
     /// directory. Expiry and refresh scheduling live above the engine.
     async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError>;

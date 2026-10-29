@@ -6,7 +6,7 @@ mod common;
 use cgka_traits::GroupId;
 use common::{
     Comparison, T0, confirm_both, deliver_request, device_group, existing, new_device, published,
-    slot, to_comparison,
+    slot, to_comparison, welcome_signer,
 };
 use marmot_pairing::{
     ANSWER_WINDOW_SECS, CancelReason, ConfirmSender, EndReason, ExistingDeviceEvent, IgnoreReason,
@@ -128,7 +128,7 @@ fn pairing_session_expires_ten_minutes_after_the_answer() {
     assert!(new.confirm_match(deadline - 1).is_ok());
     assert!(
         existing_device
-            .confirm_link(&session_id, device_group(), deadline - 1)
+            .confirm_link(&session_id, device_group(), welcome_signer(), deadline - 1)
             .is_ok()
     );
 
@@ -143,7 +143,7 @@ fn pairing_session_expires_ten_minutes_after_the_answer() {
     assert_eq!(new.confirm_match(deadline), Err(PairingError::Expired));
     assert_eq!(new.code(deadline), None);
     assert_eq!(
-        existing_device.confirm_link(&session_id, device_group(), deadline),
+        existing_device.confirm_link(&session_id, device_group(), welcome_signer(), deadline),
         Err(PairingError::Expired)
     );
     assert_eq!(existing_device.code(&session_id, deadline), None);
@@ -168,7 +168,7 @@ fn pairing_session_expires_ten_minutes_after_the_answer() {
     );
     let (mut new, mut existing_device, session_id) = run();
     let existing_confirm = existing_device
-        .confirm_link(&session_id, device_group(), answered)
+        .confirm_link(&session_id, device_group(), welcome_signer(), answered)
         .expect("tap");
     new.receive(&PairingMessage::Confirm(existing_confirm), answered);
     let Ok(NewDeviceConfirmation::Linked { confirm, .. }) = new.confirm_match(answered) else {
@@ -251,14 +251,19 @@ fn pairing_every_timed_call_ends_a_session_that_ran_out() {
         }),
         ("confirm_link with an invalid group id", |pair, now| {
             let session_id = pair.session_id();
-            let _ = pair
-                .existing
-                .confirm_link(&session_id, GroupId::new(Vec::new()), now);
+            let _ = pair.existing.confirm_link(
+                &session_id,
+                GroupId::new(Vec::new()),
+                welcome_signer(),
+                now,
+            );
             None
         }),
         ("confirm_link", |pair, now| {
             let session_id = pair.session_id();
-            let _ = pair.existing.confirm_link(&session_id, device_group(), now);
+            let _ = pair
+                .existing
+                .confirm_link(&session_id, device_group(), welcome_signer(), now);
             None
         }),
         ("reject_link", |pair, now| {
@@ -482,7 +487,8 @@ fn pairing_competing_request_during_a_comparison_blocks_the_link() {
     );
     assert!(!pair.existing.can_offer_link(&session_id, T0));
     assert_eq!(
-        pair.existing.confirm_link(&session_id, device_group(), T0),
+        pair.existing
+            .confirm_link(&session_id, device_group(), welcome_signer(), T0),
         Err(PairingError::CompetingRequests)
     );
     assert!(
@@ -496,7 +502,7 @@ fn pairing_competing_request_during_a_comparison_blocks_the_link() {
     assert!(pair.existing.can_offer_link(&session_id, T0));
     assert!(
         pair.existing
-            .confirm_link(&session_id, device_group(), T0)
+            .confirm_link(&session_id, device_group(), welcome_signer(), T0)
             .is_ok()
     );
 }
@@ -515,7 +521,7 @@ fn pairing_confirmations_go_in_a_fixed_order() {
     assert_eq!(pair.new.linked(), None, "nothing sent yet");
     let existing_confirm = pair
         .existing
-        .confirm_link(&session_id, device_group(), T0)
+        .confirm_link(&session_id, device_group(), welcome_signer(), T0)
         .expect("tap");
     assert_eq!(pair.existing.linked(&session_id), None);
     assert!(!pair.existing.can_offer_link(&session_id, T0), "decided");
@@ -546,7 +552,10 @@ fn pairing_confirmations_go_in_a_fixed_order() {
     // The existing device's user taps first.
     let mut pair = to_comparison(T0);
     let (_, confirm) = confirm_both(&mut pair, T0);
-    assert!(pair.new.accepts_welcome_for(&device_group()));
+    assert!(
+        pair.new
+            .accepts_welcome_for(&device_group(), welcome_signer().as_slice())
+    );
     assert!(matches!(
         pair.existing
             .receive(&PairingMessage::Confirm(confirm.clone()), T0, T0),
@@ -570,7 +579,7 @@ fn pairing_confirmations_go_in_a_fixed_order() {
         "still undecided"
     );
     pair.existing
-        .confirm_link(&session_id, device_group(), T0)
+        .confirm_link(&session_id, device_group(), welcome_signer(), T0)
         .expect("tap");
     assert!(matches!(
         pair.existing
@@ -596,7 +605,10 @@ fn pairing_a_confirmed_link_never_times_out() {
     assert_eq!(pair.new.expire(later), None);
     assert_eq!(pair.existing.expire(later), vec![]);
     assert_eq!(pair.new.linked(), Some(&link));
-    assert!(pair.new.accepts_welcome_for(&device_group()));
+    assert!(
+        pair.new
+            .accepts_welcome_for(&device_group(), welcome_signer().as_slice())
+    );
 
     // The existing device forgets the session once it would have expired;
     // the host acts on the link `Linked` carried.
@@ -620,7 +632,7 @@ fn pairing_lost_existing_device_confirmation_adds_nothing() {
     );
     // The existing device's confirmation never arrives.
     pair.existing
-        .confirm_link(&session_id, device_group(), T0)
+        .confirm_link(&session_id, device_group(), welcome_signer(), T0)
         .expect("tap");
 
     let timeout = PairingCancel {
@@ -641,7 +653,10 @@ fn pairing_lost_new_device_confirmation_adds_nothing_and_drops_the_link() {
     // The new device links and confirms, but its confirmation never
     // arrives.
     let _lost = confirm_both(&mut pair, T0);
-    assert!(pair.new.accepts_welcome_for(&device_group()));
+    assert!(
+        pair.new
+            .accepts_welcome_for(&device_group(), welcome_signer().as_slice())
+    );
 
     let cancels = pair.existing.expire(deadline);
     assert_eq!(
@@ -663,7 +678,9 @@ fn pairing_lost_new_device_confirmation_adds_nothing_and_drops_the_link() {
     );
     assert_eq!(pair.new.linked(), None);
     assert!(
-        !pair.new.accepts_welcome_for(&device_group()),
+        !pair
+            .new
+            .accepts_welcome_for(&device_group(), welcome_signer().as_slice()),
         "no Welcome is coming"
     );
 }
@@ -692,7 +709,7 @@ fn pairing_each_side_ignores_its_own_messages() {
     );
     let existing_confirm = pair
         .existing
-        .confirm_link(&session_id, device_group(), T0)
+        .confirm_link(&session_id, device_group(), welcome_signer(), T0)
         .expect("tap");
     assert_eq!(
         pair.existing
@@ -826,7 +843,7 @@ fn pairing_a_request_beyond_capacity_still_blocks_the_link() {
     assert!(existing_device.competing_requests(now));
     assert!(!existing_device.can_offer_link(&session_id, now));
     assert_eq!(
-        existing_device.confirm_link(&session_id, device_group(), now),
+        existing_device.confirm_link(&session_id, device_group(), welcome_signer(), now),
         Err(PairingError::CompetingRequests)
     );
 
@@ -835,7 +852,7 @@ fn pairing_a_request_beyond_capacity_still_blocks_the_link() {
     assert!(existing_device.can_offer_link(&session_id, expired));
     assert!(
         existing_device
-            .confirm_link(&session_id, device_group(), expired)
+            .confirm_link(&session_id, device_group(), welcome_signer(), expired)
             .is_ok()
     );
 }
