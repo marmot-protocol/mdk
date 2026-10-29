@@ -3362,8 +3362,11 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
         "nothing was released, so the account budget is still fully charged"
     );
 
-    // The terminal gate retries on the next advance and completes.
+    // The terminal gate retries on the next attempt and completes. A removal a
+    // convergence pass realized failed in that pass's apply, which now backs
+    // off before its next attempt (mdk#2684), so grant it that attempt now.
     failed_state_fault.disarm();
+    carol.retry_failed_convergence_pass(&group_a).unwrap();
     carol.advance_convergence(&group_a).await.unwrap();
     for row in &rows {
         assert_eq!(
