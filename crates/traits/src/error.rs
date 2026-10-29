@@ -358,8 +358,8 @@ impl EngineError {
         }
     }
 
-    /// Whether this error reflects transient backend contention or a recovery
-    /// source waiting for group evolution to settle, rather than a durable
+    /// Whether this error reflects transient backend contention or recovery
+    /// waiting for group evolution or local state to settle, rather than a durable
     /// failure. Ineligible copies and mismatched recovery authority are not
     /// transient: recheck eligibility and, when appropriate, obtain a fresh
     /// authenticated challenge rather than retrying the same grant.

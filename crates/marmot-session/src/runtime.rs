@@ -3784,8 +3784,8 @@ where
             }))
     }
 
-    /// Return the earliest durable retry cutoff for the first incomplete frozen
-    /// fanout in `group_id`, including its retained Welcome publications.
+    /// Return the earliest durable retry cutoff up to the first incomplete
+    /// network fanout, including earlier retained Welcome publications.
     ///
     /// `None` means the group has no network retry cutoff to honor. It may
     /// still have local-only work, such as acknowledgement cleanup for an
@@ -3795,6 +3795,7 @@ where
     /// is eligible now (including after a connectivity-restored wake).
     pub fn outbound_fanout_retry_delay_ms(&self, group_id: &GroupId) -> AccountResult<Option<u64>> {
         let now_ms = self.wall_clock.now_ms();
+        let mut welcome_delay = None;
         for fanout in self.session.outbound_fanouts_for_group(group_id)? {
             let outcome = fanout.outcome();
             if outcome.accepted_targets > 0
@@ -3810,10 +3811,15 @@ where
                     return Ok(None);
                 }
                 if !fanout.pending_post_confirmation_welcomes().is_empty() {
-                    return self.welcome_retry_delay_ms(
+                    let Some(delay) = self.welcome_retry_delay_ms(
                         fanout.pending_post_confirmation_welcomes(),
                         now_ms,
-                    );
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    welcome_delay =
+                        Some(welcome_delay.map_or(delay, |prior: u64| prior.min(delay)));
                 }
                 continue;
             }
@@ -3824,12 +3830,15 @@ where
                     earliest = Some(earliest.map_or(delay_ms, |prior: u64| prior.min(delay_ms)));
                 }
             }
-            // The first incomplete fanout is the group-scoped ordering
+            // The first incomplete network fanout is the group-scoped ordering
             // barrier, so later NotAttempted records cannot pull this cutoff
-            // forward and cause a scheduler polling loop.
-            return Ok(earliest);
+            // forward. Earlier Welcome-only continuations are not that barrier.
+            return Ok(match (earliest, welcome_delay) {
+                (Some(retry), Some(welcome)) => Some(retry.min(welcome)),
+                (retry, welcome) => retry.or(welcome),
+            });
         }
-        Ok(None)
+        Ok(welcome_delay)
     }
 
     fn welcome_retry_delay_ms(

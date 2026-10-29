@@ -1343,6 +1343,18 @@ async fn member_recovery_needs_proof() {
         refusal,
         EngineError::GroupRecoverySourceMismatch { .. }
     ));
+    // The durable halt can commit before a failed read realizes its native flag.
+    let mut halted = claimant_storage.get_group(&group_id).unwrap();
+    halted.unrecoverable = true;
+    claimant_storage.put_group(&halted).unwrap();
+    let unsettled = claimant
+        .sign_group_recovery(&group_id, &admin.self_id(), &unsigned)
+        .unwrap_err();
+    assert!(unsettled.is_transient());
+    assert!(matches!(
+        unsettled,
+        EngineError::GroupRecoveryUnsettled { .. }
+    ));
     for mutation in 0..3 {
         let mut replay = valid.clone();
         match mutation {
@@ -1529,7 +1541,7 @@ async fn recovery_legacy_coordinator() {
             members: vec![target.fresh_key_package().await.unwrap()],
             required_features: vec![],
             app_components: vec![],
-            initial_admins: vec![],
+            initial_admins: vec![target.self_id()],
         })
         .await
         .unwrap();
@@ -1547,7 +1559,7 @@ async fn recovery_legacy_coordinator() {
         .group_recovery_source(&group_id, &target.self_id(), &target_key)
         .unwrap();
     drop(admin);
-    let mut admin = EngineBuilder::new(storage)
+    let mut admin = EngineBuilder::new(storage.clone())
         .identity(pad32(b"recovery-legacy-admin"))
         .account_identity_proof_signer(proof_signer(b"recovery-legacy-admin"))
         .feature_registry(selfremove_registry())
@@ -1559,6 +1571,24 @@ async fn recovery_legacy_coordinator() {
     assert!(matches!(
         admin.group_recovery_source(&group_id, &target.self_id(), &target_key),
         Err(EngineError::GroupRecoverySourceMismatch { .. })
+    ));
+    let SendResult::GroupEvolution { msg, pending, .. } = target
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![admin.self_id()],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("remove legacy coordinator")
+    };
+    target.confirm_published(pending).await.unwrap();
+    admin.ingest(msg).await.unwrap();
+    converge_buffered_commit(&mut admin, &group_id);
+    assert!(storage.get_group(&group_id).unwrap().removed);
+    assert!(matches!(
+        admin.group_recovery_source(&group_id, &target.self_id(), &target_key),
+        Err(EngineError::NotAMember { .. })
     ));
 }
 
