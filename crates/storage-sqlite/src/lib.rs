@@ -120,6 +120,10 @@ pub use app::recovery_units::{
     RecoveryUnitState,
 };
 pub use app::sign_ins::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord};
+pub use app::stickers::{
+    StoredInstalledStickerState, StoredSticker, StoredStickerInstallOperation,
+    StoredStickerOutboxEvent, StoredStickerPack, StoredStickerPackVersion,
+};
 pub use app::timeline::{
     BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
     ConversationAccountSnapshot, ConversationAnchor, ConversationOpenAnchorOutcome,
