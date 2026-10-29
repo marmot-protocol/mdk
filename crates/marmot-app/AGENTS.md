@@ -366,7 +366,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   fence while any loss obligation is pending, clears the plane only against the exact observed generation, and
   never counts a recovery success. Notice ids are opaque and must not be logged.
 - Keep an account's delivery route open when its relay notification consumer lags: charge the lag as notification
-  loss with the REQ floor its SDK context reported at the lag, and enqueue the generation's control record. Only an
+  loss with the REQ floors its SDK context reported at the lag (per route when known; record them through
+  `record_account_recovery_loss_routed`), and enqueue the generation's control record. Only an
   unexpected consumer exit closes the route and sends the worker through reconnect (mdk#2070). The worker persists
   notification loss before waiting for its control record.
 - AccountRecoveryOwner owns the SubscriptionReplay goal, original unresolved windows, retry and completion.
