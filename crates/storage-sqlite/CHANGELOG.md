@@ -4,6 +4,16 @@
 
 ### Breaking changes
 
+- Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
+  It adds `recheck_revision` to `account_recovery_units`, which existing rows
+  start at 0. Every request that makes a re-check pass due bumps it
+  (`make_recovery_recheck_due`, `rearm_all_recovery_units`, and a cooldown
+  longer than `RecoveryUnitPolicy::recheck_after_cooldown_seconds` ending),
+  and `RecoveryRecheckPass::revision` reports it. `record_recovery_recheck`
+  takes the revision its quantum began on, records nothing once it moved, and
+  returns whether it recorded. Ending a long cooldown, by an answer or by
+  `record_recovery_relay_reconnected` (which now takes the policy and the
+  time), makes every re-check on the relay due in the same transaction.
 - Migration 0132 advances account storage to schema 132 (mdk#2660 phase 4).
   It adds `import_revision` to `account_delivery_loss_evidence`: the loss
   revision the import that last charged a generation left. Existing imported

@@ -10,7 +10,8 @@
 //!   says so: a unit no pass has finished yet, an epoch gap
 //!   (`make_recovery_recheck_due` from the gap's bound, which PR 5 calls),
 //!   explicit repair (`rearm_all_recovery_units`), or a relay that answers or
-//!   reconnects after a cooldown longer than an hour ([`after_cooldown`]).
+//!   reconnects after a cooldown longer than an hour (storage makes its
+//!   re-checks due in the write that ends the cooldown).
 //! - The runner picks one only when no debt unit is eligible (`select::pick`).
 //! - Each quantum resumes where the pass got to, and settlement records where
 //!   that now is. A failed or cut quantum un-covers nothing: the pass resumes
@@ -41,8 +42,8 @@ use super::{DebtTurn, RecoveryRunnerPolicy, UnitKey, WorkerTurn, recovery_caps};
 pub(super) struct RecheckPlan {
     pub(super) compare: ComparePlan,
     /// The pass as the begin turn read it. Settlement records progress only
-    /// while it still stands: a pass made due during the quantum (an epoch
-    /// gap, explicit repair) reruns whole.
+    /// under its revision: a pass made due during the quantum (an epoch gap,
+    /// explicit repair, a long cooldown) runs again as requested.
     pub(super) pass: RecoveryRecheckPass,
 }
 
@@ -264,7 +265,7 @@ pub(super) fn begin(
         .max(pass.position_seconds.unwrap_or(0));
     let ranges = ranges_to_check(app, key, start, now)?;
     let (Some(first), Some(last)) = (ranges.first(), ranges.last()) else {
-        app.record_recovery_recheck(&key.route, &key.relay, start, true, now)?;
+        app.record_recovery_recheck(&key.route, &key.relay, pass.revision, start, true, now)?;
         return Ok(None);
     };
     let local = local_items(
@@ -335,60 +336,19 @@ pub(super) fn settle(
         .settle_recovery_recheck(&key.route, &key.relay, outcome, &policy.unit, turn.now)?;
     let complete = facts.end == CompareEnd::Finished && report.stop.is_none();
     let moved = complete || facts.checked_through.is_some();
-    let standing = turn
-        .app
-        .recovery_unit(&key.route, &key.relay)?
-        .is_some_and(|unit| unit.recheck == plan.pass);
-    if standing {
-        if complete {
-            turn.app
-                .record_recovery_recheck(&key.route, &key.relay, 0, true, turn.now)?;
-        } else if let Some(position) = facts.checked_through {
-            turn.app
-                .record_recovery_recheck(&key.route, &key.relay, position, false, turn.now)?;
-        }
+    if moved {
+        turn.app.record_recovery_recheck(
+            &key.route,
+            &key.relay,
+            plan.pass.revision,
+            facts.checked_through.unwrap_or(0),
+            complete,
+            turn.now,
+        )?;
     }
     Ok(RecheckSettled {
         outcome,
         complete,
         moved,
     })
-}
-
-/// When the relay's current cooldown spell began, if one is running or has
-/// not been cleared yet.
-pub(super) fn cooldown_since(app: &SqliteAppStorage, relay: &str) -> StorageResult<Option<u64>> {
-    Ok(app
-        .recovery_relay_health(relay)?
-        .and_then(|health| health.cooldown)
-        .map(|(since, _)| since))
-}
-
-/// The relay's cooldown spell that began at `since` has ended, by an answer
-/// or a reconnect: if it lasted longer than the policy's bound, a full
-/// re-check of each of the relay's units falls due now. Returns the units
-/// made due.
-pub(super) fn after_cooldown(
-    turn: &WorkerTurn<'_>,
-    relay: &str,
-    since: Option<u64>,
-    policy: &RecoveryRunnerPolicy,
-) -> StorageResult<usize> {
-    let Some(since) = since else {
-        return Ok(0);
-    };
-    if turn.now.saturating_sub(since) <= policy.recheck_after_cooldown_seconds
-        || cooldown_since(turn.app, relay)?.is_some()
-    {
-        return Ok(0);
-    }
-    let mut made_due = 0;
-    for unit in turn.app.recovery_units()? {
-        if unit.relay == relay {
-            turn.app
-                .make_recovery_recheck_due(&unit.route, Some(relay), None)?;
-            made_due += 1;
-        }
-    }
-    Ok(made_due)
 }

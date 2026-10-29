@@ -271,8 +271,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   The one uncharged reply is the one in flight when a quantum is cut (mdk#2719). Logs carry aggregates only.
   A comparison or re-check quantum settles through the same table: its end maps to a sweep end (`compare::verdict`).
   A re-check settles the relay and the account budget but never its unit's retry state, records pass progress only
-  while the unit's pass still matches the one it began on, and never un-covers; it runs only when no debt unit is
-  eligible, on required relays whose recorded caps show NIP-77.
+  under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it
+  runs only when no debt unit is eligible, on required relays whose recorded caps show NIP-77. Storage makes a relay's
+  re-checks due in the same write that ends a cooldown longer than an hour; do not split that into a second write.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown

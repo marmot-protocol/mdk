@@ -396,3 +396,68 @@ async fn recovery_runner_resumes_a_failed_recheck_pass_and_uncovers_nothing() {
     );
     assert!(still_covered(&account));
 }
+
+/// A repair that makes a pass due while one of its quanta runs is not
+/// swallowed, though it leaves the pass looking as it did: the quantum
+/// records nothing, and the pass runs again from the floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_reruns_a_recheck_pass_made_due_mid_quantum() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let older = (floor, floor + HOUR - 1);
+    let newer = (floor + 2 * HOUR, t0 - 1);
+    let held = every([1; 32], floor, t0, HOUR);
+    account.hold(&route, &held);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(held)
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, newer.0);
+    account.live_boundary(&route, RELAY, older.0, older.1);
+    account.live_boundary(&route, RELAY, newer.0, newer.1);
+    host.tails.stand(&route, RELAY, t0);
+    account.record_caps(RELAY, caps(500, true), t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    // The older range compares; the repair lands before the newer one does.
+    relay.gate.hold_from(1);
+    let stepping = tokio::spawn(async move {
+        let summary = ran(runner.step().await);
+        (runner, summary)
+    });
+    wait_until("the second comparison", WAIT, || relay.gate.waiting() == 1).await;
+    let began = account.unit(&route, RELAY).recheck;
+    account.app.rearm_all_recovery_units().unwrap();
+    let requested = account.unit(&route, RELAY).recheck;
+    assert_eq!(
+        (requested.position_seconds, requested.completed_at_seconds),
+        (began.position_seconds, began.completed_at_seconds),
+        "the repair leaves the pass looking as it did"
+    );
+    relay.gate.open();
+    let (mut runner, interrupted) = stepping.await.unwrap();
+    assert!(interrupted.recheck);
+    assert_eq!(account.unit(&route, RELAY).recheck, requested);
+
+    // The pass runs again from the floor, and this time it is recorded.
+    let compared_before = relay.comparisons().len();
+    let again = ran(runner.step().await);
+    assert!(again.recheck);
+    let windows = &relay.comparisons()[compared_before..];
+    assert_eq!(windows.first().map(|window| window.since), Some(older.0));
+    assert!(
+        account
+            .unit(&route, RELAY)
+            .recheck
+            .completed_at_seconds
+            .is_some()
+    );
+}

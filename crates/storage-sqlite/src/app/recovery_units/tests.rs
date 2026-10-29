@@ -17,6 +17,7 @@ const POLICY: RecoveryUnitPolicy = RecoveryUnitPolicy {
     cooldown_cap_seconds: 3_600,
     max_attempts_per_hour: 720,
     max_event_bytes_per_hour: 256 << 20,
+    recheck_after_cooldown_seconds: 3_600,
 };
 
 fn group(byte: u8) -> TransportReconciliationRoute {
@@ -213,7 +214,8 @@ fn unreachable_waits_and_cools_the_relay_after_three() {
     );
     assert_eq!(app.recovery_account_usage(NOW + 60).unwrap().attempts, 4);
     assert_eq!(
-        app.record_recovery_relay_reconnected(RELAY).unwrap(),
+        app.record_recovery_relay_reconnected(RELAY, &POLICY, NOW + 60)
+            .unwrap(),
         Some(NOW)
     );
     let reconnected = health(&app, RELAY);
@@ -221,7 +223,116 @@ fn unreachable_waits_and_cools_the_relay_after_three() {
         (reconnected.unreachable_streak, reconnected.cooldown),
         (0, None)
     );
-    assert_eq!(app.record_recovery_relay_reconnected(RELAY).unwrap(), None);
+    assert_eq!(
+        app.record_recovery_relay_reconnected(RELAY, &POLICY, NOW + 60)
+            .unwrap(),
+        None
+    );
+}
+
+/// A cooldown spell longer than the bound makes every re-check on its relay
+/// due in the write that ends it, by an answer or a reconnect; a shorter one
+/// and other relays' passes are left alone.
+#[test]
+fn a_long_cooldown_makes_the_relays_rechecks_due_as_it_ends() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let (first, second) = (group(1), group(2));
+    let finished = |app: &SqliteAppStorage, route, relay, at| {
+        app.begin_recovery_unit_attempt(route, relay, None, at)
+            .unwrap();
+        let revision = unit(app, route, relay).recheck.revision;
+        assert!(
+            app.record_recovery_recheck(route, relay, revision, 0, true, at)
+                .unwrap()
+        );
+    };
+    let cool = |app: &SqliteAppStorage, at| {
+        for _ in 0..3 {
+            settle(app, &first, RELAY, RecoveryUnitOutcome::Unreachable, at);
+        }
+    };
+    let pass = |app: &SqliteAppStorage, route, relay| {
+        let pass = unit(app, route, relay).recheck;
+        (pass.position_seconds, pass.completed_at_seconds)
+    };
+    let done = |at| (None, Some(at));
+    let due = (None, None);
+
+    // A short spell ended by an answer changes no pass.
+    finished(&app, &second, RELAY, NOW);
+    cool(&app, NOW);
+    settle(
+        &app,
+        &first,
+        RELAY,
+        RecoveryUnitOutcome::NoProgress,
+        NOW + 3_600,
+    );
+    assert_eq!(pass(&app, &second, RELAY), done(NOW));
+
+    // A long one ended by a re-check's answer makes every pass on the relay
+    // due, and leaves another relay's alone.
+    finished(&app, &second, RELAY, NOW + 3_600);
+    finished(&app, &second, OTHER, NOW + 3_600);
+    cool(&app, NOW + 3_600);
+    settle_recheck(
+        &app,
+        &first,
+        RELAY,
+        RecoveryUnitOutcome::Advanced,
+        NOW + 7_201,
+    );
+    assert_eq!(pass(&app, &second, RELAY), due);
+    assert_eq!(pass(&app, &first, RELAY), due);
+    assert_eq!(pass(&app, &second, OTHER), done(NOW + 3_600));
+
+    // So does one ended by a reconnect.
+    finished(&app, &second, RELAY, NOW + 7_201);
+    cool(&app, NOW + 7_201);
+    assert_eq!(
+        app.record_recovery_relay_reconnected(RELAY, &POLICY, NOW + 10_802)
+            .unwrap(),
+        Some(NOW + 7_201)
+    );
+    assert_eq!(pass(&app, &second, RELAY), due);
+}
+
+/// A request that makes a pass due while a quantum runs wins, even when it
+/// leaves the pass looking as it did: the quantum's progress, recorded under
+/// the revision it began on, is refused, and the pass runs again.
+#[test]
+fn a_recheck_request_outlives_the_quantum_it_interrupts() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    app.begin_recovery_unit_attempt(&route, RELAY, None, NOW)
+        .unwrap();
+    let began = unit(&app, &route, RELAY).recheck;
+    assert_eq!(began, RecoveryRecheckPass::default());
+    app.make_recovery_recheck_due(&route, None, None).unwrap();
+    let requested = unit(&app, &route, RELAY).recheck;
+    assert_eq!(
+        (requested.position_seconds, requested.completed_at_seconds),
+        (None, None)
+    );
+    assert!(
+        !app.record_recovery_recheck(&route, RELAY, began.revision, 0, true, NOW)
+            .unwrap()
+    );
+    assert!(
+        !app.record_recovery_recheck(&route, RELAY, began.revision, NOW - 100, false, NOW)
+            .unwrap()
+    );
+    assert_eq!(unit(&app, &route, RELAY).recheck, requested);
+    assert!(
+        app.record_recovery_recheck(&route, RELAY, requested.revision, 0, true, NOW)
+            .unwrap()
+    );
+    assert_eq!(
+        unit(&app, &route, RELAY).recheck.completed_at_seconds,
+        Some(NOW)
+    );
 }
 
 /// Rate limiting cools the relay down without charging the unit.
@@ -456,7 +567,7 @@ fn explicit_repair_rearms_everything() {
     for route in [&parked, &retired] {
         owing(&app, route, NOW - 1_000, (NOW - 1_000, NOW - 501));
         break_unit(&app, route, NOW);
-        app.record_recovery_recheck(route, RELAY, 0, true, NOW)
+        app.record_recovery_recheck(route, RELAY, 0, 0, true, NOW)
             .unwrap();
     }
     let revision = unit(&app, &retired, RELAY).park.unwrap().revision;
@@ -468,7 +579,13 @@ fn explicit_repair_rearms_everything() {
             (repaired.state, repaired.no_progress),
             (RecoveryUnitState::Active, 0)
         );
-        assert_eq!(repaired.recheck, RecoveryRecheckPass::default());
+        assert_eq!(
+            repaired.recheck,
+            RecoveryRecheckPass {
+                revision: 1,
+                ..RecoveryRecheckPass::default()
+            }
+        );
         assert!(app.recovery_unit_spans(route, RELAY).unwrap().is_empty());
         assert_eq!(
             app.recovery_unit_debt(route, RELAY, NOW).unwrap(),
@@ -619,7 +736,7 @@ fn state_survives_a_reopen() {
         app.set_recovery_unit_fencing(&route, RELAY, true).unwrap();
         app.record_recovery_unit_slicing(&route, RELAY, 3_600, Some(500))
             .unwrap();
-        app.record_recovery_recheck(&route, RELAY, NOW - 400, false, NOW)
+        app.record_recovery_recheck(&route, RELAY, 0, NOW - 400, false, NOW)
             .unwrap();
         app.record_recovery_relay_caps(RELAY, Some(caps), NOW)
             .unwrap();
@@ -1370,21 +1487,28 @@ fn an_epoch_gap_keeps_what_a_due_pass_would_check() {
         app.begin_recovery_unit_attempt(route, RELAY, None, NOW)
             .unwrap();
     }
-    app.record_recovery_recheck(&running, RELAY, NOW - 400, false, NOW)
+    app.record_recovery_recheck(&running, RELAY, 0, NOW - 400, false, NOW)
         .unwrap();
-    app.record_recovery_recheck(&finished, RELAY, 0, true, NOW)
+    app.record_recovery_recheck(&finished, RELAY, 0, 0, true, NOW)
         .unwrap();
     for route in [&fresh, &running, &finished] {
         app.make_recovery_recheck_due(route, None, Some(NOW - 200))
             .unwrap();
     }
     let pass = |route| unit(&app, route, RELAY).recheck;
-    assert_eq!(pass(&fresh), RecoveryRecheckPass::default());
+    assert_eq!(
+        pass(&fresh),
+        RecoveryRecheckPass {
+            revision: 1,
+            ..RecoveryRecheckPass::default()
+        }
+    );
     assert_eq!(
         pass(&running),
         RecoveryRecheckPass {
             position_seconds: Some(NOW - 400),
             completed_at_seconds: None,
+            revision: 1,
         }
     );
     assert_eq!(
@@ -1392,6 +1516,7 @@ fn an_epoch_gap_keeps_what_a_due_pass_would_check() {
         RecoveryRecheckPass {
             position_seconds: Some(NOW - 200),
             completed_at_seconds: None,
+            revision: 1,
         }
     );
     // An earlier bound reaches further back; no bound starts from the floor.
@@ -1400,5 +1525,11 @@ fn an_epoch_gap_keeps_what_a_due_pass_would_check() {
     assert_eq!(pass(&finished).position_seconds, Some(NOW - 300));
     app.make_recovery_recheck_due(&finished, Some(RELAY), None)
         .unwrap();
-    assert_eq!(pass(&finished), RecoveryRecheckPass::default());
+    assert_eq!(
+        pass(&finished),
+        RecoveryRecheckPass {
+            revision: 3,
+            ..RecoveryRecheckPass::default()
+        }
+    );
 }

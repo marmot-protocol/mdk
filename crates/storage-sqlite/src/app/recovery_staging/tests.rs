@@ -330,6 +330,7 @@ fn staging_trims_the_units_parked_spans() {
         cooldown_cap_seconds: 3_600,
         max_attempts_per_hour: 720,
         max_event_bytes_per_hour: 256 << 20,
+        recheck_after_cooldown_seconds: 3_600,
     };
     app.widen_recovery_coverage_goals(std::slice::from_ref(&route), NOW - 100)
         .unwrap();

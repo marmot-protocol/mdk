@@ -68,7 +68,6 @@ pub(crate) struct RecoveryRunnerPolicy {
     pub(crate) staging: RecoveryStagingBounds,
     pub(crate) sweep: SweepPolicy,
     pub(crate) recheck_interval_seconds: u64,
-    pub(crate) recheck_after_cooldown_seconds: u64,
 }
 
 impl Default for RecoveryRunnerPolicy {
@@ -84,6 +83,7 @@ impl Default for RecoveryRunnerPolicy {
                 cooldown_cap_seconds: RUNNER_COOLDOWN_CAP_SECS,
                 max_attempts_per_hour: RUNNER_MAX_QUANTA_PER_HOUR,
                 max_event_bytes_per_hour: RUNNER_MAX_EVENT_BYTES_PER_HOUR,
+                recheck_after_cooldown_seconds: RUNNER_RECHECK_AFTER_COOLDOWN_SECS,
             },
             quantum: RUNNER_QUANTUM,
             request_timeout: RUNNER_REQUEST_TIMEOUT,
@@ -96,7 +96,6 @@ impl Default for RecoveryRunnerPolicy {
             },
             sweep: SweepPolicy::default(),
             recheck_interval_seconds: RUNNER_RECHECK_INTERVAL_SECS,
-            recheck_after_cooldown_seconds: RUNNER_RECHECK_AFTER_COOLDOWN_SECS,
         }
     }
 }

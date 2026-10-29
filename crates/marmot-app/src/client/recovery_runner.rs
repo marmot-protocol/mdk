@@ -498,12 +498,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         }
         let outcome = match self
             .host
-            .turn(move |turn| {
-                let spell = recheck::cooldown_since(turn.app, &plan.key.relay)?;
-                let outcome = quantum::settle(turn, &plan, &report, &policy)?;
-                rechecks_after_cooldown(turn, &plan.key.relay, spell, &policy);
-                Ok(outcome)
-            })
+            .turn(move |turn| quantum::settle(turn, &plan, &report, &policy))
             .await
         {
             None => return Step::Stopped,
@@ -590,13 +585,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         }
         let settled = match self
             .host
-            .turn(move |turn| {
-                let relay = &plan.compare.key.relay;
-                let spell = recheck::cooldown_since(turn.app, relay)?;
-                let settled = recheck::settle(turn, &plan, &report, &facts, &policy)?;
-                rechecks_after_cooldown(turn, relay, spell, &policy);
-                Ok(settled)
-            })
+            .turn(move |turn| recheck::settle(turn, &plan, &report, &facts, &policy))
             .await
         {
             None => return Step::Stopped,
@@ -666,8 +655,8 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             let recorded = self
                 .host
                 .turn(move |turn| {
-                    let spell = turn.app.record_recovery_relay_reconnected(&written)?;
-                    rechecks_after_cooldown(turn, &written, spell, &policy);
+                    turn.app
+                        .record_recovery_relay_reconnected(&written, &policy.unit, turn.now)?;
                     if caps.is_some() {
                         turn.app
                             .record_recovery_relay_caps(&written, caps, turn.now)?;
@@ -744,21 +733,6 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             Some(_) => {}
             None => self.reported_pause = None,
         }
-    }
-}
-
-/// Make the relay's re-checks due if the cooldown spell that began at
-/// `spell` ended longer than an hour after it began
-/// (`recheck::after_cooldown`). A failed write costs only the early re-check;
-/// the 6 h schedule still comes.
-fn rechecks_after_cooldown(
-    turn: &WorkerTurn<'_>,
-    relay: &str,
-    spell: Option<u64>,
-    policy: &RecoveryRunnerPolicy,
-) {
-    if let Err(error) = recheck::after_cooldown(turn, relay, spell, policy) {
-        log_failure("recheck_after_cooldown", error);
     }
 }
 

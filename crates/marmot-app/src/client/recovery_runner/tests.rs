@@ -137,9 +137,16 @@ impl Account {
     /// six hours: for tests about debt alone. An idle runner still wakes for
     /// it then.
     fn rechecked(&self, route: &Route, relay: &str, at: u64) {
-        self.app
-            .record_recovery_recheck(route, relay, 0, true, at)
-            .unwrap();
+        let revision = self
+            .app
+            .recovery_unit(route, relay)
+            .unwrap()
+            .map_or(0, |unit| unit.recheck.revision);
+        assert!(
+            self.app
+                .record_recovery_recheck(route, relay, revision, 0, true, at)
+                .unwrap()
+        );
     }
 
     fn debt(&self, route: &Route, relay: &str, until: u64) -> Vec<RecoveryCoverageRange> {
