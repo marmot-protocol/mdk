@@ -257,6 +257,7 @@ fn safe_failure_category(input: &str) -> String {
         | "account_home_unknown_account"
         | "account_home_unsupported_secret_backend"
         | "account_key_package"
+        | "account_key_package_announcement_pending"
         | "account_key_package_rotation_in_progress"
         | "account_session_busy"
         | "account_setup_key_package_recovery_available"
