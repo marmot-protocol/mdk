@@ -142,23 +142,32 @@ async fn a_snapshot_request_is_answered_only_by_the_device_it_names() {
         .unwrap();
     let phone = &mut devices.phone;
 
-    let (_, roster) = phone.trusted_device_roster().unwrap().unwrap();
+    let (group, roster) = phone.trusted_device_roster().unwrap().unwrap();
     assert_eq!(
         phone.small_state_snapshot_target(&roster).unwrap(),
         Some(laptop_slot)
     );
 
     phone
-        .receive_small_state_snapshot_request(&encode_snapshot_request(&laptop_slot))
+        .receive_small_state_snapshot_request(&group, &encode_snapshot_request(&laptop_slot))
         .unwrap();
     assert!(!phone.small_state_snapshot_answer_owed);
     assert!(
         phone
-            .receive_small_state_snapshot_request("{\"v\":1}")
+            .receive_small_state_snapshot_request(&group, "{\"v\":1}")
             .is_err()
     );
+    // Only the trusted device group carries small state.
+    let elsewhere = GroupId::new(vec![0x11; 16]);
+    let asks_phone = encode_snapshot_request(&phone_slot);
+    assert!(
+        phone
+            .receive_small_state_snapshot_request(&elsewhere, &asks_phone)
+            .is_err()
+    );
+    assert!(!phone.small_state_snapshot_answer_owed);
     phone
-        .receive_small_state_snapshot_request(&encode_snapshot_request(&phone_slot))
+        .receive_small_state_snapshot_request(&group, &asks_phone)
         .unwrap();
     assert!(phone.small_state_snapshot_answer_owed);
 }

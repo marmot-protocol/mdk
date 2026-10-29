@@ -15,6 +15,8 @@
 //!     chat this device holds. A local state that no longer matches it is a
 //!     change the user made here.
 //!   - `unsent` is 1 while this device still owes its siblings the value.
+//!   - `own` is 1 when the value is a change this device's user made, which
+//!     the device sends again if the update carrying it is invalidated.
 //! - `small_state_sync`: at most one row, written when this device starts to
 //!   take part in small state. `snapshot_owed` is 1 while this device still
 //!   has to ask a sibling for a snapshot.
@@ -38,6 +40,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             read_message_id_hex TEXT,
             observed TEXT,
             unsent INTEGER NOT NULL CHECK(unsent IN (0, 1)),
+            own INTEGER NOT NULL CHECK(own IN (0, 1)),
             updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
             PRIMARY KEY (group_id_hex, item),
             CHECK(
