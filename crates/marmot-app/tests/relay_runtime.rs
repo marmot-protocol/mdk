@@ -13200,6 +13200,7 @@ async fn invite_members_returns_before_blocked_welcome() {
 struct RateLimitGroupMessagesCountGiftWraps {
     rejection: &'static str,
     armed: Arc<AtomicBool>,
+    group_messages_rejected: Arc<AtomicUsize>,
     gift_wraps_while_armed: Arc<AtomicUsize>,
 }
 
@@ -13214,6 +13215,7 @@ impl WritePolicy for RateLimitGroupMessagesCountGiftWraps {
                 return PolicyResult::Accept;
             }
             if event.kind == OldKind::MlsGroupMessage {
+                self.group_messages_rejected.fetch_add(1, Ordering::SeqCst);
                 return PolicyResult::Reject(self.rejection.into());
             }
             if event.kind == OldKind::GiftWrap {
@@ -13292,14 +13294,22 @@ async fn assert_retained_invite_commit_holds_its_welcome(rejection: &'static str
         .epoch;
 
     policy.armed.store(true, Ordering::SeqCst);
-    // The relay retains the commit, so the caller may see either a pending
-    // success or a publish error; neither may release the Welcome.
-    let _ = runtime
+    // The relay holds the commit back: the caller sees the publish failure
+    // while the runtime retains the commit for retry.
+    let invite = runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
         .await;
+    assert!(
+        matches!(invite, Err(AppError::Publish(_))),
+        "a held-back commit fails the call: {invite:?}"
+    );
+    assert!(
+        policy.group_messages_rejected.load(Ordering::SeqCst) > 0,
+        "the invite staged its commit and tried to publish it"
+    );
 
-    // Give the worker's post-reply Welcome drive time to run, then check the
-    // commit never reached the group and no Welcome reached the relay.
+    // Give background retries time to run, then check the commit never
+    // reached the group and no Welcome reached the relay.
     sleep(Duration::from_secs(3)).await;
     assert_eq!(
         runtime

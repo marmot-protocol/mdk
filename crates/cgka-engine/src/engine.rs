@@ -3451,6 +3451,11 @@ impl<S: StorageProvider> Engine<S> {
     /// flight cannot be recalled; its later delivered mark fails, because
     /// the row is no longer `Sent`.
     ///
+    /// Only delivery-aware Welcomes (current-profile founding and invite
+    /// Welcomes) can be withdrawn. A legacy-profile create's Welcome is the
+    /// create's own publication, carried on its frozen fanout, so withdrawing
+    /// it could not stop it.
+    ///
     /// Withdrawal touches only the Welcome's own row, never group state, so
     /// it works for a group not hydrated yet: a restart must be able to stop
     /// a Welcome before hydration reaches its group.
@@ -3460,9 +3465,9 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
         let message = match &payload {
             StoredMessagePayload::OutboundWelcome(message)
-            | StoredMessagePayload::StagedInviteWelcome { message, .. }
-            | StoredMessagePayload::RawTransport(message) => Some(message),
-            StoredMessagePayload::OpenMlsWire(_)
+            | StoredMessagePayload::StagedInviteWelcome { message, .. } => Some(message),
+            StoredMessagePayload::RawTransport(_)
+            | StoredMessagePayload::OpenMlsWire(_)
             | StoredMessagePayload::SignedOpenMlsWire { .. }
             | StoredMessagePayload::OwnCommitWire { .. } => None,
         };
@@ -3470,7 +3475,7 @@ impl<S: StorageProvider> Engine<S> {
             .is_some_and(|message| matches!(message.envelope, TransportEnvelope::Welcome { .. }))
         {
             return Err(EngineError::Backend(
-                "stored message is not an outbound Welcome transport record".into(),
+                "stored message is not a delivery-aware outbound Welcome".into(),
             ));
         }
         match record.state {
@@ -3499,8 +3504,10 @@ impl<S: StorageProvider> Engine<S> {
         if record.state != MessageState::Failed {
             return Ok(false);
         }
+        // The caller is about to publish a Welcome under this id. A `Failed`
+        // row it cannot read still forbids that, so fail closed.
         let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
-            return Ok(false);
+            return Ok(true);
         };
         Ok(match &payload {
             StoredMessagePayload::OutboundWelcome(message)

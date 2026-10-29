@@ -376,3 +376,188 @@ async fn withdrawal_reports_a_delivered_welcome_and_refuses_other_messages() {
         .id;
     assert!(runtime.withdraw_welcome(&commit_id).is_err());
 }
+
+/// A Welcome withdrawn after a detached startup retry was prepared, but
+/// before the task runs, never reaches the relay.
+#[tokio::test]
+async fn detached_startup_retry_skips_a_welcome_withdrawn_before_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let OwedInviteWelcome {
+        mut runtime,
+        adapter,
+        wall,
+        welcome,
+        ..
+    } = owed_invite_welcome(dir.path()).await;
+    adapter.accept_only_endpoints(vec![
+        TransportEndpoint("wss://group.example".into()),
+        TransportEndpoint("wss://carol-inbox.example".into()),
+    ]);
+    let tried = welcome_publishes(&adapter).len();
+    let task = runtime
+        .prepare_welcome_retry_task_with_audit_context(vec![welcome.clone()], Default::default())
+        .unwrap();
+    assert_eq!(task.message_ids(), std::slice::from_ref(&welcome.id));
+
+    assert_eq!(
+        runtime.withdraw_welcome(&welcome.id).unwrap(),
+        WelcomeWithdrawal::Withdrawn
+    );
+    let finished = runtime
+        .finish_welcome_publish_task(task.run().await)
+        .await
+        .unwrap();
+
+    assert!(finished.welcome_failures.is_empty());
+    assert!(finished.failures.is_empty());
+    assert_eq!(welcome_publishes(&adapter).len(), tried);
+    // The task held the retry record; the next maintenance pass drops it.
+    wall.set(300_100);
+    runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        runtime
+            .session()
+            .transport_fanout(&welcome.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(welcome_publishes(&adapter).len(), tried);
+}
+
+/// A Welcome withdrawn while a detached startup retry runs is skipped if it
+/// is still queued behind the concurrency limit; the started ones finish.
+#[tokio::test]
+async fn detached_startup_retry_skips_a_queued_welcome_withdrawn_while_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot queued withdrawal key").unwrap();
+    let mut members = Vec::new();
+    let mut policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())]);
+    for index in 0..9 {
+        let mut recipient = current_session(
+            dir.path().join(format!("recipient-{index}.sqlite")),
+            &key,
+            format!("queued-withdrawal-{index}").as_bytes(),
+        );
+        members.push(recipient.fresh_key_package().await.unwrap());
+        policy = policy.with_inbox_route(
+            recipient.self_id(),
+            vec![TransportEndpoint(format!("wss://recipient-{index}.example"))],
+        );
+    }
+    let adapter = RecordingAdapter::default();
+    let wall = Arc::new(TestWallClock::new(300_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice-queued"),
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    // Created but never published, as after a crash: all nine Welcomes are
+    // owed for the startup retry.
+    runtime
+        .session_mut()
+        .create_group(CreateGroupRequest {
+            name: "queued withdrawal".into(),
+            description: String::new(),
+            members,
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let welcomes = runtime
+        .outstanding_welcome_deliveries()
+        .unwrap()
+        .into_iter()
+        .map(|(_, welcome)| welcome)
+        .collect::<Vec<_>>();
+    assert_eq!(welcomes.len(), 9);
+    let queued = welcomes[8].id.clone();
+
+    let gate = adapter.gate_welcome_publishes();
+    let task = runtime
+        .prepare_welcome_retry_task_with_audit_context(welcomes, Default::default())
+        .unwrap();
+    assert_eq!(task.message_ids().len(), 9);
+    let running = tokio::spawn(task.run());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while gate.active.load(Ordering::SeqCst) < 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("eight Welcome publishes fill the bounded worker set");
+    assert_eq!(
+        runtime.withdraw_welcome(&queued).unwrap(),
+        WelcomeWithdrawal::Withdrawn
+    );
+    gate.release.add_permits(9);
+    let finished = runtime
+        .finish_welcome_publish_task(running.await.unwrap())
+        .await
+        .unwrap();
+
+    let published = welcome_publishes(&adapter);
+    assert_eq!(published.len(), 8);
+    assert!(published.iter().all(|welcome| welcome.id != queued));
+    assert!(finished.welcome_failures.is_empty());
+    let outstanding = runtime.outstanding_welcome_deliveries().unwrap();
+    assert!(outstanding.is_empty(), "eight delivered, one withdrawn");
+    wall.set(300_100);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(welcome_publishes(&adapter).len(), 8);
+    assert!(
+        runtime
+            .session()
+            .transport_fanout(&queued)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A legacy-profile create's Welcome is the create's own publication on its
+/// frozen fanout, which withdrawal could not stop, so it is refused and the
+/// Welcome is left as it was.
+#[tokio::test]
+async fn legacy_create_welcome_cannot_be_withdrawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot legacy withdrawal key").unwrap();
+    let mut alice = session(dir.path().join("alice.sqlite"), &key, b"alice-legacy");
+    let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob-legacy");
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "legacy withdrawal".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let welcome_id = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { welcomes, .. } => welcomes[0].id.clone(),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    let runtime = AccountDeviceRuntime::new(
+        alice,
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())]),
+        RecordingKeyPackages::default(),
+    );
+
+    assert!(runtime.withdraw_welcome(&welcome_id).is_err());
+    assert!(
+        !runtime
+            .session()
+            .sent_welcome_withdrawn(&welcome_id)
+            .unwrap()
+    );
+}
