@@ -3826,6 +3826,25 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         self.identity.self_id().clone()
     }
 
+    fn own_signature_key(&self) -> Vec<u8> {
+        self.identity.signer.to_public_vec()
+    }
+
+    fn expect_device_group_welcome(
+        &mut self,
+        expectation: &cgka_traits::storage::DeviceGroupWelcomeExpectation,
+    ) -> Result<(), EngineError> {
+        Ok(self
+            .storage
+            .put_device_group_welcome_expectation(expectation)?)
+    }
+
+    fn withdraw_device_group_welcome(&mut self, group_id: &GroupId) -> Result<bool, EngineError> {
+        Ok(self
+            .storage
+            .delete_device_group_welcome_expectation(group_id)?)
+    }
+
     async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
         self.do_fresh_key_package()
     }

@@ -184,6 +184,7 @@ fn safe_failure_category(input: &str) -> String {
         | "peeler"
         | "serialize"
         | "invalid_welcome"
+        | "unexpected_device_group_welcome"
         | "missing_welcome_key_package"
         | "welcome_not_addressed_to_this_device"
         | "welcome_already_processed"

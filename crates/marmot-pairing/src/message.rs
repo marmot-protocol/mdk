@@ -683,22 +683,46 @@ mod tests {
         let group = format!(r#""{}""#, hex_of(9, 16));
         let key = format!(r#""{}""#, hex_of(7, 32));
         let long_group = format!(r#""{}""#, hex_of(9, crate::types::GROUP_ID_MAX_LEN + 1));
-        let long_key = format!(r#""{}""#, hex_of(7, crate::types::SIGNATURE_KEY_MAX_LEN + 1));
+        let long_key = format!(
+            r#""{}""#,
+            hex_of(7, crate::types::SIGNATURE_KEY_MAX_LEN + 1)
+        );
         for (content, valid) in [
             (confirm_json("new_device", None, None), true),
-            (confirm_json("existing_device", Some(&group), Some(&key)), true),
+            (
+                confirm_json("existing_device", Some(&group), Some(&key)),
+                true,
+            ),
             (confirm_json("new_device", Some(&group), None), false),
             (confirm_json("new_device", None, Some(&key)), false),
             (confirm_json("new_device", Some(&group), Some(&key)), false),
             (confirm_json("existing_device", None, None), false),
             (confirm_json("existing_device", Some(&group), None), false),
             (confirm_json("existing_device", None, Some(&key)), false),
-            (confirm_json("existing_device", Some("null"), Some(&key)), false),
-            (confirm_json("existing_device", Some(&group), Some("null")), false),
-            (confirm_json("existing_device", Some(r#""""#), Some(&key)), false),
-            (confirm_json("existing_device", Some(&group), Some(r#""""#)), false),
-            (confirm_json("existing_device", Some(&long_group), Some(&key)), false),
-            (confirm_json("existing_device", Some(&group), Some(&long_key)), false),
+            (
+                confirm_json("existing_device", Some("null"), Some(&key)),
+                false,
+            ),
+            (
+                confirm_json("existing_device", Some(&group), Some("null")),
+                false,
+            ),
+            (
+                confirm_json("existing_device", Some(r#""""#), Some(&key)),
+                false,
+            ),
+            (
+                confirm_json("existing_device", Some(&group), Some(r#""""#)),
+                false,
+            ),
+            (
+                confirm_json("existing_device", Some(&long_group), Some(&key)),
+                false,
+            ),
+            (
+                confirm_json("existing_device", Some(&group), Some(&long_key)),
+                false,
+            ),
             (confirm_json("someone_else", None, None), false),
         ] {
             assert_eq!(

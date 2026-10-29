@@ -368,7 +368,8 @@ impl<S: StorageProvider> Engine<S> {
                     EngineError::MissingRequiredCapabilities { .. } => {
                         InputRejectionCategory::UnsupportedRequiredFeature
                     }
-                    EngineError::NotGroupAdmin { .. } => {
+                    EngineError::NotGroupAdmin { .. }
+                    | EngineError::UnexpectedDeviceGroupWelcome => {
                         InputRejectionCategory::AuthorizationFailed
                     }
                     _ => InputRejectionCategory::InvalidEncoding,

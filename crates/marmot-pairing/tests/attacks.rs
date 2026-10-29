@@ -296,8 +296,16 @@ fn pairing_attack_wrong_group_id_fails_the_confirmation() {
             ..
         }
     ));
-    assert!(!pair.new.accepts_welcome_for(&attacker_group, welcome_signer().as_slice()));
-    assert!(!pair.new.accepts_welcome_for(&device_group(), welcome_signer().as_slice()));
+    assert!(
+        !pair
+            .new
+            .accepts_welcome_for(&attacker_group, welcome_signer().as_slice())
+    );
+    assert!(
+        !pair
+            .new
+            .accepts_welcome_for(&device_group(), welcome_signer().as_slice())
+    );
 }
 
 /// After a link, the new device accepts a Welcome only for the confirmed
@@ -306,7 +314,12 @@ fn pairing_attack_wrong_group_id_fails_the_confirmation() {
 fn pairing_linked_new_device_accepts_only_the_confirmed_group() {
     let mut pair = to_comparison(T0);
     let session_id = pair.session_id();
-    assert!(!pair.new.accepts_welcome_for(&device_group(), welcome_signer().as_slice()), "not before");
+    assert!(
+        !pair
+            .new
+            .accepts_welcome_for(&device_group(), welcome_signer().as_slice()),
+        "not before"
+    );
     let (_, new_confirm) = confirm_both(&mut pair, T0);
     assert!(matches!(
         pair.existing
@@ -314,8 +327,15 @@ fn pairing_linked_new_device_accepts_only_the_confirmed_group() {
         ExistingDeviceEvent::Linked(_)
     ));
     assert!(pair.existing.linked(&session_id).is_some());
-    assert!(pair.new.accepts_welcome_for(&device_group(), welcome_signer().as_slice()));
-    assert!(!pair.new.accepts_welcome_for(&GroupId::new(vec![0x0a; 16]), welcome_signer().as_slice()));
+    assert!(
+        pair.new
+            .accepts_welcome_for(&device_group(), welcome_signer().as_slice())
+    );
+    assert!(
+        !pair
+            .new
+            .accepts_welcome_for(&GroupId::new(vec![0x0a; 16]), welcome_signer().as_slice())
+    );
 }
 
 /// Someone holding the account key reads the confirmed group id and swaps in
@@ -342,8 +362,16 @@ fn pairing_swapped_welcome_signer_fails_the_confirmation() {
             ..
         }
     ));
-    assert!(!pair.new.accepts_welcome_for(&device_group(), attacker_signer.as_slice()));
-    assert!(!pair.new.accepts_welcome_for(&device_group(), welcome_signer().as_slice()));
+    assert!(
+        !pair
+            .new
+            .accepts_welcome_for(&device_group(), attacker_signer.as_slice())
+    );
+    assert!(
+        !pair
+            .new
+            .accepts_welcome_for(&device_group(), welcome_signer().as_slice())
+    );
 }
 
 /// After a link, a Welcome into the confirmed group is accepted only from the
@@ -363,7 +391,9 @@ fn pairing_linked_new_device_accepts_only_the_confirmed_sender() {
     let link = pair.new.linked().expect("linked").clone();
     assert_eq!(link.welcome_sender_key, welcome_signer());
     assert_eq!(
-        pair.existing.linked(&session_id).map(|link| &link.welcome_sender_key),
+        pair.existing
+            .linked(&session_id)
+            .map(|link| &link.welcome_sender_key),
         Some(&welcome_signer())
     );
     assert!(!pair.new.accepts_welcome_for(&device_group(), &[0x0a; 32]));
@@ -500,7 +530,8 @@ fn pairing_attack_reused_code_after_mismatch_is_refused() {
         }
     );
     assert_eq!(
-        pair.existing.confirm_link(&session_id, device_group(), welcome_signer(), T0),
+        pair.existing
+            .confirm_link(&session_id, device_group(), welcome_signer(), T0),
         Err(PairingError::WrongStep)
     );
 

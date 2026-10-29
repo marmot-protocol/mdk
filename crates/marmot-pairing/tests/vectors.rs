@@ -162,7 +162,12 @@ fn pairing_vectors_match_both_state_machines() {
             "{name}"
         );
         let existing_confirm = existing
-            .confirm_link(&session_id, device_group_id.clone(), signature_key.clone(), T0)
+            .confirm_link(
+                &session_id,
+                device_group_id.clone(),
+                signature_key.clone(),
+                T0,
+            )
             .expect("existing device confirms");
         assert_eq!(
             existing_confirm.mac,

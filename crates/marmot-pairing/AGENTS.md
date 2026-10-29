@@ -38,6 +38,10 @@ Device pairing's short-authentication-string exchange. For the human overview se
   verifies. The existing device links only on the new device's verified confirmation, and ignores one that arrives
   before its own. On the new device a cancel withdraws a link. Either order would let the existing device add a device
   that never learned which group to trust.
+- The existing device's confirmation covers the device group's id and the MLS signature key of its own leaf there
+  (#2628 D28), one `DeviceGroup` MAC item. The new device's `ConfirmedLink` carries both as `welcome_sender_key`;
+  the layer above admits a Welcome into that group only from that leaf. The id alone binds nothing: anyone holding the
+  account key can read it and found a group under it.
 - `src/emoji.rs` is generated from Matrix's `sas-emoji.json`. Never edit an entry by hand; the vectors pin its digest.
 - `start_pinned`, `answer_pinned` and the secret probes (`holds_secrets`, `sessions_holding_secrets`) exist for tests,
   under the `test-support` feature. Release code never enables it.

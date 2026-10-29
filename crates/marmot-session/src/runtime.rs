@@ -28,6 +28,7 @@ use cgka_traits::maintenance::{
     PostJoinHistoryFetchCompletion, PostJoinHistoryFetchOutcome, RetainedKeyPackagePrivateMaterial,
     SendMaintenanceDisposition, TransportFanoutAttemptState, TransportFanoutTarget,
 };
+use cgka_traits::storage::DeviceGroupWelcomeExpectation;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     EngineError, EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, MessageState,
@@ -773,6 +774,24 @@ where
 
     pub fn self_id(&self) -> MemberId {
         self.session.self_id()
+    }
+
+    /// This device's MLS signature key (`CgkaEngine::own_signature_key`).
+    pub fn own_signature_key(&self) -> Vec<u8> {
+        self.session.own_signature_key()
+    }
+
+    /// See `CgkaEngine::expect_device_group_welcome`.
+    pub fn expect_device_group_welcome(
+        &mut self,
+        expectation: &DeviceGroupWelcomeExpectation,
+    ) -> SessionResult<()> {
+        Ok(self.session.expect_device_group_welcome(expectation)?)
+    }
+
+    /// See `CgkaEngine::withdraw_device_group_welcome`.
+    pub fn withdraw_device_group_welcome(&mut self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.session.withdraw_device_group_welcome(group_id)?)
     }
 
     pub fn open_timings(&self) -> &SessionOpenTimings {

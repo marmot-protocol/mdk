@@ -16,9 +16,7 @@ use crate::sas::{
 use crate::session::{
     ConfirmedLink, EndReason, IgnoreReason, PairingError, REQUEST_TTL_SECS, SESSION_TTL_SECS,
 };
-use crate::types::{
-    AccountKey, KeyPackageEventId, KeyPackageRef, SessionId, SignatureKey, SlotId,
-};
+use crate::types::{AccountKey, KeyPackageEventId, KeyPackageRef, SessionId, SignatureKey, SlotId};
 
 /// The new device's pairing session.
 ///

@@ -200,6 +200,15 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     rule refusing any own device-group Commit that takes an Add from the proposal store, and `LinkDeviceUnsettled`
     instead of a queued link while convergence is unsettled or an own Commit is in flight.
 
+- **File:** `account_devices/device_group_welcome.rs` (test-policy builds only)
+  - **Owns:** Which Welcome a new device joins its device group through (mdk#2628 D28, D30): only the one a stored
+    expectation names, from the existing device's leaf and before the wait ends, which the join consumes. A
+    device-group Welcome no link expects, a forged one from another leaf, a chat Welcome under the reserved id, and a
+    Welcome after the wait or a withdrawal are refused before the join, and a refused forgery leaves the real Welcome
+    able to join. Also that this engine signs every leaf of a device with its one signature key (an implementation
+    fact, not a protocol rule, mdk#2628 D33), which lets a first link's Confirm name the creator's key before the
+    group exists.
+
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and
     `RemoveOwnAccountDevices`: the committer's Commit is classified same-account, stamped `ordinary`, carries its
