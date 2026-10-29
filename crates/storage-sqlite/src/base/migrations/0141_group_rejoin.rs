@@ -7,16 +7,16 @@ use rusqlite::Transaction;
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         r#"
-CREATE TABLE cgka_group_rejoin (
+CREATE TABLE IF NOT EXISTS cgka_group_rejoin (
     group_id BLOB NOT NULL REFERENCES cgka_groups(id) ON DELETE CASCADE,
     role INTEGER NOT NULL CHECK (role IN (0, 1)),
     request_id BLOB NOT NULL CHECK (length(request_id) = 32),
     record BLOB NOT NULL,
     PRIMARY KEY (group_id, role, request_id)
 ) WITHOUT ROWID;
-CREATE UNIQUE INDEX cgka_group_rejoin_recipient_idx
+CREATE UNIQUE INDEX IF NOT EXISTS cgka_group_rejoin_recipient_idx
     ON cgka_group_rejoin (group_id) WHERE role = 0;
-CREATE INDEX cgka_group_rejoin_role_idx
+CREATE INDEX IF NOT EXISTS cgka_group_rejoin_role_idx
     ON cgka_group_rejoin (role, group_id);
 "#,
     )
