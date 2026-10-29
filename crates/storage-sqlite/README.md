@@ -260,7 +260,12 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   those routes, each from its own bound, and widens their goals; any other generation un-covers every route the ledger
   holds from its floor upward (all of it when a floor is unknown) and widens their goals to it. Imports stay
   count-driven, since the relay plane gives an adopted marker's new drops a fresh token, and a worker observation past
-  the durable count makes its generation account-wide.
+  the durable count makes its generation account-wide. Each import stamps every generation it charges with the loss
+  revision its join left (`import_revision`, migration 0132). `recovery_loss_reach` reads where one cause's unresolved loss
+  may have lost events, by route, and `recovery_loss_reach_after` reads the same for loss imported after a loss
+  revision: what a checkpoint captured at that revision has not seen. Acknowledgment deletes the generations it
+  reclaims and keeps the highest stamp it deleted (`acknowledged_import_revision`), so below it the read answers
+  `None`: where that loss reached is no longer known.
   `uncover_recovery_coverage` does the same for the given routes only. A released receipt (`cross/release.rs`) un-covers its event's second on each route its inventory row
   placed it on. Live boundaries never cover that second again, since the REQ that delivered the event will not
   deliver it again; only a fetch proof (comparison, sweep slice, re-check) covers it, on its own relay, and the hold
