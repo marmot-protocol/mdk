@@ -87,6 +87,15 @@ Both Unrecoverable checks are local client gates, not remotely attested conditio
 current membership, device-key possession, the exact source and the fresh package; it cannot inspect the recipient's
 database or prove that its history is lost.
 
+Recovery refusal classification follows those local gates. Signing a grant for a usable recipient returns
+`GroupRecoverySourceMismatch`: the grant's replacement authority does not match the local copy, so repeating it
+cannot authorize recovery. A terminal copy returns `NotAMember`; an Unrecoverable coordinator returns
+`GroupUnrecoverableRepairRequired`. None is transient. The owner retires a coordinator's retained Challenge or
+Grant when it loses eligibility, without publishing or failing the account actor. `GroupRecoveryUnsettled` remains
+transient for pending evolution, convergence, epoch projection or an in-progress leave/disband that can still resolve.
+The engine regressions `member_recovery_needs_proof`, `recovery_halted_coordinator`, `recovery_removed_coordinator`
+and `member_recovery_refuses_stale` pin those distinctions; `recovery_halted_job_retires` covers owner retirement.
+
 The halted device contacts one known admin account at a time through its advertised inbox, then its own account
 as a fallback. A healthy authorized coordinator finds the device's current leaf by its persisted signing-key hash
 and challenges that exact leaf on its settled
@@ -128,8 +137,7 @@ it from a Welcome. They use the account inbox, not the broken group's encryption
 Kind `1159` is proposed, not allocated; the wire contract and older-client rollout questions are tracked in
 [marmot#451](https://github.com/marmot-protocol/marmot/issues/451).
 
-Migration 0126 advances account storage to schema 126 after recovery-coverage migration 0123,
-recovery-attempt-cap migration 0124 and device-groups migration 0125. It adds the
+Migration 0130 advances account storage to schema 130 after migration 0129. It adds the
 protocol-owned `cgka_group_rejoin` journal and gates older writers. These rejoin bounds belong to ledger policy A19,
 separate from A18's history-recovery parking budgets. Retry reservations precede directory and network work. One recipient episode
 permits 32 reservations across nonce rotation, request expiry, phase changes, cancellation and reopen. A newer
