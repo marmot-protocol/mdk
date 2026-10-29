@@ -1225,6 +1225,7 @@ fn recovery_expected_refusal(error: &EngineError) -> bool {
             | EngineError::NotAMember { .. }
             | EngineError::NotGroupAdmin { .. }
             | EngineError::UnknownMember { .. }
+            | EngineError::GroupUnrecoverableRepairRequired { .. }
             | EngineError::GroupRecoveryUnsettled { .. }
             | EngineError::GroupRecoverySourceMismatch { .. }
     )

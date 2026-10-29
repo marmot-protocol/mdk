@@ -1,4 +1,61 @@
 // Recovery eligibility must be checked before account-wide work or public KP rotation.
+#[tokio::test]
+async fn recovery_halted_job_retires() {
+    use cgka_traits::GroupStorage;
+    use storage_sqlite::{GroupRecoveryPhase, GroupRecoveryRole};
+
+    for phase in [GroupRecoveryPhase::Challenge, GroupRecoveryPhase::Grant] {
+        let mut peers = recovery_peers(0).await;
+        match phase {
+            GroupRecoveryPhase::Challenge => {
+                issue_recovery_challenge(&mut peers).await;
+                peers.wall.set(peers.wall.now().0 + 5);
+                assert_eq!(
+                    peers.coordinator.prepare_group_recovery().unwrap(),
+                    vec![peers.recipient.self_id()]
+                );
+            }
+            GroupRecoveryPhase::Grant => exchange_recovery(&mut peers).await,
+            _ => unreachable!(),
+        }
+        let published = peers.adapter.publishes().len();
+        let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
+        let storage =
+            SqliteAccountStorage::open_encrypted(peers._dir.path().join("alice.sqlite"), &key)
+                .unwrap();
+        // Model a durable halt discovered after reservation, before the owner
+        // advances. The real engine must refuse both source refresh and staging.
+        let mut halted = storage.get_group(&peers.group).unwrap();
+        halted.unrecoverable = true;
+        storage.put_group(&halted).unwrap();
+        let request_id = storage
+            .list_group_recoveries()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.role == GroupRecoveryRole::Coordinator)
+            .unwrap()
+            .request_id;
+        peers.coordinator.advance_group_recovery().await.unwrap();
+        assert_eq!(peers.adapter.publishes().len(), published);
+        let retired = storage
+            .group_recovery(&peers.group, GroupRecoveryRole::Coordinator, &request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retired.phase, GroupRecoveryPhase::Complete);
+        assert!(retired.commit_id.is_none());
+        assert_eq!(storage.get_group(&peers.group).unwrap(), halted);
+        peers.wall.set(peers.wall.now().0 + 120);
+        assert!(
+            !peers
+                .coordinator
+                .prepare_group_recovery()
+                .unwrap()
+                .contains(&peers.recipient.self_id()),
+            "halted coordinator must not reserve the retired peer again"
+        );
+    }
+}
+
 fn eligibility_legacy_session(
     path: impl Into<std::path::PathBuf>,
     key: &SqlCipherKey,
