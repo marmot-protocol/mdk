@@ -169,6 +169,7 @@ pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
             | EngineError::Peeler(cgka_traits::error::PeelerError::WrongRecipient)
             | EngineError::Serialize(_)
             | EngineError::InvalidWelcome
+            | EngineError::UnexpectedDeviceGroupWelcome
             | EngineError::MissingWelcomeKeyPackage
             | EngineError::InvalidCredentialIdentity(_)
             | EngineError::InvalidAccountIdentityProof(_)
@@ -1388,6 +1389,7 @@ impl<S: StorageProvider> Engine<S> {
                 .welcome_sender()
                 .map_err(|_| EngineError::InvalidWelcome)?;
             let welcome_sender_id = crate::identity::validated_member_id_of_leaf(welcome_sender)?;
+            let welcome_sender_key = welcome_sender.signature_key().as_slice().to_vec();
             // Bind the timestamp's authenticated author to the MLS inviter;
             // an unrelated sender rewrapping old Welcome bytes cannot make
             // those bytes a fresh invitation across a reset boundary.
@@ -1471,6 +1473,27 @@ impl<S: StorageProvider> Engine<S> {
                 storage @ EngineError::Storage(_) => storage,
                 _ => EngineError::InvalidWelcome,
             })?;
+
+            // 5f. A Welcome into a group that requires the device roster, or
+            // into a group id a confirmed device link reserved, joins only as
+            // that link's Welcome: into a device group, from the leaf whose
+            // signature key the link named, before its wait ends (mdk#2628
+            // D28, D30). The group id alone is no proof: anyone holding the
+            // account key can read it and found a group under it. The join
+            // consumes the expectation in this transaction.
+            let roster_required = crate::app_components::group_requires_device_roster(&mls_group)?;
+            match storage.device_group_welcome_expectation(&group_id)? {
+                Some(expected)
+                    if roster_required
+                        && expected.sender_signature_key == welcome_sender_key
+                        && joined_at.0 < expected.expires_at =>
+                {
+                    storage.delete_device_group_welcome_expectation(&group_id)?;
+                }
+                Some(_) => return Err(EngineError::UnexpectedDeviceGroupWelcome),
+                None if roster_required => return Err(EngineError::UnexpectedDeviceGroupWelcome),
+                None => {}
+            }
 
             if let Some(local_state_token) = confirmation_token {
                 pending_rejoin = Some(PendingWelcome {

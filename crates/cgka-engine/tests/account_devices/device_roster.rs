@@ -20,7 +20,7 @@ use cgka_traits::app_components::{
     DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1, decode_device_roster_v1,
     encode_device_roster_update_v1, encode_device_roster_v1,
 };
-use cgka_traits::storage::GroupStorage as _;
+use cgka_traits::storage::{DeviceGroupWelcomeExpectation, GroupStorage as _};
 
 /// A device of `account` that advertises the device roster beside
 /// account-devices.
@@ -38,6 +38,20 @@ pub(super) fn roster_device(account: &[u8]) -> Device {
         .build()
         .unwrap();
     Device { engine, storage }
+}
+
+/// `joiner` expects `author`'s Welcome into the device group `gid`, as a
+/// confirmed device link makes it (mdk#2628 D28, D30). The engine joins a
+/// device group only through such a Welcome.
+pub(super) fn expect_link_welcome(joiner: &mut Device, gid: &GroupId, author: &Device) {
+    joiner
+        .engine
+        .expect_device_group_welcome(&DeviceGroupWelcomeExpectation {
+            group_id: gid.clone(),
+            sender_signature_key: author.engine.own_signature_key(),
+            expires_at: u64::MAX,
+        })
+        .unwrap();
 }
 
 pub(super) fn slot(n: u8) -> DeviceSlotId {
@@ -124,6 +138,7 @@ pub(super) async fn found_device_group(
         panic!("current-profile founding group")
     };
     for (joiner, welcome) in joiners.iter_mut().zip(&welcomes) {
+        expect_link_welcome(joiner, &gid, creator);
         assert_joins(joiner, welcome, &gid, creator).await;
     }
     gid
@@ -147,7 +162,7 @@ fn device_group_request(
 
 /// `creator` founds a device group under `chosen`, the id a device link
 /// chose before the group existed.
-async fn create_under(
+pub(super) async fn create_under(
     creator: &mut Device,
     initial: &DeviceRosterV1,
     key_packages: Vec<KeyPackage>,
@@ -212,6 +227,7 @@ async fn a_device_group_is_created_under_the_id_its_link_chose() {
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
+    expect_link_welcome(&mut laptop, &chosen, &phone);
     assert_joins(&mut laptop, &welcomes[0], &chosen, &phone).await;
     for device in [&phone, &laptop] {
         assert!(requires_roster(device, &chosen));

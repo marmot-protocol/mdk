@@ -270,6 +270,8 @@ mod migration_0126_recovery_coverage_uncovers;
 mod migration_0127_recovery_units;
 #[path = "migrations/0128_loss_evidence_routes.rs"]
 mod migration_0128_loss_evidence_routes;
+#[path = "migrations/0129_device_group_welcome_expectations.rs"]
+mod migration_0129_device_group_welcome_expectations;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1058,6 +1060,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0128_loss_evidence_routes",
         suspend_foreign_keys: &[],
         apply: migration_0128_loss_evidence_routes::apply,
+    },
+    Migration {
+        version: 129,
+        name: "0129_device_group_welcome_expectations",
+        suspend_foreign_keys: &[],
+        apply: migration_0129_device_group_welcome_expectations::apply,
     },
 ];
 

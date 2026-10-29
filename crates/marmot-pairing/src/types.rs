@@ -9,6 +9,11 @@ pub const KEY_PACKAGE_REF_MAX_LEN: usize = 64;
 /// Largest MLS group id a confirmation can name, in bytes.
 pub const GROUP_ID_MAX_LEN: usize = 255;
 
+/// Largest MLS signature public key a confirmation can name, in bytes: the
+/// longest MLS signature scheme's, P-521's uncompressed point. With the
+/// longest group id it keeps a confirmation under the content limit.
+pub const SIGNATURE_KEY_MAX_LEN: usize = 133;
+
 macro_rules! fixed_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -91,6 +96,36 @@ impl KeyPackageRef {
 impl fmt::Debug for KeyPackageRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "KeyPackageRef({})", hex::encode(&self.0))
+    }
+}
+
+/// An MLS signature public key, as a leaf node's `signature_key`: opaque
+/// bytes, 1 to [`SIGNATURE_KEY_MAX_LEN`]. Marmot's ciphersuite makes it a
+/// 32-byte Ed25519 key.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SignatureKey(Vec<u8>);
+
+impl SignatureKey {
+    /// `None` if `bytes` is empty or longer than [`SIGNATURE_KEY_MAX_LEN`].
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Option<Self> {
+        let bytes = bytes.into();
+        (1..=SIGNATURE_KEY_MAX_LEN)
+            .contains(&bytes.len())
+            .then_some(Self(bytes))
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl fmt::Debug for SignatureKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SignatureKey({})", hex::encode(&self.0))
     }
 }
 
