@@ -121,6 +121,14 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's linked devices may have changed: re-read
+    /// `linked_devices`. Also fires once each time the account's worker opens
+    /// or reconnects. Carries no device or group identities, and may fire
+    /// with no visible change.
+    LinkedDevicesChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
 }
 
 /// FFI projection of [`cgka_traits::engine::GroupEvent`]. The previous FFI
@@ -451,6 +459,13 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_id_hex,
                 account_label,
             } => Self::HistoryNoticesChanged {
+                account_id_hex,
+                account_label,
+            },
+            MarmotAppEvent::LinkedDevicesChanged {
+                account_id_hex,
+                account_label,
+            } => Self::LinkedDevicesChanged {
                 account_id_hex,
                 account_label,
             },

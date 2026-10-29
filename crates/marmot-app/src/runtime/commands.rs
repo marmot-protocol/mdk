@@ -1045,6 +1045,19 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn linked_devices(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::LinkedDevice>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::LinkedDevices { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
     pub async fn acknowledge_group_catching_up(
         &self,
         account_ref: &str,

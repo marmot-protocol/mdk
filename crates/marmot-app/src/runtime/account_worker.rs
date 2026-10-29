@@ -483,6 +483,9 @@ pub(crate) enum AccountWorkerCommand {
     HistoryNotices {
         respond: oneshot::Sender<Result<Vec<crate::HistoryNotice>, AppError>>,
     },
+    LinkedDevices {
+        respond: oneshot::Sender<Result<Vec<crate::LinkedDevice>, AppError>>,
+    },
     DismissHistoryNotice {
         notice_id: String,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -2005,7 +2008,7 @@ async fn run_app_runtime_account_worker(
                 )
                 .await;
                 // A settled pass is where recovery parks or completes.
-                publish_history_notice_changes(
+                publish_account_level_changes(
                     &mut client,
                     &events,
                     &account_id_hex,
@@ -2553,7 +2556,7 @@ async fn run_app_runtime_account_worker(
                         account_error_message("native replay synchronization failed", &error),
                     );
                 }
-                publish_history_notice_changes(
+                publish_account_level_changes(
                     &mut client, &events, &account_id_hex, &account_label,
                 );
             }
@@ -3632,7 +3635,7 @@ async fn handle_account_worker_catch_up(
     });
     // A job that parked or reopened recovery debt announces it before the
     // caller, who may re-read the notices at once, gets its answer.
-    publish_history_notice_changes(
+    publish_account_level_changes(
         client,
         context.events,
         context.account_id_hex,
@@ -4811,7 +4814,7 @@ async fn handle_account_worker_command(
         // One publication seam covers all successful dispatch completions. Early
         // admission failures and cancelled commands retain their previous behavior.
         publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
-        publish_history_notice_changes(client, events, account_id_hex, account_label);
+        publish_account_level_changes(client, events, account_id_hex, account_label);
     }
 }
 
@@ -5062,7 +5065,7 @@ fn account_worker_command_future<'a>(
             );
             // Announce a parked or reopened obligation before the caller
             // re-reads the notices.
-            publish_history_notice_changes(client, events, account_id_hex, account_label);
+            publish_account_level_changes(client, events, account_id_hex, account_label);
             let _ = respond.send(result);
             true
         }),
@@ -5720,6 +5723,15 @@ fn account_worker_command_future<'a>(
             );
             true
         }),
+        AccountWorkerCommand::LinkedDevices { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.linked_devices(),
+            );
+            true
+        }),
         AccountWorkerCommand::AcknowledgeGroupCatchingUp { group_id, respond } => {
             Box::pin(async move {
                 let _ = respond_diagnosed(
@@ -5755,7 +5767,7 @@ fn account_worker_command_future<'a>(
             Box::pin(async move {
                 let result = client.dismiss_history_notice(&notice_id);
                 // Announce the removal before the caller re-reads anything.
-                publish_history_notice_changes(client, events, account_id_hex, account_label);
+                publish_account_level_changes(client, events, account_id_hex, account_label);
                 let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
                 true
             })
@@ -7809,7 +7821,7 @@ fn publish_client_pending_projection_updates(
         None,
         publication,
     );
-    publish_history_notice_changes(client, events, account_id_hex, account_label);
+    publish_account_level_changes(client, events, account_id_hex, account_label);
     for group_id in client.pending_recovery_status_updates.drain() {
         publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
     }
@@ -7842,15 +7854,19 @@ fn publish_client_pending_applied_summary(
 ) {
     let summary = client.take_pending_applied_sync_summary();
     publish_app_runtime_summary_with_v5(client, events, account_id_hex, account_label, &summary);
+    // Startup and reconnect reconcile device-group trust before reaching
+    // here, and no account-level seam follows them until the next command.
+    publish_linked_device_changes(client, events, account_id_hex, account_label);
 }
 
-/// Announce a change in the parked recovery set ("history may be incomplete"):
-/// one account-level `HistoryNoticesChanged`, plus `GroupStateUpdated` for each
-/// group whose own notices appeared or disappeared, so hosts re-read that
-/// group's `GroupRecoveryStatus`. Parking, un-parking by new evidence and
-/// dismissal all surface at the next seam that calls this; each call is one
-/// indexed read of the parked set.
-fn publish_history_notice_changes(
+/// Announce account-level changes. A change in the parked recovery set
+/// ("history may be incomplete") is one `HistoryNoticesChanged`, plus
+/// `GroupStateUpdated` for each group whose own notices appeared or
+/// disappeared, so hosts re-read that group's `GroupRecoveryStatus`. Parking,
+/// un-parking by new evidence and dismissal all surface at the next seam that
+/// calls this; each call is one indexed read of the parked set. It also
+/// announces linked-device changes ([`publish_linked_device_changes`]).
+fn publish_account_level_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -7858,6 +7874,7 @@ fn publish_history_notice_changes(
 ) {
     // Record queued subscription refusals off relay paths.
     client.record_subscription_refusals();
+    publish_linked_device_changes(client, events, account_id_hex, account_label);
     let Some(groups) = client.take_history_notice_changes() else {
         return;
     };
@@ -7867,6 +7884,24 @@ fn publish_history_notice_changes(
     });
     for group_id in groups {
         publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
+    }
+}
+
+/// One `LinkedDevicesChanged` for a hidden device-group event or a change of
+/// device-group trust since the last call. Both the account-level seam and
+/// the applied-summary seam drain it, so startup, reconnect and every command
+/// and delivery announce it.
+fn publish_linked_device_changes(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    if client.take_linked_devices_changed() {
+        let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
     }
 }
 
@@ -8581,7 +8616,7 @@ mod tests {
         // Dismissal disappears once, from the command's own publication.
         let notice = client.history_notices().unwrap().remove(0);
         assert!(client.dismiss_history_notice(&notice.notice_id).unwrap());
-        publish_history_notice_changes(&mut client, &events, &account.account_id_hex, "alice");
+        publish_account_level_changes(&mut client, &events, &account.account_id_hex, "alice");
         expect_change(&mut received);
 
         // New evidence reopens the retired gap as pending debt, which is not

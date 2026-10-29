@@ -26,6 +26,7 @@ pub(crate) fn runtime_message_update_from_event(
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -44,6 +45,7 @@ pub(crate) fn projection_update_from_event(
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -95,6 +97,7 @@ pub(crate) fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str,
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -122,6 +125,7 @@ pub(crate) fn chat_list_event_route(event: &MarmotAppEvent) -> Option<(&str, &Gr
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -163,6 +167,7 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::AccountError(_) => ChatListUpdateTrigger::SnapshotRefresh,
     }
 }

@@ -565,6 +565,21 @@ typedef enum MarmotHistoryNoticeCause {
 } MarmotHistoryNoticeCause;
 
 /**
+ * A linked device's status in the roster.
+ */
+typedef enum MarmotLinkedDeviceStatus {
+  MARMOT_LINKED_DEVICE_STATUS_ACTIVE,
+  /**
+   * Its siblings marked it inactive.
+   */
+  MARMOT_LINKED_DEVICE_STATUS_INACTIVE,
+  /**
+   * It recorded that it is signing out.
+   */
+  MARMOT_LINKED_DEVICE_STATUS_LEAVING,
+} MarmotLinkedDeviceStatus;
+
+/**
  * Why a stored group was quarantined instead of hydrated.
  */
 typedef enum MarmotAppGroupHydrationQuarantineReason {
@@ -2647,6 +2662,35 @@ typedef struct MarmotHistoryNoticeList {
   struct MarmotHistoryNotice *items;
   uintptr_t len;
 } MarmotHistoryNoticeList;
+
+/**
+ * One of this account's own devices, as the roster of the device group
+ * this device trusts lists it. `slot_id_hex` (64 lowercase hex
+ * characters) is the handle actions on the device take. `label`,
+ * `client` and `platform` are empty until set. `linked_at` is in Unix
+ * seconds. `linked_by_slot_id_hex` is NULL for the founder.
+ */
+typedef struct MarmotLinkedDevice {
+  char *slot_id_hex;
+  bool is_this_device;
+  char *label;
+  char *client;
+  char *platform;
+  uint64_t linked_at;
+  char *linked_by_slot_id_hex;
+  enum MarmotLinkedDeviceStatus status;
+  bool add_to_all_chats;
+  bool bring_history;
+  bool keep_while_inactive;
+} MarmotLinkedDevice;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotLinkedDeviceList {
+  struct MarmotLinkedDevice *items;
+  uintptr_t len;
+} MarmotLinkedDeviceList;
 
 /**
  * The updated group record plus the decline publish summary.
@@ -5294,6 +5338,13 @@ typedef enum MarmotEvent_Tag {
    * gets `GroupStateUpdated`.
    */
   MARMOT_EVENT_HISTORY_NOTICES_CHANGED,
+  /**
+   * The account's linked devices may have changed; re-read
+   * `marmot_linked_devices`. Also fires once each time the account's
+   * worker opens or reconnects. Carries no device or group identities, and
+   * may fire with no visible change.
+   */
+  MARMOT_EVENT_LINKED_DEVICES_CHANGED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -5365,6 +5416,11 @@ typedef struct MarmotEvent_HistoryNoticesChanged_Body {
   char *account_label;
 } MarmotEvent_HistoryNoticesChanged_Body;
 
+typedef struct MarmotEvent_LinkedDevicesChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_LinkedDevicesChanged_Body;
+
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
   union {
@@ -5379,6 +5435,7 @@ typedef struct MarmotEvent {
     MarmotEvent_EpochStallEscalated_Body EPOCH_STALL_ESCALATED;
     MarmotEvent_GroupChangeSuperseded_Body GROUP_CHANGE_SUPERSEDED;
     MarmotEvent_HistoryNoticesChanged_Body HISTORY_NOTICES_CHANGED;
+    MarmotEvent_LinkedDevicesChanged_Body LINKED_DEVICES_CHANGED;
   };
 } MarmotEvent;
 
@@ -7362,6 +7419,24 @@ MarmotStatus marmot_dismiss_history_notice(const struct MarmotClient *client,
                                            const char *account_ref,
                                            const char *notice_id,
                                            bool *out);
+
+/**
+ * List this account's own devices from the roster of the device group
+ * this device trusts: this device first, then by when each was linked.
+ * Empty until this device trusts a device group, and always empty in
+ * release builds until the roster's spec lands. Re-read on the
+ * `LinkedDevicesChanged` event. Free with
+ * `marmot_linked_device_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_linked_devices(const struct MarmotClient *client,
+                                   const char *account_ref,
+                                   struct MarmotLinkedDeviceList **out);
 
 /**
  * Accept a pending group invite; writes the now-confirmed group
@@ -12403,6 +12478,15 @@ void marmot_group_recovery_status_free(struct MarmotGroupRecoveryStatus *ptr);
  * library.
  */
 void marmot_history_notice_list_free(struct MarmotHistoryNoticeList *list);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_linked_device_list_free(struct MarmotLinkedDeviceList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

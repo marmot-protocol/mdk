@@ -15,6 +15,7 @@ mod directory;
 mod draft;
 mod group;
 mod history_notice;
+mod linked_device;
 mod local_submissions;
 mod media;
 mod message;

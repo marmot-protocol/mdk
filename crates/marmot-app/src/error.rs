@@ -145,8 +145,9 @@ pub enum AppError {
     GroupInviteIncludesInviter,
     /// A device-group action was refused (mdk#2628 item 3.1): this device
     /// does not advertise the roster, the confirmed KeyPackage is not this
-    /// account's published one, or the account already has a device group.
-    /// The reason is a fixed, identity-free code.
+    /// account's published one, the account already has a device group, or
+    /// the trusted device group's roster cannot be read
+    /// (`roster_unavailable`). The reason is a fixed, identity-free code.
     #[error("device group refused: {0}")]
     DeviceGroupRefused(&'static str),
     #[error("unknown local group")]

@@ -229,6 +229,7 @@ pub use client::AppClient;
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::device_group::ConfirmedDeviceLink;
+pub use client::device_group::{LinkedDevice, LinkedDeviceStatus};
 pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
@@ -2046,6 +2047,8 @@ impl MarmotApp {
             pending_group_projection_updates: std::collections::HashSet::new(),
             pending_recovery_status_updates: std::collections::HashSet::new(),
             history_notice_baseline: None,
+            // A fresh client cannot know what hosts last read.
+            linked_devices_changed: true,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),

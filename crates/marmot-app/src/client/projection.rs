@@ -203,6 +203,7 @@ impl AppClient {
             && (!matches!(event, cgka_traits::engine::GroupEvent::GroupJoined { .. })
                 || self.settle_held_device_group(group_id)?)
         {
+            self.linked_devices_changed = true;
             return Ok(Some(self.ensure_device_group_route(group_id)?));
         }
         if batch_start_frontier.is_none() && self.state_group_record(group_id).is_some() {

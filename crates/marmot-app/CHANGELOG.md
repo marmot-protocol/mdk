@@ -4,6 +4,9 @@
 
 ### Breaking changes
 
+- `MarmotAppEvent` adds `LinkedDevicesChanged { account_id_hex, account_label }`
+  (mdk#2628). Exhaustive matches add an arm for it.
+
 - `MarmotDeployment::key_package_client_preference` and
   `KeyPackageClientPreference` are removed (mdk#2628). The KeyPackage `client`
   tag no longer ranks invite candidates; it is still published when
@@ -11,6 +14,11 @@
 
 ### Added
 
+- `MarmotAppRuntime::linked_devices` lists this account's own devices as
+  `LinkedDevice`s, from the roster of the device group this device trusts,
+  this device first (mdk#2628 item 3.1). `LinkedDevicesChanged` says to
+  re-read it, since the device group's own events never reach hosts. Both are
+  empty and silent in release builds until the roster's spec lands.
 - An admin can turn on `marmot.group.account-devices.v1` in an existing group
   (mdk#2628). `AppClient::enable_account_devices` and
   `MarmotAppRuntime::enable_account_devices` send one admin Commit, only when
