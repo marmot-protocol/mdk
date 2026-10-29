@@ -732,6 +732,7 @@ include!("runtime/multi_device_welcome.rs");
 include!("runtime/key_package_slot.rs");
 include!("runtime/key_package_slot_withdrawal.rs");
 include!("runtime/account_devices_advertising.rs");
+include!("runtime/staged_invite_welcome.rs");
 
 #[derive(Clone, Default)]
 struct RecordingKeyPackages {

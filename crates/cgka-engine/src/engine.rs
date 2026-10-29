@@ -3335,6 +3335,32 @@ impl<S: StorageProvider> Engine<S> {
         Ok((record.group_id.clone(), message.clone()))
     }
 
+    /// Whether `id` names a Welcome still staged with its unconfirmed invite
+    /// commit (mdk#2726). Such a Welcome must not be published: it becomes
+    /// deliverable only when the commit confirms and promotes it, and is
+    /// retired if the commit rolls back. A missing row is not staged, so a
+    /// caller publishing an artifact this engine never retained behaves as
+    /// before.
+    pub fn sent_welcome_awaits_commit(&self, id: &MessageId) -> Result<bool, EngineError> {
+        let record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(cgka_traits::storage::StorageError::NotFound) => return Ok(false),
+            Err(error) => return Err(EngineError::Storage(error)),
+        };
+        if record.state != MessageState::Sent {
+            return Ok(false);
+        }
+        // The caller is about to publish a Welcome under this id. A `Sent`
+        // row it cannot read may still be staged, so fail closed.
+        let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+            return Ok(true);
+        };
+        Ok(matches!(
+            payload,
+            StoredMessagePayload::StagedInviteWelcome { .. }
+        ))
+    }
+
     /// Return every retained outbound Welcome whose delivery policy has not
     /// yet been acknowledged.
     ///

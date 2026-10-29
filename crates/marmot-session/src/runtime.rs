@@ -201,6 +201,9 @@ struct PublishStatus {
     possible_ambiguous_exposure: bool,
     retry_deferred: bool,
     terminal_failure: bool,
+    /// The Welcome is staged with its unconfirmed commit, so nothing was
+    /// published and nothing is recorded or owed yet.
+    awaits_commit: bool,
 }
 
 struct PendingFanoutContinuation {
@@ -4822,7 +4825,9 @@ where
                     None
                 }
             };
-            if let Some(status) = status {
+            if let Some(status) = status
+                && !status.awaits_commit
+            {
                 if status.met_required_acks {
                     self.mark_welcome_delivered_best_effort(&welcome_id);
                 } else if let Some(recipient) = recipient {
@@ -5605,6 +5610,7 @@ where
             retry_deferred: fanout_outcome.outstanding_targets > 0,
             terminal_failure: report.accepted_count() == 0
                 && fanout_outcome.outstanding_targets == 0,
+            awaits_commit: false,
         };
         let publish_failure_reason =
             if fanout_outcome.outstanding_targets > 0 && !status.met_required_acks {
@@ -5769,6 +5775,17 @@ where
         if self.detached_welcome_publishes.contains(&message_id) {
             return Ok(PreparedLegacyPublish::Complete(PublishStatus {
                 retry_deferred: true,
+                ..PublishStatus::default()
+            }));
+        }
+        // Every Welcome publish passes through here. A Welcome staged with
+        // its invite commit waits for that commit to confirm, whoever asks
+        // for it (mdk#2726).
+        if matches!(message.envelope, TransportEnvelope::Welcome { .. })
+            && self.session.sent_welcome_awaits_commit(&message_id)?
+        {
+            return Ok(PreparedLegacyPublish::Complete(PublishStatus {
+                awaits_commit: true,
                 ..PublishStatus::default()
             }));
         }
@@ -5968,6 +5985,7 @@ where
                 possible_ambiguous_exposure: fanout.possible_exposure,
                 retry_deferred,
                 terminal_failure: false,
+                awaits_commit: false,
             }));
         }
         let attempt_target = publish_target_with_endpoints(&target, retry_endpoints.clone());
@@ -6178,6 +6196,7 @@ where
                     possible_ambiguous_exposure: true,
                     retry_deferred: false,
                     terminal_failure: false,
+                    awaits_commit: false,
                 });
             }
         };
@@ -6264,6 +6283,7 @@ where
             possible_ambiguous_exposure: fanout.possible_exposure,
             retry_deferred: false,
             terminal_failure: !published && !accepted_by_any_endpoint && !fanout.possible_exposure,
+            awaits_commit: false,
         })
     }
 
