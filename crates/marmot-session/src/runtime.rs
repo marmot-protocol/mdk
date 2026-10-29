@@ -3779,17 +3779,19 @@ where
                 let outcome = fanout.outcome();
                 outcome.outstanding_targets > 0
                     || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                    || !fanout.pending_post_confirmation_welcomes().is_empty()
                     || (outcome.accepted_targets > 0 && fanout.application_message().is_some())
             }))
     }
 
-    /// Return the earliest durable retry cutoff for an incomplete frozen
-    /// fanout in `group_id`.
+    /// Return the earliest durable retry cutoff for the first incomplete frozen
+    /// fanout in `group_id`, including its retained Welcome publications.
     ///
     /// `None` means the group has no network retry cutoff to honor. It may
     /// still have local-only work, such as acknowledgement cleanup for an
-    /// accepted application-message fanout; callers should schedule that on
-    /// their ordinary retry delay. A zero delay means at least one exact event
+    /// accepted application-message fanout or Welcome preparation without a
+    /// stored attempt cutoff; callers should schedule that on their ordinary
+    /// retry delay. A zero delay means at least one exact event
     /// is eligible now (including after a connectivity-restored wake).
     pub fn outbound_fanout_retry_delay_ms(&self, group_id: &GroupId) -> AccountResult<Option<u64>> {
         let now_ms = self.wall_clock.now_ms();
@@ -3807,6 +3809,12 @@ where
                 if matches!(fanout.mls_state(), FanoutMlsState::Pending(_)) {
                     return Ok(None);
                 }
+                if !fanout.pending_post_confirmation_welcomes().is_empty() {
+                    return self.welcome_retry_delay_ms(
+                        fanout.pending_post_confirmation_welcomes(),
+                        now_ms,
+                    );
+                }
                 continue;
             }
             let mut earliest = None;
@@ -3822,6 +3830,30 @@ where
             return Ok(earliest);
         }
         Ok(None)
+    }
+
+    fn welcome_retry_delay_ms(
+        &self,
+        welcomes: &[TransportMessage],
+        now_ms: u64,
+    ) -> AccountResult<Option<u64>> {
+        let mut earliest = None;
+        for welcome in welcomes {
+            let Some(fanout) = self.session.transport_fanout(&welcome.id)? else {
+                // No durable attempt cutoff exists yet. Use the ordinary
+                // scheduler delay for preparation or local bookkeeping.
+                return Ok(None);
+            };
+            for target in &fanout.targets {
+                if let Some(delay_ms) = transport_retry_delay_ms(target, now_ms) {
+                    if target.last_attempt_at.is_none() {
+                        return Ok(None);
+                    }
+                    earliest = Some(earliest.map_or(delay_ms, |prior: u64| prior.min(delay_ms)));
+                }
+            }
+        }
+        Ok(earliest)
     }
 
     pub fn prepare_convergence_cutoff_delay_ms(
@@ -6595,17 +6627,24 @@ fn accepted_fanout_targets(fanout: &DurableTransportFanout) -> usize {
 }
 
 fn transport_fanout_target_retry_due(target: &TransportFanoutTarget, now: Timestamp) -> bool {
+    transport_retry_delay_ms(target, now.0.saturating_mul(1_000)) == Some(0)
+}
+
+fn transport_retry_delay_ms(target: &TransportFanoutTarget, now_ms: u64) -> Option<u64> {
     if matches!(
         target.state,
         TransportFanoutAttemptState::Accepted | TransportFanoutAttemptState::PolicyProhibited
     ) {
-        return false;
+        return None;
     }
     let shift = target.attempt_count.saturating_sub(1).min(7);
     let backoff = 30_u64.saturating_mul(1_u64 << shift).min(60 * 60);
-    target
-        .last_attempt_at
-        .is_none_or(|last| now.0 >= last.0.saturating_add(backoff))
+    Some(target.last_attempt_at.map_or(0, |last| {
+        last.0
+            .saturating_add(backoff)
+            .saturating_mul(1_000)
+            .saturating_sub(now_ms)
+    }))
 }
 
 /// Pull caller-owned Welcome payloads off publish work so the commit/create can confirm

@@ -35,6 +35,8 @@ the default.
 - Publishes fresh KeyPackages through an injected boundary, and drives KeyPackage generator upgrades.
 - Turns `SessionEffects.publish` work into `TransportPublishRequest`s, then confirms or rolls back pending session state
   from the adapter's publish reports.
+- Keeps a confirmed fanout scheduler-visible while linked Welcomes still await publication bookkeeping. Its retry
+  cutoff follows the Welcomes' durable endpoint backoff; work without a stored cutoff uses the ordinary retry delay.
 - Keeps transport routing policy generic, so the first implementation can be Nostr without baking Nostr into the
   session or engine crates.
 
