@@ -60,7 +60,7 @@ use crate::session::{
     AccountDeviceSession, CanonicalGroupMembership, CreateGroupEffects, GroupAuthorityView,
     HydrationProgress, IngestEffects, KeyPackageMetadata, KeyPackageRequirements, PublishWork,
     QueuedIntentRef, SessionConfig, SessionEffects, SessionError, SessionOpenTimings,
-    SessionResult,
+    SessionResult, WelcomeWithdrawal,
 };
 use crate::time::{
     MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
@@ -199,6 +199,9 @@ struct PublishStatus {
     possible_ambiguous_exposure: bool,
     retry_deferred: bool,
     terminal_failure: bool,
+    /// The Welcome was withdrawn or retired, so nothing was published and
+    /// nothing is owed.
+    withdrawn: bool,
 }
 
 struct PendingFanoutContinuation {
@@ -4802,7 +4805,9 @@ where
                     None
                 }
             };
-            if let Some(status) = status {
+            if let Some(status) = status
+                && !status.withdrawn
+            {
                 if status.met_required_acks {
                     self.mark_welcome_delivered_best_effort(&welcome_id);
                 } else if let Some(recipient) = recipient {
@@ -4956,6 +4961,14 @@ where
         let Some(mut fanout) = self.session.transport_fanout(message_id)? else {
             return Ok(());
         };
+        if matches!(
+            fanout.exact_message.envelope,
+            TransportEnvelope::Welcome { .. }
+        ) && self.session.sent_welcome_withdrawn(message_id)?
+        {
+            self.session.delete_transport_fanout(message_id)?;
+            return Ok(());
+        }
         let remaining = fanout
             .targets
             .iter()
@@ -5123,7 +5136,9 @@ where
             .await?;
         if status.met_required_acks {
             self.mark_welcome_delivered_best_effort(message_id);
-        } else if let Some(recipient) = recipient {
+        } else if !status.withdrawn
+            && let Some(recipient) = recipient
+        {
             let failure = self.welcome_delivery_failure(
                 message_id.clone(),
                 recipient,
@@ -5134,6 +5149,29 @@ where
             output.welcome_failures.push(failure);
         }
         Ok(output)
+    }
+
+    /// Withdraw one retained outbound Welcome, owed or still staged with its
+    /// commit, so that no path publishes it again: not startup recovery,
+    /// maintenance retries, explicit redelivery, nor release after its commit
+    /// confirms. Its remaining relay retries are dropped with it. A publish
+    /// already in flight cannot be recalled.
+    ///
+    /// This touches only the Welcome, never group state, so it works before
+    /// hydration reaches the Welcome's group.
+    pub fn withdraw_welcome(
+        &self,
+        message_id: &cgka_traits::MessageId,
+    ) -> AccountResult<WelcomeWithdrawal> {
+        let withdrawal = self.session.withdraw_sent_welcome(message_id)?;
+        // A detached startup publish still owns its record and finishes it;
+        // the next maintenance pass then drops it as withdrawn.
+        if withdrawal != WelcomeWithdrawal::AlreadyDelivered
+            && !self.detached_welcome_publishes.contains(message_id)
+        {
+            self.session.delete_transport_fanout(message_id)?;
+        }
+        Ok(withdrawal)
     }
 
     /// Retained outbound Welcome obligations that have not met their
@@ -5585,6 +5623,7 @@ where
             retry_deferred: fanout_outcome.outstanding_targets > 0,
             terminal_failure: report.accepted_count() == 0
                 && fanout_outcome.outstanding_targets == 0,
+            withdrawn: false,
         };
         let publish_failure_reason =
             if fanout_outcome.outstanding_targets > 0 && !status.met_required_acks {
@@ -5749,6 +5788,16 @@ where
         if self.detached_welcome_publishes.contains(&message_id) {
             return Ok(PreparedLegacyPublish::Complete(PublishStatus {
                 retry_deferred: true,
+                ..PublishStatus::default()
+            }));
+        }
+        // Every Welcome publish passes here, whichever path still holds the
+        // Welcome, so a withdrawn or retired one is never published again.
+        if matches!(message.envelope, TransportEnvelope::Welcome { .. })
+            && self.session.sent_welcome_withdrawn(&message_id)?
+        {
+            return Ok(PreparedLegacyPublish::Complete(PublishStatus {
+                withdrawn: true,
                 ..PublishStatus::default()
             }));
         }
@@ -5948,6 +5997,7 @@ where
                 possible_ambiguous_exposure: fanout.possible_exposure,
                 retry_deferred,
                 terminal_failure: false,
+                withdrawn: false,
             }));
         }
         let attempt_target = publish_target_with_endpoints(&target, retry_endpoints.clone());
@@ -6158,6 +6208,7 @@ where
                     possible_ambiguous_exposure: true,
                     retry_deferred: false,
                     terminal_failure: false,
+                    withdrawn: false,
                 });
             }
         };
@@ -6244,6 +6295,7 @@ where
             possible_ambiguous_exposure: fanout.possible_exposure,
             retry_deferred: false,
             terminal_failure: !published && !accepted_by_any_endpoint && !fanout.possible_exposure,
+            withdrawn: false,
         })
     }
 

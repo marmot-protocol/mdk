@@ -13193,6 +13193,133 @@ async fn invite_members_returns_before_blocked_welcome() {
     runtime.shutdown().await;
 }
 
+/// While armed, rate-limits kind-445 group messages, which keeps a commit
+/// retained for retry without confirming or rolling it back, and counts the
+/// gift wraps (Welcomes) that reach the relay.
+#[derive(Clone, Debug, Default)]
+struct RateLimitGroupMessagesCountGiftWraps {
+    rejection: &'static str,
+    armed: Arc<AtomicBool>,
+    gift_wraps_while_armed: Arc<AtomicUsize>,
+}
+
+impl WritePolicy for RateLimitGroupMessagesCountGiftWraps {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr_relay_builder::prelude::Event,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if !self.armed.load(Ordering::SeqCst) {
+                return PolicyResult::Accept;
+            }
+            if event.kind == OldKind::MlsGroupMessage {
+                return PolicyResult::Reject(self.rejection.into());
+            }
+            if event.kind == OldKind::GiftWrap {
+                self.gift_wraps_while_armed.fetch_add(1, Ordering::SeqCst);
+            }
+            PolicyResult::Accept
+        })
+    }
+}
+
+/// An invite's Welcome stays unpublished while the relay holds back its Add
+/// commit: the commit is retained for retry, neither confirmed nor rolled
+/// back, so the new member must not receive a Welcome into an epoch the
+/// group may never reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_invite_commit_holds_its_welcome() {
+    assert_retained_invite_commit_holds_its_welcome("rate-limited: injected group-message limit")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn possibly_exposed_invite_commit_holds_its_welcome() {
+    assert_retained_invite_commit_holds_its_welcome("error: injected group-message failure").await;
+}
+
+async fn assert_retained_invite_commit_holds_its_welcome(rejection: &'static str) {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = RateLimitGroupMessagesCountGiftWraps {
+        rejection,
+        ..RateLimitGroupMessagesCountGiftWraps::default()
+    };
+    let relay = LocalRelay::new(RelayBuilder::default().write_policy(policy.clone()));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = alice.account.account_id_hex.clone();
+    let carol_id = carol.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "retained invite",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob.account.account_id_hex && joined_group == &group_id
+        )
+    })
+    .await;
+    let bob_id = bob.account.account_id_hex.clone();
+    let source_epoch = runtime
+        .group_mls_state(&bob_id, &group_id)
+        .await
+        .unwrap()
+        .epoch;
+
+    policy.armed.store(true, Ordering::SeqCst);
+    // The relay retains the commit, so the caller may see either a pending
+    // success or a publish error; neither may release the Welcome.
+    let _ = runtime
+        .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
+        .await;
+
+    // Give the worker's post-reply Welcome drive time to run, then check the
+    // commit never reached the group and no Welcome reached the relay.
+    sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        runtime
+            .group_mls_state(&bob_id, &group_id)
+            .await
+            .unwrap()
+            .epoch,
+        source_epoch,
+        "the relay holds the commit back, so no member has it"
+    );
+    assert_eq!(
+        policy.gift_wraps_while_armed.load(Ordering::SeqCst),
+        0,
+        "no Welcome may be published before its Add commit confirms"
+    );
+
+    policy.armed.store(false, Ordering::SeqCst);
+    runtime.shutdown().await;
+}
+
 /// mdk#1803: snapshot reads bypass queued mutations during Welcome fanout.
 /// After the queued mutation completes, fresh reads observe its result.
 #[cfg(feature = "test-policy-overrides")]
