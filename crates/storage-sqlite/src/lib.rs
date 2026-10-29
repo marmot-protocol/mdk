@@ -113,8 +113,9 @@ pub use app::recovery_staging::{
 };
 pub use app::recovery_units::{
     RecoveryAccountUsage, RecoveryParkedRoute, RecoveryRecheckPass, RecoveryRelayCaps,
-    RecoveryRelayHealth, RecoverySpanRetirement, RecoveryUnit, RecoveryUnitBreak,
-    RecoveryUnitOutcome, RecoveryUnitPark, RecoveryUnitPolicy, RecoveryUnitSpan, RecoveryUnitState,
+    RecoveryRelayHealth, RecoveryRouteRemainder, RecoverySpanRetirement, RecoveryUnit,
+    RecoveryUnitBreak, RecoveryUnitOutcome, RecoveryUnitPark, RecoveryUnitPolicy, RecoveryUnitSpan,
+    RecoveryUnitState,
 };
 pub use app::timeline::{
     BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,

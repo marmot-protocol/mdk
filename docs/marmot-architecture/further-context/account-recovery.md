@@ -522,11 +522,31 @@ in `marmot-app` fills it from facts the owner already has:
 | A live REQ's endpoint admitted and placed its whole original window in the current wire epoch | Live boundary covers `[since, now]` on that route and relay, unless a loss obligation is pending, less every released second (below) |
 | A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route, less every range un-covered after the grant was selected |
 | A loss import charged a generation, including a notification lag that charges no count, or a legacy clear restored one | In the import's own transaction, a generation whose every dropped delivery the relay plane placed on a route un-covers only those routes, each from the earliest `created_at` dropped there, and widens their goals. Any other generation un-covers every route the ledger holds from its floor up (all of it when a floor is unknown) and widens their goals to it; the recorder then widens the other current routes' goals. A generation that touches more than 256 routes, or that a worker observed past its durable count, counts as one that named none. After a restart the relay plane counts new drops under a fresh token, so new loss always raises a count |
-| A receipt was released for replay | In the release's transaction, its event's second is un-covered on each route its inventory row placed it on, and that route's goal widens to it. The REQ that delivered the event will not deliver it again, so only a comparison on a relay covers that second there again; live boundaries never cover it, until retention pruning passes it. A release with no inventory row changes nothing here; the epoch gap it arms keeps that debt |
+| A receipt was released for replay | In the release's transaction, its event's second is un-covered on each route its inventory row placed it on, and that route's goal widens to it. A second below the retained window is owed nowhere, so that release changes nothing in the ledger: its coverage stays until pruning drops it. The REQ that delivered the event will not deliver it again, so only a comparison on a relay covers that second there again; live boundaries never cover it, until retention pruning passes it. A release with no inventory row changes nothing here; the epoch gap it arms keeps that debt |
 | A pending queue or notification loss | Each scope's route goal widens to the scope's floor, restoring a goal the best-effort write lost |
-| A startup incremental or explicit history request | Every current route's goal widens to the retained window (explicit: unbounded, pruned to the window) |
-| A pending epoch gap | The group's routes' goals widen to the retained window |
-| Every settlement | Coverage and goals below the retained window are pruned |
+| A startup incremental history request | Every current route's goal widens to its standing floor: the retained window's floor, or for a group route whose copy has a Welcome time, that time less the 15-minute allowance when it is later |
+| An explicit history request | Every current route's goal widens to the retained window |
+| A pending epoch gap | The group's routes' goals widen to their standing floors |
+| Every settlement | Coverage and goals below the retained window are pruned. First, what any certifying relay of a current route still owes below the floor (not covered there and not retired; parked seconds count) joins that route's parked remainder |
+
+**Standing floors.** The Welcome time is a soft signal (`Group::local_copy_welcome_created_at`):
+an application message carries its sender's compose time, so one composed offline before the
+Welcome and sent after it is openable here yet older than the Welcome. The standing floor
+therefore only starts the goals that want history in general. It never retires, un-covers or
+drops debt: loss and released receipts keep their own floors, explicit repair wants the whole
+window, and goals only widen, so a later Welcome raises nothing.
+
+**Parked remainders.** Debt the moving retention floor overtakes before anything covers it,
+and loss whose floor is unknown or older than the window, is parked rather than dropped: each
+route keeps one remainder, the earliest and latest such second, under a park revision from the
+same counter as unit parks. It is never fetched and never coverage, and only a dismissal clears
+it. A route's notice revision is the newest among its broken units' parks and its remainder, so
+dismissing the notice clears both. Each prune also settles every route below its floor: a later
+prune parks only from there up, because it no longer holds the coverage below. Widening a goal
+back below that floor, as the shadow report does each time for pending loss, therefore parks
+nothing twice and does not bring back a dismissed remainder; only loss lowers the settled floor
+to its own. While the ledger is in shadow mode nothing sweeps, so most routes gather a
+remainder; the switch-over drops those.
 
 Every un-cover is also appended to an un-cover log under a new account-wide generation. A
 grant reads that generation when it is selected, before anything is frozen or fetched, and its

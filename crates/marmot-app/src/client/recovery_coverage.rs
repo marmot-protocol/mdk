@@ -189,25 +189,71 @@ impl AppClient {
         }
     }
 
-    /// Startup incremental history and explicit repair want every current
-    /// route's retained window. Explicit history is unbounded below; pruning
-    /// raises it to the window.
+    /// Where a current route's standing goal starts: the retention floor,
+    /// or for a group route whose copy has a Welcome time, that time less the
+    /// clock-skew allowance when it is later. The Welcome time is only a hint
+    /// (`Group::local_copy_welcome_created_at`): it starts goals and never
+    /// retires, un-covers or drops debt, so loss, released receipts and
+    /// explicit repair keep their own floors, and a goal already lower stays.
+    /// A Welcome time after `now` (the joining clock ran fast) is ignored, even
+    /// one inside the allowance, or the goal would start minutes ago and never
+    /// owe the window.
+    fn standing_floor(&self, current: &CurrentRoute, now: u64) -> u64 {
+        let welcome = current.group_id.as_ref().and_then(|group| {
+            self.runtime
+                .group_record(&cgka_traits::GroupId::new(group.clone()))
+                .ok()?
+                .local_copy_welcome_created_at
+        });
+        welcome
+            .filter(|welcome| welcome.0 <= now)
+            .map_or(0, |welcome| crate::history_floor(welcome.0).0)
+            .max(retention_floor(now))
+    }
+
+    /// Widen each current route's goal to its standing floor.
+    fn widen_standing_goals(
+        &self,
+        app: &SqliteAppStorage,
+        routes: &[&CurrentRoute],
+        now: u64,
+    ) -> Result<(), AppError> {
+        let mut by_floor = std::collections::BTreeMap::<u64, Vec<_>>::new();
+        for current in routes {
+            by_floor
+                .entry(self.standing_floor(current, now))
+                .or_default()
+                .push(current.route.clone());
+        }
+        for (floor, routes) in by_floor {
+            app.widen_recovery_coverage_goals(&routes, floor)?;
+        }
+        Ok(())
+    }
+
+    /// Startup incremental history wants every current route from its
+    /// standing floor, and explicit repair every route's whole retained
+    /// window. Nothing below the window is owed.
     pub(crate) fn record_coverage_request(&self, cause: RecoveryCause) {
-        let since = match cause {
-            RecoveryCause::IncrementalHistory => retention_floor(unix_now_seconds()),
-            RecoveryCause::ExplicitHistory => 0,
-            _ => return,
-        };
-        let routes = self
-            .current_coverage_routes()
-            .into_iter()
-            .map(|current| current.route)
-            .collect::<Vec<_>>();
-        if let Err(error) = self.coverage_storage().and_then(|storage| {
-            Ok(storage
-                .app_storage()
-                .widen_recovery_coverage_goals(&routes, since)?)
-        }) {
+        let now = unix_now_seconds();
+        let current = self.current_coverage_routes();
+        let result = self.coverage_storage().and_then(|storage| {
+            let app = storage.app_storage();
+            match cause {
+                RecoveryCause::IncrementalHistory => {
+                    self.widen_standing_goals(&app, &current.iter().collect::<Vec<_>>(), now)
+                }
+                RecoveryCause::ExplicitHistory => {
+                    let routes = current
+                        .into_iter()
+                        .map(|current| current.route)
+                        .collect::<Vec<_>>();
+                    Ok(app.widen_recovery_coverage_goals(&routes, retention_floor(now))?)
+                }
+                _ => Ok(()),
+            }
+        });
+        if let Err(error) = result {
             log_failure("record_coverage_request", &error);
         }
     }
@@ -369,7 +415,7 @@ impl AppClient {
         let floor = retention_floor(now);
         let current = self.current_coverage_routes();
         let demands = app.pending_recovery_demands()?;
-        // An epoch gap needs its group's routes' retained window.
+        // An epoch gap needs its group's routes from their standing floors.
         let gap_routes = current
             .iter()
             .filter(|route| {
@@ -380,11 +426,11 @@ impl AppClient {
                     })
                 })
             })
-            .map(|route| route.route.clone())
             .collect::<Vec<_>>();
-        app.widen_recovery_coverage_goals(&gap_routes, floor)?;
+        self.widen_standing_goals(app, &gap_routes, now)?;
         // Pending loss owes each scope's window: this restores a goal the
-        // import's best-effort widening lost.
+        // import's best-effort widening lost. A goal back below the floor
+        // parks nothing the prune already settled.
         let mut demand_scopes = Vec::with_capacity(demands.len());
         for demand in &demands {
             let scopes = app.recovery_scope_snapshots(demand.ticket.id)?;
@@ -403,7 +449,13 @@ impl AppClient {
             }
             demand_scopes.push(scopes);
         }
-        app.prune_recovery_coverage(floor)?;
+        // What a current route still owes below the floor is parked, not
+        // dropped.
+        let certifying = current
+            .iter()
+            .map(|current| (current.route.clone(), current.required.clone()))
+            .collect::<Vec<_>>();
+        app.prune_recovery_coverage(floor, &certifying)?;
         let fence = app.recovery_revision_fence()?;
 
         let mut report = CoverageShadowReport::default();
