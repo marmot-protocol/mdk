@@ -587,6 +587,25 @@ impl AppClient {
             Ok(lost) => live.break_reached(&present, lost.as_deref()),
             Err(error) => return log_failure("record_native_coverage", &error.into()),
         }
+        // The adapter may also have ended a generation while the ledger was
+        // written (a `CLOSED` or reconnect it processed meanwhile): a tail
+        // stands only on a generation it still reports streaming, with the
+        // count this observation saw.
+        let (input_placed, streaming, _) = {
+            let observation = self.adapter.replay_admission().await;
+            observe_live_counts(&observation)
+        };
+        if !input_placed || self.delivery_loss_blocks_cursor() {
+            return;
+        }
+        let facts = facts
+            .into_iter()
+            .filter(|fact| {
+                streaming
+                    .iter()
+                    .any(|now| now.key == fact.key && now.count == fact.count && !now.ended)
+            })
+            .collect::<Vec<_>>();
         live.tails = live.tails(&facts, |route, since| {
             match app.recovery_coverage_newest_released(route, since) {
                 Ok(newest) => Some(newest.map_or(since, |second| second.saturating_add(1))),
@@ -695,7 +714,7 @@ impl AppClient {
         app: &SqliteAppStorage,
     ) -> Result<CoverageShadowReport, AppError> {
         let now = unix_now_seconds();
-        let tails = self.live_tails(app, now).await;
+        self.record_native_coverage_at(app, now).await;
         let floor = retention_floor(now);
         let current = self.current_coverage_routes();
         let demands = app.pending_recovery_demands()?;
@@ -741,6 +760,8 @@ impl AppClient {
             .collect::<Vec<_>>();
         app.prune_recovery_coverage(floor, &certifying)?;
         let fence = app.recovery_revision_fence()?;
+        // Tails as of now, not as of the writes above.
+        let tails = self.live_tails(app, now).await;
 
         let mut report = CoverageShadowReport::default();
         let mut owed_routes = HashSet::new();

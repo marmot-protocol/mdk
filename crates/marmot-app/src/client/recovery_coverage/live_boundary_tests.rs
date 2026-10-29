@@ -12,7 +12,9 @@ use super::scenario_tests::{
     Fixture, STORED_AT, authorize, certified_routes, fixture, fixture_with_stored, owed,
     reactivate, relay, report, routes,
 };
-use super::{LiveCountFact, LiveCoverage, live_boundary_since, retention_floor};
+use super::{
+    LiveCountFact, LiveCoverage, live_boundary_since, observe_live_counts, retention_floor,
+};
 use crate::unix_now_seconds;
 
 const HOUR: u64 = 60 * 60;
@@ -308,6 +310,38 @@ async fn a_tail_lapses_when_the_client_reports_another_connection() {
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     for route in routes(&fixture.client) {
         assert!(owed(&fixture, &route, later).await, "{route:?}");
+        assert!(live_until(&fixture, &route).is_some(), "the proof stays");
+    }
+}
+
+/// The adapter can end a generation while the recorder writes the ledger (a
+/// `CLOSED` or reconnect it processes meanwhile): a tail stands only on what
+/// the adapter still reports after the write, not on the look before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tail_lapses_when_the_connection_changes_during_the_write() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let fixture = fixture().await;
+    owe_retained_window(&fixture);
+    let app = fixture.storage.app_storage();
+    let later = unix_now_seconds() + HOUR;
+    let reads = || fixture.relay.connection_reads.load(SeqCst);
+    let before = reads();
+    let _ = observe_live_counts(&fixture.client.adapter.replay_admission().await);
+    let per_look = reads() - before;
+    assert!(per_look > 0, "a look asks the client about each open count");
+    // The recorder's first look sees the connection; every read after it
+    // sees the next one.
+    fixture
+        .relay
+        .reconnect_at_read
+        .store(reads() + per_look + 1, SeqCst);
+    let tails = fixture.client.live_tails(&app, later).await;
+    for route in routes(&fixture.client) {
+        assert_eq!(
+            tails.owed_until(&route, &relay(), later),
+            later,
+            "{route:?}"
+        );
         assert!(live_until(&fixture, &route).is_some(), "the proof stays");
     }
 }

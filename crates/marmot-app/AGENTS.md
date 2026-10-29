@@ -206,7 +206,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   uncounted, so a count cannot show a reply was not cut, and relays are assumed to cut newest first. Read the
   un-cover mark before each look at the adapter and write through `record_recovery_coverage_since`; a generation that
   loss imported since the last look may have reached never proves again (`LiveCoverage`), and the log is read again
-  after the look so loss imported during it gives no tail. Past the request an open,
+  after the look so loss imported during it gives no tail; the adapter is looked at again after the write, and a
+  generation it no longer reports streaming with the same count gives none either. Past the request an open,
   healthy REQ vouches only provisionally: `LiveTails`, held in memory and never written to the ledger, because nothing
   proves when an open REQ stopped delivering. A tail starts at the count's `live_from`, which for a REQ the relay pool
   sent again is its EOSE, never the request stamp, and stands only while the adapter reports the count streaming

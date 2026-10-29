@@ -632,7 +632,8 @@ the log's generation before each look at the adapter's REQs, so a REQ generation
 not see began after that look's mark, and any loss imported after it, other than a released
 second, breaks every generation it could have reached (all of them while loss is account-wide).
 It reads the log again after the look, so loss imported while it looked also ends the tails of
-the generations it saw. The first mark is read when the client opens; the relay plane's shared adapter can still report
+the generations it saw. It also looks at the adapter again after the write, and a generation the
+adapter ended meanwhile (a `CLOSED` or reconnect it processed) gets no tail. The first mark is read when the client opens; the relay plane's shared adapter can still report
 REQs an earlier session of the account opened, and those never prove for the new session.
 
 Every un-cover is also appended to an un-cover log under a new account-wide generation. A

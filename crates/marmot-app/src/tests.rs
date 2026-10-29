@@ -543,6 +543,10 @@ pub(crate) struct ScriptedPushRelayClient {
     /// Every relay reads as connected on this attempt, as its own state, so
     /// moving it is a reconnect no notification reports.
     pub(crate) connection_attempt: std::sync::atomic::AtomicUsize,
+    /// How many times the adapter has asked for a relay's connection.
+    pub(crate) connection_reads: std::sync::atomic::AtomicUsize,
+    /// The 1-based read that first sees the next connection; zero never.
+    pub(crate) reconnect_at_read: std::sync::atomic::AtomicUsize,
     subscription_attempts: std::sync::Mutex<Vec<NostrSubscription>>,
     block_next_subscribe: std::sync::atomic::AtomicBool,
     blocked_subscribe_count: std::sync::atomic::AtomicUsize,
@@ -1157,9 +1161,12 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         _: &MemberId,
         _: &TransportEndpoint,
     ) -> Option<transport_nostr_adapter::RelayConnection> {
-        let attempt = self
-            .connection_attempt
-            .load(std::sync::atomic::Ordering::SeqCst);
+        use std::sync::atomic::Ordering::SeqCst;
+        let read = self.connection_reads.fetch_add(1, SeqCst) + 1;
+        if read == self.reconnect_at_read.load(SeqCst) {
+            self.connection_attempt.fetch_add(1, SeqCst);
+        }
+        let attempt = self.connection_attempt.load(SeqCst);
         Some(transport_nostr_adapter::RelayConnection::new(0, attempt))
     }
 
