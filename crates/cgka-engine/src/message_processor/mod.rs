@@ -900,8 +900,13 @@ impl<S: StorageProvider> Engine<S> {
             // A link never waits in the queue (device-group.md, "Linking a
             // device"): the new device stops waiting for its Welcome, and a
             // link drained after that would add a device that never joins.
-            // The caller retries while the new device still waits.
-            if matches!(&intent, SendIntent::LinkDevice { .. }) {
+            // The caller retries while the new device still waits. Its undo
+            // is not queued either: the app decides it from the roster it
+            // read, and retries it until it lands.
+            if matches!(
+                &intent,
+                SendIntent::LinkDevice { .. } | SendIntent::UnlinkDevice { .. }
+            ) {
                 return Err(EngineError::LinkDeviceUnsettled { group_id });
             }
             // An activation the current state already refuses is answered now,
@@ -4139,6 +4144,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::EnableDisbanding { group_id }
         | SendIntent::EnableAccountDevices { group_id }
         | SendIntent::LinkDevice { group_id, .. }
+        | SendIntent::UnlinkDevice { group_id, .. }
         | SendIntent::Disband { group_id } => group_id,
     }
 }
@@ -4163,6 +4169,7 @@ pub(crate) fn is_fair_scheduled_intent(
         | SendIntent::EnableDisbanding { .. }
         | SendIntent::EnableAccountDevices { .. }
         | SendIntent::LinkDevice { .. }
+        | SendIntent::UnlinkDevice { .. }
         | SendIntent::Disband { .. } => true,
         SendIntent::AddOwnAccountDevices { .. } | SendIntent::RemoveOwnAccountDevices { .. } => {
             account_devices_required

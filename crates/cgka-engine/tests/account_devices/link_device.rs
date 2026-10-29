@@ -2,7 +2,8 @@
 //! admin Commit in a device group that adds a newly linked device of the
 //! account and writes its roster entry. Every member accepts it, the linked
 //! device joins through its Welcome, a refused link changes nothing, and a
-//! link is never queued.
+//! link is never queued. Its undo, `SendIntent::UnlinkDevice` (D40), removes
+//! that device's leaf and entry in one Commit under the same rules.
 
 use super::activation::{buffer_unsettled, queued_intents};
 use super::device_roster::{
@@ -517,4 +518,161 @@ async fn a_device_group_commit_takes_no_add_from_the_proposal_store() {
         &gid,
     )
     .await;
+}
+
+fn unlink(
+    gid: &GroupId,
+    leaf_signature_key: Vec<u8>,
+    operations: Vec<DeviceRosterOperationV1>,
+) -> SendIntent {
+    SendIntent::UnlinkDevice {
+        group_id: gid.clone(),
+        leaf_signature_key,
+        roster_update: update(operations),
+    }
+}
+
+/// Link a tablet into the phone and laptop's device group, and let it join.
+async fn link_tablet(phone: &mut Device, laptop: &mut Device, gid: &GroupId) -> Device {
+    let mut tablet = roster_device(b"alice");
+    let key_package = tablet.engine.fresh_key_package().await.unwrap();
+    let intent = link(
+        gid,
+        &key_package,
+        vec![DeviceRosterOperationV1::SetDevice(
+            slot(3),
+            linked_entry("Tablet", &key_package),
+        )],
+    );
+    let SendResult::GroupEvolution {
+        msg,
+        welcomes,
+        pending,
+    } = phone.engine.send(intent).await.unwrap()
+    else {
+        panic!("expected GroupEvolution")
+    };
+    phone.engine.confirm_published(pending).await.unwrap();
+    assert_accepted(laptop, &route_to_group(&msg, gid), gid).await;
+    expect_link_welcome(&mut tablet, gid, phone);
+    assert_joins(&mut tablet, &welcomes[0], gid, phone).await;
+    tablet
+}
+
+/// The unlink removes the device's leaf and writes its roster entry away in
+/// one privileged Commit, with no Welcome. Every member accepts it, and the
+/// removed device sees itself removed.
+#[tokio::test]
+async fn an_unlink_removes_the_device_and_its_entry_in_one_commit() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let mut tablet = link_tablet(&mut phone, &mut laptop, &gid).await;
+    let intent = unlink(
+        &gid,
+        signature_key(&tablet, &gid),
+        vec![DeviceRosterOperationV1::RemoveDevice(slot(3))],
+    );
+
+    let SendResult::GroupEvolution {
+        msg,
+        welcomes,
+        pending,
+    } = phone.engine.send(intent).await.unwrap()
+    else {
+        panic!("expected GroupEvolution")
+    };
+    assert!(welcomes.is_empty());
+    phone.engine.confirm_published(pending).await.unwrap();
+    let commit = route_to_group(&msg, &gid);
+    assert_priorities(
+        &phone,
+        &commit,
+        &mut [&mut laptop],
+        &gid,
+        CommitOrderingPriority::Privileged,
+    )
+    .await;
+    assert_accepted(&mut tablet, &commit, &gid).await;
+    assert!(tablet.engine.group_record(&gid).unwrap().removed);
+
+    let expected = roster(&[(1, "Phone"), (2, "Laptop")]);
+    for device in [&phone, &laptop] {
+        assert_eq!(roster_of(device, &gid), expected);
+        assert_eq!(load_group(device, &gid).members().count(), 2);
+    }
+}
+
+/// An unlink names one other leaf of the account and removes exactly one
+/// listed device entry; anything else is refused with nothing staged.
+#[tokio::test]
+async fn a_refused_unlink_leaves_the_group_as_it_was() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let tablet = link_tablet(&mut phone, &mut laptop, &gid).await;
+    let tablet_key = signature_key(&tablet, &gid);
+    let remove = |n: u8| DeviceRosterOperationV1::RemoveDevice(slot(n));
+    let epoch = phone.engine.epoch(&gid).unwrap();
+    let held = roster_of(&phone, &gid);
+
+    let cases = [
+        (
+            unlink(&gid, tablet_key.clone(), vec![remove(3), remove(2)]),
+            "it must remove exactly one device entry",
+        ),
+        (
+            unlink(&gid, tablet_key.clone(), vec![reject_slot(3)]),
+            "it must remove exactly one device entry",
+        ),
+        (
+            unlink(&gid, tablet_key.clone(), vec![remove(4)]),
+            "the roster lists no such device",
+        ),
+        (
+            unlink(&gid, vec![7; 32], vec![remove(3)]),
+            "no current leaf has a device's signature key",
+        ),
+        (
+            unlink(&gid, signature_key(&phone, &gid), vec![remove(1)]),
+            "use SendIntent::Leave to remove this device",
+        ),
+    ];
+    for (intent, reason) in cases {
+        assert_refused(phone.engine.send(intent).await, reason);
+    }
+    assert_eq!(phone.engine.epoch(&gid).unwrap(), epoch);
+    assert_eq!(roster_of(&phone, &gid), held);
+    assert_eq!(load_group(&phone, &gid).members().count(), 3);
+    assert!(queued_intents(&phone, &gid).is_empty());
+}
+
+/// Like a link, an unlink while the device group is unsettled is refused,
+/// not queued, and goes out once the group settles.
+#[tokio::test]
+async fn an_unlink_is_refused_not_queued_while_a_commit_is_in_flight() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let tablet = link_tablet(&mut phone, &mut laptop, &gid).await;
+    let intent = unlink(
+        &gid,
+        signature_key(&tablet, &gid),
+        vec![DeviceRosterOperationV1::RemoveDevice(slot(3))],
+    );
+    let SendResult::GroupEvolution { pending, .. } = phone
+        .engine
+        .send(SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected GroupEvolution")
+    };
+
+    let refused = phone.engine.send(intent.clone()).await;
+    assert!(
+        matches!(&refused, Err(EngineError::LinkDeviceUnsettled { group_id }) if *group_id == gid),
+        "{refused:?}"
+    );
+    assert!(queued_intents(&phone, &gid).is_empty());
+
+    phone.engine.confirm_published(pending).await.unwrap();
+    send_commit(&mut phone, intent, &gid).await;
+    assert!(!roster_of(&phone, &gid).devices.contains_key(&slot(3)));
 }

@@ -145,6 +145,7 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
         SendIntent::LinkDevice { .. } => "link_device",
+        SendIntent::UnlinkDevice { .. } => "unlink_device",
         SendIntent::Disband { .. } => "disband",
     }
 }
@@ -169,6 +170,7 @@ pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId 
         | SendIntent::EnableDisbanding { group_id }
         | SendIntent::EnableAccountDevices { group_id }
         | SendIntent::LinkDevice { group_id, .. }
+        | SendIntent::UnlinkDevice { group_id, .. }
         | SendIntent::Disband { group_id } => group_id.clone(),
     }
 }
