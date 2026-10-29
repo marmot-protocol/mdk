@@ -35,17 +35,17 @@ fn device_group_app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClie
 
 /// Alice's phone and laptop, each with a published KeyPackage, and the link
 /// confirming the laptop's under `device_group_id`.
-struct Devices {
-    _dirs: [tempfile::TempDir; 2],
-    relay: Arc<ScriptedPushRelayClient>,
-    phone_app: MarmotApp,
-    laptop_app: MarmotApp,
-    phone: AppClient,
-    laptop: AppClient,
-    link: ConfirmedDeviceLink,
+pub(super) struct Devices {
+    pub(super) _dirs: [tempfile::TempDir; 2],
+    pub(super) relay: Arc<ScriptedPushRelayClient>,
+    pub(super) phone_app: MarmotApp,
+    pub(super) laptop_app: MarmotApp,
+    pub(super) phone: AppClient,
+    pub(super) laptop: AppClient,
+    pub(super) link: ConfirmedDeviceLink,
 }
 
-async fn phone_and_laptop() -> Devices {
+pub(super) async fn phone_and_laptop() -> Devices {
     let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
     let home = AccountHome::open(dirs[0].path());
     let alice_id = home.create_account("alice").unwrap().account_id_hex;
@@ -998,7 +998,7 @@ async fn the_host_never_learns_of_the_device_group() {
     assert_eq!(quarantined, vec![chat_hex]);
 }
 
-fn stable_slot(app: &MarmotApp) -> String {
+pub(super) fn stable_slot(app: &MarmotApp) -> String {
     app.account_storage("alice")
         .unwrap()
         .key_package_lifecycle()

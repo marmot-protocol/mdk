@@ -16,7 +16,8 @@
 //!     change the user made here.
 //!   - `unsent` is 1 while this device still owes its siblings the value.
 //! - `small_state_sync`: at most one row, written when this device starts to
-//!   take part in small state.
+//!   take part in small state. `snapshot_owed` is 1 while this device still
+//!   has to ask a sibling for a snapshot.
 //!
 //! No rows are seeded.
 use crate::SqliteResultExt;
@@ -58,7 +59,8 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
 
         CREATE TABLE small_state_sync (
             id INTEGER PRIMARY KEY CHECK(id = 1),
-            started_at INTEGER NOT NULL CHECK(started_at >= 0)
+            started_at INTEGER NOT NULL CHECK(started_at >= 0),
+            snapshot_owed INTEGER NOT NULL CHECK(snapshot_owed IN (0, 1))
         );",
     )
     .storage()
