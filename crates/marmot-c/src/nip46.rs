@@ -1017,7 +1017,8 @@ pub unsafe extern "C" fn marmot_nip46_login(
 }
 
 /// Attach a pinned signer and activate its MDK worker. Identity lookup itself
-/// is offline, but worker activation requests a fresh identity proof. Restore
+/// is offline; worker activation requests an identity proof only when no usable
+/// current-profile proof is stored. Restore
 /// handles before client_start, then run each account's connect/register on an
 /// independent background worker after local startup; never run this on UI.
 /// # Safety

@@ -4171,3 +4171,93 @@ async fn one_convergence_pass_preserves_rename_before_disband() {
     assert!(bob.advance_convergence(&group_id).await.unwrap().is_empty());
     assert!(bob.drain_events().is_empty());
 }
+
+#[tokio::test]
+async fn encrypted_engine_reopen_reuses_identity_proof_in_fresh_key_packages() {
+    use cgka_engine::account_identity_proof::{
+        AccountIdentityProofRequest, AccountIdentityProofSigner,
+    };
+    use cgka_traits::storage::AccountDeviceSignerStorage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SignOnce {
+        inner: Arc<dyn AccountIdentityProofSigner>,
+        calls: AtomicUsize,
+    }
+    impl AccountIdentityProofSigner for SignOnce {
+        fn sign_account_identity_proof(
+            &self,
+            request: &AccountIdentityProofRequest,
+        ) -> Result<[u8; 64], String> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                return Err("EXTERNAL_SIGNER_REJECTED: unexpected second proof request".into());
+            }
+            self.inner.sign_account_identity_proof(request)
+        }
+    }
+    fn proof_from_key_package(kp: &cgka_traits::engine::KeyPackage) -> Vec<u8> {
+        let message = MlsMessageIn::tls_deserialize_exact(kp.bytes()).unwrap();
+        let MlsMessageBodyIn::KeyPackage(key_package) = message.extract() else {
+            panic!("expected KeyPackage");
+        };
+        let key_package = key_package
+            .validate(
+                &openmls_rust_crypto::RustCrypto::default(),
+                ProtocolVersion::Mls10,
+            )
+            .unwrap();
+        key_package
+            .leaf_node()
+            .extensions()
+            .app_data_dictionary()
+            .unwrap()
+            .dictionary()
+            .get(&ACCOUNT_IDENTITY_PROOF_COMPONENT_ID)
+            .unwrap()
+            .to_vec()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite");
+    let key = SqlCipherKey::new("engine proof reopen test").unwrap();
+    let seed = b"proof-reopen";
+    let signer = Arc::new(SignOnce {
+        inner: proof_signer(seed),
+        calls: AtomicUsize::new(0),
+    });
+    let original = {
+        let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let mut engine = EngineBuilder::new(storage.clone())
+            .identity(pad32(seed))
+            .account_identity_proof_signer(signer.clone())
+            .peeler(Box::new(MockPeeler::default()))
+            .build()
+            .unwrap();
+        let proof = proof_from_key_package(&engine.fresh_key_package().await.unwrap());
+        drop(engine);
+        storage.close().unwrap();
+        proof
+    };
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let binding = storage
+        .account_device_signer(&MemberId::new(pad32(seed)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        binding.account_identity_proof.as_deref(),
+        Some(original.as_slice())
+    );
+    let mut engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(seed))
+        .account_identity_proof_signer(signer.clone())
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .unwrap();
+    let fresh = engine.fresh_key_package().await.unwrap();
+    assert_eq!(proof_from_key_package(&fresh), original);
+    assert_eq!(
+        key_package_metadata(&fresh).unwrap().protocol_profile,
+        ProtocolProfile::Current
+    );
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+}

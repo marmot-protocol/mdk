@@ -25,12 +25,8 @@ pub struct Identity {
     pub(crate) signer: SignatureKeyPair,
     pub(crate) credential_with_key: CredentialWithKey,
     pub(crate) self_id: MemberId,
-    /// Proof material minted for this engine session.
-    ///
-    /// Current-profile proofs bind a fresh `created_at`, so they are rebuilt
-    /// whenever an [`Identity`] is constructed even when the persisted MLS
-    /// signer is reused. Callers must not treat these bytes as durable across
-    /// account-device session restarts.
+    /// Validated proof material for this MLS-key binding. Current proofs are
+    /// durable and retain their signed timestamp across account-device opens.
     pub(crate) account_identity_proof: crate::account_identity_proof::AccountIdentityProofMaterial,
 }
 
@@ -53,75 +49,94 @@ impl Identity {
         validate_credential_identity(&identity_bytes).map_err(|e| e.to_string())?;
         let scheme: SignatureScheme = ciphersuite.signature_algorithm();
         let self_id = MemberId::new(identity_bytes.clone());
-        if let Some(binding) = storage_err(storage.account_device_signer(&self_id))? {
-            let signer = SignatureKeyPair::read(
-                storage.mls_storage(),
-                &binding.mls_signature_public_key,
-                scheme,
-            )
-            .ok_or_else(|| {
-                "identity storage: local signer record exists, but OpenMLS keypair is missing"
-                    .to_string()
-            })?;
-            return Self::from_signer(
-                signer,
-                identity_bytes,
-                ciphersuite,
-                protocol_profile,
-                proof_signer,
-            );
-        }
+        let (signer, mut binding) =
+            if let Some(binding) = storage_err(storage.account_device_signer(&self_id))? {
+                if binding.marmot_identity != self_id {
+                    return Err("identity storage: signer binding account mismatch".into());
+                }
+                let signer = SignatureKeyPair::read(
+                    storage.mls_storage(),
+                    &binding.mls_signature_public_key,
+                    scheme,
+                )
+                .ok_or_else(|| {
+                    "identity storage: local signer record exists, but OpenMLS keypair is missing"
+                        .to_string()
+                })?;
+                if signer.to_public_vec() != binding.mls_signature_public_key {
+                    return Err("identity storage: signer binding key mismatch".into());
+                }
+                (signer, binding)
+            } else {
+                let signer = SignatureKeyPair::new(scheme).map_err(|e| format!("signer: {e}"))?;
+                signer
+                    .store(storage.mls_storage())
+                    .map_err(|e| format!("store signer: {e:?}"))?;
+                let binding = AccountDeviceSignerBinding {
+                    marmot_identity: self_id.clone(),
+                    mls_signature_public_key: signer.to_public_vec(),
+                    account_identity_proof: None,
+                };
+                // Retain the key binding even when signing is cancelled. A retry
+                // acquires a proof for this key rather than creating another key.
+                storage_err(storage.put_account_device_signer(&binding))?;
+                (signer, binding)
+            };
 
-        let signer = SignatureKeyPair::new(scheme).map_err(|e| format!("signer: {e}"))?;
-        signer
-            .store(storage.mls_storage())
-            .map_err(|e| format!("store signer: {e:?}"))?;
-        storage_err(
-            storage.put_account_device_signer(&AccountDeviceSignerBinding {
-                marmot_identity: self_id,
-                mls_signature_public_key: signer.to_public_vec(),
-            }),
-        )?;
-        Self::from_signer(
-            signer,
-            identity_bytes,
-            ciphersuite,
-            protocol_profile,
-            proof_signer,
-        )
-    }
-
-    fn from_signer(
-        signer: SignatureKeyPair,
-        identity_bytes: Vec<u8>,
-        ciphersuite: Ciphersuite,
-        protocol_profile: ProtocolProfile,
-        proof_signer: &dyn crate::account_identity_proof::AccountIdentityProofSigner,
-    ) -> Result<Self, String> {
         let credential = BasicCredential::new(identity_bytes.clone());
         let credential_with_key = CredentialWithKey {
             credential: credential.into(),
             signature_key: signer.public().into(),
         };
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
-            .as_secs();
-        let account_identity_proof =
-            crate::account_identity_proof::account_identity_proof_material(
+        let retained = binding.account_identity_proof.as_ref().filter(|proof| {
+            protocol_profile == ProtocolProfile::Current
+                && crate::account_identity_proof::validate_current_proof_for_key(
+                    proof,
+                    &identity_bytes,
+                    &binding.mls_signature_public_key,
+                    ciphersuite,
+                )
+                .is_ok()
+        });
+        let account_identity_proof = if let Some(proof) = retained {
+            crate::account_identity_proof::AccountIdentityProofMaterial::CurrentComponent(
+                proof.clone(),
+            )
+        } else {
+            let created_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
+                .as_secs();
+            let proof = crate::account_identity_proof::account_identity_proof_material(
                 &identity_bytes,
-                &signer.to_public_vec(),
+                &binding.mls_signature_public_key,
                 ciphersuite,
-                ciphersuite.signature_algorithm(),
+                scheme,
                 protocol_profile,
                 created_at,
                 proof_signer,
             )
             .map_err(|e| e.to_string())?;
+            if let crate::account_identity_proof::AccountIdentityProofMaterial::CurrentComponent(
+                raw,
+            ) = &proof
+            {
+                crate::account_identity_proof::validate_current_proof_for_key(
+                    raw,
+                    &identity_bytes,
+                    &binding.mls_signature_public_key,
+                    ciphersuite,
+                )
+                .map_err(|e| e.to_string())?;
+                binding.account_identity_proof = Some(raw.clone());
+                storage_err(storage.put_account_device_signer(&binding))?;
+            }
+            proof
+        };
         Ok(Self {
             signer,
             credential_with_key,
-            self_id: MemberId::new(identity_bytes),
+            self_id,
             account_identity_proof,
         })
     }
@@ -317,3 +332,7 @@ mod tests {
         assert!(validate_credential_identity(&[0xFFu8; 32]).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "identity/proof_reuse_tests.rs"]
+mod proof_reuse_tests;

@@ -827,6 +827,11 @@ pub trait MemberValidationCacheStorage {
 pub struct AccountDeviceSignerBinding {
     pub marmot_identity: MemberId,
     pub mls_signature_public_key: Vec<u8>,
+    /// Current-profile account identity proof component, validated by the engine
+    /// against this binding and the selected ciphersuite before every reuse.
+    /// Older records have no proof and acquire one on their next current open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identity_proof: Option<Vec<u8>>,
 }
 
 pub trait AccountDeviceSignerStorage {
