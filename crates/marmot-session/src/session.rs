@@ -914,6 +914,11 @@ impl AccountDeviceSession {
         Ok(self.engine.admin_pubkeys(group_id)?)
     }
 
+    /// See [`cgka_engine::engine::Engine::set_device_tag_group`].
+    pub fn set_device_tag_group(&mut self, group_id: Option<GroupId>) -> SessionResult<()> {
+        Ok(self.engine.set_device_tag_group(group_id)?)
+    }
+
     /// See [`cgka_engine::engine::Engine::member_device_tag_claim`].
     pub fn member_device_tag_claim(
         &self,

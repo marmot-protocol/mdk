@@ -41,8 +41,16 @@ versioning through the workspace version in the root `Cargo.toml`.
   belongs to a device, to a removed slot, or to no one. A tag that doesn't decode, open or verify reads as no tag and
   never makes anything invalid. `AccountDeviceRuntime::member_device_tag_claim` reads a member's leaf in the group's
   current epoch. No group may require 0x800f: a Commit, standalone proposal or Welcome that would is rejected. A
-  GroupContext entry under it is unknown data, which MDK accepts but never writes. No device tags its leaves yet, and
-  the engine refuses to advertise 0x800f.
+  GroupContext entry under it is unknown data, which MDK accepts but never writes.
+- The engine puts device tags in this device's KeyPackages and leaves (mdk#2628 item 3.1d). The host names the device
+  group it trusts with `AccountDeviceRuntime::set_device_tag_group`, which hydrates it. A group that isn't live tags
+  nothing; it stays named, and the call returns an error while that holds. A device signs its tags with its MLS
+  signature key (`own_signature_key`), which it sets as its roster entry's tag signature key in an ordinary roster
+  update; that Commit's own leaf already carries a tag. From then on every KeyPackage it builds carries a fresh tag, a
+  KeyPackage whose tag doesn't read as its own is due for replacement, and every own Commit or self-update that replaces
+  a leaf without such a tag adds one. A founder whose entry in a new device group's roster carries its key tags its
+  founding leaf. A tagged leaf advertises 0x800f, which the host still can't list. Only test-policy builds hold a device
+  group, so release builds tag nothing.
 - `marmot-app` keeps an account's device group (mdk#2628 item 3.1). A confirmed device link creates it under the
   group id the link chose, and the founding Add takes this account's own device only through the exact confirmed
   KeyPackage. The device that created the group trusts it, and so does a device that joined through the Welcome a

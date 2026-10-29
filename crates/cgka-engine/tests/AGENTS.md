@@ -218,8 +218,13 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** `marmot.member.device-tag.v1` (0x800f, mdk#2628 item 3.1d) through the engine: a member leaf whose tag
     verifies under a roster device's key reads as that device, against the current tree only; a tag that doesn't
     open never invalidates a Commit; another account's leaf is unclaimed; a Commit, standalone proposal or Welcome
-    that requires 0x800f is rejected; a GroupContext entry under it is unknown data the engine never writes. The tag
-    crypto and the spec vector are unit-tested in `src/device_tag.rs`.
+    that requires 0x800f is rejected; a GroupContext entry under it is unknown data the engine never writes. Producing
+    them: a device that sets its own key in a roster update tags that Commit's UpdatePath; every KeyPackage it then
+    builds carries a fresh tag, and an untagged or no longer matching one is stale; a founder tags its founding leaf
+    from the roster it founds; each kind of own Commit tags a leaf that needs a tag, and the members accept it; a leaf
+    whose tag reads as its own keeps it; without a named device group nothing is tagged; naming a seeded group hydrates
+    it, and a quarantined one tags nothing while a tagged KeyPackage stays current. The tag crypto and the spec vector
+    are unit-tested in `src/device_tag.rs`.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and

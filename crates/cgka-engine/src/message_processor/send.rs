@@ -20,6 +20,7 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageOut};
+use openmls_traits::OpenMlsProvider as _;
 use std::collections::HashSet;
 use tls_codec::Serialize as _;
 
@@ -323,10 +324,29 @@ impl<S: StorageProvider> Engine<S> {
         // fanout after confirm is unchanged. Non-empty grants couple the
         // admin-policy update into the same Add commit (#1298).
         let (commit_out, welcome_out) = if granted_admin_ids.is_empty() {
-            let (commit_out, welcome_out, _gi) = mls_group
-                .add_members(&provider, &self.identity.signer, &parsed_kps)
-                .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
-            (commit_out, welcome_out)
+            // OpenMLS's `add_members`, whose UpdatePath tags this device's
+            // leaf when the leaf needs a tag.
+            let leaf_node_parameters = self.own_commit_leaf_parameters(&mls_group, &[])?;
+            let bundle = mls_group
+                .commit_builder()
+                .propose_adds(parsed_kps.iter().cloned())
+                .force_self_update(true)
+                .leaf_node_parameters(leaf_node_parameters)
+                .load_psks(provider.storage())
+                .map_err(|e| EngineError::Backend(format!("add_members load_psks: {e:?}")))?
+                .build(
+                    provider.rand(),
+                    provider.crypto(),
+                    &self.identity.signer,
+                    |_| true,
+                )
+                .map_err(|e| EngineError::Backend(format!("add_members build: {e:?}")))?
+                .stage_commit(&provider)
+                .map_err(|e| EngineError::Backend(format!("add_members stage: {e:?}")))?;
+            let welcome_out = bundle
+                .to_welcome_msg()
+                .ok_or_else(|| EngineError::Backend("add_members produced no Welcome".into()))?;
+            (bundle.into_commit(), welcome_out)
         } else {
             let admin_update = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
                 GROUP_ADMIN_POLICY_COMPONENT_ID,
@@ -637,10 +657,25 @@ impl<S: StorageProvider> Engine<S> {
         let commit_out = if resulting_admins.len() == admins.len() {
             // No admin loses their last leaf: a plain Remove commit carries
             // the admin set forward unchanged.
-            let (commit_out, _welcome_opt, _gi) = mls_group
-                .remove_members(&provider, &self.identity.signer, &leaf_indices)
-                .map_err(|e| EngineError::Backend(format!("remove_members: {e:?}")))?;
-            commit_out
+            // OpenMLS's `remove_members`, whose UpdatePath tags this
+            // device's leaf when the leaf needs a tag.
+            let leaf_node_parameters = self.own_commit_leaf_parameters(&mls_group, &[])?;
+            mls_group
+                .commit_builder()
+                .propose_removals(leaf_indices.iter().copied())
+                .leaf_node_parameters(leaf_node_parameters)
+                .load_psks(provider.storage())
+                .map_err(|e| EngineError::Backend(format!("remove_members load_psks: {e:?}")))?
+                .build(
+                    provider.rand(),
+                    provider.crypto(),
+                    &self.identity.signer,
+                    |_| true,
+                )
+                .map_err(|e| EngineError::Backend(format!("remove_members build: {e:?}")))?
+                .stage_commit(&provider)
+                .map_err(|e| EngineError::Backend(format!("remove_members stage: {e:?}")))?
+                .into_commit()
         } else {
             // Couple an admin-policy update dropping the de-leafed admin keys
             // into the same commit. The AdminDepletion guard above ensures

@@ -25,7 +25,12 @@ use cgka_traits::storage::{DeviceGroupWelcomeExpectation, GroupStorage as _};
 /// A device of `account` that advertises the device roster beside
 /// account-devices.
 pub(super) fn roster_device(account: &[u8]) -> Device {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    roster_device_on(SqliteAccountStorage::in_memory().unwrap(), account)
+}
+
+/// [`roster_device`] over `storage`, as a reopened session builds it. The
+/// caller hydrates its groups.
+pub(super) fn roster_device_on(storage: SqliteAccountStorage, account: &[u8]) -> Device {
     let mut supported: Vec<_> = default_group_components().into_iter().collect();
     supported.extend([ACCOUNT_DEVICES_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID]);
     let engine = EngineBuilder::new(storage.clone())

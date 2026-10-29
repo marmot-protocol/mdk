@@ -176,6 +176,10 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) identity: Identity,
     pub(crate) registry: FeatureRegistry,
     pub(crate) supported_app_components: AppComponentSet,
+    /// The device group whose roster this device tags its KeyPackages and
+    /// leaves from; the host sets it once it trusts that group
+    /// ([`Self::set_device_tag_group`]).
+    pub(crate) device_tag_group: Option<GroupId>,
     /// Profile emitted by newly created KeyPackages and groups. Existing
     /// groups retain their independently persisted/wire-classified profile.
     pub(crate) new_protocol_profile: ProtocolProfile,
@@ -657,6 +661,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             identity,
             registry: self.registry,
             supported_app_components: self.supported_app_components,
+            device_tag_group: None,
             new_protocol_profile: self.new_protocol_profile,
             peeler,
             ciphersuite: self.ciphersuite,
