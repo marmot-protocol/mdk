@@ -35,13 +35,13 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     `SetDevice` commit replacing one device entry with an edit applied to the roster as read now. It sends nothing
     unless the device group is stable with nothing of this device's in flight, and sends the edit as
     `SendIntent::ReplaceDeviceEntry` naming the entry it read: the engine stages it only while the slot still holds
-    that entry, so an entry is never replaced from a stale read (`DeviceEntryChanged` maps to `Busy`). Announcements
-    and the host's device edits both go through it; don't add another roster commit. Each
+    that entry, so an entry is never replaced from a stale read (`DeviceEntryChanged` maps to `Busy`). Announcements,
+    the tag signature key and the host's device edits all go through it; don't add another device-entry commit. Each
     announcement also writes the host's `DeviceSelfReport` (this device's client and platform) into its own entry.
   - `runtime/device_tag_key.rs` — this device's tag signature key (mdk#2628 3.1d): the host names the device group to
     tag from (`set_device_tag_group`). Maintenance, and the host before each KeyPackage publication
     (`set_device_tag_key_holding`), set this device's MLS signature key in its own roster entry when the entry lacks
-    it, under the announcement's gates. No KeyPackage is staged, announced or published while the key is due and not
+    it, through `edit_device_roster_entry` like the announcement. No KeyPackage is staged, announced or published while the key is due and not
     in the merged roster, or while another device's entry carries it (the engine tags from whichever entry does), and
     a staged one that no longer advertises what this device would build is replaced. A refresh held back this way
     counts toward `key_package_refresh_overdue` like one held back by its announcement.
