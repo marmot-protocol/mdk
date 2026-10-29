@@ -249,14 +249,14 @@ async fn a_pending_add_of_an_unsupported_device_stays_out_of_the_activation() {
 
 /// Bob's activation is buffered at Alice, unsettled, so the send waits for
 /// convergence: `ingest` buffers it and the next send is queued behind it.
-async fn buffer_unsettled(receiver: &mut Device, commit: &TransportMessage) {
+pub(super) async fn buffer_unsettled(receiver: &mut Device, commit: &TransportMessage) {
     assert!(matches!(
         receiver.engine.ingest(commit.clone()).await.unwrap(),
         IngestOutcome::Buffered { .. }
     ));
 }
 
-fn queued_intents(device: &Device, gid: &GroupId) -> Vec<SendIntent> {
+pub(super) fn queued_intents(device: &Device, gid: &GroupId) -> Vec<SendIntent> {
     device
         .storage
         .list_queued_outbound_intents(gid)

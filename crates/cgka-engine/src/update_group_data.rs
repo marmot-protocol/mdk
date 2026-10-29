@@ -356,7 +356,7 @@ impl<S: StorageProvider> Engine<S> {
     /// removal path in `do_send_remove_members`, and invite-with-admin Adds.
     /// `context` prefixes error messages so failures stay attributable to the
     /// calling intent. Returns the commit and, when Adds were staged, the
-    /// Welcome.
+    /// Welcome. The commit also takes every proposal pending in the store.
     pub(crate) fn stage_commit_with_app_data_updates(
         &self,
         mls_group: &mut MlsGroup,
@@ -364,6 +364,45 @@ impl<S: StorageProvider> Engine<S> {
         removals: Vec<LeafNodeIndex>,
         adds: Vec<MlsKeyPackage>,
         proposals: Vec<Proposal>,
+        context: &str,
+    ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
+        self.stage_app_data_commit(
+            mls_group, provider, removals, adds, proposals, true, context,
+        )
+    }
+
+    /// [`Self::stage_commit_with_app_data_updates`] for a commit that carries
+    /// only the given proposals, by value: proposals pending in the store
+    /// stay there. The link Commit uses it, so linking one device never
+    /// executes another member's queued Add, Remove or roster update.
+    pub(crate) fn stage_exact_commit_with_app_data_updates(
+        &self,
+        mls_group: &mut MlsGroup,
+        provider: &EngineOpenMlsProvider<'_, S>,
+        adds: Vec<MlsKeyPackage>,
+        proposals: Vec<Proposal>,
+        context: &str,
+    ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
+        self.stage_app_data_commit(
+            mls_group,
+            provider,
+            Vec::new(),
+            adds,
+            proposals,
+            false,
+            context,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_app_data_commit(
+        &self,
+        mls_group: &mut MlsGroup,
+        provider: &EngineOpenMlsProvider<'_, S>,
+        removals: Vec<LeafNodeIndex>,
+        adds: Vec<MlsKeyPackage>,
+        proposals: Vec<Proposal>,
+        consume_pending: bool,
         context: &str,
     ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
         // Validate the proposal set as one operation. In particular, removal
@@ -379,6 +418,7 @@ impl<S: StorageProvider> Engine<S> {
         let roster_required = crate::app_components::group_requires_device_roster(mls_group)?;
         let mut builder = mls_group
             .commit_builder()
+            .consume_proposal_store(consume_pending)
             .propose_removals(removals)
             .propose_adds(adds)
             .add_proposals(proposals)

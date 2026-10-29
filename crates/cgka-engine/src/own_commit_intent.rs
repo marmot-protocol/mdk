@@ -44,7 +44,8 @@ impl<S: StorageProvider> Engine<S> {
     /// The kind and authoring baseline to retain for an intent that is about
     /// to stage a group evolution, or `None` for intents that never need
     /// re-issue (application messages, leaves, self-updates, same-account
-    /// Adds and Removes, enabling disbanding or account-devices, disband).
+    /// Adds and Removes, enabling disbanding or account-devices, linking a
+    /// device, disband).
     pub(crate) fn own_commit_recording(
         &self,
         intent: &SendIntent,
@@ -90,6 +91,7 @@ impl<S: StorageProvider> Engine<S> {
             | SendIntent::RemoveOwnAccountDevices { .. }
             | SendIntent::EnableDisbanding { .. }
             | SendIntent::EnableAccountDevices { .. }
+            | SendIntent::LinkDevice { .. }
             | SendIntent::Disband { .. } => None,
         })
     }

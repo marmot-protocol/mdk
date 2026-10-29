@@ -39,6 +39,15 @@ versioning through the workspace version in the root `Cargo.toml`.
   No device group is ever a chat: it stays out of the chat list, invites, timelines and host events, while its
   relay route stays live. Pairing doesn't reach the app yet, so only test-policy builds reach any of this, through
   `MarmotAppConfig::dev_device_groups` and two hidden hooks.
+- `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
+  one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
+  pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster
+  update that sets exactly one device entry. Any Commit a device makes in its device group that adds a member now adds
+  exactly one, by value, and sets that device's roster entry for a new slot, announcing it. So an Invite, a
+  same-account Add or an Add proposal from the store never adds a device there. A link is never queued: while the
+  device group is settling, it is refused with the new `EngineError::LinkDeviceUnsettled`, and the caller retries
+  while the new device still waits for its Welcome. The device gets its Welcome as an invited device does. Like the
+  roster, it is reachable only in test-policy builds until the device group's spec is adopted.
 - The engine can create a group under a group id the host chose before the group exists
   (`create_group_with_chosen_id_and_audit_context`), as a device link needs (mdk#2628). The id has 1 to 255 bytes.
   An id that names any group this device holds, a removed or forgotten copy included, is refused before anything is
