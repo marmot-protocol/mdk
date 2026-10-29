@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use marmot_c::commands::{
     marmot_account_id_hex, marmot_default_profile_pseudonym, marmot_normalize_member_ref,
-    marmot_random_profile_pseudonym,
+    marmot_npub, marmot_random_profile_pseudonym,
 };
 use marmot_c::secret_store::{MarmotSecretStore, MarmotSecretStoreStatus};
 use marmot_c::types::group::{MarmotMemberRef, marmot_member_ref_free};
@@ -190,7 +190,23 @@ fn account_id_hex_and_pseudonyms_are_offline() {
                     .expect("utf-8");
                 assert_eq!(member_ref, expected, "case {}", case.name);
                 assert_eq!(account_id, expected, "case {}", case.name);
-                assert_eq!(npub, NPUB, "case {}", case.name);
+                // The npub round-trips through the resolved account id, which
+                // equals the canonical ACCOUNT_ID for every profile row but
+                // not for the bare event-id hex row.
+                let npub_hex = CString::new(expected)
+                    .unwrap_or_else(|_| panic!("case {} account id must be a C string", case.name));
+                let mut npub_out: *mut c_char = 0x10 as *mut c_char;
+                let npub_status =
+                    unsafe { marmot_npub(client, npub_hex.as_ptr(), &raw mut npub_out) };
+                assert_eq!(
+                    npub_status,
+                    MarmotStatus::Ok,
+                    "case {} npub encode",
+                    case.name
+                );
+                let expected_npub = take_string(npub_out)
+                    .unwrap_or_else(|| panic!("case {} account id has no npub", case.name));
+                assert_eq!(npub, expected_npub, "case {}", case.name);
                 unsafe { marmot_member_ref_free(typed_out) };
             }
             None => {
