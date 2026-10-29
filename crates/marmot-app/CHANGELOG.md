@@ -20,6 +20,12 @@
 
 ### Added
 
+- While this device trusts a device group, it tags its KeyPackages and leaves
+  from that group's roster (mdk#2628 item 3.1d). The founder's entry carries
+  its tag signature key from the start; a device that joins sets its own on
+  its next maintenance pass or KeyPackage publication, before it stages a
+  KeyPackage, and each device then replaces its untagged KeyPackage with a
+  tagged one. Release builds hold no device group and tag nothing.
 - `MarmotAppRuntime::linked_devices` lists this account's own devices as
   `LinkedDevice`s, from the roster of the device group this device trusts,
   this device first (mdk#2628 item 3.1). `LinkedDevicesChanged` says to

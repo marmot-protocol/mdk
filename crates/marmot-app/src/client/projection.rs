@@ -629,6 +629,7 @@ impl AppClient {
     /// pipeline; eager clients call it before returning from open.
     pub(crate) fn reconcile_hydrated_account_state(&mut self) -> Result<(), AppError> {
         self.reconcile_device_groups()?;
+        self.sync_device_tag_group()?;
         if self.reconcile_live_engine_groups()? {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }

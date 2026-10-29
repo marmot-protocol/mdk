@@ -21,6 +21,11 @@
 //!   entry before that KeyPackage reaches its slot (3.4). The runtime holds
 //!   publication until the roster does; this module tells it which group.
 //!
+//! - While this device trusts one, it tags its KeyPackages and leaves from
+//!   its roster (3.1d). The founder's own entry carries its tag signature key
+//!   from the start; a device that joins sets its own on its next maintenance
+//!   pass.
+//!
 //! - The host reads the roster only as [`LinkedDevice`]s, this account's own
 //!   devices, from the device group this device trusts. The group's own events
 //!   never reach the host; `LinkedDevicesChanged` stands in for them.
@@ -275,11 +280,15 @@ impl AppClient {
         OsRng.fill_bytes(&mut roster.leaf_tag_key);
         // Each founding entry announces the KeyPackage in that device's slot
         // (3.4), so neither device owes a roster commit before it publishes.
+        // This device's entry also carries its tag signature key, so the
+        // engine tags its founding leaf (3.1d); the new device sets its own
+        // once it joins.
         roster.devices.insert(
             own_slot,
             DeviceEntryV1 {
                 linked_at: now,
                 announced_key_package: own_lifecycle.current_key_package_ref,
+                tag_signature_key: Some(self.runtime.own_signature_key()),
                 ..DeviceEntryV1::default()
             },
         );
@@ -380,6 +389,7 @@ impl AppClient {
             "install_device_group_route",
             self.ensure_device_group_route(&group_id).map(drop),
         );
+        super::recover_post_canonical_result("name_device_tag_group", self.sync_device_tag_group());
         self.linked_devices_changed = true;
         Ok(group_id)
     }
@@ -525,6 +535,7 @@ impl AppClient {
             now,
         )? {
             self.linked_devices_changed = true;
+            self.sync_device_tag_group()?;
             return Ok(true);
         }
         if storage.device_group(&group_id_hex)?.is_some() {
@@ -625,13 +636,38 @@ impl AppClient {
         Ok(())
     }
 
+    /// Tell the runtime which device group this device tags its KeyPackages
+    /// and leaves from (mdk#2628 3.1d): the one it announces in. Naming the
+    /// group hydrates it, so a deferred open names it only once hydration
+    /// has run; before then, and while the group is not live, this device
+    /// builds untagged. The group stays named either way.
+    pub(crate) fn sync_device_tag_group(&mut self) -> Result<(), AppError> {
+        let group = self.rostered_device_group()?;
+        let renamed = self.runtime.device_tag_group() != group.as_ref();
+        if self.runtime.set_device_tag_group(group).is_err() && renamed {
+            tracing::warn!(
+                target: "marmot_app::client::device_group",
+                method = "sync_device_tag_group",
+                "this device's device group is not live; it tags nothing until it is"
+            );
+        }
+        Ok(())
+    }
+
     /// Publish a fresh KeyPackage for an app path that does not wait for
     /// maintenance, announcing it first in this device's device group. If
-    /// the announcement cannot be made now, the publication is refused with
-    /// nothing sent, and maintenance makes both later.
+    /// the announcement, or this device's tag signature key before it, cannot
+    /// be set now, the publication is refused with nothing staged, and
+    /// maintenance makes them later.
     pub(crate) async fn publish_fresh_key_package_announced(
         &mut self,
     ) -> Result<KeyPackage, AppError> {
+        self.sync_key_package_announcement_group()?;
+        self.set_device_tag_key().await?;
+        self.announce_and_publish_fresh_key_package().await
+    }
+
+    async fn announce_and_publish_fresh_key_package(&mut self) -> Result<KeyPackage, AppError> {
         self.announce_key_package(true).await?;
         Ok(self.runtime.publish_fresh_key_package().await?)
     }
@@ -641,10 +677,13 @@ impl AppClient {
     /// instead, that one is announced.
     pub(crate) async fn republish_key_package_announced(&mut self) -> Result<KeyPackage, AppError> {
         self.sync_key_package_announcement_group()?;
+        // Set first: once this device tags, an untagged current KeyPackage is
+        // stale, and the republish falls back to a fresh one.
+        self.set_device_tag_key().await?;
         if self.runtime.key_package_announcement_group().is_some()
             && self.runtime.key_package_republish_falls_back()?
         {
-            return self.publish_fresh_key_package_announced().await;
+            return self.announce_and_publish_fresh_key_package().await;
         }
         self.announce_key_package(false).await?;
         Ok(self.runtime.republish_key_package().await?)
@@ -654,9 +693,8 @@ impl AppClient {
     /// none is, or the current one. A failed read of this device's device
     /// group refuses the publication, since the runtime treats no group as
     /// nothing to announce. A failed announcement leaves the runtime's gate to
-    /// refuse it.
+    /// refuse it. The caller has named both groups.
     async fn announce_key_package(&mut self, fresh: bool) -> Result<(), AppError> {
-        self.sync_key_package_announcement_group()?;
         if self.runtime.key_package_announcement_group().is_none() {
             return Ok(());
         }
@@ -680,6 +718,34 @@ impl AppClient {
                 method = "announce_key_package",
                 error_kind = error.privacy_safe_kind(),
                 "could not announce this device's key package; maintenance retries"
+            );
+        }
+        Ok(())
+    }
+
+    /// Set this device's tag signature key in its roster entry if it is due,
+    /// before a KeyPackage publication: the runtime stages none while it is
+    /// due (mdk#2628 3.1d). A failed update leaves that gate to refuse the
+    /// publication.
+    async fn set_device_tag_key(&mut self) -> Result<(), AppError> {
+        self.sync_device_tag_group()?;
+        if self.runtime.device_tag_group().is_none() {
+            return Ok(());
+        }
+        let result = async {
+            let held = self.epoch_gap_held_groups()?;
+            let effects = self.runtime.set_device_tag_key_holding(&held).await?;
+            self.observe_drained_session_events(&effects)
+                .await
+                .map(drop)
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(
+                target: "marmot_app::client::device_group",
+                method = "set_device_tag_key",
+                error_kind = error.privacy_safe_kind(),
+                "could not set this device's tag signature key; maintenance retries"
             );
         }
         Ok(())

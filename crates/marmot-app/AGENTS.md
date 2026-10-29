@@ -84,6 +84,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   opens with it set: a client dropped before a drain (a reconnect attempt whose transport fails) takes its change with
   it, and its replacement cannot see that change. Startup and reconnect settle trust with no command after them, so a
   new seam that settles trust must reach one of those two.
+- Name the device group to tag from (mdk#2628 3.1d) with `sync_device_tag_group`, which picks the same group the
+  announcement does. Naming hydrates it, so never name it at a deferred open's end: the post-hydration reconcile
+  does, as do settling a join, creating a group, maintenance and every KeyPackage publication. Name it before reading
+  whether the current KeyPackage still serves (`key_package_republish_falls_back`), since an untagged one is stale once
+  this device tags. The founder's founding entry carries its own tag signature key; every other device sets its own
+  in maintenance or, before a host KeyPackage publication, through `set_device_tag_key`, once per call, since the
+  runtime stages no KeyPackage while the key is due.
 - The overdue-refresh warning (`key_package_refresh_overdue`) asks the runtime's announcement gate, never a copy of
   the roster. The client recomputes it after each maintenance pass; a change sets
   `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free

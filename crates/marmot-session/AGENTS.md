@@ -31,6 +31,11 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   - `runtime/slot_announcement.rs` — the slot-announcement gate (mdk#2628 3.4): while the host names a device group,
     no KeyPackage reaches this device's slot until this device's own roster entry there names it. Maintenance
     announces first.
+  - `runtime/device_tag_key.rs` — this device's tag signature key (mdk#2628 3.1d): the host names the device group to
+    tag from (`set_device_tag_group`). Maintenance, and the host before each KeyPackage publication
+    (`set_device_tag_key_holding`), set this device's MLS signature key in its own roster entry when the entry lacks
+    it, under the announcement's gates. No KeyPackage is staged, announced or published while the key is due and not
+    in the merged roster, and a staged one that no longer advertises what this device would build is replaced.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.
