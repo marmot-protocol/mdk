@@ -58,6 +58,8 @@ pub enum GroupRecoveryPhase {
 ///
 /// Timestamps are Unix seconds. All retained jobs count toward admission limits,
 /// including expired and complete jobs, until the runtime explicitly deletes them.
+/// A retained nonce binds its peer and, for recipients, its local state token.
+/// Source evidence, including the leaf index, can refresh within that job.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupRecoveryRecord {
@@ -119,8 +121,9 @@ fn decode(bytes: &[u8]) -> StorageResult<GroupRecoveryRecord> {
 impl SqliteAccountStorage {
     /// Insert or replace one recovery job atomically with capacity admission.
     ///
-    /// Same-key updates remain possible at capacity. A different recipient nonce
-    /// for the same group returns [`StorageError::AlreadyExists`]; coordinator
+    /// Same-job updates remain possible at capacity. Rebinding a retained nonce's
+    /// peer or recipient local state token, or inserting a different recipient
+    /// nonce for the same group, returns [`StorageError::AlreadyExists`]. Coordinator
     /// capacity exhaustion returns [`StorageError::Capacity`]. Neither refusal
     /// changes existing jobs. This joins the caller's transaction when present.
     pub fn put_group_recovery(&self, record: &GroupRecoveryRecord) -> StorageResult<()> {
@@ -135,10 +138,10 @@ impl SqliteAccountStorage {
         let bytes = serialize(&StoredRecoveryRef { version: 1, record })?;
         self.connection.with_transaction(|| {
             let connection = self.lock()?;
-            let exists: bool = connection
+            let existing: Option<Vec<u8>> = connection
                 .query_row_cached(
-                    "SELECT EXISTS(SELECT 1 FROM cgka_group_rejoin
-                 WHERE group_id = ?1 AND role = ?2 AND request_id = ?3)",
+                    "SELECT record FROM cgka_group_rejoin
+                 WHERE group_id = ?1 AND role = ?2 AND request_id = ?3",
                     params![
                         record.group_id.as_slice(),
                         record.role.as_sql(),
@@ -146,8 +149,17 @@ impl SqliteAccountStorage {
                     ],
                     |row| row.get(0),
                 )
+                .optional()
                 .storage()?;
-            if !exists {
+            if let Some(existing) = existing {
+                let existing = decode(&existing)?;
+                if existing.peer != record.peer
+                    || (record.role == GroupRecoveryRole::Recipient
+                        && existing.local_state_token != record.local_state_token)
+                {
+                    return Err(StorageError::AlreadyExists);
+                }
+            } else {
                 match record.role {
                     GroupRecoveryRole::Recipient => {
                         let occupied: bool = connection
@@ -344,9 +356,16 @@ mod tests {
                 GroupRecoveryBody::Challenge { source },
             ),
         ];
-        for (phase, body) in phases {
+        for (phase, mut body) in phases {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
             store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+            if let GroupRecoveryBody::Challenge { source }
+            | GroupRecoveryBody::Grant { source, .. } = &mut body
+            {
+                source.epoch = EpochId(24);
+                source.leaf_index = 10;
+                expected.leaf_index = source.leaf_index;
+            }
             expected.phase = phase;
             expected.message.body = body;
             expected.retry_at += 27;
@@ -371,6 +390,44 @@ mod tests {
                 vec![expected.clone()]
             );
             reopened.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn group_recovery_identity() {
+        for (role, peer, token) in [
+            (GroupRecoveryRole::Recipient, member_id(8), Some([3; 32])),
+            (GroupRecoveryRole::Coordinator, member_id(8), None),
+            (GroupRecoveryRole::Recipient, member_id(7), Some([4; 32])),
+            (GroupRecoveryRole::Recipient, member_id(7), None),
+        ] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+            let mut initial = record(1, 1, role);
+            if role == GroupRecoveryRole::Coordinator {
+                initial.local_state_token = None;
+            }
+            store.put_group_recovery(&initial).unwrap();
+            let mut rebound = initial.clone();
+            rebound.peer = peer;
+            rebound.local_state_token = token;
+            rebound.phase = GroupRecoveryPhase::Complete;
+            rebound.retry_at = 0;
+            rebound.attempts = 0;
+            rebound.total_attempts = 0;
+            rebound.outbound = None;
+            rebound.commit_id = None;
+            assert!(matches!(
+                store.put_group_recovery(&rebound),
+                Err(StorageError::AlreadyExists)
+            ));
+            let retained = store
+                .group_recovery(&initial.group_id, role, &initial.request_id)
+                .unwrap()
+                .unwrap();
+            // Compare the complete durable record, including exact carrier bytes
+            // and retry evidence, rather than only the conflicting identity.
+            assert_eq!(serialize(&retained).unwrap(), serialize(&initial).unwrap());
         }
     }
 
@@ -445,8 +502,19 @@ mod tests {
             assert_eq!(store.list_group_recoveries().unwrap(), before);
         }
         let mut existing = record(1, 0, GroupRecoveryRole::Coordinator);
-        existing.phase = GroupRecoveryPhase::Publishing;
+        existing.phase = GroupRecoveryPhase::Challenge;
         existing.retry_at += 55;
+        existing.leaf_index = 10;
+        existing.message.body = GroupRecoveryBody::Challenge {
+            source: GroupRecoverySource {
+                epoch: EpochId(24),
+                epoch_authenticator_hash: [31; 32],
+                leaf_index: existing.leaf_index,
+                leaf_hash: [32; 32],
+                device_key_hash: [23; 32],
+                coordinator_key_hash: [24; 32],
+            },
+        };
         store.put_group_recovery(&existing).unwrap();
         assert_eq!(
             store
