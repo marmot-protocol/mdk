@@ -113,7 +113,13 @@ A20|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_RECHECK_INTERV
 A20|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_RECHECK_AFTER_COOLDOWN_SECS
 A20|crates/transport-nostr-adapter/src/compare/mod.rs|COMPARE_SET_LIMIT
 A20|crates/transport-nostr-adapter/src/compare/mod.rs|COMPARE_IDS_PER_REQUEST
-# A21 bounds authenticated recovery control and durable job admission.
+# A21 bounds authenticated automatic Unrecoverable rejoin episodes and control admission.
+A21|crates/marmot-session/src/runtime/group_recovery.rs|REQUEST_LIFETIME_SECS
+A21|crates/marmot-session/src/runtime/group_recovery.rs|MAX_RECIPIENT_JOBS
+A21|crates/marmot-session/src/runtime/group_recovery.rs|MAX_RECOVERY_BATCH
+A21|crates/marmot-session/src/runtime/group_recovery.rs|RECOVERY_RETRY_SECS
+A21|crates/marmot-session/src/runtime/group_recovery.rs|MAX_RECIPIENT_ATTEMPTS
+A21|crates/marmot-session/src/runtime/group_recovery.rs|COMMIT_COOLDOWN_SECS
 A21|crates/cgka-engine/src/message_processor/send.rs|MAX_RECOVERY_MEMBERS
 A21|crates/storage-sqlite/src/protocol/storage/group_recovery.rs|MAX_GROUP_RECOVERY_COORDINATOR_JOBS
 A21|crates/storage-sqlite/src/protocol/storage/group_recovery.rs|MAX_GROUP_RECOVERY_COORDINATOR_JOBS_PER_GROUP

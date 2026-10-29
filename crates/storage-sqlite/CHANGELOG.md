@@ -28,6 +28,11 @@
   evidence intact. Same-job phase, retry and source refreshes remain writable.
   Group deletion cascades to its recovery jobs. Older binaries reject the
   upgraded database.
+  Runtime ownership retains exact publication artifacts and per-member Commit
+  cooldowns. Separate native and authenticated remote epoch baselines allow a
+  taller losing copy to rejoin. A durable one-shot remote rearm caps each
+  episode at 64 reservations between native/admin changes or explicit retry.
+  Nonce rotation clears remote-only height claims, not cost or the spent refill.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it
