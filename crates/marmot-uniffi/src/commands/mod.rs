@@ -11,6 +11,7 @@ mod account;
 mod agent_stream;
 mod audit;
 mod chat_list;
+mod device_link;
 mod directory;
 mod draft;
 mod group;

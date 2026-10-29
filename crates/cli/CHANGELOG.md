@@ -12,10 +12,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 ### Added
 
 - A new `marmot-pairing` crate implements device pairing's code exchange (mdk#2628): Matrix's `m.sas.v1`
-  verification in Marmot encodings, with seven emoji or three numbers to compare, a commitment to the new device's
-  key, and confirmations that cover the new device's exact `KeyPackageRef`, the device group's id, and the MLS
-  signature key of the existing device's leaf in it, the only sender whose Welcome the new device accepts. It ends in
-  a verified link and does no I/O. `transport-nostr-adapter` gift-wraps its messages to the account's own key behind
+  verification in Marmot encodings, with seven emoji to compare, a commitment to the new device's key, and
+  confirmations that cover the new device's exact `KeyPackageRef`, the device group's id, and the MLS signature key of
+  the existing device's leaf in it, the only sender whose Welcome the new device accepts. It ends in a verified link
+  and does no I/O. `transport-nostr-adapter` gift-wraps its messages to the account's own key behind
   the `unreleased-device-pairing` feature. Nothing enables that feature, so no release sends pairing messages until
   the pairing spec merges.
 - `wn-agent doctor` checks a standalone connector setup without changing anything (mdk#2570). It prints one line per
@@ -85,6 +85,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   listed as no longer signed in. A publication that is only stale never signs a slot out, and a check of fallback
   relays, when the account lists none, is never complete. Hosts can't reach it yet, and only test-policy builds run
   it.
+- Hosts can link a new device of the account through pairing (mdk#2628 item 3.3b): `start_device_link`,
+  `confirm_device_link_match` and `cancel_device_link` on the new device, `link_device` and `decline_device_link` on a
+  device already signed in, and `device_link_snapshot`, in `marmot-app`, UniFFI and C, with a `DeviceLinkChanged`
+  event to re-read it. Every call is refused in release builds until the pairing and device-group specs land.
 - `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
   one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
   pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster

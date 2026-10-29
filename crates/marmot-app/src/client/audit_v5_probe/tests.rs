@@ -658,7 +658,7 @@ async fn normal_opt_in_records_real_welcome_and_operational_v5_rows() {
         let retained = alice.runtime.outstanding_welcome_deliveries().unwrap();
         assert_eq!(retained.len(), 1);
         let outer_id = <[u8; 32]>::try_from(retained[0].1.id.as_slice()).unwrap();
-        alice.drive_unpublished_welcome_delivery(None).await;
+        let _ = alice.drive_unpublished_welcome_delivery(None).await;
         assert!(
             alice
                 .runtime
@@ -894,7 +894,7 @@ impl Scenario {
             1
         );
         self.retained_welcome = Some(retained[0].1.clone());
-        self.alice.drive_unpublished_welcome_delivery(None).await;
+        let _ = self.alice.drive_unpublished_welcome_delivery(None).await;
         // Independent sender-side product oracle: enough actual relay ACKs
         // completed the retained delivery obligation. This is not a v5 ACK row.
         assert!(
@@ -1765,6 +1765,8 @@ async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
         storage: storage_sqlite::SqliteAccountStorage::in_memory()
             .unwrap()
             .app_storage(),
+        #[cfg(feature = "unreleased-device-pairing")]
+        pairing: None,
     };
     assert!(matches!(
         peeler.peel_welcome(&message).await,

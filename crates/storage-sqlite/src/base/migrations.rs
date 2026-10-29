@@ -278,6 +278,8 @@ mod migration_0130_recovery_coverage_remainders;
 mod migration_0131_account_sign_ins;
 #[path = "migrations/0132_loss_import_revision.rs"]
 mod migration_0132_loss_import_revision;
+#[path = "migrations/0133_device_links.rs"]
+mod migration_0133_device_links;
 #[path = "migrations/0134_recovery_recheck_revision.rs"]
 mod migration_0134_recovery_recheck_revision;
 
@@ -1092,6 +1094,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0132_loss_import_revision",
         suspend_foreign_keys: &[],
         apply: migration_0132_loss_import_revision::apply,
+    },
+    Migration {
+        version: 133,
+        name: "0133_device_links",
+        suspend_foreign_keys: &[],
+        apply: migration_0133_device_links::apply,
     },
     Migration {
         version: 134,

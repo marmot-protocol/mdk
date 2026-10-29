@@ -14,6 +14,14 @@
   returns whether it recorded. Ending a long cooldown, by an answer or by
   `record_recovery_relay_reconnected` (which now takes the policy and the
   time), makes every re-check on the relay due in the same transaction.
+- Migration 0133 advances account storage to schema 133 (mdk#2628 item 3.3b).
+  It adds `device_links`, one row per device this device approved adding to
+  the account's device group, written before the approving commit, with
+  whether that commit has settled:
+  `pending`, `settled` or `reversed`. `SqliteAppStorage` gains
+  `record_device_link`, `device_link`, `device_links` and
+  `settle_device_link`. A local forget removes the group's rows. No rows are
+  seeded.
 - Migration 0132 advances account storage to schema 132 (mdk#2660 phase 4).
   It adds `import_revision` to `account_delivery_loss_evidence`: the loss
   revision the import that last charged a generation left. Existing imported
