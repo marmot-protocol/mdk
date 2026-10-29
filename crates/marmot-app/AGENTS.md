@@ -59,12 +59,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `suppress_local_deleted_group_event` (both event loops), `refresh_group`, `reconcile_live_engine_groups` and
   `refresh_routing`. Every host surface built from engine or recovery state rather than the projection filters with
   `host_may_see_group`, which fails closed: quarantine, history notices and their changes, epoch-stall escalations,
-  deferred events, recovery-status and superseded-change updates, and Welcome redelivery. A new such surface filters
-  too. Trust is separate from hiding. Act on a device group's roster only once `device_groups` says `created` or
-  `linked`. Never judge a joined Welcome: the engine decides which Welcome joins, before the join (mdk#2628 D28, D30).
-  `record_confirmed_device_link` refuses a group this device already holds, writes the `awaiting_welcome` row, then
-  records the engine's `DeviceGroupWelcomeExpectation` (group, the existing device's leaf signature key,
-  `WELCOME_WAIT_SECS`), deleting the row if that fails. Withdrawing a link and ending a wait
+  deferred events, recovery-status and superseded-change updates, convergence park notices, and Welcome redelivery. A
+  new such surface filters too. Trust is separate from hiding. Act on a device group's roster only once `device_groups`
+  says `created` or `linked`. Never judge a joined Welcome: the engine decides which Welcome joins, before the join
+  (mdk#2628 D28, D30). `record_confirmed_device_link` refuses a group this device already holds, writes the
+  `awaiting_welcome` row, then records the engine's `DeviceGroupWelcomeExpectation` (group, the existing device's leaf
+  signature key, `WELCOME_WAIT_SECS`), deleting the row if that fails. Withdrawing a link and ending a wait
   (`withdraw_confirmed_device_link`, `end_welcome_waits` on every record and reconcile) delete the expectation before
   the row, so once either returns no Welcome under the link joins. A row a crash or failure leaves without its
   expectation admits nothing, and `end_welcome_waits` drops it at once rather than at the wait's end. Decide

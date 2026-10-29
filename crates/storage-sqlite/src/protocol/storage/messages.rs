@@ -536,14 +536,18 @@ impl MessageStorage for SqliteAccountStorage {
         at_or_after_epoch: EpochId,
         filter: OpenMlsContentFilter,
     ) -> StorageResult<Vec<MessageRecord>> {
-        let Some((sql, filter_epoch)) = openmls_filtered_message_sql(states, filter) else {
+        let Some((sql, filter_epochs)) = openmls_filtered_message_sql(states, filter) else {
             return Ok(Vec::new());
         };
         let mut bound = vec![
             rusqlite::types::Value::Blob(group_id.as_slice().to_vec()),
             rusqlite::types::Value::Integer(epoch_to_i64(at_or_after_epoch)?),
         ];
-        bound.extend(filter_epoch.map(rusqlite::types::Value::Integer));
+        bound.extend(
+            filter_epochs
+                .into_iter()
+                .map(rusqlite::types::Value::Integer),
+        );
         let conn = self.lock()?;
         let mut stmt = conn.prepare_cached(&sql).storage()?;
         let records = stmt
@@ -1109,8 +1113,8 @@ fn state_filtered_message_sql(states: &[MessageState]) -> String {
 }
 
 /// SQL for [`MessageStorage::list_openmls_messages_in_states`], binding the
-/// group id (`?1`), the epoch floor (`?2`) and, when the filter has one, the
-/// filter's MLS epoch (`?3`) returned beside it. `None` when no row can match.
+/// group id (`?1`), the epoch floor (`?2`) and the filter's MLS epochs, if
+/// any, from `?3` on, returned beside it. `None` when no row can match.
 ///
 /// Each arm selects row ids from the covering
 /// `(group_id, state, openmls_content, openmls_epoch)` index, so rows the
@@ -1120,7 +1124,7 @@ fn state_filtered_message_sql(states: &[MessageState]) -> String {
 fn openmls_filtered_message_sql(
     states: &[MessageState],
     filter: OpenMlsContentFilter,
-) -> Option<(String, Option<i64>)> {
+) -> Option<(String, Vec<i64>)> {
     let state_list = |states: &[&MessageState]| {
         states
             .iter()
@@ -1136,7 +1140,7 @@ fn openmls_filtered_message_sql(
     };
     let unknown = format!("{OPENMLS_CONTENT_PENDING}, {OPENMLS_CONTENT_UNCLASSIFIED}");
     let mut arms = Vec::new();
-    let mut filter_epoch = None;
+    let mut filter_epochs = Vec::new();
     match filter {
         OpenMlsContentFilter::ApplicationsAt(epoch) => {
             let all: Vec<_> = states.iter().collect();
@@ -1147,10 +1151,30 @@ fn openmls_filtered_message_sql(
             arms.push(id_query(&all, &unknown));
             // No classified application holds an epoch SQLite cannot store.
             if let Ok(epoch) = i64::try_from(epoch.0) {
-                filter_epoch = Some(epoch);
+                filter_epochs.push(epoch);
                 arms.push(format!(
                     "{} AND openmls_epoch = ?3",
                     id_query(&all, &OPENMLS_CONTENT_APPLICATION.to_string())
+                ));
+            }
+        }
+        OpenMlsContentFilter::CommitsAndProposalsBetween { from, through } => {
+            let all: Vec<_> = states.iter().collect();
+            if all.is_empty() {
+                return None;
+            }
+            let all = state_list(&all);
+            arms.push(id_query(&all, &unknown));
+            // No classified commit or proposal holds an epoch SQLite cannot
+            // store, so a range starting beyond it holds none.
+            if let Ok(from) = i64::try_from(from.0) {
+                filter_epochs.extend([from, i64::try_from(through.0).unwrap_or(i64::MAX)]);
+                arms.push(format!(
+                    "{} AND openmls_epoch BETWEEN ?3 AND ?4",
+                    id_query(
+                        &all,
+                        &format!("{OPENMLS_CONTENT_COMMIT}, {OPENMLS_CONTENT_PROPOSAL}")
+                    )
                 ));
             }
         }
@@ -1187,7 +1211,7 @@ fn openmls_filtered_message_sql(
                 if let OpenMlsContentFilter::WithoutProcessedApplicationsThrough(epoch) = filter {
                     // An epoch beyond SQLite's INTEGER range leaves out every
                     // classified application, all of which hold smaller epochs.
-                    filter_epoch = Some(i64::try_from(epoch.0).unwrap_or(i64::MAX));
+                    filter_epochs.push(i64::try_from(epoch.0).unwrap_or(i64::MAX));
                     arms.push(format!(
                         "{} AND openmls_epoch > ?3",
                         id_query(&processed, &OPENMLS_CONTENT_APPLICATION.to_string())
@@ -1206,7 +1230,7 @@ fn openmls_filtered_message_sql(
              ORDER BY insert_order",
             arms.join(" UNION ALL ")
         ),
-        filter_epoch,
+        filter_epochs,
     ))
 }
 

@@ -774,6 +774,11 @@ pub struct AppClient {
     pub(crate) pending_group_projection_updates: HashSet<String>,
     /// Recovery status has its own notification queue; saving a projection must not consume it.
     pub(crate) pending_recovery_status_updates: HashSet<GroupId>,
+    /// Groups whose convergence pass hosts were last told is parked (mdk#2684).
+    /// A park or an un-park against this set owes the host a group-state notice.
+    pub(crate) announced_convergence_parks: HashSet<GroupId>,
+    /// Groups owed that notice; the account worker publishes them each turn.
+    pub(crate) pending_convergence_park_notices: HashSet<GroupId>,
     /// The parked recovery set as last announced to hosts ("history may be
     /// incomplete"): one small entry per parked occurrence, compared at each
     /// publication seam so a change raises `HistoryNoticesChanged`.
@@ -975,6 +980,10 @@ pub struct AppClient {
     /// retirement, for the retry path its callers depend on.
     #[cfg(test)]
     pub(crate) fail_next_terminal_recovery_retire: bool,
+    /// One-shot failure of an explicit convergence retry's advance, after the
+    /// retry re-armed the pass and before any attempt could park it again.
+    #[cfg(test)]
+    pub(crate) fail_next_convergence_retry_advance: bool,
     /// Temporary history subscriptions, floored at each copy's Welcome. One
     /// lives while the group's post-join history fetch is owed, and while a
     /// post-join maintenance obligation waits for its first relay EOSE.
@@ -2697,6 +2706,7 @@ impl AppClient {
             epoch: group.epoch.0,
             member_count: crate::groups::member_account_count(&group.members),
             unrecoverable: group.unrecoverable,
+            convergence_parked: self.runtime.convergence_pass_parked(group_id)?,
             required_app_components: group
                 .required_capabilities
                 .app_components
@@ -3517,6 +3527,8 @@ impl AppClient {
         self.pending_local_group_deletion_frontier_clears
             .remove(&group_hex);
         self.pending_recovery_status_updates.remove(group_id);
+        self.announced_convergence_parks.remove(group_id);
+        self.pending_convergence_park_notices.remove(group_id);
         self.pending_projection_updates
             .retain(|update| update.group_id_hex != group_hex);
         self.pending_welcome_delivery_events
@@ -6205,6 +6217,20 @@ impl AppClient {
         // pass re-syncs routes before checkpointing. Refuse it up front rather
         // than publish and then fail that checkpoint.
         self.sync_runtime_groups().await?;
+        // An explicit retry is the user's evidence: a parked or backing-off
+        // pass makes its next attempt now (mdk#2684). The worker's next
+        // schedule read re-arms the group whatever the attempt returns: an
+        // advance that errors before it re-parks the pass would otherwise
+        // leave it due with no wake.
+        if self.runtime.retry_failed_convergence_pass(group_id)? {
+            self.pending_convergence_groups.insert(group_id.clone());
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_convergence_retry_advance) {
+            return Err(AppError::Storage(cgka_traits::storage::StorageError::Busy(
+                "injected convergence retry advance failure".to_owned(),
+            )));
+        }
         let effects = self.runtime.advance_convergence(group_id).await?;
         self.observe_convergence_retry_effects(group_id, &effects)
             .await

@@ -19,6 +19,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotAppGroupMlsState` gains a trailing `convergence_parked` field for a
+  group whose convergence pass spent its failure budget (mdk#2684). Show it as
+  stuck syncing; `marmot_retry_group_convergence` grants one more attempt.
+  The struct grows, so use matching regenerated headers and libraries.
 - `marmot_linked_devices` writes this account's own devices as a
   `MarmotLinkedDeviceList` (free with `marmot_linked_device_list_free`), from
   the roster of the device group this device trusts, this device first

@@ -878,9 +878,9 @@ async fn a_device_group_welcome_stays_out_of_host_redelivery() {
 
 /// The host never learns of the device group through a surface built from
 /// engine or recovery state rather than the projection: epoch-stall
-/// escalations, recovery-status and superseded-change updates, history
-/// notices and their changes, and quarantine. A chat on the same surfaces
-/// still shows.
+/// escalations, recovery-status and superseded-change updates, convergence
+/// park notices, history notices and their changes, and quarantine. A chat on
+/// the same surfaces still shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_host_never_learns_of_the_device_group() {
     let Devices {
@@ -930,6 +930,13 @@ async fn the_host_never_learns_of_the_device_group() {
         .map(|report| report.group_id)
         .collect();
     assert_eq!(superseded, vec![chat.clone()]);
+
+    // A convergence pass each group parked (mdk#2684).
+    phone.take_convergence_park_notices();
+    for id in [&group, &chat] {
+        phone.note_convergence_park(id, true);
+    }
+    assert_eq!(phone.take_convergence_park_notices(), vec![chat.clone()]);
 
     // An epoch gap each group's recovery parked.
     let storage = phone_app.account_storage("alice").unwrap();

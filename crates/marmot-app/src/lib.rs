@@ -2046,6 +2046,8 @@ impl MarmotApp {
             pending_seen_event_count: 0,
             pending_group_projection_updates: std::collections::HashSet::new(),
             pending_recovery_status_updates: std::collections::HashSet::new(),
+            announced_convergence_parks: std::collections::HashSet::new(),
+            pending_convergence_park_notices: std::collections::HashSet::new(),
             history_notice_baseline: None,
             // A fresh client cannot know what hosts last read.
             linked_devices_changed: true,
@@ -2117,6 +2119,8 @@ impl MarmotApp {
             fail_next_released_backfill_reload: false,
             #[cfg(test)]
             fail_next_terminal_recovery_retire: false,
+            #[cfg(test)]
+            fail_next_convergence_retry_advance: false,
             post_join_maintenance_subscriptions: HashMap::new(),
             post_join_history_sessions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),

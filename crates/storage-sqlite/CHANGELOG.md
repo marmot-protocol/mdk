@@ -111,6 +111,11 @@
 
 ### Added
 
+- `OpenMlsContentFilter::CommitsAndProposalsBetween` lists only the commits and
+  proposals whose MLS epoch falls in a range, plus the rows SQLite cannot
+  classify (mdk#2684). A failed convergence batch checks its horizon through it
+  on every load, reading neither the group's applications nor its older
+  history.
 - `queue_current_push_registration_share_for_group` queues the stored
   registration for one joined group again, including a revision whose share
   already completed. It does nothing while native push is off or without a

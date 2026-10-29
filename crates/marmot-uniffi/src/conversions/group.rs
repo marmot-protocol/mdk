@@ -724,6 +724,11 @@ pub struct AppGroupMlsStateFfi {
     pub disbanding: bool,
     pub disbanding_blockers: Vec<String>,
     pub disband_request: Option<DisbandRequestFfi>,
+    /// Convergence stopped retrying a batch that kept failing. New input from
+    /// another member or `retry_group_convergence` resumes it; sends stay
+    /// queued meanwhile.
+    #[uniffi(default = false)]
+    pub convergence_parked: bool,
 }
 
 impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
@@ -740,6 +745,7 @@ impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
             disbanding: value.disbanding,
             disbanding_blockers: value.disbanding_blockers,
             disband_request: value.disband_request.map(Into::into),
+            convergence_parked: value.convergence_parked,
         }
     }
 }
