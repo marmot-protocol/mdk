@@ -92,6 +92,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     would pick the phantom still applies on its first attempt. Also an ignored measurement of host advances and
     wall time to the first delivered message over a widened group.
 
+- **File:** `distributed_convergence/refused_queued_intents.rs`
+  - **Owns:** A queued admin change the settled state refuses (the sender was demoted while it waited) is retired and
+    announced as `GroupEvent::QueuedIntentRefused` for each admin intent kind, the work queued behind it still drains,
+    and no later drain prepares it again (mdk#2694). The storage-held counterpart lives in `record_write_atomicity.rs`.
+
 - **File:** `distributed_convergence/encrypted_media_source_secret.rs`
   - **Owns:** A replayed media application carries its source-epoch encrypted-media secret on `MessageReceived`
     even when the same pass advances past the anchor horizon and prunes that epoch's retained anchor.

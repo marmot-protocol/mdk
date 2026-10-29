@@ -3160,6 +3160,9 @@ impl<S: StorageProvider> Engine<S> {
                 group_id: group, ..
             }
             | GroupEvent::LocalGroupCopyRestored { group_id: group }
+            | GroupEvent::QueuedIntentRefused {
+                group_id: group, ..
+            }
             | GroupEvent::GroupMemberLeavesRemoved {
                 group_id: group, ..
             }

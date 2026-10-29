@@ -58,9 +58,10 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `upgrade.rs` | `do_upgrade_group_capabilities` (MLS primitives via `GroupContextExtensions`, app components via `AppDataUpdate`) |
 | `update_group_data.rs` | `SendIntent::UpdateGroupData`: stages an `AppDataUpdate` for `marmot.group.profile.v1`; admin-policy and routing updates are out of scope |
 | `disband.rs` | Durable terminal group-disband workflow |
-| `account_devices_activation.rs` | `SendIntent::EnableAccountDevices`: one admin Commit that requires 0x800d (and removes a stray GroupContext entry under its id) through the AppDataUpdate path; one aggregate eligibility check, `account_devices_activation_refusal`, serves the host's read and the refusal before staging; no `OwnCommitIntent` re-issue |
+| `account_devices_activation.rs` | `SendIntent::EnableAccountDevices`: one admin Commit that requires 0x800d (and removes a stray GroupContext entry under its id) through the AppDataUpdate path; one aggregate eligibility check, `account_devices_activation_refusal`, serves the host's read and the refusal before staging; a send queued behind convergence is checked before it is queued, and a drain-time refusal is retired like any other (`queued_intent_refusal.rs`); no `OwnCommitIntent` re-issue |
 | `link_device.rs` | `SendIntent::LinkDevice`: one admin Commit in a device group that adds the KeyPackage a link confirmed and sets its roster entry, through the shared Adds-plus-AppDataUpdates staging, taking nothing from the proposal store; refused unless the group requires 0x800e, the KeyPackage is this account's and supports the group, and the update sets exactly one device entry; never queued (`LinkDeviceUnsettled` while the group settles or an own Commit is in flight); no `OwnCommitIntent` re-issue |
 | `own_commit_intent.rs` | `OwnCommitIntent` records and re-issue of own commits superseded by branch selection (mdk#1734) |
+| `queued_intent_refusal.rs` | What the outbound drain does with a queued intent whose preparation fails on the settled state (mdk#2694): retire and announce (`GroupEvent::QueuedIntentRefused`) a refusal, keep a failure the device or a closed group-wide gate caused |
 | `own_account_devices.rs` | `SendIntent::AddOwnAccountDevices` / `RemoveOwnAccountDevices`: a by-value same-account Commit that leaves the proposal store alone, refused unless the classifier calls it same-account (so only while the group requires 0x800d); no `OwnCommitIntent` re-issue |
 | `maintenance.rs` | KeyPackage replacement staging and promotion (OpenMLS material and the lifecycle record in one transaction), the own-leaf hash, and mandatory sender-ratchet rotation after own-checkpoint installation. Replay rotation uses a durable Manual obligation whose phase cannot release the restored epoch's application-send gate; its private epoch-bound id is pruned only after exact checkpoints at the same horizon. Ordinary scheduling and other account records live above the engine; it adds no storage forwards for them (mdk#2602) |
 | `group_authority.rs` | Advisory live-engine authority facts for conversation capture; mutations still validate authority |
@@ -416,6 +417,17 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   two overwritable states or no state (inbound apply behind `can_ingest`, the outbound drain behind its `Stable`-only
   re-check, hydration on fresh state, create/join), so a fired refusal means a new caller lost that gate — fix the
   caller, don't relax the refusal.
+- **A queued intent the settled state refuses is retired, never retried.** The drain's preparation is the send, so a
+  failure is a refusal when the device could evaluate the intent and every gate that holds back all of the group's
+  sends was open (`queued_intent_refusal.rs`): the drain deletes the record, announces
+  `GroupEvent::QueuedIntentRefused` with the id `SendResult::Queued` returned, and goes on with the next record; with
+  the fairness slot, the refusal uses up the attempt. A failure whose error reports the device or the group's lifecycle
+  (`reports_the_device`, an exhaustive match: classify a new `EngineError` variant there), or that came while a
+  group-wide gate was closed, keeps the record and fails the drain as before. Classify by the gates, never by an
+  error's text: one `InvalidTransition` is a hold or a verdict depending on its source. Returning a refusal from the
+  drain instead wedges the group's queue, every later drain failing on the same record (mdk#2694). Pinned by
+  `tests/distributed_convergence/refused_queued_intents.rs` and
+  `tests/record_write_atomicity.rs::a_queued_intent_held_by_a_storage_failure_stays_queued`.
 - **A held publication and an unresolved convergence input are mutually exclusive**, which is why
   `converge_stored_openmls_messages*` needs no held-publication gate. Outbound: `should_queue_outbound_intent` settles
   convergence before staging, so an unresolved input diverts the intent to the retention queue and `begin_pending` is

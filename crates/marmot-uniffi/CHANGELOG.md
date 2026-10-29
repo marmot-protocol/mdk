@@ -4,6 +4,12 @@
 
 ### Breaking changes
 
+- `GroupEventKindFfi` adds `QueuedIntentRefused { intent_id_hex, intent_kind,
+  reason }` (mdk#2694): a send that waited for the group to settle was dropped
+  because the settled state refused it; tell the user, who may try again.
+  Update exhaustive Swift/Kotlin handling and regenerate bindings with the
+  matching native library.
+
 - `MarmotEventFfi` adds `LinkedDevicesChanged { account_id_hex, account_label }`
   (mdk#2628). Update exhaustive Swift/Kotlin handling and regenerate bindings
   with the matching native library.

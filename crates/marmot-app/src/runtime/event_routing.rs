@@ -158,9 +158,8 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
             }
             GroupEvent::MessageReceived { .. }
             | GroupEvent::AppMessageInvalidated { .. }
-            | GroupEvent::TransportObjectResourceRefused { .. } => {
-                ChatListUpdateTrigger::SnapshotRefresh
-            }
+            | GroupEvent::TransportObjectResourceRefused { .. }
+            | GroupEvent::QueuedIntentRefused { .. } => ChatListUpdateTrigger::SnapshotRefresh,
         },
         MarmotAppEvent::ProjectionUpdated(update) => update.update.chat_list_trigger,
         MarmotAppEvent::MessageReceived(_)
@@ -181,6 +180,7 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
     match event {
         GroupEvent::LocalGroupCopyTerminated { group_id, .. }
         | GroupEvent::LocalGroupCopyRestored { group_id }
+        | GroupEvent::QueuedIntentRefused { group_id, .. }
         | GroupEvent::GroupMemberLeavesRemoved { group_id, .. }
         | GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }

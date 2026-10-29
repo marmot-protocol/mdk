@@ -349,7 +349,8 @@ pub enum SendResult {
     /// The engine accepted the local intent but did not publish anything
     /// yet because the group has unresolved convergence input. The intent
     /// will be regenerated from the canonical state when the group becomes
-    /// stable.
+    /// stable. If that state refuses it, the engine drops it and announces
+    /// [`GroupEvent::QueuedIntentRefused`] with this `intent_id`.
     Queued {
         group_id: GroupId,
         intent_id: MessageId,
@@ -635,6 +636,22 @@ pub enum GroupEvent {
     /// Restores participation without an invitation or changing local archive intent.
     LocalGroupCopyRestored {
         group_id: GroupId,
+    },
+    /// A queued intent was dropped unsent: once the group settled, the
+    /// settled state refused it, as it would have refused the same intent
+    /// sent directly (the sender is no longer an admin, a precondition no
+    /// longer holds, the change is not valid on that state). The engine does
+    /// not prepare it again; the user may ask again (mdk#2694).
+    QueuedIntentRefused {
+        group_id: GroupId,
+        /// The id [`SendResult::Queued`] returned for the intent.
+        intent_id: MessageId,
+        /// Stable name of the intent's kind, such as `update_group_data`.
+        intent_kind: String,
+        /// Stable, privacy-safe name of the refusal: the
+        /// [`EngineError::privacy_safe_kind`](crate::error::EngineError::privacy_safe_kind)
+        /// of the error the preparation returned, such as `not_group_admin`.
+        reason: String,
     },
     /// Device destinations invalidated by an actual canonical state transition.
     /// Derived from the live pre-apply tree and the final selected tree, rather
