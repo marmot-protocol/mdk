@@ -1,6 +1,7 @@
 //! Pairing as it runs on this device: its own new-device session, the
-//! prompts for sign-ins it can link, the pairing messages it owes, and the
-//! links it approved that have not settled yet.
+//! prompts for sign-ins it can link, the pairing messages it owes, the links
+//! it approved that are not made yet, and the device group it joined until
+//! its first commit there lands.
 //!
 //! Pairing secrets live only in the `marmot-pairing` sessions held here, in
 //! memory. Nothing here persists or logs a code, key, session id, slot or
@@ -30,7 +31,7 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr::prelude::PublicKey;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use storage_sqlite::{DeviceGroupTrust, DeviceLinkSettlement};
+use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome, DeviceLinkRecord};
 use transport_nostr_adapter::pairing::{
     InboundPairingMessage, PairingEventError, read_pairing_rumor, wrap_pairing_message,
 };
@@ -39,7 +40,9 @@ use super::{
     DeviceLinkChoices, DeviceLinkEmoji, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPrompt,
     DeviceLinkPromptState, DeviceLinkSnapshot, NewDeviceLinkState,
 };
-use crate::client::device_group::{ConfirmedDeviceLink, WELCOME_WAIT_SECS, device_slot};
+use crate::client::device_group::{
+    ConfirmedDeviceLink, LINK_DEADLINE_SECS, WELCOME_WAIT_SECS, device_slot,
+};
 use crate::client::{AppClient, WelcomeDelivery, recover_post_canonical_result};
 use crate::{AccountRelayListStatus, AppError, unix_now_seconds};
 
@@ -140,10 +143,14 @@ pub(crate) struct DevicePairing {
     /// Linking as hosts were last told it changed; empty when the client
     /// opens, which announces it.
     last_view: DeviceLinkSnapshot,
-    /// When each pending link's device group was first seen quiet, keyed by
-    /// group and slot; the settlement window counts from then. In memory, so
-    /// a restart starts the window again.
+    /// When each pending link was first seen missing from its quiet device
+    /// group's roster, keyed by group and slot; the settlement window counts
+    /// from then. In memory, so a restart starts the window again.
     quiet_since: HashMap<(String, String), Instant>,
+    /// This device was removed from the device group it joined through a
+    /// link before its first commit there landed: its user is told linking
+    /// failed until it starts another link.
+    removed_after_join: bool,
 }
 
 impl DevicePairing {
@@ -201,8 +208,8 @@ struct Prompt {
     /// to commit on a later drive, while it is still useful.
     approval: Option<Approval>,
     /// This device committed the link, or created the device group for it.
-    /// The prompt stays linking until [`AppClient::link_publication_state`]
-    /// confirms it.
+    /// The prompt stays linking until [`AppClient::decide_device_links`]
+    /// decides the link.
     publication: Option<LinkPublication>,
 }
 
@@ -214,7 +221,7 @@ struct Approval {
 }
 
 /// A link this device committed, or created the device group for, that is
-/// not confirmed yet.
+/// not decided yet.
 struct LinkPublication {
     group_id: GroupId,
     /// The Welcomes the link sent: those this device's engine tracked after
@@ -226,12 +233,21 @@ struct LinkPublication {
     redeliver_at: u64,
 }
 
-/// Where a link's publication stands.
-enum PublicationState {
-    Confirmed,
-    /// Not confirmed yet, with the link's Welcomes the relays have not taken.
-    Pending(Vec<MessageId>),
-    Failed,
+/// Where a link this device approved stands in its device group's roster,
+/// as the selected branch leaves it (D40).
+#[derive(Debug, PartialEq, Eq)]
+enum LinkVerdict {
+    /// The new device's first commit set its tag signature key: the link is
+    /// made, and stays made.
+    Made,
+    /// The roster lists the device as this device's link, and its deadline
+    /// has not passed.
+    Waiting,
+    /// The deadline passed with no commit from the new device.
+    TimedOut,
+    /// The roster does not list the device as this device's link: the
+    /// approving commit never landed, or lost.
+    Lost,
 }
 
 struct FoundKeyPackage {
@@ -323,7 +339,8 @@ impl AppClient {
                 "could not end the Welcome waits that ran out"
             );
         }
-        self.settle_device_links(now);
+        self.follow_device_group_joins().await;
+        self.decide_device_links(now).await;
         self.device_pairing.prompts.retain(|prompt| {
             !prompt.stage.is_terminal() || now < prompt.updated_at.saturating_add(SESSION_TTL_SECS)
         });
@@ -471,6 +488,7 @@ impl AppClient {
             return Err(AppError::DeviceGroupRefused("key_package_not_published"));
         };
         let key_package_event_id = KeyPackageEventId::new(event_id);
+        self.device_pairing.removed_after_join = false;
         let (pairing, request) = NewDevicePairing::start(
             self.account_key()?,
             key_package_event_id,
@@ -1093,18 +1111,24 @@ impl AppClient {
         } else {
             None
         };
+        let leaf_signature_key = marmot_session::key_package_metadata(&key_package)
+            .map_err(|_| AppError::DeviceGroupRefused("key_package_not_confirmed"))?
+            .leaf_signature_key;
         let earlier_welcomes = self.sent_welcome_ids()?;
-        // Record the approval before its commit, so no crash can lose it. One
-        // whose commit never lands settles as reversed.
-        self.app
-            .account_storage(&self.state.label)?
-            .app_storage()
-            .record_device_link(
-                &hex::encode(link.device_group_id.as_slice()),
-                &hex::encode(slot),
-                &key_package_ref_hex,
-                now,
-            )?;
+        let group_id_hex = hex::encode(link.device_group_id.as_slice());
+        let slot_hex = hex::encode(slot);
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        // Record the approval before its commit, so no crash can lose it,
+        // with the leaf it adds: the new device's first commit sets that key
+        // as its tag key, and a failed link removes that leaf. One whose
+        // commit never lands fails.
+        storage.record_device_link(
+            &group_id_hex,
+            &slot_hex,
+            &key_package_ref_hex,
+            &hex::encode(&leaf_signature_key),
+            now,
+        )?;
         match roster_update {
             Some(update) => {
                 self.link_device_into_group(&link.device_group_id, key_package, update)
@@ -1120,21 +1144,38 @@ impl AppClient {
                 self.create_device_group(&confirmed, choices).await?;
             }
         }
-        // The link is made, so a failed read here must not end it as though
-        // it were not: with no Welcome known, it is never confirmed and fails
-        // once the new device stops waiting.
-        let welcomes = match self.sent_welcome_ids() {
+        // The commit is made, so a failed read or write here must not end the
+        // link as though it were not: the link's gate never reads its Welcome,
+        // which is published only to reach the new device. With no Welcome
+        // recorded, a link that fails withdraws none; the new device refuses
+        // a Welcome once its wait ended.
+        let welcomes: HashSet<MessageId> = match self.sent_welcome_ids() {
             Ok(sent) => sent.difference(&earlier_welcomes).cloned().collect(),
             Err(error) => {
                 tracing::warn!(
                     target: TARGET,
                     method = "add_linked_device",
                     error_kind = error.privacy_safe_kind(),
-                    "could not read a link's Welcomes; it is not confirmed"
+                    "could not read a link's Welcomes; none is published again"
                 );
                 HashSet::new()
             }
         };
+        // A link adds one KeyPackage, so it sends one Welcome.
+        if let [welcome] = welcomes.iter().collect::<Vec<_>>().as_slice()
+            && let Err(error) = storage.record_device_link_welcome(
+                &group_id_hex,
+                &slot_hex,
+                &hex::encode(welcome.as_slice()),
+            )
+        {
+            tracing::warn!(
+                target: TARGET,
+                method = "add_linked_device",
+                error_kind = AppError::from(error).privacy_safe_kind(),
+                "could not record a link's Welcome; a failed link withdraws none"
+            );
+        }
         Ok((link.device_group_id.clone(), welcomes))
     }
 
@@ -1203,11 +1244,10 @@ impl AppClient {
         Ok(())
     }
 
-    /// Decide each link this device committed, or created the device group
-    /// for, by [`Self::link_publication_state`], the only way a prompt
-    /// becomes linked. A Welcome of the link the relays have not taken is
-    /// published again until the new device stops waiting, and a link not
-    /// confirmed by then fails.
+    /// Publish again each Welcome of a link this device committed, or created
+    /// the device group for, that the relays have not taken, until the new
+    /// device stops waiting for it. Whether the link is made is decided only
+    /// by [`Self::decide_device_links`].
     async fn follow_link_publications(&mut self, now: u64) {
         let pending: Vec<SessionId> = self
             .device_pairing
@@ -1218,52 +1258,43 @@ impl AppClient {
                 if matches!(prompt.stage, Stage::Linking(_)) {
                     Some(prompt.session_id)
                 } else {
-                    // The session ended first; nothing waits for the link.
+                    // The link was decided; nothing waits for its Welcome.
                     prompt.publication = None;
                     None
                 }
             })
             .collect();
         for session_id in pending {
-            let state = self
-                .link_publication_state(&session_id)
-                .unwrap_or_else(|error| {
+            let Some((group_id, welcomes)) = self
+                .device_pairing
+                .prompt_mut(&session_id)
+                .and_then(|prompt| prompt.publication.as_ref())
+                .filter(|publication| {
+                    now < publication.wait_ends && now >= publication.redeliver_at
+                })
+                .map(|publication| (publication.group_id.clone(), publication.welcomes.clone()))
+            else {
+                continue;
+            };
+            let undelivered = match self.undelivered_welcomes(&group_id, &welcomes) {
+                Ok(undelivered) => undelivered,
+                Err(error) => {
                     tracing::warn!(
                         target: TARGET,
                         method = "follow_link_publications",
                         error_kind = error.privacy_safe_kind(),
-                        "could not read a link's publication; it stays pending"
+                        "could not read a link's Welcome; it is published again later"
                     );
-                    PublicationState::Pending(Vec::new())
-                });
-            let Some(publication) = self
+                    continue;
+                }
+            };
+            if let Some(publication) = self
                 .device_pairing
                 .prompt_mut(&session_id)
                 .and_then(|prompt| prompt.publication.as_mut())
-            else {
-                continue;
-            };
-            let undelivered = match state {
-                PublicationState::Confirmed => {
-                    if let Some(prompt) = self.device_pairing.prompt_mut(&session_id) {
-                        prompt.publication = None;
-                        prompt.stage = Stage::Linked;
-                        prompt.updated_at = now;
-                    }
-                    continue;
-                }
-                PublicationState::Pending(undelivered) if now < publication.wait_ends => {
-                    undelivered
-                }
-                PublicationState::Pending(_) | PublicationState::Failed => {
-                    self.fail_link_publication(&session_id, now);
-                    continue;
-                }
-            };
-            if undelivered.is_empty() || now < publication.redeliver_at {
-                continue;
+            {
+                publication.redeliver_at = now.saturating_add(WELCOME_REDELIVER_SECS);
             }
-            publication.redeliver_at = now.saturating_add(WELCOME_REDELIVER_SECS);
             for id in undelivered {
                 if let Err(error) = self.redeliver_welcome(&hex::encode(id.as_slice())).await {
                     tracing::debug!(
@@ -1277,124 +1308,35 @@ impl AppClient {
         }
     }
 
-    /// Where a link this device made stands. It is confirmed once the device
-    /// group this device trusts is stable with the link in its roster, as
-    /// the link's commit or the group's creation left it, and the relays took
-    /// every Welcome the link sent. A commit the runtime still retries keeps
-    /// it pending, as does a Welcome not taken yet; a commit rolled back, or
-    /// a group gone, fails it.
-    fn link_publication_state(
-        &mut self,
-        session_id: &SessionId,
-    ) -> Result<PublicationState, AppError> {
-        let Some((group_id, welcomes, slot)) = self
-            .device_pairing
-            .prompts
-            .iter()
-            .find(|prompt| &prompt.session_id == session_id)
-            .and_then(|prompt| {
-                let publication = prompt.publication.as_ref()?;
-                Some((
-                    publication.group_id.clone(),
-                    publication.welcomes.clone(),
-                    prompt.found.as_ref()?.slot,
-                ))
-            })
-        else {
-            return Ok(PublicationState::Failed);
-        };
-        match self.runtime.epoch_state(&group_id) {
-            None => return Ok(PublicationState::Failed),
-            Some(EpochState::Stable { .. }) => {}
-            Some(_) => return Ok(PublicationState::Pending(Vec::new())),
-        }
-        let own_slot = self.own_slot()?;
-        let in_roster = self
-            .trusted_device_roster()?
-            .is_some_and(|(trusted, roster)| {
-                trusted == group_id
-                    && link_settlement(&roster, &slot, &own_slot) == DeviceLinkSettlement::Settled
-            });
-        if !in_roster {
-            return Ok(PublicationState::Failed);
-        }
-        let undelivered = self.undelivered_welcomes(&group_id, Some(&welcomes))?;
-        Ok(if !welcomes.is_empty() && undelivered.is_empty() {
-            PublicationState::Confirmed
-        } else {
-            PublicationState::Pending(undelivered)
-        })
-    }
-
-    /// The Welcomes `group_id` still owes, among `welcomes` when given: those
-    /// the engine has not seen reach the relays.
+    /// The Welcomes among `welcomes` that `group_id` still owes: those the
+    /// engine has not seen reach the relays.
     fn undelivered_welcomes(
         &self,
         group_id: &GroupId,
-        welcomes: Option<&HashSet<MessageId>>,
+        welcomes: &HashSet<MessageId>,
     ) -> Result<Vec<MessageId>, AppError> {
         Ok(self
             .runtime
             .outstanding_welcome_deliveries()?
             .into_iter()
             .filter(|(welcome_group, welcome)| {
-                welcome_group == group_id && welcomes.is_none_or(|ids| ids.contains(&welcome.id))
+                welcome_group == group_id && welcomes.contains(&welcome.id)
             })
             .map(|(_, welcome)| welcome.id)
             .collect())
     }
 
-    /// End a link whose publication failed, or was not confirmed before the
-    /// new device stopped waiting, telling the new device so. Its record
-    /// settles as reversed now, so a device whose Welcome never reached it
-    /// is never taken as linked, whatever the roster lists.
-    fn fail_link_publication(&mut self, session_id: &SessionId, now: u64) {
-        let Some(prompt) = self.device_pairing.prompt_mut(session_id) else {
-            return;
-        };
-        let publication = prompt.publication.take();
-        let slot = prompt.found.as_ref().map(|found| found.slot);
-        prompt.stage = Stage::Ended(DeviceLinkEndReason::LinkFailed);
-        prompt.updated_at = now;
-        self.device_pairing.send(
-            PairingMessage::Cancel(PairingCancel {
-                session_id: *session_id,
-                reason: CancelReason::CannotLink,
-            }),
-            now,
-        );
-        let (Some(publication), Some(slot)) = (publication, slot) else {
-            return;
-        };
-        let settled = self
-            .app
-            .account_storage(&self.state.label)
-            .and_then(|storage| {
-                storage
-                    .app_storage()
-                    .settle_device_link(
-                        &hex::encode(publication.group_id.as_slice()),
-                        &hex::encode(slot),
-                        DeviceLinkSettlement::Reversed,
-                        now,
-                    )
-                    .map_err(AppError::from)
-            });
-        if let Err(error) = settled {
-            tracing::warn!(
-                target: TARGET,
-                method = "fail_link_publication",
-                error_kind = error.privacy_safe_kind(),
-                "could not record a failed device link"
-            );
-        }
-    }
-
-    /// Decide every pending link this device approved whose commit settled:
-    /// the device group has been past it with nothing left to converge for
-    /// the engine's settlement window, in milliseconds. The roster then says
-    /// whether the link held.
-    fn settle_device_links(&mut self, now: u64) {
+    /// Decide every link this device approved, through one gate whether its
+    /// prompt is here or a restart dropped it (D40). The link is made once
+    /// the new device's first commit in the device group, which sets its tag
+    /// signature key in its roster entry, is on the selected branch and the
+    /// group holds no unprocessed input. It fails if the approving commit
+    /// never landed or lost, or if [`LINK_DEADLINE_SECS`] after the entry's
+    /// `linked_at` that commit is still absent; neither the approving
+    /// commit's publication nor its Welcome's delivery decides it. A failed
+    /// link this device still lists is removed again on every drive until
+    /// it is gone.
+    async fn decide_device_links(&mut self, now: u64) {
         let window = Duration::from_millis(self.app.settlement_quiescence_ms());
         let Ok(storage) = self.app.account_storage(&self.state.label) else {
             return;
@@ -1405,93 +1347,229 @@ impl AppClient {
         };
         let mut pending = Vec::new();
         for link in links {
-            if link.settlement != DeviceLinkSettlement::Pending {
-                continue;
+            match link.outcome {
+                DeviceLinkOutcome::Linked => continue,
+                DeviceLinkOutcome::Failed => {
+                    self.unlink_failed_device(&link, &own_slot, false).await;
+                    continue;
+                }
+                DeviceLinkOutcome::Pending => {}
             }
             let key = (link.group_id_hex.clone(), link.slot_hex.clone());
             pending.push(key.clone());
-            // A link still waiting on its publication is decided by that
-            // first.
-            if self.link_publication_pending(&link.group_id_hex, &link.slot_hex) {
-                continue;
-            }
-            let Ok(group_bytes) = hex::decode(&link.group_id_hex) else {
+            let Some(outcome) = self.link_outcome(&link, &own_slot, &key, window, now) else {
                 continue;
             };
-            let group_id = GroupId::new(group_bytes);
-            let settlement = if matches!(self.stored_group(&group_id), Ok(None)) {
-                // The approval never made its group: a first link whose
-                // creation failed, or a crash before it.
-                DeviceLinkSettlement::Reversed
-            } else {
-                let quiet = matches!(
-                    self.runtime.epoch_state(&group_id),
-                    Some(EpochState::Stable { .. })
-                ) && matches!(
-                    self.runtime.has_pending_convergence_inputs(&group_id),
-                    Ok(false)
-                ) && matches!(
-                    self.runtime.has_queued_outbound_intents(&group_id),
-                    Ok(false)
-                );
-                if !quiet {
-                    self.device_pairing.quiet_since.remove(&key);
-                    continue;
-                }
-                let since = *self
-                    .device_pairing
-                    .quiet_since
-                    .entry(key.clone())
-                    .or_insert_with(Instant::now);
-                if since.elapsed() < window {
-                    continue;
-                }
-                let Ok(slot) = device_slot(&link.slot_hex) else {
-                    continue;
-                };
-                // Decide a link only by the roster of the group this device
-                // trusts; any other waits.
-                let roster = match self.trusted_device_roster() {
-                    Ok(Some((trusted, roster))) if trusted == group_id => roster,
-                    _ => continue,
-                };
-                match link_settlement(&roster, &slot, &own_slot) {
-                    // The roster lists the device, but the link is made only
-                    // once its Welcome reached the relays too, as the gate
-                    // requires. With the gate's prompt gone, as a restart
-                    // drops it, any Welcome the device group still owes holds
-                    // the link until the new device has stopped waiting.
-                    DeviceLinkSettlement::Settled if !self.link_confirmed(&slot) => {
-                        match self.undelivered_welcomes(&group_id, None) {
-                            Ok(owed) if owed.is_empty() => DeviceLinkSettlement::Settled,
-                            Ok(_) if now >= link.linked_at.saturating_add(WELCOME_WAIT_SECS) => {
-                                DeviceLinkSettlement::Reversed
-                            }
-                            _ => continue,
-                        }
-                    }
-                    settlement => settlement,
-                }
-            };
+            self.device_pairing.quiet_since.remove(&key);
             if let Err(error) =
-                storage.settle_device_link(&link.group_id_hex, &link.slot_hex, settlement, now)
+                storage.decide_device_link(&link.group_id_hex, &link.slot_hex, outcome, now)
             {
                 tracing::warn!(
                     target: TARGET,
-                    method = "settle_device_links",
+                    method = "decide_device_links",
                     error_kind = AppError::from(error).privacy_safe_kind(),
-                    "could not record a settled device link"
+                    "could not record a decided device link"
                 );
                 continue;
             }
-            self.device_pairing.quiet_since.remove(&key);
-            if settlement == DeviceLinkSettlement::Reversed {
-                self.end_reversed_prompt(&link.slot_hex, &link.key_package_ref_hex, now);
+            self.end_link_prompt(&link, outcome, now);
+            if outcome == DeviceLinkOutcome::Failed {
+                self.unlink_failed_device(&link, &own_slot, true).await;
             }
         }
         self.device_pairing
             .quiet_since
             .retain(|key, _| pending.contains(key));
+    }
+
+    /// The outcome `link` has reached, if any. Its device group must be
+    /// stable with no convergence input left to process, and its roster is
+    /// read only when it is the group this device trusts. A link the roster
+    /// does not list fails only after the settlement window, in milliseconds,
+    /// since branch selection may still bring its commit back.
+    fn link_outcome(
+        &mut self,
+        link: &DeviceLinkRecord,
+        own_slot: &DeviceSlotId,
+        key: &(String, String),
+        window: Duration,
+        now: u64,
+    ) -> Option<DeviceLinkOutcome> {
+        let group_id = GroupId::new(hex::decode(&link.group_id_hex).ok()?);
+        if matches!(self.stored_group(&group_id), Ok(None)) {
+            // The approval never made its group: a first link whose creation
+            // failed, or a crash before it.
+            return Some(DeviceLinkOutcome::Failed);
+        }
+        let quiet = matches!(
+            self.runtime.epoch_state(&group_id),
+            Some(EpochState::Stable { .. })
+        ) && matches!(
+            self.runtime.has_pending_convergence_inputs(&group_id),
+            Ok(false)
+        );
+        if !quiet {
+            self.device_pairing.quiet_since.remove(key);
+            return None;
+        }
+        let roster = match self.trusted_device_roster() {
+            Ok(Some((trusted, roster))) if trusted == group_id => roster,
+            _ => return None,
+        };
+        let slot = device_slot(&link.slot_hex).ok()?;
+        let leaf_signature_key = hex::decode(&link.leaf_signature_key_hex).ok()?;
+        match link_verdict(&roster, &slot, own_slot, &leaf_signature_key, now) {
+            LinkVerdict::Made => Some(DeviceLinkOutcome::Linked),
+            LinkVerdict::Waiting => {
+                self.device_pairing.quiet_since.remove(key);
+                None
+            }
+            LinkVerdict::TimedOut => Some(DeviceLinkOutcome::Failed),
+            LinkVerdict::Lost => {
+                let since = *self
+                    .device_pairing
+                    .quiet_since
+                    .entry(key.clone())
+                    .or_insert_with(Instant::now);
+                (since.elapsed() >= window).then_some(DeviceLinkOutcome::Failed)
+            }
+        }
+    }
+
+    /// Undo a failed link (D40): withdraw its Welcome, so no recovery
+    /// publishes it again, then, while the trusted roster still lists the
+    /// device as this device's link, remove its leaf and roster entry in one
+    /// commit. The withdrawal runs when the link fails and again with each
+    /// removal attempt; withdrawing twice changes nothing. A removal the
+    /// unsettled group refuses is tried again on the next drive.
+    async fn unlink_failed_device(
+        &mut self,
+        link: &DeviceLinkRecord,
+        own_slot: &DeviceSlotId,
+        failed_now: bool,
+    ) {
+        let result = async {
+            let group_id = GroupId::new(hex::decode(&link.group_id_hex)?);
+            let slot = device_slot(&link.slot_hex)?;
+            let listed = match self.trusted_device_roster()? {
+                Some((trusted, roster)) if trusted == group_id => roster
+                    .devices
+                    .get(&slot)
+                    .is_some_and(|device| device.linked_by.as_ref() == Some(own_slot)),
+                _ => false,
+            };
+            if !failed_now && !listed {
+                return Ok(());
+            }
+            if let Some(welcome_id) = &link.welcome_id_hex {
+                self.runtime
+                    .withdraw_welcome(&MessageId::new(hex::decode(welcome_id)?))?;
+            }
+            if !listed {
+                return Ok(());
+            }
+            let leaf_signature_key = hex::decode(&link.leaf_signature_key_hex)?;
+            let has_leaf = self.stored_group(&group_id)?.is_some_and(|group| {
+                group
+                    .members
+                    .iter()
+                    .any(|member| member.credential == leaf_signature_key)
+            });
+            let operations = vec![DeviceRosterOperationV1::RemoveDevice(slot)];
+            if !has_leaf {
+                // No leaf to remove: write the entry away alone.
+                return self
+                    .commit_device_roster_update(group_id, operations, "unlink_device")
+                    .await;
+            }
+            self.unlink_device_from_group(&group_id, leaf_signature_key, operations)
+                .await
+        }
+        .await;
+        match result {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.as_engine_error(),
+                    Some(EngineError::LinkDeviceUnsettled { .. })
+                ) =>
+            {
+                tracing::debug!(
+                    target: TARGET,
+                    method = "unlink_failed_device",
+                    "the device group is unsettled; the removal waits"
+                );
+            }
+            Err(error) => tracing::warn!(
+                target: TARGET,
+                method = "unlink_failed_device",
+                error_kind = error.privacy_safe_kind(),
+                "could not remove a device whose link failed; retrying"
+            ),
+        }
+    }
+
+    /// Remove the leaf `leaf_signature_key` from the device group and its
+    /// roster entry in one commit, published as the link's was.
+    async fn unlink_device_from_group(
+        &mut self,
+        group_id: &GroupId,
+        leaf_signature_key: Vec<u8>,
+        operations: Vec<DeviceRosterOperationV1>,
+    ) -> Result<(), AppError> {
+        let roster_update = DeviceRosterUpdateV1::new(operations)
+            .and_then(|update| encode_device_roster_update_v1(&update).map_err(|e| e.to_string()))
+            .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
+        let audit_context = Self::local_human_action_context(
+            "unlink_device",
+            vec!["members"],
+            vec![DEVICE_ROSTER_COMPONENT_ID],
+            Some(1),
+        );
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::UnlinkDevice {
+                    group_id: group_id.clone(),
+                    leaf_signature_key,
+                    roster_update,
+                },
+                audit_context,
+            )
+            .await?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await
+    }
+
+    /// End the linking prompt of `link` with its outcome, telling the new
+    /// device when the link failed.
+    fn end_link_prompt(&mut self, link: &DeviceLinkRecord, outcome: DeviceLinkOutcome, now: u64) {
+        let Some(prompt) = self.device_pairing.prompts.iter_mut().find(|prompt| {
+            matches!(prompt.stage, Stage::Linking(_))
+                && hex::encode(prompt.key_package_ref.as_slice()) == link.key_package_ref_hex
+                && prompt
+                    .found
+                    .as_ref()
+                    .is_some_and(|found| hex::encode(found.slot) == link.slot_hex)
+        }) else {
+            return;
+        };
+        prompt.publication = None;
+        prompt.approval = None;
+        prompt.updated_at = now;
+        if outcome == DeviceLinkOutcome::Linked {
+            prompt.stage = Stage::Linked;
+            return;
+        }
+        prompt.stage = Stage::Ended(DeviceLinkEndReason::LinkFailed);
+        let session_id = prompt.session_id;
+        self.device_pairing.send(
+            PairingMessage::Cancel(PairingCancel {
+                session_id,
+                reason: CancelReason::CannotLink,
+            }),
+            now,
+        );
     }
 
     /// Test hook: date every prompt's request `secs` earlier, as a code
@@ -1503,54 +1581,86 @@ impl AppClient {
         }
     }
 
-    /// Whether [`Self::link_publication_state`] confirmed this device's link
-    /// of `slot` since the client opened.
-    fn link_confirmed(&self, slot: &DeviceSlotId) -> bool {
-        self.device_pairing.prompts.iter().any(|prompt| {
-            matches!(prompt.stage, Stage::Linked)
-                && prompt
-                    .found
-                    .as_ref()
-                    .is_some_and(|found| &found.slot == slot)
-        })
+    // New device, after its link's Welcome joined.
+
+    /// Make this device's first commit in the device group it joined through
+    /// a link as soon as it can, rather than on the next maintenance pass,
+    /// and forget the join once that commit is on the selected branch. A
+    /// device removed from its device group forgets its copy, so its next
+    /// Welcome is a first join; one removed before its first commit there
+    /// landed tells its user that linking failed (D40).
+    async fn follow_device_group_joins(&mut self) {
+        if let Err(error) = self.follow_device_group_joins_inner().await {
+            tracing::warn!(
+                target: TARGET,
+                method = "follow_device_group_joins",
+                error_kind = error.privacy_safe_kind(),
+                "could not follow this device's device group join; retrying"
+            );
+        }
     }
 
-    /// Whether the link this device made for `slot_hex` in `group_id_hex`
-    /// still waits on its publication.
-    fn link_publication_pending(&self, group_id_hex: &str, slot_hex: &str) -> bool {
-        self.device_pairing.prompts.iter().any(|prompt| {
-            prompt.publication.as_ref().is_some_and(|publication| {
-                hex::encode(publication.group_id.as_slice()) == group_id_hex
-            }) && prompt
-                .found
+    async fn follow_device_group_joins_inner(&mut self) -> Result<(), AppError> {
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let trusted = self.trusted_device_group()?;
+        let joins = storage.device_group_joins()?;
+        if let Some(group_id) = &trusted
+            && self
+                .stored_group(group_id)?
+                .is_some_and(|group| group.removed)
+        {
+            let joined = joins
+                .iter()
+                .any(|(group_id_hex, _)| *group_id_hex == hex::encode(group_id.as_slice()));
+            self.forget_group_local(group_id).await?;
+            self.linked_devices_changed = true;
+            self.sync_device_tag_group()?;
+            if joined {
+                match self.device_pairing.new_device.as_mut() {
+                    Some(link) if matches!(link.outcome, Some(NewDeviceOutcome::Linked)) => {
+                        link.outcome =
+                            Some(NewDeviceOutcome::Ended(DeviceLinkEndReason::LinkFailed));
+                    }
+                    Some(_) => {}
+                    None => self.device_pairing.removed_after_join = true,
+                }
+            }
+            return Ok(());
+        }
+        for (group_id_hex, _) in joins {
+            let joined = trusted
                 .as_ref()
-                .is_some_and(|found| hex::encode(found.slot) == slot_hex)
-        })
+                .is_some_and(|group_id| hex::encode(group_id.as_slice()) == group_id_hex);
+            let linked = joined
+                && storage
+                    .device_group(&group_id_hex)?
+                    .is_some_and(|record| record.trust == DeviceGroupTrust::Linked);
+            if !linked || self.own_first_commit_landed()? {
+                storage.delete_device_group_join(&group_id_hex)?;
+                continue;
+            }
+            self.set_device_tag_key().await?;
+        }
+        Ok(())
     }
 
-    /// End the linked prompt whose link a competing commit reversed after it
-    /// landed, telling the new device so if it still waits.
-    fn end_reversed_prompt(&mut self, slot_hex: &str, key_package_ref_hex: &str, now: u64) {
-        let Some(prompt) = self.device_pairing.prompts.iter_mut().find(|prompt| {
-            matches!(prompt.stage, Stage::Linked)
-                && hex::encode(prompt.key_package_ref.as_slice()) == key_package_ref_hex
-                && prompt
-                    .found
-                    .as_ref()
-                    .is_some_and(|found| hex::encode(found.slot) == slot_hex)
-        }) else {
-            return;
+    /// Whether this device's first commit in its trusted device group is on
+    /// the selected branch: the group is stable with no convergence input
+    /// left, and this device's roster entry carries its tag signature key.
+    fn own_first_commit_landed(&mut self) -> Result<bool, AppError> {
+        let Some((group_id, roster)) = self.trusted_device_roster()? else {
+            return Ok(false);
         };
-        prompt.stage = Stage::Ended(DeviceLinkEndReason::LinkFailed);
-        prompt.updated_at = now;
-        let session_id = prompt.session_id;
-        self.device_pairing.send(
-            PairingMessage::Cancel(PairingCancel {
-                session_id,
-                reason: CancelReason::CannotLink,
-            }),
-            now,
-        );
+        let quiet = matches!(
+            self.runtime.epoch_state(&group_id),
+            Some(EpochState::Stable { .. })
+        ) && !self.runtime.has_pending_convergence_inputs(&group_id)?;
+        let own_key = self.runtime.own_signature_key();
+        Ok(quiet
+            && roster
+                .devices
+                .get(&self.own_slot()?)
+                .is_some_and(|device| device.tag_signature_key.as_ref() == Some(&own_key)))
     }
 
     /// End sessions whose time ran out, and send the cancels owed.
@@ -1654,11 +1764,15 @@ impl AppClient {
         } else {
             self.trusted_device_roster()?.map(|(_, roster)| roster)
         };
-        let new_device = self
-            .device_pairing
-            .new_device
-            .as_ref()
-            .map(|link| new_device_state(link, now));
+        let new_device = match self.device_pairing.new_device.as_ref() {
+            Some(link) => Some(new_device_state(link, now)),
+            None => self
+                .device_pairing
+                .removed_after_join
+                .then_some(NewDeviceLinkState::Ended {
+                    reason: DeviceLinkEndReason::LinkFailed,
+                }),
+        };
         let existing = self.device_pairing.existing.as_ref();
         let competing = existing.is_some_and(|existing| existing.competing_requests(now));
         let prompts = self
@@ -1785,23 +1899,32 @@ fn roster_entry<'a>(
     }
 }
 
-/// How a link this device approved settled, once its device group is quiet:
-/// it stands if the roster lists the device's slot as linked by this device.
-/// Otherwise a competing commit won. The announced KeyPackage is no evidence:
-/// the device replaces it whenever it refreshes its KeyPackage.
-fn link_settlement(
+/// Where the link of `slot` this device approved stands in `roster` at
+/// `now`. The link stands only as this device's link of the slot; the
+/// announced KeyPackage is no evidence, since the device replaces it whenever
+/// it refreshes its KeyPackage. It is made once the entry carries
+/// `leaf_signature_key`, the key of the leaf the link added, as its tag
+/// signature key: only that device's first commit sets it.
+fn link_verdict(
     roster: &DeviceRosterV1,
     slot: &DeviceSlotId,
     own_slot: &DeviceSlotId,
-) -> DeviceLinkSettlement {
-    let stands = roster
+    leaf_signature_key: &[u8],
+    now: u64,
+) -> LinkVerdict {
+    let Some(device) = roster
         .devices
         .get(slot)
-        .is_some_and(|device| device.linked_by.as_ref() == Some(own_slot));
-    if stands {
-        DeviceLinkSettlement::Settled
+        .filter(|device| device.linked_by.as_ref() == Some(own_slot))
+    else {
+        return LinkVerdict::Lost;
+    };
+    if device.tag_signature_key.as_deref() == Some(leaf_signature_key) {
+        LinkVerdict::Made
+    } else if now >= device.linked_at.saturating_add(LINK_DEADLINE_SECS) {
+        LinkVerdict::TimedOut
     } else {
-        DeviceLinkSettlement::Reversed
+        LinkVerdict::Waiting
     }
 }
 
@@ -1947,40 +2070,54 @@ mod tests {
     }
 
     #[test]
-    fn a_link_settles_only_as_this_devices_link_of_the_slot() {
+    fn a_link_is_made_only_by_the_new_devices_first_commit_before_the_deadline() {
         let (phone, laptop, tablet) = ([1; 32], [2; 32], [3; 32]);
-        let confirmed = vec![7; 32];
-        let roster = |linked_by: DeviceSlotId, key_package_ref: Vec<u8>| DeviceRosterV1 {
+        let leaf_key = vec![9; 32];
+        let roster = |linked_by: DeviceSlotId, tag_key: Option<Vec<u8>>| DeviceRosterV1 {
             devices: [(
                 tablet,
                 DeviceEntryV1 {
                     linked_by: Some(linked_by),
-                    announced_key_package: Some(key_package_ref),
+                    linked_at: 1_000,
+                    announced_key_package: Some(vec![7; 32]),
+                    tag_signature_key: tag_key,
                     ..DeviceEntryV1::default()
                 },
             )]
             .into(),
             ..DeviceRosterV1::default()
         };
-        let settled = |roster: &DeviceRosterV1| link_settlement(roster, &tablet, &phone);
+        let verdict =
+            |roster: &DeviceRosterV1, now| link_verdict(roster, &tablet, &phone, &leaf_key, now);
+        let deadline = 1_000 + LINK_DEADLINE_SECS;
 
+        assert_eq!(verdict(&roster(phone, None), 1_000), LinkVerdict::Waiting);
         assert_eq!(
-            settled(&roster(phone, confirmed.clone())),
-            DeviceLinkSettlement::Settled
-        );
-        // Another device's link of the same KeyPackage won.
-        assert_eq!(
-            settled(&roster(laptop, confirmed.clone())),
-            DeviceLinkSettlement::Reversed
-        );
-        // The device announced a refreshed KeyPackage since: its link stands.
-        assert_eq!(
-            settled(&roster(phone, vec![8; 32])),
-            DeviceLinkSettlement::Settled
+            verdict(&roster(phone, None), deadline - 1),
+            LinkVerdict::Waiting
         );
         assert_eq!(
-            settled(&DeviceRosterV1::default()),
-            DeviceLinkSettlement::Reversed
+            verdict(&roster(phone, None), deadline),
+            LinkVerdict::TimedOut
+        );
+        // The first commit set the leaf's key: made, even past the deadline.
+        assert_eq!(
+            verdict(&roster(phone, Some(leaf_key.clone())), deadline + 5),
+            LinkVerdict::Made
+        );
+        // A key the link's leaf does not hold is no evidence.
+        assert_eq!(
+            verdict(&roster(phone, Some(vec![8; 32])), 1_000),
+            LinkVerdict::Waiting
+        );
+        // Another device's link of the same slot won.
+        assert_eq!(
+            verdict(&roster(laptop, Some(leaf_key.clone())), 1_000),
+            LinkVerdict::Lost
+        );
+        assert_eq!(
+            verdict(&DeviceRosterV1::default(), 1_000),
+            LinkVerdict::Lost
         );
     }
 }

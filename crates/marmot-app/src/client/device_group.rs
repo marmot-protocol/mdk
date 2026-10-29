@@ -84,6 +84,13 @@ pub struct ConfirmedDeviceLink {
 /// engine joins no Welcome under the link after it.
 pub(crate) const WELCOME_WAIT_SECS: u64 = 600;
 
+/// How long, in seconds after its roster entry's `linked_at`, a device this
+/// device linked has to make its first commit in the device group before the
+/// link fails and this device removes it (D40). It outlasts the new
+/// device's Welcome wait, the epoch-gap holds and a short suspend.
+pub(crate) const LINK_DEADLINE_SECS: u64 = 3_600;
+const _: () = assert!(LINK_DEADLINE_SECS > WELCOME_WAIT_SECS);
+
 /// One of this account's devices, as the roster of the device group this
 /// device trusts lists it. Every entry is this account's own device: the
 /// engine refuses a device group that holds another account's leaf.
@@ -554,6 +561,15 @@ impl AppClient {
             return Ok(storage.device_group(&group_id_hex)?.is_some());
         }
         let now = unix_now_seconds();
+        if storage
+            .device_group(&group_id_hex)?
+            .is_some_and(|record| record.trust == DeviceGroupTrust::AwaitingWelcome)
+        {
+            // Recorded first, so a crash before the trust changes leaves the
+            // join to be recorded again: the pairing drive makes this
+            // device's first commit there as soon as it can (D40).
+            storage.record_device_group_join(&group_id_hex, now)?;
+        }
         if storage.set_device_group_trust(
             &group_id_hex,
             DeviceGroupTrust::AwaitingWelcome,
@@ -780,7 +796,7 @@ impl AppClient {
     /// before a KeyPackage publication: the runtime stages none while it is
     /// due (mdk#2628 3.1d). A failed update leaves that gate to refuse the
     /// publication.
-    async fn set_device_tag_key(&mut self) -> Result<(), AppError> {
+    pub(crate) async fn set_device_tag_key(&mut self) -> Result<(), AppError> {
         self.sync_device_tag_group()?;
         if self.runtime.device_tag_group().is_none() {
             return Ok(());
