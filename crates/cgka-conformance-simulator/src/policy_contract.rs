@@ -255,6 +255,13 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 41] = [
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),
+    // The recovery runner's retry, breaker and quantum values pace which
+    // history it fetches and when; they certify nothing a fetch did not prove.
+    decision(
+        "A19",
+        ConstantInfluence::InputAcquisition,
+        VersioningRule::OperationalNonInterference,
+    ),
 ];
 
 const fn decision(

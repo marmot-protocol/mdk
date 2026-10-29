@@ -79,6 +79,7 @@ mod push;
 mod receipts;
 pub(crate) mod recovery;
 mod recovery_coverage;
+mod recovery_runner;
 mod retention;
 mod sync;
 #[cfg(test)]
