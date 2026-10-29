@@ -1020,6 +1020,25 @@ does one that is announced but failing at the relays. Re-read on `MarmotEventFfi
 which carries no device or group identities and also fires once each time the account's worker opens or reconnects.
 It is false in every release build until the roster's spec lands.
 
+## Linking a new device
+
+Linking a new device of the account shows the same seven emoji on both devices, and each user confirms. Every call
+returns a `DeviceLinkSnapshotFfi`, and every call is refused in release builds until the pairing and device-group specs
+land:
+
+- The new device calls `start_device_link(account_ref)` and shows `new_device`: `WaitingForAnswer` (ask the user to
+  open the app on a device already signed in), then `Comparing` with the code. Offer "They match"
+  (`confirm_device_link_match`) and cancel (`cancel_device_link`). It then shows `WaitingForOtherDevice`, `Joining`,
+  and `Linked`, or `Ended` with a reason.
+- A device already signed in shows each entry in `prompts`. `Comparing` shows the code; offer a label field, "Add to
+  all my chats" and "Bring chat history" (both on by default), Link device (`link_device`) and Not now
+  (`decline_device_link`). Other states say why Link isn't offered, or `AddedElsewhere`: "<device_label> was added
+  by <added_by_label>".
+- Each emoji carries an English `description` for screen readers. Users compare the pictures, not the descriptions.
+- `device_link_snapshot(account_ref)` reads linking without changing it. Re-read on `MarmotEventFfi::DeviceLinkChanged`,
+  which carries no device, session or group identities. It also fires once each time the account's worker opens or
+  reconnects, which ends any link in progress.
+
 ## History may be incomplete notices
 
 Automatic recovery stops retrying an obligation after a fixed budget of attempts that

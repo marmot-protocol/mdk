@@ -56,6 +56,18 @@
   3.4), so hosts can tell the user before inviters stop treating the device as
   fresh at 30 days. `KeyPackageRefreshOverdueChanged` says to re-read it. Both
   are false and silent in release builds until the roster's spec lands.
+- Device pairing links a new device of the account through the account runtime (mdk#2628 item 3.3b), behind the
+  unreleased `unreleased-device-pairing` feature and `dev_device_groups`. The new device starts a link naming its
+  published KeyPackage (`MarmotAppRuntime::start_device_link`), both devices show the same seven emoji with their
+  descriptions, and its user confirms (`confirm_device_link_match`) or cancels (`cancel_device_link`). A device
+  already signed in shows a prompt once it found and checked that KeyPackage; its user chooses Link device with a
+  label and two settings, both on by default (`link_device`), or Not now (`decline_device_link`).
+  `device_link_snapshot` reads both sides as `DeviceLinkSnapshot`. A first link creates the device group; a later one
+  adds the device in one commit, retried while the device group settles until the new device stops waiting. The
+  prompt says why a client can't be linked, refuses a 21st device, and on other
+  devices changes to who added it. `MarmotAppEvent::DeviceLinkChanged` says to re-read linking; it also fires once
+  each time the account's worker opens or reconnects, which ends any link in progress. Nothing reaches a release
+  build.
 - An admin can turn on `marmot.group.account-devices.v1` in an existing group
   (mdk#2628). `AppClient::enable_account_devices` and
   `MarmotAppRuntime::enable_account_devices` send one admin Commit, only when

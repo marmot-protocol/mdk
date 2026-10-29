@@ -1557,6 +1557,15 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// Linking a new device may have changed as this device shows it:
+    /// re-read `device_link_snapshot`. Also fires once each time the
+    /// account's worker opens or reconnects, which ends any link in
+    /// progress. Carries no device, session or group identities, and may
+    /// fire with no visible change.
+    DeviceLinkChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
 }
 
 impl MarmotAppRuntime {
@@ -3980,6 +3989,86 @@ impl MarmotAppRuntime {
 
     pub async fn publish_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
         self.accounts.publish_key_package(account_ref).await
+    }
+
+    /// Linking a new device of this account (mdk#2628 item 3.3b), on the new
+    /// device: ask a device already signed in to link this one. Refused unless
+    /// the build has `unreleased-device-pairing` and device groups are on.
+    pub async fn start_device_link(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(account_ref, crate::DeviceLinkOp::Start)
+            .await
+    }
+
+    /// On the new device: the user says both screens show the same emoji.
+    pub async fn confirm_device_link_match(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(account_ref, crate::DeviceLinkOp::ConfirmMatch)
+            .await
+    }
+
+    /// On the new device: cancel the link.
+    pub async fn cancel_device_link(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(account_ref, crate::DeviceLinkOp::Cancel)
+            .await
+    }
+
+    /// On a device already signed in: Link device, with the new device's
+    /// label and settings.
+    pub async fn link_device(
+        &self,
+        account_ref: &str,
+        prompt_id: &str,
+        choices: crate::DeviceLinkChoices,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(
+            account_ref,
+            crate::DeviceLinkOp::Link {
+                prompt_id: prompt_id.to_owned(),
+                choices,
+            },
+        )
+        .await
+    }
+
+    /// On a device already signed in: Not now.
+    pub async fn decline_device_link(
+        &self,
+        account_ref: &str,
+        prompt_id: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(
+            account_ref,
+            crate::DeviceLinkOp::Decline {
+                prompt_id: prompt_id.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Linking as this device shows it now: its own new-device session and
+    /// the prompts for sign-ins it can link.
+    pub async fn device_link_snapshot(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(account_ref, crate::DeviceLinkOp::Read)
+            .await
+    }
+
+    async fn device_link(
+        &self,
+        account_ref: &str,
+        op: crate::DeviceLinkOp,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.accounts.device_link(account_ref, op).await
     }
 
     pub async fn rotate_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
