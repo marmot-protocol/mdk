@@ -40,7 +40,7 @@ pub struct ConstantDecision {
     pub versioning: VersioningRule,
 }
 
-pub const CONSTANT_DECISIONS: [ConstantDecision; 41] = [
+pub const CONSTANT_DECISIONS: [ConstantDecision; 42] = [
     decision(
         "P1",
         ConstantInfluence::SelectedStateSemantic,
@@ -252,6 +252,13 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 41] = [
     // changes which history arrives, never what counts as covered.
     decision(
         "A18",
+        ConstantInfluence::InputAcquisition,
+        VersioningRule::OperationalNonInterference,
+    ),
+    // The recovery runner's retry, breaker and quantum values pace which
+    // history it fetches and when; they certify nothing a fetch did not prove.
+    decision(
+        "A19",
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),

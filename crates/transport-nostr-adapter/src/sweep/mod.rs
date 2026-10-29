@@ -254,6 +254,14 @@ pub trait SweepRelay: Send + Sync {
     /// Every event of `route` at `second`, for a second holding more events
     /// than one reply can.
     async fn fetch_second(&self, route: SweepRoute, second: u64, cap: Option<u32>) -> SecondReply;
+
+    /// Event JSON bytes the relay sent since the last call, whether a reply
+    /// kept them or not: duplicates, a reply a budget cut short and the chunks
+    /// of a second that failed included. Zero for a relay that does not meter
+    /// what it reads; a caller budgeting bytes then counts the events it gets.
+    fn take_fetched_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// How a covered slice was proven complete.

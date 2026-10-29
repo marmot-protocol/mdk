@@ -89,3 +89,20 @@ A17|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_NOTIFICATION_CAPACITY
 A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_QUIET_PASSES
 A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_UNSERVED_PASSES
 A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_ATTEMPTS
+# A19 is the recovery runner's starting values: unit retry, relay cooldown, account caps, quantum and staging.
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BACKOFF_BASE_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BACKOFF_CAP_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BREAK_AFTER_NO_PROGRESS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_UNREACHABLE_RETRY_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_COOLDOWN_AFTER_UNREACHABLE
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_COOLDOWN_BASE_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_COOLDOWN_CAP_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_MAX_QUANTA_PER_HOUR
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_MAX_EVENT_BYTES_PER_HOUR
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_QUANTUM
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_REQUEST_TIMEOUT
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_LOCAL_FAILURE_BACKOFF_BASE_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_LOCAL_FAILURE_BACKOFF_CAP_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_STAGED_GROUP_EVENTS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_STAGED_GROUP_BYTES
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_STAGED_ACCOUNT_BYTES

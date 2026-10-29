@@ -857,7 +857,7 @@ impl AppClient {
 
 #[cfg(test)]
 #[path = "recovery_coverage/scenario_tests.rs"]
-mod scenario_tests;
+pub(in crate::client) mod scenario_tests;
 
 #[cfg(test)]
 #[path = "recovery_coverage/live_boundary_tests.rs"]
