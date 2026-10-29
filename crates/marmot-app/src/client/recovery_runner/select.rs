@@ -248,9 +248,10 @@ fn class(candidate: &Candidate, hints: &PriorityHints) -> u8 {
     }
 }
 
-/// Pick the next unit from `survey`. `new_round` lets a new round start once
-/// every eligible unit has been served; without it (an explicit pass) that
-/// ends the pick.
+/// Pick the next unit from `survey`. `new_round` lets a class start a new
+/// round once each of its eligible units has been served; without it (an
+/// explicit pass) every eligible unit of every class is served once, and then
+/// the pick ends.
 pub(super) fn pick(
     survey: Survey,
     memory: &mut Memory,
@@ -286,14 +287,29 @@ pub(super) fn pick(
     if eligible.is_empty() {
         return Pick::Idle { next_due };
     }
-    if eligible
-        .iter()
-        .all(|candidate| memory.served.contains(&candidate.key))
-    {
-        if !new_round {
+    if new_round {
+        // Rounds run within the first class that has an eligible unit: once
+        // each of its units has been served, the class starts a new round.
+        let first = eligible
+            .iter()
+            .map(|candidate| class(candidate, hints))
+            .min()
+            .expect("eligible is not empty");
+        eligible.retain(|candidate| class(candidate, hints) == first);
+        if eligible
+            .iter()
+            .all(|candidate| memory.served.contains(&candidate.key))
+        {
+            for candidate in &eligible {
+                memory.served.remove(&candidate.key);
+            }
+        }
+    } else {
+        // An explicit pass serves each unit once, whatever its class.
+        eligible.retain(|candidate| !memory.served.contains(&candidate.key));
+        if eligible.is_empty() {
             return Pick::Idle { next_due: None };
         }
-        memory.new_round();
     }
     let mut route_size: BTreeMap<&TransportReconciliationRoute, u64> = BTreeMap::new();
     for candidate in eligible.iter().filter(|candidate| !candidate.best_effort) {

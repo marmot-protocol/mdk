@@ -346,8 +346,11 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     }
 
     async fn step_within(&mut self, pass_deadline: Option<Instant>, new_round: bool) -> Step {
-        if self.cancel.is_cancelled() || !self.take_reconnects().await {
+        if self.cancel.is_cancelled() {
             return Step::Stopped;
+        }
+        if let Some(step) = self.take_reconnects(pass_deadline).await {
+            return step;
         }
         let policy = self.policy;
         let survey = match self
@@ -391,7 +394,13 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     /// credit.
     async fn quantum(&mut self, candidate: Candidate, pass_deadline: Option<Instant>) -> Step {
         let policy = self.policy;
-        let caps = self.host.relay_caps(&candidate.key.relay).await;
+        let caps = match self
+            .bounded(pass_deadline, self.host.relay_caps(&candidate.key.relay))
+            .await
+        {
+            Ok(caps) => caps,
+            Err(step) => return step,
+        };
         let key = candidate.key.clone();
         let best_effort = candidate.best_effort;
         let plan = match self
@@ -467,36 +476,67 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     /// again (a known change re-arms the units planned with other caps). The
     /// survey that follows reads fresh tails, so a reconnect's new tail, which
     /// starts at its EOSE, leaves the downtime owed as ordinary sweep debt.
-    /// Returns `false` once the worker is gone.
-    async fn take_reconnects(&mut self) -> bool {
-        let relays = std::mem::take(
-            &mut *self
-                .signals
-                .reconnected
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for relay in relays {
-            self.memory.relay_reconnected(&relay);
-            let caps = self.host.relay_caps(&relay).await.map(recovery_caps);
+    /// A shutdown or the pass deadline during a caps read leaves that relay
+    /// and the rest for the next step. Returns the step to end with, if any.
+    async fn take_reconnects(&mut self, pass_deadline: Option<Instant>) -> Option<Step> {
+        let mut relays = std::mem::take(&mut *self.reconnected());
+        while let Some(relay) = relays.pop_first() {
+            let caps = match self
+                .bounded(pass_deadline, self.host.relay_caps(&relay))
+                .await
+            {
+                Ok(caps) => caps.map(recovery_caps),
+                Err(step) => {
+                    relays.insert(relay);
+                    self.reconnected().append(&mut relays);
+                    return Some(step);
+                }
+            };
+            let written = relay.clone();
             let recorded = self
                 .host
                 .turn(move |turn| {
-                    turn.app.record_recovery_relay_reconnected(&relay)?;
+                    turn.app.record_recovery_relay_reconnected(&written)?;
                     if caps.is_some() {
                         turn.app
-                            .record_recovery_relay_caps(&relay, caps, turn.now)?;
+                            .record_recovery_relay_caps(&written, caps, turn.now)?;
                     }
                     Ok::<_, cgka_traits::storage::StorageError>(())
                 })
                 .await;
             match recorded {
-                None => return false,
-                Some(Err(error)) => log_failure("relay_reconnected", error),
-                Some(Ok(())) => {}
+                None => return Some(Step::Stopped),
+                Some(Err(error)) => {
+                    // The next step tries the reconnect again.
+                    log_failure("relay_reconnected", error);
+                    self.reconnected().insert(relay);
+                }
+                Some(Ok(())) => self.memory.relay_reconnected(&relay),
             }
         }
-        true
+        None
+    }
+
+    fn reconnected(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        self.signals
+            .reconnected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Await `read` off the worker unless the runner shuts down or the pass
+    /// deadline comes first.
+    async fn bounded<T>(
+        &self,
+        pass_deadline: Option<Instant>,
+        read: impl std::future::Future<Output = T>,
+    ) -> Result<T, Step> {
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => Err(Step::Stopped),
+            () = sleep_until(pass_deadline) => Err(Step::Idle { next_due: None }),
+            value = read => Ok(value),
+        }
     }
 
     /// The account breaker: a cap pauses the runner until the window rolls,

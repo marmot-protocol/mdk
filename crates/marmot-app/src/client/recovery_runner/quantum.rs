@@ -11,8 +11,14 @@
 //! ledger reads before and after each staged slice. Coverage other writers
 //! recorded (live traffic, another route, another relay) is not this quantum's
 //! progress, so it resets nothing.
+//!
+//! Every event byte the relay returns is charged to the account's rolling
+//! hour, including full replies a halving discards, saturated seconds and
+//! duplicates: each staged slice carries what was returned since the last
+//! one, and settlement charges the rest. A best-effort relay is never charged.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use cgka_traits::TransportDelivery;
@@ -25,8 +31,9 @@ use storage_sqlite::{
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::sweep::{
-    CoveredSlice, RelayCaps, SweepCursor, SweepCursorStore, SweepEnd, SweepRequest, SweepRoute,
-    SweepSink, SweepSinkError, SweepStoreError, UnreachableKind, run_sweep,
+    CoveredSlice, RelayCaps, SecondReply, SliceQuery, SliceReply, SweepCursor, SweepCursorStore,
+    SweepEnd, SweepRelay, SweepRequest, SweepRoute, SweepSink, SweepSinkError, SweepStoreError,
+    UnreachableKind, run_sweep,
 };
 
 use super::select::SweepPlan;
@@ -51,6 +58,10 @@ pub(super) struct QuantumReport {
     pub(super) end: SweepEnd,
     pub(super) requests: u32,
     pub(super) answers: u32,
+    /// Waits for a `rate-limited:` CLOSED.
+    pub(super) rate_limited_waits: u32,
+    /// Event bytes the relay returned that no staged slice charged.
+    pub(super) unstaged_bytes: u64,
     /// Seconds it newly covered on its own (route, relay).
     pub(super) newly_covered_seconds: u64,
     /// Seconds and events in the slices it proved: the route's rate.
@@ -90,11 +101,55 @@ impl SweepCursorStore for PlannedCursor {
     }
 }
 
+/// The unit's relay, counting the event bytes of every reply it returns.
+struct Metered<'a> {
+    relay: &'a dyn SweepRelay,
+    bytes: &'a AtomicU64,
+}
+
+impl Metered<'_> {
+    fn count(&self, events: &[Event]) {
+        self.bytes.fetch_add(event_bytes(events), Ordering::Relaxed);
+    }
+}
+
+#[async_trait]
+impl SweepRelay for Metered<'_> {
+    fn caps(&self) -> RelayCaps {
+        self.relay.caps()
+    }
+
+    async fn fetch_slice(&self, query: SliceQuery) -> SliceReply {
+        let reply = self.relay.fetch_slice(query).await;
+        if let SliceReply::Answered { events, .. } = &reply {
+            self.count(events);
+        }
+        reply
+    }
+
+    async fn fetch_second(&self, route: SweepRoute, second: u64, cap: Option<u32>) -> SecondReply {
+        let reply = self.relay.fetch_second(route, second, cap).await;
+        if let SecondReply::Complete(events) = &reply {
+            self.count(events);
+        }
+        reply
+    }
+}
+
+fn event_bytes(events: &[Event]) -> u64 {
+    events
+        .iter()
+        .map(|event| event.as_json().len() as u64)
+        .fold(0u64, u64::saturating_add)
+}
+
 /// Stages each proven slice in its own worker turn and counts the seconds it
 /// newly covered.
 struct StageSink<'a, H> {
     host: &'a H,
     plan: &'a SweepPlan,
+    /// Bytes the relay returned that no staged slice has charged yet.
+    returned_bytes: &'a AtomicU64,
     newly_covered_seconds: u64,
     stop: Option<SinkStop>,
 }
@@ -106,10 +161,11 @@ impl<H: RunnerHost> SweepSink for StageSink<'_, H> {
         slice: CoveredSlice,
         events: Vec<Event>,
     ) -> Result<(), SweepSinkError> {
-        let fetched_bytes = events
-            .iter()
-            .map(|event| event.as_json().len() as u64)
-            .fold(0u64, u64::saturating_add);
+        let fetched_bytes = if self.plan.best_effort {
+            0
+        } else {
+            self.returned_bytes.swap(0, Ordering::Relaxed)
+        };
         let mut deliveries = Vec::with_capacity(events.len());
         for event in events {
             deliveries.extend(self.host.deliveries(&self.plan.key.relay, event).await);
@@ -130,12 +186,18 @@ impl<H: RunnerHost> SweepSink for StageSink<'_, H> {
                 super::log_failure("stage", error);
                 SinkStop::Local
             }
+            // The transaction committed, bytes included.
             Some(Ok(None)) => SinkStop::StaleMark,
             Some(Ok(Some(newly))) => {
                 self.newly_covered_seconds = self.newly_covered_seconds.saturating_add(newly);
                 return Ok(());
             }
         };
+        if stop != SinkStop::StaleMark {
+            // Nothing was written: settlement charges these bytes instead.
+            self.returned_bytes
+                .fetch_add(fetched_bytes, Ordering::Relaxed);
+        }
         self.stop = Some(stop);
         Err(SweepSinkError)
     }
@@ -215,6 +277,8 @@ pub(super) async fn run<H: RunnerHost>(
         end: SweepEnd::Finished,
         requests: 0,
         answers: 0,
+        rate_limited_waits: 0,
+        unstaged_bytes: 0,
         newly_covered_seconds: 0,
         proved_seconds: 0,
         proved_events: 0,
@@ -226,12 +290,18 @@ pub(super) async fn run<H: RunnerHost>(
         report.end = SweepEnd::Unreachable(UnreachableKind::Disconnected);
         return report;
     };
+    let returned_bytes = AtomicU64::new(0);
+    let relay = Metered {
+        relay: &*relay,
+        bytes: &returned_bytes,
+    };
     let route = SweepRoute::Group {
         nostr_group_id: plan.nostr_group_id,
     };
     let mut sink = StageSink {
         host,
         plan,
+        returned_bytes: &returned_bytes,
         newly_covered_seconds: 0,
         stop: None,
     };
@@ -248,7 +318,7 @@ pub(super) async fn run<H: RunnerHost>(
                 deadline: Some(deadline),
                 policy: policy.sweep,
             },
-            &*relay,
+            &relay,
             &mut sink,
             &store,
             cancel,
@@ -256,6 +326,9 @@ pub(super) async fn run<H: RunnerHost>(
         .await;
         report.requests = report.requests.saturating_add(swept.stats.requests);
         report.answers = report.answers.saturating_add(swept.stats.answers);
+        report.rate_limited_waits = report
+            .rate_limited_waits
+            .saturating_add(swept.stats.rate_limited_waits);
         for slice in &swept.covered {
             report.proved_seconds = report
                 .proved_seconds
@@ -272,6 +345,9 @@ pub(super) async fn run<H: RunnerHost>(
     }
     report.newly_covered_seconds = sink.newly_covered_seconds;
     report.stop = sink.stop;
+    if !plan.best_effort {
+        report.unstaged_bytes = returned_bytes.into_inner();
+    }
     report
 }
 
@@ -281,26 +357,37 @@ pub(super) async fn run<H: RunnerHost>(
 pub(super) fn classify(
     end: SweepEnd,
     answered: bool,
+    rate_limited: bool,
     newly_covered_seconds: u64,
     stop: Option<SinkStop>,
     still_owed: bool,
 ) -> RecoveryUnitOutcome {
     use RecoveryUnitOutcome as Outcome;
+    let local = match end {
+        SweepEnd::SinkFailed => !matches!(stop, Some(SinkStop::StaleMark | SinkStop::WorkerGone)),
+        SweepEnd::StoreFailed => true,
+        _ => false,
+    };
+    if local {
+        // A failed local write outranks progress, as in the sweep's own
+        // classifier. The slices staged before it stay covered.
+        return Outcome::LocalFailure;
+    }
     if newly_covered_seconds > 0 {
         // A cut or a cancellation after progress included.
         return Outcome::Advanced;
     }
     match end {
-        SweepEnd::SinkFailed => match stop {
-            Some(SinkStop::StaleMark | SinkStop::WorkerGone) => Outcome::Unanswered,
-            Some(SinkStop::Local) | None => Outcome::LocalFailure,
-        },
-        SweepEnd::StoreFailed => Outcome::LocalFailure,
+        // A stale mark or a gone worker; a store failure is local, above.
+        SweepEnd::SinkFailed | SweepEnd::StoreFailed => Outcome::Unanswered,
         // Every slice was proven, but none newly covered: someone else proved
         // them first, or a loss during the fetch took them back.
         SweepEnd::Finished if still_owed => Outcome::NoProgress,
         SweepEnd::Finished => Outcome::NothingOwed,
         SweepEnd::Cancelled => Outcome::Unanswered,
+        // The relay said only `rate-limited:`, and the next wait would have
+        // outlasted the quantum: rate limited and never cleared.
+        SweepEnd::DeadlineReached if !answered && rate_limited => Outcome::RateLimited,
         SweepEnd::DeadlineReached if !answered => Outcome::Unanswered,
         SweepEnd::DeadlineReached | SweepEnd::SaturatedSecond { .. } => Outcome::NoProgress,
         SweepEnd::RateLimited => Outcome::RateLimited,
@@ -309,8 +396,9 @@ pub(super) fn classify(
     }
 }
 
-/// Settle the quantum: apply its outcome to the unit's retry state and record
-/// its slicing. A best-effort relay keeps no retry state.
+/// Settle the quantum: charge the bytes no staged slice charged, apply its
+/// outcome to the unit's retry state, and record its slicing. A best-effort
+/// relay keeps no retry state.
 pub(super) fn settle(
     turn: &WorkerTurn<'_>,
     plan: &SweepPlan,
@@ -325,6 +413,7 @@ pub(super) fn settle(
     let outcome = classify(
         report.end,
         report.answers > 0,
+        report.rate_limited_waits > 0,
         report.newly_covered_seconds,
         report.stop,
         still_owed,
@@ -333,18 +422,36 @@ pub(super) fn settle(
         return Ok(outcome);
     }
     let key = &plan.key;
+    if report.unstaged_bytes > 0 {
+        // A slice that proves nothing: the bytes alone.
+        turn.app.stage_recovery_slice(
+            &RecoveryStagedSlice {
+                route: &key.route,
+                relay: &key.relay,
+                events: &[],
+                fetched_bytes: report.unstaged_bytes,
+                covered: &[],
+                proof: RecoveryCoverageProof::SweepSlice,
+                mark: plan.mark,
+            },
+            turn.now,
+        )?;
+    }
     turn.app
         .settle_recovery_unit(&key.route, &key.relay, outcome, &policy.unit, turn.now)?;
+    // The slicing only seeds the next quantum's first request, so a failed
+    // write costs one resize and never changes the settled outcome.
     if (report.delta, report.observed_cap) != (plan.delta, plan.observed_cap)
         && report.delta > 0
         && report.observed_cap != Some(0)
-    {
-        turn.app.record_recovery_unit_slicing(
+        && let Err(error) = turn.app.record_recovery_unit_slicing(
             &key.route,
             &key.relay,
             report.delta,
             report.observed_cap,
-        )?;
+        )
+    {
+        super::log_failure("slicing", error);
     }
     Ok(outcome)
 }
