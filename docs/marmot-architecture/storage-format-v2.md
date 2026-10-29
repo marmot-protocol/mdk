@@ -157,6 +157,10 @@ applications), reading row ids from the covering
 `(group_id, state, openmls_content, openmls_epoch)` index. Classes `-1` and `4`
 are always returned, and the engine re-classifies every returned row from its
 payload, so a derivation gap costs reads, not correctness.
+The `CommitsAndProposalsBetween` filter, which a failed convergence pass reads
+on every load (mdk#2684), seeks classes `1` and `2` by an `openmls_epoch`
+range in the same index, so neither applications nor commits outside the
+range cost reads.
 
 Existing rows take `-1` without a table rewrite. The bounded promotion sweep
 (`promote_legacy_message_rows`) now also derives those rows, writing only the

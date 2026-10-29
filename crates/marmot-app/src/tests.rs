@@ -537,6 +537,16 @@ pub(crate) struct ScriptedPushRelayClient {
     pub(crate) indexer_publish_release: tokio::sync::Notify,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     scoped_subscriptions: std::sync::Mutex<Vec<(String, NostrSubscription)>>,
+    /// When set, [`report_scripted_eose`] answers each REQ still awaiting
+    /// EOSE with one stored event created at this second before its EOSE.
+    pub(crate) stored_before_eose: std::sync::Mutex<Option<u64>>,
+    /// Every relay reads as connected on this attempt, as its own state, so
+    /// moving it is a reconnect no notification reports.
+    pub(crate) connection_attempt: std::sync::atomic::AtomicUsize,
+    /// How many times the adapter has asked for a relay's connection.
+    pub(crate) connection_reads: std::sync::atomic::AtomicUsize,
+    /// The 1-based read that first sees the next connection; zero never.
+    pub(crate) reconnect_at_read: std::sync::atomic::AtomicUsize,
     subscription_attempts: std::sync::Mutex<Vec<NostrSubscription>>,
     block_next_subscribe: std::sync::atomic::AtomicBool,
     blocked_subscribe_count: std::sync::atomic::AtomicUsize,
@@ -1146,6 +1156,20 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for ScriptedPushRelayClient {
+    fn relay_connection(
+        &self,
+        _: &MemberId,
+        _: &TransportEndpoint,
+    ) -> Option<transport_nostr_adapter::RelayConnection> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let read = self.connection_reads.fetch_add(1, SeqCst) + 1;
+        if read == self.reconnect_at_read.load(SeqCst) {
+            self.connection_attempt.fetch_add(1, SeqCst);
+        }
+        let attempt = self.connection_attempt.load(SeqCst);
+        Some(transport_nostr_adapter::RelayConnection::new(0, attempt))
+    }
+
     async fn acquire_history(
         &self,
         request: transport_nostr_adapter::NostrAcquisitionRequest,
@@ -1596,13 +1620,21 @@ pub(crate) async fn report_scripted_eose(
     relay: &ScriptedPushRelayClient,
     accept: fn(&NostrSubscription) -> bool,
 ) {
+    let stored = *relay.stored_before_eose.lock().unwrap();
+    let eose = |endpoint: TransportEndpoint, id: String| async move {
+        // Counts only a REQ still awaiting EOSE on that relay.
+        if let Some(created_at) = stored {
+            plane
+                .count_stored_replay_event_for_test(endpoint.clone(), id.clone(), created_at)
+                .await;
+        }
+        plane.handle_relay_eose_for_test(endpoint, id).await;
+    };
     let scoped = relay.scoped_subscriptions.lock().unwrap().clone();
     for (id, subscription) in scoped {
         if accept(&subscription) {
             for endpoint in subscription.endpoints() {
-                plane
-                    .handle_relay_eose_for_test(endpoint.clone(), id.clone())
-                    .await;
+                eose(endpoint.clone(), id.clone()).await;
             }
         }
     }
@@ -1611,9 +1643,7 @@ pub(crate) async fn report_scripted_eose(
             continue;
         }
         for endpoint in subscription.endpoints() {
-            plane
-                .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
-                .await;
+            eose(endpoint.clone(), subscription.subscription_id()).await;
         }
     }
 }
@@ -23756,6 +23786,136 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
         2,
         "the due removal progresses once the actual fanout barrier clears"
     );
+}
+
+/// Plant a frozen batch whose failure budget ran out (mdk#2684), however it
+/// got there.
+fn plant_parked_convergence_pass(app: &MarmotApp, group_id: &cgka_traits::GroupId, epoch: u64) {
+    use cgka_traits::convergence_pass::{
+        ConvergencePassPhase, ConvergencePassRetry, ConvergencePassStep, DurableConvergencePass,
+    };
+    use cgka_traits::storage::ConvergencePassStorage;
+    app.account_storage("alice")
+        .unwrap()
+        .put_convergence_pass(&DurableConvergencePass {
+            group_id: group_id.clone(),
+            generation: 1,
+            phase: ConvergencePassPhase::Frozen,
+            base_epoch: cgka_traits::EpochId(epoch),
+            clock_instance_id: 0,
+            opened_monotonic_ms: 0,
+            quiescence_deadline_monotonic_ms: 0,
+            absolute_deadline_monotonic_ms: 0,
+            opened_wall_ms: 0,
+            quiescence_deadline_wall_ms: 0,
+            absolute_deadline_wall_ms: 0,
+            members: Vec::new(),
+            frozen_at_wall_ms: Some(0),
+            cutoff_cause: None,
+            fairness_slot_available: false,
+            retry: Some(ConvergencePassRetry {
+                failed_attempts: 12,
+                failed_step: ConvergencePassStep::Apply,
+                next_attempt_monotonic_ms: 0,
+                next_attempt_wall_ms: 0,
+                parked_at_wall_ms: Some(0),
+            }),
+        })
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_convergence_pass_owes_hosts_one_notice_per_change() {
+    use cgka_traits::storage::ConvergencePassStorage;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("parked", &[]).await.unwrap();
+    let epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    assert!(client.take_convergence_park_notices().is_empty());
+    plant_parked_convergence_pass(&app, &group_id, epoch);
+
+    let mut notices = Vec::new();
+    for _ in 0..2 {
+        assert!(matches!(
+            client.convergence_schedule_state(&group_id).unwrap(),
+            crate::ConvergenceScheduleState::Idle
+        ));
+        notices.push(client.take_convergence_park_notices());
+    }
+    assert_eq!(
+        notices,
+        [vec![group_id.clone()], Vec::new()],
+        "the park is announced once, whichever schedule read sees it"
+    );
+    assert!(
+        client
+            .group_mls_state(&group_id)
+            .unwrap()
+            .convergence_parked
+    );
+
+    app.account_storage("alice")
+        .unwrap()
+        .delete_convergence_pass(&group_id)
+        .unwrap();
+    let mut notices = Vec::new();
+    for _ in 0..2 {
+        client.convergence_schedule_state(&group_id).unwrap();
+        notices.push(client.take_convergence_park_notices());
+    }
+    assert_eq!(
+        notices,
+        [vec![group_id.clone()], Vec::new()],
+        "leaving the park is announced once too"
+    );
+    assert!(
+        !client
+            .group_mls_state(&group_id)
+            .unwrap()
+            .convergence_parked
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_convergence_retry_whose_advance_fails_still_wakes_the_group() {
+    use cgka_traits::storage::ConvergencePassStorage;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("parked", &[]).await.unwrap();
+    let epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    plant_parked_convergence_pass(&app, &group_id, epoch);
+    client.take_pending_convergence_groups();
+
+    // The retry un-parks the batch, then its advance fails before any attempt
+    // could park it again (mdk#2684).
+    client.fail_next_convergence_retry_advance = true;
+    assert!(client.retry_group_convergence(&group_id).await.is_err());
+    let pass = app
+        .account_storage("alice")
+        .unwrap()
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("the batch survives the failed advance");
+    assert!(!pass.is_parked());
+    assert_eq!(
+        client.take_pending_convergence_groups(),
+        vec![group_id.clone()],
+        "the worker's next schedule read must still see the group"
+    );
+    assert!(matches!(
+        client.convergence_schedule_state(&group_id).unwrap(),
+        crate::ConvergenceScheduleState::Ready
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

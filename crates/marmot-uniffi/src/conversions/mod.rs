@@ -151,6 +151,7 @@ mod tests {
             disbanding: false,
             disbanding_blockers: vec![],
             disband_request: None,
+            convergence_parked: false,
         }
     }
 

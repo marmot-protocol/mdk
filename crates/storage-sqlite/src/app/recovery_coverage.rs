@@ -764,6 +764,54 @@ impl SqliteAppStorage {
         })
     }
 
+    /// The routes that lost coverage after `mark` other than by a released
+    /// second: loss un-covers from a floor upward. `None` when every route may
+    /// have: an account-wide un-cover, or a log that no longer reaches back to
+    /// `mark`. A released second is left out because no live boundary covers
+    /// it anyway.
+    pub fn recovery_coverage_lost_since(
+        &self,
+        mark: RecoveryCoverageMark,
+    ) -> StorageResult<Option<Vec<TransportReconciliationRoute>>> {
+        let conn = self.lock()?;
+        let mark = integer(mark.0)?;
+        let pruned: i64 = conn
+            .query_row_cached(
+                "SELECT pruned_through FROM account_recovery_coverage_uncover_state
+                 WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if pruned > mark {
+            return Ok(None);
+        }
+        let rows = conn
+            .prepare_cached(
+                "SELECT DISTINCT route_kind, route_id FROM account_recovery_coverage_uncovers
+                 WHERE generation > ?1
+                   AND (until_seconds IS NULL OR until_seconds <> since_seconds)",
+            )
+            .storage()?
+            .query_map([mark], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                ))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        let mut routes = Vec::with_capacity(rows.len());
+        for row in rows {
+            match row {
+                (Some(kind), Some(id)) => routes.push(route_from(kind, &id)?),
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(routes))
+    }
+
     /// The routes need everything from `since_seconds` up to now. A goal only
     /// widens; an existing lower floor stays.
     pub fn widen_recovery_coverage_goals(
@@ -986,6 +1034,26 @@ impl SqliteAppStorage {
             });
         }
         Ok(covered.unwrap_or_default())
+    }
+
+    /// The newest second at or after `since_seconds` on the route that is
+    /// released for replay and still held out of live boundaries.
+    pub fn recovery_coverage_newest_released(
+        &self,
+        route: &TransportReconciliationRoute,
+        since_seconds: u64,
+    ) -> StorageResult<Option<u64>> {
+        let (kind, id) = route.storage_key();
+        let newest: Option<i64> = self
+            .lock()?
+            .query_row_cached(
+                "SELECT MAX(second) FROM account_recovery_coverage_released
+                 WHERE route_kind = ?1 AND route_id = ?2 AND second >= ?3",
+                params![kind, id, integer(since_seconds)?],
+                |row| row.get(0),
+            )
+            .storage()?;
+        newest.map(i64_to_u64).transpose()
     }
 
     /// Whether every one of `relays` covers `[since, until]` on the route.
@@ -2130,7 +2198,22 @@ mod tests {
                 )
             })
             .unwrap();
+        assert_eq!(
+            app.recovery_coverage_newest_released(&route, since)
+                .unwrap(),
+            Some(sent)
+        );
+        assert_eq!(
+            app.recovery_coverage_newest_released(&route, sent + 1)
+                .unwrap(),
+            None
+        );
         app.prune_recovery_coverage(sent + 1, &[]).unwrap();
+        assert_eq!(
+            app.recovery_coverage_newest_released(&route, since)
+                .unwrap(),
+            None
+        );
         record(&app, &route, RELAY_A, sent - 10, now, live, 5);
         assert_eq!(
             ranges(&app, &route, RELAY_A)
@@ -2196,6 +2279,75 @@ mod tests {
         assert_eq!(
             app.recovery_coverage_debt(&route, &both, now).unwrap(),
             vec![range(sent, sent)]
+        );
+    }
+
+    /// Loss since a mark names its routes, an account-wide loss or a pruned
+    /// log names every route, and a released second names none.
+    #[test]
+    fn loss_since_a_mark_names_its_routes_but_not_released_seconds() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        let (lost, released) = (group(1), group(2));
+        let start = app.recovery_coverage_mark().unwrap();
+        assert_eq!(
+            app.recovery_coverage_lost_since(start).unwrap(),
+            Some(vec![])
+        );
+
+        // A second inside the retained window, so the release is logged.
+        let second = i64_to_u64(crate::base::codec::unix_now_seconds_i64()).unwrap() - 60;
+        storage
+            .connection
+            .with_transaction(|| uncover_second_tx(&*storage.lock()?, &released, second))
+            .unwrap();
+        assert!(
+            app.recovery_coverage_mark().unwrap() > start,
+            "the release is in the log"
+        );
+        assert_eq!(
+            app.recovery_coverage_lost_since(start).unwrap(),
+            Some(vec![]),
+            "a released second is no loss"
+        );
+        app.uncover_recovery_coverage(std::slice::from_ref(&lost), 600)
+            .unwrap();
+        assert_eq!(
+            app.recovery_coverage_lost_since(start).unwrap(),
+            Some(vec![lost.clone()])
+        );
+        let after = app.recovery_coverage_mark().unwrap();
+        assert_eq!(
+            app.recovery_coverage_lost_since(after).unwrap(),
+            Some(vec![])
+        );
+
+        storage
+            .connection
+            .with_transaction(|| uncover_loss_tx(&*storage.lock()?, 700))
+            .unwrap();
+        assert_eq!(
+            app.recovery_coverage_lost_since(after).unwrap(),
+            None,
+            "account-wide loss names every route"
+        );
+        let current = app.recovery_coverage_mark().unwrap();
+        let later = i64_to_u64(crate::base::codec::unix_now_seconds_i64()).unwrap()
+            + UNCOVER_LOG_RETENTION_SECS
+            + 1;
+        storage
+            .connection
+            .with_transaction(|| prune_uncover_log_tx(&*storage.lock()?, Some(later)))
+            .unwrap();
+        assert_eq!(
+            app.recovery_coverage_lost_since(start).unwrap(),
+            None,
+            "a pruned log cannot say what it held"
+        );
+        assert_eq!(
+            app.recovery_coverage_lost_since(current).unwrap(),
+            Some(vec![]),
+            "nothing was logged after the current mark"
         );
     }
 

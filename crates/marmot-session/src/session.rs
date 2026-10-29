@@ -1275,6 +1275,16 @@ impl AccountDeviceSession {
         Ok(self.engine.has_pending_convergence_inputs(group_id)?)
     }
 
+    /// See `Engine::convergence_pass_parked` (mdk#2684).
+    pub fn convergence_pass_parked(&self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.engine.convergence_pass_parked(group_id)?)
+    }
+
+    /// See `Engine::retry_failed_convergence_pass` (mdk#2684).
+    pub fn retry_failed_convergence_pass(&mut self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.engine.retry_failed_convergence_pass(group_id)?)
+    }
+
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> SessionResult<bool> {
         Ok(self.engine.has_queued_outbound_intents(group_id)?)
     }

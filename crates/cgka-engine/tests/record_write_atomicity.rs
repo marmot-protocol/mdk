@@ -31,8 +31,9 @@ use cgka_traits::storage::{
     DeviceGroupWelcomeStorage, DisbandCandidate, DisbandCandidateStorage, DisbandRequest,
     DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage,
     KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MemberValidationCacheStorage,
-    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
-    StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
+    MessageStorage, OpenMlsContentFilter, OutboundFanoutStorage, OutboundIntentStorage,
+    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
+    WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -43,6 +44,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
+#[path = "record_write_atomicity/convergence_pass_retry.rs"]
+mod convergence_pass_retry;
 mod support;
 use support::proof_signer;
 
@@ -368,6 +371,8 @@ struct PreparationDelay {
     graph_ms: Arc<AtomicUsize>,
     metadata_calls: Arc<AtomicUsize>,
     graph_calls: Arc<AtomicUsize>,
+    /// `list_disband_candidates` calls, the first read of every reseed.
+    disband_candidate_reads: Arc<AtomicUsize>,
 }
 
 impl MessageStorage for FaultStorage {
@@ -400,6 +405,29 @@ impl MessageStorage for FaultStorage {
         }
         self.inner
             .list_messages_in_states(group_id, states, at_or_after_epoch)
+    }
+    /// A failed batch's input check reads through the backend's filter. Every
+    /// other listing keeps the trait default, so `graph_calls` still counts
+    /// each reseed's graph listing.
+    fn list_openmls_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+        filter: OpenMlsContentFilter,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        if matches!(
+            filter,
+            OpenMlsContentFilter::CommitsAndProposalsBetween { .. }
+        ) {
+            return self.inner.list_openmls_messages_in_states(
+                group_id,
+                states,
+                at_or_after_epoch,
+                filter,
+            );
+        }
+        self.list_messages_in_states(group_id, states, at_or_after_epoch)
     }
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
         if self.leave_write_fault.should_fail() {
@@ -641,6 +669,9 @@ impl DisbandCandidateStorage for FaultStorage {
         self.inner.disband_candidate(group_id, commit_id)
     }
     fn list_disband_candidates(&self, group_id: &GroupId) -> StorageResult<Vec<DisbandCandidate>> {
+        self.preparation_delay
+            .disband_candidate_reads
+            .fetch_add(1, Ordering::SeqCst);
         if self.post_commit_disband_read_fault.remaining() > 0
             && self.inner.get_group(group_id)?.removed
             && self.post_commit_disband_read_fault.should_fail()
@@ -3331,8 +3362,11 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
         "nothing was released, so the account budget is still fully charged"
     );
 
-    // The terminal gate retries on the next advance and completes.
+    // The terminal gate retries on the next attempt and completes. A removal a
+    // convergence pass realized failed in that pass's apply, which now backs
+    // off before its next attempt (mdk#2684), so grant it that attempt now.
     failed_state_fault.disarm();
+    carol.retry_failed_convergence_pass(&group_a).unwrap();
     carol.advance_convergence(&group_a).await.unwrap();
     for row in &rows {
         assert_eq!(

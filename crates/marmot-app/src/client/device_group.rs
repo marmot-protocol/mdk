@@ -155,7 +155,7 @@ impl AppClient {
     /// engine or recovery state rather than the projection filters with this:
     /// quarantine, history notices and their changes, epoch-stall
     /// escalations, deferred events, recovery-status and superseded-change
-    /// updates, and Welcome redelivery.
+    /// updates, convergence park notices, and Welcome redelivery.
     pub(crate) fn host_may_see_group(&self, group_id: &GroupId) -> bool {
         self.is_device_group(group_id)
             .is_ok_and(|is_device_group| !is_device_group)

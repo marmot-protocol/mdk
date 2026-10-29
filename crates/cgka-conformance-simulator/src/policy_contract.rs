@@ -40,7 +40,7 @@ pub struct ConstantDecision {
     pub versioning: VersioningRule,
 }
 
-pub const CONSTANT_DECISIONS: [ConstantDecision; 40] = [
+pub const CONSTANT_DECISIONS: [ConstantDecision; 41] = [
     decision(
         "P1",
         ConstantInfluence::SelectedStateSemantic,
@@ -154,6 +154,11 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 40] = [
     // Cooperative elapsed-time and replay-probe slicing share one scheduler decision.
     decision(
         "E13",
+        ConstantInfluence::OperationalScheduler,
+        VersioningRule::OperationalNonInterference,
+    ),
+    decision(
+        "E14",
         ConstantInfluence::OperationalScheduler,
         VersioningRule::OperationalNonInterference,
     ),
