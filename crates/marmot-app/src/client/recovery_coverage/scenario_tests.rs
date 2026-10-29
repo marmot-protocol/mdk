@@ -575,8 +575,9 @@ async fn a_receipt_released_under_a_live_boundary_stays_owed() {
     );
 }
 
-/// A notification lag charges no delivery count, but it is loss: every
-/// current route is un-covered from the lag's REQ floor and owes from there.
+/// A notification lag charges no delivery count, but it is loss. One whose
+/// routes are unknown un-covers every current route from the lag's REQ floor,
+/// and each owes from there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notification_lag_uncovers_every_route_from_its_floor() {
     let fixture = fixture().await;
@@ -606,6 +607,76 @@ async fn notification_lag_uncovers_every_route_from_its_floor() {
         assert!(app.recovery_coverage_goal(route).unwrap() <= Some(floor));
         assert!(owed(&fixture, route, unix_now_seconds()).await);
     }
+}
+
+/// A lag on the account's own SDK context carries each route's REQ floor, and
+/// the worker records it per route: each route owes from its own floor, so
+/// the inbox REQ's wider window no longer drags the group's debt back with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notification_lag_uncovers_each_route_from_its_own_floor() {
+    let mut fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    assert_eq!(report(&fixture).await.disagreements(), 0);
+    let group = routes(&fixture.client)
+        .into_iter()
+        .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
+        .unwrap();
+    let TransportReconciliationRoute::Group(group_id) = group else {
+        unreachable!()
+    };
+    let proved = app.recovery_coverage_ranges(&group, &relay()).unwrap();
+    let since = proved.iter().map(|p| p.range.since_seconds).min().unwrap();
+    let until = proved.iter().map(|p| p.range.until_seconds).max().unwrap();
+    assert!(
+        since < until
+            && app
+                .recovery_coverage_covers(&group, &[relay()], since, until)
+                .unwrap()
+    );
+    let account = fixture.client.adapter.account_id().clone();
+    fixture
+        .client
+        .app
+        .relay_plane
+        .simulate_routed_notification_lag_for_test(
+            &account,
+            1,
+            transport_nostr_adapter::NostrNotificationLossBounds {
+                floor: transport_nostr_adapter::NostrNotificationLossFloor::Since(since),
+                routes: Some(std::collections::BTreeMap::from([
+                    (transport_nostr::DeliveryRoute::Inbox, since),
+                    (transport_nostr::DeliveryRoute::Group(group_id), until),
+                ])),
+            },
+        );
+    let received = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.client.receive_next_delivery(),
+    )
+    .await
+    .expect("the lag reaches the worker")
+    .unwrap();
+    assert!(matches!(
+        received,
+        transport_nostr::AccountDeliveryReceive::Overflow(_)
+    ));
+    assert!(
+        app.recovery_coverage_ranges(&TransportReconciliationRoute::Inbox, &relay())
+            .unwrap()
+            .iter()
+            .all(|proved| proved.range.until_seconds < since),
+        "the inbox owes from its own floor"
+    );
+    assert!(
+        app.recovery_coverage_covers(&group, &[relay()], since, until - 1)
+            .unwrap(),
+        "the group keeps what lies below its own floor"
+    );
+    assert!(
+        !app.recovery_coverage_covers(&group, &[relay()], until, until)
+            .unwrap(),
+        "the group owes from its own floor"
+    );
 }
 
 /// A certificate captured before newer loss no longer proves anything to the

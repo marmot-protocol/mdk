@@ -85,10 +85,11 @@ pub mod sweep;
 mod telemetry;
 
 pub use acquisition::{
-    NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
-    NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
-    NostrAcquisitionScope, NostrAcquisitionStats, NostrNotificationLoss,
-    NostrNotificationLossFloor, NostrNotificationLossScope,
+    DeliveryRoute, MAX_DELIVERY_LOSS_ROUTES, NostrAcquisitionCancellation, NostrAcquisitionEnd,
+    NostrAcquisitionEndpoint, NostrAcquisitionError, NostrAcquisitionLimits,
+    NostrAcquisitionRequest, NostrAcquisitionResult, NostrAcquisitionScope, NostrAcquisitionStats,
+    NostrNotificationLoss, NostrNotificationLossBounds, NostrNotificationLossFloor,
+    NostrNotificationLossScope,
 };
 pub use key_package::{
     CLIENT_NAME_MAX_BYTES, CLIENT_TAG, KIND_MARMOT_KEY_PACKAGE, NostrKeyPackagePublication,
@@ -384,6 +385,25 @@ impl NostrSubscription {
                 routes.iter().any(|route| &route.group_id == group_id)
             }
             Self::AccountInbox { .. } => false,
+        }
+    }
+
+    /// The routes this REQ's filter selects, or `None` when one of them is
+    /// not a 32-byte transport route that recovery keys.
+    pub fn delivery_routes(&self) -> Option<Vec<DeliveryRoute>> {
+        let group = |id: &[u8]| <[u8; 32]>::try_from(id).ok().map(DeliveryRoute::Group);
+        match self {
+            Self::AccountInbox { .. } => Some(vec![DeliveryRoute::Inbox]),
+            Self::Group {
+                transport_group_id, ..
+            }
+            | Self::GroupMaintenance {
+                transport_group_id, ..
+            } => group(transport_group_id).map(|route| vec![route]),
+            Self::GroupBatch { routes, .. } => routes
+                .iter()
+                .map(|route| group(&route.transport_group_id))
+                .collect(),
         }
     }
 
@@ -3649,7 +3669,7 @@ impl NostrTransportAdapter {
 }
 
 #[derive(Clone)]
-struct DeliveryRoute {
+struct DeliveryTarget {
     account_id: MemberId,
     group_id_hint: Option<GroupId>,
     plane: TransportDeliveryPlane,
@@ -6976,7 +6996,7 @@ impl AdapterState {
             return Vec::new();
         };
         let wire = inbound_wire_metadata(&relay_event.event, &message.envelope);
-        let delivery_for = |route: DeliveryRoute, message| TransportDelivery {
+        let delivery_for = |route: DeliveryTarget, message| TransportDelivery {
             account_id: route.account_id,
             group_id_hint: route.group_id_hint,
             message,
@@ -7063,7 +7083,7 @@ impl AdapterState {
         &self,
         message: &TransportMessage,
         endpoint: &TransportEndpoint,
-    ) -> Vec<DeliveryRoute> {
+    ) -> Vec<DeliveryTarget> {
         match &message.envelope {
             TransportEnvelope::GroupMessage { transport_group_id } => {
                 // #698/#752: O(1) index lookup by transport_group_id, then match
@@ -7083,7 +7103,7 @@ impl AdapterState {
                             .iter()
                             .any(|candidate| candidate.matches(endpoint, parsed_endpoint.as_ref()))
                     })
-                    .map(|entry| DeliveryRoute {
+                    .map(|entry| DeliveryTarget {
                         account_id: entry.account_id.clone(),
                         group_id_hint: Some(entry.group_id.clone()),
                         plane: TransportDeliveryPlane::Group,
@@ -7103,7 +7123,7 @@ impl AdapterState {
                                 candidate.matches(endpoint, parsed_endpoint.as_ref())
                             })
                     })
-                    .map(|(account_id, _)| DeliveryRoute {
+                    .map(|(account_id, _)| DeliveryTarget {
                         account_id: account_id.clone(),
                         group_id_hint: None,
                         plane: TransportDeliveryPlane::AccountInbox,

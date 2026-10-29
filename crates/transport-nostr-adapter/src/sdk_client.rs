@@ -35,9 +35,10 @@ use transport_nostr_peeler::{
 use crate::network_proxy as process_proxy;
 use crate::sweep::hint_tap::{EoseHints, HintTransport};
 use crate::{
-    NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
-    NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
-    NostrAcquisitionScope, NostrAcquisitionStats, NostrEventPublishRequest, NostrNotificationLoss,
+    DeliveryRoute, MAX_DELIVERY_LOSS_ROUTES, NostrAcquisitionCancellation, NostrAcquisitionEnd,
+    NostrAcquisitionEndpoint, NostrAcquisitionError, NostrAcquisitionLimits,
+    NostrAcquisitionRequest, NostrAcquisitionResult, NostrAcquisitionScope, NostrAcquisitionStats,
+    NostrEventPublishRequest, NostrNotificationLoss, NostrNotificationLossBounds,
     NostrNotificationLossFloor, NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome,
     NostrRelayClient, NostrRelayEvent, NostrSubscribeReport, NostrSubscription,
     NostrTransportAdapter, RelayConnection, ReplayRestart, SubscriptionRefusal,
@@ -663,8 +664,9 @@ pub struct RelayRegistrationOutcome {
     pub accepted: bool,
 }
 
-/// The `since` floors of the REQs one account context issued, which bound the
-/// events a lag on its notification receiver can lose.
+/// The `since` floors of the REQs one account context issued, and the routes
+/// each selects, which bound the events a lag on its notification receiver can
+/// lose.
 ///
 /// Deliveries are routed by message content, not by subscription id
 /// (`AdapterState::routes_for`), and the SDK does not verify subscription ids
@@ -674,46 +676,81 @@ pub struct RelayRegistrationOutcome {
 /// CLOSE. Neither has a deadline. A stalled consumer keeps them buffered, and
 /// a relay with a deep outbound backlog keeps sending them for as long as the
 /// backlog takes to drain. So a closed REQ's floor bounds the receiver's loss
-/// for the rest of the context's life. Only the lowest closed floor matters.
+/// for the rest of the context's life. Only the lowest closed floor matters,
+/// overall and on each route.
 #[derive(Debug, Default)]
 struct SubscriptionFloors {
-    /// Filter `since` of each live REQ, in Unix seconds; `None` is unfloored.
-    live: HashMap<SubscriptionId, Option<u64>>,
+    live: HashMap<SubscriptionId, RequestFloor>,
     /// The lowest floor among the REQs this context closed, replaced, or
     /// abandoned.
     retired: Option<NostrNotificationLossFloor>,
+    /// The lowest floor per route among those REQs, unless one of them was
+    /// unfloored, its routes were unknown, or they passed
+    /// [`MAX_DELIVERY_LOSS_ROUTES`], which empties the map.
+    retired_routes: BTreeMap<DeliveryRoute, u64>,
+    retired_routes_unknown: bool,
+}
+
+/// One REQ's filter `since` in Unix seconds (`None` is unfloored), and the
+/// routes it selects (`None` when they are unknown).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestFloor {
+    since: Option<u64>,
+    routes: Option<Vec<DeliveryRoute>>,
+}
+
+impl RequestFloor {
+    fn floor(&self) -> NostrNotificationLossFloor {
+        NostrNotificationLossFloor::from_since(self.since)
+    }
+}
+
+/// Lower `routes`' floor for each of `request`'s routes to its `since`.
+/// `false` when the request has no floor or no known routes, or the routes
+/// pass the cap.
+fn lower_route_floors(routes: &mut BTreeMap<DeliveryRoute, u64>, request: &RequestFloor) -> bool {
+    let (Some(since), Some(selected)) = (request.since, &request.routes) else {
+        return false;
+    };
+    for route in selected {
+        routes
+            .entry(*route)
+            .and_modify(|floor| *floor = (*floor).min(since))
+            .or_insert(since);
+    }
+    routes.len() <= MAX_DELIVERY_LOSS_ROUTES
 }
 
 impl SubscriptionFloors {
     /// Record a REQ before it goes out, returning the floor it replaces under
     /// the same id. A replaced filter's frames can still arrive, so its floor
     /// is retired rather than forgotten.
-    fn open(&mut self, id: &SubscriptionId, since: Option<u64>) -> Option<Option<u64>> {
-        let replaced = self.live.insert(id.clone(), since);
-        if let Some(previous) = replaced
-            && previous != since
+    fn open(&mut self, id: &SubscriptionId, request: RequestFloor) -> Option<RequestFloor> {
+        let replaced = self.live.insert(id.clone(), request.clone());
+        if let Some(previous) = &replaced
+            && *previous != request
         {
-            self.retire(NostrNotificationLossFloor::from_since(previous));
+            self.retire(previous.clone());
         }
         replaced
     }
 
     /// A REQ that failed may still have reached a relay: retire its floor, and
     /// restore the floor of the REQ it would have replaced.
-    fn abandon(&mut self, id: &SubscriptionId, replaced: Option<Option<u64>>) {
-        let since = match replaced {
+    fn abandon(&mut self, id: &SubscriptionId, replaced: Option<RequestFloor>) {
+        let request = match replaced {
             Some(previous) => self.live.insert(id.clone(), previous),
             None => self.live.remove(id),
         };
-        if let Some(since) = since {
-            self.retire(NostrNotificationLossFloor::from_since(since));
+        if let Some(request) = request {
+            self.retire(request);
         }
     }
 
     /// The REQ's CLOSE went out.
     fn close(&mut self, id: &SubscriptionId) {
-        if let Some(since) = self.live.remove(id) {
-            self.retire(NostrNotificationLossFloor::from_since(since));
+        if let Some(request) = self.live.remove(id) {
+            self.retire(request);
         }
     }
 
@@ -724,29 +761,51 @@ impl SubscriptionFloors {
         let closed = self
             .live
             .extract_if(|id, _| !still_live.contains(id))
-            .map(|(_, since)| NostrNotificationLossFloor::from_since(since))
+            .map(|(_, request)| request)
             .collect::<Vec<_>>();
-        for floor in closed {
-            self.retire(floor);
+        for request in closed {
+            self.retire(request);
         }
     }
 
-    fn retire(&mut self, floor: NostrNotificationLossFloor) {
+    fn retire(&mut self, request: RequestFloor) {
+        let floor = request.floor();
         self.retired = Some(self.retired.map_or(floor, |kept| kept.lowest(floor)));
+        if !self.retired_routes_unknown && !lower_route_floors(&mut self.retired_routes, &request) {
+            self.retired_routes.clear();
+            self.retired_routes_unknown = true;
+        }
     }
 
-    /// The lowest floor among live REQs and every REQ this context closed.
-    /// With neither, there is no REQ evidence at all. That reads as
-    /// unbounded, not as no loss: the lost notifications then came from a
-    /// REQ this record never saw.
-    fn loss_floor(&self) -> NostrNotificationLossFloor {
-        self.live
+    /// The lowest floor among live REQs and every REQ this context closed,
+    /// and each route's. With neither, there is no REQ evidence at all. That
+    /// reads as unbounded, not as no loss: the lost notifications then came
+    /// from a REQ this record never saw.
+    fn loss_bounds(&self) -> NostrNotificationLossBounds {
+        let floor = self
+            .live
             .values()
-            .copied()
-            .map(NostrNotificationLossFloor::from_since)
+            .map(RequestFloor::floor)
             .chain(self.retired)
             .reduce(NostrNotificationLossFloor::lowest)
-            .unwrap_or(NostrNotificationLossFloor::Unbounded)
+            .unwrap_or(NostrNotificationLossFloor::Unbounded);
+        NostrNotificationLossBounds {
+            floor,
+            routes: self.loss_routes(),
+        }
+    }
+
+    fn loss_routes(&self) -> Option<BTreeMap<DeliveryRoute, u64>> {
+        if self.retired_routes_unknown {
+            return None;
+        }
+        let mut routes = self.retired_routes.clone();
+        for request in self.live.values() {
+            if !lower_route_floors(&mut routes, request) {
+                return None;
+            }
+        }
+        (!routes.is_empty()).then_some(routes)
     }
 }
 
@@ -2268,10 +2327,19 @@ impl NostrSdkRelayClient {
     /// reports [`NostrNotificationLossFloor::Unbounded`]: its receiver's loss
     /// cannot be attributed to one account's REQs.
     pub fn notification_loss_floor(&self) -> NostrNotificationLossFloor {
+        self.notification_loss_bounds().floor
+    }
+
+    /// [`Self::notification_loss_floor`], and each route's own: the lowest
+    /// `since` among the REQs that select it. Routes are known only when
+    /// every REQ names its routes and has a floor.
+    pub fn notification_loss_bounds(&self) -> NostrNotificationLossBounds {
         if self.account_id.is_none() {
-            return NostrNotificationLossFloor::Unbounded;
+            return NostrNotificationLossBounds::account_wide(
+                NostrNotificationLossFloor::Unbounded,
+            );
         }
-        self.subscription_floors().loss_floor()
+        self.subscription_floors().loss_bounds()
     }
 
     /// [`Self::notification_loss_floor`] of the account context a
@@ -3839,8 +3907,11 @@ impl NostrSdkRelayClient {
         // Record the floor before any relay can answer, as the adapter records
         // routes before the REQ: a lag can lose the very first reply.
         let id = plan.subscription_id.clone();
-        let since = plan.filter.since.map(|since| since.as_secs());
-        let replaced = self.subscription_floors().open(&id, since);
+        let request = RequestFloor {
+            since: plan.filter.since.map(|since| since.as_secs()),
+            routes: subscription.delivery_routes(),
+        };
+        let replaced = self.subscription_floors().open(&id, request);
         let result = self.subscribe_planned(plan).await;
         if result.is_err() {
             // The REQ may have reached a relay before the failure.
@@ -6266,61 +6337,164 @@ mod tests {
     fn notification_loss_floor_is_the_lowest_live_or_closed_since() {
         use NostrNotificationLossFloor::{Since, Unbounded};
         let id = |name: &str| SubscriptionId::new(name);
+        let req = |since| RequestFloor {
+            since,
+            routes: None,
+        };
         let mut floors = SubscriptionFloors::default();
         assert_eq!(
-            floors.loss_floor(),
+            floors.loss_bounds().floor,
             Unbounded,
             "no REQ evidence is not a bound"
         );
 
-        assert_eq!(floors.open(&id("inbox"), Some(500)), None);
-        floors.open(&id("group"), Some(300));
-        assert_eq!(floors.loss_floor(), Since(300));
+        assert_eq!(floors.open(&id("inbox"), req(Some(500))), None);
+        floors.open(&id("group"), req(Some(300)));
+        assert_eq!(floors.loss_bounds().floor, Since(300));
 
         // A closed REQ's frames can still arrive however long ago it closed,
         // so its floor stays after later REQs open above it.
         floors.close(&id("group"));
-        floors.open(&id("group"), Some(800));
-        floors.open(&id("other"), Some(900));
-        assert_eq!(floors.loss_floor(), Since(300), "a lower closed REQ");
+        floors.open(&id("group"), req(Some(800)));
+        floors.open(&id("other"), req(Some(900)));
+        assert_eq!(floors.loss_bounds().floor, Since(300), "a lower closed REQ");
 
         // A REQ replaced under its id keeps its earlier filter's floor too.
         let mut replaced = SubscriptionFloors::default();
-        replaced.open(&id("inbox"), Some(500));
-        assert_eq!(replaced.open(&id("inbox"), Some(900)), Some(Some(500)));
-        assert_eq!(replaced.loss_floor(), Since(500));
+        replaced.open(&id("inbox"), req(Some(500)));
+        assert_eq!(
+            replaced.open(&id("inbox"), req(Some(900))),
+            Some(req(Some(500)))
+        );
+        assert_eq!(replaced.loss_bounds().floor, Since(500));
 
         // A failed REQ may have reached a relay; the one it would have
         // replaced is still live.
         let mut failed = SubscriptionFloors::default();
-        failed.open(&id("inbox"), Some(900));
-        let previous = failed.open(&id("inbox"), Some(700));
+        failed.open(&id("inbox"), req(Some(900)));
+        let previous = failed.open(&id("inbox"), req(Some(700)));
         failed.abandon(&id("inbox"), previous);
-        assert_eq!(failed.live.get(&id("inbox")), Some(&Some(900)));
-        assert_eq!(failed.loss_floor(), Since(700));
+        assert_eq!(failed.live.get(&id("inbox")), Some(&req(Some(900))));
+        assert_eq!(failed.loss_bounds().floor, Since(700));
 
         // Account teardown retires everything but a REQ whose CLOSE failed.
         let mut teardown = SubscriptionFloors::default();
-        teardown.open(&id("kept"), Some(950));
-        teardown.open(&id("orphan"), Some(100));
+        teardown.open(&id("kept"), req(Some(950)));
+        teardown.open(&id("orphan"), req(Some(100)));
         teardown.close_all_except(&[id("kept")]);
         assert_eq!(teardown.live.keys().collect::<Vec<_>>(), [&id("kept")]);
         teardown.close(&id("kept"));
-        assert_eq!(teardown.loss_floor(), Since(100));
+        assert_eq!(teardown.loss_bounds().floor, Since(100));
 
         // An old unfloored REQ that closed while a floored one stays live
         // leaves every later lag on its context unbounded: however long ago
         // it closed, its frames may still be buffered or on their way.
         let mut unfloored = SubscriptionFloors::default();
-        unfloored.open(&id("maintenance"), None);
-        unfloored.open(&id("group"), Some(900));
+        unfloored.open(&id("maintenance"), req(None));
+        unfloored.open(&id("group"), req(Some(900)));
         unfloored.close(&id("maintenance"));
-        unfloored.open(&id("inbox"), Some(950));
-        assert_eq!(unfloored.loss_floor(), Unbounded);
-        let fresh = unfloored.open(&id("fresh"), Some(50));
+        unfloored.open(&id("inbox"), req(Some(950)));
+        assert_eq!(unfloored.loss_bounds().floor, Unbounded);
+        let fresh = unfloored.open(&id("fresh"), req(Some(50)));
         unfloored.abandon(&id("fresh"), fresh);
         assert!(!unfloored.live.contains_key(&id("fresh")));
         assert_eq!(unfloored.retired, Some(Unbounded), "no floor raises it");
+    }
+
+    #[test]
+    fn notification_loss_routes_are_each_routes_lowest_since() {
+        use NostrNotificationLossFloor::{Since, Unbounded};
+        let id = |name: &str| SubscriptionId::new(name);
+        let group = |byte: u8| DeliveryRoute::Group([byte; 32]);
+        let req = |since, routes: &[DeliveryRoute]| RequestFloor {
+            since,
+            routes: Some(routes.to_vec()),
+        };
+        let mut floors = SubscriptionFloors::default();
+        assert_eq!(floors.loss_bounds().routes, None, "no REQ evidence");
+        floors.open(&id("inbox"), req(Some(500), &[DeliveryRoute::Inbox]));
+        floors.open(&id("batch"), req(Some(300), &[group(1), group(2)]));
+        floors.open(&id("group"), req(Some(800), &[group(3)]));
+        assert_eq!(
+            floors.loss_bounds(),
+            NostrNotificationLossBounds {
+                floor: Since(300),
+                routes: Some(BTreeMap::from([
+                    (DeliveryRoute::Inbox, 500),
+                    (group(1), 300),
+                    (group(2), 300),
+                    (group(3), 800),
+                ])),
+            }
+        );
+
+        // A closed or replaced REQ keeps each of its routes' floors; a route
+        // only a later REQ selects starts at that REQ's.
+        floors.close(&id("group"));
+        floors.open(&id("group"), req(Some(950), &[group(3)]));
+        floors.open(&id("batch"), req(Some(900), &[group(2), group(4)]));
+        let routes = floors.loss_bounds().routes.unwrap();
+        assert_eq!(routes.get(&group(1)), Some(&300));
+        assert_eq!(routes.get(&group(2)), Some(&300));
+        assert_eq!(routes.get(&group(3)), Some(&800));
+        assert_eq!(routes.get(&group(4)), Some(&900));
+
+        // A failed REQ may have reached a relay: its routes keep its floor.
+        let previous = floors.open(&id("late"), req(Some(100), &[group(5)]));
+        floors.abandon(&id("late"), previous);
+        assert_eq!(
+            floors.loss_bounds().routes.unwrap().get(&group(5)),
+            Some(&100)
+        );
+
+        // A REQ with unknown routes, live or closed, leaves every route
+        // owing from the floor.
+        let mut unknown = SubscriptionFloors::default();
+        unknown.open(&id("inbox"), req(Some(500), &[DeliveryRoute::Inbox]));
+        unknown.open(
+            &id("odd"),
+            RequestFloor {
+                since: Some(700),
+                routes: None,
+            },
+        );
+        assert_eq!(unknown.loss_bounds().floor, Since(500));
+        assert_eq!(unknown.loss_bounds().routes, None);
+        unknown.close(&id("odd"));
+        unknown.open(&id("group"), req(Some(900), &[group(1)]));
+        assert_eq!(unknown.loss_bounds().routes, None, "for the context's life");
+
+        // An unfloored REQ bounds no route.
+        let mut unfloored = SubscriptionFloors::default();
+        unfloored.open(&id("maintenance"), req(None, &[group(1)]));
+        unfloored.open(&id("inbox"), req(Some(500), &[DeliveryRoute::Inbox]));
+        assert_eq!(
+            unfloored.loss_bounds(),
+            NostrNotificationLossBounds::account_wide(Unbounded)
+        );
+        unfloored.close(&id("maintenance"));
+        assert_eq!(unfloored.loss_bounds().routes, None);
+
+        // Past the route cap the routes are unknown, live or closed.
+        let many = (0..=MAX_DELIVERY_LOSS_ROUTES)
+            .map(|index| {
+                let mut route = [0_u8; 32];
+                route[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                DeliveryRoute::Group(route)
+            })
+            .collect::<Vec<_>>();
+        let mut wide = SubscriptionFloors::default();
+        wide.open(&id("all"), req(Some(500), &many));
+        assert_eq!(wide.loss_bounds().routes, None);
+        wide.close(&id("all"));
+        assert!(wide.retired_routes_unknown);
+        assert_eq!(wide.loss_bounds().routes, None);
+        let mut within = SubscriptionFloors::default();
+        within.open(&id("all"), req(Some(500), &many[1..]));
+        assert_eq!(
+            within.loss_bounds().routes.map(|routes| routes.len()),
+            Some(MAX_DELIVERY_LOSS_ROUTES)
+        );
     }
 
     #[tokio::test]
@@ -6357,6 +6531,14 @@ mod tests {
         .unwrap();
         root.subscribe(group(Some(Timestamp(1_000)))).await.unwrap();
         assert_eq!(account.notification_loss_floor(), Since(1_000));
+        let routes = BTreeMap::from([
+            (DeliveryRoute::Inbox, 2_000),
+            (DeliveryRoute::Group([0xD4; 32]), 1_000),
+        ]);
+        assert_eq!(
+            account.notification_loss_bounds().routes.as_ref(),
+            Some(&routes)
+        );
         assert_eq!(
             root.notification_loss_floor_for_account(&account_id).await,
             Since(1_000)
@@ -6383,6 +6565,10 @@ mod tests {
             Since(1_000),
             "closed REQs keep counting for the context's life"
         );
+        assert_eq!(
+            account.notification_loss_bounds().routes.as_ref(),
+            Some(&routes)
+        );
 
         // A subscribe that fails after its floor was recorded keeps it: the
         // REQ may have reached a relay.
@@ -6398,6 +6584,13 @@ mod tests {
         assert!(failed.is_err());
         assert!(account.subscription_floors().live.is_empty());
         assert_eq!(account.notification_loss_floor(), Since(50));
+        assert_eq!(
+            account
+                .notification_loss_bounds()
+                .routes
+                .and_then(|routes| routes.get(&DeliveryRoute::Inbox).copied()),
+            Some(50)
+        );
         root.shutdown_accounts().await;
     }
 
