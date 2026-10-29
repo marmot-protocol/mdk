@@ -202,6 +202,22 @@ pub enum SendIntent {
         key_package: KeyPackage,
         roster_update: Vec<u8>,
     },
+    /// Remove a device whose link failed from the account's device group,
+    /// with its roster entry, in one admin Commit (mdk#2628 item 3.3b, D40).
+    /// Only the device that approved the link sends it, once the new device
+    /// made no Commit in the device group by the link's deadline.
+    ///
+    /// `leaf_signature_key` names the leaf the link added, as
+    /// [`Member::credential`](crate::group::Member) reports it: another leaf
+    /// of this device's account. `roster_update` is a
+    /// `marmot.account.device-roster.v1` update with exactly one operation,
+    /// removing the device entry of a slot the roster lists. Like a link, it
+    /// is never queued.
+    UnlinkDevice {
+        group_id: GroupId,
+        leaf_signature_key: Vec<u8>,
+        roster_update: Vec<u8>,
+    },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
     /// Rotate only this sender's MLS LeafNode key material.
