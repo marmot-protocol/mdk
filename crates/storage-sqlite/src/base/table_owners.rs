@@ -52,6 +52,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     // Everything else, including the transport-specific tables.
     ("account_attachment_history_version", Side::App),
     ("account_delivery_loss_evidence", Side::App),
+    ("account_delivery_loss_evidence_routes", Side::App),
     ("account_delivery_spill", Side::App),
     ("account_group_app_components", Side::App),
     ("account_groups", Side::App),

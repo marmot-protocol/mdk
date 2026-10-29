@@ -13,7 +13,7 @@ mod plan;
 #[cfg(test)]
 mod replay_tests;
 mod stall;
-pub use loss::{RecoveryLossCause, RecoveryLossSnapshot, RecoveryLossWatermark};
+pub use loss::{MAX_LOSS_ROUTES, RecoveryLossCause, RecoveryLossSnapshot, RecoveryLossWatermark};
 pub use notice::ParkedRecoveryObligation;
 pub use observe::{
     RecoveryDemandTransition, RecoveryLossImport, RecoveryObligationState, RecoveryObligationStatus,
@@ -344,6 +344,21 @@ pub(crate) fn arm_overflow_tx(
     }
     // Preserve what the worker already observed, even when this token's marker
     // callback has not committed yet. A delayed duplicate cannot rearm debt.
+    // Drops past the durable count have no marker write naming their routes
+    // yet, and the import below covers their count, so they un-cover every
+    // route; an absent row starts account-wide.
+    let durable: Option<i64> = conn
+        .query_row_cached(
+            "SELECT dropped_count FROM account_delivery_loss_evidence
+             WHERE account_label = ?1 AND cause = 0 AND marker_token = ?2",
+            params![label, token],
+            |row| row.get(0),
+        )
+        .optional()
+        .storage()?;
+    if durable.is_some_and(|durable| durable < dropped) {
+        loss::unroute_tx(conn, label, 0, token)?;
+    }
     let (bound_state, bound_seconds) = loss_bound_values(earliest_created_at)?;
     conn.execute_cached(
         &format!(
@@ -377,6 +392,73 @@ pub(crate) fn loss_bound_values(
         Some(seconds) => (1, Some(sqlite_integer(seconds)?)),
         None => (2, None),
     })
+}
+
+/// What the generations one import charged lost: every route from the lowest
+/// floor among those that named no routes, and each named route from its own
+/// lowest bound. An import may charge any number of generations, so the named
+/// routes it holds are un-covered early once they pass [`MAX_LOSS_ROUTES`].
+#[derive(Default)]
+struct ChargedLoss {
+    every_route: Option<u64>,
+    routes: std::collections::BTreeMap<crate::TransportReconciliationRoute, u64>,
+}
+
+impl ChargedLoss {
+    /// Charge what the generation lost; the caller un-covers it in the same
+    /// transaction.
+    fn charge(
+        &mut self,
+        conn: &Connection,
+        label: &str,
+        cause: i64,
+        token: i64,
+    ) -> StorageResult<()> {
+        match loss::evidence_routes(conn, label, cause, token)? {
+            Some(routes) => {
+                for (route, bound) in routes {
+                    let lowest = self.routes.entry(route).or_insert(bound);
+                    *lowest = (*lowest).min(bound);
+                }
+                if self.routes.len() > MAX_LOSS_ROUTES {
+                    let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64())?;
+                    for (route, bound) in std::mem::take(&mut self.routes) {
+                        crate::app::recovery_coverage::uncover_route_loss_tx(
+                            conn, &route, bound, now,
+                        )?;
+                    }
+                }
+            }
+            None => {
+                let floor = loss::evidence_floor(conn, label, cause, token)?;
+                self.every_route = Some(self.every_route.map_or(floor, |lowest| lowest.min(floor)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Un-cover what was lost, in the import's transaction. Returns whether
+    /// every route lost coverage.
+    fn uncover(self, conn: &Connection) -> StorageResult<bool> {
+        if let Some(floor) = self.every_route {
+            crate::app::recovery_coverage::uncover_loss_tx(conn, floor)?;
+        }
+        let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64())?;
+        for (route, bound) in self.routes {
+            match self.every_route {
+                Some(floor) if bound >= floor => {
+                    // Its coverage went with the account-wide floor, but that
+                    // widens only goals the ledger already holds, and this
+                    // route may have left current routing.
+                    crate::app::recovery_coverage::widen_goal(conn, &route, floor)?
+                }
+                _ => {
+                    crate::app::recovery_coverage::uncover_route_loss_tx(conn, &route, bound, now)?
+                }
+            }
+        }
+        Ok(self.every_route.is_some())
+    }
 }
 
 /// The one obligation every generation of a loss cause joins.
@@ -450,7 +532,8 @@ fn join_loss_tx(
 /// Token-only legacy retirement cannot certify other generations joined into
 /// the same account demand. Reconstitute those generations in this transaction;
 /// their imported watermark remains distinct from low-level retirement. Loss
-/// the user already retired carries no debt and is not reconstituted.
+/// the user already retired carries no debt and is not reconstituted. Each
+/// restored generation un-covers as an import does.
 pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageResult<bool> {
     let rows = conn
         .prepare_cached(
@@ -471,7 +554,7 @@ pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageR
         .storage()?
         .collect::<Result<Vec<_>, _>>()
         .storage()?;
-    let mut floor = None::<u64>;
+    let mut lost = ChargedLoss::default();
     for (token, since, dropped) in &rows {
         join_loss_tx(conn, label, 0, *token, *dropped, *since, true)?;
         conn.execute_cached(
@@ -480,12 +563,9 @@ pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageR
             params![label, token],
         )
         .storage()?;
-        let restored = loss::evidence_floor(conn, label, 0, *token)?;
-        floor = Some(floor.map_or(restored, |floor| floor.min(restored)));
+        lost.charge(conn, label, 0, *token)?;
     }
-    if let Some(floor) = floor {
-        crate::app::recovery_coverage::uncover_loss_tx(conn, floor)?;
-    }
+    lost.uncover(conn)?;
     Ok(!rows.is_empty())
 }
 
@@ -732,8 +812,8 @@ impl SqliteAppStorage {
     /// demand creation share a transaction, so cancellation cannot lose either.
     ///
     /// Returns what the import charged, at most one entry per loss cause, so
-    /// the owner can record the change. Loss that changed no obligation
-    /// revision reports nothing.
+    /// the owner can record the change. A cause whose import changed no
+    /// obligation revision reports only when it un-covered every route.
     pub fn synchronize_account_delivery_loss(
         &self,
         label: &str,
@@ -756,9 +836,10 @@ impl SqliteAppStorage {
             // evidence set is deliberately not disk-capped; do not mirror it
             // into an unbounded temporary Vec on reopen. The audit summary is
             // constant-size: one accumulator per cause.
-            // Per cause: the demand before, the count charged, and the lowest
-            // floor among the generations this import charged.
-            let mut imports: [Option<(Option<observe::DemandRow>, u64, u64)>; 2] = [None, None];
+            // Per cause: the demand before, the count charged, and what the
+            // generations this import charged lost.
+            let mut imports: [Option<(Option<observe::DemandRow>, u64, ChargedLoss)>; 2] =
+                [None, None];
             let mut cursor = (-1_i64, -1_i64);
             loop {
                 let row = conn
@@ -790,17 +871,13 @@ impl SqliteAppStorage {
                     .and_then(|cause| imports.get_mut(cause))
                 {
                     let charged = i64_to_u64(dropped.saturating_sub(imported.unwrap_or(0)).max(0))?;
-                    let floor = loss::evidence_floor(&conn, label, cause, token)?;
-                    match slot {
-                        Some((_, total, lowest)) => {
-                            *total = total.saturating_add(charged);
-                            *lowest = (*lowest).min(floor);
-                        }
-                        None => {
-                            let before =
-                                observe::demand_row(&conn, &loss_demand_key(cause, label)?)?;
-                            *slot = Some((before, charged, floor));
-                        }
+                    if slot.is_none() {
+                        let before = observe::demand_row(&conn, &loss_demand_key(cause, label)?)?;
+                        *slot = Some((before, 0, ChargedLoss::default()));
+                    }
+                    if let Some((_, total, lost)) = slot {
+                        *total = total.saturating_add(charged);
+                        lost.charge(&conn, label, cause, token)?;
                     }
                 }
                 join_loss_tx(&conn, label, cause, token, dropped, observed_at, true)?;
@@ -813,19 +890,20 @@ impl SqliteAppStorage {
             }
             let mut changes = Vec::new();
             for (cause, slot) in imports.into_iter().enumerate() {
-                let Some((before, charged, uncover_floor)) = slot else {
+                let Some((before, charged, lost)) = slot else {
                     continue;
                 };
                 let cause_value = i64::try_from(cause).map_err(|_| {
                     StorageError::Serialization("unsupported recovery loss cause".into())
                 })?;
+                let every_route = lost.uncover(&conn)?;
                 let Some(after) =
                     observe::demand_row(&conn, &loss_demand_key(cause_value, label)?)?
                 else {
                     continue;
                 };
                 let transition = observe::transition(before.as_ref(), &after);
-                if transition == RecoveryDemandTransition::Unchanged {
+                if transition == RecoveryDemandTransition::Unchanged && !every_route {
                     continue;
                 }
                 let cause = if cause == 0 {
@@ -834,13 +912,13 @@ impl SqliteAppStorage {
                     RecoveryLossCause::NotificationConsumer
                 };
                 let goal_floor = loss::goal_floor(&conn, label, cause)?;
-                crate::app::recovery_coverage::uncover_loss_tx(&conn, uncover_floor)?;
                 changes.push(RecoveryLossImport {
                     cause,
                     obligation: observe::ticket(&after)?,
                     transition,
                     charged,
                     goal_floor,
+                    every_route,
                 });
             }
             Ok(changes)
@@ -848,9 +926,11 @@ impl SqliteAppStorage {
     }
 
     /// [`Self::mark_account_delivery_recovery_bounded`], also reporting how the
-    /// worker's observation changed the queue-loss obligation, when it did.
-    /// The marker writer usually imported the generation first, so this is
-    /// most often `None`.
+    /// worker's observation changed the queue-loss obligation, when it did or
+    /// when it un-covered every route. The marker writer usually imported the
+    /// generation first, so this is most often `None`. It un-covers the
+    /// generation when it imported count, and an observation past the durable
+    /// count un-covers every route.
     pub fn mark_account_delivery_recovery_observed(
         &self,
         label: &str,
@@ -882,24 +962,36 @@ impl SqliteAppStorage {
                 crate::base::codec::unix_now_seconds_i64(),
                 earliest_created_at,
             )?;
+            let charged: bool = conn
+                .query_row_cached(
+                    "SELECT ?3 IS NULL OR imported_count > ?3 FROM account_delivery_loss_evidence
+                     WHERE account_label = ?1 AND cause = 0 AND marker_token = ?2",
+                    params![label, token, imported],
+                    |row| row.get(0),
+                )
+                .optional()
+                .storage()?
+                .unwrap_or(false);
+            let mut lost = ChargedLoss::default();
+            if charged {
+                lost.charge(&conn, label, 0, token)?;
+            }
+            let every_route = lost.uncover(&conn)?;
             let Some(after) = observe::demand_row(&conn, &key)? else {
                 return Ok(None);
             };
             let transition = observe::transition(before.as_ref(), &after);
-            if transition == RecoveryDemandTransition::Unchanged {
+            if transition == RecoveryDemandTransition::Unchanged && !every_route {
                 return Ok(None);
             }
             let goal_floor = loss::goal_floor(&conn, label, RecoveryLossCause::Queue)?;
-            crate::app::recovery_coverage::uncover_loss_tx(
-                &conn,
-                loss::evidence_floor(&conn, label, 0, token)?,
-            )?;
             Ok(Some(RecoveryLossImport {
                 cause: RecoveryLossCause::Queue,
                 obligation: observe::ticket(&after)?,
                 transition,
                 charged: i64_to_u64(dropped.saturating_sub(imported.unwrap_or(0)).max(0))?,
                 goal_floor,
+                every_route,
             }))
         })
     }

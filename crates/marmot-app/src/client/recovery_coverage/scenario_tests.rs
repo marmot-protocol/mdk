@@ -219,6 +219,88 @@ async fn pending_loss_keeps_live_boundaries_from_re_covering_it() {
     }
 }
 
+/// Queue loss whose drops named their routes un-covers only those routes,
+/// from their own bounds: the inbox, where nothing was dropped, stays covered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_queue_loss_uncovers_only_its_routes() {
+    let fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let routes = routes(&fixture.client);
+    let group = routes
+        .iter()
+        .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
+        .unwrap()
+        .clone();
+    let floor = unix_now_seconds().saturating_sub(30);
+    app.record_account_recovery_loss_routed(
+        "alice",
+        storage_sqlite::RecoveryLossCause::Queue,
+        41,
+        3,
+        unix_now_seconds(),
+        Some(floor),
+        Some(&[(group.clone(), floor)]),
+    )
+    .unwrap();
+    fixture.client.synchronize_recovery_loss(&app).unwrap();
+    fixture.client.record_native_coverage(&app).await;
+    for route in &routes {
+        let owed = !app
+            .recovery_coverage_debt(route, &[relay()], unix_now_seconds())
+            .unwrap()
+            .is_empty();
+        assert_eq!(owed, *route == group, "only the group lost deliveries");
+    }
+}
+
+/// A restored generation's new drops arrive under a fresh token, so they
+/// import as new loss and cost coverage: first the route they name, then
+/// every route once a drop names none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_generations_new_loss_uncovers_its_routes() {
+    let fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let routes = routes(&fixture.client);
+    let group = routes
+        .iter()
+        .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
+        .unwrap()
+        .clone();
+    let inbox = TransportReconciliationRoute::Inbox;
+    assert!(routes.contains(&inbox));
+    let floor = unix_now_seconds().saturating_sub(30);
+    let lose = |token, count, lost: Option<&[(TransportReconciliationRoute, u64)]>| {
+        app.record_account_recovery_loss_routed(
+            "alice",
+            storage_sqlite::RecoveryLossCause::Queue,
+            token,
+            count,
+            unix_now_seconds(),
+            Some(floor),
+            lost,
+        )
+        .unwrap();
+        fixture.client.synchronize_recovery_loss(&app).unwrap();
+    };
+    let owed = |route: &TransportReconciliationRoute| {
+        !app.recovery_coverage_debt(route, &[relay()], unix_now_seconds())
+            .unwrap()
+            .is_empty()
+    };
+    lose(41, 50, Some(&[(group.clone(), floor)]));
+    fixture.client.record_native_coverage(&app).await;
+    assert!(!owed(&inbox));
+
+    // Restored after a restart: the plane counts new drops under a fresh
+    // token.
+    lose(42, 1, Some(&[(inbox.clone(), floor)]));
+    assert!(owed(&inbox), "the restored generation lost the inbox");
+    lose(42, 2, None);
+    for route in &routes {
+        assert!(owed(route), "a drop that named no route costs every route");
+    }
+}
+
 /// Loss imported after a grant was selected can lie inside the window its
 /// pass certified, so settlement must not restore that window's coverage
 /// from the loss's floor up; below the floor the certificate stands.

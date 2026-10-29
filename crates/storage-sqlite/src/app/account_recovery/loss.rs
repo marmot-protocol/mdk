@@ -2,7 +2,7 @@
 use super::*;
 #[cfg(test)]
 use crate::SqliteAccountStorage;
-use crate::SqliteAppStorage;
+use crate::{SqliteAppStorage, TransportReconciliationRoute};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i64)]
@@ -114,6 +114,55 @@ pub(super) fn goal_floor(
         .and_then(|seconds| u64::try_from(seconds).ok()))
 }
 
+/// The most routes one loss generation lists. A generation that touches more
+/// is un-covered on every route, as if a charge had named none.
+pub const MAX_LOSS_ROUTES: usize = 256;
+
+/// The routes one generation's import un-covers: every route its writes
+/// named, each from the earliest `created_at` it could have lost there. `None` when it un-covers every route from its floor: some charge
+/// named no route or time, or it touched more than [`MAX_LOSS_ROUTES`].
+pub(super) fn evidence_routes(
+    conn: &Connection,
+    label: &str,
+    cause: i64,
+    token: i64,
+) -> StorageResult<Option<Vec<(TransportReconciliationRoute, u64)>>> {
+    let routed: Option<i64> = conn
+        .query_row_cached(
+            "SELECT route_state FROM account_delivery_loss_evidence
+             WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3 AND bound_state = 1",
+            params![label, cause, token],
+            |row| row.get(0),
+        )
+        .optional()
+        .storage()?;
+    if routed != Some(1) {
+        return Ok(None);
+    }
+    conn.prepare_cached(
+        "SELECT route_kind, route_id, bound_seconds FROM account_delivery_loss_evidence_routes
+         WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
+    )
+    .storage()?
+    .query_map(params![label, cause, token], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })
+    .storage()?
+    .map(|row| {
+        let (kind, id, bound) = row.storage()?;
+        Ok((
+            crate::app::recovery_coverage::route_from(kind, &id)?,
+            i64_to_u64(bound)?,
+        ))
+    })
+    .collect::<StorageResult<Vec<_>>>()
+    .map(Some)
+}
+
 /// The floor one generation's import un-covers the coverage ledger from: the
 /// earliest `created_at` it charged, or zero when any charge had no known
 /// time. Generations imported earlier were un-covered by their own import, so
@@ -137,6 +186,42 @@ pub(super) fn evidence_floor(
         Some((1, Some(seconds))) => u64::try_from(seconds).unwrap_or(0),
         _ => 0,
     })
+}
+
+/// Make a generation account-wide: every route lost coverage from its floor,
+/// so it lists none.
+pub(super) fn unroute_tx(
+    conn: &Connection,
+    label: &str,
+    cause: i64,
+    token: i64,
+) -> StorageResult<()> {
+    conn.execute_cached(
+        "UPDATE account_delivery_loss_evidence SET route_state = 0
+         WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
+        params![label, cause, token],
+    )
+    .storage()?;
+    drop_unrouted_routes_tx(conn, label, cause, token)
+}
+
+/// An account-wide generation needs no route rows.
+fn drop_unrouted_routes_tx(
+    conn: &Connection,
+    label: &str,
+    cause: i64,
+    token: i64,
+) -> StorageResult<()> {
+    conn.execute_cached(
+        "DELETE FROM account_delivery_loss_evidence_routes
+         WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
+           AND NOT EXISTS (SELECT 1 FROM account_delivery_loss_evidence
+               WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
+                 AND route_state = 1)",
+        params![label, cause, token],
+    )
+    .storage()?;
+    Ok(())
 }
 
 impl SqliteAppStorage {
@@ -172,32 +257,97 @@ impl SqliteAppStorage {
         observed_at_seconds: u64,
         earliest_created_at: Option<u64>,
     ) -> StorageResult<()> {
+        self.record_account_recovery_loss_routed(
+            label,
+            cause,
+            marker_token,
+            observed_count,
+            observed_at_seconds,
+            earliest_created_at,
+            None,
+        )
+    }
+
+    /// Like [`Self::record_account_recovery_loss_bounded`], also naming the
+    /// routes these charges lost on, each with the earliest `created_at` it
+    /// could have lost there. `None`, or an empty list, means some charge
+    /// named no route, and the generation un-covers every route from then on.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_account_recovery_loss_routed(
+        &self,
+        label: &str,
+        cause: RecoveryLossCause,
+        marker_token: u64,
+        observed_count: u64,
+        observed_at_seconds: u64,
+        earliest_created_at: Option<u64>,
+        routes: Option<&[(TransportReconciliationRoute, u64)]>,
+    ) -> StorageResult<()> {
         let (bound_state, bound_seconds) =
             crate::app::account_recovery::loss_bound_values(earliest_created_at)?;
-        self.lock()?
-            .execute_cached(
+        let token = sqlite_integer(marker_token)?;
+        let routes = routes.filter(|routes| !routes.is_empty() && routes.len() <= MAX_LOSS_ROUTES);
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            conn.execute_cached(
                 &format!(
                     "INSERT INTO account_delivery_loss_evidence
                      (account_label,cause,marker_token,pending_since,dropped_count,
-                      bound_state,bound_seconds)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7)
+                      bound_state,bound_seconds,route_state)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
                      ON CONFLICT(account_label,cause,marker_token) DO UPDATE SET
                          dropped_count=MAX(dropped_count,excluded.dropped_count),
+                         route_state=MIN(route_state,excluded.route_state),
                          {}",
                     crate::app::account_recovery::LOSS_BOUND_MERGE
                 ),
                 params![
                     label,
                     cause as i64,
-                    sqlite_integer(marker_token)?,
+                    token,
                     sqlite_integer(observed_at_seconds)?,
                     sqlite_integer(observed_count)?,
                     bound_state,
-                    bound_seconds
+                    bound_seconds,
+                    i64::from(routes.is_some())
                 ],
             )
             .storage()?;
-        Ok(())
+            for (route, bound) in routes.unwrap_or_default() {
+                let (kind, id) = route.storage_key();
+                conn.execute_cached(
+                    "INSERT INTO account_delivery_loss_evidence_routes
+                     (account_label, cause, marker_token, route_kind, route_id, bound_seconds)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6 FROM account_delivery_loss_evidence
+                     WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
+                       AND route_state = 1
+                     ON CONFLICT DO UPDATE SET
+                         bound_seconds = MIN(bound_seconds, excluded.bound_seconds)",
+                    params![
+                        label,
+                        cause as i64,
+                        token,
+                        kind,
+                        id,
+                        sqlite_integer(*bound)?
+                    ],
+                )
+                .storage()?;
+            }
+            let listed: i64 = conn
+                .query_row_cached(
+                    "SELECT COUNT(*) FROM account_delivery_loss_evidence_routes
+                     WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
+                    params![label, cause as i64, token],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            if usize::try_from(listed).map_or(true, |listed| listed > MAX_LOSS_ROUTES) {
+                unroute_tx(&conn, label, cause as i64, token)
+            } else {
+                drop_unrouted_routes_tx(&conn, label, cause as i64, token)
+            }
+        })
     }
 
     /// The earliest `created_at` every unresolved charge of this cause is

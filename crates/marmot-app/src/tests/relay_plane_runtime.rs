@@ -239,7 +239,7 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
     app.relay_plane
         .set_account_delivery_recovery_marker_for_test(
             &account,
-            Arc::new(|_, _, _| panic!("notification lag must never use the queue writer")),
+            Arc::new(|_, _, _, _| panic!("notification lag must never use the queue writer")),
         );
     app.relay_plane.simulate_notification_lag_for_test(
         &account,

@@ -4971,15 +4971,23 @@ impl MarmotApp {
             let recovery_storage = self.account_storage(label)?;
             let recovery_label = label.to_owned();
             let recovery_marker: transport_nostr::AccountDeliveryRecoveryMarker =
-                Arc::new(move |marker_token, dropped, earliest_created_at| {
+                Arc::new(move |marker_token, dropped, earliest_created_at, routes| {
+                    let routes = routes.map(|routes| {
+                        routes
+                            .iter()
+                            .map(|(route, earliest)| (reconciliation_route(*route), *earliest))
+                            .collect::<Vec<_>>()
+                    });
                     recovery_storage
                         .app_storage()
-                        .record_account_delivery_loss_bounded(
+                        .record_account_recovery_loss_routed(
                             &recovery_label,
+                            storage_sqlite::RecoveryLossCause::Queue,
                             marker_token,
                             dropped,
                             unix_now_seconds(),
                             earliest_created_at,
+                            routes.as_deref(),
                         )
                         .map_err(|error| {
                             if error.is_closed() {
@@ -8306,6 +8314,24 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
 fn empty_key_package_lifecycle(stable_slot_id: String) -> cgka_traits::KeyPackageLifecycleState {
     cgka_traits::KeyPackageLifecycleState::slot_only(stable_slot_id)
 }
+
+/// The coverage ledger's key for a route the relay plane placed a delivery
+/// on.
+pub(crate) fn reconciliation_route(
+    route: transport_nostr::DeliveryRoute,
+) -> storage_sqlite::TransportReconciliationRoute {
+    match route {
+        transport_nostr::DeliveryRoute::Inbox => {
+            storage_sqlite::TransportReconciliationRoute::Inbox
+        }
+        transport_nostr::DeliveryRoute::Group(id) => {
+            storage_sqlite::TransportReconciliationRoute::Group(id)
+        }
+    }
+}
+
+// Storage lists every route a loss generation the plane records may name.
+const _: () = assert!(transport_nostr::MAX_DELIVERY_LOSS_ROUTES == storage_sqlite::MAX_LOSS_ROUTES);
 
 fn unix_now_seconds() -> u64 {
     SystemTime::now()

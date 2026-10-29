@@ -13290,7 +13290,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         let attempts = marker_attempts.clone();
         let storage = app.account_storage("alice").unwrap();
         let marker: transport_nostr::AccountDeliveryRecoveryMarker =
-            Arc::new(move |marker_token, dropped, _| {
+            Arc::new(move |marker_token, dropped, _, _| {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if !release.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable);
@@ -14087,7 +14087,7 @@ fn live_ingest_keeps_the_cursor_behind_a_queue_omission_after_replay() {
         );
         let marker_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts = marker_attempts.clone();
-        let marker: transport_nostr::AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
+        let marker: transport_nostr::AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _, _| {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable)
         });
