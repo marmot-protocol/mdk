@@ -35,6 +35,67 @@ pub enum ReplayCaptureOutcome {
     Stale,
 }
 
+/// One source generation: one REQ on one relay from its last (re)start. It
+/// changes whenever the source restarts, so a count never carries across a
+/// disconnect, receiver loss or capture. Opaque; never diagnostic output.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReplaySourceGeneration(pub(super) u64);
+
+impl ReplaySourceGeneration {
+    /// A generation for a consumer's own tests.
+    #[doc(hidden)]
+    pub fn from_raw_for_test(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+/// The connection a relay client holds open to one relay, by its own state:
+/// opaque, compared only for equality. A client names every connection
+/// differently, and names none for a relay it is not connected to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelayConnection {
+    handle: u64,
+    attempt: usize,
+}
+
+impl RelayConnection {
+    /// `handle` names the client's relay object, `attempt` the connection
+    /// attempt it is on; together they never repeat for one relay.
+    pub fn new(handle: u64, attempt: usize) -> Self {
+        Self { handle, attempt }
+    }
+}
+
+/// What one relay's live REQ returned before its physical EOSE in one source
+/// generation. Backward paging of a clamped replay does not change it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayLiveCount {
+    /// Stored events the relay sent before EOSE.
+    pub events: usize,
+    /// The oldest `created_at` among them.
+    pub oldest: Option<u64>,
+    /// A local wall-clock second no later than when the relay ran the query
+    /// this EOSE answered: stamped before the adapter issued the REQ, or the
+    /// SDK's record of the connection it was re-sent on. Everything the relay
+    /// stored before then and the filter matches was sent before this EOSE.
+    pub requested_at: u64,
+    /// A local wall-clock second from which the REQ has been open on the
+    /// relay without a break: `requested_at` when the adapter issued it in
+    /// this serial. When the SDK sent it again (on a reconnect, or after a
+    /// kept `CLOSED`), the second the adapter recorded this EOSE, since when
+    /// the SDK sent it is not reliably known. A provisional tail never starts
+    /// earlier.
+    pub live_from: u64,
+}
+
+/// A generation's count that ended while its boundary was admitted: the relay
+/// closed the REQ, or the connection dropped.
+#[derive(Clone, Copy)]
+pub struct ReplayEndedCount {
+    pub generation: ReplaySourceGeneration,
+    pub count: ReplayLiveCount,
+}
+
 /// A live REQ's original query and its currently issued endpoint facts.
 #[derive(Clone, Copy)]
 pub struct ReplayRequestView<'a> {
@@ -169,11 +230,50 @@ impl ReplayEndpointView<'_> {
 
     /// This endpoint admitted its complete original range in the current epoch.
     pub fn admitted(&self) -> bool {
+        self.state_endpoint()
+            .is_some_and(|endpoint| endpoint.boundary_admitted)
+    }
+
+    /// The source's current generation on this endpoint.
+    pub fn generation(&self) -> ReplaySourceGeneration {
+        ReplaySourceGeneration(self.state_endpoint().map_or(0, |endpoint| endpoint.serial))
+    }
+
+    /// What the current generation's EOSE counted, once it arrived and until
+    /// the adapter sees the REQ close or its connection drop. Not admission:
+    /// read [`Self::admitted`]; not liveness: read [`Self::streaming`].
+    pub fn live_count(&self) -> Option<ReplayLiveCount> {
+        self.state_endpoint()
+            .and_then(|endpoint| endpoint.live_count)
+    }
+
+    /// The relay client reports, now, this relay connected on the connection
+    /// the current generation started on. That is the only evidence its REQ
+    /// still streams: a notification that it stopped can arrive late, or not
+    /// at all (a shutdown, a removed account context, a reconnect the
+    /// adapter has not seen yet). It names a connection, not the REQ: it can
+    /// stay true until the adapter processes a `CLOSED` or a boundary already
+    /// queued for this relay, a delay recovery accepts.
+    pub fn streaming(&self) -> bool {
+        self.state_endpoint()
+            .and_then(|endpoint| endpoint.connection)
+            .is_some_and(|connection| {
+                self.state.relay_connection(self.account, self.relay) == Some(connection)
+            })
+    }
+
+    /// The last generation that ended after its boundary was admitted, until
+    /// the next one does.
+    pub fn ended_count(&self) -> Option<ReplayEndedCount> {
+        self.state_endpoint()
+            .and_then(|endpoint| endpoint.ended_count)
+    }
+
+    fn state_endpoint(&self) -> Option<&ReplayEndpoint> {
         self.coverage
             .endpoint_deadlines
             .get(self.id)
             .and_then(|relays| relays.get(&self.relay))
-            .is_some_and(|endpoint| endpoint.boundary_admitted)
     }
 
     /// Freeze this source, not an arbitrary account/endpoint/window request.

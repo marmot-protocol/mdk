@@ -31,6 +31,10 @@ E11|crates/cgka-engine/src/message_processor/mod.rs|FOREGROUND_DEFERRED_PEEL_BUD
 E12|crates/cgka-engine/src/message_processor/mod.rs|MAX_FOREGROUND_DEFERRED_ROWS
 E13|crates/cgka-engine/src/message_processor/mod.rs|BACKGROUND_CONVERGENCE_BUDGET_MS
 E13|crates/cgka-engine/src/message_processor/mod.rs|BACKGROUND_CONVERGENCE_REPLAY_PROBES_PER_SLICE
+# E14 backs off and parks a frozen batch whose attempts keep failing (mdk#2684).
+E14|crates/cgka-engine/src/distributed_convergence.rs|CONVERGENCE_PASS_RETRY_BASE_MS
+E14|crates/cgka-engine/src/distributed_convergence.rs|CONVERGENCE_PASS_RETRY_MAX_MS
+E14|crates/cgka-engine/src/distributed_convergence.rs|CONVERGENCE_PASS_PARK_AFTER_FAILURES
 A1|crates/marmot-app/src/runtime/account_worker.rs|CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS
 A2|crates/marmot-app/src/runtime/account_worker.rs|MIN_CONVERGENCE_SETTLEMENT_DELAY
 A3|crates/marmot-app/src/runtime/account_worker.rs|CONVERGENCE_RETRY_BASE_DELAY

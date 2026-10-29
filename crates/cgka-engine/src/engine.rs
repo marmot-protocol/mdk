@@ -3662,7 +3662,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &mut self,
         welcome_msg: TransportMessage,
     ) -> Result<GroupId, EngineError> {
-        self.do_join_welcome(welcome_msg).await
+        self.do_join_welcome(welcome_msg, None).await
     }
 
     fn feature_status(

@@ -126,7 +126,13 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     candidate generation rather than once per bounded slice. A failed canonical apply rolls back inside a caller
     transaction that still commits, without a full pre-apply snapshot (mdk#2326). A reorg onto a legacy full anchor
     keeps live rows, queued intents and pending app output on SQLite and on the generic rewind, including when a
-    write fails part way through the generic one (mdk#2330)
+    write fails part way through the generic one (mdk#2330). `record_write_atomicity/convergence_pass_retry.rs`: a
+    frozen batch whose apply keeps failing backs off and parks after its budget, reopens on a commit or a
+    current-epoch proposal it does not hold, including one a direct-path peel rewrote into an older row, but not on
+    application traffic or input beyond its horizon, reseeds nothing on loads with no new input, takes one explicit
+    retry (none for a quarantined group, whose park reads as none), and keeps its count, delay and park across a
+    restart; with `test-conformance-snapshot`, structural progress reports the backoff as a wake, the park as idle,
+    a due SelfRemove auto-commit behind either as waiting, and new input as runnable (mdk#2684)
 
 - **File:** `apply_history_cost.rs`
   - **Owns:** Ignored regression benchmark for canonical-apply cost against stored message history (mdk#2326). Run in

@@ -259,6 +259,9 @@ pub enum OpenMlsContentFilter {
     WithoutProcessedApplications,
     /// Only applications whose epoch is this one.
     ApplicationsAt(EpochId),
+    /// Only commits and proposals whose epoch is from `from` through
+    /// `through`, the selection input inside a convergence pass's horizon.
+    CommitsAndProposalsBetween { from: EpochId, through: EpochId },
 }
 
 /// Messages + epoch-scoped snapshot/rollback hooks.
@@ -336,9 +339,10 @@ pub trait MessageStorage {
     /// The filter only narrows what is read: a backend may return rows it
     /// excludes, and the default returns every row, so callers classify each
     /// returned row themselves. It must not leave out any other row.
-    /// Convergence pass seeding, the send gate, and the deferred-peel commit
-    /// fingerprint list through this, so a backend that classifies rows does
-    /// not hand them the group's whole delivered history.
+    /// Convergence pass seeding, the send gate, the deferred-peel commit
+    /// fingerprint and a failed batch's check for new selection input list
+    /// through this, so a backend that classifies rows does not hand them the
+    /// group's whole delivered history.
     fn list_openmls_messages_in_states(
         &self,
         group_id: &GroupId,

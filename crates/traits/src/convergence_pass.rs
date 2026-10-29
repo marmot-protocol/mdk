@@ -55,6 +55,62 @@ pub struct ConvergencePassMember {
     pub source_epoch: u64,
 }
 
+/// The step at which an attempt to resolve a frozen pass failed (mdk#2684).
+///
+/// Aggregate only: it names where the attempt stopped, never what it read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConvergencePassStep {
+    /// Searching the frozen batch's candidate branches.
+    Select,
+    /// Recording the halt for missing retained state.
+    Halt,
+    /// Completing a pass that selection reported blocked.
+    CompleteBlocked,
+    /// Reading what the apply needs before it starts.
+    PrepareApply,
+    /// The atomic apply of the selected result.
+    Apply,
+}
+
+impl ConvergencePassStep {
+    /// Stable low-cardinality label for tracing and audit records.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Select => "select",
+            Self::Halt => "halt",
+            Self::CompleteBlocked => "complete_blocked",
+            Self::PrepareApply => "prepare_apply",
+            Self::Apply => "apply",
+        }
+    }
+}
+
+/// Consecutive failed attempts to resolve one frozen batch (mdk#2684).
+///
+/// A failed attempt leaves its pass unresolved, so without this record every
+/// later advance replays the batch from scratch. The pass backs off between
+/// attempts and parks once its failure budget is spent; it stays parked across
+/// restarts until new selection input reopens it or the host asks for a retry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvergencePassRetry {
+    pub failed_attempts: u32,
+    pub failed_step: ConvergencePassStep,
+    /// The next attempt may start at this process-local instant.
+    pub next_attempt_monotonic_ms: u64,
+    /// The same instant on the wall clock, which rebases it after a restart.
+    pub next_attempt_wall_ms: u64,
+    /// When the failure budget ran out. A parked pass makes no attempt on its
+    /// own.
+    pub parked_at_wall_ms: Option<u64>,
+}
+
+impl ConvergencePassRetry {
+    pub const fn is_parked(&self) -> bool {
+        self.parked_at_wall_ms.is_some()
+    }
+}
+
 /// Durable per-group convergence-pass state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableConvergencePass {
@@ -78,11 +134,23 @@ pub struct DurableConvergencePass {
     /// fairness edge.
     #[serde(default)]
     pub fairness_slot_available: bool,
+    /// Failed attempts of this frozen batch; `None` until one fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<ConvergencePassRetry>,
 }
 
 impl DurableConvergencePass {
     pub const fn is_active(&self) -> bool {
         self.phase.is_active()
+    }
+
+    /// An active pass whose failure budget ran out.
+    pub fn is_parked(&self) -> bool {
+        self.is_active()
+            && self
+                .retry
+                .as_ref()
+                .is_some_and(ConvergencePassRetry::is_parked)
     }
 
     pub fn cutoff_monotonic_ms(&self) -> u64 {

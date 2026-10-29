@@ -53,6 +53,11 @@
   loses a fork to one that also changes that device's entry is not made
   again.
 
+- `AppGroupMlsStateFfi.convergence_parked` (default `false`) reports a group
+  whose convergence pass spent its failure budget (mdk#2684). Show it as stuck
+  syncing; `retry_group_convergence` grants one more attempt. Regenerate
+  bindings with the matching native library.
+
 - `linked_devices(account_ref)` returns this account's own devices as
   `LinkedDeviceFfi` records, from the roster of the device group this device
   trusts, this device first (mdk#2628 item 3.1). Re-read it on

@@ -117,8 +117,8 @@ pub use telemetry::{
 const DELIVERY_BUFFER: usize = 1024;
 
 pub use replay_admission::{
-    ReplayCaptureOutcome, ReplayCapturePlan, ReplayCaptureToken, ReplayEndpointView,
-    ReplayRequestView,
+    RelayConnection, ReplayCaptureOutcome, ReplayCapturePlan, ReplayCaptureToken, ReplayEndedCount,
+    ReplayEndpointView, ReplayLiveCount, ReplayRequestView, ReplaySourceGeneration,
 };
 pub use replay_ingress::{ReplayBatch, ReplayBatchTake, ReplayIngress};
 
@@ -836,6 +836,20 @@ impl NostrSubscribeReport {
 /// Boundary between this adapter and the actual Nostr relay implementation.
 #[async_trait]
 pub trait NostrRelayClient: Send + Sync {
+    /// The connection `account`'s REQs to `endpoint` are open on now, read
+    /// from the client's own state, not its notifications: none when the
+    /// relay is not connected, the account has no context here, or the client
+    /// has shut down. A live count's provisional tail stands only while this
+    /// names the connection its serial started on, so an implementation must
+    /// err toward none, and never name a connection that is not open now.
+    fn relay_connection(
+        &self,
+        _account: &MemberId,
+        _endpoint: &TransportEndpoint,
+    ) -> Option<RelayConnection> {
+        None
+    }
+
     /// Optional bounded, request-scoped history operation. Implementations must
     /// validate the complete owned request before issuing any network work and
     /// return one terminal outcome for every requested endpoint. Cancellation
@@ -1154,7 +1168,10 @@ pub struct NostrTransportAdapter {
 impl NostrTransportAdapter {
     pub fn new(relay_client: Arc<dyn NostrRelayClient>) -> Self {
         let (delivery_tx, delivery_rx) = mpsc::channel(DELIVERY_BUFFER);
-        let state = AdapterState::default();
+        let state = AdapterState {
+            relay_client: Some(relay_client.clone()),
+            ..AdapterState::default()
+        };
         let replay_losses = state.replay_losses.clone();
         Self {
             relay_client,
@@ -1666,6 +1683,21 @@ impl NostrTransportAdapter {
         epoch: [u64; 2],
         reason: ReplayRestart,
     ) -> bool {
+        self.observe_replay_boundary(account, endpoint, epoch, reason, None)
+            .await
+    }
+
+    /// [`Self::observe_replay_epoch`] for a connection boundary that carries
+    /// `connected_at`: a wall-clock second no later than any REQ sent on that
+    /// connection, which every REQ the boundary restarts takes.
+    pub async fn observe_replay_boundary(
+        &self,
+        account: Option<&MemberId>,
+        endpoint: &TransportEndpoint,
+        epoch: [u64; 2],
+        reason: ReplayRestart,
+        connected_at: Option<u64>,
+    ) -> bool {
         {
             let mut state = self.state.write().await;
             let relay = state.relay_index.index_for(endpoint);
@@ -1687,10 +1719,19 @@ impl NostrTransportAdapter {
             } else {
                 ReplayRestart::Connection
             };
-            for (account_id, coverage) in &mut state.account_replay_coverage {
-                if account.is_some_and(|account| account != account_id) {
+            let connections = state
+                .account_replay_coverage
+                .keys()
+                .filter(|account_id| account.is_none_or(|account| account == *account_id))
+                .map(|account_id| {
+                    let connection = self.relay_client.relay_connection(account_id, endpoint);
+                    (account_id.clone(), connection)
+                })
+                .collect::<HashMap<_, _>>();
+            for (account_id, connection) in connections {
+                let Some(coverage) = state.account_replay_coverage.get_mut(&account_id) else {
                     continue;
-                }
+                };
                 coverage.restart_relay(
                     relay,
                     restart,
@@ -1699,10 +1740,37 @@ impl NostrTransportAdapter {
                     } else {
                         ReplayOrigin::Changed
                     },
+                    connected_at,
+                    connection,
                 );
             }
         }
         true
+    }
+
+    /// The relay's connection `epoch` dropped: no live REQ on it streams
+    /// until the next connection, so every live count there ends. A
+    /// disconnect of a connection already replaced changes nothing.
+    pub async fn observe_replay_disconnect(
+        &self,
+        account: Option<&MemberId>,
+        endpoint: &TransportEndpoint,
+        epoch: [u64; 2],
+    ) {
+        let mut state = self.state.write().await;
+        let relay = state.relay_index.index_for(endpoint);
+        if state
+            .replay_epochs
+            .get(&(account.cloned(), relay))
+            .is_some_and(|current| *current > epoch)
+        {
+            return;
+        }
+        for (account_id, coverage) in &mut state.account_replay_coverage {
+            if account.is_none_or(|account| account == account_id) {
+                coverage.end_relay_live_counts(relay);
+            }
+        }
     }
 
     /// The id of the live batch REQ carrying the account's group route
@@ -3767,7 +3835,106 @@ struct ReplayEndpoint {
     /// source still awaited the owner. Only a finished capture clears it;
     /// any other way the source is readmitted or retired records it.
     loss_debt: Option<u64>,
+    /// A local wall-clock second no later than any query the relay can run
+    /// for this REQ in the current serial (see
+    /// [`ReplayLiveCount::requested_at`]).
+    requested_at: u64,
+    /// What this serial's physical EOSE counted, until the serial ends or the
+    /// relay closes the REQ.
+    live_count: Option<ReplayLiveCount>,
+    /// The relay closed the REQ or its connection dropped in this serial: an
+    /// EOSE still in flight is not live, so it installs no count.
+    stopped: bool,
+    /// After this serial's EOSE the relay closed the REQ, and the SDK keeps
+    /// it to send again (AUTH, a rate limit): what the restored reply counts
+    /// before its own EOSE, which installs a fresh count.
+    recount: Option<StoredReplay>,
+    /// The SDK, not the adapter, sent the REQ this serial's next EOSE
+    /// answers: on a reconnect, or again after a kept `CLOSED`. When it did is
+    /// not reliably known, so that count streams only from its EOSE
+    /// ([`ReplayLiveCount::live_from`]).
+    sent_again: bool,
+    /// The connection the relay client reported open when the adapter issued
+    /// the REQ or saw the connection that restarted it; none when it reported
+    /// none. The REQ streams only while the client still reports this one
+    /// ([`ReplayEndpointView::streaming`]). Receiver loss and captures keep
+    /// it: a reconnect they hid shows as a different connection.
+    connection: Option<RelayConnection>,
+    /// The last count that ended while its boundary was admitted, until the
+    /// next one does.
+    ended_count: Option<ReplayEndedCount>,
     cancellation: NostrAcquisitionCancellation,
+}
+
+impl ReplayEndpoint {
+    /// The relay closed the REQ or the connection dropped: this serial's
+    /// count stops streaming. A count whose boundary was admitted is kept as
+    /// ended; nothing it counted carries into the next serial.
+    fn end_live_count(&mut self) {
+        self.stopped = true;
+        self.recount = None;
+        self.take_live_count();
+    }
+
+    /// The relay closed the REQ, but the SDK keeps it and sends it again:
+    /// the count stops as [`Self::end_live_count`] stops it, and the restored
+    /// reply's EOSE counts afresh in this serial. While the relay still
+    /// awaits its EOSE, its own counting does that; past it, `after_eose`
+    /// starts a recount.
+    fn hold_live_count(&mut self, after_eose: bool) {
+        self.take_live_count();
+        if !self.stopped {
+            self.sent_again = true;
+            if after_eose {
+                self.recount = Some(StoredReplay::default());
+            }
+        }
+    }
+
+    /// What this serial's EOSE counted in `stored`, as a live count.
+    fn eose_count(&self, stored: StoredReplay) -> ReplayLiveCount {
+        ReplayLiveCount {
+            events: stored.events,
+            oldest: stored.oldest,
+            requested_at: self.requested_at,
+            live_from: if self.sent_again {
+                self.requested_at.max(unix_now_seconds())
+            } else {
+                self.requested_at
+            },
+        }
+    }
+
+    fn take_live_count(&mut self) {
+        if let Some(count) = self.live_count.take()
+            && self.boundary_admitted
+        {
+            self.ended_count = Some(ReplayEndedCount {
+                generation: ReplaySourceGeneration(self.serial),
+                count,
+            });
+        }
+    }
+
+    /// The source leaves its admitted boundary through loss, a failed or cut
+    /// capture, or a restart: its count proves nothing past here. A reconnect
+    /// whose disconnect the transport reported has already ended the count;
+    /// one it did not report keeps none.
+    fn drop_boundary(&mut self) {
+        self.live_count = None;
+        self.boundary_admitted = false;
+    }
+}
+
+impl AccountReplayCoverage {
+    /// `relay`'s connection dropped under every live REQ issued there.
+    fn end_relay_live_counts(&mut self, relay: RelayIndex) {
+        for relays in self.endpoint_deadlines.values_mut() {
+            if let Some(endpoint) = relays.get_mut(&relay) {
+                endpoint.end_live_count();
+            }
+        }
+    }
 }
 
 impl Drop for ReplayEndpoint {
@@ -4301,11 +4468,14 @@ impl AccountReplayCoverage {
         }
     }
 
+    /// `connections` holds the connection the relay client reports open to
+    /// each relay now, before the REQ goes out.
     fn add_subscription(
         &mut self,
         id: String,
         subscription: &NostrSubscription,
         relays: HashMap<RelayIndex, RelayReplay>,
+        connections: &HashMap<RelayIndex, RelayConnection>,
     ) {
         // Registration is idempotent; a real retry has a fresh REQ id.
         if self.subscriptions.contains_key(&id) {
@@ -4342,6 +4512,9 @@ impl AccountReplayCoverage {
             self.windows.insert(id.clone(), window);
         }
         let deadline = tokio::time::Instant::now() + REPLAY_PAGE_LIMITS.max_duration;
+        // Coverage is added before the REQ goes out, so any query that
+        // answers it runs after this.
+        let requested_at = unix_now_seconds();
         self.source_serial += 1;
         let serial = self.source_serial;
         let request: Arc<str> = Arc::from(id.as_str());
@@ -4402,6 +4575,13 @@ impl AccountReplayCoverage {
                             queued: None,
                             owner_capture: false,
                             loss_debt: None,
+                            requested_at,
+                            live_count: None,
+                            stopped: false,
+                            recount: None,
+                            sent_again: false,
+                            connection: connections.get(relay).copied(),
+                            ended_count: None,
                             cancellation: self.cancellation.child_token(),
                         },
                     )
@@ -5009,7 +5189,16 @@ impl AccountReplayCoverage {
         }
     }
 
-    fn restart_relay(&mut self, relay: RelayIndex, restart: ReplayRestart, origin: ReplayOrigin) {
+    /// `connection` is the one the relay client reports open now: every REQ
+    /// a connection boundary restarts streams only while it stays open.
+    fn restart_relay(
+        &mut self,
+        relay: RelayIndex,
+        restart: ReplayRestart,
+        origin: ReplayOrigin,
+        connected_at: Option<u64>,
+        connection: Option<RelayConnection>,
+    ) {
         let requests = self
             .subscriptions
             .iter()
@@ -5046,8 +5235,20 @@ impl AccountReplayCoverage {
                         .get(&request)
                         .and_then(|relays| relays.get(&relay))
                         .is_some_and(|endpoint| endpoint.capturing);
-                    if origin == ReplayOrigin::Changed || (!complete && !capturing) {
-                        self.restart_request(&request, relay, ReplayStart::Connection);
+                    if (origin == ReplayOrigin::Changed || (!complete && !capturing))
+                        && self
+                            .restart_request(&request, relay, ReplayStart::Connection)
+                            .is_some()
+                        && let Some(endpoint) = self
+                            .endpoint_deadlines
+                            .get_mut(&request)
+                            .and_then(|relays| relays.get_mut(&relay))
+                    {
+                        if let Some(connected_at) = connected_at {
+                            // Both bound every query on this connection from below.
+                            endpoint.requested_at = endpoint.requested_at.max(connected_at);
+                        }
+                        endpoint.connection = connection;
                     }
                 }
             }
@@ -5112,7 +5313,7 @@ impl AccountReplayCoverage {
             endpoint.queued = None;
             endpoint.capturing = false;
             endpoint.owner_capture = false;
-            endpoint.boundary_admitted = false;
+            endpoint.drop_boundary();
             endpoint.deadline = None;
         }
         for replay in self
@@ -5262,11 +5463,14 @@ impl AccountReplayCoverage {
             );
         }
         let endpoint = self.endpoint_deadlines.get_mut(id)?.get_mut(&relay)?;
+        endpoint.drop_boundary();
+        endpoint.stopped = false;
+        endpoint.recount = None;
+        endpoint.sent_again = true;
         endpoint.deadline = (restart == ReplayStart::Connection).then_some(deadline);
         endpoint.serial = serial;
         endpoint.capturing = restart != ReplayStart::Connection;
         endpoint.owner_capture = restart == ReplayStart::Capture;
-        endpoint.boundary_admitted = false;
         endpoint.queued = None;
         endpoint.cancellation.cancel();
         endpoint.cancellation = self.cancellation.child_token();
@@ -5309,20 +5513,27 @@ impl AccountReplayCoverage {
 
     fn record_stored_event(&mut self, id: &str, relay: RelayIndex, created_at: u64) {
         self.expire_replay(tokio::time::Instant::now());
-        if self
+        let stored = if self
             .subscriptions
             .get(id)
             .and_then(|relays| relays.get(&relay))
-            != Some(&RelayReplay::Awaiting)
+            == Some(&RelayReplay::Awaiting)
         {
+            self.stored
+                .entry(id.to_owned())
+                .or_default()
+                .entry(relay)
+                .or_default()
+        } else if let Some(recount) = self
+            .endpoint_deadlines
+            .get_mut(id)
+            .and_then(|relays| relays.get_mut(&relay))
+            .and_then(|endpoint| endpoint.recount.as_mut())
+        {
+            recount
+        } else {
             return;
-        }
-        let stored = self
-            .stored
-            .entry(id.to_owned())
-            .or_default()
-            .entry(relay)
-            .or_default();
+        };
         stored.events += 1;
         stored.oldest = Some(
             stored
@@ -5379,8 +5590,26 @@ impl AccountReplayCoverage {
         }
         let replay = self.replay_mut(id, relay)?;
         if *replay != RelayReplay::Awaiting {
+            // A REQ the SDK sent again after a kept `CLOSED` counts afresh.
+            if let Some(endpoint) = self
+                .endpoint_deadlines
+                .get_mut(id)
+                .and_then(|relays| relays.get_mut(&relay))
+                && let Some(recount) = endpoint.recount.take()
+            {
+                endpoint.live_count = Some(endpoint.eose_count(recount));
+            }
             return None;
         }
+        if let Some(endpoint) = self
+            .endpoint_deadlines
+            .get_mut(id)
+            .and_then(|relays| relays.get_mut(&relay))
+            .filter(|endpoint| !endpoint.stopped)
+        {
+            endpoint.live_count = Some(endpoint.eose_count(stored));
+        }
+        let replay = self.replay_mut(id, relay)?;
         if stored.events >= RELAY_REPLAY_PAGE_LIMIT
             && let Some(oldest) = stored.oldest
         {
@@ -5494,7 +5723,7 @@ impl AccountReplayCoverage {
             .and_then(|relays| relays.get_mut(&relay))
         {
             endpoint.capturing = false;
-            endpoint.boundary_admitted = false;
+            endpoint.drop_boundary();
             endpoint.queued = None;
             endpoint.cancellation.cancel();
             endpoint.deadline = None;
@@ -5542,6 +5771,38 @@ impl AccountReplayCoverage {
             .get(id)
             .and_then(|relays| relays.get(&relay))
             .is_some_and(|stored| stored.ended);
+        // Past `Awaiting`, the restored reply's stored events no longer count
+        // through `stored`.
+        let after_eose = self
+            .subscriptions
+            .get(id)
+            .and_then(|relays| relays.get(&relay))
+            .is_some_and(|replay| *replay != RelayReplay::Awaiting);
+        // The REQ no longer streams live on this relay, even after EOSE,
+        // until the SDK sends a kept one again.
+        if let Some(endpoint) = self
+            .endpoint_deadlines
+            .get_mut(id)
+            .and_then(|relays| relays.get_mut(&relay))
+        {
+            if disposition == SubscriptionRefusalDisposition::Pending {
+                endpoint.hold_live_count(after_eose);
+            } else {
+                endpoint.end_live_count();
+            }
+        }
+        // The restored reply counts alone: what the closed one sent says
+        // nothing of the time it was closed.
+        if disposition == SubscriptionRefusalDisposition::Pending
+            && !after_eose
+            && let Some(stored) = self
+                .stored
+                .get_mut(id)
+                .and_then(|relays| relays.get_mut(&relay))
+        {
+            stored.events = 0;
+            stored.oldest = None;
+        }
         let Some(replay) = self.replay_mut(id, relay) else {
             return;
         };
@@ -5981,6 +6242,9 @@ struct GroupRouteEntry {
 
 #[derive(Default)]
 struct AdapterState {
+    /// Read for each live REQ's current connection (see
+    /// [`NostrRelayClient::relay_connection`]); none only in a bare state.
+    relay_client: Option<Arc<dyn NostrRelayClient>>,
     accounts: HashMap<MemberId, AccountRoutes>,
     /// Endpoint-level EOSE proof for the route snapshot issued by the most
     /// recent activation of each account. This is intentionally independent of
@@ -6031,6 +6295,12 @@ struct AdapterState {
 }
 
 impl AdapterState {
+    /// The connection `account`'s REQs to `relay` are open on now.
+    fn relay_connection(&self, account: &MemberId, relay: RelayIndex) -> Option<RelayConnection> {
+        let client = self.relay_client.as_ref()?;
+        client.relay_connection(account, self.relay_index.resolve(relay)?)
+    }
+
     /// Rebuild the derived `by_transport_group` index from the authoritative
     /// `accounts` routing state. Called after every mutation so the index cannot
     /// drift from signed ordinary and temporary maintenance routes (#698/#752).
@@ -6230,9 +6500,13 @@ impl AdapterState {
             .endpoints()
             .iter()
             .map(|endpoint| (self.relay_index.index_for(endpoint), RelayReplay::Awaiting))
+            .collect::<HashMap<_, _>>();
+        let connections = relays
+            .keys()
+            .filter_map(|relay| Some((*relay, self.relay_connection(account_id, *relay)?)))
             .collect();
         if let Some(coverage) = self.account_replay_coverage.get_mut(account_id) {
-            coverage.add_subscription(id, subscription, relays);
+            coverage.add_subscription(id, subscription, relays, &connections);
         }
     }
 
@@ -7429,6 +7703,15 @@ mod batch_tests {
     }
 
     fn replay_coverage(routes: usize) -> (AccountReplayCoverage, String, Arc<ReplayLosses>) {
+        replay_coverage_on(routes, &HashMap::new())
+    }
+
+    /// [`replay_coverage`] issued while the relay client reported
+    /// `connections` open.
+    fn replay_coverage_on(
+        routes: usize,
+        connections: &HashMap<RelayIndex, RelayConnection>,
+    ) -> (AccountReplayCoverage, String, Arc<ReplayLosses>) {
         let account = MemberId::new(vec![0xA1; 32]);
         let routes = (0..routes as u8)
             .map(|index| route(index, "wss://a.example", Some(100)))
@@ -7445,6 +7728,7 @@ mod batch_tests {
                 (RelayIndex(1), RelayReplay::Awaiting),
                 (RelayIndex(2), RelayReplay::Awaiting),
             ]),
+            connections,
         );
         (coverage, id, losses)
     }
@@ -7491,6 +7775,7 @@ mod batch_tests {
                     (RelayIndex(1), RelayReplay::Awaiting),
                     (RelayIndex(2), RelayReplay::Awaiting),
                 ]),
+                &HashMap::new(),
             );
             coverage.remove_subscription(&previous);
             let group = coverage.groups.values().next().unwrap();
@@ -7583,6 +7868,407 @@ mod batch_tests {
         coverage.ack_placement(&MessageId::new(vec![7; 32]));
         coverage.restart_request(&id, RelayIndex(1), ReplayStart::Gap);
         assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
+    }
+
+    /// A physical EOSE keeps what its relay counted for the whole filter,
+    /// with the stamp taken before the REQ went out. The connection dropping
+    /// ends that count; receiver loss ends a count with nothing kept, and so
+    /// does a reconnect with no disconnect seen. The REQ the SDK sends again
+    /// on reconnecting streams only from its own EOSE.
+    #[tokio::test]
+    async fn live_count_lasts_one_generation() {
+        let before = unix_now_seconds();
+        let (mut coverage, id, _) = replay_coverage(2);
+        let requested_at = coverage.endpoint_deadlines[&id][&RelayIndex(1)].requested_at;
+        assert!((before..=unix_now_seconds()).contains(&requested_at));
+        for created_at in [150, 120, 130] {
+            coverage.record_stored_event(&id, RelayIndex(1), created_at);
+        }
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        let count = ReplayLiveCount {
+            events: 3,
+            oldest: Some(120),
+            requested_at,
+            live_from: requested_at,
+        };
+        let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
+        assert!(endpoint.boundary_admitted);
+        assert_eq!(endpoint.live_count, Some(count));
+        let first = ReplaySourceGeneration(endpoint.serial);
+        assert!(
+            coverage.endpoint_deadlines[&id][&RelayIndex(2)]
+                .live_count
+                .is_none(),
+            "a relay counts only once its own EOSE arrives"
+        );
+
+        coverage.end_relay_live_counts(RelayIndex(1));
+        coverage.restart_request(&id, RelayIndex(1), ReplayStart::Connection);
+        let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
+        assert!(endpoint.live_count.is_none());
+        let ended = endpoint.ended_count.expect("the admitted count ended");
+        assert!(ended.generation == first);
+        assert_eq!(ended.count, count);
+        assert!(ReplaySourceGeneration(endpoint.serial) != first);
+
+        // The reconnect's own EOSE counts afresh; receiver loss then ends it
+        // without keeping it, and the earlier ended count stays.
+        let eose = unix_now_seconds();
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        let resent = coverage.endpoint_deadlines[&id][&RelayIndex(1)]
+            .live_count
+            .expect("the resent REQ's EOSE counts");
+        assert_eq!(
+            (resent.events, resent.oldest, resent.requested_at),
+            (0, None, requested_at)
+        );
+        assert!((eose..=unix_now_seconds()).contains(&resent.live_from));
+        coverage.restart_request(&id, RelayIndex(1), ReplayStart::Gap);
+        let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
+        assert!(endpoint.live_count.is_none());
+        assert!(endpoint.ended_count.expect("kept").generation == first);
+
+        // A reconnect the transport reported no disconnect for keeps no
+        // count from the old connection.
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.restart_request(&id, RelayIndex(1), ReplayStart::Connection);
+        let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
+        assert!(endpoint.live_count.is_none());
+        assert!(endpoint.ended_count.expect("kept").generation == first);
+    }
+
+    /// A connection boundary's stamp bounds every REQ the boundary restarts
+    /// from below, so their next counts carry it; one without a stamp keeps
+    /// the earlier one, which bounds every later send too, and a stamp older
+    /// than the one held never moves it back. Whatever the stamp, a REQ the
+    /// SDK sent again streams only from its EOSE: a stale or missing stamp
+    /// never lets its tail cover the time the REQ was down.
+    #[tokio::test]
+    async fn a_reconnect_carries_its_connection_stamp() {
+        let (mut coverage, id, _) = replay_coverage(1);
+        let issued = coverage.endpoint_deadlines[&id][&RelayIndex(1)].requested_at;
+        let requested_at = |coverage: &AccountReplayCoverage| {
+            coverage.endpoint_deadlines[&id][&RelayIndex(1)].requested_at
+        };
+        coverage.restart_relay(
+            RelayIndex(1),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+            Some(issued + 600),
+            None,
+        );
+        assert_eq!(requested_at(&coverage), issued + 600);
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        assert_eq!(
+            coverage.endpoint_deadlines[&id][&RelayIndex(1)]
+                .live_count
+                .map(|count| count.requested_at),
+            Some(issued + 600)
+        );
+        coverage.restart_relay(
+            RelayIndex(1),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+            None,
+            None,
+        );
+        assert_eq!(requested_at(&coverage), issued + 600);
+        coverage.restart_relay(
+            RelayIndex(1),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+            Some(issued),
+            None,
+        );
+        assert_eq!(requested_at(&coverage), issued + 600);
+
+        // The pool can report the previous connection's time, or none, for
+        // a resend: the count keeps the stale stamp as its proof's end, but
+        // its tail starts at this EOSE.
+        let (mut coverage, id, _) = replay_coverage(1);
+        let issued = coverage.endpoint_deadlines[&id][&RelayIndex(1)].requested_at;
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.end_relay_live_counts(RelayIndex(1));
+        coverage.restart_relay(
+            RelayIndex(1),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+            Some(issued - 600),
+            None,
+        );
+        let eose = unix_now_seconds();
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        let count = coverage.endpoint_deadlines[&id][&RelayIndex(1)]
+            .live_count
+            .expect("the resend counts");
+        assert_eq!(count.requested_at, issued);
+        assert!((eose..=unix_now_seconds()).contains(&count.live_from));
+    }
+
+    /// A count streams only while the relay client reports, when asked, the
+    /// connection its serial started on. Another connection, or none, ends
+    /// that with no notification at all; the next serial a reconnect starts
+    /// streams on the connection open then. A relay the client reported no
+    /// connection to when the REQ was issued never streams in that serial.
+    #[tokio::test]
+    async fn a_count_streams_only_on_the_connection_its_serial_started_on() {
+        let relay = TransportEndpoint("wss://a.example".to_owned());
+        let first = RelayConnection::new(7, 1);
+        let client = Arc::new(ConnectionRelayClient::default());
+        client.reports(Some(first));
+        let adapter = NostrTransportAdapter::new(client.clone());
+        let account = MemberId::new(vec![0xA1; 32]);
+        let (mut coverage, id, _) = replay_coverage_on(1, &HashMap::from([(RelayIndex(1), first)]));
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(2), 0);
+        {
+            let mut state = adapter.state.write().await;
+            for (index, url) in
+                (0..).zip(["wss://other.example", "wss://a.example", "wss://b.example"])
+            {
+                let endpoint = TransportEndpoint(url.to_owned());
+                assert_eq!(state.relay_index.index_for(&endpoint), RelayIndex(index));
+            }
+            state
+                .account_replay_coverage
+                .insert(account.clone(), coverage);
+        }
+        // Per relay: whether it holds a live count, and whether it streams.
+        let streams = || async {
+            let status = adapter.take_replay_status(&account).await;
+            let source = status.sources().next().expect("one live REQ");
+            source
+                .endpoints()
+                .map(|endpoint| (endpoint.live_count().is_some(), endpoint.streaming()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(streams().await, [(true, true), (true, false)]);
+
+        client.reports(Some(RelayConnection::new(7, 2)));
+        assert_eq!(
+            streams().await,
+            [(true, false), (true, false)],
+            "a reconnect the adapter has not seen"
+        );
+
+        for epoch in [[1, 1], [1, 2]] {
+            assert!(
+                adapter
+                    .observe_replay_epoch(Some(&account), &relay, epoch, ReplayRestart::Connection)
+                    .await
+            );
+        }
+        adapter
+            .state
+            .write()
+            .await
+            .account_replay_coverage
+            .get_mut(&account)
+            .expect("installed")
+            .record_eose(&id, RelayIndex(1), 0);
+        assert_eq!(streams().await, [(true, true), (true, false)]);
+
+        client.reports(None);
+        assert_eq!(streams().await, [(true, false), (true, false)]);
+    }
+
+    /// A disconnect ends the relay's live counts, and a disconnect of a
+    /// connection already replaced changes nothing.
+    #[tokio::test]
+    async fn a_disconnect_ends_the_live_count() {
+        let relay = TransportEndpoint("wss://a.example".to_owned());
+        let adapter = NostrTransportAdapter::new(Arc::new(OwingRelayClient {
+            owing: TransportEndpoint("wss://elsewhere.example".to_owned()),
+        }));
+        let account = MemberId::new(vec![0xA1; 32]);
+        let (mut coverage, id, _) = replay_coverage(1);
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        let first = ReplaySourceGeneration(coverage.endpoint_deadlines[&id][&RelayIndex(1)].serial);
+        {
+            let mut state = adapter.state.write().await;
+            let other = TransportEndpoint("wss://other.example".to_owned());
+            assert_eq!(state.relay_index.index_for(&other), RelayIndex(0));
+            assert_eq!(state.relay_index.index_for(&relay), RelayIndex(1));
+            state
+                .account_replay_coverage
+                .insert(account.clone(), coverage);
+        }
+        let endpoint = || async {
+            let state = adapter.state.read().await;
+            let endpoint =
+                &state.account_replay_coverage[&account].endpoint_deadlines[&id][&RelayIndex(1)];
+            (endpoint.live_count, endpoint.ended_count)
+        };
+        assert!(
+            adapter
+                .observe_replay_epoch(Some(&account), &relay, [1, 2], ReplayRestart::Connection)
+                .await
+        );
+
+        adapter
+            .observe_replay_disconnect(Some(&account), &relay, [1, 1])
+            .await;
+        let (live, ended) = endpoint().await;
+        assert!(live.is_some() && ended.is_none(), "a replaced connection");
+
+        adapter
+            .observe_replay_disconnect(Some(&account), &relay, [1, 2])
+            .await;
+        let (live, ended) = endpoint().await;
+        assert!(live.is_none());
+        assert!(ended.expect("the admitted count ended").generation == first);
+    }
+
+    /// An EOSE already in flight when the connection dropped belongs to no
+    /// live stream, so it installs no count; the next serial's EOSE does.
+    #[tokio::test]
+    async fn an_eose_after_the_disconnect_counts_nothing_live() {
+        let (mut coverage, id, _) = replay_coverage(1);
+        coverage.end_relay_live_counts(RelayIndex(1));
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
+        assert!(endpoint.live_count.is_none() && endpoint.ended_count.is_none());
+
+        assert!(
+            coverage
+                .restart_request(&id, RelayIndex(1), ReplayStart::Connection)
+                .is_some()
+        );
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        assert!(
+            coverage.endpoint_deadlines[&id][&RelayIndex(1)]
+                .live_count
+                .is_some()
+        );
+    }
+
+    /// A relay's `CLOSED` after EOSE ends the REQ's live stream there, so its
+    /// count ends, though the history it served stays admitted.
+    #[tokio::test]
+    async fn closed_after_eose_ends_the_live_count() {
+        let (mut coverage, id, _) = replay_coverage(1);
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Dropped);
+        let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
+        assert!(endpoint.boundary_admitted, "EOSE is final");
+        assert!(endpoint.live_count.is_none());
+        assert!(endpoint.ended_count.is_some());
+    }
+
+    /// A `CLOSED` the SDK keeps (AUTH, a rate limit) stops the count until the
+    /// REQ it sends again reaches EOSE; that reply counts afresh, before or
+    /// after the serial's first EOSE, and streams from that EOSE. A dropped
+    /// one stays stopped.
+    #[tokio::test]
+    async fn a_kept_close_counts_the_restored_reply() {
+        let (mut coverage, id, _) = replay_coverage(1);
+        let requested_at = coverage.endpoint_deadlines[&id][&RelayIndex(1)].requested_at;
+        let counted = |coverage: &AccountReplayCoverage, eose: u64| {
+            let count = coverage.endpoint_deadlines[&id][&RelayIndex(1)].live_count?;
+            assert_eq!(count.requested_at, requested_at);
+            assert!((eose..=unix_now_seconds()).contains(&count.live_from));
+            Some((count.events, count.oldest))
+        };
+        coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
+        coverage.record_stored_event(&id, RelayIndex(1), 400);
+        let eose = unix_now_seconds();
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        assert_eq!(
+            counted(&coverage, eose),
+            Some((1, Some(400))),
+            "a close before EOSE"
+        );
+
+        coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
+        let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
+        assert!(endpoint.live_count.is_none());
+        assert!(endpoint.ended_count.is_some());
+        coverage.record_stored_event(&id, RelayIndex(1), 600);
+        coverage.record_stored_event(&id, RelayIndex(1), 500);
+        let eose = unix_now_seconds();
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        assert_eq!(
+            counted(&coverage, eose),
+            Some((2, Some(500))),
+            "a close after EOSE"
+        );
+
+        coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Dropped);
+        coverage.record_stored_event(&id, RelayIndex(1), 700);
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        assert!(
+            coverage.endpoint_deadlines[&id][&RelayIndex(1)]
+                .live_count
+                .is_none()
+        );
+    }
+
+    /// A restored REQ's query ran an unknown time after the request stamp,
+    /// while the REQ was closed: it counts only its own reply, before or after
+    /// the serial's first EOSE, and an empty one still streams from its EOSE.
+    #[tokio::test]
+    async fn a_restored_reply_counts_only_its_own_events() {
+        let (mut coverage, id, _) = replay_coverage(1);
+        coverage.record_stored_event(&id, RelayIndex(1), 300);
+        coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
+        let eose = unix_now_seconds();
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        let count = coverage.endpoint_deadlines[&id][&RelayIndex(1)]
+            .live_count
+            .expect("an empty restored reply counts");
+        assert_eq!(
+            (count.events, count.oldest),
+            (0, None),
+            "the closed reply's event does not count for the restored one"
+        );
+        assert!(count.live_from >= eose);
+
+        let (mut coverage, id, _) = replay_coverage(1);
+        coverage.record_stored_event(&id, RelayIndex(1), 1_000);
+        coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
+        coverage.record_stored_event(&id, RelayIndex(1), 1_200);
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        assert_eq!(
+            coverage.endpoint_deadlines[&id][&RelayIndex(1)]
+                .live_count
+                .map(|count| (count.events, count.oldest)),
+            Some((1, Some(1_200))),
+            "only the restored reply's oldest counts"
+        );
+
+        let (mut coverage, id, _) = replay_coverage(1);
+        coverage.record_stored_event(&id, RelayIndex(1), 400);
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
+        let eose = unix_now_seconds();
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
+        let count = endpoint.live_count.expect("an empty recount");
+        assert_eq!((count.events, count.oldest), (0, None));
+        assert!(count.live_from >= eose);
+        assert!(endpoint.ended_count.is_some());
+    }
+
+    /// A count at the replay page limit is kept through backward paging; the
+    /// boundary it belongs to is admitted only once paging finishes.
+    #[tokio::test]
+    async fn a_paged_replay_keeps_its_live_count() {
+        let (mut coverage, id, _) = replay_coverage(1);
+        for created_at in 0..RELAY_REPLAY_PAGE_LIMIT as u64 {
+            coverage.record_stored_event(&id, RelayIndex(1), 1_000 + created_at);
+        }
+        assert!(coverage.record_eose(&id, RelayIndex(1), 0).is_some());
+        let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
+        assert!(!endpoint.boundary_admitted);
+        assert_eq!(
+            endpoint.live_count,
+            Some(ReplayLiveCount {
+                events: RELAY_REPLAY_PAGE_LIMIT,
+                oldest: Some(1_000),
+                requested_at: endpoint.requested_at,
+                live_from: endpoint.requested_at,
+            })
+        );
     }
 
     #[tokio::test]
@@ -7884,6 +8570,7 @@ mod batch_tests {
             id.clone(),
             &batch,
             HashMap::from([(RelayIndex(2), RelayReplay::Awaiting)]),
+            &HashMap::new(),
         );
         let paging = paging_for(&mut coverage, &id);
         let units = coverage.page_units(&paging);
@@ -7937,6 +8624,7 @@ mod batch_tests {
             id.clone(),
             &batch,
             HashMap::from([(RelayIndex(2), RelayReplay::Awaiting)]),
+            &HashMap::new(),
         );
         let paging = paging_for(&mut coverage, &id);
         let routes = paging.window.per_route();
@@ -8060,6 +8748,8 @@ mod batch_tests {
             RelayIndex(2),
             ReplayRestart::Connection,
             ReplayOrigin::Changed,
+            None,
+            None,
         );
         assert_eq!(
             losses.pending.lock().unwrap().get(&account),
@@ -8132,6 +8822,8 @@ mod batch_tests {
             RelayIndex(2),
             ReplayRestart::Connection,
             ReplayOrigin::Changed,
+            None,
+            None,
         );
         assert_eq!(
             losses.pending.lock().unwrap().get(&account),
@@ -8224,6 +8916,8 @@ mod batch_tests {
             RelayIndex(1),
             ReplayRestart::Connection,
             ReplayOrigin::Changed,
+            None,
+            None,
         );
         assert_eq!(
             coverage.buffered_items, 1,
@@ -8255,6 +8949,8 @@ mod batch_tests {
             RelayIndex(1),
             ReplayRestart::Connection,
             ReplayOrigin::Changed,
+            None,
+            None,
         );
         assert_eq!(coverage.buffered_items, 0);
         assert_eq!(
@@ -8304,6 +9000,8 @@ mod batch_tests {
             RelayIndex(2),
             ReplayRestart::Connection,
             ReplayOrigin::Changed,
+            None,
+            None,
         );
         assert_eq!(coverage.buffered_items, 0);
         assert_eq!(
@@ -8340,6 +9038,8 @@ mod batch_tests {
             RelayIndex(2),
             ReplayRestart::ReceiverLoss,
             ReplayOrigin::Changed,
+            None,
+            None,
         );
         assert_eq!(coverage.buffered_items, 0);
         assert_eq!(
@@ -8360,6 +9060,8 @@ mod batch_tests {
             RelayIndex(2),
             ReplayRestart::Connection,
             ReplayOrigin::Initial,
+            None,
+            None,
         );
         tokio::time::advance(Duration::from_secs(20)).await;
         coverage.record_stored_event(&id, RelayIndex(2), 150);
@@ -8380,11 +9082,15 @@ mod batch_tests {
             RelayIndex(2),
             ReplayRestart::Connection,
             ReplayOrigin::Changed,
+            None,
+            None,
         );
         coverage.restart_relay(
             RelayIndex(2),
             ReplayRestart::ReceiverLoss,
             ReplayOrigin::Changed,
+            None,
+            None,
         );
         assert!(
             coverage
@@ -8433,6 +9139,50 @@ mod batch_tests {
     /// Reports every REQ on `owing` as owed by that unreachable relay.
     struct OwingRelayClient {
         owing: TransportEndpoint,
+    }
+
+    /// Reports one scripted connection for every relay.
+    #[derive(Default)]
+    struct ConnectionRelayClient {
+        connection: std::sync::Mutex<Option<RelayConnection>>,
+    }
+
+    impl ConnectionRelayClient {
+        fn reports(&self, connection: Option<RelayConnection>) {
+            *self.connection.lock().unwrap() = connection;
+        }
+    }
+
+    #[async_trait]
+    impl NostrRelayClient for ConnectionRelayClient {
+        fn relay_connection(&self, _: &MemberId, _: &TransportEndpoint) -> Option<RelayConnection> {
+            *self.connection.lock().unwrap()
+        }
+
+        async fn subscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+            Ok(())
+        }
+
+        async fn unsubscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+            Ok(())
+        }
+
+        async fn unsubscribe_account(
+            &self,
+            _: &MemberId,
+            _: &[NostrSubscription],
+        ) -> Result<(), TransportAdapterError> {
+            Ok(())
+        }
+
+        async fn publish_event(
+            &self,
+            _: &[TransportEndpoint],
+            _: &NostrTransportEvent,
+            _: usize,
+        ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+            unreachable!("replay coverage does not publish")
+        }
     }
 
     #[async_trait]

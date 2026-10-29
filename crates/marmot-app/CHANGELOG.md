@@ -33,6 +33,11 @@
   device group is in flight. A rename whose commit loses a fork to one that
   also changes that device's entry is not made again, and the winning label
   stands. Refused in release builds until the roster's spec lands.
+- `AppGroupMlsState.convergence_parked` reports a group whose convergence
+  pass spent its failure budget (mdk#2684). Show it as stuck syncing until
+  new group activity arrives or the user retries;
+  `retry_group_convergence` grants the parked pass one more attempt, and a
+  `GroupStateUpdated` follows a scheduled pass that parks.
 - `MarmotAppRuntime::linked_devices` lists this account's own devices as
   `LinkedDevice`s, from the roster of the device group this device trusts,
   this device first (mdk#2628 item 3.1). `LinkedDevicesChanged` says to
@@ -325,6 +330,12 @@
 
 ### Fixed
 
+- A convergence pass that fails after its decision no longer replays its
+  batch on every scheduled advance, send and inbound commit (mdk#2684). Each
+  failed attempt waits 1 s, doubling to 5 min, before the next; after 12 in a
+  row the pass parks until a commit or proposal it can take in arrives or
+  the user retries. Count, delay and park survive a restart. Live application
+  traffic does not wake it, and other groups keep their turns meanwhile.
 - A send that waited for the group to settle and is then refused by the
   settled state no longer blocks the group's queued sends (mdk#2694). An admin
   change queued by an admin who was demoted before it went out used to fail
@@ -332,6 +343,12 @@
   dropped and announced as `GroupEvent::QueuedIntentRefused`, carrying the
   `intent_id` its queued result returned; nothing retries it.
 
+- Incoming Welcomes use one authenticated unwrap for invitation policy and
+  MLS admission, including rejoin offers that need confirmation. Accounts
+  with blocked users no longer request the same external-signer decryption
+  twice. Blocked invitations remain durably dismissed after unblocking.
+- Rejoin confirmation and retries after trusted removal hold account block-list
+  updates until both MLS admission and the app projection have completed.
 - Account recovery no longer retries a native capture the pass cutoff always
   cuts every ~20 s forever (mdk#2660). A cut capture records no notification
   loss until its source is readmitted without it, counts nothing toward a

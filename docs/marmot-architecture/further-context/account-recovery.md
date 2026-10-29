@@ -519,7 +519,7 @@ in `marmot-app` fills it from facts the owner already has:
 
 | Fact | Ledger effect |
 | --- | --- |
-| A live REQ's endpoint admitted and placed its whole original window in the current wire epoch | Live boundary covers `[since, now]` on that route and relay, unless a loss obligation is pending, less every released second (below) |
+| A live REQ's endpoint admitted and placed its whole original window, and counted the stored events its relay sent before EOSE | Live boundary on every route the filter carries, from the second after the oldest event counted (never before the REQ's `since`) through the second before the REQ went out (below); a count with no event proves nothing. Written once per generation, while it is healthy (input placed, no loss or spill hand-off pending). A generation that loss may have reached proves nothing. Released seconds stay out (below). The time since the request is a provisional tail, never written (below) |
 | A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route, less every range un-covered after the grant was selected |
 | A loss import charged a generation, including a notification lag that charges no count, or a legacy clear restored one | In the import's own transaction, a generation whose every dropped delivery the relay plane placed on a route un-covers only those routes, each from the earliest `created_at` dropped there, and widens their goals. Any other generation un-covers every route the ledger holds from its floor up (all of it when a floor is unknown) and widens their goals to it; the recorder then widens the other current routes' goals. A generation that touches more than 256 routes, or that a worker observed past its durable count, counts as one that named none. After a restart the relay plane counts new drops under a fresh token, so new loss always raises a count |
 | A receipt was released for replay | In the release's transaction, its event's second is un-covered on each route its inventory row placed it on, and that route's goal widens to it. A second below the retained window is owed nowhere, so that release changes nothing in the ledger: its coverage stays until pruning drops it. The REQ that delivered the event will not deliver it again, so only a comparison on a relay covers that second there again; live boundaries never cover it, until retention pruning passes it. A release with no inventory row changes nothing here; the epoch gap it arms keeps that debt |
@@ -548,6 +548,94 @@ nothing twice and does not bring back a dismissed remainder; only loss lowers th
 to its own. While the ledger is in shadow mode nothing sweeps, so most routes gather a
 remainder; the switch-over drops those.
 
+A count proves only what its relay had stored when it ran the query, so its live boundary ends
+the second before the count's request stamp. The adapter takes that stamp before it issues the
+REQ; for a REQ the relay pool re-sent on reconnecting, it uses the pool's record of when that
+connection was made, and only when the pool's connection count shows the record belongs to a
+connection the adapter saw. Either way the stamp is no later than the relay's query. The pool
+marks a connection open before it counts it and records its time, so that record can be the
+previous connection's, or missing; a stale stamp only ends the proof earlier.
+
+A count also proves nothing at or before the second of the oldest event it holds. A relay may
+cut its reply at a limit of its own, and the relay pool drops some frames before the adapter
+counts them (expired, deleted or replaced events, bad signatures, frames it cannot parse), so
+a count is only a lower bound on what the relay sent and cannot show that a reply was not cut.
+The rule assumes relays cut a reply newest first, as NIP-01 asks of a `limit`: every stored
+event newer than the oldest one counted was then sent. A relay that cuts any other way breaks
+that assumption, and the ledger cannot see it. A count with no event proves nothing, and live
+boundaries read no NIP-11 limit. An API that reported the raw frames each REQ received before
+EOSE could later add back, on top of this rule, a proof from the REQ's `since` for a reply
+under the relay's limit.
+
+Past the request an open REQ vouches only while it lasts, and nothing proves when it stopped
+delivering: a connection can die silently, and a frozen process notices nothing. So each
+healthy generation's REQ holds a provisional tail in memory (`LiveTails`), never in the ledger.
+It starts at the request stamp only when the adapter itself issued the REQ. For a REQ the
+relay pool sent again (on a reconnect, or after a `CLOSED` it keeps) it starts at the second
+its EOSE was recorded, since when the pool sent it is not reliably known, and the time the REQ
+was down stays owed. It starts past the oldest event returned when that is newer (a reply cut
+at the relay's limit may have left out what it stored after the request), and past the newest
+second released on its route. Debt that drives work reads the ledger only up to the
+second before a route's tail on a relay (`LiveTails::owed_until`, refreshed by
+`AppClient::live_tails` on every call), and so does the shadow report.
+
+A tail stands only on positive evidence read when it is asked for: the account's relay client
+must report the relay connected, on the same connection the generation's serial started on.
+The adapter records that connection when it issues the REQ, or when it sees the reconnect
+that restarted it. The relay pool names a connection by its relay object and attempt count,
+read on both sides of its status, so a read inside a reconnect (the pool marks the new
+connection open before it counts it) names the new connection or none. A notification that a
+REQ stopped can come late or never: a shutdown can cut short the disconnects it sends, a
+removed account context sends none the adapter applies, and a reconnect is seen only once its
+boundary is processed. None of these can leave a tail up, because the client's own state no
+longer names the generation's connection. A tail lapses silently, so the runner reads tails
+at every debt read and never holds them across a wait.
+
+That evidence names a connection, not a REQ, so a tail can outlive its REQ by the time the
+adapter takes to process notifications already queued for that relay. Two cases:
+- The relay closes the REQ (`CLOSED`) and keeps the connection open.
+- The adapter processes a reconnect's boundary after the next connection has opened. The
+  restarted serial is then bound to that newer connection until the earlier connection's
+  disconnect is processed.
+
+This delay is accepted, and bounded:
+- A notification forwarder that falls behind records notification loss, and loss breaks
+  the tail (below).
+- A tail is never written to the ledger and never marks a second proved. A late lapse only
+  delays a sweep.
+
+Closing the delay needs evidence from the end of that ordered path, not one stage of it. The
+deferred design is a periodic probe REQ on each connection: its EOSE reaches the adapter after
+anything the relay sent before it, so it confirms a tail only up to the second the probe was
+sent. Build it with the runner if the runner shows the delay matters.
+
+When the generation ends (the relay closes the REQ or leaves `Connected`, or the client no
+longer reports its connection) or breaks, its tail goes, and
+the time since its request is owed until a later EOSE or a fetch proves it. A `CLOSED` the
+relay pool keeps to send again (AUTH, a rate limit) ends the tail only until the restored
+REQ's EOSE, which counts only its own reply and starts a tail there.
+
+A restart or relay rebuild drops every tail, and its new REQs start at the transport cursor
+less the rebuild lookback, which a healthy generation keeps raising past its request. The new
+generation proves only from its `since` or past the oldest event it counted, whichever is
+later, so the seconds from a route's last durable proof to that start stay owed, inside the
+retained window startup history already owes, until the runner's sweep proves them. A busy
+route's count reaches back near its `since`, so it owes little more than the time between its
+last request and that `since`; a quiet route's count holds nothing, so it owes everything from
+its last proof through the new request. The REQs do not reach back to the last proof instead:
+a quiet route would still prove nothing, a busy filter would return up to the relay's limit
+and prove only above its oldest event, and a multi-group filter would reach back to its
+stalest route.
+
+The recorder knows a generation loss may have reached by the un-cover log (below): it reads
+the log's generation before each look at the adapter's REQs, so a REQ generation one look did
+not see began after that look's mark, and any loss imported after it, other than a released
+second, breaks every generation it could have reached (all of them while loss is account-wide).
+It reads the log again after the look, so loss imported while it looked also ends the tails of
+the generations it saw. It also looks at the adapter again after the write, and a generation the
+adapter ended meanwhile (a `CLOSED` or reconnect it processed) gets no tail. The first mark is read when the client opens; the relay plane's shared adapter can still report
+REQs an earlier session of the account opened, and those never prove for the new session.
+
 Every un-cover is also appended to an un-cover log under a new account-wide generation. A
 grant reads that generation when it is selected, before anything is frozen or fetched, and its
 certificates leave out every range un-covered on their routes since, so a loss or release that
@@ -560,7 +648,10 @@ ledger proved (ledger ahead), scopes the obligation proved that the ledger has n
 behind), and current routes with ledger debt that no pending scope covers. A scope holds proof
 only as completion would count it: its predicate over checkpoints captured at the account's
 current loss, route and inventory revisions and the obligation's own revision. A scope whose
-floor is unknown or older than the retained window is owed from that window's floor. Known-event and maintenance-boundary scopes are
+floor is unknown or older than the retained window is owed from that window's floor. On each
+required relay the ledger is read only up to that relay's live tail, which vouches for the
+rest provisionally, as replay admission does for the obligation; unowed debt is read the same
+way. Known-event and maintenance-boundary scopes are
 not comparable. On the normal catch-up path (live boundaries,
 a bounded loss, a certified pass) the two agree at every step.
 
@@ -583,12 +674,15 @@ Known disagreements, expected until later phases remove their cause:
   is older than the window, from that window's floor, so once the window is covered the
   ledger is ahead.
 - **Dismissed loss.** A dismissal retires the obligation without coverage. The ledger keeps the
-  debt until a live boundary or comparison covers it, counted as unowed debt; for queue loss
-  the next live boundary re-covers the range, because queue loss does not start a new wire
-  generation.
-- **Relay caps are not checked.** The adapter reports an admitted boundary, not how many
-  stored events the relay returned against its cap, so a silently capped live REQ counts as
-  covered. Phase 3 reads NIP-11 `max_limit` and counts each slice.
+  debt until a comparison or the next generation's live boundary covers it, counted as unowed
+  debt.
+- **Tail debt after loss.** Loss breaks every live generation it may have reached, so a
+  connected account that recovered from loss owes the time since that generation's request,
+  as unowed debt, until a comparison proves it, or its next generation's EOSE does on a
+  route busy enough to count an event older than that time.
+- **Quiet windows.** A live count with no event proves nothing, so where replay admission
+  settles an obligation over a window with no events, the ledger keeps it as unowed debt
+  until a comparison proves it.
 - **Required relays only.** A certificate is recorded for the route's required relays, and a
   scope is compared on its required relays; a scope with none is not comparable. Live
   boundaries are recorded for every endpoint that admitted one.

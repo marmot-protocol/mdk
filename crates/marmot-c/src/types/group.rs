@@ -291,6 +291,9 @@ c_mirror! {
         copy disbanding: bool,
         str_vec disbanding_blockers/disbanding_blockers_len,
         opt_rec disband_request: MarmotDisbandRequest,
+        /// Convergence stopped retrying a batch that kept failing; new
+        /// input or `marmot_retry_group_convergence` resumes it.
+        copy convergence_parked: bool,
     }
 }
 

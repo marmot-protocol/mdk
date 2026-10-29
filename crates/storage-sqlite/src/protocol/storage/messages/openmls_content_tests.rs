@@ -325,6 +325,102 @@ fn openmls_listing_leaves_out_only_rows_the_filter_excludes() {
     );
 }
 
+/// A failed convergence batch looks for new selection input (mdk#2684) by
+/// listing the commits and proposals inside its horizon as they are stored
+/// now, so a row rewritten in place counts as much as a new one.
+#[test]
+fn horizon_listing_returns_commits_and_proposals_in_an_epoch_range() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut labels = seed_listing_rows(&store);
+    let between = |from, through| OpenMlsContentFilter::CommitsAndProposalsBetween {
+        from: EpochId(from),
+        through: EpochId(through),
+    };
+
+    // Rows the backend cannot classify come back for the caller to judge.
+    assert_eq!(
+        listed(&store, &labels, &GRAPH_STATES, 0, between(0, 9)),
+        [
+            "commit@2",
+            "proposal@3",
+            "fresh commit@3",
+            "unreadable",
+            "pending app@1"
+        ]
+    );
+    assert_eq!(
+        listed(&store, &labels, &GRAPH_STATES, 0, between(3, 3)),
+        [
+            "proposal@3",
+            "fresh commit@3",
+            "unreadable",
+            "pending app@1"
+        ]
+    );
+    assert_eq!(
+        listed(&store, &labels, &GRAPH_STATES, 0, between(0, 2)),
+        ["commit@2", "unreadable", "pending app@1"]
+    );
+    // No classified row holds an epoch beyond SQLite's INTEGER range, and a
+    // bound beyond it keeps every one below.
+    assert_eq!(
+        listed(
+            &store,
+            &labels,
+            &GRAPH_STATES,
+            0,
+            between(u64::MAX, u64::MAX)
+        ),
+        ["unreadable", "pending app@1"]
+    );
+    assert_eq!(
+        listed(&store, &labels, &GRAPH_STATES, 0, between(3, u64::MAX)),
+        [
+            "proposal@3",
+            "fresh commit@3",
+            "unreadable",
+            "pending app@1"
+        ]
+    );
+    // The row epoch floor and the state list still apply.
+    assert_eq!(
+        listed(&store, &labels, &GRAPH_STATES, 3, between(0, 9)),
+        ["proposal@3", "fresh commit@3"]
+    );
+    assert!(listed(&store, &labels, &[], 0, between(0, 9)).is_empty());
+
+    // A row rewritten in place into a commit is listed, in the order it was
+    // first stored.
+    let deferred = row(
+        12,
+        3,
+        MessageState::PeelDeferred,
+        StoredMessagePayload::raw_transport(transport(12, vec![12]))
+            .encode()
+            .unwrap(),
+    );
+    store.put_message(&deferred).unwrap();
+    labels.push((12, "peeled commit@3"));
+    assert!(!listed(&store, &labels, &GRAPH_STATES, 0, between(3, 3)).contains(&"peeled commit@3"));
+    store
+        .put_message(&MessageRecord {
+            state: MessageState::Created,
+            payload: wire_payload(private_message(3, COMMIT)),
+            ..deferred
+        })
+        .unwrap();
+    assert_eq!(
+        listed(&store, &labels, &GRAPH_STATES, 0, between(3, 3)),
+        [
+            "proposal@3",
+            "fresh commit@3",
+            "unreadable",
+            "pending app@1",
+            "peeled commit@3"
+        ]
+    );
+}
+
 #[test]
 fn promotion_derives_content_for_rows_written_before_the_columns() {
     let store = SqliteAccountStorage::in_memory().unwrap();
