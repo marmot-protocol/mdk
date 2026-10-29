@@ -237,8 +237,10 @@ where
     /// announcement is held back, so the host can warn the user (D31 choice
     /// 6). That is: a device group is set and the slot isn't withdrawn, the
     /// KeyPackage this device would publish (the pending replacement, else the
-    /// current one) is not announced, and this device's newest publication in
-    /// the slot is older than the weekly refresh bound, or there is none. A
+    /// current one) is not announced, or none may be staged while this
+    /// device's tag signature key is unsettled (mdk#2628 3.1d), and this
+    /// device's newest publication in the slot is older than the weekly
+    /// refresh bound, or there is none. A
     /// publication is then always owed, so retry backoff at the relays never
     /// hides it. A routine refresh announces and publishes in one maintenance
     /// pass, so it never shows. One that is announced but failing at the
@@ -258,7 +260,7 @@ where
         else {
             return Ok(false);
         };
-        if self.key_package_announced(&key_package_ref)? {
+        if self.key_package_announced(&key_package_ref)? && self.device_tag_key_settled()? {
             return Ok(false);
         }
         let now = self.wall_clock.now();

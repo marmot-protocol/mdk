@@ -12,7 +12,7 @@ use crate::{ConfirmedDeviceLink, LinkedDevice, LinkedDeviceStatus};
 use cgka_traits::TransportFanoutAttemptState;
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
-    DeviceRosterV1, DeviceSettingsV1, DeviceStatusV1, decode_device_roster_v1,
+    DeviceRosterV1, DeviceSettingsV1, DeviceStatusV1, DeviceTagClaim, decode_device_roster_v1,
     encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
@@ -815,7 +815,8 @@ async fn a_chat_welcome_under_a_waiting_link_is_refused() {
 
 /// A deferred open holds the device group before hydration gives it a route.
 /// A routing rebuild then skips it rather than failing, so a KeyPackage still
-/// publishes, and hydration restores the route.
+/// publishes, and hydration restores the route. The phone has already
+/// replaced its untagged KeyPackage, so the one it republishes is announced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deferred_open_routes_before_the_device_group_hydrates() {
     let Devices {
@@ -827,6 +828,7 @@ async fn a_deferred_open_routes_before_the_device_group_hydrates() {
         ..
     } = phone_and_laptop().await;
     let group = phone.dev_create_device_group(link).await.unwrap();
+    phone.run_due_maintenance().await.unwrap();
     drop(phone);
     let plane = MarmotRelayPlane::new(None, relay.clone());
     let mut phone = phone_app
@@ -1479,11 +1481,40 @@ async fn linked_devices() -> (Devices, GroupId) {
         .unwrap();
     let mut cursor = 0;
     deliver_new(&mut devices.laptop, &devices.relay, &mut cursor).await;
+    // Settling the join names the group to tag from at once (mdk#2628 3.1d).
+    assert_eq!(devices.laptop.runtime.device_tag_group(), Some(&group));
     devices.laptop.sync().await.unwrap();
     assert_eq!(
         trust(&devices.laptop_app, &group),
         Some(DeviceGroupTrust::Linked)
     );
+    (devices, group)
+}
+
+/// [`linked_devices`] once both devices tag (mdk#2628 3.1d). One
+/// maintenance pass each replaces its untagged KeyPackage, the laptop's after
+/// it sets its tag signature key; the phone's founding entry carries its key.
+/// Each new KeyPackage is announced before it is published, and both devices
+/// see every roster commit.
+async fn tagging_devices() -> (Devices, GroupId) {
+    let (mut devices, group) = linked_devices().await;
+    let start = devices.relay.published_events.lock().unwrap().len();
+    let (mut phone_cursor, mut laptop_cursor) = (start, start);
+    devices.laptop.run_due_maintenance().await.unwrap();
+    deliver_new(&mut devices.phone, &devices.relay, &mut phone_cursor).await;
+    devices.phone.sync().await.unwrap();
+    devices.phone.run_due_maintenance().await.unwrap();
+    deliver_new(&mut devices.laptop, &devices.relay, &mut laptop_cursor).await;
+    devices.laptop.sync().await.unwrap();
+    for device in [&devices.phone, &devices.laptop] {
+        for reader in [&devices.phone, &devices.laptop] {
+            assert_eq!(announced(reader, &group, device), current_ref(device));
+        }
+        assert_eq!(
+            key_package_claim(device, &roster(device, &group)),
+            DeviceTagClaim::Device(slot_of(device))
+        );
+    }
     (devices, group)
 }
 
@@ -1527,9 +1558,9 @@ fn published_kinds(relay: &ScriptedPushRelayClient, since: usize) -> Vec<u64> {
 }
 
 /// A device's roster entry names each KeyPackage before it reaches the slot.
-/// The founding roster names both devices' current ones, so maintenance owes
-/// no commit. A rotation sends the roster commit first, then the KeyPackage
-/// the sibling sees announced.
+/// Once both devices tag, the roster names both devices' current ones, so
+/// maintenance owes no commit. A rotation sends the roster commit first, then
+/// the KeyPackage the sibling sees announced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_key_package_is_announced_before_it_reaches_the_slot() {
     let (
@@ -1541,7 +1572,7 @@ async fn a_key_package_is_announced_before_it_reaches_the_slot() {
             ..
         },
         group,
-    ) = linked_devices().await;
+    ) = tagging_devices().await;
     for client in [&phone, &laptop] {
         assert_eq!(announced(client, &group, &laptop), current_ref(&laptop));
         assert_eq!(announced(client, &group, &phone), current_ref(&phone));
@@ -1578,7 +1609,7 @@ async fn a_key_package_waits_for_its_announcement() {
             ..
         },
         group,
-    ) = linked_devices().await;
+    ) = tagging_devices().await;
     let before = relay.published_events.lock().unwrap().len();
     let announced_before = announced(&laptop, &group, &laptop);
     relay.reject_next_publish();
@@ -1608,7 +1639,9 @@ async fn a_key_package_waits_for_its_announcement() {
 
 /// A host publication that must send a fresh KeyPackage announces that one,
 /// not the current one, and sends it in the same call: here because the
-/// device group's Welcome consumed the laptop's KeyPackage.
+/// device group's Welcome consumed the laptop's KeyPackage. The laptop sets
+/// its tag signature key first, so the fresh one is tagged. The phone has
+/// already replaced its untagged one, so its current one still serves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_republish_that_needs_a_fresh_key_package_announces_that_one() {
     let (
@@ -1621,18 +1654,28 @@ async fn a_republish_that_needs_a_fresh_key_package_announces_that_one() {
         },
         group,
     ) = linked_devices().await;
+    let mut laptop_cursor = relay.published_events.lock().unwrap().len();
+    phone.run_due_maintenance().await.unwrap();
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
     assert!(laptop.runtime.key_package_republish_falls_back().unwrap());
-    assert_fresh_publication_is_announced(&mut laptop, &relay, &group, 0).await;
+    assert_fresh_publication_is_announced(&mut laptop, &relay, &group, 0, 1).await;
+    assert_eq!(
+        key_package_claim(&laptop, &roster(&laptop, &group)),
+        DeviceTagClaim::Device(slot_of(&laptop))
+    );
     assert!(!phone.runtime.key_package_republish_falls_back().unwrap());
 }
 
 /// One host `publish_key_package` call commits the announcement of a fresh
-/// KeyPackage newer than `newer_than`, then publishes it.
+/// KeyPackage newer than `newer_than`, then publishes it, after
+/// `tag_key_commits` roster commits setting the device's tag signature key.
 async fn assert_fresh_publication_is_announced(
     device: &mut AppClient,
     relay: &ScriptedPushRelayClient,
     group: &GroupId,
     newer_than: u64,
+    tag_key_commits: usize,
 ) {
     let previous = current_ref(device);
     let before = relay.published_events.lock().unwrap().len();
@@ -1653,10 +1696,9 @@ async fn assert_fresh_publication_is_announced(
             .0
             > newer_than
     );
-    assert_eq!(
-        published_kinds(relay, before),
-        vec![transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE, 30443]
-    );
+    let mut kinds = vec![transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE; tag_key_commits + 1];
+    kinds.push(30443);
+    assert_eq!(published_kinds(relay, before), kinds);
 }
 
 /// Without a readable device group the runtime would see nothing to
@@ -1764,4 +1806,363 @@ async fn a_refresh_held_back_a_week_is_overdue_until_it_publishes() {
     laptop.run_due_maintenance().await.unwrap();
     assert!(!laptop.key_package_refresh_overdue().unwrap());
     assert!(laptop.take_key_package_refresh_overdue_changed());
+}
+
+/// The roster slot `client` publishes its KeyPackages in.
+fn slot_of(client: &AppClient) -> [u8; 32] {
+    hex::decode(own_slot(client)).unwrap().try_into().unwrap()
+}
+
+/// What `reader`'s copy of the device group says `device`'s leaf there is.
+fn leaf_claim(
+    reader: &AppClient,
+    group: &GroupId,
+    device: &AppClient,
+    roster: &DeviceRosterV1,
+) -> Option<DeviceTagClaim> {
+    let epoch = reader.runtime.group_record(group).unwrap().epoch;
+    let leaf_index = device.runtime.own_leaf_index(group).unwrap();
+    reader
+        .runtime
+        .member_device_tag_claim(group, epoch, leaf_index, roster)
+        .unwrap()
+}
+
+/// What `client`'s current KeyPackage says it is, read against `roster`.
+fn key_package_claim(client: &AppClient, roster: &DeviceRosterV1) -> DeviceTagClaim {
+    use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn, ProtocolVersion};
+    use tls_codec::Deserialize as _;
+    let key_package = client
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap()
+        .current_key_package
+        .unwrap();
+    let MlsMessageBodyIn::KeyPackage(key_package) =
+        MlsMessageIn::tls_deserialize_exact(key_package.bytes())
+            .unwrap()
+            .extract()
+    else {
+        panic!("expected a KeyPackage")
+    };
+    let key_package = key_package
+        .validate(
+            &openmls_rust_crypto::RustCrypto::default(),
+            ProtocolVersion::Mls10,
+        )
+        .unwrap();
+    cgka_engine::device_tag::device_tag_claim(key_package.leaf_node(), roster)
+}
+
+/// Each device tags from the device group it trusts (mdk#2628 3.1d). The
+/// founder's founding entry carries its tag signature key, so its leaf reads
+/// as its slot from the start. The laptop sets its own key on its next
+/// maintenance pass, in a roster commit whose own leaf already carries the
+/// tag, before it stages anything; the same pass then announces and
+/// publishes a tagged KeyPackage. The phone's next pass replaces its
+/// untagged one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_device_tags_from_the_device_group_it_trusts() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let (phone_slot, laptop_slot) = (slot_of(&phone), slot_of(&laptop));
+    let founding = roster(&laptop, &group);
+    assert_eq!(
+        founding.devices[&phone_slot].tag_signature_key,
+        Some(phone.runtime.own_signature_key())
+    );
+    assert_eq!(founding.devices[&laptop_slot].tag_signature_key, None);
+    assert_eq!(
+        leaf_claim(&laptop, &group, &phone, &founding),
+        Some(DeviceTagClaim::Device(phone_slot))
+    );
+    assert_eq!(
+        leaf_claim(&laptop, &group, &laptop, &founding),
+        Some(DeviceTagClaim::Unclaimed)
+    );
+
+    assert_eq!(
+        key_package_claim(&laptop, &founding),
+        DeviceTagClaim::Unclaimed
+    );
+    let mut phone_cursor = relay.published_events.lock().unwrap().len();
+    let since = phone_cursor;
+    laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        published_kinds(&relay, since),
+        vec![
+            transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE,
+            transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE,
+            30443
+        ],
+        "the key goes out before the KeyPackage's announcement"
+    );
+    deliver_new(&mut phone, &relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    for reader in [&phone, &laptop] {
+        let roster = roster(reader, &group);
+        assert_eq!(
+            roster.devices[&laptop_slot].tag_signature_key,
+            Some(laptop.runtime.own_signature_key())
+        );
+        assert_eq!(
+            leaf_claim(reader, &group, &laptop, &roster),
+            Some(DeviceTagClaim::Device(laptop_slot))
+        );
+    }
+    assert_eq!(
+        key_package_claim(&laptop, &roster(&laptop, &group)),
+        DeviceTagClaim::Device(laptop_slot)
+    );
+
+    assert_eq!(
+        key_package_claim(&phone, &roster(&phone, &group)),
+        DeviceTagClaim::Unclaimed
+    );
+    phone.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        key_package_claim(&phone, &roster(&phone, &group)),
+        DeviceTagClaim::Device(phone_slot)
+    );
+}
+
+/// A KeyPackage staged while this device's tag signature key is due would go
+/// out untagged once the key is set (mdk#2628 3.1d), so nothing is staged
+/// until the merged roster carries it. When the relay refuses the roster
+/// commit, neither maintenance nor a host publication stages or publishes a
+/// KeyPackage. Once it accepts, one host rotation sets the key, then
+/// announces and publishes a tagged KeyPackage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_package_waits_for_the_tag_signature_key() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let laptop_slot = slot_of(&laptop);
+    let current = current_ref(&laptop);
+    let before = relay.published_events.lock().unwrap().len();
+    relay.reject_next_publish();
+    laptop.run_due_maintenance().await.unwrap();
+    relay.reject_next_publish();
+    let error = laptop.publish_key_package().await.unwrap_err();
+    assert_eq!(
+        error.privacy_safe_kind(),
+        "account_key_package_announcement_pending"
+    );
+    assert!(published_kinds(&relay, before).is_empty());
+    let status = laptop.key_package_maintenance_status().unwrap().unwrap();
+    assert!(status.pending_replacement.is_none(), "nothing is staged");
+    assert_eq!(current_ref(&laptop), current);
+    assert_eq!(
+        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
+        None
+    );
+
+    laptop.rotate_key_package().await.unwrap();
+    assert_eq!(
+        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
+        Some(laptop.runtime.own_signature_key())
+    );
+    assert_ne!(current_ref(&laptop), current);
+    assert_eq!(announced(&laptop, &group, &laptop), current_ref(&laptop));
+    assert_eq!(
+        key_package_claim(&laptop, &roster(&laptop, &group)),
+        DeviceTagClaim::Device(laptop_slot)
+    );
+    assert_eq!(
+        published_kinds(&relay, before),
+        vec![
+            transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE,
+            transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE,
+            30443
+        ],
+        "the key goes out before the KeyPackage's announcement"
+    );
+}
+
+/// A replacement staged before this device tags is superseded once it does
+/// (mdk#2628 3.1d), so it never reaches the slot untagged. The phone's
+/// rotation is refused at the relay, leaving its replacement staged; once
+/// the phone founds its device group, its next maintenance pass announces and
+/// publishes a tagged KeyPackage in its place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_untagged_staged_key_package_is_replaced_once_the_device_tags() {
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    relay.reject_next_publish();
+    phone.rotate_key_package().await.unwrap_err();
+    let untagged = phone
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap()
+        .pending_replacement
+        .expect("the refused replacement stays staged")
+        .key_package_ref;
+
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    phone.run_due_maintenance().await.unwrap();
+    assert_ne!(current_ref(&phone), Some(hex::encode(&untagged)));
+    assert_eq!(announced(&phone, &group, &phone), current_ref(&phone));
+    assert_eq!(
+        key_package_claim(&phone, &roster(&phone, &group)),
+        DeviceTagClaim::Device(slot_of(&phone))
+    );
+}
+
+/// A refresh waiting for this device's tag signature key (mdk#2628 3.1d) is
+/// held back like one waiting for its announcement: once the slot's
+/// publication is a week old it is overdue, though the current KeyPackage is
+/// announced. It clears once the key is set and a tagged KeyPackage publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_waiting_for_the_tag_signature_key_is_overdue_after_a_week() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            laptop_app,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let laptop_slot = slot_of(&laptop);
+    let _ = laptop.take_key_package_refresh_overdue_changed();
+    age_publication(&laptop_app, 8);
+    assert_eq!(announced(&laptop, &group, &laptop), current_ref(&laptop));
+    relay.reject_next_publish();
+    laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
+        None
+    );
+    assert!(laptop.key_package_refresh_overdue().unwrap());
+    assert!(laptop.take_key_package_refresh_overdue_changed());
+
+    laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        key_package_claim(&laptop, &roster(&laptop, &group)),
+        DeviceTagClaim::Device(laptop_slot)
+    );
+    assert!(!laptop.key_package_refresh_overdue().unwrap());
+    assert!(laptop.take_key_package_refresh_overdue_changed());
+}
+
+/// The engine tags from whichever roster entry carries this device's tag
+/// signature key, so while another device's entry carries it, a KeyPackage
+/// built now would read as that device's (mdk#2628 3.1d). This device then
+/// stages and publishes none, and sets nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_held_by_another_device_stages_no_key_package() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let laptop_slot = slot_of(&laptop);
+    let update = encode_device_roster_update_v1(
+        &DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
+            [9; 32],
+            DeviceEntryV1 {
+                tag_signature_key: Some(laptop.runtime.own_signature_key()),
+                ..DeviceEntryV1::default()
+            },
+        )])
+        .unwrap(),
+    )
+    .unwrap();
+    let mut laptop_cursor = relay.published_events.lock().unwrap().len();
+    let effects = phone
+        .runtime
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: update,
+            }],
+        })
+        .await
+        .unwrap();
+    phone
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    let current = current_ref(&laptop);
+
+    let before = relay.published_events.lock().unwrap().len();
+    laptop.run_due_maintenance().await.unwrap();
+    let error = laptop.publish_key_package().await.unwrap_err();
+    assert_eq!(
+        error.privacy_safe_kind(),
+        "account_key_package_announcement_pending"
+    );
+    assert!(published_kinds(&relay, before).is_empty());
+    let status = laptop.key_package_maintenance_status().unwrap().unwrap();
+    assert!(status.pending_replacement.is_none(), "nothing is staged");
+    assert_eq!(current_ref(&laptop), current);
+    assert_eq!(
+        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
+        None
+    );
+}
+
+/// An eager open names the device group to tag from before it returns; a
+/// deferred one only once hydration has run, since naming hydrates it. Each
+/// maintenance pass names it again, as it does the group it announces in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_names_the_device_group_to_tag_from_once_it_is_hydrated() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            phone_app,
+            phone,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    assert_eq!(phone.runtime.device_tag_group(), Some(&group));
+    drop(phone);
+    let phone = phone_app.client("alice").await.unwrap();
+    assert_eq!(phone.runtime.device_tag_group(), Some(&group));
+    drop(phone);
+
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let mut phone = phone_app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    assert_eq!(phone.runtime.device_tag_group(), None);
+    crate::runtime::account_worker::drain_deferred_hydration(&mut phone)
+        .await
+        .unwrap();
+    assert_eq!(phone.runtime.device_tag_group(), Some(&group));
+
+    phone.runtime.set_device_tag_group(None).unwrap();
+    phone.run_due_maintenance().await.unwrap();
+    assert_eq!(phone.runtime.device_tag_group(), Some(&group));
 }
