@@ -293,7 +293,7 @@ impl AppClient {
 
     /// The sign-ins this device does not recognize, the earliest to appear
     /// first. Empty while device groups are off.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(all(test, feature = "test-policy-overrides")), allow(dead_code))]
     pub(crate) fn unrecognized_sign_ins(&mut self) -> Result<Vec<UnrecognizedSignIn>, AppError> {
         if !self.app.device_groups_enabled() {
             return Ok(Vec::new());
@@ -322,7 +322,7 @@ impl AppClient {
     /// Answer the unrecognized sign-in in `slot_id_hex`. A rejection is
     /// recorded here first, then committed to the device group's roster when
     /// one is trusted and quiet; maintenance retries what this call could not.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(all(test, feature = "test-policy-overrides")), allow(dead_code))]
     pub(crate) async fn answer_sign_in(
         &mut self,
         slot_id_hex: &str,
