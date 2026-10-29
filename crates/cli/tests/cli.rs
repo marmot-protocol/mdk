@@ -1952,30 +1952,51 @@ impl Drop for DaemonGuard {
 /// The pids of running `wnd` processes started with `--socket <socket>`. A
 /// zombie has no arguments left to match, so it is never returned.
 fn wnd_pids_for_socket(socket: &std::path::Path) -> Vec<libc::pid_t> {
+    // `ucomm` is the bare executable name, so the match does not depend on
+    // how the path to `wnd` is spelled.
     let Ok(ps) = Command::new("ps")
-        .args(["-A", "-ww", "-o", "pid=", "-o", "command="])
+        .args(["-A", "-ww", "-o", "pid=", "-o", "ucomm=", "-o", "command="])
         .stderr(Stdio::null())
         .output()
     else {
         return Vec::new();
     };
+    wnd_pids_in_ps_output(&String::from_utf8_lossy(&ps.stdout), socket)
+}
+
+/// Pick the `wnd` processes serving `socket` out of `ps -o pid= -o ucomm=
+/// -o command=` output.
+fn wnd_pids_in_ps_output(ps: &str, socket: &std::path::Path) -> Vec<libc::pid_t> {
     let socket_arg = format!(" --socket {}", socket.display());
-    String::from_utf8_lossy(&ps.stdout)
-        .lines()
+    ps.lines()
         .filter_map(|line| {
-            let (pid, command) = line.trim_start().split_once(char::is_whitespace)?;
-            let command = command.trim_start();
-            let program = command.split(' ').next()?;
-            let serves_socket = command.match_indices(&socket_arg).any(|(at, arg)| {
-                let rest = &command[at + arg.len()..];
-                rest.is_empty() || rest.starts_with(' ')
-            });
-            if std::path::Path::new(program).file_name() != Some("wnd".as_ref()) || !serves_socket {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<libc::pid_t>().ok()?;
+            if pid <= 0 || fields.next()? != "wnd" {
                 return None;
             }
-            pid.parse::<libc::pid_t>().ok().filter(|pid| *pid > 0)
+            line.match_indices(&socket_arg)
+                .any(|(at, arg)| {
+                    let rest = &line[at + arg.len()..];
+                    rest.is_empty() || rest.starts_with(' ')
+                })
+                .then_some(pid)
         })
         .collect()
+}
+
+#[test]
+fn wnd_pids_in_ps_output_matches_only_wnd_serving_the_socket() {
+    let socket = std::path::Path::new("/tmp/with space/dev/wnd.sock");
+    let ps = "\
+  101 wnd      /work tree/target/debug/wnd --home /tmp/with space --socket /tmp/with space/dev/wnd.sock --secret-store file
+  102 wnd      /work tree/target/debug/wnd --socket /tmp/with space/dev/wnd.sock
+  103 wn       /work tree/target/debug/wn --socket /tmp/with space/dev/wnd.sock daemon stop
+  104 wnd      /work tree/target/debug/wnd --socket /tmp/with space/dev/wnd.sock.other
+  105 wnd      /work tree/target/debug/wnd --socket /tmp/other/dev/wnd.sock
+  106 wnd      <defunct>
+";
+    assert_eq!(wnd_pids_in_ps_output(ps, socket), vec![101, 102]);
 }
 
 /// Whether `pid` names a live process (a zombie still counts).
