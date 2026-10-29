@@ -85,13 +85,20 @@ fn own_slot(client: &AppClient) -> String {
         .stable_slot_id
 }
 
-fn link_for(key_package: &cgka_traits::KeyPackage, group: u8) -> ConfirmedDeviceLink {
+/// The link `creator` confirms for `key_package`, naming device group
+/// `group`, whose Welcome comes from `creator`'s leaf.
+fn link_for(
+    key_package: &cgka_traits::KeyPackage,
+    group: u8,
+    creator: &AppClient,
+) -> ConfirmedDeviceLink {
     ConfirmedDeviceLink {
         key_package_event_id_hex: hex::encode(
             key_package.source.as_ref().unwrap().event_id.as_slice(),
         ),
         key_package_ref_hex: key_package_ref(key_package),
         device_group_id: GroupId::new(vec![group; 16]),
+        welcome_sender_key: creator.runtime.own_signature_key(),
     }
 }
 
@@ -300,7 +307,7 @@ async fn a_copy_of_this_devices_key_package_never_rejects_it() {
             .unwrap();
     }
 
-    let link = link_for(&laptop_key_package, 0x5a);
+    let link = link_for(&laptop_key_package, 0x5a, &phone);
     laptop
         .dev_record_confirmed_device_link(link.clone())
         .unwrap();
@@ -412,10 +419,8 @@ async fn a_rejection_before_any_device_group_founds_the_roster() {
     let report = phone.check_sign_ins().await.unwrap();
     assert_eq!(report.slots[&tablet_slot], SlotOutcome::Rejected);
 
-    let group = phone
-        .dev_create_device_group(link_for(&laptop_key_package, 0x5a))
-        .await
-        .unwrap();
+    let link = link_for(&laptop_key_package, 0x5a, &phone);
+    let group = phone.dev_create_device_group(link).await.unwrap();
     let roster = roster(&phone, &group);
     let tablet_slot_id: [u8; 32] = hex::decode(&tablet_slot).unwrap().try_into().unwrap();
     assert_eq!(
@@ -461,7 +466,7 @@ async fn a_rejection_in_the_device_group_reaches_every_sibling() {
     let laptop_key_package = published_key_package(&mut laptop, relay).await;
     phone.check_sign_ins().await.unwrap();
     laptop.check_sign_ins().await.unwrap();
-    let link = link_for(&laptop_key_package, 0x5a);
+    let link = link_for(&laptop_key_package, 0x5a, &phone);
     laptop
         .dev_record_confirmed_device_link(link.clone())
         .unwrap();
@@ -552,7 +557,7 @@ async fn rejections_made_at_once_both_reach_the_roster() {
     let laptop_key_package = published_key_package(&mut laptop, relay).await;
     phone.check_sign_ins().await.unwrap();
     laptop.check_sign_ins().await.unwrap();
-    let link = link_for(&laptop_key_package, 0x5a);
+    let link = link_for(&laptop_key_package, 0x5a, &phone);
     laptop
         .dev_record_confirmed_device_link(link.clone())
         .unwrap();
