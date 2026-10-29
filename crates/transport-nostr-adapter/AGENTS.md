@@ -93,6 +93,34 @@ for reconnect/backoff and relay status mechanics.
     only then does that relay's EOSE count.
   - A failed, unsupported or over-long paging stays incomplete for the next activation and recovery. So does a full page that
     cannot move past its oldest second, because that second may hide more events and everything older.
+- Keep each endpoint's `ReplayLiveCount` to its own physical EOSE in one source generation (the endpoint serial), for
+  the coverage ledger's live boundary (#2660). Backward paging keeps it. Its `requested_at` must be no later
+  than when the relay ran the query: the endpoint's stamp taken before its REQ is issued, raised for a REQ the SDK
+  re-sent on reconnecting to that connection's `connected_at`. The monitor reads that stamp only when the SDK's
+  success count shows it belongs to a connection the monitor saw (`connection_stamp`); never stamp a count later
+  than that. The relay leaving `Connected` (`NostrSdkNotification::Disconnected`, which a client shutdown sends for
+  every connection still open before it aborts the monitors) or a relay `CLOSED` ends the count as
+  `ReplayEndedCount`, only if its boundary was admitted, and an EOSE still in flight for that serial installs none
+  (`ReplayEndpoint::stopped`). A `CLOSED` the SDK keeps to send again (AUTH, a rate limit) ends the count without
+  stopping the serial: the restored REQ's EOSE counts only its own reply (after the serial's first EOSE, through
+  `ReplayEndpoint::recount`). A count's `live_from`, where its provisional tail may start, is `requested_at` only
+  when the adapter issued the REQ in that serial; for a REQ the SDK sent (a reconnect, a kept `CLOSED`) it is the
+  second the adapter recorded its EOSE (`ReplayEndpoint::sent_again`), because the SDK reports `Connected` before it
+  counts the connection and records its time, so that stamp can be the previous connection's or missing. A reconnect
+  without a reported disconnect, receiver loss, a capture and a failed or cut capture drop it. Never carry a count
+  into the next serial.
+- A live count streams (`ReplayEndpointView::streaming`, which alone may hold a provisional tail) only while the relay
+  client reports, when asked, the connection its serial started on (`NostrRelayClient::relay_connection`): the one
+  it reported when the adapter issued the REQ, or when the adapter saw the boundary that restarted it
+  (`ReplayEndpoint::connection`). Never infer streaming from notifications alone: a shutdown, a removed account
+  context or a reconnect the adapter has not seen yet must read as not streaming at once. The SDK client names a
+  connection by its relay monitor and the SDK's attempt count, read on both sides of a `Connected` status read
+  (`current_connection`): the SDK marks `Connecting`, counts the attempt, then marks `Connected` before it counts the
+  success, so only that sandwich errs toward none under every interleaving. A multi-account root answers from the
+  account's own context; a removed or shut-down context, or a shut-down frontier, names none. Streaming names a
+  connection, not a REQ: it can stay true until the adapter processes notifications already queued for that relay
+  (a `CLOSED` on a connection that stays open, or a boundary handled after the next connection opened, which records
+  that newer connection). That delay is the accepted limit; anything it does not bound is a bug.
 - Stage each group's complete replay range before timestamp/id-ordered release, including backward pages. Keep
   live arrivals behind the draining batch. Every replacement REQ establishes its own current-peer boundary,
   including equivalent or narrower repacks; never inherit another REQ's ready floor. In-deadline peers fence

@@ -222,3 +222,21 @@ impl AccountPublishFixture {
         let _ = task.await;
     }
 }
+
+impl MarmotRelayPlane {
+    /// Count one stored event, created at `created_at`, in `endpoint`'s reply
+    /// to a live REQ that has not reached EOSE there, without delivering
+    /// anything: what a scripted relay returned before its EOSE.
+    pub async fn count_stored_replay_event_for_test(
+        &self,
+        endpoint: TransportEndpoint,
+        subscription_id: String,
+        created_at: u64,
+    ) {
+        self.inner
+            .transport
+            .adapter
+            .observe_unconvertible_relay_event(endpoint, subscription_id, created_at)
+            .await;
+    }
+}

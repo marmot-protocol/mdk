@@ -89,6 +89,7 @@ pub(crate) use push::PushFetchClock;
 use push::notification_trigger_for_intent;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use push::{AcceptedPushAnnounce, PushAnnounceTiming};
+pub(crate) use recovery_coverage::LiveCoverage;
 #[cfg(test)]
 pub(crate) use sync::ScriptedComparisons;
 #[cfg(test)]
@@ -859,6 +860,8 @@ pub struct AppClient {
     /// Whether the last in-place job's network cutoff skipped or timed out a
     /// route. A pass that finished early and was admitted late was not cut.
     pub(crate) recovery_job_network_cut: bool,
+    /// The coverage ledger's live-boundary recorder state (mdk#2660).
+    pub(crate) live_coverage: tokio::sync::Mutex<recovery_coverage::LiveCoverage>,
     /// Whether the last in-place job's admission stopped at the whole budget.
     pub(crate) recovery_job_admission_expired: bool,
     /// Epoch-stall escalations the detector has raised but no caller has been

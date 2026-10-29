@@ -1983,6 +1983,15 @@ impl MarmotApp {
             Instant::now(),
             recovery_policy,
         )?;
+        // Before the client activates any REQ; a failed read trusts none.
+        let live_coverage = client::LiveCoverage::open(
+            self.account_storage(&open.state.label)?
+                .app_storage()
+                .recovery_coverage_mark()
+                .ok(),
+            &open.adapter,
+        )
+        .await;
         let incremental_request = if relay_plane
             .subscription_rebuild_since(open.state.last_transport_timestamp)
             .is_none()
@@ -2072,6 +2081,7 @@ impl MarmotApp {
             native_sync_deliveries: 0,
             explicit_history_window_certified: false,
             recovery_job_network_cut: false,
+            live_coverage: tokio::sync::Mutex::new(live_coverage),
             recovery_job_admission_expired: false,
             pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),

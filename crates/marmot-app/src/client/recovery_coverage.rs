@@ -10,13 +10,16 @@
 //! aggregate counts. Nothing here schedules, retries or fences recovery, and
 //! every write is best effort: a failure is logged and the recovery step it
 //! follows goes on. No route, relay, group or obligation identity is logged.
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use storage_sqlite::{
-    RecoveryCause, RecoveryCoverageProof, RecoveryCoverageSlice, RecoveryLossImport,
-    RecoveryPredicate, RecoveryRevisionFence, RecoveryScopeOutcome, SqliteAppStorage,
-    StoredRecoveryScope, TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationRoute,
+    RecoveryCause, RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageSlice,
+    RecoveryLossImport, RecoveryPredicate, RecoveryRevisionFence, RecoveryScopeOutcome,
+    SqliteAppStorage, StoredRecoveryScope, TRANSPORT_RECONCILIATION_RETENTION_SECS,
+    TransportReconciliationRoute,
 };
+use transport_nostr::MarmotRelayPlaneAccountAdapter;
+use transport_nostr_adapter::{ReplayAdmissionStatus, ReplayLiveCount, ReplaySourceGeneration};
 
 use super::AppClient;
 use super::recovery::AttemptGrant;
@@ -49,6 +52,255 @@ impl CoverageShadowReport {
     pub(crate) fn disagreements(&self) -> u64 {
         self.ledger_ahead + self.ledger_behind + self.unowed_debt_routes
     }
+}
+
+/// One live REQ's generation on one relay: the request, the relay as the
+/// ledger spells it, and the adapter's generation. Account-private.
+type GenerationKey = (String, String, ReplaySourceGeneration);
+
+/// Where each healthy, open live REQ's provisional coverage starts, by route
+/// and relay (as the ledger spells it), as of the recorder's last look at the
+/// adapter. While such a REQ stays open its relay sends it everything it
+/// stores from that second on, so those seconds are not owed while it lasts.
+/// The ledger never holds them: nothing proves when an open REQ stopped
+/// delivering, so once its generation ends or breaks they are owed until a
+/// later EOSE or a fetch proves them. A tail never covers a second released
+/// for replay, which its REQ will not deliver again.
+///
+/// Debt that drives work (a unit's debt, its derived cursor, the capture
+/// fence) is the ledger's debt through [`LiveTails::owed_until`], read from
+/// [`AppClient::live_tails`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LiveTails(BTreeMap<(TransportReconciliationRoute, String), u64>);
+
+impl LiveTails {
+    /// The last second the ledger must prove on `relay` for `route` at
+    /// `now`: the second before a live tail starts there, else `now`.
+    pub(crate) fn owed_until(
+        &self,
+        route: &TransportReconciliationRoute,
+        relay: &str,
+        now: u64,
+    ) -> u64 {
+        self.0
+            .get(&(route.clone(), relay.to_owned()))
+            .map_or(now, |since| since.saturating_sub(1).min(now))
+    }
+
+    fn start(&mut self, route: &TransportReconciliationRoute, relay: &str, since: u64) {
+        self.0
+            .entry((route.clone(), relay.to_owned()))
+            .and_modify(|held| *held = (*held).min(since))
+            .or_insert(since);
+    }
+}
+
+/// What the live-boundary recorder keeps between observations.
+///
+/// A live REQ's count proves to the ledger only what its relay had stored
+/// when it ran the query: from [`live_boundary_since`] through the second
+/// before the count's `requested_at`, a stamp taken before the REQ went out.
+/// Past that the REQ vouches only provisionally, while it lasts
+/// ([`LiveTails`]).
+///
+/// A generation that loss may have reached proves nothing again. The
+/// recorder reads the un-cover generation before each observation of the
+/// adapter, so a generation that one observation did not see began after that
+/// observation's mark, and every loss imported since that mark (all of it
+/// account-wide until loss carries routes) is checked against every
+/// generation seen now. The first mark is read when the client opens; the
+/// shared adapter may still report generations an earlier session of the
+/// account saw begin, and loss imported before that mark could have reached
+/// them, so none of those is trusted.
+pub(crate) struct LiveCoverage {
+    mark: Option<RecoveryCoverageMark>,
+    /// Generations loss may have reached, while the adapter still reports
+    /// them.
+    broken: HashSet<GenerationKey>,
+    /// Generations whose count is settled: written, or unable to prove
+    /// anything. A count is written once.
+    settled: HashSet<GenerationKey>,
+    tails: LiveTails,
+}
+
+impl LiveCoverage {
+    /// `mark` is the un-cover generation read as the client opens, before it
+    /// observes `adapter`; `None` makes the first observation trust no
+    /// generation.
+    pub(crate) async fn open(
+        mark: Option<RecoveryCoverageMark>,
+        adapter: &MarmotRelayPlaneAccountAdapter,
+    ) -> Self {
+        let (_, _, inherited) = observe_live_counts(&adapter.replay_admission().await);
+        Self {
+            mark,
+            broken: inherited.into_keys().collect(),
+            settled: HashSet::new(),
+            tails: LiveTails::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn opened_at(mark: Option<RecoveryCoverageMark>) -> Self {
+        Self {
+            mark,
+            broken: HashSet::new(),
+            settled: HashSet::new(),
+            tails: LiveTails::default(),
+        }
+    }
+
+    /// Break every generation in `present` whose routes `lost` touches; with
+    /// no route list (account-wide loss, or a log that no longer reaches the
+    /// mark), every one.
+    fn break_reached(
+        &mut self,
+        present: &HashMap<GenerationKey, Vec<TransportReconciliationRoute>>,
+        lost: Option<&[TransportReconciliationRoute]>,
+    ) {
+        for (key, routes) in present {
+            if lost.is_none_or(|lost| lost.iter().any(|route| routes.contains(route))) {
+                self.broken.insert(key.clone());
+            }
+        }
+    }
+
+    /// The counts `facts` settle now, each with the range it proves on every
+    /// route its filter carries, if any: from [`live_boundary_since`]
+    /// through the second before its `requested_at`. Generations loss may
+    /// have reached prove nothing.
+    fn durable<'a>(
+        &self,
+        facts: &'a [LiveCountFact],
+    ) -> Vec<(&'a LiveCountFact, Option<(u64, u64)>)> {
+        facts
+            .iter()
+            .filter(|fact| {
+                fact.placed && !self.settled.contains(&fact.key) && !self.broken.contains(&fact.key)
+            })
+            .map(|fact| {
+                let range = live_boundary_since(fact.since, &fact.count)
+                    .map(|since| (since, fact.count.requested_at.saturating_sub(1)))
+                    .filter(|(since, until)| since <= until);
+                (fact, range)
+            })
+            .collect()
+    }
+
+    /// Where each healthy, open generation's tail starts on each route its
+    /// filter carries: at its count's `live_from` (its `requested_at`, or its
+    /// EOSE for a REQ the relay pool sent again), unless the relay sent no
+    /// stored event older than that, so it may have cut what it stored
+    /// after; then just past the oldest it sent. `released` moves a start on
+    /// a route past the seconds released for replay there, or drops it.
+    fn tails(
+        &self,
+        facts: &[LiveCountFact],
+        mut released: impl FnMut(&TransportReconciliationRoute, u64) -> Option<u64>,
+    ) -> LiveTails {
+        let mut tails = LiveTails::default();
+        for fact in facts
+            .iter()
+            .filter(|fact| !fact.ended && fact.placed && !self.broken.contains(&fact.key))
+        {
+            let count = &fact.count;
+            let since = match count.oldest {
+                Some(oldest) if count.events > 0 && oldest >= count.live_from => {
+                    oldest.saturating_add(1)
+                }
+                _ => count.live_from,
+            };
+            for route in &fact.routes {
+                if let Some(since) = released(route, since) {
+                    tails.start(route, &fact.key.1, since);
+                }
+            }
+        }
+        tails
+    }
+}
+
+/// One generation's count, copied out of the adapter's guard.
+struct LiveCountFact {
+    key: GenerationKey,
+    routes: Vec<TransportReconciliationRoute>,
+    since: u64,
+    count: ReplayLiveCount,
+    /// The relay closed the REQ or its connection dropped, or the relay
+    /// client no longer reports the connection its serial started on.
+    ended: bool,
+    /// The request's input reached durable placement.
+    placed: bool,
+}
+
+/// The first second a live REQ's count proves on one relay: the second after
+/// the oldest event the client saw before EOSE, and never before the REQ's
+/// `since`. A relay that cut its reply sent the newest events it stored, so
+/// everything newer than the oldest one it sent reached the client; the
+/// count says nothing about how many it sent, because the SDK drops some
+/// frames (an expired event, one its database deleted) without a word, so
+/// even a short reply may have been cut. An empty count proves nothing.
+fn live_boundary_since(since: u64, count: &ReplayLiveCount) -> Option<u64> {
+    count
+        .oldest
+        .filter(|_| count.events > 0)
+        .map(|oldest| oldest.saturating_add(1).max(since))
+}
+
+/// The adapter's live-REQ generations, copied out of its guard: whether its
+/// input is placed (the cursor seal's own guard), the counts that can prove,
+/// and every generation it reports with the routes its filter carries.
+fn observe_live_counts(
+    observation: &ReplayAdmissionStatus<'_>,
+) -> (
+    bool,
+    Vec<LiveCountFact>,
+    HashMap<GenerationKey, Vec<TransportReconciliationRoute>>,
+) {
+    let input_placed = !observation.pending && !observation.spill_pending;
+    let mut facts = Vec::new();
+    let mut present = HashMap::new();
+    for source in observation.sources() {
+        let routes = source
+            .group_routes()
+            .map(|id| TransportReconciliationRoute::Group(*id))
+            .collect::<Vec<_>>();
+        let routes = if routes.is_empty() {
+            vec![TransportReconciliationRoute::Inbox]
+        } else {
+            routes
+        };
+        let placed = source.placed();
+        for endpoint in source.endpoints() {
+            let relay = transport_nostr::canonical_relay(endpoint.endpoint().as_str());
+            let mut fact = |generation, count, ended| {
+                let key = (source.id().to_owned(), relay.clone(), generation);
+                present.insert(key.clone(), routes.clone());
+                if let Some(count) = count {
+                    facts.push(LiveCountFact {
+                        key,
+                        routes: routes.clone(),
+                        since: source.since(),
+                        count,
+                        ended,
+                        placed,
+                    });
+                }
+            };
+            // A count whose REQ the relay client no longer reports streaming
+            // has ended, whatever the adapter has heard: it is written, with
+            // no tail.
+            fact(
+                endpoint.generation(),
+                endpoint.live_count().filter(|_| endpoint.admitted()),
+                !endpoint.streaming(),
+            );
+            if let Some(ended) = endpoint.ended_count() {
+                fact(ended.generation, Some(ended.count), true);
+            }
+        }
+    }
+    (input_placed, facts, present)
 }
 
 /// A route the account currently subscribes, with the relays that certify it.
@@ -258,67 +510,118 @@ impl AppClient {
         }
     }
 
-    /// Every endpoint that admitted its live REQ's complete original window in
-    /// the current wire epoch covers that window up to now. The adapter resets
-    /// that fact on a new wire generation, so a reconnect proves nothing until
-    /// its own boundary is admitted again. Like the cursor seal, nothing is
-    /// recorded while loss is pending: queue loss drops deliveries after the
-    /// adapter placed them, without a new generation.
+    /// Record what live REQs prove, as live boundaries on each relay that
+    /// admitted its REQ's whole original window and counted its stored events
+    /// before EOSE: from [`live_boundary_since`] through the second before the
+    /// REQ went out, once per generation. Then find each healthy generation's
+    /// provisional tail
+    /// ([`LiveTails`]). Healthy means the cursor seal's guards: input placed,
+    /// no loss or spill hand-off pending. Loss may have dropped what a
+    /// generation delivered, so a generation it may have reached proves
+    /// nothing again (see [`LiveCoverage`]). Storage keeps released seconds
+    /// out of every live boundary.
     pub(crate) async fn record_native_coverage(&self, app: &SqliteAppStorage) {
-        let loss_pending = app.pending_recovery_demands().map(|demands| {
-            demands.iter().any(|demand| {
-                matches!(
-                    demand.cause,
-                    RecoveryCause::QueueLoss | RecoveryCause::NotificationLoss
-                )
-            })
-        });
-        match loss_pending {
-            Ok(false) => {}
-            Ok(true) => return,
+        self.record_native_coverage_at(app, unix_now_seconds())
+            .await;
+    }
+
+    pub(crate) async fn record_native_coverage_at(&self, app: &SqliteAppStorage, now: u64) {
+        let mut live = self.live_coverage.lock().await;
+        live.tails = LiveTails::default();
+        // Before the adapter: whatever this observation sees for the first
+        // time began after this mark.
+        let mark = match app.recovery_coverage_mark() {
+            Ok(mark) => mark,
             Err(error) => return log_failure("record_native_coverage", &error.into()),
-        }
-        let now = unix_now_seconds();
-        let mut facts: Vec<(TransportReconciliationRoute, String, u64)> = Vec::new();
-        {
+        };
+        let lost = match live.mark {
+            Some(previous) => match app.recovery_coverage_lost_since(previous) {
+                Ok(lost) => lost,
+                Err(error) => return log_failure("record_native_coverage", &error.into()),
+            },
+            None => None,
+        };
+        let (input_placed, facts, present) = {
             let observation = self.adapter.replay_admission().await;
-            for source in observation.sources() {
-                if !source.placed() {
-                    continue;
-                }
-                let routes = source
-                    .group_routes()
-                    .map(|id| TransportReconciliationRoute::Group(*id))
-                    .collect::<Vec<_>>();
-                let routes = if routes.is_empty() {
-                    vec![TransportReconciliationRoute::Inbox]
-                } else {
-                    routes
-                };
-                for endpoint in source.endpoints().filter(|endpoint| endpoint.admitted()) {
-                    for route in &routes {
-                        facts.push((
-                            route.clone(),
-                            transport_nostr::canonical_relay(endpoint.endpoint().as_str()),
-                            source.since().min(now),
-                        ));
-                    }
-                }
-            }
+            observe_live_counts(&observation)
+        };
+        live.broken.retain(|key| present.contains_key(key));
+        live.settled.retain(|key| present.contains_key(key));
+        live.break_reached(&present, lost.as_deref());
+        live.mark = Some(mark);
+        if !input_placed || self.delivery_loss_blocks_cursor() {
+            return;
         }
-        let slices = facts
+        let durable = live.durable(&facts);
+        let slices = durable
             .iter()
-            .map(|(route, relay, since)| RecoveryCoverageSlice {
-                route,
-                relay,
-                since_seconds: *since,
-                until_seconds: now,
-                proof: RecoveryCoverageProof::LiveBoundary,
+            .filter_map(|(fact, range)| range.map(|range| (fact, range)))
+            .flat_map(|(fact, (since, until))| {
+                fact.routes.iter().map(move |route| RecoveryCoverageSlice {
+                    route,
+                    relay: &fact.key.1,
+                    since_seconds: since,
+                    until_seconds: until,
+                    proof: RecoveryCoverageProof::LiveBoundary,
+                })
             })
             .collect::<Vec<_>>();
-        if let Err(error) = app.record_recovery_coverage(&slices, now) {
-            log_failure("record_native_coverage", &error.into());
+        match app.record_recovery_coverage_since(&slices, now, mark) {
+            Ok(true) => {
+                let settled = durable
+                    .iter()
+                    .map(|(fact, _)| fact.key.clone())
+                    .collect::<Vec<_>>();
+                live.settled.extend(settled);
+            }
+            Ok(false) => {
+                return tracing::debug!(target: TARGET, method = "record_native_coverage",
+                    slices = slices.len(), "un-cover log no longer reaches the observation's mark");
+            }
+            Err(error) => return log_failure("record_native_coverage", &error.into()),
         }
+        // Loss imported while the adapter was read may have reached a
+        // generation this observation saw: the write left its seconds out,
+        // and it gets no tail either.
+        match app.recovery_coverage_lost_since(mark) {
+            Ok(lost) => live.break_reached(&present, lost.as_deref()),
+            Err(error) => return log_failure("record_native_coverage", &error.into()),
+        }
+        // The adapter may also have ended a generation while the ledger was
+        // written (a `CLOSED` or reconnect it processed meanwhile): a tail
+        // stands only on a generation it still reports streaming, with the
+        // count this observation saw.
+        let (input_placed, streaming, _) = {
+            let observation = self.adapter.replay_admission().await;
+            observe_live_counts(&observation)
+        };
+        if !input_placed || self.delivery_loss_blocks_cursor() {
+            return;
+        }
+        let facts = facts
+            .into_iter()
+            .filter(|fact| {
+                streaming
+                    .iter()
+                    .any(|now| now.key == fact.key && now.count == fact.count && !now.ended)
+            })
+            .collect::<Vec<_>>();
+        live.tails = live.tails(&facts, |route, since| {
+            match app.recovery_coverage_newest_released(route, since) {
+                Ok(newest) => Some(newest.map_or(since, |second| second.saturating_add(1))),
+                Err(error) => {
+                    log_failure("record_native_coverage", &error.into());
+                    None
+                }
+            }
+        });
+    }
+
+    /// The live tails now: observes the adapter as
+    /// [`Self::record_native_coverage_at`] does, then returns what it found.
+    pub(crate) async fn live_tails(&self, app: &SqliteAppStorage, now: u64) -> LiveTails {
+        self.record_native_coverage_at(app, now).await;
+        self.live_coverage.lock().await.tails.clone()
     }
 
     /// A certified comparison covers its frozen window on each relay that
@@ -410,8 +713,8 @@ impl AppClient {
         &self,
         app: &SqliteAppStorage,
     ) -> Result<CoverageShadowReport, AppError> {
-        self.record_native_coverage(app).await;
         let now = unix_now_seconds();
+        self.record_native_coverage_at(app, now).await;
         let floor = retention_floor(now);
         let current = self.current_coverage_routes();
         let demands = app.pending_recovery_demands()?;
@@ -457,6 +760,8 @@ impl AppClient {
             .collect::<Vec<_>>();
         app.prune_recovery_coverage(floor, &certifying)?;
         let fence = app.recovery_revision_fence()?;
+        // Tails as of now, not as of the writes above.
+        let tails = self.live_tails(app, now).await;
 
         let mut report = CoverageShadowReport::default();
         let mut owed_routes = HashSet::new();
@@ -495,17 +800,28 @@ impl AppClient {
                     report.not_comparable += 1;
                     continue;
                 };
-                report.scopes_compared += 1;
                 // The ledger keeps nothing below the retained window: an
                 // older or unknown floor owes everything still retained.
                 let since = scope.plan.since_seconds.unwrap_or(floor).max(floor);
-                let until = scope.plan.until_seconds.min(now);
-                let ledger = app.recovery_coverage_covers(
-                    &route,
-                    &relays(&scope.plan.required_endpoints),
-                    since,
-                    until,
-                )?;
+                report.scopes_compared += 1;
+                let mut ledger = true;
+                for relay in relays(&scope.plan.required_endpoints) {
+                    // A live tail vouches for the rest while it lasts, as
+                    // replay admission does for the obligation.
+                    let until = scope
+                        .plan
+                        .until_seconds
+                        .min(tails.owed_until(&route, &relay, now));
+                    if !app.recovery_coverage_covers(
+                        &route,
+                        std::slice::from_ref(&relay),
+                        since,
+                        until,
+                    )? {
+                        ledger = false;
+                        break;
+                    }
+                }
                 let holds =
                     obligation_holds(&scope, demand.predicate, &fence, demand.ticket.revision);
                 match (holds, ledger) {
@@ -521,12 +837,18 @@ impl AppClient {
                 TransportReconciliationRoute::Inbox => inbox_owed,
                 TransportReconciliationRoute::Group(id) => owed_routes.contains(id),
             };
-            if !owed
-                && !app
-                    .recovery_coverage_debt(&route.route, &route.required, now)?
+            if owed {
+                continue;
+            }
+            for relay in &route.required {
+                let until = tails.owed_until(&route.route, relay, now);
+                if !app
+                    .recovery_coverage_debt(&route.route, std::slice::from_ref(relay), until)?
                     .is_empty()
-            {
-                report.unowed_debt_routes += 1;
+                {
+                    report.unowed_debt_routes += 1;
+                    break;
+                }
             }
         }
         Ok(report)
@@ -536,3 +858,7 @@ impl AppClient {
 #[cfg(test)]
 #[path = "recovery_coverage/scenario_tests.rs"]
 mod scenario_tests;
+
+#[cfg(test)]
+#[path = "recovery_coverage/live_boundary_tests.rs"]
+mod live_boundary_tests;

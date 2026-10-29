@@ -1210,7 +1210,8 @@ async fn reader_loss_refetches_seen() {
             panic!("the native reader must receive the small initial range intact");
         };
         match notification {
-            boundary @ NostrSdkNotification::Replay { .. } => {
+            boundary @ (NostrSdkNotification::Replay { .. }
+            | NostrSdkNotification::Disconnected { .. }) => {
                 assert!(
                     !dispatch_sdk_replay(boundary, &fx.adapter, None, &|reason| fx
                         .sdk

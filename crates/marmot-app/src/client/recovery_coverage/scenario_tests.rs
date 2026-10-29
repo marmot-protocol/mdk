@@ -18,24 +18,37 @@ use crate::tests::{
 };
 use crate::unix_now_seconds;
 
-const RELAY: &str = "wss://relay.example";
+pub(super) const RELAY: &str = "wss://relay.example";
+
+/// When the one stored event the fixture relay returns before each EOSE was
+/// created. It is older than every window the fixture asks for, which no
+/// real relay returns; it only makes each count prove its REQ's whole window,
+/// so scenarios can watch that proof come and go.
+pub(super) const STORED_AT: u64 = 1;
 
 /// The ledger's spelling of the fixture relay.
-fn relay() -> String {
+pub(super) fn relay() -> String {
     transport_nostr::canonical_relay(RELAY)
 }
 
-struct Fixture {
-    _dir: tempfile::TempDir,
-    _pump: ScriptedEosePump,
-    client: AppClient,
-    storage: SqliteAccountStorage,
-    group: cgka_traits::GroupId,
+pub(super) struct Fixture {
+    pub(super) _dir: tempfile::TempDir,
+    pub(super) _pump: ScriptedEosePump,
+    pub(super) relay: Arc<ScriptedPushRelayClient>,
+    pub(super) client: AppClient,
+    pub(super) storage: SqliteAccountStorage,
+    pub(super) group: cgka_traits::GroupId,
 }
 
 /// One account with one group and a checkpointed cursor whose live
 /// subscriptions have reached owner admission: the normal caught-up state.
-async fn fixture() -> Fixture {
+pub(super) async fn fixture() -> Fixture {
+    fixture_with_stored(Some(STORED_AT)).await
+}
+
+/// [`fixture`], with the relay returning one stored event created at
+/// `stored` before each EOSE, or none.
+pub(super) async fn fixture_with_stored(stored: Option<u64>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     crate::AccountHome::open(dir.path())
         .create_account("alice")
@@ -47,6 +60,7 @@ async fn fixture() -> Fixture {
         crate::MarmotAppConfig::white_noise(),
     )
     .with_test_relay_client(relay.clone());
+    *relay.stored_before_eose.lock().unwrap() = stored;
     let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut state = app.load_state("alice").unwrap();
     state.last_transport_timestamp = Some(unix_now_seconds().saturating_sub(60));
@@ -73,13 +87,37 @@ async fn fixture() -> Fixture {
     Fixture {
         _dir: dir,
         _pump: pump,
+        relay,
         client,
         storage,
         group,
     }
 }
 
-fn routes(client: &AppClient) -> Vec<TransportReconciliationRoute> {
+/// Start the account's REQs again, as a reconnect does, and wait until the
+/// new generation's boundaries are admitted.
+pub(super) async fn reactivate(fixture: &mut Fixture) {
+    fixture.client.prepare_transport().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            fixture.client.synchronize_native_replay().await.unwrap();
+            let observation = fixture.client.adapter.replay_admission().await;
+            if fixture
+                .client
+                .recovery_owner
+                .native_replay_authorizes(observation.generation())
+            {
+                break;
+            }
+            drop(observation);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the new generation reaches owner admission");
+}
+
+pub(super) fn routes(client: &AppClient) -> Vec<TransportReconciliationRoute> {
     client
         .current_coverage_routes()
         .into_iter()
@@ -87,7 +125,7 @@ fn routes(client: &AppClient) -> Vec<TransportReconciliationRoute> {
         .collect()
 }
 
-async fn report(fixture: &Fixture) -> CoverageShadowReport {
+pub(super) async fn report(fixture: &Fixture) -> CoverageShadowReport {
     fixture
         .client
         .coverage_shadow_report(&fixture.storage.app_storage())
@@ -95,7 +133,21 @@ async fn report(fixture: &Fixture) -> CoverageShadowReport {
         .unwrap()
 }
 
-async fn authorize(client: &mut AppClient) -> AttemptGrant {
+/// Whether `route` owes anything on the fixture relay at `now`, as debt that
+/// drives work reads it: the ledger's debt short of the live tail.
+pub(super) async fn owed(
+    fixture: &Fixture,
+    route: &TransportReconciliationRoute,
+    now: u64,
+) -> bool {
+    let app = fixture.storage.app_storage();
+    let tails = fixture.client.live_tails(&app, now).await;
+    !app.recovery_coverage_debt(route, &[relay()], tails.owed_until(route, &relay(), now))
+        .unwrap()
+        .is_empty()
+}
+
+pub(super) async fn authorize(client: &mut AppClient) -> AttemptGrant {
     client
         .authorize_account_recovery(
             None,
@@ -107,7 +159,7 @@ async fn authorize(client: &mut AppClient) -> AttemptGrant {
 }
 
 /// Every compared route's relay answers and certifies it.
-fn certified_routes(grant: &AttemptGrant) -> ScriptedComparisons {
+pub(super) fn certified_routes(grant: &AttemptGrant) -> ScriptedComparisons {
     grant
         .inventory
         .iter()
@@ -161,9 +213,9 @@ async fn ledger_and_obligations_agree_through_a_normal_catch_up() {
         );
         assert!(app.recovery_coverage_goal(route).unwrap() <= Some(floor));
     }
-    let owed = report(&fixture).await;
-    assert!(owed.agree_owed >= 2, "{owed:?}");
-    assert_eq!(owed.disagreements(), 0, "{owed:?}");
+    let pending = report(&fixture).await;
+    assert!(pending.agree_owed >= 2, "{pending:?}");
+    assert_eq!(pending.disagreements(), 0, "{pending:?}");
 
     // A certified pass settles the loss and covers its window again.
     fixture.client.test_comparison_results = Some(certified_routes(&grant));
@@ -188,11 +240,13 @@ async fn ledger_and_obligations_agree_through_a_normal_catch_up() {
                     && proved.range.since_seconds <= floor),
             "the certificate covers the loss window"
         );
-        assert!(
-            app.recovery_coverage_debt(route, &[relay()], unix_now_seconds())
-                .unwrap()
-                .is_empty()
-        );
+    }
+    // The loss ended the live tails it may have reached; the next
+    // generation's EOSE proves the time since the certificate.
+    reactivate(&mut fixture).await;
+    let now = unix_now_seconds();
+    for route in &routes {
+        assert!(!owed(&fixture, route, now).await);
     }
     let settled = report(&fixture).await;
     assert_eq!(settled.disagreements(), 0, "{settled:?}");
@@ -208,12 +262,9 @@ async fn pending_loss_keeps_live_boundaries_from_re_covering_it() {
     app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
         .unwrap();
     fixture.client.synchronize_recovery_loss(&app).unwrap();
-    fixture.client.record_native_coverage(&app).await;
     for route in routes(&fixture.client) {
         assert!(
-            !app.recovery_coverage_debt(&route, &[relay()], unix_now_seconds())
-                .unwrap()
-                .is_empty(),
+            owed(&fixture, &route, unix_now_seconds()).await,
             "the loss stays owed"
         );
     }
@@ -243,13 +294,13 @@ async fn routed_queue_loss_uncovers_only_its_routes() {
     )
     .unwrap();
     fixture.client.synchronize_recovery_loss(&app).unwrap();
-    fixture.client.record_native_coverage(&app).await;
+    let now = unix_now_seconds();
     for route in &routes {
-        let owed = !app
-            .recovery_coverage_debt(route, &[relay()], unix_now_seconds())
-            .unwrap()
-            .is_empty();
-        assert_eq!(owed, *route == group, "only the group lost deliveries");
+        assert_eq!(
+            owed(&fixture, route, now).await,
+            *route == group,
+            "only the group lost deliveries"
+        );
     }
 }
 
@@ -282,22 +333,22 @@ async fn a_restored_generations_new_loss_uncovers_its_routes() {
         .unwrap();
         fixture.client.synchronize_recovery_loss(&app).unwrap();
     };
-    let owed = |route: &TransportReconciliationRoute| {
-        !app.recovery_coverage_debt(route, &[relay()], unix_now_seconds())
-            .unwrap()
-            .is_empty()
+    let owed = async |route: &TransportReconciliationRoute| {
+        owed(&fixture, route, unix_now_seconds()).await
     };
     lose(41, 50, Some(&[(group.clone(), floor)]));
-    fixture.client.record_native_coverage(&app).await;
-    assert!(!owed(&inbox));
+    assert!(!owed(&inbox).await);
 
     // Restored after a restart: the plane counts new drops under a fresh
     // token.
     lose(42, 1, Some(&[(inbox.clone(), floor)]));
-    assert!(owed(&inbox), "the restored generation lost the inbox");
+    assert!(owed(&inbox).await, "the restored generation lost the inbox");
     lose(42, 2, None);
     for route in &routes {
-        assert!(owed(route), "a drop that named no route costs every route");
+        assert!(
+            owed(route).await,
+            "a drop that named no route costs every route"
+        );
     }
 }
 
@@ -553,11 +604,7 @@ async fn notification_lag_uncovers_every_route_from_its_floor() {
             "the lag un-covers its routes from the floor"
         );
         assert!(app.recovery_coverage_goal(route).unwrap() <= Some(floor));
-        assert!(
-            !app.recovery_coverage_debt(route, &[relay()], unix_now_seconds())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(owed(&fixture, route, unix_now_seconds()).await);
     }
 }
 
@@ -640,9 +687,9 @@ async fn retained_window_proof_puts_the_ledger_ahead(floor: Option<u64>) {
                 .is_none_or(|since| since < retained)),
         "the loss's scopes start below the retained window"
     );
-    let owed = report(&fixture).await;
-    assert!(owed.agree_owed >= 2, "{owed:?}");
-    assert_eq!(owed.disagreements(), 0, "{owed:?}");
+    let pending = report(&fixture).await;
+    assert!(pending.agree_owed >= 2, "{pending:?}");
+    assert_eq!(pending.disagreements(), 0, "{pending:?}");
     // What lies below the window is parked on every route, not dropped.
     let remainders = app.recovery_coverage_remainders().unwrap();
     for route in routes(&fixture.client) {
