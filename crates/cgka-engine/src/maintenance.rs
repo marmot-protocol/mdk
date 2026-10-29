@@ -419,15 +419,15 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<GroupRecoverySource, EngineError> {
         self.ensure_group_live(group_id)?;
         let record = self.storage.get_group(group_id)?;
+        if record.is_terminal() {
+            return Err(EngineError::NotAMember {
+                group_id: group_id.clone(),
+            });
+        }
         if self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
             && record.protocol_profile == cgka_traits::group::ProtocolProfile::Legacy
         {
             return Err(EngineError::GroupRecoverySourceMismatch {
-                group_id: group_id.clone(),
-            });
-        }
-        if record.is_terminal() {
-            return Err(EngineError::NotAMember {
                 group_id: group_id.clone(),
             });
         }
@@ -626,7 +626,13 @@ impl<S: StorageProvider> Engine<S> {
                 group_id: group_id.clone(),
             });
         }
-        if !record.unrecoverable || !self.epoch_manager.is_unrecoverable(group_id) {
+        let native_unrecoverable = self.epoch_manager.is_unrecoverable(group_id);
+        if record.unrecoverable != native_unrecoverable {
+            return Err(EngineError::GroupRecoveryUnsettled {
+                group_id: group_id.clone(),
+            });
+        }
+        if !record.unrecoverable {
             // A grant cannot authorize replacing a usable local copy. Waiting
             // for its epoch to settle never makes this same grant eligible.
             return Err(EngineError::GroupRecoverySourceMismatch {

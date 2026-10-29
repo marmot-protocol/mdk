@@ -48,7 +48,11 @@ async fn retained_welcome_retry_cutoff() {
     let policy = StaticTransportRouting::new(vec![inbox.clone()])
         .with_inbox_route(bob.self_id(), vec![inbox.clone()])
         .with_inbox_route(carol.self_id(), vec![inbox.clone()])
-        .with_group_route(group.clone(), group.as_slice().to_vec(), vec![endpoint]);
+        .with_group_route(
+            group.clone(),
+            group.as_slice().to_vec(),
+            vec![endpoint.clone()],
+        );
     let adapter = RecordingAdapter::default();
     adapter.fail_endpoints_as(
         vec![inbox],
@@ -108,6 +112,54 @@ async fn retained_welcome_retry_cutoff() {
     let delivered = runtime.redeliver_welcome(&unfinished).await.unwrap();
     assert!(delivered.welcome_failures.is_empty());
     assert!(runtime.has_pending_outbound_fanouts(&group).unwrap());
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        Some(30_000)
+    );
+    // A Welcome continuation is not the ordering barrier for a newer Commit.
+    let staged = runtime
+        .session_mut()
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    let PublishWork::GroupEvolution { msg, pending, .. } = &staged.publish[0] else {
+        panic!("expected staged self-update");
+    };
+    let TransportEnvelope::GroupMessage { transport_group_id } = &msg.envelope else {
+        panic!("expected group Commit");
+    };
+    let ready = OutboundFanout::stage(
+        TransportPublishRequest {
+            account_id: runtime.session().self_id(),
+            message: msg.clone(),
+            target: TransportPublishTarget::Group {
+                group_id: group.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint],
+            },
+            required_acks: 1,
+        },
+        Some(*pending),
+        Some(group.clone()),
+        100_001,
+    )
+    .unwrap();
+    runtime.session().put_outbound_fanout(&ready).unwrap();
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        Some(0)
+    );
+    runtime
+        .session()
+        .delete_outbound_fanout(ready.message_id())
+        .unwrap();
+    runtime
+        .session_mut()
+        .publish_failed(*pending)
+        .await
+        .unwrap();
     assert_eq!(
         runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
         Some(30_000)

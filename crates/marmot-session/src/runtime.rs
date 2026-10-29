@@ -3938,8 +3938,8 @@ where
             }))
     }
 
-    /// Return the earliest durable retry cutoff for the first incomplete frozen
-    /// fanout in `group_id`, including its retained Welcome publications.
+    /// Return the earliest durable retry cutoff up to the first fanout below
+    /// quorum or awaiting MLS confirmation, including earlier retained Welcomes.
     ///
     /// `None` means the group has no network retry cutoff to honor. It may
     /// still have local-only work, such as acknowledgement cleanup for an
@@ -3965,10 +3965,14 @@ where
                     return Ok(None);
                 }
                 if !fanout.pending_post_confirmation_welcomes().is_empty() {
-                    return self.welcome_retry_delay_ms(
+                    let Some(delay) = self.welcome_retry_delay_ms(
                         fanout.pending_post_confirmation_welcomes(),
                         now_ms,
-                    );
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    earliest = Some(earliest.map_or(delay, |prior: u64| prior.min(delay)));
                 }
                 continue;
             }
