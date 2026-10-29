@@ -186,7 +186,8 @@ pub struct RecoveryUnitSpan {
 }
 
 /// A route with at least one broken unit: one notice, whose revision is the
-/// newest park among them. Not `Debug`: it carries the route and relays.
+/// newest park among them and the route's remainder. Not `Debug`: it carries
+/// the route and relays.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecoveryParkedRoute {
     pub route: TransportReconciliationRoute,
@@ -194,6 +195,18 @@ pub struct RecoveryParkedRoute {
     /// The oldest park among its broken units.
     pub parked_at_seconds: u64,
     pub relays: Vec<String>,
+}
+
+/// Debt the retention floor overtook on a route while some relay still owed
+/// it: the earliest and latest such second. It is never fetched and never
+/// coverage; only a dismissal clears it. Not `Debug`: it carries the route.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RecoveryRouteRemainder {
+    pub route: TransportReconciliationRoute,
+    pub range: RecoveryCoverageRange,
+    pub revision: u64,
+    /// When the route's remainder was first parked.
+    pub parked_at_seconds: u64,
 }
 
 fn retirement_code(reason: RecoverySpanRetirement) -> i64 {
@@ -938,10 +951,111 @@ pub(crate) fn trim_spans_tx(
     replace_spans_tx(conn, route, relay, PARKED_SPAN, &kept_parked)
 }
 
+/// The retention floor is about to overtake each route's goal below `floor`.
+/// Whatever any of the route's `relays` still owes there (not covered on that
+/// relay and not retired; parked seconds are owed) joins the route's parked
+/// remainder, so the prune never makes debt vanish. With no relays, nothing
+/// covers the route and all of it is owed. Only seconds from the route's
+/// settled floor up count: an earlier prune parked or dropped everything
+/// below it and kept no coverage there, so a goal widened back below it
+/// parks nothing twice, and a dismissed remainder stays dismissed until loss
+/// lowers the settled floor. A route's first remainder takes a new park
+/// revision; a later one widens it under the same revision. Runs inside that
+/// prune, before it drops anything.
+pub(crate) fn park_overtaken_tx(
+    conn: &Connection,
+    floor: u64,
+    routes: &[(TransportReconciliationRoute, Vec<String>)],
+    now_seconds: u64,
+) -> StorageResult<()> {
+    let Some(top) = floor.checked_sub(1) else {
+        return Ok(());
+    };
+    for (route, relays) in routes {
+        let (kind, id) = route.storage_key();
+        let Some(since) = conn
+            .query_row_cached(
+                "SELECT MAX(since_seconds, settled_below_seconds)
+                 FROM account_recovery_coverage_goals
+                 WHERE route_kind = ?1 AND route_id = ?2
+                   AND MAX(since_seconds, settled_below_seconds) < ?3",
+                params![kind, id, integer(floor)?],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .storage()?
+        else {
+            continue;
+        };
+        let below = RecoveryCoverageRange {
+            since_seconds: i64_to_u64(since)?,
+            until_seconds: top,
+        };
+        let owed = if relays.is_empty() {
+            vec![below]
+        } else {
+            let mut owed = Vec::new();
+            for relay in relays {
+                let mut taken = relay_covered_tx(conn, route, relay)?;
+                taken.extend(
+                    spans_tx(conn, route, relay, RETIRED_SPAN)?
+                        .iter()
+                        .map(|span| span.range),
+                );
+                owed.extend(subtract(below, &union(taken)));
+            }
+            union(owed)
+        };
+        let (Some(first), Some(last)) = (owed.first(), owed.last()) else {
+            continue;
+        };
+        let (since, until) = (integer(first.since_seconds)?, integer(last.until_seconds)?);
+        let widened = conn
+            .execute_cached(
+                "UPDATE account_recovery_coverage_remainders
+                 SET since_seconds = MIN(since_seconds, ?3), until_seconds = MAX(until_seconds, ?4)
+                 WHERE route_kind = ?1 AND route_id = ?2",
+                params![kind, id, since, until],
+            )
+            .storage()?;
+        if widened == 0 {
+            let revision = next_park_revision_tx(conn)?;
+            conn.execute_cached(
+                "INSERT INTO account_recovery_coverage_remainders
+                 (route_kind, route_id, since_seconds, until_seconds, park_revision,
+                  parked_at_seconds)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![kind, id, since, until, revision, integer(now_seconds)?],
+            )
+            .storage()?;
+        }
+    }
+    Ok(())
+}
+
+/// The route's remainder revision, if it has one.
+fn remainder_revision_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+) -> StorageResult<Option<u64>> {
+    let (kind, id) = route.storage_key();
+    conn.query_row_cached(
+        "SELECT park_revision FROM account_recovery_coverage_remainders
+         WHERE route_kind = ?1 AND route_id = ?2",
+        params![kind, id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .storage()?
+    .map(i64_to_u64)
+    .transpose()
+}
+
 /// Drop parked and retired span parts below the retention floor, as the
 /// coverage prune does for ranges and goals, so every span stays inside the
 /// route's goal and any re-arm turns a parked span back into ordinary debt.
-/// Runs inside that prune.
+/// Parked parts were added to the route's remainder first. Runs inside that
+/// prune.
 pub(crate) fn prune_spans_tx(conn: &Connection, floor: i64) -> StorageResult<()> {
     conn.execute_cached(
         "DELETE FROM account_recovery_unit_spans WHERE until_seconds < ?1",
@@ -1224,9 +1338,10 @@ impl SqliteAppStorage {
     }
 
     /// Dismiss a parked route's notice: its broken units become retired with
-    /// a fresh budget for anything else they owe, and their parked spans are
-    /// retired as dismissed, never covered. Returns `false` when `revision` is
-    /// not the route's current park.
+    /// a fresh budget for anything else they owe, their parked spans are
+    /// retired as dismissed, never covered, and its remainder is gone. Returns
+    /// `false` when `revision` is not the route's current park: the newest
+    /// among its broken units and its remainder.
     pub fn dismiss_recovery_route_park(
         &self,
         route: &TransportReconciliationRoute,
@@ -1244,10 +1359,17 @@ impl SqliteAppStorage {
                 .iter()
                 .filter_map(|unit| unit.park)
                 .map(|park| park.revision)
+                .chain(remainder_revision_tx(&conn, route)?)
                 .max();
             if current != Some(revision) {
                 return Ok(false);
             }
+            conn.execute_cached(
+                "DELETE FROM account_recovery_coverage_remainders
+                 WHERE route_kind = ?1 AND route_id = ?2",
+                params![kind, id],
+            )
+            .storage()?;
             for unit in &broken {
                 let mut retired = spans_tx(&conn, route, &unit.relay, RETIRED_SPAN)?;
                 retired.extend(
@@ -1499,9 +1621,11 @@ impl SqliteAppStorage {
         Ok(Some(u64::MAX))
     }
 
-    /// Every route with a broken unit, one notice each.
+    /// Every route with a broken unit, one notice each. Its revision also
+    /// covers the route's remainder, so dismissing the notice clears both.
     pub fn parked_recovery_routes(&self) -> StorageResult<Vec<RecoveryParkedRoute>> {
-        let units = units_tx(&*self.lock()?, "WHERE state = 1", [])?;
+        let conn = self.lock()?;
+        let units = units_tx(&conn, "WHERE state = 1", [])?;
         let mut routes: Vec<RecoveryParkedRoute> = Vec::new();
         for unit in units {
             let park = unit.park.ok_or_else(invalid)?;
@@ -1519,7 +1643,50 @@ impl SqliteAppStorage {
                 }),
             }
         }
+        for parked in &mut routes {
+            if let Some(revision) = remainder_revision_tx(&conn, &parked.route)? {
+                parked.revision = parked.revision.max(revision);
+            }
+        }
         Ok(routes)
+    }
+
+    /// Every route's parked remainder, by route.
+    pub fn recovery_coverage_remainders(&self) -> StorageResult<Vec<RecoveryRouteRemainder>> {
+        let conn = self.lock()?;
+        let rows = conn
+            .prepare_cached(
+                "SELECT route_kind, route_id, since_seconds, until_seconds, park_revision,
+                 parked_at_seconds FROM account_recovery_coverage_remainders
+                 ORDER BY route_kind, route_id",
+            )
+            .storage()?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        rows.into_iter()
+            .map(|(kind, id, since, until, revision, parked_at)| {
+                Ok(RecoveryRouteRemainder {
+                    route: route_from(kind, &id)?,
+                    range: RecoveryCoverageRange {
+                        since_seconds: i64_to_u64(since)?,
+                        until_seconds: i64_to_u64(until)?,
+                    },
+                    revision: i64_to_u64(revision)?,
+                    parked_at_seconds: i64_to_u64(parked_at)?,
+                })
+            })
+            .collect()
     }
 
     /// The unit's debt up to `until_seconds`: its route's goal minus what this

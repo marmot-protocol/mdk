@@ -270,7 +270,12 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   generation before a fetch, and `record_recovery_coverage_since` subtracts from its slices every range un-covered
   on their routes after the mark, or records nothing once the log (an hour, at most 4,096 rows) no longer reaches
   back to it. `prune_recovery_coverage` drops coverage below the retention floor, raises goals to it and ages the log;
-  pruning is not an un-cover. The ledger is in shadow mode: no obligation, retry, fence or schedule reads it.
+  pruning is not an un-cover. First, what each route the caller passes still owes below the floor on any of its
+  certifying relays joins the route's parked remainder (migration 0130): one range per route under a park revision,
+  never coverage, cleared only by dismissal. The prune then marks every route settled below its floor, and a later
+  prune parks only from that mark up, so a goal widened back below it parks nothing twice; loss lowers the mark to its
+  floor. A released receipt below the window changes nothing in the ledger (its coverage stays until the prune), so only loss parks debt from below it. The ledger is in
+  shadow mode: no obligation, retry, fence or schedule reads it.
 - **Retry state and staging (`recovery_units.rs`, `recovery_staging.rs`, migration 0127, mdk#2660).** One row per
   `(route, relay)` unit holds the recovery runner's retry state: active, broken (no progress or refused, with a park
   revision and one probe a newer loss can earn) or retired, plus backoff, fencing, slicing, planned relay caps and

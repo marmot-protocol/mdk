@@ -450,7 +450,7 @@ impl ChargedLoss {
                     // Its coverage went with the account-wide floor, but that
                     // widens only goals the ledger already holds, and this
                     // route may have left current routing.
-                    crate::app::recovery_coverage::widen_goal(conn, &route, floor)?
+                    crate::app::recovery_coverage::reopen_goal(conn, &route, floor)?
                 }
                 _ => {
                     crate::app::recovery_coverage::uncover_route_loss_tx(conn, &route, bound, now)?

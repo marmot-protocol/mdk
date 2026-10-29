@@ -643,6 +643,16 @@ async fn retained_window_proof_puts_the_ledger_ahead(floor: Option<u64>) {
     let owed = report(&fixture).await;
     assert!(owed.agree_owed >= 2, "{owed:?}");
     assert_eq!(owed.disagreements(), 0, "{owed:?}");
+    // What lies below the window is parked on every route, not dropped.
+    let remainders = app.recovery_coverage_remainders().unwrap();
+    for route in routes(&fixture.client) {
+        let remainder = remainders
+            .iter()
+            .find(|remainder| remainder.route == route)
+            .expect("the loss parks the rest of its range");
+        assert!(remainder.range.since_seconds <= floor.unwrap_or(0));
+        assert!(remainder.range.until_seconds + 1 >= retained);
+    }
 
     let now = unix_now_seconds();
     let relay = relay();
@@ -662,6 +672,17 @@ async fn retained_window_proof_puts_the_ledger_ahead(floor: Option<u64>) {
     let ahead = report(&fixture).await;
     assert!(ahead.ledger_ahead >= 2, "{ahead:?}");
     assert_eq!(ahead.agree_owed, 0, "{ahead:?}");
+
+    // Every report widens the pending loss's goals back below the floor, but
+    // a prune settled what lies there, so a dismissal sticks.
+    for remainder in app.recovery_coverage_remainders().unwrap() {
+        assert!(
+            app.dismiss_recovery_route_park(&remainder.route, remainder.revision)
+                .unwrap()
+        );
+    }
+    report(&fixture).await;
+    assert!(app.recovery_coverage_remainders().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -673,4 +694,98 @@ async fn unknown_loss_floor_is_owed_from_the_retention_floor() {
 async fn loss_floor_older_than_retention_is_owed_from_the_retention_floor() {
     let floor = unix_now_seconds() - TRANSPORT_RECONCILIATION_RETENTION_SECS - 86_400;
     retained_window_proof_puts_the_ledger_ahead(Some(floor)).await;
+}
+
+/// A group copy's Welcome time starts only its route's standing goal, never
+/// below the retained window: loss below it still owes from its own floor,
+/// and explicit repair wants the whole window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copys_welcome_time_starts_only_its_standing_goal() {
+    use cgka_traits::storage::GroupStorage;
+    let fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let now = unix_now_seconds();
+    let welcome_at = now - 6 * 60 * 60;
+    let mut record = fixture.storage.get_group(&fixture.group).unwrap();
+    record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+    fixture.storage.put_group(&record).unwrap();
+    let current = fixture.client.current_coverage_routes();
+    let group_route = current
+        .iter()
+        .find(|current| current.group_id.as_deref() == Some(fixture.group.as_slice()))
+        .expect("the group is subscribed")
+        .route
+        .clone();
+    let welcome_floor = crate::history_floor(welcome_at).0;
+    for current in &current {
+        let expected = if current.route == group_route {
+            welcome_floor
+        } else {
+            super::retention_floor(now)
+        };
+        assert_eq!(fixture.client.standing_floor(current, now), expected);
+    }
+    assert_eq!(
+        app.recovery_coverage_goal(&group_route).unwrap(),
+        None,
+        "nothing wanted the new group's route yet"
+    );
+
+    fixture
+        .client
+        .record_coverage_request(RecoveryCause::IncrementalHistory);
+    assert_eq!(
+        app.recovery_coverage_goal(&group_route).unwrap(),
+        Some(welcome_floor)
+    );
+    for route in routes(&fixture.client) {
+        if route != group_route {
+            assert!(
+                app.recovery_coverage_goal(&route).unwrap() <= Some(super::retention_floor(now))
+            );
+        }
+    }
+
+    // Loss from before the Welcome owes from its own floor.
+    let lost_from = welcome_at - 60 * 60;
+    app.record_account_recovery_loss_bounded(
+        "alice",
+        storage_sqlite::RecoveryLossCause::NotificationConsumer,
+        7,
+        0,
+        unix_now_seconds(),
+        Some(lost_from),
+    )
+    .unwrap();
+    fixture.client.synchronize_recovery_loss(&app).unwrap();
+    assert_eq!(
+        app.recovery_coverage_goal(&group_route).unwrap(),
+        Some(lost_from)
+    );
+
+    // Explicit repair wants the whole window, and nothing below it.
+    fixture
+        .client
+        .record_coverage_request(RecoveryCause::ExplicitHistory);
+    let goal = app.recovery_coverage_goal(&group_route).unwrap().unwrap();
+    assert!(goal >= super::retention_floor(now));
+    assert!(goal <= super::retention_floor(unix_now_seconds()));
+
+    // A Welcome older than the window starts nothing below it, and one still
+    // ahead of now (the joining clock ran fast) is ignored, even inside the
+    // allowance.
+    for welcome_at in [
+        now - TRANSPORT_RECONCILIATION_RETENTION_SECS - 60 * 60,
+        now + 10 * 60,
+        now + 60 * 60,
+    ] {
+        record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+        fixture.storage.put_group(&record).unwrap();
+        for current in &fixture.client.current_coverage_routes() {
+            assert_eq!(
+                fixture.client.standing_floor(current, now),
+                super::retention_floor(now)
+            );
+        }
+    }
 }

@@ -662,9 +662,20 @@ fn state_survives_a_reopen() {
     );
 }
 
+fn remainder(
+    app: &SqliteAppStorage,
+    route: &TransportReconciliationRoute,
+) -> Option<RecoveryRouteRemainder> {
+    app.recovery_coverage_remainders()
+        .unwrap()
+        .into_iter()
+        .find(|remainder| &remainder.route == route)
+}
+
 /// The retention prune trims parked and retired spans at its floor, as it
 /// does coverage and goals, so a later re-arm owes exactly what the window
-/// still holds.
+/// still holds. The parked seconds it overtakes join the route's remainder;
+/// dismissed ones do not.
 #[test]
 fn the_retention_prune_trims_spans_at_its_floor() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
@@ -676,7 +687,16 @@ fn the_retention_prune_trims_spans_at_its_floor() {
     }
     let revision = unit(&app, &retired, RELAY).park.unwrap().revision;
     assert!(app.dismiss_recovery_route_park(&retired, revision).unwrap());
-    app.prune_recovery_coverage(NOW - 200).unwrap();
+    let routes = [
+        (parked.clone(), vec![RELAY.to_owned()]),
+        (retired.clone(), vec![RELAY.to_owned()]),
+    ];
+    app.prune_recovery_coverage(NOW - 200, &routes).unwrap();
+    assert_eq!(
+        remainder(&app, &parked).unwrap().range,
+        range(NOW - 500, NOW - 201)
+    );
+    assert!(remainder(&app, &retired).is_none());
     assert_eq!(
         app.recovery_unit_spans(&parked, RELAY).unwrap(),
         vec![RecoveryUnitSpan {
@@ -699,10 +719,256 @@ fn the_retention_prune_trims_spans_at_its_floor() {
             "repair owes the window's part of every span"
         );
     }
-    app.prune_recovery_coverage(NOW + 1).unwrap();
+    app.prune_recovery_coverage(NOW + 1, &routes).unwrap();
     for route in [&parked, &retired] {
         assert!(app.recovery_unit_spans(route, RELAY).unwrap().is_empty());
     }
+    assert_eq!(
+        remainder(&app, &parked).unwrap().range,
+        range(NOW - 500, NOW)
+    );
+    assert_eq!(
+        remainder(&app, &retired).unwrap().range,
+        range(NOW - 200, NOW),
+        "repair made the dismissed span owed again"
+    );
+}
+
+/// The prune parks, before raising a goal, what any certifying relay still
+/// owes below the floor: one range per route, from the earliest to the latest
+/// such second, under one revision however often it widens. A route the
+/// caller leaves out, or one every relay covers, parks nothing.
+#[test]
+fn the_retention_prune_parks_overtaken_debt() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let (owed, covered, left_out, bare) = (group(1), group(2), group(3), group(4));
+    for route in [&owed, &covered, &left_out, &bare] {
+        app.widen_recovery_coverage_goals(std::slice::from_ref(route), NOW - 1_000)
+            .unwrap();
+    }
+    cover(&app, &owed, RELAY, (NOW - 1_000, NOW - 701));
+    cover(&app, &owed, RELAY, (NOW - 600, NOW));
+    cover(&app, &owed, OTHER, (NOW - 1_000, NOW - 801));
+    cover(&app, &owed, OTHER, (NOW - 700, NOW));
+    cover(&app, &covered, RELAY, (NOW - 1_000, NOW));
+    let both = vec![RELAY.to_owned(), OTHER.to_owned()];
+    let routes = [
+        (owed.clone(), both.clone()),
+        (covered.clone(), vec![RELAY.to_owned()]),
+        (bare.clone(), Vec::new()),
+    ];
+    app.prune_recovery_coverage(NOW - 500, &routes).unwrap();
+    let first = remainder(&app, &owed).unwrap();
+    assert_eq!(first.range, range(NOW - 800, NOW - 601));
+    assert!(first.parked_at_seconds >= NOW, "parked when the prune ran");
+    assert!(first.revision > 0);
+    assert!(remainder(&app, &covered).is_none());
+    assert!(remainder(&app, &left_out).is_none());
+    assert_eq!(
+        remainder(&app, &bare).unwrap().range,
+        range(NOW - 1_000, NOW - 501),
+        "a route no relay certifies owes all of it"
+    );
+    assert_eq!(app.recovery_coverage_goal(&owed).unwrap(), Some(NOW - 500));
+
+    // Coverage the prune keeps parks nothing more; new loss above it does.
+    app.prune_recovery_coverage(NOW - 400, &routes).unwrap();
+    assert!(remainder(&app, &owed).unwrap() == first);
+    app.uncover_recovery_coverage(std::slice::from_ref(&owed), NOW - 450)
+        .unwrap();
+    app.prune_recovery_coverage(NOW - 300, &routes).unwrap();
+    let widened = remainder(&app, &owed).unwrap();
+    assert_eq!(widened.range, range(NOW - 800, NOW - 301));
+    assert_eq!(widened.revision, first.revision);
+}
+
+/// Loss from below the window, or from an unknown bound, owes the window and
+/// parks the rest at the next prune.
+#[test]
+fn loss_below_the_window_parks_the_rest() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let (known, unknown) = (group(1), group(2));
+    for route in [&known, &unknown] {
+        owing(&app, route, NOW - 500, (NOW - 500, NOW));
+    }
+    app.uncover_recovery_coverage(std::slice::from_ref(&known), NOW - 2_000)
+        .unwrap();
+    app.uncover_recovery_coverage(std::slice::from_ref(&unknown), 0)
+        .unwrap();
+    let routes = [
+        (known.clone(), vec![RELAY.to_owned()]),
+        (unknown.clone(), vec![RELAY.to_owned()]),
+    ];
+    app.prune_recovery_coverage(NOW - 500, &routes).unwrap();
+    assert_eq!(
+        remainder(&app, &known).unwrap().range,
+        range(NOW - 2_000, NOW - 501)
+    );
+    assert_eq!(
+        remainder(&app, &unknown).unwrap().range,
+        range(0, NOW - 501)
+    );
+    for route in [&known, &unknown] {
+        assert_eq!(
+            app.recovery_unit_debt(route, RELAY, NOW).unwrap(),
+            vec![range(NOW - 500, NOW)]
+        );
+    }
+}
+
+/// Nothing below the retention window is owed, so releasing an event from
+/// there reopens no dismissed span and breaks no retired unit. (`NOW` is far
+/// below the real window.)
+#[test]
+fn a_release_below_the_window_reopens_no_span() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    let revision = break_unit(&app, &route, NOW).park.unwrap().revision;
+    assert!(app.dismiss_recovery_route_park(&route, revision).unwrap());
+    let retired = app.recovery_unit_spans(&route, RELAY).unwrap();
+    storage
+        .connection
+        .with_transaction(|| {
+            crate::app::recovery_coverage::uncover_second_tx(&*storage.lock()?, &route, NOW - 300)
+        })
+        .unwrap();
+    assert!(matches!(
+        unit(&app, &route, RELAY).state,
+        RecoveryUnitState::Retired
+    ));
+    assert!(app.recovery_unit_spans(&route, RELAY).unwrap() == retired);
+    assert_eq!(
+        app.recovery_coverage_goal(&route).unwrap(),
+        Some(NOW - 1_000)
+    );
+}
+
+/// A route's notice covers its broken units and its remainder under the
+/// newest revision among them; dismissing it with that revision clears
+/// both, and a stale revision, or another route's, clears nothing.
+#[test]
+fn dismissal_clears_the_remainder_under_the_routes_newest_park() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let (alone, both) = (group(1), group(2));
+    for route in [&alone, &both] {
+        app.widen_recovery_coverage_goals(std::slice::from_ref(route), NOW - 1_000)
+            .unwrap();
+    }
+    owing(&app, &both, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    let park = break_unit(&app, &both, NOW).park.unwrap().revision;
+    let routes = [
+        (alone.clone(), vec![RELAY.to_owned()]),
+        (both.clone(), vec![RELAY.to_owned()]),
+    ];
+    // `both` owes nothing below the floor until new loss lands there.
+    app.uncover_recovery_coverage(std::slice::from_ref(&both), NOW - 900)
+        .unwrap();
+    app.prune_recovery_coverage(NOW - 800, &routes).unwrap();
+    let alone_revision = remainder(&app, &alone).unwrap().revision;
+    let both_revision = remainder(&app, &both).unwrap().revision;
+    assert!(both_revision > park);
+    let parked = app.parked_recovery_routes().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].revision, both_revision);
+
+    assert!(!app.dismiss_recovery_route_park(&both, park).unwrap());
+    assert!(!app.dismiss_recovery_route_park(&alone, park).unwrap());
+    assert!(
+        app.dismiss_recovery_route_park(&both, both_revision)
+            .unwrap()
+    );
+    assert!(remainder(&app, &both).is_none());
+    assert!(matches!(
+        unit(&app, &both, RELAY).state,
+        RecoveryUnitState::Retired
+    ));
+    assert!(
+        app.dismiss_recovery_route_park(&alone, alone_revision)
+            .unwrap()
+    );
+    assert!(remainder(&app, &alone).is_none());
+    assert!(
+        !app.dismiss_recovery_route_park(&alone, alone_revision)
+            .unwrap()
+    );
+}
+
+/// A prune settles each route below its floor. Widening a goal back below
+/// it, as the report does for pending loss every time, parks nothing twice:
+/// not history that was covered before the prune dropped its coverage, and
+/// not a remainder that was dismissed. Only new loss reopens it.
+#[test]
+fn a_goal_widened_back_below_the_settled_floor_parks_nothing_twice() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let (partial, covered) = (group(1), group(2));
+    for route in [&partial, &covered] {
+        app.uncover_recovery_coverage(std::slice::from_ref(route), NOW - 1_000)
+            .unwrap();
+    }
+    cover(&app, &partial, RELAY, (NOW - 1_000, NOW - 801));
+    cover(&app, &partial, RELAY, (NOW - 600, NOW));
+    cover(&app, &covered, RELAY, (NOW - 1_000, NOW));
+    let routes = [
+        (partial.clone(), vec![RELAY.to_owned()]),
+        (covered.clone(), vec![RELAY.to_owned()]),
+    ];
+    app.prune_recovery_coverage(NOW - 500, &routes).unwrap();
+    let first = remainder(&app, &partial).unwrap();
+    assert_eq!(first.range, range(NOW - 800, NOW - 601));
+    assert!(remainder(&app, &covered).is_none());
+
+    // The report restores the pending loss's goal before every prune.
+    for floor in [NOW - 500, NOW - 400] {
+        app.widen_recovery_coverage_goals(&[partial.clone(), covered.clone()], NOW - 1_000)
+            .unwrap();
+        app.prune_recovery_coverage(floor, &routes).unwrap();
+        assert!(remainder(&app, &partial).unwrap() == first);
+        assert!(
+            remainder(&app, &covered).is_none(),
+            "covered before the prune"
+        );
+    }
+
+    assert!(
+        app.dismiss_recovery_route_park(&partial, first.revision)
+            .unwrap()
+    );
+    app.widen_recovery_coverage_goals(std::slice::from_ref(&partial), NOW - 1_000)
+        .unwrap();
+    app.prune_recovery_coverage(NOW - 400, &routes).unwrap();
+    assert!(remainder(&app, &partial).is_none(), "a dismissal sticks");
+
+    // New loss from below the settled floor parks again, under a new notice.
+    app.uncover_recovery_coverage(std::slice::from_ref(&partial), NOW - 900)
+        .unwrap();
+    app.prune_recovery_coverage(NOW - 400, &routes).unwrap();
+    let reopened = remainder(&app, &partial).unwrap();
+    assert_eq!(reopened.range, range(NOW - 900, NOW - 401));
+    assert!(reopened.revision > first.revision);
+}
+
+/// A prune settles a route it was not given too: what it owed below the floor
+/// is dropped once, and widening its goal back later parks none of it.
+#[test]
+fn a_route_left_out_stays_settled_when_its_goal_widens_back() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    app.uncover_recovery_coverage(std::slice::from_ref(&route), NOW - 1_000)
+        .unwrap();
+    cover(&app, &route, RELAY, (NOW - 1_000, NOW));
+    app.prune_recovery_coverage(NOW - 500, &[]).unwrap();
+    app.widen_recovery_coverage_goals(std::slice::from_ref(&route), NOW - 1_000)
+        .unwrap();
+    app.prune_recovery_coverage(NOW - 500, &[(route.clone(), vec![RELAY.to_owned()])])
+        .unwrap();
+    assert!(remainder(&app, &route).is_none());
 }
 
 /// Any coverage write on the unit's relay trims its spans, and covering the
