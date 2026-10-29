@@ -232,8 +232,8 @@ async fn a_queued_admin_policy_edit_refused_after_demotion_is_retired() {
 }
 
 /// An Invite whose KeyPackage a direct send would refuse is refused when sent
-/// during convergence, not queued: a bad signature fails as `Backend`, which
-/// the drain holds, so the queued Invite would never leave the queue.
+/// during convergence, not queued: the sender is answered at once, as from a
+/// direct send, rather than by a later refusal announcement.
 #[tokio::test]
 async fn an_invite_with_a_bad_key_package_signature_is_refused_before_it_is_queued() {
     let (mut alice, _alice_storage) = build_client(b"alice");

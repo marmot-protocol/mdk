@@ -24,18 +24,22 @@
 //! The drain decides from the group's gates, not from an error's text, because
 //! one error type carries both kinds: an `InvalidTransition` is a lifecycle
 //! hold ("send requires Stable") or a verdict (strict cutover refusing an
-//! Invite into a legacy group) depending on where it came from. OpenMLS
-//! storage failures surface as `Backend`, so `Backend` is held like the
-//! Welcome path's retryable errors (`terminal_welcome_error`); a
-//! deterministic `Backend` failure is an engine defect, not a refusal.
+//! Invite into a legacy group) depending on where it came from.
 //!
-//! KeyPackage validation is the known exception: a bad signature surfaces as
-//! `Backend`. Its checks read nothing of the group's state, so an intent's
-//! KeyPackages are checked before it is queued
-//! ([`Engine::check_queued_key_packages`]), answered as a direct send would
-//! answer them then, and a drain does not meet that failure. A lifetime is
-//! checked against the clock at both points: a package not yet valid is
-//! refused when queued, and one that expires while queued is refused at drain.
+//! `Backend` is a refusal. The engine maps every OpenMLS error to it, and
+//! most are verdicts on the intent: a KeyPackage whose signature fails, a
+//! same-account Add of a device already in the group. Holding `Backend` would
+//! leave each of those failing every later drain. The cost is an OpenMLS
+//! storage failure during a drain: it retires that one intent and announces
+//! it, as a direct send's failure leaves nothing behind, and the user may ask
+//! again. `Storage` errors, which the engine's own writes raise, stay held.
+//!
+//! An intent's KeyPackages are also checked before it is queued
+//! ([`Engine::check_queued_key_packages`]): those checks read nothing of the
+//! group's state, so the sender learns of a bad package at once, as from a
+//! direct send, rather than from a later announcement. A lifetime is checked
+//! against the clock at both points: a package not yet valid is refused when
+//! queued, and one that expires while queued is refused at drain.
 //!
 //! The announcement rides `events_buf` like `LocalGroupCopyTerminated`'s: a
 //! crash between the durable retirement and the host draining events loses
@@ -64,7 +68,6 @@ pub(crate) enum QueuedPreparationFailure {
 fn reports_the_device(error: &EngineError) -> bool {
     match error {
         EngineError::Storage(_)
-        | EngineError::Backend(_)
         | EngineError::Peeler(_)
         | EngineError::UnknownGroup(_)
         | EngineError::GroupNotHydrated(_)
@@ -94,6 +97,8 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::LinkDeviceUnsettled { .. }
         | EngineError::InvalidTransition(_)
         | EngineError::Serialize(_)
+        // Every OpenMLS error, verdicts included; see the module docs.
+        | EngineError::Backend(_)
         | EngineError::InvalidWelcome
         | EngineError::MissingWelcomeKeyPackage
         | EngineError::WelcomeNotAddressedToThisDevice
@@ -104,9 +109,8 @@ fn reports_the_device(error: &EngineError) -> bool {
 
 impl<S: StorageProvider> Engine<S> {
     /// Refuse now an intent whose KeyPackages a direct send would refuse now.
-    /// Run before it is queued: the drain holds the `Backend` error a bad
-    /// signature raises, so a queued intent carrying one would never leave
-    /// the queue.
+    /// Run before it is queued, so the sender is answered at once rather than
+    /// by a later [`GroupEvent::QueuedIntentRefused`].
     pub(crate) fn check_queued_key_packages(&self, intent: &SendIntent) -> Result<(), EngineError> {
         let (SendIntent::Invite { key_packages, .. }
         | SendIntent::AddOwnAccountDevices { key_packages, .. }) = intent

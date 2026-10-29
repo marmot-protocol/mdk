@@ -651,3 +651,72 @@ async fn without_account_devices_a_same_account_intent_takes_no_fairness_attempt
         "the skipped same-account intent stays queued"
     );
 }
+
+/// A same-account Add of a device already in the group is refused by OpenMLS
+/// (a repeated signature key), which surfaces as `Backend`. Queued, it is
+/// retired and announced like any other refusal, and the self-update queued
+/// behind it drains (mdk#2694).
+#[tokio::test]
+async fn a_queued_add_of_a_device_already_in_the_group_is_retired() {
+    let mut m = members(true).await;
+    let gid = m.gid.clone();
+    let present = m.bob_sibling.engine.fresh_key_package().await.unwrap();
+    queue(
+        &m.bob,
+        &gid,
+        b"queued-0",
+        add_own_devices(&gid, vec![present]),
+    );
+    let self_update = SendIntent::SelfUpdate {
+        group_id: gid.clone(),
+    };
+    queue(&m.bob, &gid, b"queued-1", self_update.clone());
+    m.bob.engine.drain_events();
+
+    let mut drained = Vec::new();
+    let mut refusals = Vec::new();
+    for pass in 0..3 {
+        drained.extend(
+            m.bob
+                .engine
+                .converge_and_drain_queued_outbound_intents(&gid, 3_000_000 + pass)
+                .await
+                .expect("a refused queued intent must not fail the drain"),
+        );
+        refusals.extend(
+            m.bob
+                .engine
+                .drain_events()
+                .into_iter()
+                .filter_map(|event| match event {
+                    GroupEvent::QueuedIntentRefused {
+                        intent_id,
+                        intent_kind,
+                        reason,
+                        ..
+                    } => Some((intent_id, intent_kind, reason)),
+                    _ => None,
+                }),
+        );
+    }
+    assert_eq!(
+        refusals,
+        vec![(
+            MessageId::new(b"queued-0".to_vec()),
+            "add_own_account_devices".to_string(),
+            "backend".to_string()
+        )]
+    );
+    let [SendResult::GroupEvolution { .. }] = &drained[..] else {
+        panic!("expected the self-update behind the refused Add, got {drained:?}")
+    };
+    let queued = m
+        .bob
+        .storage
+        .list_queued_outbound_intents(&gid)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.intent)
+        .collect::<Vec<_>>();
+    assert_eq!(queued, vec![self_update], "only the in-flight self-update");
+}

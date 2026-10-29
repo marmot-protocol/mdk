@@ -425,9 +425,10 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   (`reports_the_device`, an exhaustive match: classify a new `EngineError` variant there), or that came while a
   group-wide gate was closed, keeps the record and fails the drain as before. Classify by the gates, never by an
   error's text: one `InvalidTransition` is a hold or a verdict depending on its source. Returning a refusal from the
-  drain instead wedges the group's queue, every later drain failing on the same record (mdk#2694). A check that reads
-  no group state and can fail as a held error runs before queueing instead: an intent's KeyPackages
-  (`check_queued_key_packages`; a bad signature is `Backend`). Pinned by
+  drain instead wedges the group's queue, every later drain failing on the same record (mdk#2694). `Backend` is a
+  refusal, not a hold: the engine maps every OpenMLS error to it, verdicts included (a bad KeyPackage signature, a
+  same-account Add of a device already in the group). An intent's KeyPackages are also checked before it is queued
+  (`check_queued_key_packages`), so a bad one is answered at once. Pinned by
   `tests/distributed_convergence/refused_queued_intents.rs` and
   `tests/record_write_atomicity.rs::a_queued_intent_held_by_a_storage_failure_stays_queued`.
 - **A held publication and an unresolved convergence input are mutually exclusive**, which is why

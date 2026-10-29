@@ -279,8 +279,8 @@ advance_convergence(group_id) -> Vec<SendResult>
 
 The engine MUST regenerate queued outbound work from the selected canonical state. It MUST remove a queued intent only
 after regeneration succeeds or the settled state refuses it. A regeneration that fails because the sender lacks the
-authority, a precondition no longer holds, or the change is not valid on that state is the refusal a direct send would
-get: the engine removes the intent, emits `GroupEvent::QueuedIntentRefused` with its `intent_id`, never regenerates it
+authority, a precondition no longer holds, or the change is not valid on that state (an OpenMLS error included) is the
+refusal a direct send would get: the engine removes the intent, emits `GroupEvent::QueuedIntentRefused` with its `intent_id`, never regenerates it
 again, and continues with later queued work. A failure the device or a group-wide gate caused (storage, an
 unrecoverable halt, a pending restored-epoch rotation) keeps the intent queued (mdk#2694).
 
