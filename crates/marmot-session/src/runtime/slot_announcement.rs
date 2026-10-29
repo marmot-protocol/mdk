@@ -30,7 +30,7 @@ enum Announcement {
     /// The entry names another KeyPackage, or none.
     Due {
         slot: DeviceSlotId,
-        entry: DeviceEntryV1,
+        entry: Box<DeviceEntryV1>,
     },
     /// It cannot be announced now: the device group is unreadable, or holds
     /// no entry for this device's slot.
@@ -150,7 +150,7 @@ where
         };
         let (slot, mut entry) = match self.key_package_announcement(&key_package_ref)? {
             Announcement::Announced => return Ok(AccountDeviceEffects::default()),
-            Announcement::Due { slot, entry } => (slot, entry),
+            Announcement::Due { slot, entry } => (slot, *entry),
             Announcement::Blocked(reason) => {
                 tracing::debug!(
                     target: TRACE_TARGET,
@@ -302,7 +302,10 @@ where
             Some(entry) if entry.announced_key_package.as_deref() == Some(key_package_ref) => {
                 Announcement::Announced
             }
-            Some(entry) => Announcement::Due { slot, entry },
+            Some(entry) => Announcement::Due {
+                slot,
+                entry: Box::new(entry),
+            },
         })
     }
 }

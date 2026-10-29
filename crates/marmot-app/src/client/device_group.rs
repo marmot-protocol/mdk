@@ -39,6 +39,8 @@ use cgka_traits::storage::{
     MaintenanceStorage as _, StorageError,
 };
 use cgka_traits::{EpochId, Group, GroupId, KeyPackage, TransportGroupSubscription};
+use rand::RngCore as _;
+use rand::rngs::OsRng;
 use storage_sqlite::{DeviceGroupRecord, DeviceGroupTrust};
 
 use super::{AppClient, UnpublishedWelcomeDelivery, UnpublishedWelcomeKind, group_is_terminal};
@@ -270,6 +272,7 @@ impl AppClient {
 
         let now = unix_now_seconds();
         let mut roster = DeviceRosterV1::default();
+        OsRng.fill_bytes(&mut roster.leaf_tag_key);
         // Each founding entry announces the KeyPackage in that device's slot
         // (3.4), so neither device owes a roster commit before it publishes.
         roster.devices.insert(

@@ -406,6 +406,7 @@ fn reject_slot(n: u8) -> DeviceRosterOperationV1 {
         RejectedSlotV1 {
             reason: RejectedSlotReasonV1::NotMe,
             rejected_at: 1,
+            tag_signature_key: None,
         },
     )
 }

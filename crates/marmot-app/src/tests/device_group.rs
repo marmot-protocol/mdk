@@ -12,7 +12,8 @@ use crate::{ConfirmedDeviceLink, LinkedDevice, LinkedDeviceStatus};
 use cgka_traits::TransportFanoutAttemptState;
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
-    DeviceSettingsV1, DeviceStatusV1, decode_device_roster_v1, encode_device_roster_update_v1,
+    DeviceRosterV1, DeviceSettingsV1, DeviceStatusV1, decode_device_roster_v1,
+    encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
 use storage_sqlite::DeviceGroupTrust;
@@ -93,13 +94,17 @@ fn trust(app: &MarmotApp, group: &GroupId) -> Option<DeviceGroupTrust> {
         .map(|record| record.trust)
 }
 
-fn roster_devices(client: &AppClient, group: &GroupId) -> usize {
+fn roster(client: &AppClient, group: &GroupId) -> DeviceRosterV1 {
     let bytes = client
         .runtime
         .app_component(group, DEVICE_ROSTER_COMPONENT_ID)
         .unwrap()
         .unwrap();
-    decode_device_roster_v1(&bytes).unwrap().devices.len()
+    decode_device_roster_v1(&bytes).unwrap()
+}
+
+fn roster_devices(client: &AppClient, group: &GroupId) -> usize {
+    roster(client, group).devices.len()
 }
 
 /// Nothing projects the group: no group row, chat-list row, pending invite or
@@ -173,6 +178,11 @@ async fn a_confirmed_link_creates_a_hidden_device_group_both_devices_trust() {
     // A withdrawal after the join finds the link done and leaves it.
     assert!(!laptop.dev_withdraw_confirmed_device_link(&group).unwrap());
     assert_eq!(trust(&laptop_app, &group), Some(DeviceGroupTrust::Linked));
+    // The creating device draws the tag key at random, and the laptop holds the
+    // same one.
+    let leaf_tag_key = roster(&phone, &group).leaf_tag_key;
+    assert_ne!(leaf_tag_key, [0; 32]);
+    assert_eq!(roster(&laptop, &group).leaf_tag_key, leaf_tag_key);
 
     // A roster update reaches the laptop and is never projected either.
     let update = encode_device_roster_update_v1(
@@ -201,6 +211,7 @@ async fn a_confirmed_link_creates_a_hidden_device_group_both_devices_trust() {
     deliver_new(&mut laptop, &relay, &mut cursor).await;
     laptop.sync().await.unwrap();
     for (app, client) in [(&phone_app, &phone), (&laptop_app, &laptop)] {
+        assert_eq!(roster(client, &group).leaf_tag_key, leaf_tag_key);
         assert_eq!(roster_devices(client, &group), 3);
         assert_hidden(app, client, &group);
     }
@@ -1056,6 +1067,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         settings,
         status,
         announced_key_package: Some(vec![7; 32]),
+        tag_signature_key: Some(label.as_bytes().to_vec()),
         history_key: Some(vec![8; 32]),
     };
     let update = encode_device_roster_update_v1(
