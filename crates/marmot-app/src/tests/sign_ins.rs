@@ -10,7 +10,8 @@ use super::*;
 use crate::client::sign_ins::{Announcement, SlotOutcome};
 use crate::{ConfirmedDeviceLink, SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
 use cgka_traits::app_components::{
-    DEVICE_ROSTER_COMPONENT_ID, DeviceRosterV1, RejectedSlotReasonV1, decode_device_roster_v1,
+    DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1, DeviceRosterV1, RejectedSlotReasonV1,
+    decode_device_roster_v1,
 };
 use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
 
@@ -607,6 +608,79 @@ async fn a_rejection_in_the_device_group_reaches_every_sibling() {
     assert!(laptop.unrecognized_sign_ins().unwrap().is_empty());
     let report = laptop.check_sign_ins().await.unwrap();
     assert_eq!(report.slots[&tablet_slot], SlotOutcome::Rejected);
+}
+
+/// A rejection the roster loses after this device settled it is committed
+/// again by this device, with no report that a commit of its own lost. Here
+/// another device's roster update removes it, as a winning branch that lacks
+/// it would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejection_the_roster_loses_is_committed_again() {
+    let account = Account::new(3, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+    let mut laptop = account.open(1).await;
+    let laptop_key_package = published_key_package(&mut laptop, relay).await;
+    phone.check_sign_ins().await.unwrap();
+    laptop.check_sign_ins().await.unwrap();
+    let link = link_for(&laptop_key_package, 0x5a, &phone);
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    let (mut phone_cursor, mut laptop_cursor) = (0, 0);
+    deliver_new(&mut laptop, relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    assert_eq!(laptop.trusted_device_group().unwrap(), Some(group.clone()));
+
+    let mut tablet = account.open(2).await;
+    published_key_package(&mut tablet, relay).await;
+    let tablet_slot = own_slot(&tablet);
+    let tablet_slot_id: [u8; 32] = hex::decode(&tablet_slot).unwrap().try_into().unwrap();
+    phone.check_sign_ins().await.unwrap();
+    phone
+        .answer_sign_in(&tablet_slot, SignInResponse::Reject)
+        .await
+        .unwrap();
+    phone.commit_sign_in_rejections().await.unwrap();
+    let pending = || {
+        account.apps[0]
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .sign_in(&tablet_slot)
+            .unwrap()
+            .unwrap()
+            .roster_pending
+    };
+    assert!(!pending());
+    deliver_new(&mut laptop, relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    let holds_it = |client: &AppClient| {
+        roster(client, &group)
+            .rejected_slots
+            .contains_key(&tablet_slot_id)
+    };
+    assert!(holds_it(&laptop));
+
+    laptop
+        .commit_device_roster_update(
+            group.clone(),
+            vec![DeviceRosterOperationV1::RemoveRejectedSlot(tablet_slot_id)],
+            "remove_rejected_slot",
+        )
+        .await
+        .unwrap();
+    deliver_new(&mut phone, relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    assert!(!holds_it(&phone));
+    assert!(pending());
+    phone.commit_sign_in_rejections().await.unwrap();
+    assert!(holds_it(&phone));
+    deliver_new(&mut laptop, relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    assert!(holds_it(&laptop));
 }
 
 /// Two devices reject different sign-ins at once. Convergence keeps one of

@@ -412,9 +412,11 @@ impl AppClient {
             .await
     }
 
-    /// Convergence superseded a roster update this device made, which may
-    /// have carried a rejection: check every rejection against the roster
-    /// again, so one the winning branch lacks is committed anew.
+    /// The device group changed, or convergence superseded a roster update
+    /// this device made: check every rejection against the roster again, so
+    /// one the roster lost is committed anew. A rejection settled from
+    /// another device's commit is lost if that commit later loses
+    /// convergence, and that device may never come back to repair it.
     pub(crate) fn rearm_sign_in_rejections(&self) {
         let rearmed = self
             .app
