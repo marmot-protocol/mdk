@@ -125,6 +125,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("content_report_backfill", Side::App),
     ("content_reports", Side::App),
     ("conversation_read_state", Side::App),
+    ("device_group_joins", Side::App),
     ("device_groups", Side::App),
     ("device_links", Side::App),
     ("direct_conversation_members", Side::App),

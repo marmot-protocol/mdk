@@ -7,6 +7,7 @@
 
 use super::canonical_membership::{deliver_new, published_key_package};
 use super::*;
+use crate::client::device_group::LINK_DEADLINE_SECS;
 use crate::{
     DeviceLinkChoices, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPromptState,
     DeviceLinkSnapshot, NewDeviceLinkState,
@@ -17,7 +18,7 @@ use cgka_traits::app_components::{
     encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
-use storage_sqlite::{DeviceGroupTrust, DeviceLinkSettlement};
+use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome};
 
 /// One of Alice's devices, with its own cursor over the shared relay.
 struct Device {
@@ -182,20 +183,74 @@ async fn link(
     );
     let joining = new.step(relay).await; // existing confirm in, own confirm out
     assert_eq!(joining.new_device, Some(NewDeviceLinkState::Joining));
-    let linked = existing.step(relay).await; // new confirm in: the commit
+    let committed = existing.step(relay).await; // new confirm in: the commit
     assert_eq!(
-        linked.prompt_for_slot(&new.slot_hex()).unwrap().state,
-        DeviceLinkPromptState::Linked
+        committed.prompt_for_slot(&new.slot_hex()).unwrap().state,
+        DeviceLinkPromptState::Linking,
+        "only the new device's first commit makes the link"
     );
-    let joined = new.step(relay).await; // the Welcome
-    assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
+    join_then_linked(relay, existing, new).await;
     new.client.trusted_device_group().unwrap().unwrap()
+}
+
+/// The new device joins through its Welcome and makes its first commit in
+/// the device group on the same drive. The device that linked it reads that
+/// commit and shows the link made, after its settlement window if it waits
+/// one.
+async fn join_then_linked(
+    relay: &ScriptedPushRelayClient,
+    existing: &mut Device,
+    new: &mut Device,
+) {
+    let joined = new.step(relay).await; // the Welcome, and its first commit
+    assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
+    let give_up = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let read = existing.step(relay).await; // that commit
+        let state = read.prompt_for_slot(&new.slot_hex()).unwrap().state.clone();
+        if state == DeviceLinkPromptState::Linked || std::time::Instant::now() >= give_up {
+            assert_eq!(state, DeviceLinkPromptState::Linked);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The worker's timer would take the held commit once the window
+        // passed.
+        let group = existing.client.trusted_device_group().unwrap().unwrap();
+        let advanced = existing
+            .client
+            .runtime
+            .advance_convergence(&group)
+            .await
+            .unwrap();
+        existing
+            .client
+            .observe_drained_session_events(&advanced)
+            .await
+            .unwrap();
+    }
+}
+
+/// The link of `slot` that `device` recorded in `group`.
+fn link_record(
+    device: &Device,
+    group: &GroupId,
+    slot_hex: &str,
+) -> storage_sqlite::DeviceLinkRecord {
+    device
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .device_link(&hex::encode(group.as_slice()), slot_hex)
+        .unwrap()
+        .unwrap()
 }
 
 /// A first link: the new device names its KeyPackage, both screens show the
 /// same seven emoji, the new device's user confirms first, and Link device
 /// creates the device group with the new device and its label and settings.
-/// The link settles once the group is quiet.
+/// The link is made once the new device's first commit there, setting its
+/// tag signature key, is on the quiet group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_first_link_creates_the_device_group_with_the_chosen_label_and_settings() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
@@ -217,89 +272,18 @@ async fn a_first_link_creates_the_device_group_with_the_chosen_label_and_setting
         assert!(founder.add_to_all_chats && founder.bring_history);
     }
 
-    // The group is quiet and these devices wait no settlement quiescence,
-    // so the link settled on the drive that recorded it.
-    let storage = phone.app.account_storage("alice").unwrap().app_storage();
-    let record = storage
-        .device_link(&hex::encode(group.as_slice()), &laptop.slot_hex())
-        .unwrap()
-        .unwrap();
-    assert_eq!(record.settlement, DeviceLinkSettlement::Settled);
-    assert!(record.settled_at.is_some_and(|at| at >= record.linked_at));
+    let record = link_record(&phone, &group, &laptop.slot_hex());
+    assert_eq!(record.outcome, DeviceLinkOutcome::Linked);
+    assert!(record.decided_at.is_some_and(|at| at >= record.linked_at));
+    assert!(record.welcome_id_hex.is_some());
     assert_eq!(
-        Some(hex::decode(&record.key_package_ref_hex).unwrap()),
-        phone.roster(&group).devices[&laptop_slot].announced_key_package
+        Some(hex::decode(&record.leaf_signature_key_hex).unwrap()),
+        phone.roster(&group).devices[&laptop_slot].tag_signature_key
     );
-}
-
-/// A link settles only once its device group has been quiet for the whole
-/// settlement window, counted in milliseconds from when this device first
-/// saw it quiet.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_link_settles_only_after_the_settlement_window() {
-    let (relay, [mut phone, mut laptop]) = alice_devices_settling_after::<2>(1_500).await;
-    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
-    let settlement = |phone: &Device| {
-        phone
-            .app
-            .account_storage("alice")
-            .unwrap()
-            .app_storage()
-            .device_link(&hex::encode(group.as_slice()), &laptop.slot_hex())
-            .unwrap()
-            .unwrap()
-            .settlement
-    };
-
-    phone.step(&relay).await;
-    assert_eq!(settlement(&phone), DeviceLinkSettlement::Pending);
-    tokio::time::sleep(Duration::from_millis(1_600)).await;
-    phone.step(&relay).await;
-    assert_eq!(settlement(&phone), DeviceLinkSettlement::Settled);
-}
-
-/// The new device refreshing its KeyPackage before the link settles replaces
-/// the KeyPackage its roster entry announces. The entry still says this
-/// device linked it, so the link settles and its prompt stays linked.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_key_package_refreshed_before_settlement_leaves_the_link_standing() {
-    let (relay, [mut phone, mut laptop]) = alice_devices_settling_after::<2>(3_000).await;
-    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
-    let laptop_slot_hex = laptop.slot_hex();
-    let laptop_slot: [u8; 32] = hex::decode(&laptop_slot_hex).unwrap().try_into().unwrap();
-    let settlement = |phone: &Device| {
-        phone
-            .app
-            .account_storage("alice")
-            .unwrap()
-            .app_storage()
-            .device_link(&hex::encode(group.as_slice()), &laptop_slot_hex)
-            .unwrap()
-            .unwrap()
-            .settlement
-    };
-
-    let rotated = laptop.client.rotate_key_package().await.unwrap();
-    let rotated_ref = marmot_session::key_package_metadata(&rotated)
-        .unwrap()
-        .key_package_ref_hex;
-    phone.step(&relay).await; // the announcement
-    assert_eq!(
-        phone.roster(&group).devices[&laptop_slot]
-            .announced_key_package
-            .as_deref()
-            .map(hex::encode),
-        Some(rotated_ref)
-    );
-    assert_eq!(settlement(&phone), DeviceLinkSettlement::Pending);
-
-    tokio::time::sleep(Duration::from_millis(3_100)).await;
-    let settled = phone.step(&relay).await;
-    assert_eq!(settlement(&phone), DeviceLinkSettlement::Settled);
-    assert_eq!(
-        settled.prompt_for_slot(&laptop_slot_hex).unwrap().state,
-        DeviceLinkPromptState::Linked
-    );
+    // The new device forgets its join once its first commit there landed.
+    laptop.step(&relay).await;
+    let joins = laptop.app.account_storage("alice").unwrap().app_storage();
+    assert!(joins.device_group_joins().unwrap().is_empty());
 }
 
 /// A later link adds the new device to the device group in one commit, by a
@@ -341,13 +325,12 @@ async fn a_sibling_adds_a_later_device_and_the_other_prompt_says_who() {
     tablet.step(&relay).await;
     let joining = tablet.op(DeviceLinkOp::ConfirmMatch).await;
     assert_eq!(joining.new_device, Some(NewDeviceLinkState::Joining));
-    let linked = laptop.step(&relay).await; // the link commit
+    let committed = laptop.step(&relay).await; // the link commit
     assert_eq!(
-        linked.prompt_for_slot(&tablet.slot_hex()).unwrap().state,
-        DeviceLinkPromptState::Linked
+        committed.prompt_for_slot(&tablet.slot_hex()).unwrap().state,
+        DeviceLinkPromptState::Linking
     );
-    let joined = tablet.step(&relay).await;
-    assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
+    join_then_linked(&relay, &mut laptop, &mut tablet).await;
     assert_eq!(tablet.trust(&group), Some(DeviceGroupTrust::Linked));
 
     let added = phone.step(&relay).await;
@@ -610,7 +593,8 @@ async fn create_device_group_unpublished(
 }
 
 /// A first link's founding Welcome that no relay took keeps the link
-/// linking. It is published again, and the link is linked once it lands.
+/// linking. It is published again, and once it lands the new device joins,
+/// and its first commit makes the link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_first_links_undelivered_welcome_is_published_again_until_it_lands() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
@@ -624,13 +608,12 @@ async fn a_first_links_undelivered_welcome_is_published_again_until_it_lands() {
         .client
         .drive_device_pairing_at(crate::unix_now_seconds() + 10)
         .await;
-    let linked = phone.step(&relay).await;
+    let published = phone.step(&relay).await;
     assert_eq!(
-        linked.prompt_for_slot(&slot).unwrap().state,
-        DeviceLinkPromptState::Linked
+        published.prompt_for_slot(&slot).unwrap().state,
+        DeviceLinkPromptState::Linking
     );
-    let joined = laptop.step(&relay).await;
-    assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
+    join_then_linked(&relay, &mut phone, &mut laptop).await;
     assert_eq!(laptop.trust(&group), Some(DeviceGroupTrust::Linked));
 }
 
@@ -658,25 +641,43 @@ async fn not_now_is_refused_while_a_links_welcome_is_owed() {
         .client
         .drive_device_pairing_at(crate::unix_now_seconds() + 10)
         .await;
-    let linked = phone.step(&relay).await;
+    let published = phone.step(&relay).await;
     assert_eq!(
-        linked.prompt_for_slot(&slot).unwrap().state,
-        DeviceLinkPromptState::Linked
+        published.prompt_for_slot(&slot).unwrap().state,
+        DeviceLinkPromptState::Linking
     );
-    let joined = laptop.step(&relay).await;
-    assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
+    join_then_linked(&relay, &mut phone, &mut laptop).await;
 }
 
-/// A first link whose founding Welcome no relay takes before the new device
-/// stops waiting ends: the link fails, and its record settles as reversed,
-/// though the device group lists the new device.
+/// A first link whose founding Welcome no relay takes stays linking past the
+/// new device's Welcome wait and its request's deadline: only the link's
+/// deadline, an hour after it, fails it. The device that linked it then
+/// withdraws the Welcome and removes the device it added, and the new device,
+/// which stopped waiting, never joins.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_first_link_whose_welcome_never_lands_ends_the_link() {
+async fn a_first_link_whose_welcome_never_lands_fails_at_the_deadline() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
     let (group, slot) = create_device_group_unpublished(&relay, &mut phone, &mut laptop).await;
+    let laptop_slot: [u8; 32] = hex::decode(&slot).unwrap().try_into().unwrap();
+    // The request was made eleven minutes before the link, so its deadline
+    // passes before the new device stops waiting.
+    phone.client.backdate_link_requests(660);
+    let now = crate::unix_now_seconds();
 
-    let after_wait = crate::unix_now_seconds() + 601;
-    phone.client.drive_device_pairing_at(after_wait).await;
+    for later in [560, 601, LINK_DEADLINE_SECS - 60] {
+        phone.client.drive_device_pairing_at(now + later).await;
+        let waiting = phone.client.device_link(DeviceLinkOp::Read).await.unwrap();
+        assert_eq!(
+            waiting.prompt_for_slot(&slot).unwrap().state,
+            DeviceLinkPromptState::Linking
+        );
+    }
+
+    relay.allow_publishes();
+    phone
+        .client
+        .drive_device_pairing_at(now + LINK_DEADLINE_SECS + 1)
+        .await;
     let ended = phone.client.device_link(DeviceLinkOp::Read).await.unwrap();
     assert_eq!(
         ended.prompt_for_slot(&slot).unwrap().state,
@@ -684,18 +685,34 @@ async fn a_first_link_whose_welcome_never_lands_ends_the_link() {
             reason: DeviceLinkEndReason::LinkFailed
         }
     );
-    let record = phone
-        .app
-        .account_storage("alice")
-        .unwrap()
-        .app_storage()
-        .device_link(&hex::encode(group.as_slice()), &slot)
-        .unwrap()
-        .unwrap();
-    assert_eq!(record.settlement, DeviceLinkSettlement::Reversed);
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Failed
+    );
+    assert!(
+        phone
+            .client
+            .runtime
+            .outstanding_welcome_deliveries()
+            .unwrap()
+            .is_empty(),
+        "the link's Welcome is withdrawn"
+    );
+    assert!(!phone.roster(&group).devices.contains_key(&laptop_slot));
+    let leaf = hex::decode(link_record(&phone, &group, &slot).leaf_signature_key_hex).unwrap();
+    assert!(
+        !phone
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .get_group(&group)
+            .unwrap()
+            .members
+            .iter()
+            .any(|member| member.credential == leaf)
+    );
 
-    relay.allow_publishes();
-    laptop.client.drive_device_pairing_at(after_wait).await;
+    laptop.client.drive_device_pairing_at(now + 601).await;
     let gave_up = laptop.step(&relay).await;
     assert!(matches!(
         gave_up.new_device,
@@ -704,30 +721,58 @@ async fn a_first_link_whose_welcome_never_lands_ends_the_link() {
     assert_eq!(laptop.trust(&group), None);
 }
 
-/// A link waiting on its Welcome is decided by the new device's wait, not by
-/// its request's deadline, which a long code comparison can bring first.
+/// A device that joins but makes no commit in the device group by the
+/// link's deadline is removed by the device that linked it, with its roster
+/// entry, in one commit. Joining the Welcome late, it then reads its own
+/// removal: it forgets the group and tells its user that linking failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_link_waiting_on_its_welcome_outlives_its_request() {
+async fn a_device_with_no_first_commit_by_the_deadline_is_removed_and_told() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
-    let (_, slot) = create_device_group_unpublished(&relay, &mut phone, &mut laptop).await;
-    // The request was made eleven minutes before the link, so its deadline
-    // passes a minute before the new device stops waiting.
-    phone.client.backdate_link_requests(660);
-    let now = crate::unix_now_seconds();
-
-    phone.client.drive_device_pairing_at(now + 560).await;
-    let waiting = phone.client.device_link(DeviceLinkOp::Read).await.unwrap();
+    let slot = choose_link(&relay, &mut phone, &mut laptop).await;
+    laptop.op(DeviceLinkOp::ConfirmMatch).await;
+    laptop.step(&relay).await; // phone's confirm in, laptop's out
+    let committed = phone.step(&relay).await; // laptop's confirm in: the group
     assert_eq!(
-        waiting.prompt_for_slot(&slot).unwrap().state,
+        committed.prompt_for_slot(&slot).unwrap().state,
         DeviceLinkPromptState::Linking
     );
-    phone.client.drive_device_pairing_at(now + 601).await;
-    let ended = phone.client.device_link(DeviceLinkOp::Read).await.unwrap();
+    let group = phone.client.trusted_device_group().unwrap().unwrap();
+    let laptop_slot: [u8; 32] = hex::decode(&slot).unwrap().try_into().unwrap();
+
+    phone
+        .client
+        .drive_device_pairing_at(crate::unix_now_seconds() + LINK_DEADLINE_SECS + 1)
+        .await;
+    let ended = phone.step(&relay).await;
     assert_eq!(
         ended.prompt_for_slot(&slot).unwrap().state,
         DeviceLinkPromptState::Ended {
             reason: DeviceLinkEndReason::LinkFailed
         }
+    );
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Failed
+    );
+    assert!(!phone.roster(&group).devices.contains_key(&laptop_slot));
+
+    let removed = laptop.step(&relay).await; // the Welcome, then its removal
+    assert_eq!(
+        removed.new_device,
+        Some(NewDeviceLinkState::Ended {
+            reason: DeviceLinkEndReason::LinkFailed
+        })
+    );
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    assert_eq!(laptop.trust(&group), None);
+    let laptop_storage = laptop.app.account_storage("alice").unwrap().app_storage();
+    assert!(laptop_storage.device_group_joins().unwrap().is_empty());
+
+    // A failed link stays failed: the commit it waited for changes nothing.
+    phone.step(&relay).await;
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Failed
     );
 }
 
@@ -751,37 +796,54 @@ async fn reopen(device: Device) -> Device {
 }
 
 /// A restart drops a first link's prompt while no relay has taken its
-/// founding Welcome. The device group lists the new device, but the link is
-/// not settled while the group still owes that Welcome, and is reversed once
-/// the new device has stopped waiting.
+/// founding Welcome. The link is decided by the same gate: pending past the
+/// new device's Welcome wait, failed at the link's deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_link_whose_welcome_is_owed_across_a_restart_is_not_settled() {
+async fn a_link_whose_welcome_is_owed_across_a_restart_fails_at_the_deadline() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
     let (group, slot) = create_device_group_unpublished(&relay, &mut phone, &mut laptop).await;
     let mut phone = reopen(phone).await;
-    let settlement = |phone: &Device| {
-        phone
-            .app
-            .account_storage("alice")
-            .unwrap()
-            .app_storage()
-            .device_link(&hex::encode(group.as_slice()), &slot)
-            .unwrap()
-            .unwrap()
-            .settlement
-    };
 
     let now = crate::unix_now_seconds();
-    phone.client.drive_device_pairing_at(now).await;
-    phone.client.drive_device_pairing_at(now + 1).await;
+    for later in [0, 1, 601] {
+        phone.client.drive_device_pairing_at(now + later).await;
+        assert_eq!(
+            link_record(&phone, &group, &slot).outcome,
+            DeviceLinkOutcome::Pending,
+            "a roster entry is no link until the new device's first commit"
+        );
+    }
+    phone
+        .client
+        .drive_device_pairing_at(now + LINK_DEADLINE_SECS + 1)
+        .await;
     assert_eq!(
-        settlement(&phone),
-        DeviceLinkSettlement::Pending,
-        "a roster entry whose Welcome is still owed is not a link"
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Failed
+    );
+}
+
+/// A restart drops a later link's prompt after its commit. The new device's
+/// first commit still makes the link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_is_made_across_a_restart_by_the_new_devices_first_commit() {
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let (group, slot) =
+        link_tablet_until_commit(&relay, &mut phone, &mut laptop, &mut tablet).await;
+    phone.step(&relay).await; // tablet's confirm in: the commit
+    let mut phone = reopen(phone).await;
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Pending
     );
 
-    phone.client.drive_device_pairing_at(now + 601).await;
-    assert_eq!(settlement(&phone), DeviceLinkSettlement::Reversed);
+    let joined = tablet.step(&relay).await; // the Welcome, and its first commit
+    assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
+    phone.step(&relay).await; // that commit
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Linked
+    );
 }
 
 /// Prompt ids never repeat across a reopen, so an id a host kept from
@@ -841,8 +903,8 @@ async fn link_tablet_until_commit(
 }
 
 /// A later link's commit lands, but no relay takes its Welcome. The link
-/// stays linking while that Welcome is published again, and is linked once
-/// it lands; the new device then joins.
+/// stays linking while that Welcome is published again; once it lands the
+/// new device joins, and its first commit makes the link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_link_commits_undelivered_welcome_is_published_again_until_it_lands() {
     let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
@@ -871,13 +933,12 @@ async fn a_link_commits_undelivered_welcome_is_published_again_until_it_lands() 
         .client
         .drive_device_pairing_at(crate::unix_now_seconds() + 10)
         .await;
-    let linked = phone.step(&relay).await;
+    let landed = phone.step(&relay).await;
     assert_eq!(
-        linked.prompt_for_slot(&slot).unwrap().state,
-        DeviceLinkPromptState::Linked
+        landed.prompt_for_slot(&slot).unwrap().state,
+        DeviceLinkPromptState::Linking
     );
-    let joined = tablet.step(&relay).await;
-    assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
+    join_then_linked(&relay, &mut phone, &mut tablet).await;
     assert_eq!(tablet.trust(&group), Some(DeviceGroupTrust::Linked));
 }
 
@@ -958,13 +1019,12 @@ async fn a_link_commit_that_failed_in_transit_links_once_it_lands() {
         .observe_drained_session_events(&retried)
         .await
         .unwrap();
-    let linked = phone.step(&relay).await;
+    let landed = phone.step(&relay).await;
     assert_eq!(
-        linked.prompt_for_slot(&slot).unwrap().state,
-        DeviceLinkPromptState::Linked
+        landed.prompt_for_slot(&slot).unwrap().state,
+        DeviceLinkPromptState::Linking
     );
-    let joined = tablet.step(&relay).await;
-    assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
+    join_then_linked(&relay, &mut phone, &mut tablet).await;
     assert_eq!(tablet.trust(&group), Some(DeviceGroupTrust::Linked));
 }
 
@@ -1014,13 +1074,10 @@ async fn not_now_is_refused_while_an_approval_waits() {
 }
 
 /// A retained link commit whose retry the relay refuses rolls back: the link
-/// ends on both devices, and the new device never got a Welcome. The long
-/// settlement window keeps settlement from ending the link first, so the
-/// prompt is never `Linked` on the way.
+/// ends on both devices, and the new device never got a Welcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_retained_link_commit_that_rolls_back_ends_the_link() {
-    let (relay, [mut phone, mut laptop, mut tablet]) =
-        alice_devices_settling_after::<3>(600_000).await;
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
     let (group, slot) =
         link_tablet_until_commit(&relay, &mut phone, &mut laptop, &mut tablet).await;
 
@@ -1070,10 +1127,13 @@ async fn a_retained_link_commit_that_rolls_back_ends_the_link() {
 }
 
 /// A link commit the relay refused rolls back, so the link ends on both
-/// devices and its record settles as reversed.
+/// devices and its record fails once the quiet roster has gone a whole
+/// settlement window without it, since branch selection might still bring
+/// the commit back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_link_commit_ends_the_link_on_both_devices() {
-    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let (relay, [mut phone, mut laptop, mut tablet]) =
+        alice_devices_settling_after::<3>(1_500).await;
     let (group, slot) =
         link_tablet_until_commit(&relay, &mut phone, &mut laptop, &mut tablet).await;
 
@@ -1093,26 +1153,27 @@ async fn a_refused_link_commit_ends_the_link_on_both_devices() {
         })
     );
     assert_eq!(tablet.trust(&group), None);
-    let record = phone
-        .app
-        .account_storage("alice")
-        .unwrap()
-        .app_storage()
-        .device_link(&hex::encode(group.as_slice()), &slot)
-        .unwrap()
-        .unwrap();
-    assert_eq!(record.settlement, DeviceLinkSettlement::Reversed);
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Pending
+    );
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    phone.step(&relay).await;
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Failed
+    );
 }
 
 /// A link is recorded before its commit. One whose device group was never
-/// created, as after a crash between the two, settles as reversed.
+/// created, as after a crash between the two, fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_approval_whose_device_group_never_existed_settles_reversed() {
+async fn an_approval_whose_device_group_never_existed_fails() {
     let (_relay, [mut phone]) = alice_devices::<1>().await;
     let (group_hex, slot_hex) = ("ab".repeat(16), "cd".repeat(32));
     let storage = phone.app.account_storage("alice").unwrap().app_storage();
     storage
-        .record_device_link(&group_hex, &slot_hex, &"ef".repeat(32), 1)
+        .record_device_link(&group_hex, &slot_hex, &"ef".repeat(32), &"12".repeat(32), 1)
         .unwrap();
 
     phone
@@ -1124,8 +1185,8 @@ async fn an_approval_whose_device_group_never_existed_settles_reversed() {
             .device_link(&group_hex, &slot_hex)
             .unwrap()
             .unwrap()
-            .settlement,
-        DeviceLinkSettlement::Reversed
+            .outcome,
+        DeviceLinkOutcome::Failed
     );
 }
 
