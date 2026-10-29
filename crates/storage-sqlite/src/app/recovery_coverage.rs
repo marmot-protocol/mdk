@@ -1473,6 +1473,69 @@ mod tests {
         );
     }
 
+    /// A routed write that lists no route names none, so its generation is
+    /// account-wide.
+    #[test]
+    fn an_empty_route_list_is_account_wide() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let kept = group(1);
+        prove(&app, &[&kept], 1);
+        lose(&app, 41, 1, 500, Some(&[]));
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(imports[0].every_route);
+        assert_eq!(
+            ranges(&app, &kept, RELAY_A),
+            vec![(100, 499, RecoveryCoverageProof::Comparison)]
+        );
+    }
+
+    /// One import can charge more generations, naming more distinct routes,
+    /// than one generation may list. Each named route still loses coverage
+    /// from its own bound and gets its goal, and a route none named keeps its
+    /// coverage.
+    #[test]
+    fn an_import_of_many_routed_generations_uncovers_each_route() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let kept = group(255);
+        let named = (0..crate::MAX_LOSS_ROUTES as u64 + 10)
+            .map(|i| {
+                let mut id = [0; 32];
+                id[..8].copy_from_slice(&i.to_be_bytes());
+                (TransportReconciliationRoute::Group(id), 500 + i)
+            })
+            .collect::<Vec<_>>();
+        let (first, last) = (&named[0].0, &named[named.len() - 1].0);
+        prove(&app, &[&kept, first, last], 1);
+        for (i, lost) in named.iter().enumerate() {
+            lose(
+                &app,
+                1_000 + i as u64,
+                1,
+                lost.1,
+                Some(std::slice::from_ref(lost)),
+            );
+        }
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(!imports[0].every_route);
+        for (route, bound) in &named {
+            assert_eq!(app.recovery_coverage_goal(route).unwrap(), Some(*bound));
+        }
+        for (route, bound) in [&named[0], &named[named.len() - 1]] {
+            assert_eq!(
+                ranges(&app, route, RELAY_A),
+                vec![(100, bound - 1, RecoveryCoverageProof::Comparison)]
+            );
+        }
+        assert_eq!(
+            ranges(&app, &kept, RELAY_A),
+            vec![(100, 900, RecoveryCoverageProof::Comparison)]
+        );
+    }
+
     /// Shorthand for a queue-loss marker write.
     fn lose(
         app: &SqliteAppStorage,

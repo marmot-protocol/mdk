@@ -270,8 +270,8 @@ impl SqliteAppStorage {
 
     /// Like [`Self::record_account_recovery_loss_bounded`], also naming the
     /// routes these charges lost on, each with the earliest `created_at` it
-    /// could have lost there. `None` means some charge named no route, and
-    /// the generation un-covers every route from then on.
+    /// could have lost there. `None`, or an empty list, means some charge
+    /// named no route, and the generation un-covers every route from then on.
     #[allow(clippy::too_many_arguments)]
     pub fn record_account_recovery_loss_routed(
         &self,
@@ -286,7 +286,7 @@ impl SqliteAppStorage {
         let (bound_state, bound_seconds) =
             crate::app::account_recovery::loss_bound_values(earliest_created_at)?;
         let token = sqlite_integer(marker_token)?;
-        let routes = routes.filter(|routes| routes.len() <= MAX_LOSS_ROUTES);
+        let routes = routes.filter(|routes| !routes.is_empty() && routes.len() <= MAX_LOSS_ROUTES);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             conn.execute_cached(

@@ -396,7 +396,8 @@ pub(crate) fn loss_bound_values(
 
 /// What the generations one import charged lost: every route from the lowest
 /// floor among those that named no routes, and each named route from its own
-/// lowest bound.
+/// lowest bound. An import may charge any number of generations, so the named
+/// routes it holds are un-covered early once they pass [`MAX_LOSS_ROUTES`].
 #[derive(Default)]
 struct ChargedLoss {
     every_route: Option<u64>,
@@ -418,6 +419,14 @@ impl ChargedLoss {
                 for (route, bound) in routes {
                     let lowest = self.routes.entry(route).or_insert(bound);
                     *lowest = (*lowest).min(bound);
+                }
+                if self.routes.len() > MAX_LOSS_ROUTES {
+                    let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64())?;
+                    for (route, bound) in std::mem::take(&mut self.routes) {
+                        crate::app::recovery_coverage::uncover_route_loss_tx(
+                            conn, &route, bound, now,
+                        )?;
+                    }
                 }
             }
             None => {
