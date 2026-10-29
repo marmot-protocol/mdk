@@ -97,9 +97,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   them or it trusts a group it joined. A rejection is committed only while the roster has no entry for the slot, and
   never replaces one; a slot the roster holds as a device ends it, since the user confirmed that link. A rejection stays
   pending until the roster shows it. A sign-in this device dismissed is listed again once the roster has no entry for
-  its slot. Every device-group event and every superseded roster update re-arms every rejection
-  (`rearm_sign_in_rejections`): a rejection settled from another device's commit is lost when that commit loses
-  convergence, and only a device that made the rejection restores it. A slot is its `d` as published, compared as bytes;
+  its slot. Every device-group event and every superseded roster update rechecks every rejection
+  (`recheck_sign_in_rejections`): it ends at once a rejection of a slot the roster now holds as a device, so a link
+  that branch selection drops before the next pass asks again rather than restoring `not_me`, and re-arms the rest. A
+  rejection settled from another device's commit is lost when that commit loses convergence, and only a device that
+  made the rejection restores it. A slot is its `d` as published, compared as bytes;
   one the roster cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a
   rejected KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's
   included, into a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7).

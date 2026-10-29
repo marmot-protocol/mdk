@@ -204,9 +204,9 @@ impl AppClient {
                 || self.settle_held_device_group(group_id)?)
         {
             self.linked_devices_changed = true;
-            // Its roster may have lost a rejection this device made, to
-            // another device's commit losing convergence (mdk#2628 3.2).
-            self.rearm_sign_in_rejections();
+            // Its roster may now hold a slot this device rejected, or have
+            // lost a rejection it made (mdk#2628 3.2).
+            self.recheck_sign_in_rejections();
             return Ok(Some(self.ensure_device_group_route(group_id)?));
         }
         if batch_start_frontier.is_none() && self.state_group_record(group_id).is_some() {

@@ -10,8 +10,8 @@ use super::*;
 use crate::client::sign_ins::{Announcement, SlotOutcome};
 use crate::{ConfirmedDeviceLink, SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
 use cgka_traits::app_components::{
-    DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1, DeviceRosterV1, RejectedSlotReasonV1,
-    decode_device_roster_v1,
+    DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterV1,
+    RejectedSlotReasonV1, decode_device_roster_v1,
 };
 use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
 use storage_sqlite::SignInAnswer;
@@ -722,6 +722,86 @@ async fn a_rejection_the_roster_loses_is_committed_again() {
     deliver_new(&mut laptop, relay, &mut laptop_cursor).await;
     laptop.sync().await.unwrap();
     assert!(holds_it(&laptop));
+}
+
+/// A link of a slot this device rejected ends the rejection as soon as this
+/// device sees it, not at its next pass. When the link is gone again before
+/// that pass, as branch selection can drop it, the device asks about the
+/// slot again and commits nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_dropped_before_the_next_pass_asks_again() {
+    let account = Account::new(3, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+    let mut laptop = account.open(1).await;
+    let laptop_key_package = published_key_package(&mut laptop, relay).await;
+    phone.check_sign_ins().await.unwrap();
+    laptop.check_sign_ins().await.unwrap();
+    let link = link_for(&laptop_key_package, 0x5a, &phone);
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    let (mut phone_cursor, mut laptop_cursor) = (0, 0);
+    deliver_new(&mut laptop, relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    assert_eq!(laptop.trusted_device_group().unwrap(), Some(group.clone()));
+
+    let mut tablet = account.open(2).await;
+    published_key_package(&mut tablet, relay).await;
+    let tablet_slot = own_slot(&tablet);
+    let tablet_slot_id: [u8; 32] = hex::decode(&tablet_slot).unwrap().try_into().unwrap();
+    phone.check_sign_ins().await.unwrap();
+    phone
+        .answer_sign_in(&tablet_slot, SignInResponse::Reject)
+        .await
+        .unwrap();
+    phone.commit_sign_in_rejections().await.unwrap();
+    deliver_new(&mut laptop, relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+
+    // The laptop links the tablet, and the link is gone again.
+    laptop
+        .commit_device_roster_update(
+            group.clone(),
+            vec![
+                DeviceRosterOperationV1::SetDevice(tablet_slot_id, DeviceEntryV1::default()),
+                DeviceRosterOperationV1::RemoveRejectedSlot(tablet_slot_id),
+            ],
+            "link_device",
+        )
+        .await
+        .unwrap();
+    laptop
+        .commit_device_roster_update(
+            group.clone(),
+            vec![DeviceRosterOperationV1::RemoveDevice(tablet_slot_id)],
+            "drop_link",
+        )
+        .await
+        .unwrap();
+    deliver_new(&mut phone, relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    let record = account.apps[0]
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .sign_in(&tablet_slot)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.answer, SignInAnswer::Dismissed);
+    assert!(!record.roster_pending);
+    assert_eq!(
+        listed(&mut phone),
+        [(tablet_slot.clone(), false, UnrecognizedSignInState::Prompt)]
+    );
+    let before = relay.published_events.lock().unwrap().len();
+    phone.commit_sign_in_rejections().await.unwrap();
+    assert_eq!(relay.published_events.lock().unwrap().len(), before);
+    let roster = roster(&phone, &group);
+    assert!(!roster.devices.contains_key(&tablet_slot_id));
+    assert!(!roster.rejected_slots.contains_key(&tablet_slot_id));
 }
 
 /// Two devices reject different sign-ins at once. Convergence keeps one of

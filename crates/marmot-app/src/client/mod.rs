@@ -7126,7 +7126,7 @@ impl AppClient {
             if report.kind == cgka_traits::engine::SupersededIntentKind::AppComponents
                 && self.is_device_group(&report.group_id).unwrap_or(true)
             {
-                self.rearm_sign_in_rejections();
+                self.recheck_sign_in_rejections();
             }
             if !self.host_may_see_group(&report.group_id) {
                 continue;

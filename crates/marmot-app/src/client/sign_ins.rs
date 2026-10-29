@@ -49,7 +49,7 @@ use cgka_traits::app_components::{
 };
 use cgka_traits::storage::MaintenanceStorage as _;
 use cgka_traits::{EpochState, FanoutMlsState, GroupId};
-use storage_sqlite::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord};
+use storage_sqlite::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord, SqliteAppStorage};
 
 use super::AppClient;
 use super::device_group::device_slot;
@@ -413,15 +413,8 @@ impl AppClient {
         };
         let mut operations = Vec::new();
         for record in pending {
-            if roster_slot(&record.slot_id_hex)
-                .is_some_and(|slot| roster.devices.contains_key(&slot))
-            {
-                storage.answer_sign_in(
-                    &record.slot_id_hex,
-                    &[SignInAnswer::Rejected],
-                    SignInAnswer::Dismissed,
-                    unix_now_seconds(),
-                )?;
+            if linked(record, &roster) {
+                end_rejection(&storage, record)?;
                 continue;
             }
             match rejected_slot(record, &roster)? {
@@ -441,21 +434,39 @@ impl AppClient {
     }
 
     /// The device group changed, or convergence superseded a roster update
-    /// this device made: check every rejection against the roster again, so
-    /// one the roster lost is committed anew. A rejection settled from
-    /// another device's commit is lost if that commit later loses
-    /// convergence, and that device may never come back to repair it.
-    pub(crate) fn rearm_sign_in_rejections(&self) {
-        let rearmed = self
-            .app
-            .account_storage(&self.state.label)
-            .and_then(|storage| Ok(storage.app_storage().rearm_sign_in_rejections()?));
+    /// this device made. A rejection of a slot the roster now holds as a
+    /// device ends at once: the user confirmed that link, and if branch
+    /// selection drops it before the next pass, the device asks again rather
+    /// than restore the rejection. Every other rejection is checked against
+    /// the roster again, so one the roster lost is committed anew. A rejection
+    /// settled from another device's commit is lost if that commit later
+    /// loses convergence, and that device may never come back to repair it.
+    pub(crate) fn recheck_sign_in_rejections(&mut self) {
+        let ended = self.trusted_device_roster().and_then(|roster| {
+            let Some((_, roster)) = roster else {
+                return Ok(());
+            };
+            let storage = self.app.account_storage(&self.state.label)?.app_storage();
+            for record in storage.sign_ins()? {
+                if record.answer == SignInAnswer::Rejected && linked(&record, &roster) {
+                    end_rejection(&storage, &record)?;
+                }
+            }
+            Ok(())
+        });
+        let rearmed = ended.and_then(|()| {
+            Ok(self
+                .app
+                .account_storage(&self.state.label)?
+                .app_storage()
+                .rearm_sign_in_rejections()?)
+        });
         if let Err(error) = rearmed {
             tracing::warn!(
                 target: "marmot_app::client::sign_ins",
-                method = "rearm_sign_in_rejections",
+                method = "recheck_sign_in_rejections",
                 error_kind = error.privacy_safe_kind(),
-                "could not recheck sign-in rejections after convergence"
+                "could not recheck sign-in rejections after a device group change"
             );
         }
     }
@@ -648,6 +659,24 @@ fn listed_state(
         return keeps_prompt.then_some(UnrecognizedSignInState::RejectedElsewhere);
     }
     Some(waiting)
+}
+
+/// Whether the roster holds `record`'s slot as a device: the user confirmed
+/// a link of it, which ends a rejection of it.
+fn linked(record: &SignInRecord, roster: &DeviceRosterV1) -> bool {
+    roster_slot(&record.slot_id_hex).is_some_and(|slot| roster.devices.contains_key(&slot))
+}
+
+/// End `record`'s rejection: a link of its slot overrode it. The sign-in is
+/// listed again if the roster later has no entry for the slot.
+fn end_rejection(storage: &SqliteAppStorage, record: &SignInRecord) -> Result<(), AppError> {
+    storage.answer_sign_in(
+        &record.slot_id_hex,
+        &[SignInAnswer::Rejected],
+        SignInAnswer::Dismissed,
+        unix_now_seconds(),
+    )?;
+    Ok(())
 }
 
 /// The rejected slot that records `record`'s rejection, if the roster has no
