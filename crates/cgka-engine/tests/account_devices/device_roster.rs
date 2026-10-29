@@ -288,9 +288,10 @@ async fn a_roster_update_sets_and_removes_single_entries() {
     let rejected = RejectedSlotV1 {
         reason: RejectedSlotReasonV1::NotMe,
         rejected_at: 1_700_000_000,
+        tag_signature_key: None,
     };
     let operations = vec![
-        DeviceRosterOperationV1::SetRejectedSlot(slot(9), rejected),
+        DeviceRosterOperationV1::SetRejectedSlot(slot(9), rejected.clone()),
         DeviceRosterOperationV1::SetDevice(slot(2), entry("Work laptop")),
     ];
     let mut expected = roster_of(&phone, &gid);
@@ -343,6 +344,18 @@ async fn the_committer_refuses_a_roster_update_that_breaks_the_roster() {
                 RejectedSlotV1 {
                     reason: RejectedSlotReasonV1::Removed,
                     rejected_at: 0,
+                    tag_signature_key: None,
+                },
+            )],
+        ),
+        (
+            "a not-me slot a tag signature key",
+            vec![DeviceRosterOperationV1::SetRejectedSlot(
+                slot(9),
+                RejectedSlotV1 {
+                    reason: RejectedSlotReasonV1::NotMe,
+                    rejected_at: 0,
+                    tag_signature_key: Some(vec![0x0c; 32]),
                 },
             )],
         ),

@@ -88,10 +88,13 @@ pub enum DeviceStatusV1 {
     Leaving,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RejectedSlotV1 {
     pub reason: RejectedSlotReasonV1,
     pub rejected_at: u64,
+    /// A removed device's tag signature key, kept so its tags still read
+    /// as its slot's. A `NotMe` slot never had an entry and has none.
+    pub tag_signature_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,13 +193,15 @@ impl DeviceRosterUpdateV1 {
         for operation in &self.operations {
             match operation {
                 DeviceRosterOperationV1::SetDevice(_, device) => validate_device(device)?,
+                DeviceRosterOperationV1::SetRejectedSlot(_, rejected) => {
+                    validate_rejected_slot(rejected)?;
+                }
                 DeviceRosterOperationV1::SetRejectedKeyPackage(key_package_ref, _)
                 | DeviceRosterOperationV1::RemoveRejectedKeyPackage(key_package_ref) => {
                     validate_key_package_ref(key_package_ref)?;
                 }
                 DeviceRosterOperationV1::SetAccount(account) => validate_account(account)?,
                 DeviceRosterOperationV1::RemoveDevice(_)
-                | DeviceRosterOperationV1::SetRejectedSlot(..)
                 | DeviceRosterOperationV1::RemoveRejectedSlot(_) => {}
             }
         }
@@ -207,7 +212,8 @@ impl DeviceRosterUpdateV1 {
 impl DeviceRosterV1 {
     /// The roster's own invariants: field bounds, at most
     /// [`MAX_LEAVES_PER_ACCOUNT`] devices, no two devices with one tag
-    /// signature key, and no slot both a device and rejected.
+    /// signature key, no tag signature key on a `NotMe` slot, and no slot
+    /// both a device and rejected.
     pub fn validate(&self) -> Result<(), String> {
         if self.devices.len() > MAX_LEAVES_PER_ACCOUNT {
             return Err(format!(
@@ -229,6 +235,14 @@ impl DeviceRosterV1 {
             .any(|slot| self.rejected_slots.contains_key(slot))
         {
             return Err("device roster lists a slot as both a device and rejected".into());
+        }
+        for rejected in self.rejected_slots.values() {
+            validate_rejected_slot(rejected)?;
+            if rejected.reason == RejectedSlotReasonV1::NotMe
+                && rejected.tag_signature_key.is_some()
+            {
+                return Err("device roster gives a not-me slot a tag signature key".into());
+            }
         }
         for key_package_ref in self.rejected_key_packages.keys() {
             validate_key_package_ref(key_package_ref)?;
@@ -252,7 +266,7 @@ impl DeviceRosterV1 {
                         .ok_or("device roster update removes a device it does not hold")?;
                 }
                 DeviceRosterOperationV1::SetRejectedSlot(slot, rejected) => {
-                    next.rejected_slots.insert(*slot, *rejected);
+                    next.rejected_slots.insert(*slot, rejected.clone());
                 }
                 DeviceRosterOperationV1::RemoveRejectedSlot(slot) => {
                     next.rejected_slots
@@ -334,6 +348,17 @@ fn validate_device(device: &DeviceEntryV1) -> Result<(), String> {
         )?;
     }
     Ok(())
+}
+
+fn validate_rejected_slot(rejected: &RejectedSlotV1) -> Result<(), String> {
+    match &rejected.tag_signature_key {
+        Some(tag_signature_key) => validate_bounded(
+            tag_signature_key,
+            DEVICE_ROSTER_TAG_SIGNATURE_KEY_MAX_LEN,
+            "tag signature key",
+        ),
+        None => Ok(()),
+    }
 }
 
 fn validate_account(account: &AccountEntryV1) -> Result<(), String> {
@@ -433,6 +458,7 @@ fn encode_rejected_slot(rejected: &RejectedSlotV1, out: &mut Vec<u8>) {
         RejectedSlotReasonV1::Removed => 1,
     });
     out.extend_from_slice(&rejected.rejected_at.to_be_bytes());
+    encode_optional_bytes(rejected.tag_signature_key.as_deref(), out);
 }
 
 fn encode_rejected_key_package(rejected: &RejectedKeyPackageV1, out: &mut Vec<u8>) {
@@ -630,9 +656,17 @@ fn decode_rejected_slot(cursor: &mut &[u8]) -> Result<RejectedSlotV1, String> {
         _ => return Err("device roster rejection reason is unknown".into()),
     };
     let rejected_at = take_u64(cursor, "rejected_at")?;
+    let tag_signature_key = decode_optional(cursor, "tag signature key", |cursor| {
+        decode_bounded(
+            cursor,
+            DEVICE_ROSTER_TAG_SIGNATURE_KEY_MAX_LEN,
+            "tag signature key",
+        )
+    })?;
     Ok(RejectedSlotV1 {
         reason,
         rejected_at,
+        tag_signature_key,
     })
 }
 
@@ -739,6 +773,7 @@ mod tests {
         RejectedSlotV1 {
             reason: RejectedSlotReasonV1::Removed,
             rejected_at: 1_700_001_000,
+            tag_signature_key: Some(vec![0x06; 32]),
         }
     }
 
@@ -871,6 +906,7 @@ mod tests {
                 RejectedSlotV1 {
                     reason: RejectedSlotReasonV1::Removed,
                     rejected_at: 0x6553_f200,
+                    tag_signature_key: Some(vec![0x44; 32]),
                 },
             ),
             DeviceRosterOperationV1::RemoveDevice(slot(0x11)),
@@ -880,13 +916,16 @@ mod tests {
         assert_eq!(
             hex::encode(&removal_bytes),
             concat!(
-                "404b",                                                             // operations<V>: 75 bytes
+                "406d",                                                             // operations<V>: 109 bytes
                 "01",                                                               // remove_device
                 "1111111111111111111111111111111111111111111111111111111111111111", // slot
                 "02", // set_rejected_slot
                 "1111111111111111111111111111111111111111111111111111111111111111", // slot
                 "01", // reason removed
                 "000000006553f200", // rejected_at
+                "01", // tag_signature_key present
+                "20",
+                "4444444444444444444444444444444444444444444444444444444444444444", // tag_signature_key
             )
         );
         let next = roster.apply(&removal).unwrap();
@@ -968,6 +1007,7 @@ mod tests {
             RejectedSlotV1 {
                 reason: RejectedSlotReasonV1::NotMe,
                 rejected_at: 0,
+                tag_signature_key: None,
             },
         );
         assert!(encode_device_roster_v1(&both).is_err());
@@ -1001,11 +1041,47 @@ mod tests {
         );
         for bad_key in [Vec::new(), vec![0x0c; 256]] {
             let roster = DeviceRosterV1 {
-                devices: [(slot(1), signing(bad_key))].into_iter().collect(),
+                devices: [(slot(1), signing(bad_key.clone()))].into_iter().collect(),
+                ..DeviceRosterV1::default()
+            };
+            assert!(encode_device_roster_v1(&roster).is_err());
+            let roster = DeviceRosterV1 {
+                rejected_slots: [(
+                    slot(1),
+                    RejectedSlotV1 {
+                        tag_signature_key: Some(bad_key),
+                        ..removed()
+                    },
+                )]
+                .into_iter()
+                .collect(),
                 ..DeviceRosterV1::default()
             };
             assert!(encode_device_roster_v1(&roster).is_err());
         }
+
+        // A removed slot keeps its device's key; a not-me slot never had
+        // one. A removed slot's key may match a device's: the signature
+        // covers the slot it names.
+        let rejected = |reason| DeviceRosterV1 {
+            devices: [(slot(1), signing(vec![0x06; 32]))].into_iter().collect(),
+            rejected_slots: [(
+                slot(2),
+                RejectedSlotV1 {
+                    reason,
+                    ..removed()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..DeviceRosterV1::default()
+        };
+        assert!(encode_device_roster_v1(&rejected(RejectedSlotReasonV1::Removed)).is_ok());
+        assert!(
+            encode_device_roster_v1(&rejected(RejectedSlotReasonV1::NotMe))
+                .unwrap_err()
+                .contains("not-me slot")
+        );
     }
 
     #[test]
@@ -1096,6 +1172,7 @@ mod tests {
                 RejectedSlotV1 {
                     reason: RejectedSlotReasonV1::NotMe,
                     rejected_at: 0,
+                    tag_signature_key: None,
                 },
             ),
             // The laptop takes the phone's tag signature key.
