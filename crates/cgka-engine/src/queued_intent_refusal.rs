@@ -103,6 +103,7 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::MissingWelcomeKeyPackage
         | EngineError::WelcomeNotAddressedToThisDevice
         | EngineError::WelcomeAlreadyProcessed
+        | EngineError::UnexpectedDeviceGroupWelcome
         | EngineError::Other(_) => false,
     }
 }
