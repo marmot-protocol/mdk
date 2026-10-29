@@ -167,3 +167,98 @@ async fn hydrated_welcome_stays_owned() {
             .all(|(_, message)| message.id != welcome.id)
     );
 }
+
+#[tokio::test]
+async fn recovery_ingest_drains_native() {
+    use cgka_traits::peeler::TransportPeeler as _;
+
+    enum OpenMode {
+        Eager,
+        Deferred,
+    }
+
+    for mode in [OpenMode::Eager, OpenMode::Deferred] {
+        let (dir, session, _, group, welcome) = hydrated_recovery_fixture().await;
+        drop(session);
+        let config = SessionConfig::new(
+            dir.path().join("alice.sqlite"),
+            SqlCipherKey::new("hydrated welcome ownership key").unwrap(),
+            pad32(b"hydrated-alice"),
+            Box::new(nostr_peeler(b"hydrated-alice")),
+        )
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: deterministic_nostr_keys(b"hydrated-alice"),
+        }))
+        .protocol_profile(ProtocolProfile::Current);
+        let config = match mode {
+            OpenMode::Eager => config,
+            OpenMode::Deferred => config.defer_group_hydration(),
+        };
+        let session = AccountDeviceSession::open(config).unwrap();
+        let adapter = RecordingAdapter::default();
+        let endpoint = TransportEndpoint("wss://recovery-hydration.example".into());
+        let mut runtime = AccountDeviceRuntime::new(
+            session,
+            adapter.clone(),
+            StaticTransportRouting::new(vec![endpoint.clone()])
+                .with_group_route(
+                    group.clone(),
+                    group.as_slice().to_vec(),
+                    vec![endpoint.clone()],
+                )
+                .with_inbox_route(
+                    cgka_traits::types::MemberId::new(pad32(b"hydrated-bob")),
+                    vec![endpoint],
+                ),
+            RecordingKeyPackages::default(),
+        );
+        let account = runtime.self_id();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let control = cgka_traits::GroupRecoveryMessage {
+            group_id: group.clone(),
+            request_id: [0x92; 32],
+            expires_at: now + 600,
+            body: cgka_traits::GroupRecoveryBody::Request {
+                device_key_hash: [0x93; 32],
+            },
+        };
+        let carrier = nostr_peeler(b"hydrated-bob")
+            .wrap_group_recovery(&control, &account)
+            .await
+            .unwrap();
+
+        let ingested = runtime
+            .ingest_delivery(&recovery_inbox_delivery(account, carrier))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ingested.outcome,
+            cgka_traits::IngestOutcome::Ignored { .. }
+        ));
+        assert!(matches!(
+            runtime.epoch_state(&group),
+            Some(cgka_traits::EpochState::Stable { .. })
+        ));
+        assert!(
+            adapter
+                .publishes()
+                .iter()
+                .any(|request| request.message.id == welcome.id)
+        );
+        assert!(ingested.effects.events.iter().any(|event| matches!(
+            event,
+            GroupEvent::EpochChanged { group_id, .. } if group_id == &group
+        )));
+        assert!(
+            ingested
+                .effects
+                .fanout
+                .iter()
+                .any(|outcome| { outcome.mls_confirmed && outcome.fanout_complete })
+        );
+    }
+}

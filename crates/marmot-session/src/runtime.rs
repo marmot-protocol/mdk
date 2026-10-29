@@ -3920,6 +3920,8 @@ where
 
     /// Ingest a borrowed delivery through the ordinary engine and publication path.
     /// Its transport owner retains the frame until the operation is acknowledged.
+    /// Recovery controls also drain independently authorized native work restored
+    /// by hydration, even when the control itself is ignored.
     pub async fn ingest_delivery(
         &mut self,
         delivery: &TransportDelivery,
@@ -3953,7 +3955,21 @@ where
                     started.elapsed(),
                     ingested.is_ok(),
                 );
-                return ingested;
+                let mut ingested = ingested?;
+                let restored = self.session.drain();
+                if !restored.is_empty() {
+                    let started = Instant::now();
+                    let published = self.publish_session_effects(restored).await;
+                    observe(
+                        AccountIngestPhase::EffectPublication,
+                        started.elapsed(),
+                        published.is_ok(),
+                    );
+                    // The control contributes no native effects. Move the
+                    // restored batch whole, including its fanout summaries.
+                    ingested.effects = published?;
+                }
+                return Ok(ingested);
             }
             ingested => ingested,
         };
