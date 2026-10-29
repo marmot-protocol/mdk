@@ -4,6 +4,20 @@
 
 ### Breaking changes
 
+- Migration 0130 advances account storage to schema 130 (mdk#2660 phase 4).
+  It adds `account_recovery_coverage_remainders`, each route's parked
+  remainder, and `settled_below_seconds` to
+  `account_recovery_coverage_goals` (an existing goal starts settled at its
+  own floor, where the earlier prune left it).
+  `prune_recovery_coverage` takes the current routes with their certifying
+  relays, parks what they still owe between each route's settled floor and
+  the retention floor, then settles every route at the retention floor; loss
+  lowers a route's settled floor to the loss floor.
+  `recovery_coverage_remainders` reads the remainders.
+  `dismiss_recovery_route_park` clears a route's remainder too, and accepts
+  the newest revision among its broken units and its remainder, which
+  `parked_recovery_routes` now reports. A released receipt (or a discarded
+  staged event) below the retention window no longer changes the ledger.
 - Migration 0129 advances account storage to schema 129 (mdk#2628 item 3.3b).
   It adds `cgka_device_group_welcome_expectations`, one row per device group a
   confirmed link waits to join: the sender leaf's signature key and the end of

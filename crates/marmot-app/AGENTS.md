@@ -204,7 +204,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   released receipt's second out of every live boundary; only a fetch proof covers it, on its own relay. `coverage_shadow_report`
   is the test-visible comparison with pending obligations; a scope holds proof only as completion would count it (its
   predicate at the current loss, route, inventory and obligation revisions), and a scope whose floor is unknown or
-  older than the retained window is owed from the retention floor. It logs aggregate counts only. Known disagreements
+  older than the retained window is owed from the retention floor. Before it prunes, it passes the current routes and
+  their required relays, so what they still owe below the floor is parked as each route's remainder; the prune settles
+  every route there, so restoring a pending loss's goal below it each report parks nothing twice. Standing goals
+  (startup history, epoch gaps) start at `standing_floor`: a group copy's Welcome time less the allowance, never below
+  the window. That time is only a hint: never use it to retire, un-cover or drop debt. It logs aggregate counts only.
+  Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
