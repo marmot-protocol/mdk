@@ -14,9 +14,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use storage_sqlite::{
     RecoveryCause, RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageSlice,
-    RecoveryLossImport, RecoveryPredicate, RecoveryRevisionFence, RecoveryScopeOutcome,
-    SqliteAppStorage, StoredRecoveryScope, TRANSPORT_RECONCILIATION_RETENTION_SECS,
-    TransportReconciliationRoute,
+    RecoveryLossCause, RecoveryLossImport, RecoveryLossReach, RecoveryPredicate,
+    RecoveryRevisionFence, RecoveryScopeOutcome, SqliteAppStorage, StoredRecoveryScope,
+    TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationRoute,
 };
 use transport_nostr::MarmotRelayPlaneAccountAdapter;
 use transport_nostr_adapter::{ReplayAdmissionStatus, ReplayLiveCount, ReplaySourceGeneration};
@@ -31,7 +31,8 @@ const TARGET: &str = "marmot_app::recovery_coverage";
 
 /// How the ledger and the obligations compare, in aggregate. Each compared
 /// scope is counted once; known-event, maintenance-boundary and unresolved
-/// scopes are not comparable.
+/// scopes are not comparable, nor is a loss obligation's scope on a route its
+/// loss never reached inside the scope's window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CoverageShadowReport {
     pub(crate) scopes_compared: u64,
@@ -331,17 +332,47 @@ fn log_failure(method: &'static str, error: &AppError) {
         "coverage ledger write skipped");
 }
 
-/// Whether the obligation counts the scope proved, as completion would: its
-/// own predicate over checkpoints captured at the account's current loss,
-/// route and inventory revisions and the obligation's current revision. A
-/// certificate from before newer loss proves nothing any more.
+/// Where each cause's unresolved loss may have lost events, as of one
+/// report. Account-private.
+struct LossReach {
+    queue: RecoveryLossReach,
+    notification: RecoveryLossReach,
+}
+
+impl LossReach {
+    fn read(app: &SqliteAppStorage, label: &str) -> Result<Self, AppError> {
+        Ok(Self {
+            queue: app.recovery_loss_reach(label, RecoveryLossCause::Queue)?,
+            notification: app
+                .recovery_loss_reach(label, RecoveryLossCause::NotificationConsumer)?,
+        })
+    }
+
+    /// The loss a loss demand owes, or `None` for any other demand.
+    fn owed_by(&self, cause: RecoveryCause) -> Option<&RecoveryLossReach> {
+        match cause {
+            RecoveryCause::QueueLoss => Some(&self.queue),
+            RecoveryCause::NotificationLoss => Some(&self.notification),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the obligation counts the scope proved, as completion would once
+/// loss invalidates by route: its own predicate over checkpoints captured at
+/// the account's current route and inventory revisions and the obligation's
+/// current revision. A checkpoint from before newer loss proves nothing only
+/// when `newer_loss_reaches`: loss imported after the checkpoint's loss
+/// revision may have lost an event on the scope's route inside its window.
+/// Retiring that loss later proves nothing, so it still voids.
 fn obligation_holds(
     scope: &StoredRecoveryScope,
     predicate: RecoveryPredicate,
     fence: &RecoveryRevisionFence,
     obligation_revision: u64,
+    newer_loss_reaches: bool,
 ) -> bool {
-    let current = scope.loss_revision == fence.loss_revision
+    let current = (scope.loss_revision == fence.loss_revision || !newer_loss_reaches)
         && scope.route_revision == fence.route_revision
         && scope.inventory_revision == fence.inventory_revision
         && scope.obligation_revision == obligation_revision;
@@ -731,22 +762,20 @@ impl AppClient {
             })
             .collect::<Vec<_>>();
         self.widen_standing_goals(app, &gap_routes, now)?;
-        // Pending loss owes each scope's window: this restores a goal the
-        // import's best-effort widening lost. A goal back below the floor
-        // parks nothing the prune already settled.
+        // Loss is imported on this worker, so every loss read below was
+        // imported at or before the fence's loss revision, or not yet.
+        let fence = app.recovery_revision_fence()?;
+        let reach = LossReach::read(app, &self.state.label)?;
+        // Pending loss owes each scope's route from where it reached that
+        // route: this restores a goal the import's best-effort widening lost.
+        // A goal back below the floor parks nothing the prune already settled.
         let mut demand_scopes = Vec::with_capacity(demands.len());
         for demand in &demands {
             let scopes = app.recovery_scope_snapshots(demand.ticket.id)?;
-            if matches!(
-                demand.cause,
-                RecoveryCause::QueueLoss | RecoveryCause::NotificationLoss
-            ) {
-                for scope in &scopes {
-                    if let Some(route) = scope_route(scope) {
-                        app.widen_recovery_coverage_goals(
-                            std::slice::from_ref(&route),
-                            scope.plan.since_seconds.unwrap_or(0),
-                        )?;
+            if let Some(owed) = reach.owed_by(demand.cause) {
+                for route in scopes.iter().filter_map(scope_route) {
+                    if let Some(floor) = owed.floor(&route) {
+                        app.widen_recovery_coverage_goals(std::slice::from_ref(&route), floor)?;
                     }
                 }
             }
@@ -759,10 +788,11 @@ impl AppClient {
             .map(|current| (current.route.clone(), current.required.clone()))
             .collect::<Vec<_>>();
         app.prune_recovery_coverage(floor, &certifying)?;
-        let fence = app.recovery_revision_fence()?;
         // Tails as of now, not as of the writes above.
         let tails = self.live_tails(app, now).await;
 
+        // What each stale loss revision has not seen, read once per revision.
+        let mut newer_loss = BTreeMap::new();
         let mut report = CoverageShadowReport::default();
         let mut owed_routes = HashSet::new();
         let mut inbox_owed = false;
@@ -800,6 +830,15 @@ impl AppClient {
                     report.not_comparable += 1;
                     continue;
                 };
+                // A loss obligation owes every route, but owes the ledger
+                // only those its loss reached inside the scope's window.
+                if reach
+                    .owed_by(demand.cause)
+                    .is_some_and(|owed| !owed.reaches(&route, scope.plan.until_seconds))
+                {
+                    report.not_comparable += 1;
+                    continue;
+                }
                 // The ledger keeps nothing below the retained window: an
                 // older or unknown floor owes everything still retained.
                 let since = scope.plan.since_seconds.unwrap_or(floor).max(floor);
@@ -822,8 +861,22 @@ impl AppClient {
                         break;
                     }
                 }
-                let holds =
-                    obligation_holds(&scope, demand.predicate, &fence, demand.ticket.revision);
+                let newer_loss_reaches = scope.loss_revision != fence.loss_revision && {
+                    let newer = match newer_loss.entry(scope.loss_revision) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                            app.recovery_loss_reach_after(&self.state.label, scope.loss_revision)?,
+                        ),
+                    };
+                    newer.reaches(&route, scope.plan.until_seconds)
+                };
+                let holds = obligation_holds(
+                    &scope,
+                    demand.predicate,
+                    &fence,
+                    demand.ticket.revision,
+                    newer_loss_reaches,
+                );
                 match (holds, ledger) {
                     (false, false) => report.agree_owed += 1,
                     (true, true) => report.agree_covered += 1,

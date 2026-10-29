@@ -679,17 +679,10 @@ async fn notification_lag_uncovers_each_route_from_its_own_floor() {
     );
 }
 
-/// A certificate captured before newer loss no longer proves anything to the
-/// obligation, and the import un-covered it in the ledger: both owe it again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn newer_loss_voids_a_pending_obligations_certificates() {
-    let mut fixture = fixture().await;
-    let app = fixture.storage.app_storage();
-    let floor = unix_now_seconds().saturating_sub(30);
-    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
-        .unwrap();
+/// Run a pass for the pending queue loss in which the inbox certifies and the
+/// group's relay fails, so the loss stays owed with the inbox proved.
+async fn certify_only_the_inbox(fixture: &mut Fixture) -> CoverageShadowReport {
     let grant = authorize(&mut fixture.client).await;
-    // The inbox certifies; the group's relay fails, so the loss stays owed.
     fixture.client.test_comparison_results = Some(ScriptedComparisons::by_route(|route| {
         let failed = matches!(route, TransportReconciliationRoute::Group(_));
         Ok(Some((
@@ -712,12 +705,152 @@ async fn newer_loss_voids_a_pending_obligations_certificates() {
         .await
         .unwrap();
     assert!(
-        app.pending_recovery_demands()
+        fixture
+            .storage
+            .app_storage()
+            .pending_recovery_demands()
             .unwrap()
             .iter()
             .any(|demand| demand.cause == RecoveryCause::QueueLoss)
     );
-    let partial = report(&fixture).await;
+    report(fixture).await
+}
+
+/// The end of the pending queue loss's scope on `route`.
+fn queue_loss_scope_until(fixture: &Fixture, route: &TransportReconciliationRoute) -> u64 {
+    let app = fixture.storage.app_storage();
+    let loss = app
+        .pending_recovery_demands()
+        .unwrap()
+        .into_iter()
+        .find(|demand| demand.cause == RecoveryCause::QueueLoss)
+        .expect("the loss is owed");
+    app.recovery_scope_snapshots(loss.ticket.id)
+        .unwrap()
+        .iter()
+        .find(|scope| super::scope_route(scope).as_ref() == Some(route))
+        .expect("the loss has a scope on the route")
+        .plan
+        .until_seconds
+}
+
+/// Newer loss voids a pending obligation's certificates only where it may
+/// have lost events: on another route, or after the proved window ends, the
+/// inbox's certificate still holds and the report agrees. Loss inside the
+/// window voids it, and the ledger owes it again too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn newer_loss_elsewhere_leaves_a_pending_obligations_certificates() {
+    let mut fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let group = routes(&fixture.client)
+        .into_iter()
+        .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
+        .unwrap();
+    let inbox = TransportReconciliationRoute::Inbox;
+    let floor = unix_now_seconds().saturating_sub(30);
+    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
+        .unwrap();
+    let partial = certify_only_the_inbox(&mut fixture).await;
+    assert!(partial.agree_covered >= 1, "{partial:?}");
+    let until = queue_loss_scope_until(&fixture, &inbox);
+    let lag = |token, floor, routes: Option<&[(TransportReconciliationRoute, u64)]>| {
+        let before = app.recovery_revision_fence().unwrap().loss_revision;
+        app.record_account_recovery_loss_routed(
+            "alice",
+            storage_sqlite::RecoveryLossCause::NotificationConsumer,
+            token,
+            0,
+            unix_now_seconds(),
+            Some(floor),
+            routes,
+        )
+        .unwrap();
+        fixture.client.synchronize_recovery_loss(&app).unwrap();
+        assert!(app.recovery_revision_fence().unwrap().loss_revision > before);
+    };
+
+    lag(7, floor, Some(&[(group.clone(), floor)]));
+    let elsewhere = report(&fixture).await;
+    assert_eq!(
+        elsewhere.agree_covered, partial.agree_covered,
+        "{elsewhere:?}"
+    );
+    assert_eq!(elsewhere.disagreements(), 0, "{elsewhere:?}");
+
+    lag(8, until + 1, None);
+    let later = report(&fixture).await;
+    assert_eq!(later.agree_covered, partial.agree_covered, "{later:?}");
+    assert_eq!(later.disagreements(), 0, "{later:?}");
+
+    lag(9, until, Some(&[(inbox, until)]));
+    let inside = report(&fixture).await;
+    assert_eq!(inside.agree_covered, 0, "{inside:?}");
+    assert_eq!(inside.disagreements(), 0, "{inside:?}");
+}
+
+/// The queue loss obligation owes every route, but routed loss reached only
+/// the group: its inbox scope owes the ledger nothing, so it is not compared,
+/// while the group's is owed by both. A certified pass settles startup
+/// history first, so only the loss is pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_loss_scope_its_loss_never_reached_is_not_compared() {
+    let mut fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let group = routes(&fixture.client)
+        .into_iter()
+        .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
+        .unwrap();
+    let history = fixture
+        .client
+        .authorize_account_recovery(
+            None,
+            marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+        )
+        .await
+        .unwrap()
+        .expect("startup history selects a grant");
+    fixture.client.test_comparison_results = Some(certified_routes(&history));
+    fixture
+        .client
+        .run_recovery_grant_for_test(history)
+        .await
+        .unwrap();
+    let settled = report(&fixture).await;
+    assert_eq!(settled.scopes_compared, 0, "{settled:?}");
+
+    let floor = unix_now_seconds().saturating_sub(10);
+    app.record_account_recovery_loss_routed(
+        "alice",
+        storage_sqlite::RecoveryLossCause::Queue,
+        41,
+        3,
+        unix_now_seconds(),
+        Some(floor),
+        Some(&[(group.clone(), floor)]),
+    )
+    .unwrap();
+    fixture
+        .client
+        .recovery_owner
+        .test_advance_to_retry(&fixture.storage);
+    let _grant = authorize(&mut fixture.client).await;
+    queue_loss_scope_until(&fixture, &TransportReconciliationRoute::Inbox);
+    let pending = report(&fixture).await;
+    assert_eq!(pending.agree_owed, 1, "{pending:?}");
+    assert_eq!(pending.scopes_compared, 1, "{pending:?}");
+    assert_eq!(pending.disagreements(), 0, "{pending:?}");
+}
+
+/// A certificate captured before newer loss no longer proves anything to the
+/// obligation, and the import un-covered it in the ledger: both owe it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn newer_loss_voids_a_pending_obligations_certificates() {
+    let mut fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let floor = unix_now_seconds().saturating_sub(30);
+    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
+        .unwrap();
+    let partial = certify_only_the_inbox(&mut fixture).await;
     assert!(partial.agree_covered >= 1, "{partial:?}");
     assert_eq!(partial.disagreements(), 0, "{partial:?}");
 

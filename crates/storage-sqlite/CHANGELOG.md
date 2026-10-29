@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- Migration 0132 advances account storage to schema 132 (mdk#2660 phase 4).
+  It adds `import_revision` to `account_delivery_loss_evidence`: the loss
+  revision the import that last charged a generation left. Existing imported
+  rows take the current loss revision; rows no import charged stay NULL.
+  `recovery_loss_reach` and `recovery_loss_reach_after` return a
+  `RecoveryLossReach`: where unresolved loss of one cause, or loss imported
+  after a loss revision, may have lost events, by route.
 - Migration 0131 advances account storage to schema 131 (mdk#2628 item 3.2).
   It adds `account_sign_ins`, one row per KeyPackage slot of the account that
   this device found and does not recognize: whether this device's first check
