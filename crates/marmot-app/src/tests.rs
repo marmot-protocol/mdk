@@ -1623,6 +1623,33 @@ pub(crate) fn every_subscription(_: &NostrSubscription) -> bool {
     true
 }
 
+/// Let end-of-stored-events admit `client`'s live REQs' native replay. Until
+/// then its group messages wait behind the unanswered sources, a sync admits
+/// them only through its recovery job, and that job can return before it does
+/// (mdk#2624). Call this before the client's first grant: a job that starts
+/// before a source's EOSE captures that source; the scripted relay serves no
+/// history, so the capture leaves it incomplete and no later EOSE admits it.
+/// Its `SubscriptionReplay` duty would then join every grant (mdk#2693).
+pub(crate) async fn settle_live_replay(
+    plane: &MarmotRelayPlane,
+    relay: &ScriptedPushRelayClient,
+    client: &mut AppClient,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        report_scripted_eose(plane, relay, every_subscription).await;
+        client.synchronize_native_replay().await.unwrap();
+        if client.recovery_owner.test_replay_complete() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the live REQs' replay settles"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 const EXPLICIT_CATCH_UP_BACKFILL_DEADLINE: Duration = Duration::from_secs(5);
 
 #[cfg(feature = "test-policy-overrides")]
@@ -23792,7 +23819,7 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
     for member in [&bob, &carol] {
         remember_test_member_inbox(&app, &member.account_id_hex, "wss://relay.example");
     }
-    let plane = MarmotRelayPlane::new(None, relay);
+    let plane = MarmotRelayPlane::new(None, relay.clone());
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
         .await
@@ -23830,6 +23857,9 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
             .joined_groups
             .contains(&group_id)
     );
+    // Bob's leave reaches Alice behind her live REQs' replay; settle it so
+    // her next sync ingests the proposal instead of leaving it to a grant.
+    settle_live_replay(&plane, &relay, &mut alice).await;
     bob_client.leave_group(&group_id).await.unwrap();
     alice.sync().await.unwrap();
     let delay = alice
