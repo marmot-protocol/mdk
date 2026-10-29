@@ -182,6 +182,17 @@ pub struct SmallStateSync {
     pub recorded: usize,
 }
 
+/// A sibling whose whole snapshot this device still needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmallStateSnapshotRequest {
+    /// The sibling's slot.
+    pub to: [u8; 32],
+    /// The latest request to it; `None` before the first.
+    pub request: Option<[u8; 16]>,
+    /// When that request was sent, in seconds; `None` to ask at once.
+    pub asked_at: Option<u64>,
+}
+
 impl SqliteAppStorage {
     /// Start taking part in small state, owing a snapshot request. `true`
     /// when this call started it.
@@ -212,16 +223,181 @@ impl SqliteAppStorage {
             .storage()
     }
 
-    /// Owe a snapshot request (`true`), or record one sent (`false`). Does
-    /// nothing before [`Self::start_small_state`].
-    pub fn set_small_state_snapshot_owed(&self, owed: bool) -> StorageResult<()> {
+    /// Owe snapshot requests: this device may have lost messages its
+    /// siblings sent. Does nothing before [`Self::start_small_state`].
+    pub fn owe_small_state_snapshots(&self) -> StorageResult<()> {
         self.lock()?
             .execute_cached(
-                "UPDATE small_state_sync SET snapshot_owed = ?1 WHERE id = 1",
-                params![i64::from(owed)],
+                "UPDATE small_state_sync SET snapshot_owed = 1 WHERE id = 1",
+                [],
             )
             .storage()?;
         Ok(())
+    }
+
+    /// Begin owed snapshot requests: this device needs a whole snapshot from
+    /// each sibling in `to`, and owes its siblings every item it holds. Earlier
+    /// requests are forgotten. Does nothing unless requests are owed.
+    pub fn begin_small_state_snapshots(&self, to: &[[u8; 32]]) -> StorageResult<()> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let begun = conn
+                .execute_cached(
+                    "UPDATE small_state_sync SET snapshot_owed = 0
+                     WHERE id = 1 AND snapshot_owed = 1",
+                    [],
+                )
+                .storage()?;
+            if begun == 0 {
+                return Ok(());
+            }
+            conn.execute_cached("DELETE FROM small_state_snapshot_requests", [])
+                .storage()?;
+            for slot in to {
+                conn.execute_cached(
+                    "INSERT OR IGNORE INTO small_state_snapshot_requests (to_slot) VALUES (?1)",
+                    params![slot.as_slice()],
+                )
+                .storage()?;
+            }
+            conn.execute_cached(
+                "UPDATE small_state_items SET unsent = 1 WHERE unsent = 0",
+                [],
+            )
+            .storage()?;
+            Ok(())
+        })
+    }
+
+    /// The siblings whose whole snapshot this device still needs, in slot
+    /// order.
+    pub fn small_state_snapshot_requests(&self) -> StorageResult<Vec<SmallStateSnapshotRequest>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT to_slot, request, asked_at FROM small_state_snapshot_requests
+                 ORDER BY to_slot",
+            )
+            .storage()?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        let corrupt = || StorageError::Backend("corrupt small-state snapshot request".into());
+        rows.into_iter()
+            .map(|(to, request, asked_at)| {
+                Ok(SmallStateSnapshotRequest {
+                    to: to.try_into().map_err(|_| corrupt())?,
+                    request: request
+                        .map(|request| request.try_into().map_err(|_| corrupt()))
+                        .transpose()?,
+                    asked_at: asked_at.map(i64_to_u64).transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Record a request sent to `to` with id `request`. The parts of an
+    /// earlier request's answer no longer count.
+    pub fn record_small_state_snapshot_asked(
+        &self,
+        to: &[u8; 32],
+        request: &[u8; 16],
+        asked_at: u64,
+    ) -> StorageResult<()> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            conn.execute_cached(
+                "DELETE FROM small_state_snapshot_parts
+                 WHERE request = (SELECT request FROM small_state_snapshot_requests
+                                  WHERE to_slot = ?1)",
+                params![to.as_slice()],
+            )
+            .storage()?;
+            conn.execute_cached(
+                "UPDATE small_state_snapshot_requests SET request = ?2, asked_at = ?3
+                 WHERE to_slot = ?1",
+                params![to.as_slice(), request.as_slice(), u64_to_i64(asked_at)?],
+            )
+            .storage()?;
+            Ok(())
+        })
+    }
+
+    /// Stop needing `to`'s snapshot: it is no longer an active sibling.
+    pub fn drop_small_state_snapshot_request(&self, to: &[u8; 32]) -> StorageResult<()> {
+        self.lock()?
+            .execute_cached(
+                "DELETE FROM small_state_snapshot_requests WHERE to_slot = ?1",
+                params![to.as_slice()],
+            )
+            .storage()?;
+        Ok(())
+    }
+
+    /// Ask again at once for the request `request`, which branch selection
+    /// withdrew. `false` when no sibling's latest request has that id.
+    pub fn withdraw_small_state_snapshot_request(&self, request: &[u8; 16]) -> StorageResult<bool> {
+        Ok(self
+            .lock()?
+            .execute_cached(
+                "UPDATE small_state_snapshot_requests SET asked_at = NULL WHERE request = ?1",
+                params![request.as_slice()],
+            )
+            .storage()?
+            == 1)
+    }
+
+    /// Record that part `part` of `parts` of the answer to `request` was
+    /// merged. `true` when that makes the answer whole: the sibling's snapshot
+    /// is no longer needed.
+    pub fn record_small_state_snapshot_part(
+        &self,
+        request: &[u8; 16],
+        part: u64,
+        parts: u64,
+    ) -> StorageResult<bool> {
+        if part == 0 || part > parts || parts > MAX_SMALL_STATE_NUMBER {
+            return Ok(false);
+        }
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let inserted = conn
+                .execute_cached(
+                    "INSERT OR IGNORE INTO small_state_snapshot_parts (request, parts, part)
+                     SELECT request, ?2, ?3 FROM small_state_snapshot_requests
+                     WHERE request = ?1",
+                    params![request.as_slice(), u64_to_i64(parts)?, u64_to_i64(part)?],
+                )
+                .storage()?;
+            if inserted == 0 {
+                return Ok(false);
+            }
+            let merged: i64 = conn
+                .query_row_cached(
+                    "SELECT COUNT(*) FROM small_state_snapshot_parts
+                     WHERE request = ?1 AND parts = ?2",
+                    params![request.as_slice(), u64_to_i64(parts)?],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            if i64_to_u64(merged)? < parts {
+                return Ok(false);
+            }
+            conn.execute_cached(
+                "DELETE FROM small_state_snapshot_requests WHERE request = ?1",
+                params![request.as_slice()],
+            )
+            .storage()?;
+            Ok(true)
+        })
     }
 
     /// Record local changes, merge `incoming`, and apply winning values, in
@@ -290,14 +466,14 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Owe the siblings again every value this device's user set that it
-    /// still holds, with its version and change id: an update that carried
-    /// some of them was invalidated. A value a sibling's beat is no longer
-    /// held, so it is not sent again. Returns how many are owed again.
-    pub fn owe_own_small_state_items(&self) -> StorageResult<usize> {
+    /// Owe the siblings every item this device holds, with its version and
+    /// change id: a small-state message it sent or merged was withdrawn, or it
+    /// may have lost messages its siblings need. Returns how many are owed
+    /// again.
+    pub fn owe_all_small_state_items(&self) -> StorageResult<usize> {
         self.lock()?
             .execute_cached(
-                "UPDATE small_state_items SET unsent = 1 WHERE own = 1 AND unsent = 0",
+                "UPDATE small_state_items SET unsent = 1 WHERE unsent = 0",
                 [],
             )
             .storage()
@@ -572,12 +748,12 @@ fn items_tx(conn: &Connection, unsent_only: bool) -> StorageResult<Vec<SmallStat
 }
 
 /// Write `item` as the held value: this device's user's change, owed to the
-/// siblings (`own`), or a sibling's that won.
+/// siblings (`unsent`), or a sibling's that won.
 fn write_item_tx(
     conn: &Connection,
     item: &SmallStateItem,
     observed: Option<&str>,
-    own: bool,
+    unsent: bool,
     now: u64,
 ) -> StorageResult<()> {
     let (flag, mute_until, read) = match &item.value {
@@ -594,9 +770,9 @@ fn write_item_tx(
     conn.execute_cached(
         "INSERT INTO small_state_items (
             group_id_hex, item, version, change_id, flag, mute_until,
-            read_epoch, read_at, read_message_id_hex, observed, unsent, own, updated_at
+            read_epoch, read_at, read_message_id_hex, observed, unsent, updated_at
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(group_id_hex, item) DO UPDATE SET
             version = excluded.version,
             change_id = excluded.change_id,
@@ -607,7 +783,6 @@ fn write_item_tx(
             read_message_id_hex = excluded.read_message_id_hex,
             observed = excluded.observed,
             unsent = excluded.unsent,
-            own = excluded.own,
             updated_at = excluded.updated_at",
         params![
             item.group_id_hex,
@@ -623,9 +798,24 @@ fn write_item_tx(
             read.map(|position| u64_to_i64(position.at)).transpose()?,
             read.map(|position| position.message_id_hex.as_str()),
             observed,
-            i64::from(own),
+            i64::from(unsent),
             u64_to_i64(now)?,
         ],
+    )
+    .storage()?;
+    Ok(())
+}
+
+/// Forget what this device observed of an item, so its held value is applied
+/// again.
+fn clear_observed_tx(
+    conn: &Connection,
+    group_id_hex: &str,
+    name: SmallStateItemName,
+) -> StorageResult<()> {
+    conn.execute_cached(
+        "UPDATE small_state_items SET observed = NULL WHERE group_id_hex = ?1 AND item = ?2",
+        params![group_id_hex, name.as_str()],
     )
     .storage()?;
     Ok(())
@@ -681,10 +871,15 @@ fn record_local_changes_tx(
                     observed: Some(seen),
                     ..
                 }) if seen == observed => continue,
-                Some(HeldRow { item, .. }) => item
-                    .version
-                    .map_or(1, |held| held.version.saturating_add(1))
-                    .min(MAX_SMALL_STATE_NUMBER),
+                Some(HeldRow { item, .. }) => match item.version {
+                    // No change can beat the highest version: put the held
+                    // value back.
+                    Some(held) if held.version >= MAX_SMALL_STATE_NUMBER => {
+                        clear_observed_tx(conn, group_id_hex, name)?;
+                        continue;
+                    }
+                    held => held.map_or(1, |held| held.version + 1),
+                },
                 None if chat.is_default(name) => continue,
                 None => 1,
             };

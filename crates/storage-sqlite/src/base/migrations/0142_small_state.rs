@@ -15,11 +15,15 @@
 //!     chat this device holds. A local state that no longer matches it is a
 //!     change the user made here.
 //!   - `unsent` is 1 while this device still owes its siblings the value.
-//!   - `own` is 1 when the value is a change this device's user made, which
-//!     the device sends again if the update carrying it is invalidated.
 //! - `small_state_sync`: at most one row, written when this device starts to
 //!   take part in small state. `snapshot_owed` is 1 while this device still
-//!   has to ask a sibling for a snapshot.
+//!   has to ask its siblings for snapshots.
+//! - `small_state_snapshot_requests`: one row per sibling (`to_slot`) whose
+//!   whole snapshot this device still needs. `request` is the random id of
+//!   the latest request to it and `asked_at` when, in seconds; NULL in both
+//!   asks at once.
+//! - `small_state_snapshot_parts`: the parts of the answer to a request merged
+//!   so far, by the answer's number of parts.
 //!
 //! No rows are seeded.
 use crate::SqliteResultExt;
@@ -40,7 +44,6 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             read_message_id_hex TEXT,
             observed TEXT,
             unsent INTEGER NOT NULL CHECK(unsent IN (0, 1)),
-            own INTEGER NOT NULL CHECK(own IN (0, 1)),
             updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
             PRIMARY KEY (group_id_hex, item),
             CHECK(
@@ -64,7 +67,21 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             id INTEGER PRIMARY KEY CHECK(id = 1),
             started_at INTEGER NOT NULL CHECK(started_at >= 0),
             snapshot_owed INTEGER NOT NULL CHECK(snapshot_owed IN (0, 1))
-        );",
+        );
+
+        CREATE TABLE small_state_snapshot_requests (
+            to_slot BLOB PRIMARY KEY CHECK(length(to_slot) = 32),
+            request BLOB UNIQUE CHECK(request IS NULL OR length(request) = 16),
+            asked_at INTEGER CHECK(asked_at IS NULL OR asked_at >= 0)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE small_state_snapshot_parts (
+            request BLOB NOT NULL REFERENCES small_state_snapshot_requests (request)
+                ON DELETE CASCADE,
+            parts INTEGER NOT NULL CHECK(parts >= 1),
+            part INTEGER NOT NULL CHECK(part >= 1 AND part <= parts),
+            PRIMARY KEY (request, parts, part)
+        ) WITHOUT ROWID;",
     )
     .storage()
 }

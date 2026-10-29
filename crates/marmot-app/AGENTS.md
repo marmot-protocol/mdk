@@ -183,7 +183,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   device last observed is its user's change, so no setter needs a hook and leaving a chat is never a change. Archives
   go through `set_group_archived_unobserved`, keeping the worker's in-memory account state authoritative (mdk#178).
   Each chat a pass changes gets one chat-list update through `pending_projection_updates`. The merge rule's tie-break
-  (`tie_break`) and its placement of a new pin (`new_pin_index`) are each one function; change them nowhere else.
+  (`tie_break`) and its placement of a new pin (`new_pin_index`) are each one function; change them nowhere else. A
+  device that may have lost messages needs a whole snapshot from every sibling the roster lists, tracked per sibling in
+  storage; a withdrawn small-state message owes every held item again, whoever sent it.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

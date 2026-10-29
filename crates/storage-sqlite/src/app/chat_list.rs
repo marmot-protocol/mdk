@@ -31,7 +31,7 @@ pub use selection::{ChatListSelectionError, ChatListSelectionSnapshot};
 use serde::{Deserialize, Serialize};
 pub use small_state::{
     MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition, SmallStateItem, SmallStateItemName,
-    SmallStateRule, SmallStateSync, SmallStateValue, SmallStateVersion,
+    SmallStateRule, SmallStateSnapshotRequest, SmallStateSync, SmallStateValue, SmallStateVersion,
 };
 use std::collections::{HashMap, HashSet};
 pub use window::{ChatListWindowQuery, ChatListWindowRead};
