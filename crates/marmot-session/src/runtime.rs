@@ -211,6 +211,17 @@ struct PublishStatus {
     awaits_commit: bool,
 }
 
+/// Why a Welcome is not published (see `welcome_hold`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WelcomeHold {
+    /// Withdrawn, or retired with its rolled-back commit: never published
+    /// again, and nothing is owed.
+    Withdrawn,
+    /// Staged with its unconfirmed invite commit: held until the commit
+    /// confirms and promotes it (mdk#2726).
+    AwaitsCommit,
+}
+
 struct PendingFanoutContinuation {
     pending: PendingStateRef,
     kind: FanoutPendingKind,
@@ -5011,6 +5022,26 @@ where
         Ok(())
     }
 
+    /// Why a Welcome must not reach a relay now, checked by both places that
+    /// publish one: the publish preparation step and maintenance's retry of a
+    /// stored fanout.
+    fn welcome_hold(
+        &self,
+        message_id: &cgka_traits::MessageId,
+        envelope: &TransportEnvelope,
+    ) -> AccountResult<Option<WelcomeHold>> {
+        if !matches!(envelope, TransportEnvelope::Welcome { .. }) {
+            return Ok(None);
+        }
+        if self.session.sent_welcome_withdrawn(message_id)? {
+            return Ok(Some(WelcomeHold::Withdrawn));
+        }
+        if self.session.sent_welcome_awaits_commit(message_id)? {
+            return Ok(Some(WelcomeHold::AwaitsCommit));
+        }
+        Ok(None)
+    }
+
     /// Complete the endpoint snapshot for an already-persisted exact event.
     ///
     /// Group evolutions call this only after the first accepted acknowledgement
@@ -5027,13 +5058,15 @@ where
         let Some(mut fanout) = self.session.transport_fanout(message_id)? else {
             return Ok(());
         };
-        if matches!(
-            fanout.exact_message.envelope,
-            TransportEnvelope::Welcome { .. }
-        ) && self.session.sent_welcome_withdrawn(message_id)?
-        {
-            self.session.delete_transport_fanout(message_id)?;
-            return Ok(());
+        match self.welcome_hold(message_id, &fanout.exact_message.envelope)? {
+            // A withdrawn Welcome's remaining retries go with it.
+            Some(WelcomeHold::Withdrawn) => {
+                self.session.delete_transport_fanout(message_id)?;
+                return Ok(());
+            }
+            // A staged one keeps them for when its commit confirms.
+            Some(WelcomeHold::AwaitsCommit) => return Ok(()),
+            None => {}
         }
         let remaining = fanout
             .targets
@@ -5868,24 +5901,21 @@ where
             }));
         }
         // Every Welcome publish passes here, whichever path still holds the
-        // Welcome, so a withdrawn or retired one is never published again.
-        if matches!(message.envelope, TransportEnvelope::Welcome { .. })
-            && self.session.sent_welcome_withdrawn(&message_id)?
-        {
-            return Ok(PreparedLegacyPublish::Complete(PublishStatus {
-                withdrawn: true,
-                ..PublishStatus::default()
-            }));
-        }
-        // A Welcome staged with its invite commit waits for that commit to
-        // confirm, whoever asks for it (mdk#2726).
-        if matches!(message.envelope, TransportEnvelope::Welcome { .. })
-            && self.session.sent_welcome_awaits_commit(&message_id)?
-        {
-            return Ok(PreparedLegacyPublish::Complete(PublishStatus {
-                awaits_commit: true,
-                ..PublishStatus::default()
-            }));
+        // Welcome, or through maintenance's retry of its fanout.
+        match self.welcome_hold(&message_id, &message.envelope)? {
+            Some(WelcomeHold::Withdrawn) => {
+                return Ok(PreparedLegacyPublish::Complete(PublishStatus {
+                    withdrawn: true,
+                    ..PublishStatus::default()
+                }));
+            }
+            Some(WelcomeHold::AwaitsCommit) => {
+                return Ok(PreparedLegacyPublish::Complete(PublishStatus {
+                    awaits_commit: true,
+                    ..PublishStatus::default()
+                }));
+            }
+            None => {}
         }
         let msg_id_hex = hex::encode(message_id.as_slice());
         // Capture the outbound wire envelope before `message` is moved into the
