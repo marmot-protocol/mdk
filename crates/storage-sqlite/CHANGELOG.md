@@ -4,6 +4,17 @@
 
 ### Breaking changes
 
+- Migration 0132 advances account storage to schema 132 (mdk#2628 item 4.3).
+  It adds `small_state_items`, one row per chat and item (`read`, `pin`,
+  `mute`, `archive`) holding the value the account's devices agree on, what
+  this device last observed of it and whether its siblings are still owed
+  it, and `small_state_sync`, which records that this device started and
+  whether it still owes a snapshot request. `SqliteAppStorage` gains
+  `start_small_state`, `small_state_started`, `small_state_snapshot_owed`,
+  `set_small_state_snapshot_owed`, `sync_small_state`, `small_state_items`,
+  `unsent_small_state_items`, `mark_small_state_sent` and
+  `owe_small_state_items`, with `SmallStateItem`, `SmallStateRule` and their
+  value types.
 - Migration 0131 advances account storage to schema 131 (mdk#2628 item 3.2).
   It adds `account_sign_ins`, one row per KeyPackage slot of the account that
   this device found and does not recognize: whether this device's first check

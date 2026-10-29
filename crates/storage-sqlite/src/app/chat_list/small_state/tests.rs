@@ -13,13 +13,18 @@ const MUTE_UNTIL: u64 = 4_000_000_000;
 
 /// Highest version wins, then the lowest change id; the furthest read wins.
 /// Change ids count up from 1, so a sibling's id can sort either side.
+/// Pins go first unless `pin_last`.
 struct TestRule {
     next: Cell<u8>,
+    pin_last: bool,
 }
 
 impl TestRule {
     fn new() -> Self {
-        Self { next: Cell::new(0) }
+        Self {
+            next: Cell::new(0),
+            pin_last: false,
+        }
     }
 }
 
@@ -38,6 +43,10 @@ impl SmallStateRule for TestRule {
     fn new_change_id(&self) -> [u8; 16] {
         self.next.set(self.next.get() + 1);
         [self.next.get(); 16]
+    }
+
+    fn pin_index(&self, _pinned: &[String]) -> usize {
+        if self.pin_last { usize::MAX } else { 0 }
     }
 }
 
@@ -126,22 +135,27 @@ fn versioned(group: &str, value: SmallStateValue, version: u64, id: u8) -> Small
     }
 }
 
-fn read(group: &str, epoch: u64, at: u64, id: &str) -> SmallStateItem {
+/// A message id: 64 lowercase hex characters.
+fn message(n: u8) -> String {
+    format!("{n:064x}")
+}
+
+fn read(group: &str, epoch: u64, at: u64, id: u8) -> SmallStateItem {
     SmallStateItem {
         group_id_hex: group.to_owned(),
         value: SmallStateValue::Read(ReadPosition {
             epoch,
             at,
-            message_id_hex: id.to_owned(),
+            message_id_hex: message(id),
         }),
         version: None,
     }
 }
 
-fn delivered_chat(group: &str, id: &str, epoch: u64, at: u64) -> StoredAppEvent {
+fn delivered_chat(group: &str, id: u8, epoch: u64, at: u64) -> StoredAppEvent {
     StoredAppEvent {
         group_id_hex: group.to_owned(),
-        message_id_hex: id.to_owned(),
+        message_id_hex: message(id),
         source_message_id_hex: Some(format!("source-{id}")),
         source_epoch: Some(epoch),
         direction: "received".to_owned(),
@@ -170,9 +184,18 @@ fn nothing_is_recorded_or_applied_before_small_state_starts() {
     assert!(app.small_state_items().unwrap().is_empty());
     assert_eq!(pins(&store), vec!["11"]);
 
+    assert!(!app.small_state_snapshot_owed().unwrap());
+    app.set_small_state_snapshot_owed(true).unwrap();
+    assert!(!app.small_state_snapshot_owed().unwrap());
+
     assert!(app.start_small_state().unwrap());
     assert!(!app.start_small_state().unwrap());
     assert!(app.small_state_started().unwrap());
+    assert!(app.small_state_snapshot_owed().unwrap());
+    app.set_small_state_snapshot_owed(false).unwrap();
+    assert!(!app.small_state_snapshot_owed().unwrap());
+    assert!(!app.start_small_state().unwrap());
+    assert!(!app.small_state_snapshot_owed().unwrap());
 }
 
 #[test]
@@ -384,10 +407,19 @@ fn items_for_a_chat_not_held_yet_apply_when_it_arrives() {
     assert_eq!(pins(&store), vec!["22"]);
     assert!(app.chat_notification_settings("22").unwrap().muted);
 
-    // Leaving the chat is not a change to its settings.
+    // Leaving the chat is not a change to its settings, and coming back
+    // applies them again.
     save_groups(&store, &[("11", false)]);
     assert_eq!(sync(&store, &[], &rule), SmallStateSync::default());
     assert_eq!(app.small_state_items().unwrap().len(), 2);
+    app.clear_chat_muted("22").unwrap();
+    save_groups(&store, &[("11", false), ("22", false)]);
+    let outcome = sync(&store, &[], &rule);
+    assert_eq!(outcome.recorded, 0);
+    assert_eq!(outcome.applied.len(), 1);
+    assert_eq!(pins(&store), vec!["22"]);
+    assert!(app.chat_notification_settings("22").unwrap().muted);
+    assert!(app.unsent_small_state_items().unwrap().is_empty());
 }
 
 #[test]
@@ -397,48 +429,115 @@ fn read_positions_only_move_forward() {
     let rule = TestRule::new();
     app.initialize_chat_read_state(LOCAL, "11", &no_mentions)
         .unwrap();
-    for (id, epoch, at) in [("m7", 7, 200), ("m8", 8, 150), ("m9", 8, 160)] {
+    for (id, epoch, at) in [(7, 7, 200), (8, 8, 150), (9, 8, 160)] {
         app.record_app_event(&delivered_chat("11", id, epoch, at))
             .unwrap();
     }
     app.refresh_chat_list_row(LOCAL, "11", &no_mentions)
         .unwrap();
 
-    app.mark_timeline_message_read(LOCAL, "11", "m7", &no_mentions)
+    app.mark_timeline_message_read(LOCAL, "11", &message(7), &no_mentions)
         .unwrap();
     assert_eq!(sync(&store, &[], &rule).recorded, 1);
     assert_eq!(
         app.unsent_small_state_items().unwrap(),
-        vec![read("11", 7, 200, "m7")]
+        vec![read("11", 7, 200, 7)]
     );
 
     // A sibling read further: the marker follows, and nothing is owed back.
-    let outcome = sync(&store, &[read("11", 8, 150, "m8")], &rule);
+    let outcome = sync(&store, &[read("11", 8, 150, 8)], &rule);
     assert_eq!(
         outcome.applied.get("11"),
         Some(&BTreeSet::from([SmallStateItemName::Read]))
     );
     assert!(app.unsent_small_state_items().unwrap().is_empty());
     let row = app.chat_list_row("11").unwrap().unwrap();
-    assert_eq!(row.last_read_message_id_hex.as_deref(), Some("m8"));
+    assert_eq!(row.last_read_message_id_hex, Some(message(8)));
     assert_eq!(row.unread_count, 1);
 
     // An older position, or the same one, changes nothing.
-    let outcome = sync(&store, &[read("11", 7, 900, "m7")], &rule);
+    let outcome = sync(
+        &store,
+        &[read("11", 7, 900, 7), read("11", 8, 150, 8)],
+        &rule,
+    );
     assert_eq!(outcome, SmallStateSync::default());
     assert_eq!(
         app.small_state_items().unwrap(),
-        vec![read("11", 8, 150, "m8")]
+        vec![read("11", 8, 150, 8)]
     );
 
     // A sibling's read keeps this device's manual-unread reminder.
     app.set_chat_manually_unread(LOCAL, "11", true, &no_mentions)
         .unwrap();
-    sync(&store, &[read("11", 8, 160, "m9")], &rule);
+    sync(&store, &[read("11", 8, 160, 9)], &rule);
     let row = app.chat_list_row("11").unwrap().unwrap();
-    assert_eq!(row.last_read_message_id_hex.as_deref(), Some("m9"));
+    assert_eq!(row.last_read_message_id_hex, Some(message(9)));
     assert_eq!(row.unread_count, 0);
     assert!(row.manually_marked_unread);
+}
+
+#[test]
+fn items_that_break_the_rules_are_skipped() {
+    let store = started_store(&[("11", false)]);
+    let app = store.app_storage();
+    let rule = TestRule::new();
+    let too_large = MAX_SMALL_STATE_NUMBER + 1;
+    let invalid = [
+        versioned("11", SmallStateValue::Pin(true), 0, 1),
+        versioned("11", SmallStateValue::Pin(true), too_large, 1),
+        versioned("1", SmallStateValue::Pin(true), 1, 1),
+        versioned("AB", SmallStateValue::Pin(true), 1, 1),
+        versioned(
+            "11",
+            SmallStateValue::Mute(MuteSetting::MutedUntil(too_large)),
+            1,
+            1,
+        ),
+        SmallStateItem {
+            version: None,
+            ..versioned("11", SmallStateValue::Archive(true), 1, 1)
+        },
+        read("11", too_large, 1, 1),
+        SmallStateItem {
+            value: SmallStateValue::Read(ReadPosition {
+                epoch: 1,
+                at: 1,
+                message_id_hex: "m1".to_owned(),
+            }),
+            ..read("11", 1, 1, 1)
+        },
+        SmallStateItem {
+            version: Some(SmallStateVersion {
+                version: 1,
+                change_id: [1; 16],
+            }),
+            ..read("11", 1, 1, 1)
+        },
+    ];
+    assert!(invalid.iter().all(|item| !item.is_valid()));
+    assert_eq!(sync(&store, &invalid, &rule), SmallStateSync::default());
+    assert!(app.small_state_items().unwrap().is_empty());
+    assert!(pins(&store).is_empty());
+}
+
+#[test]
+fn the_rule_places_a_pin_that_arrives_through_small_state() {
+    let store = started_store(&[("11", false), ("22", false), ("33", false)]);
+    let app = store.app_storage();
+    let rule = TestRule {
+        pin_last: true,
+        ..TestRule::new()
+    };
+    app.set_chat_pinned("11", true).unwrap();
+    app.set_chat_pinned("22", true).unwrap();
+    sync(&store, &[], &rule);
+    sync(
+        &store,
+        &[versioned("33", SmallStateValue::Pin(true), 1, 9)],
+        &rule,
+    );
+    assert_eq!(pins(&store), vec!["22", "11", "33"]);
 }
 
 #[test]

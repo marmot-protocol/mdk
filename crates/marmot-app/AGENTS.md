@@ -107,6 +107,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   one the roster cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a
   rejected KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's
   included, into a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7).
+- Small state (`src/small_state.rs` and `src/client/small_state.rs`, mdk#2628 4.3) keeps each chat's read position,
+  pin, mute and archive the same on the account's devices, from the first maintenance pass after this device trusts a
+  device group. A pass is one storage transaction (`sync_small_state`): a local state that differs from what this
+  device last observed is its user's change, so no setter needs a hook and leaving a chat is never a change. Archives
+  go through `set_group_archived_unobserved`, keeping the worker's in-memory account state authoritative (mdk#178).
+  Each chat a pass changes gets one chat-list update through `pending_projection_updates`. The merge rule's tie-break
+  (`tie_break`) and its placement of a new pin (`new_pin_index`) are each one function; change them nowhere else.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

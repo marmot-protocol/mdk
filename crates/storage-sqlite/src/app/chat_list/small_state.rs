@@ -30,9 +30,9 @@ use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The largest version an item may carry: the largest integer every JSON
-/// reader holds exactly.
-pub const MAX_SMALL_STATE_VERSION: u64 = (1 << 53) - 1;
+/// The largest number an item carries, as a version, epoch or time: the
+/// largest integer every JSON reader holds exactly.
+pub const MAX_SMALL_STATE_NUMBER: u64 = (1 << 53) - 1;
 
 /// Which setting of a chat an item holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -121,6 +121,42 @@ impl SmallStateItem {
     pub const fn name(&self) -> SmallStateItemName {
         self.value.name()
     }
+
+    /// Whether the item keeps the rules every device holds it to: a chat as
+    /// lowercase hex, a version on every item but a read position, and every
+    /// number at most [`MAX_SMALL_STATE_NUMBER`]. Storage skips one that
+    /// does not.
+    pub fn is_valid(&self) -> bool {
+        let number = |value: u64| value <= MAX_SMALL_STATE_NUMBER;
+        let chat = !self.group_id_hex.is_empty()
+            && self.group_id_hex.len() % 2 == 0
+            && is_lower_hex(&self.group_id_hex);
+        let value = match &self.value {
+            SmallStateValue::Read(position) => {
+                self.version.is_none()
+                    && number(position.epoch)
+                    && number(position.at)
+                    && position.message_id_hex.len() == 64
+                    && is_lower_hex(&position.message_id_hex)
+            }
+            SmallStateValue::Mute(MuteSetting::MutedUntil(until)) => number(*until),
+            SmallStateValue::Pin(_) | SmallStateValue::Mute(_) | SmallStateValue::Archive(_) => {
+                true
+            }
+        };
+        let version = match (&self.value, self.version) {
+            (SmallStateValue::Read(_), version) => version.is_none(),
+            (_, Some(version)) => version.version >= 1 && number(version.version),
+            (_, None) => false,
+        };
+        chat && value && version
+    }
+}
+
+fn is_lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// How received values merge; the app owns it.
@@ -129,6 +165,9 @@ pub trait SmallStateRule {
     fn wins(&self, incoming: &SmallStateItem, held: &SmallStateItem) -> bool;
     /// A fresh change id for a change this device's user made.
     fn new_change_id(&self) -> [u8; 16];
+    /// Where a chat that becomes pinned through small state goes among
+    /// `pinned`, this device's pinned chats in order. Clamped to the end.
+    fn pin_index(&self, pinned: &[String]) -> usize;
 }
 
 /// What one [`SqliteAppStorage::sync_small_state`] did.
@@ -144,12 +183,14 @@ pub struct SmallStateSync {
 }
 
 impl SqliteAppStorage {
-    /// Start taking part in small state. `true` when this call started it.
+    /// Start taking part in small state, owing a snapshot request. `true`
+    /// when this call started it.
     pub fn start_small_state(&self) -> StorageResult<bool> {
         let inserted = self
             .lock()?
             .execute_cached(
-                "INSERT OR IGNORE INTO small_state_sync (id, started_at) VALUES (1, ?1)",
+                "INSERT OR IGNORE INTO small_state_sync (id, started_at, snapshot_owed)
+                 VALUES (1, ?1, 1)",
                 params![u64_to_i64(unix_now_seconds())?],
             )
             .storage()?;
@@ -158,6 +199,29 @@ impl SqliteAppStorage {
 
     pub fn small_state_started(&self) -> StorageResult<bool> {
         small_state_started_tx(&*self.lock()?)
+    }
+
+    /// Whether this device still has to ask a sibling for a snapshot.
+    pub fn small_state_snapshot_owed(&self) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM small_state_sync WHERE id = 1 AND snapshot_owed = 1)",
+                [],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
+    /// Owe a snapshot request (`true`), or record one sent (`false`). Does
+    /// nothing before [`Self::start_small_state`].
+    pub fn set_small_state_snapshot_owed(&self, owed: bool) -> StorageResult<()> {
+        self.lock()?
+            .execute_cached(
+                "UPDATE small_state_sync SET snapshot_owed = ?1 WHERE id = 1",
+                params![i64::from(owed)],
+            )
+            .storage()?;
+        Ok(())
     }
 
     /// Record local changes, merge `incoming`, and apply winning values, in
@@ -176,12 +240,13 @@ impl SqliteAppStorage {
                 return Ok(outcome);
             }
             let now = unix_now_seconds();
+            forget_left_chats_tx(&conn)?;
             let chats = held_chats_tx(&conn)?;
             outcome.recorded = record_local_changes_tx(&conn, &chats, rule, now)?;
-            for item in incoming {
+            for item in incoming.iter().filter(|item| item.is_valid()) {
                 merge_item_tx(&conn, item, rule, now)?;
             }
-            apply_winners_tx(&mut conn, &chats, &mut outcome)?;
+            apply_winners_tx(&mut conn, &chats, rule, &mut outcome)?;
             for (group_id_hex, names) in &outcome.applied {
                 if names.contains(&SmallStateItemName::Read) {
                     refresh_chat_list_row_tx(
@@ -277,7 +342,10 @@ impl HeldChat {
                 None => MuteSetting::Unmuted,
                 Some(None) => MuteSetting::Muted,
                 Some(Some(until_ms)) => MuteSetting::MutedUntil(
-                    u64::try_from(until_ms).unwrap_or_default().div_ceil(1000),
+                    u64::try_from(until_ms)
+                        .unwrap_or_default()
+                        .div_ceil(1000)
+                        .min(MAX_SMALL_STATE_NUMBER),
                 ),
             })),
             SmallStateItemName::Read => self.read.clone().map(SmallStateValue::Read),
@@ -358,6 +426,20 @@ fn held_chats_tx(conn: &Connection) -> StorageResult<BTreeMap<String, HeldChat>>
         );
     }
     Ok(chats)
+}
+
+/// A chat this device left keeps its items but no longer has its own state of
+/// them: when it comes back, its items are applied again, never taken for a
+/// change.
+fn forget_left_chats_tx(conn: &Connection) -> StorageResult<()> {
+    conn.execute_cached(
+        "UPDATE small_state_items SET observed = NULL
+         WHERE observed IS NOT NULL
+           AND group_id_hex NOT IN (SELECT group_id_hex FROM account_groups)",
+        [],
+    )
+    .storage()?;
+    Ok(())
 }
 
 /// A held row: the winning item and what this device last observed.
@@ -576,12 +658,12 @@ fn record_local_changes_tx(
                 Some(SmallStateValue::Read(held)) => local > held,
                 _ => true,
             };
-            if further {
-                let item = SmallStateItem {
-                    group_id_hex: group_id_hex.clone(),
-                    value: SmallStateValue::Read(local),
-                    version: None,
-                };
+            let item = SmallStateItem {
+                group_id_hex: group_id_hex.clone(),
+                value: SmallStateValue::Read(local),
+                version: None,
+            };
+            if further && item.is_valid() {
                 write_item_tx(conn, &item, None, true, now)?;
                 recorded += 1;
             }
@@ -598,7 +680,7 @@ fn record_local_changes_tx(
                 Some(HeldRow { item, .. }) => item
                     .version
                     .map_or(1, |held| held.version.saturating_add(1))
-                    .min(MAX_SMALL_STATE_VERSION),
+                    .min(MAX_SMALL_STATE_NUMBER),
                 None if chat.is_default(name) => continue,
                 None => 1,
             };
@@ -613,8 +695,10 @@ fn record_local_changes_tx(
                     change_id: rule.new_change_id(),
                 }),
             };
-            write_item_tx(conn, &item, Some(&observed), true, now)?;
-            recorded += 1;
+            if item.is_valid() {
+                write_item_tx(conn, &item, Some(&observed), true, now)?;
+                recorded += 1;
+            }
         }
     }
     Ok(recorded)
@@ -644,6 +728,7 @@ fn merge_item_tx(
 fn apply_winners_tx(
     conn: &mut Connection,
     chats: &BTreeMap<String, HeldChat>,
+    rule: &dyn SmallStateRule,
     outcome: &mut SmallStateSync,
 ) -> StorageResult<()> {
     for (group_id_hex, chat) in chats {
@@ -676,7 +761,7 @@ fn apply_winners_tx(
                     // An archived chat is never pinned here.
                     let pin = pin && !chat.archived;
                     if pin != pinned {
-                        set_pinned_tx(conn, group_id_hex, pin)?;
+                        set_pinned_tx(conn, group_id_hex, pin, rule)?;
                         pinned = pin;
                         note_applied(outcome, group_id_hex, name);
                     }
@@ -756,9 +841,13 @@ fn advance_read_marker_tx(
     Ok(())
 }
 
-/// Pin or unpin as this device's own pin command does: a newly pinned chat
-/// goes first.
-fn set_pinned_tx(conn: &mut Connection, group_id_hex: &str, pinned: bool) -> StorageResult<()> {
+/// Pin or unpin. A newly pinned chat goes where the rule places it.
+fn set_pinned_tx(
+    conn: &mut Connection,
+    group_id_hex: &str,
+    pinned: bool,
+    rule: &dyn SmallStateRule,
+) -> StorageResult<()> {
     let pin_error = |error: ChatPinError| match error {
         ChatPinError::Storage(error) => error,
         other => StorageError::Backend(other.to_string()),
@@ -766,7 +855,10 @@ fn set_pinned_tx(conn: &mut Connection, group_id_hex: &str, pinned: bool) -> Sto
     let mut order = pinned_chat_order_tx(conn).map_err(pin_error)?;
     let existing = order.iter().position(|candidate| candidate == group_id_hex);
     match (pinned, existing) {
-        (true, None) => order.insert(0, group_id_hex.to_owned()),
+        (true, None) => {
+            let index = rule.pin_index(&order).min(order.len());
+            order.insert(index, group_id_hex.to_owned());
+        }
         (false, Some(position)) => {
             order.remove(position);
         }

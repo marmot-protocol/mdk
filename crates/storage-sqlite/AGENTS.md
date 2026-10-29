@@ -65,6 +65,7 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 | `src/app/transport/agent_stream_sequences.rs` | Durable, fail-closed publisher sequence reservations for QUIC previews. |
 | `src/app/account_projection.rs` | Account-level event projection. |
 | `src/app/chat_list.rs` | Chat-list projection, including avatar URLs; `chat_list/` holds attention, pages, and windows. |
+| `src/app/chat_list/small_state.rs` | Small state shared with the account's other devices (mdk#2628 item 4.3, migration 0132): each chat's read position, pin, mute and archive as items. One transaction records local changes (a local state that differs from what this device last observed), merges received items under the app's `SmallStateRule`, and applies winners; archives go back to the caller, which owns the in-memory account state. Invalid items are skipped, never stored. |
 | `src/app/chat_presentation.rs` | Durable selected-presentation foundation (runtime orchestration owns hydration). |
 | `src/app/group_system.rs` | Local presentation of kind-1210 content (not a wire-format change). |
 | `src/app/transport/user_blocks.rs` | Account-private NIP-51 block state; never stored in the shared database. |

@@ -81,6 +81,7 @@ pub(crate) mod recovery;
 mod recovery_coverage;
 mod retention;
 pub(crate) mod sign_ins;
+mod small_state;
 mod sync;
 #[cfg(test)]
 mod upload_cleanup_tests;
@@ -790,6 +791,9 @@ pub struct AppClient {
     /// what hosts last read. The worker's account-level and applied-summary
     /// seams drain it into one `LinkedDevicesChanged`.
     pub(crate) linked_devices_changed: bool,
+    /// A sibling asked this device for a small-state snapshot it has not
+    /// sent yet (mdk#2628 item 4.3).
+    pub(crate) small_state_snapshot_answer_owed: bool,
     /// The last overdue-refresh answer a maintenance pass computed, and
     /// whether hosts owe a `KeyPackageRefreshOverdueChanged`. The flag starts
     /// set, since a fresh client cannot know what hosts last read.
@@ -1440,6 +1444,7 @@ impl AppClient {
             crate::ProductUnit::Attempt,
         );
         self.drive_sign_ins().await;
+        self.drive_small_state().await;
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;

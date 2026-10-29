@@ -31,6 +31,8 @@ mod replaceable_delivery;
 mod report_backfill;
 #[cfg(feature = "test-policy-overrides")]
 mod sign_ins;
+#[cfg(feature = "test-policy-overrides")]
+mod small_state;
 mod suspension_close;
 mod unreachable_group_relays;
 mod user_blocks;
