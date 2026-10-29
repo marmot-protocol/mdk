@@ -12,17 +12,23 @@
 //! recorded (live traffic, another route, another relay) is not this quantum's
 //! progress, so it resets nothing.
 //!
-//! Every event byte the relay returns is charged to the account's rolling
-//! hour, including full replies a halving discards, saturated seconds and
-//! duplicates: each staged slice carries what was returned since the last
-//! one, and settlement charges the rest. A best-effort relay is never charged.
+//! Every event byte the relay sends is charged to the account's rolling hour,
+//! including full replies a halving discards, replies a budget cut short,
+//! saturated seconds and duplicates: each staged slice carries what was read
+//! since the last one, and settlement charges the rest. A best-effort relay is
+//! never charged.
+//!
+//! The relay wrapper also keeps whether the last reply was a `rate-limited:`
+//! CLOSED. A quantum that reaches its deadline right after one was rate
+//! limited and never cleared, whatever answers came before.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use cgka_traits::TransportDelivery;
 use cgka_traits::storage::StorageResult;
+use cgka_traits::transport_adapter::TransportEndpointRejectionCategory;
 use nostr::prelude::Event;
 use storage_sqlite::{
     RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageRange, RecoveryStagedSlice,
@@ -31,9 +37,9 @@ use storage_sqlite::{
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::sweep::{
-    CoveredSlice, RelayCaps, SecondReply, SliceQuery, SliceReply, SweepCursor, SweepCursorStore,
-    SweepEnd, SweepRelay, SweepRequest, SweepRoute, SweepSink, SweepSinkError, SweepStoreError,
-    UnreachableKind, run_sweep,
+    ClosedReason, CoveredSlice, RelayCaps, SecondReply, SliceQuery, SliceReply, SweepCursor,
+    SweepCursorStore, SweepEnd, SweepRelay, SweepRequest, SweepRoute, SweepSink, SweepSinkError,
+    SweepStoreError, UnreachableKind, run_sweep,
 };
 
 use super::select::SweepPlan;
@@ -58,8 +64,8 @@ pub(super) struct QuantumReport {
     pub(super) end: SweepEnd,
     pub(super) requests: u32,
     pub(super) answers: u32,
-    /// Waits for a `rate-limited:` CLOSED.
-    pub(super) rate_limited_waits: u32,
+    /// The last reply was a `rate-limited:` CLOSED.
+    pub(super) rate_limited: bool,
     /// Event bytes the relay returned that no staged slice charged.
     pub(super) unstaged_bytes: u64,
     /// Seconds it newly covered on its own (route, relay).
@@ -101,15 +107,30 @@ impl SweepCursorStore for PlannedCursor {
     }
 }
 
-/// The unit's relay, counting the event bytes of every reply it returns.
+/// What the quantum's relay replies told it.
+#[derive(Default)]
+struct Meter {
+    /// Event bytes read that no staged slice has charged yet.
+    bytes: AtomicU64,
+    /// The last reply was a `rate-limited:` CLOSED.
+    rate_limited: AtomicBool,
+}
+
+/// The unit's relay, metering every reply.
 struct Metered<'a> {
     relay: &'a dyn SweepRelay,
-    bytes: &'a AtomicU64,
+    meter: &'a Meter,
 }
 
 impl Metered<'_> {
-    fn count(&self, events: &[Event]) {
-        self.bytes.fetch_add(event_bytes(events), Ordering::Relaxed);
+    /// A relay that meters its reads reports at least the events it kept;
+    /// one that does not reports nothing, and the events are what was read.
+    fn read(&self, kept: &[Event], rate_limited: bool) {
+        let bytes = self.relay.take_fetched_bytes().max(event_bytes(kept));
+        self.meter.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.meter
+            .rate_limited
+            .store(rate_limited, Ordering::Relaxed);
     }
 }
 
@@ -121,19 +142,27 @@ impl SweepRelay for Metered<'_> {
 
     async fn fetch_slice(&self, query: SliceQuery) -> SliceReply {
         let reply = self.relay.fetch_slice(query).await;
-        if let SliceReply::Answered { events, .. } = &reply {
-            self.count(events);
+        match &reply {
+            SliceReply::Answered { events, .. } => self.read(events, false),
+            SliceReply::Closed(reason) => self.read(&[], is_rate_limit(reason)),
+            SliceReply::Unreachable(_) => self.read(&[], false),
         }
         reply
     }
 
     async fn fetch_second(&self, route: SweepRoute, second: u64, cap: Option<u32>) -> SecondReply {
         let reply = self.relay.fetch_second(route, second, cap).await;
-        if let SecondReply::Complete(events) = &reply {
-            self.count(events);
+        match &reply {
+            SecondReply::Complete(events) => self.read(events, false),
+            SecondReply::Closed(reason) => self.read(&[], is_rate_limit(reason)),
+            SecondReply::Unproven | SecondReply::Unreachable(_) => self.read(&[], false),
         }
         reply
     }
+}
+
+fn is_rate_limit(reason: &ClosedReason) -> bool {
+    reason.0 == Some(TransportEndpointRejectionCategory::RateLimited)
 }
 
 fn event_bytes(events: &[Event]) -> u64 {
@@ -148,8 +177,7 @@ fn event_bytes(events: &[Event]) -> u64 {
 struct StageSink<'a, H> {
     host: &'a H,
     plan: &'a SweepPlan,
-    /// Bytes the relay returned that no staged slice has charged yet.
-    returned_bytes: &'a AtomicU64,
+    meter: &'a Meter,
     newly_covered_seconds: u64,
     stop: Option<SinkStop>,
 }
@@ -164,7 +192,7 @@ impl<H: RunnerHost> SweepSink for StageSink<'_, H> {
         let fetched_bytes = if self.plan.best_effort {
             0
         } else {
-            self.returned_bytes.swap(0, Ordering::Relaxed)
+            self.meter.bytes.swap(0, Ordering::Relaxed)
         };
         let mut deliveries = Vec::with_capacity(events.len());
         for event in events {
@@ -195,8 +223,7 @@ impl<H: RunnerHost> SweepSink for StageSink<'_, H> {
         };
         if stop != SinkStop::StaleMark {
             // Nothing was written: settlement charges these bytes instead.
-            self.returned_bytes
-                .fetch_add(fetched_bytes, Ordering::Relaxed);
+            self.meter.bytes.fetch_add(fetched_bytes, Ordering::Relaxed);
         }
         self.stop = Some(stop);
         Err(SweepSinkError)
@@ -277,7 +304,7 @@ pub(super) async fn run<H: RunnerHost>(
         end: SweepEnd::Finished,
         requests: 0,
         answers: 0,
-        rate_limited_waits: 0,
+        rate_limited: false,
         unstaged_bytes: 0,
         newly_covered_seconds: 0,
         proved_seconds: 0,
@@ -290,10 +317,10 @@ pub(super) async fn run<H: RunnerHost>(
         report.end = SweepEnd::Unreachable(UnreachableKind::Disconnected);
         return report;
     };
-    let returned_bytes = AtomicU64::new(0);
+    let meter = Meter::default();
     let relay = Metered {
         relay: &*relay,
-        bytes: &returned_bytes,
+        meter: &meter,
     };
     let route = SweepRoute::Group {
         nostr_group_id: plan.nostr_group_id,
@@ -301,7 +328,7 @@ pub(super) async fn run<H: RunnerHost>(
     let mut sink = StageSink {
         host,
         plan,
-        returned_bytes: &returned_bytes,
+        meter: &meter,
         newly_covered_seconds: 0,
         stop: None,
     };
@@ -326,9 +353,6 @@ pub(super) async fn run<H: RunnerHost>(
         .await;
         report.requests = report.requests.saturating_add(swept.stats.requests);
         report.answers = report.answers.saturating_add(swept.stats.answers);
-        report.rate_limited_waits = report
-            .rate_limited_waits
-            .saturating_add(swept.stats.rate_limited_waits);
         for slice in &swept.covered {
             report.proved_seconds = report
                 .proved_seconds
@@ -345,15 +369,17 @@ pub(super) async fn run<H: RunnerHost>(
     }
     report.newly_covered_seconds = sink.newly_covered_seconds;
     report.stop = sink.stop;
+    report.rate_limited = meter.rate_limited.into_inner();
     if !plan.best_effort {
-        report.unstaged_bytes = returned_bytes.into_inner();
+        report.unstaged_bytes = meter.bytes.into_inner();
     }
     report
 }
 
-/// The outcome table (section 3 of the plan) for one quantum. `still_owed`
-/// says whether the planned ranges still owe anything on this relay; it only
-/// matters for a quantum that finished without newly covering anything.
+/// The outcome table (section 3 of the plan) for one quantum. `rate_limited`
+/// says the last reply was a `rate-limited:` CLOSED. `still_owed` says whether
+/// the planned ranges still owe anything on this relay; it only matters for a
+/// quantum that finished without newly covering anything.
 pub(super) fn classify(
     end: SweepEnd,
     answered: bool,
@@ -385,9 +411,9 @@ pub(super) fn classify(
         SweepEnd::Finished if still_owed => Outcome::NoProgress,
         SweepEnd::Finished => Outcome::NothingOwed,
         SweepEnd::Cancelled => Outcome::Unanswered,
-        // The relay said only `rate-limited:`, and the next wait would have
-        // outlasted the quantum: rate limited and never cleared.
-        SweepEnd::DeadlineReached if !answered && rate_limited => Outcome::RateLimited,
+        // The quantum ran out waiting out a rate limit no answer followed:
+        // rate limited and never cleared.
+        SweepEnd::DeadlineReached if rate_limited => Outcome::RateLimited,
         SweepEnd::DeadlineReached if !answered => Outcome::Unanswered,
         SweepEnd::DeadlineReached | SweepEnd::SaturatedSecond { .. } => Outcome::NoProgress,
         SweepEnd::RateLimited => Outcome::RateLimited,
@@ -413,7 +439,7 @@ pub(super) fn settle(
     let outcome = classify(
         report.end,
         report.answers > 0,
-        report.rate_limited_waits > 0,
+        report.rate_limited,
         report.newly_covered_seconds,
         report.stop,
         still_owed,

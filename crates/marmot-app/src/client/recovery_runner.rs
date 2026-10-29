@@ -255,6 +255,8 @@ pub(crate) struct RecoveryRunner<H> {
     memory: Memory,
     /// Surveys that failed in a row, for the runner's own local backoff.
     survey_failures: u32,
+    /// Reconnect writes that failed in a row, likewise.
+    reconnect_failures: u32,
     /// The account breaker's pause last reported, so each pause logs once.
     reported_pause: Option<u64>,
 }
@@ -279,6 +281,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             cancel: cancel.clone(),
             memory: Memory::default(),
             survey_failures: 0,
+            reconnect_failures: 0,
             reported_pause: None,
         };
         let handle = RecoveryRunnerHandle {
@@ -302,7 +305,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             let next_due = match self.step().await {
                 Step::Stopped => break,
                 Step::Ran(_) | Step::Raced => continue,
-                Step::Idle { next_due } => next_due,
+                Step::Idle { next_due } => self.retry_reconnects_by(next_due),
             };
             let sleep =
                 next_due.map(|at| Duration::from_secs(at.saturating_sub(self.host.now_seconds())));
@@ -424,20 +427,30 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 });
             }
         };
-        let mut deadline = Instant::now() + policy.quantum;
-        if let Some(pass_deadline) = pass_deadline {
-            deadline = deadline.min(pass_deadline);
-        }
+        let deadline = Instant::now() + policy.quantum;
         let ranges = plan.ranges.len();
-        let report = quantum::run(
-            &*self.host,
-            &plan,
-            caps.unwrap_or_default(),
-            deadline,
-            &self.cancel,
-            &policy,
-        )
-        .await;
+        // The pass deadline preempts the quantum as shutdown does. The sweep's
+        // own deadline stays the quantum's, so a cut pass reads as a
+        // preemption, never as the relay's verdict.
+        let preempt = self.cancel.child_token();
+        let report = {
+            let run = quantum::run(
+                &*self.host,
+                &plan,
+                caps.unwrap_or_default(),
+                deadline,
+                &preempt,
+                &policy,
+            );
+            tokio::pin!(run);
+            tokio::select! {
+                report = &mut run => report,
+                () = sleep_until(pass_deadline) => {
+                    preempt.cancel();
+                    run.await
+                }
+            }
+        };
         let outcome = match self
             .host
             .turn(move |turn| quantum::settle(turn, &plan, &report, &policy))
@@ -507,14 +520,32 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             match recorded {
                 None => return Some(Step::Stopped),
                 Some(Err(error)) => {
-                    // The next step tries the reconnect again.
+                    // Retried on the local-failure backoff (`retry_reconnects_by`).
                     log_failure("relay_reconnected", error);
+                    self.reconnect_failures = self.reconnect_failures.saturating_add(1);
                     self.reconnected().insert(relay);
                 }
-                Some(Ok(())) => self.memory.relay_reconnected(&relay),
+                Some(Ok(())) => {
+                    self.reconnect_failures = 0;
+                    self.memory.relay_reconnected(&relay);
+                }
             }
         }
         None
+    }
+
+    /// When an idle task wakes: at `next_due`, or sooner while a reconnect
+    /// waits to be recorded, on the local-failure backoff. Its relay's units
+    /// may all be cooling or broken, waiting for exactly that write.
+    fn retry_reconnects_by(&self, next_due: Option<u64>) -> Option<u64> {
+        if self.reconnected().is_empty() {
+            return next_due;
+        }
+        let retry = self.host.now_seconds().saturating_add(
+            self.policy
+                .local_failure_backoff_seconds(self.reconnect_failures),
+        );
+        Some(next_due.map_or(retry, |due| due.min(retry)))
     }
 
     fn reconnected(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {

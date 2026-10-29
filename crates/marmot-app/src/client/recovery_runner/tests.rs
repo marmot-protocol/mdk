@@ -3,8 +3,9 @@
 //! once at the start of each debt turn, as the account worker will.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -386,8 +387,8 @@ struct ModelRelay {
     negentropy: bool,
     events: Vec<Event>,
     reachable: AtomicBool,
-    /// Every slice request gets `rate-limited:` back.
-    limiting: bool,
+    /// Requests, by index, that get `rate-limited:` back.
+    limited: Range<usize>,
     latency: Duration,
     requests: AtomicUsize,
     queries: Mutex<Vec<SliceQuery>>,
@@ -409,7 +410,7 @@ impl ModelRelay {
             negentropy: caps.negentropy,
             events: Vec::new(),
             reachable: AtomicBool::new(true),
-            limiting: false,
+            limited: 0..0,
             latency: Duration::ZERO,
             requests: AtomicUsize::new(0),
             queries: Mutex::new(Vec::new()),
@@ -436,8 +437,12 @@ impl ModelRelay {
         self
     }
 
-    fn rate_limiting(mut self) -> Self {
-        self.limiting = true;
+    fn rate_limiting(self) -> Self {
+        self.rate_limiting_requests(0..usize::MAX)
+    }
+
+    fn rate_limiting_requests(mut self, requests: Range<usize>) -> Self {
+        self.limited = requests;
         self
     }
 
@@ -507,25 +512,33 @@ impl ModelRelay {
         }
     }
 
-    /// Wait out the gate and the latency; whether the relay answers.
-    async fn arrive(&self) -> bool {
+    /// Wait out the gate and the latency. What the relay says instead of an
+    /// answer, if anything.
+    async fn arrive(&self) -> Option<ClosedOrUnreachable> {
         let index = self.requests.fetch_add(1, Ordering::SeqCst);
         self.gate.pass(index).await;
         if !self.latency.is_zero() {
             tokio::time::sleep(self.latency).await;
         }
-        self.reachable.load(Ordering::SeqCst)
+        if !self.reachable.load(Ordering::SeqCst) {
+            Some(ClosedOrUnreachable::Unreachable)
+        } else if self.limited.contains(&index) {
+            Some(ClosedOrUnreachable::RateLimited)
+        } else {
+            None
+        }
     }
 
     async fn fetch_slice(&self, query: SliceQuery) -> SliceReply {
         let _flight = self.in_flight.enter();
         self.check_uncovered(query.route, query.since);
         self.queries.lock().unwrap().push(query);
-        if !self.arrive().await {
-            return SliceReply::Unreachable(UnreachableKind::TimedOut);
-        }
-        if self.limiting {
-            return SliceReply::Closed(ClosedReason::from_message("rate-limited: slow down"));
+        match self.arrive().await {
+            Some(ClosedOrUnreachable::Unreachable) => {
+                return SliceReply::Unreachable(UnreachableKind::TimedOut);
+            }
+            Some(ClosedOrUnreachable::RateLimited) => return SliceReply::Closed(rate_limited()),
+            None => {}
         }
         let matching = self.matching(query.route, query.since, query.until);
         let limit = query
@@ -543,8 +556,12 @@ impl ModelRelay {
     async fn fetch_second(&self, route: SweepRoute, second: u64) -> SecondReply {
         let _flight = self.in_flight.enter();
         self.seconds.lock().unwrap().push(second);
-        if !self.arrive().await {
-            return SecondReply::Unreachable(UnreachableKind::TimedOut);
+        match self.arrive().await {
+            Some(ClosedOrUnreachable::Unreachable) => {
+                return SecondReply::Unreachable(UnreachableKind::TimedOut);
+            }
+            Some(ClosedOrUnreachable::RateLimited) => return SecondReply::Closed(rate_limited()),
+            None => {}
         }
         if self.negentropy {
             SecondReply::Complete(self.matching(route, second, second))
@@ -552,6 +569,15 @@ impl ModelRelay {
             SecondReply::Unproven
         }
     }
+}
+
+enum ClosedOrUnreachable {
+    RateLimited,
+    Unreachable,
+}
+
+fn rate_limited() -> ClosedReason {
+    ClosedReason::from_message("rate-limited: slow down")
 }
 
 /// The sweep's view of a model relay, with the caps the runner planned.
@@ -584,6 +610,9 @@ struct TestHost {
     debt_turns: AtomicUsize,
     /// How long a NIP-11 read takes.
     caps_latency: Mutex<Duration>,
+    /// Worker turns still to fail, against `closed`.
+    failing_turns: AtomicUsize,
+    closed: OnceLock<Account>,
 }
 
 impl TestHost {
@@ -604,11 +633,24 @@ impl TestHost {
                 .collect(),
             debt_turns: AtomicUsize::new(0),
             caps_latency: Mutex::new(Duration::ZERO),
+            failing_turns: AtomicUsize::new(0),
+            closed: OnceLock::new(),
         })
     }
 
     fn debt_turns(&self) -> usize {
         self.debt_turns.load(Ordering::SeqCst)
+    }
+
+    /// The next `turns` worker turns (not debt turns) run on a closed
+    /// database, so every storage call in them fails.
+    fn fail_next_turns(&self, turns: usize) {
+        self.closed.get_or_init(|| {
+            let closed = account();
+            closed._storage.close().unwrap();
+            closed
+        });
+        self.failing_turns.store(turns, Ordering::SeqCst);
     }
 }
 
@@ -619,8 +661,19 @@ impl RunnerHost for TestHost {
         F: FnOnce(&WorkerTurn<'_>) -> T + Send + 'static,
         T: Send + 'static,
     {
+        let failing = self
+            .failing_turns
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |turns| {
+                turns.checked_sub(1)
+            })
+            .is_ok();
+        let app = if failing {
+            &self.closed.get().expect("a closed database").app
+        } else {
+            &self.app
+        };
         Some(turn(&WorkerTurn {
-            app: &self.app,
+            app,
             now: self.clock.now(),
         }))
     }
@@ -1456,6 +1509,276 @@ async fn recovery_runner_cools_a_relay_that_only_says_rate_limited() {
     );
 }
 
+/// One route on a relay that stalls on its oldest second (every reply is
+/// full, so none proves a slice) and rate limits the requests in `limited`,
+/// stepped once at the starting values.
+async fn step_against_rate_limits(
+    limited: Range<usize>,
+    hold_from: Option<usize>,
+) -> (Account, Arc<ModelRelay>, QuantumSummary) {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let relay = stalling_relay([1; 32], floor)
+        .rate_limiting_requests(limited)
+        .build();
+    if let Some(index) = hold_from {
+        relay.gate.hold_from(index);
+    }
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, RecoveryRunnerPolicy::default());
+    let summary = ran(runner.step().await);
+    (account, relay, summary)
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_cools_a_relay_rate_limited_after_an_answer() {
+    // The first reply answers; every later one is rate limited until the
+    // quantum runs out.
+    let (account, relay, summary) = step_against_rate_limits(1..usize::MAX, None).await;
+
+    assert_eq!(summary.outcome, Outcome::RateLimited);
+    assert!(relay.requests() > 2);
+    let health = account.app.recovery_relay_health(RELAY).unwrap().unwrap();
+    assert!(health.cooldown.is_some(), "the relay cools down");
+    assert_eq!(account.unit(&group(1), RELAY).no_progress, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_settles_an_answer_after_a_rate_limit_as_answered() {
+    // The first request is rate limited, the second answers, and the third
+    // is still in flight when the quantum runs out.
+    let (account, relay, summary) = step_against_rate_limits(0..1, Some(2)).await;
+
+    assert_eq!(summary.outcome, Outcome::NoProgress);
+    assert_eq!(relay.gate.waiting(), 0, "the cut request was dropped");
+    let health = account.app.recovery_relay_health(RELAY).unwrap().unwrap();
+    assert!(
+        health.cooldown.is_none(),
+        "an answer cleared the rate limit"
+    );
+    assert_eq!(account.unit(&group(1), RELAY).no_progress, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_reads_a_pass_cut_during_a_rate_limit_as_preempted() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .rate_limiting_requests(0..1)
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, t0 - HOUR);
+    host.tails.stand(&route, RELAY, t0);
+    let policy = RecoveryRunnerPolicy::default();
+    let (mut runner, _handle) = runner(&host, policy);
+
+    // The pass ends inside the first rate-limit wait: a preemption, not the
+    // relay's verdict, so nothing is charged and nothing cools.
+    let budget = policy.sweep.rate_limit_backoff / 2;
+    assert_eq!(
+        runner.run_pass(budget).await,
+        PassReport {
+            quanta: 1,
+            advanced: 0
+        }
+    );
+    assert_eq!(relay.requests(), 1);
+    let unit = account.unit(&route, RELAY);
+    assert_eq!((unit.no_progress, unit.backoff_step), (0, 0));
+    let health = account.app.recovery_relay_health(RELAY).unwrap();
+    assert!(health.is_none_or(|health| health.cooldown.is_none()));
+    assert_eq!(
+        account
+            .app
+            .recovery_account_usage(clock.now())
+            .unwrap()
+            .attempts,
+        0
+    );
+
+    // A full quantum waits the limit out.
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_retries_a_failed_reconnect_before_the_cooldown_ends() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, t0 - HOUR);
+    host.tails.stand(&route, RELAY, t0);
+    let mut policy = test_policy();
+    policy.unit.cooldown_base_seconds = HOUR;
+    for _ in 0..policy.unit.cooldown_after_unreachable {
+        account
+            .app
+            .settle_recovery_unit(&route, RELAY, Outcome::Unreachable, &policy.unit, t0)
+            .unwrap();
+    }
+    let cooling = || {
+        account
+            .app
+            .recovery_relay_health(RELAY)
+            .unwrap()
+            .unwrap()
+            .cooldown
+            .is_some()
+    };
+    assert!(cooling());
+    let (runner, handle) = runner(&host, policy);
+    let task = runner.spawn();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(relay.requests(), 0, "every unit is cooling");
+
+    // The reconnect's write fails once. The task retries it on the local
+    // backoff, not at the end of the hour-long cooldown it should end.
+    host.fail_next_turns(1);
+    let started = Instant::now();
+    handle.relay_reconnected(RELAY);
+    wait_until("the reconnect", Duration::from_secs(5 * 60), || !cooling()).await;
+    wait_until("the sweep", WAIT, || relay.requests() > 0).await;
+    assert!(started.elapsed() < Duration::from_secs(60));
+
+    handle.shutdown();
+    task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_counts_a_best_effort_attempt_only_when_it_reached_the_relay() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (route, unrelated) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    let other = ModelRelay::new(OTHER_RELAY, caps(500, true))
+        .with_events(every([1; 32], floor, t0, 60))
+        .build();
+    let routes = vec![RunnerRoute {
+        best_effort: vec![OTHER_RELAY.to_owned()],
+        ..required(&route, &[RELAY])
+    }];
+    let host = TestHost::new(&account, &clock, routes, &[&relay, &other]);
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    host.tails.stand(&route, OTHER_RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+    assert_eq!(ran(runner.step().await).key.relay, RELAY);
+
+    // Its staging write fails: a local failure, not the one attempt. It runs
+    // again once the local hold ends.
+    host.fail_next_turns(1);
+    let failed = ran(runner.step().await);
+    assert_eq!(
+        (failed.key.relay.as_str(), failed.outcome),
+        (OTHER_RELAY, Outcome::LocalFailure)
+    );
+    assert!(idle(runner.step().await).is_some(), "held, not done");
+    clock.advance(RecoveryRunnerPolicy::default().local_failure_backoff_seconds(1));
+    other.set_reachable(false);
+    let tried = ran(runner.step().await);
+    assert_eq!(
+        (tried.key.relay.as_str(), tried.outcome),
+        (OTHER_RELAY, Outcome::Unreachable)
+    );
+    assert_eq!(idle(runner.step().await), None, "one attempt per debt");
+
+    // A loss on another route moves the account's un-cover mark but changes
+    // nothing this relay owes.
+    account.goal(&unrelated, floor);
+    account.live_boundary(&unrelated, RELAY, floor, t0);
+    let mark = account.app.recovery_coverage_mark().unwrap();
+    account
+        .app
+        .uncover_recovery_coverage(std::slice::from_ref(&unrelated), floor)
+        .unwrap();
+    assert_ne!(account.app.recovery_coverage_mark().unwrap(), mark);
+    assert_eq!(idle(runner.step().await), None);
+
+    // Debt before its first owed second is new evidence. The required relay
+    // owes it too, and its class goes first.
+    other.set_reachable(true);
+    account.goal(&route, floor - HOUR);
+    assert_eq!(ran(runner.step().await).key.relay, RELAY);
+    let renewed = ran(runner.step().await);
+    assert_eq!(renewed.key.relay, OTHER_RELAY);
+}
+
+#[test]
+fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
+    let (quiet, busy) = (group(1), group(2));
+    let candidate = |route: &Route, owed_seconds: u64| select::Candidate {
+        key: unit_key(route, RELAY),
+        best_effort: false,
+        owed_seconds,
+        position: 0,
+        last_served_at: None,
+        due_at: 0,
+        blocked: false,
+    };
+    let mut memory = select::Memory::default();
+    let policy = test_policy();
+    // The quiet route's last quantum proved an hour with no events.
+    let report = quantum::QuantumReport {
+        end: SweepEnd::Finished,
+        requests: 1,
+        answers: 1,
+        rate_limited: false,
+        unstaged_bytes: 0,
+        newly_covered_seconds: HOUR,
+        proved_seconds: HOUR,
+        proved_events: 0,
+        delta: HOUR,
+        observed_cap: None,
+        stop: None,
+    };
+    memory.settled(
+        &candidate(&quiet, HOUR),
+        Some(&report),
+        Outcome::Advanced,
+        0,
+        &policy,
+    );
+
+    // A month of quiet owes more than a minute of the busy route, which has
+    // no rate yet.
+    let survey = select::Survey {
+        candidates: vec![candidate(&quiet, 30 * DAY), candidate(&busy, 60)],
+        paused_until: None,
+    };
+    let select::Pick::Unit(first) =
+        select::pick(survey, &mut memory, &PriorityHints::default(), 0, true)
+    else {
+        panic!("a unit is due");
+    };
+    assert_eq!(first.key.route, busy);
+}
+
 #[tokio::test(start_paused = true)]
 async fn recovery_runner_bounds_caps_reads_by_the_pass_and_shutdown() {
     let account = account();
@@ -1609,7 +1932,8 @@ fn recovery_runner_classifies_every_sweep_end() {
     let local = Some(SinkStop::Local);
     let stale = Some(SinkStop::StaleMark);
     let gone = Some(SinkStop::WorkerGone);
-    // (end, answered, rate limited, newly covered, sink stop, still owed)
+    // (end, answered, last reply rate limited, newly covered, sink stop, still
+    // owed)
     let cases = [
         (
             (End::Finished, true, false, 0, None, true),
@@ -1631,9 +1955,10 @@ fn recovery_runner_classifies_every_sweep_end() {
             (End::DeadlineReached, false, true, 0, None, true),
             Outcome::RateLimited,
         ),
+        // Answers before the rate limit do not clear it.
         (
             (End::DeadlineReached, true, true, 0, None, true),
-            Outcome::NoProgress,
+            Outcome::RateLimited,
         ),
         (
             (End::DeadlineReached, true, false, 0, None, true),

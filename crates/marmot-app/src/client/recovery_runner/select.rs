@@ -39,9 +39,6 @@ pub(super) struct Candidate {
     /// It waits for new evidence, not for time: a broken unit without a probe,
     /// a suspended group, or a relay staging holds back.
     pub(super) blocked: bool,
-    /// The un-cover generation the survey read; with `position` it names a
-    /// best-effort relay's debt.
-    pub(super) mark: RecoveryCoverageMark,
 }
 
 /// Every owing unit of the current routes, read in one debt turn.
@@ -68,8 +65,10 @@ pub(super) struct Memory {
     /// Units held back after local failures: until when, and the failures in
     /// a row.
     local: BTreeMap<UnitKey, (u64, u32)>,
-    /// Each best-effort unit's debt at its last attempt that made no progress.
-    best_effort: BTreeMap<UnitKey, (u64, RecoveryCoverageMark)>,
+    /// Each best-effort unit's first owed second at its last attempt that
+    /// made no progress. A loss that moves it earlier is new debt; growth at
+    /// the newest end, or an un-cover after it, is not.
+    best_effort: BTreeMap<UnitKey, u64>,
 }
 
 impl Memory {
@@ -112,26 +111,27 @@ impl Memory {
                 RecoveryUnitOutcome::Advanced => {
                     self.best_effort.remove(&candidate.key);
                 }
-                // The runner preempted it: that was no attempt.
-                RecoveryUnitOutcome::Unanswered => {}
+                // The runner preempted it, or its own write failed: that was no
+                // attempt. A local failure waits out the local hold instead.
+                RecoveryUnitOutcome::Unanswered | RecoveryUnitOutcome::LocalFailure => {}
                 _ => {
                     self.best_effort
-                        .insert(candidate.key.clone(), (candidate.position, candidate.mark));
+                        .insert(candidate.key.clone(), candidate.position);
                 }
             }
         }
     }
 
     /// The unit's debt in events at the route's last observed rate, or in
-    /// seconds when no rate is known.
+    /// seconds when no rate is known or the route was last seen empty.
     fn size(&self, candidate: &Candidate) -> u64 {
         match self.rates.get(&candidate.key.route) {
-            Some((events, seconds)) => {
+            Some((events, seconds)) if *events > 0 => {
                 let size = u128::from(candidate.owed_seconds) * u128::from(*events)
                     / u128::from((*seconds).max(1));
                 u64::try_from(size).unwrap_or(u64::MAX)
             }
-            None => candidate.owed_seconds,
+            _ => candidate.owed_seconds,
         }
     }
 }
@@ -186,7 +186,6 @@ fn cooldown_until(
 pub(super) fn survey(turn: &DebtTurn<'_>, policy: &RecoveryRunnerPolicy) -> StorageResult<Survey> {
     let app = turn.app;
     let now = turn.now;
-    let mark = app.recovery_coverage_mark()?;
     let paused_until = app
         .recovery_account_paused_until(&policy.unit, now)?
         .filter(|until| *until > now);
@@ -224,7 +223,6 @@ pub(super) fn survey(turn: &DebtTurn<'_>, policy: &RecoveryRunnerPolicy) -> Stor
                 last_served_at: unit.as_ref().and_then(|unit| unit.last_served_at_seconds),
                 due_at: retry_at.max(cooldown.unwrap_or(0)),
                 blocked: broken || suspended(route) || backpressured(app, route, relay, policy)?,
-                mark,
             });
         }
     }
@@ -268,8 +266,7 @@ pub(super) fn pick(
     let mut eligible = Vec::new();
     for candidate in survey.candidates {
         let tried = candidate.best_effort
-            && memory.best_effort.get(&candidate.key)
-                == Some(&(candidate.position, candidate.mark));
+            && memory.best_effort.get(&candidate.key) == Some(&candidate.position);
         if candidate.blocked || tried {
             continue;
         }
