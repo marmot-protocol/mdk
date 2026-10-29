@@ -697,6 +697,13 @@ where
         Ok(self.session.admin_pubkeys(group_id)?)
     }
 
+    /// Tag this device's KeyPackages and leaves from `group_id`'s roster, or
+    /// stop with `None`. See
+    /// [`cgka_engine::engine::Engine::set_device_tag_group`].
+    pub fn set_device_tag_group(&mut self, group_id: Option<GroupId>) -> AccountResult<()> {
+        Ok(self.session.set_device_tag_group(group_id)?)
+    }
+
     /// Which roster slot the leaf at `leaf_index` belongs to, read from its
     /// device tag against the device group's current `roster`. `None` when
     /// `epoch` is not the group's current epoch or no leaf sits at that

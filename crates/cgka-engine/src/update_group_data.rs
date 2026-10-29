@@ -417,12 +417,17 @@ impl<S: StorageProvider> Engine<S> {
             }),
         )?;
         let roster_required = crate::app_components::group_requires_device_roster(mls_group)?;
+        // The roster `proposals` leave decides whether a Commit that sets this
+        // device's own tag key tags its UpdatePath leaf; one another member's
+        // pending proposal changes as well is not foreseen here.
+        let leaf_node_parameters = self.own_commit_leaf_parameters(mls_group, &proposals)?;
         let mut builder = mls_group
             .commit_builder()
             .consume_proposal_store(consume_pending)
             .propose_removals(removals)
             .propose_adds(adds)
             .add_proposals(proposals)
+            .leaf_node_parameters(leaf_node_parameters)
             .load_psks(
                 <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
                     provider,

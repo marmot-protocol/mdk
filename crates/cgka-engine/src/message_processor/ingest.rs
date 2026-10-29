@@ -1955,9 +1955,31 @@ impl<S: StorageProvider> Engine<S> {
             pending_commit_guard.set_stored_proposal_ref(stored_proposal_ref);
         }
         let pre_commit_ctx = group_lifecycle::build_group_context_snapshot(mls_group, &provider)?;
-        let (commit_out, _welcome_opt, _gi) = mls_group
-            .commit_to_pending_proposals(&provider, &self.identity.signer)
-            .map_err(|e| EngineError::Backend(format!("auto_commit: {e:?}")))?;
+        // OpenMLS's `commit_to_pending_proposals`, whose UpdatePath tags this
+        // device's leaf when the leaf needs a tag.
+        let leaf_node_parameters = self.own_commit_leaf_parameters(mls_group, &[])?;
+        let commit_out = mls_group
+            .commit_builder()
+            .consume_proposal_store(true)
+            .leaf_node_parameters(leaf_node_parameters)
+            .load_psks(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                    &provider,
+                ),
+            )
+            .map_err(|e| EngineError::Backend(format!("auto_commit load_psks: {e:?}")))?
+            .build(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::rand(&provider),
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(
+                    &provider,
+                ),
+                &self.identity.signer,
+                |_| true,
+            )
+            .map_err(|e| EngineError::Backend(format!("auto_commit build: {e:?}")))?
+            .stage_commit(&provider)
+            .map_err(|e| EngineError::Backend(format!("auto_commit stage: {e:?}")))?
+            .into_commit();
         let staged_commit = mls_group
             .pending_commit()
             .ok_or_else(|| EngineError::Backend("auto-commit produced no pending commit".into()))?;

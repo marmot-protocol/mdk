@@ -120,15 +120,22 @@ pub(crate) struct InitialComponentState {
     pub(crate) optional_app_components: Vec<AppComponentData>,
 }
 
+/// The `app_data_dictionary` of a new own LeafNode. A leaf that carries
+/// `device_tag` also advertises `0x800f` (device-tag-v1.md, "Producing
+/// tags"); the host never lists it among its supported components.
 pub(crate) fn leaf_app_components_extension(
     supported: &AppComponentSet,
     account_identity_proof: Option<&[u8]>,
+    device_tag: Option<Vec<u8>>,
 ) -> Result<Extension, EngineError> {
     let mut dict = AppDataDictionary::new();
     let mut advertised = supported.ids.clone();
     advertised.insert(APP_COMPONENTS_COMPONENT_ID);
     if account_identity_proof.is_some() {
         advertised.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+    }
+    if device_tag.is_some() {
+        advertised.insert(DEVICE_TAG_COMPONENT_ID);
     }
     dict.insert(
         APP_COMPONENTS_COMPONENT_ID,
@@ -140,6 +147,9 @@ pub(crate) fn leaf_app_components_extension(
     );
     if let Some(proof) = account_identity_proof {
         dict.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, proof.to_vec());
+    }
+    if let Some(tag) = device_tag {
+        dict.insert(DEVICE_TAG_COMPONENT_ID, tag);
     }
     Ok(Extension::AppDataDictionary(
         AppDataDictionaryExtension::new(dict),
@@ -2426,7 +2436,7 @@ mod tests {
         let mut supported = AppComponentSet::from(default_group_components());
         supported.insert(NOSTR_ROUTING_COMPONENT_ID);
 
-        let ext = leaf_app_components_extension(&supported, None).unwrap();
+        let ext = leaf_app_components_extension(&supported, None, None).unwrap();
         let Extension::AppDataDictionary(ext) = ext else {
             panic!("expected an AppDataDictionary extension");
         };

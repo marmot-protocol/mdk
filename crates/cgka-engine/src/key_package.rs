@@ -134,9 +134,8 @@ pub fn durably_owned_key_packages<S: StorageProvider>(
     Ok(owned)
 }
 
-/// Parse and validate a transported KeyPackage enough for transport-directory
-/// publication/fetch checks.
-pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, EngineError> {
+/// Decode a transported KeyPackage and verify its signature and structure.
+fn decode_key_package(kp: &KeyPackage) -> Result<MlsKeyPackage, EngineError> {
     let msg = MlsMessageIn::tls_deserialize_exact(kp.bytes())
         .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
     let kp_in = match msg.extract() {
@@ -147,7 +146,13 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
             ));
         }
     };
-    let key_package = validation_crypto::validate(kp_in)?;
+    validation_crypto::validate(kp_in)
+}
+
+/// Parse and validate a transported KeyPackage enough for transport-directory
+/// publication/fetch checks.
+pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, EngineError> {
+    let key_package = decode_key_package(kp)?;
     let member_id = crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
     // Validate the account-identity proof against the KeyPackage's OWN
     // ciphersuite, matching `parse_key_package` (mdk#747). `DEFAULT_CIPHERSUITE`
@@ -189,17 +194,7 @@ pub(crate) fn key_package_ref(
 /// either the current last-resort application-data component or the legacy
 /// last-resort extension.
 pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> {
-    let msg = MlsMessageIn::tls_deserialize_exact(kp.bytes())
-        .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
-    let kp_in = match msg.extract() {
-        MlsMessageBodyIn::KeyPackage(key_package) => key_package,
-        _ => {
-            return Err(EngineError::Serialize(
-                "MLS message did not carry a KeyPackage".into(),
-            ));
-        }
-    };
-    let key_package = validation_crypto::validate(kp_in)?;
+    let key_package = decode_key_package(kp)?;
     crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
     // See `key_package_metadata`: validate against the KeyPackage's own
     // ciphersuite, not `DEFAULT_CIPHERSUITE` (mdk#747).
@@ -387,9 +382,11 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Whether `key_package` advertises what a KeyPackage built now would:
     /// the same profile, ciphersuite, MLS extensions and proposals, and app
-    /// components. When the set this client supports changes, its published
-    /// KeyPackage is due for replacement (`foundation/key-packages.md`,
-    /// "Capability advertising").
+    /// components, and, once this device can tag, a device tag that reads as
+    /// its own. When the set this client supports changes, or the device
+    /// starts tagging, its published KeyPackage is due for replacement
+    /// (`foundation/key-packages.md`, "Capability advertising";
+    /// device-tag-v1.md, "Producing tags").
     pub fn key_package_advertises_current_capabilities(
         &self,
         key_package: &KeyPackage,
@@ -397,10 +394,17 @@ impl<S: StorageProvider> Engine<S> {
         let metadata = key_package_metadata(key_package)?;
         let caps = leaf_capabilities(&self.registry, self.ciphersuite, self.new_protocol_profile);
         let advertised = crate::capabilities::advertised_capabilities_from_caps(&caps);
+        let own_tag = self.own_device_tag(&self.storage)?;
+        if let Some(own_tag) = &own_tag
+            && !own_tag.reads_as_own(decode_key_package(key_package)?.leaf_node())
+        {
+            return Ok(false);
+        }
+        // An empty stand-in tag gives the list a tagged KeyPackage advertises.
         let app_components = crate::app_components::app_components_of_leaf_extensions(
             &self
                 .identity
-                .leaf_extensions(&self.supported_app_components)?,
+                .leaf_extensions(&self.supported_app_components, own_tag.map(|_| Vec::new()))?,
         )?;
         Ok(metadata.protocol_profile == self.new_protocol_profile
             && metadata.ciphersuite == u16::from(self.ciphersuite)
@@ -425,11 +429,21 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// Maintenance uses this inside `StorageProvider::with_transaction` so the
     /// OpenMLS private bundle and the lifecycle record become durable together.
+    ///
+    /// Once this device can tag, every KeyPackage it builds carries a fresh
+    /// device tag, whether it is published or handed to a sibling
+    /// (device-tag-v1.md, "Producing tags").
     pub(crate) fn build_fresh_key_package(&self, storage: &S) -> Result<KeyPackage, EngineError> {
         let caps = leaf_capabilities(&self.registry, self.ciphersuite, self.new_protocol_profile);
+        let device_tag = self
+            .own_device_tag(storage)
+            .ok()
+            .flatten()
+            .map(|own| own.seal(&self.crypto, &self.identity.signer))
+            .transpose()?;
         let leaf_extensions = self
             .identity
-            .leaf_extensions(&self.supported_app_components)?;
+            .leaf_extensions(&self.supported_app_components, device_tag)?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
 
         let bundle = MlsKeyPackage::builder()

@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use crate::capabilities::{
     capabilities_of_key_package, extension_from_group_capabilities, leaf_capabilities,
 };
+use crate::device_tag::OwnDeviceTag;
 use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
@@ -20,7 +21,7 @@ use crate::wire_format::{
 use cgka_traits::TransportEndpoint;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet,
-    default_group_components,
+    DEVICE_ROSTER_COMPONENT_ID, decode_device_roster_v1, default_group_components,
 };
 use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
@@ -462,9 +463,27 @@ impl<S: StorageProvider> Engine<S> {
             self.new_protocol_profile,
             "identity proof material must match the new-state profile"
         );
+        // The founding leaf of a device group is tagged from the roster it
+        // founds, so the founder's first leaf there already reads as its own;
+        // a leaf in any other group from the device group's roster.
+        let own_tag = if required_caps
+            .app_components
+            .contains(DEVICE_ROSTER_COMPONENT_ID)
+        {
+            req.app_components
+                .iter()
+                .find(|component| component.component_id == DEVICE_ROSTER_COMPONENT_ID)
+                .and_then(|component| decode_device_roster_v1(&component.data).ok())
+                .and_then(|roster| OwnDeviceTag::find(roster, self.identity.signer.public()))
+        } else {
+            self.own_device_tag(&self.storage).ok().flatten()
+        };
+        let device_tag = own_tag
+            .map(|own| own.seal(&self.crypto, &self.identity.signer))
+            .transpose()?;
         let leaf_extensions = self
             .identity
-            .leaf_extensions(&self.supported_app_components)?;
+            .leaf_extensions(&self.supported_app_components, device_tag)?;
 
         // Validate the creator (implicit admin) on the SAME x-only secp256k1
         // basis as the co-admins below (mdk#737 review), so no admin-set entry

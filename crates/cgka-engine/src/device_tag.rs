@@ -8,19 +8,31 @@
 //! would need its signature scheme passed in here. A tag never makes anything
 //! invalid: reading one that does not decode, open or verify gives
 //! [`DeviceTagClaim::Unclaimed`], never an error.
+//!
+//! This device signs its tags with its MLS signature key, so the roster's
+//! `tag_signature_key` for its entry is that key and [`OwnDeviceTag`] finds
+//! the entry by it. `SignWithLabel`'s label keeps a tag signature apart from
+//! every MLS signature made with the same key.
 
+use crate::engine::Engine;
 pub use cgka_traits::app_components::DeviceTagClaim;
 use cgka_traits::app_components::{
-    DEVICE_TAG_COMPONENT_ID, DEVICE_TAG_NONCE_LEN, DeviceRosterV1, DeviceSlotId,
-    DeviceTagContentV1, DeviceTagV1, RejectedSlotReasonV1, decode_device_tag_content_v1,
-    decode_device_tag_v1, encode_component_vectors, encode_device_tag_content_v1,
-    encode_device_tag_signed_content_v1, encode_device_tag_v1,
+    DEVICE_ROSTER_COMPONENT_ID, DEVICE_TAG_COMPONENT_ID, DEVICE_TAG_NONCE_LEN, DeviceRosterV1,
+    DeviceSlotId, DeviceTagContentV1, DeviceTagV1, RejectedSlotReasonV1, decode_device_roster_v1,
+    decode_device_tag_content_v1, decode_device_tag_v1, encode_component_vectors,
+    encode_device_tag_content_v1, encode_device_tag_signed_content_v1, encode_device_tag_v1,
 };
 use cgka_traits::error::EngineError;
+use cgka_traits::storage::StorageProvider;
+use cgka_traits::types::GroupId;
+use openmls::group::MlsGroup;
+use openmls::messages::proposals::Proposal;
 use openmls::prelude::LeafNode;
+use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::random::OpenMlsRand;
+use openmls_traits::signatures::Signer;
 use openmls_traits::types::{AeadType, SignatureScheme};
 use std::sync::LazyLock;
 
@@ -32,14 +44,14 @@ const SIGN_LABEL: &[u8] = b"MLS 1.0 Marmot DeviceTag";
 static VERIFY_CRYPTO: LazyLock<RustCrypto> = LazyLock::new(RustCrypto::default);
 
 /// The `0x800f` entry for a leaf whose signature key is
-/// `leaf_signature_key`: `slot` signed with the device's tag signature
-/// private key (a 32-byte Ed25519 seed), sealed under the roster's
-/// `leaf_tag_key` with a nonce drawn from `crypto`.
+/// `leaf_signature_key`: `slot` signed by `tag_signer`, the device's tag
+/// signature key, sealed under the roster's `leaf_tag_key` with a nonce drawn
+/// from `crypto`.
 pub fn seal_device_tag<C: OpenMlsCrypto + OpenMlsRand>(
     crypto: &C,
     leaf_tag_key: &[u8; 32],
     slot: &DeviceSlotId,
-    tag_signature_private_key: &[u8],
+    tag_signer: &impl Signer,
     leaf_signature_key: &[u8],
 ) -> Result<Vec<u8>, EngineError> {
     let nonce = crypto
@@ -49,7 +61,7 @@ pub fn seal_device_tag<C: OpenMlsCrypto + OpenMlsRand>(
         crypto,
         leaf_tag_key,
         slot,
-        tag_signature_private_key,
+        tag_signer,
         leaf_signature_key,
         nonce,
     )
@@ -59,16 +71,17 @@ fn seal_with_nonce(
     crypto: &impl OpenMlsCrypto,
     leaf_tag_key: &[u8; 32],
     slot: &DeviceSlotId,
-    tag_signature_private_key: &[u8],
+    tag_signer: &impl Signer,
     leaf_signature_key: &[u8],
     nonce: [u8; DEVICE_TAG_NONCE_LEN],
 ) -> Result<Vec<u8>, EngineError> {
-    let signature = crypto
-        .sign(
-            SignatureScheme::ED25519,
-            &sign_content(slot, leaf_signature_key),
-            tag_signature_private_key,
-        )
+    if tag_signer.signature_scheme() != SignatureScheme::ED25519 {
+        return Err(EngineError::Backend(
+            "device tag signature: the tag key is not Ed25519".into(),
+        ));
+    }
+    let signature = tag_signer
+        .sign(&sign_content(slot, leaf_signature_key))
         .map_err(|e| EngineError::Backend(format!("device tag signature: {e:?}")))?;
     let content = encode_device_tag_content_v1(&DeviceTagContentV1 {
         slot: *slot,
@@ -85,6 +98,168 @@ fn seal_with_nonce(
         )
         .map_err(|e| EngineError::Backend(format!("device tag seal: {e:?}")))?;
     encode_device_tag_v1(&DeviceTagV1 { nonce, sealed }).map_err(EngineError::Serialize)
+}
+
+/// This device's entry in its device group's roster, once it can tag
+/// (device-tag-v1.md, "Producing tags"): the roster holds `leaf_tag_key` and
+/// an entry whose `tag_signature_key` is this device's MLS signature key.
+#[derive(Clone, Debug)]
+pub(crate) struct OwnDeviceTag {
+    roster: DeviceRosterV1,
+    slot: DeviceSlotId,
+}
+
+impl OwnDeviceTag {
+    /// The entry in `roster` that carries `own_signature_key`, or `None` while
+    /// none does. A valid roster never gives two entries the same key.
+    pub(crate) fn find(roster: DeviceRosterV1, own_signature_key: &[u8]) -> Option<Self> {
+        let slot = roster
+            .devices
+            .iter()
+            .find(|(_, device)| device.tag_signature_key.as_deref() == Some(own_signature_key))
+            .map(|(slot, _)| *slot)?;
+        Some(Self { roster, slot })
+    }
+
+    /// Whether `leaf`, one of this device's, carries a tag that reads as this
+    /// device's. A leaf that does not needs a tagged replacement.
+    pub(crate) fn reads_as_own(&self, leaf: &LeafNode) -> bool {
+        device_tag_claim(leaf, &self.roster) == DeviceTagClaim::Device(self.slot)
+    }
+
+    /// A fresh tag for a leaf signed by `signer`, this device's MLS signer.
+    pub(crate) fn seal<C: OpenMlsCrypto + OpenMlsRand>(
+        &self,
+        crypto: &C,
+        signer: &SignatureKeyPair,
+    ) -> Result<Vec<u8>, EngineError> {
+        seal_device_tag(
+            crypto,
+            &self.roster.leaf_tag_key,
+            &self.slot,
+            signer,
+            signer.public(),
+        )
+    }
+}
+
+impl<S: StorageProvider> Engine<S> {
+    /// Tag this device's KeyPackages and own leaves from the roster of
+    /// `group_id`, its device group, or stop tagging with `None`. The host
+    /// names a device group only once it trusts it: holding the account key
+    /// never authenticates a device, so an untrusted group's `leaf_tag_key`
+    /// must never seal a tag. Kept in memory; the host sets it again after
+    /// every open.
+    ///
+    /// Naming a group the session only seeded hydrates it, so its roster is
+    /// read only once hydration has validated it. A group that fails
+    /// hydration is quarantined, and the device tags nothing from a group that
+    /// is not live. The group is named either way, since the host's trust has
+    /// moved to it and no earlier group may tag in its place; the error says
+    /// it is not live, as it does on every later call while that holds.
+    ///
+    /// This device tags once that roster holds an entry whose
+    /// `tag_signature_key` is its MLS signature key (`own_signature_key`;
+    /// device-tag-v1.md, "Producing tags"). It sets that key itself in a
+    /// roster update through `SendIntent::UpdateAppComponents`, whose
+    /// UpdatePath then carries the first tag.
+    pub fn set_device_tag_group(&mut self, group_id: Option<GroupId>) -> Result<(), EngineError> {
+        self.device_tag_group = group_id;
+        match self.device_tag_group.clone() {
+            Some(group_id) => {
+                self.ensure_hydrated(&group_id)?;
+                self.ensure_group_live(&group_id)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// This device's entry in its device group's current roster, read through
+    /// `storage`: `None` while it cannot tag, and an error while the named
+    /// group is not live or its MLS state does not load, when it cannot tell.
+    ///
+    /// Building goes ahead untagged on an error, since a tag never blocks
+    /// anything, and the device tags again once the group is readable. The
+    /// KeyPackage check passes the error on, so a tagged KeyPackage is not
+    /// replaced with an untagged one meanwhile.
+    pub(crate) fn own_device_tag(&self, storage: &S) -> Result<Option<OwnDeviceTag>, EngineError> {
+        let Some(group_id) = self.device_tag_group.as_ref() else {
+            return Ok(None);
+        };
+        self.ensure_group_live(group_id)?;
+        let device_group = MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .map_err(|error| EngineError::Backend(format!("load device group: {error:?}")))
+        .and_then(|device_group| {
+            device_group.ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))
+        })
+        .inspect_err(|_| {
+            tracing::warn!(
+                target: "cgka_engine::device_tag",
+                method = "own_device_tag",
+                "the device group did not load; building untagged"
+            );
+        })?;
+        Ok(self.own_device_tag_after(&device_group, &[]))
+    }
+
+    /// This device's entry in `device_group`'s roster as a Commit carrying
+    /// `proposals` leaves it, or `None` while it cannot tag. A Commit that
+    /// sets this device's key tags its own UpdatePath leaf under that key.
+    /// A roster that does not resolve leaves the device unable to tag rather
+    /// than failing what it was building.
+    pub(crate) fn own_device_tag_after(
+        &self,
+        device_group: &MlsGroup,
+        proposals: &[Proposal],
+    ) -> Option<OwnDeviceTag> {
+        if !device_group.is_active()
+            || !crate::app_components::group_requires_device_roster(device_group).ok()?
+        {
+            return None;
+        }
+        let mut roster = crate::app_components::app_component_data_of_group(
+            device_group,
+            DEVICE_ROSTER_COMPONENT_ID,
+        )?;
+        for proposal in proposals {
+            let Proposal::AppDataUpdate(update) = proposal else {
+                continue;
+            };
+            if update.component_id() != DEVICE_ROSTER_COMPONENT_ID {
+                continue;
+            }
+            roster = crate::app_components::resolved_app_data_update(true, Some(&roster), update)
+                .ok()??;
+        }
+        let roster = decode_device_roster_v1(&roster).ok()?;
+        OwnDeviceTag::find(roster, self.identity.signer.public())
+    }
+
+    /// The entry to tag this device's leaf in `mls_group` from, when a Commit
+    /// carrying `proposals` replaces that leaf and its tag does not read as
+    /// this device's; `None` when the leaf keeps its tag or the device cannot
+    /// tag. In the device group itself the roster is the one the Commit
+    /// leaves.
+    pub(crate) fn device_tag_due(
+        &self,
+        mls_group: &MlsGroup,
+        proposals: &[Proposal],
+    ) -> Option<OwnDeviceTag> {
+        let leaf = mls_group.own_leaf_node()?;
+        let in_device_group = self
+            .device_tag_group
+            .as_ref()
+            .is_some_and(|group_id| group_id.as_slice() == mls_group.group_id().as_slice());
+        let own = if in_device_group {
+            self.own_device_tag_after(mls_group, proposals)
+        } else {
+            self.own_device_tag(&self.storage).ok().flatten()
+        };
+        own.filter(|own| !own.reads_as_own(leaf))
+    }
 }
 
 /// Which roster slot `leaf` belongs to, as its device tag says
@@ -170,12 +345,20 @@ mod tests {
     const TAG_PRIVATE_KEY: [u8; 32] = [0x55; 32];
     const TAG_PUBLIC_KEY: &str = "c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242";
 
+    fn tag_signer() -> SignatureKeyPair {
+        SignatureKeyPair::from_raw(
+            SignatureScheme::ED25519,
+            TAG_PRIVATE_KEY.to_vec(),
+            tag_public_key(),
+        )
+    }
+
     fn spec_tag() -> Vec<u8> {
         seal_with_nonce(
             &RustCrypto::default(),
             &LEAF_TAG_KEY,
             &SLOT,
-            &TAG_PRIVATE_KEY,
+            &tag_signer(),
             &LEAF_SIGNATURE_KEY,
             [0x77; 12],
         )
@@ -336,6 +519,22 @@ mod tests {
     }
 
     #[test]
+    fn this_devices_entry_is_the_one_carrying_its_key() {
+        let signer = tag_signer();
+        let mut roster = roster_with_device(Some(tag_public_key()));
+        roster.devices.insert([0x12; 32], DeviceEntryV1::default());
+        let own = OwnDeviceTag::find(roster.clone(), signer.public()).unwrap();
+        assert_eq!(own.slot, SLOT);
+        // Its MLS key signs the tag and is also the leaf's signature key.
+        let tag = own.seal(&RustCrypto::default(), &signer).unwrap();
+        assert_eq!(
+            read_entry(&tag, signer.public(), &roster),
+            DeviceTagClaim::Device(SLOT)
+        );
+        assert!(OwnDeviceTag::find(roster_with_device(None), signer.public()).is_none());
+    }
+
+    #[test]
     fn sealing_draws_a_fresh_nonce_and_reads_back() {
         let crypto = RustCrypto::default();
         let seal = || {
@@ -343,7 +542,7 @@ mod tests {
                 &crypto,
                 &LEAF_TAG_KEY,
                 &SLOT,
-                &TAG_PRIVATE_KEY,
+                &tag_signer(),
                 &LEAF_SIGNATURE_KEY,
             )
             .unwrap()

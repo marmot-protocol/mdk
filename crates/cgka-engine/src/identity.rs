@@ -134,9 +134,12 @@ impl Identity {
         self.account_identity_proof.protocol_profile()
     }
 
+    /// Extensions for a new own LeafNode, carrying `device_tag` when this
+    /// device can tag.
     pub(crate) fn leaf_extensions(
         &self,
         supported_app_components: &cgka_traits::app_components::AppComponentSet,
+        device_tag: Option<Vec<u8>>,
     ) -> Result<Extensions<LeafNode>, EngineError> {
         let extensions = match &self.account_identity_proof {
             crate::account_identity_proof::AccountIdentityProofMaterial::LegacyExtension(
@@ -145,6 +148,7 @@ impl Identity {
                 crate::app_components::leaf_app_components_extension(
                     supported_app_components,
                     None,
+                    device_tag,
                 )?,
                 extension.clone(),
             ],
@@ -153,6 +157,7 @@ impl Identity {
             ) => vec![crate::app_components::leaf_app_components_extension(
                 supported_app_components,
                 Some(component),
+                device_tag,
             )?],
         };
         Extensions::from_vec(extensions)
