@@ -276,6 +276,8 @@ mod migration_0129_device_group_welcome_expectations;
 mod migration_0130_recovery_coverage_remainders;
 #[path = "migrations/0131_account_sign_ins.rs"]
 mod migration_0131_account_sign_ins;
+#[path = "migrations/0132_small_state.rs"]
+mod migration_0132_small_state;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1082,6 +1084,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0131_account_sign_ins",
         suspend_foreign_keys: &[],
         apply: migration_0131_account_sign_ins::apply,
+    },
+    Migration {
+        version: 132,
+        name: "0132_small_state",
+        suspend_foreign_keys: &[],
+        apply: migration_0132_small_state::apply,
     },
 ];
 
