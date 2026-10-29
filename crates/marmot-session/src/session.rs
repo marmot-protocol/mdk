@@ -37,7 +37,7 @@ use cgka_traits::maintenance::{
     WallClock,
 };
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{MaintenanceStorage, StorageError};
+use cgka_traits::storage::{DeviceGroupWelcomeExpectation, MaintenanceStorage, StorageError};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::{
@@ -1591,6 +1591,27 @@ impl AccountDeviceSession {
 
     pub fn self_id(&self) -> MemberId {
         self.engine.self_id()
+    }
+
+    /// This device's MLS signature key (`CgkaEngine::own_signature_key`).
+    pub fn own_signature_key(&self) -> Vec<u8> {
+        self.engine.own_signature_key()
+    }
+
+    /// See `CgkaEngine::expect_device_group_welcome`.
+    pub fn expect_device_group_welcome(
+        &mut self,
+        expectation: &DeviceGroupWelcomeExpectation,
+    ) -> Result<(), EngineError> {
+        self.engine.expect_device_group_welcome(expectation)
+    }
+
+    /// See `CgkaEngine::withdraw_device_group_welcome`.
+    pub fn withdraw_device_group_welcome(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        self.engine.withdraw_device_group_welcome(group_id)
     }
 
     #[cfg_attr(not(feature = "test-support"), allow(dead_code))]

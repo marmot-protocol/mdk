@@ -3,7 +3,7 @@
 use cgka_traits::GroupId;
 
 use crate::message::CancelReason;
-use crate::types::{KeyPackageEventId, KeyPackageRef, SessionId, SlotId};
+use crate::types::{KeyPackageEventId, KeyPackageRef, SessionId, SignatureKey, SlotId};
 
 /// A request with no answer expires this long after it was made, in seconds.
 pub const REQUEST_TTL_SECS: u64 = 10 * 60;
@@ -32,7 +32,8 @@ pub const MAX_TRACKED_REQUESTS: usize = 32;
 ///
 /// The existing device adds the KeyPackage with this exact `KeyPackageRef`,
 /// and no other, to the device group. The new device accepts a Welcome only
-/// for this device group.
+/// for this device group, and only from the leaf whose signature key the
+/// existing device's confirmation named.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfirmedLink {
     pub session_id: SessionId,
@@ -43,14 +44,21 @@ pub struct ConfirmedLink {
     pub key_package_ref: KeyPackageRef,
     /// The device group, covered by the existing device's confirmation.
     pub device_group_id: GroupId,
+    /// The MLS signature key of the existing device's leaf in that group,
+    /// covered by the same confirmation. The Welcome's sender leaf must have
+    /// it: anyone holding the account key can read the group id and found a
+    /// group under it, but cannot sign as this leaf.
+    pub welcome_sender_key: SignatureKey,
     /// The existing device that took part.
     pub existing_device_slot: SlotId,
 }
 
 impl ConfirmedLink {
-    /// Whether a Welcome into `group_id` is the one this link allows.
-    pub fn allows_welcome_for(&self, group_id: &GroupId) -> bool {
+    /// Whether a Welcome into `group_id`, sent by the leaf with
+    /// `sender_signature_key`, is the one this link allows.
+    pub fn allows_welcome_for(&self, group_id: &GroupId, sender_signature_key: &[u8]) -> bool {
         &self.device_group_id == group_id
+            && self.welcome_sender_key.as_slice() == sender_signature_key
     }
 }
 

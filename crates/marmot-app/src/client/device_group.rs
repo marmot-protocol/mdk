@@ -9,6 +9,12 @@
 //! - This device trusts one only if it created it or joined it through the
 //!   Welcome a confirmed link named. Requiring the roster never makes a group
 //!   trusted, and holding the account key never authenticates a device.
+//! - The engine decides which Welcome that is, before it joins (D28, D30).
+//!   The new device records the link's expectation (the group, the signature
+//!   key of the existing device's leaf, the end of the wait) before it sends
+//!   its own confirmation, and the engine joins a device group only through
+//!   the Welcome that matches it. The app never judges a joined group's
+//!   Welcome after the fact.
 //! - The founding Add may hold this account's own device only through the
 //!   exact `KeyPackageRef` a confirmed link names (D14, D21).
 //! - While this device trusts one, it names each KeyPackage in its own roster
@@ -28,7 +34,10 @@ use cgka_traits::app_components::{
     encode_nostr_routing_v1,
 };
 use cgka_traits::engine::CreateGroupRequest;
-use cgka_traits::storage::{GroupStorage as _, MaintenanceStorage as _, StorageError};
+use cgka_traits::storage::{
+    DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage as _, GroupStorage as _,
+    MaintenanceStorage as _, StorageError,
+};
 use cgka_traits::{EpochId, Group, GroupId, KeyPackage, TransportGroupSubscription};
 use storage_sqlite::{DeviceGroupRecord, DeviceGroupTrust};
 
@@ -47,7 +56,16 @@ pub struct ConfirmedDeviceLink {
     /// The device group, covered by the existing device's confirmation. On a
     /// first link the existing device chooses it before the group exists.
     pub device_group_id: GroupId,
+    /// The MLS signature key of the existing device's leaf in that group,
+    /// covered by the same confirmation: the only sender whose Welcome into
+    /// it the new device joins (D28).
+    pub welcome_sender_key: Vec<u8>,
 }
+
+/// How long the new device waits for its Welcome after it records a
+/// confirmed link, in seconds: the pairing session's lifetime (D27). The
+/// engine joins no Welcome under the link after it.
+pub(crate) const WELCOME_WAIT_SECS: u64 = 600;
 
 /// One of this account's devices, as the roster of the device group this
 /// device trusts lists it. Every entry is this account's own device: the
@@ -363,9 +381,17 @@ impl AppClient {
         Ok(group_id)
     }
 
-    /// The new device's side of a confirmed link: trust the Welcome into the
-    /// device group it names. If that Welcome already arrived, the group this
-    /// device holds becomes trusted now. A link never names another group.
+    /// The new device's side of a confirmed link, before it sends its own
+    /// confirmation: wait [`WELCOME_WAIT_SECS`] for the Welcome into the
+    /// device group the link names, from the leaf it names. The engine joins
+    /// that group only through that Welcome, and refuses every other Welcome
+    /// into its id meanwhile, so a group someone else founded under the id
+    /// never joins and never takes it.
+    ///
+    /// The group must be new to this device. Its waiting row is written
+    /// first and removed again if the engine cannot record the expectation.
+    /// A crash between the two writes leaves a row with no expectation
+    /// behind it, which admits nothing and which the next sweep drops.
     #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
     pub(crate) fn record_confirmed_device_link(
         &mut self,
@@ -374,34 +400,88 @@ impl AppClient {
         if !self.app.device_groups_enabled() {
             return Err(AppError::DeviceGroupRefused("roster_unsupported"));
         }
-        let held = self.stored_group(&link.device_group_id)?;
-        if held.as_ref().is_some_and(|group| !requires_roster(group)) {
+        let now = unix_now_seconds();
+        self.end_welcome_waits(now)?;
+        if self.stored_group(&link.device_group_id)?.is_some() {
             return Err(AppError::DeviceGroupRefused("device_group_exists"));
         }
         let group_id_hex = hex::encode(link.device_group_id.as_slice());
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        let now = unix_now_seconds();
-        if storage.set_device_group_trust(
-            &group_id_hex,
-            DeviceGroupTrust::Untrusted,
-            DeviceGroupTrust::Linked,
-            Some(&link.key_package_ref_hex),
-            now,
-        )? {
-            self.linked_devices_changed = true;
-            return Ok(());
-        }
         if !storage.insert_device_group(&DeviceGroupRecord {
-            group_id_hex,
+            group_id_hex: group_id_hex.clone(),
             trust: DeviceGroupTrust::AwaitingWelcome,
             key_package_ref_hex: Some(link.key_package_ref_hex.clone()),
             recorded_at: now,
         })? {
             return Err(AppError::DeviceGroupRefused("device_group_exists"));
         }
-        // A crash can leave the joined group with no row; settle it now.
-        if held.is_some() {
-            self.settle_held_device_group(&link.device_group_id)?;
+        let expected = self
+            .runtime
+            .expect_device_group_welcome(&DeviceGroupWelcomeExpectation {
+                group_id: link.device_group_id.clone(),
+                sender_signature_key: link.welcome_sender_key.clone(),
+                expires_at: now.saturating_add(WELCOME_WAIT_SECS),
+            });
+        if let Err(error) = expected {
+            storage.delete_device_group(&group_id_hex, DeviceGroupTrust::AwaitingWelcome)?;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// The new device's side of a withdrawn link: stop waiting for the
+    /// Welcome into `group_id`. The engine's expectation goes first, so once
+    /// this returns no Welcome under the link joins; then the waiting row. On
+    /// an error the caller retries, and a row left without its expectation
+    /// admits nothing meanwhile.
+    ///
+    /// Returns whether the link was still waiting. When it was not, the
+    /// Welcome already joined and the group settles as linked.
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+    pub(crate) fn withdraw_confirmed_device_link(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        self.runtime.withdraw_device_group_welcome(group_id)?;
+        if self.stored_group(group_id)?.is_some() {
+            return Ok(false);
+        }
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        storage.delete_device_group(
+            &hex::encode(group_id.as_slice()),
+            DeviceGroupTrust::AwaitingWelcome,
+        )?;
+        Ok(true)
+    }
+
+    /// End every wait for a link's Welcome that can no longer join a group:
+    /// one that ran out by `now`, whose engine expectation goes first, and one
+    /// with no expectation behind it, as a crash inside a record or a
+    /// withdrawal leaves. Neither admits a Welcome, and a row left waiting
+    /// would refuse a new link until the wait ran out. A group the engine
+    /// holds under a waiting row joined in time, since the engine joins none
+    /// after the wait or without the expectation, and settles as linked
+    /// instead.
+    pub(crate) fn end_welcome_waits(&mut self, now: u64) -> Result<(), AppError> {
+        let account_storage = self.app.account_storage(&self.state.label)?;
+        let storage = account_storage.app_storage();
+        for record in storage.device_groups()? {
+            if record.trust != DeviceGroupTrust::AwaitingWelcome {
+                continue;
+            }
+            let group_id = GroupId::new(hex::decode(&record.group_id_hex)?);
+            if self.stored_group(&group_id)?.is_some() {
+                continue;
+            }
+            if now >= record.recorded_at.saturating_add(WELCOME_WAIT_SECS) {
+                self.runtime.withdraw_device_group_welcome(&group_id)?;
+            } else if account_storage
+                .device_group_welcome_expectation(&group_id)?
+                .is_some()
+            {
+                continue;
+            }
+            storage.delete_device_group(&record.group_id_hex, DeviceGroupTrust::AwaitingWelcome)?;
         }
         Ok(())
     }
@@ -461,12 +541,14 @@ impl AppClient {
         Ok(true)
     }
 
-    /// Settle creations a restart interrupted. A row becomes `created` only
-    /// if the engine holds the group as this device created it: requiring the
-    /// roster, with a copy that began at epoch 0, where no Welcome-installed
-    /// copy begins. Otherwise the row goes, and a device group the engine
-    /// holds settles like any other held one.
+    /// Settle creations a restart interrupted, and end waits for a link's
+    /// Welcome that ran out. A row becomes `created` only if the engine holds
+    /// the group as this device created it: requiring the roster, with a copy
+    /// that began at epoch 0, where no Welcome-installed copy begins.
+    /// Otherwise the row goes, and a device group the engine holds settles
+    /// like any other held one.
     pub(crate) fn reconcile_device_groups(&mut self) -> Result<(), AppError> {
+        self.end_welcome_waits(unix_now_seconds())?;
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         for record in storage.device_groups()? {
             if record.trust != DeviceGroupTrust::Creating {
@@ -515,6 +597,17 @@ impl AppClient {
         link: ConfirmedDeviceLink,
     ) -> Result<(), AppError> {
         self.record_confirmed_device_link(&link)
+    }
+
+    /// Test-policy hook: withdraw a link this device recorded as the new
+    /// device, as if pairing had cancelled it.
+    #[cfg(feature = "test-policy-overrides")]
+    #[doc(hidden)]
+    pub fn dev_withdraw_confirmed_device_link(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        self.withdraw_confirmed_device_link(group_id)
     }
 
     /// Tell the runtime which device group this device announces its

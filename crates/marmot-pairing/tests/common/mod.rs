@@ -7,7 +7,8 @@ use cgka_traits::GroupId;
 use marmot_pairing::{
     AccountKey, ExistingDeviceEvent, ExistingDevicePairing, KeyPackageEventId, KeyPackageRef,
     NewDeviceConfirmation, NewDeviceEvent, NewDevicePairing, PairingAnswer, PairingConfirm,
-    PairingMessage, PairingRequest, PairingReveal, PublishedKeyPackage, SessionId, SlotId,
+    PairingMessage, PairingRequest, PairingReveal, PublishedKeyPackage, SessionId, SignatureKey,
+    SlotId,
 };
 
 /// A fixed start time, in Unix seconds.
@@ -38,6 +39,11 @@ pub fn slot(number: u8) -> SlotId {
 
 pub fn device_group() -> GroupId {
     GroupId::new(vec![0xd6; 16])
+}
+
+/// The existing device's MLS signature key in [`device_group`].
+pub fn welcome_signer() -> SignatureKey {
+    SignatureKey::new(vec![0x5e; 32]).expect("32 bytes")
 }
 
 pub fn existing(number: u8) -> ExistingDevicePairing {
@@ -105,7 +111,7 @@ pub fn confirm_both(pair: &mut Comparison, now: u64) -> (PairingConfirm, Pairing
     let session_id = pair.session_id();
     let existing_confirm = pair
         .existing
-        .confirm_link(&session_id, device_group(), now)
+        .confirm_link(&session_id, device_group(), welcome_signer(), now)
         .expect("the existing device confirms");
     assert_eq!(
         pair.new

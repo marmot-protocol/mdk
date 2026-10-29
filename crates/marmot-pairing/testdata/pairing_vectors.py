@@ -53,7 +53,7 @@ def emoji_numbers(sas: bytes) -> list:
     return [(bits >> (42 - 6 * i)) & 0x3F for i in range(7)]
 
 
-def vector(name: str, kp_ref_len: int, group_id_len: int) -> dict:
+def vector(name: str, kp_ref_len: int, group_id_len: int, signature_key_len: int) -> dict:
     session = h(name + " session")
     account = h(name + " account")
     kp_event = h(name + " key package event")
@@ -62,6 +62,7 @@ def vector(name: str, kp_ref_len: int, group_id_len: int) -> dict:
     )[:kp_ref_len]
     slot = h(name + " existing device slot")
     group = (h(name + " device group") * 8)[:group_id_len]
+    signature_key = (h(name + " existing device signature key") * 5)[:signature_key_len]
     new_secret = h(name + " new device secret")
     existing_secret = h(name + " existing device secret")
     new_key = public(new_secret)
@@ -90,7 +91,10 @@ def vector(name: str, kp_ref_len: int, group_id_len: int) -> dict:
     new_mac_info = mac_info(1, 1)
     new_mac = hmac.new(hkdf(shared_new, new_mac_info, 32), var(kp_ref), hashlib.sha256).digest()
     existing_mac_info = mac_info(2, 2)
-    existing_mac = hmac.new(hkdf(shared_new, existing_mac_info, 32), var(group), hashlib.sha256).digest()
+    device_group = var(group) + var(signature_key)
+    existing_mac = hmac.new(
+        hkdf(shared_new, existing_mac_info, 32), var(device_group), hashlib.sha256
+    ).digest()
 
     def content(obj: dict) -> str:
         return json.dumps(obj, separators=(",", ":"))
@@ -103,6 +107,7 @@ def vector(name: str, kp_ref_len: int, group_id_len: int) -> dict:
         "key_package_ref": kp_ref.hex(),
         "existing_device_slot": slot.hex(),
         "device_group_id": group.hex(),
+        "signature_key": signature_key.hex(),
         "new_device_secret": new_secret.hex(),
         "existing_device_secret": existing_secret.hex(),
         "new_device_key": new_key.hex(),
@@ -115,6 +120,7 @@ def vector(name: str, kp_ref_len: int, group_id_len: int) -> dict:
         "new_device_mac_info": new_mac_info.hex(),
         "new_device_mac": new_mac.hex(),
         "existing_device_mac_info": existing_mac_info.hex(),
+        "existing_device_mac_value": device_group.hex(),
         "existing_device_mac": existing_mac.hex(),
         "content": {
             "request": content({
@@ -134,6 +140,7 @@ def vector(name: str, kp_ref_len: int, group_id_len: int) -> dict:
                 "session": session.hex(),
                 "from": "existing_device",
                 "device_group": group.hex(),
+                "signature_key": signature_key.hex(),
                 "mac": existing_mac.hex(),
             }),
         },
@@ -160,9 +167,9 @@ def main() -> None:
         "at 7aaeac07608f97942eff88634a56b630a745ce56",
         "emoji_table_sha256": emoji_table_sha256(pathlib.Path(sys.argv[1])),
         "vectors": [
-            vector("pairing-v1 basic", 32, 16),
-            vector("pairing-v1 short ref", 20, 32),
-            vector("pairing-v1 long ref and group", 64, 255),
+            vector("pairing-v1 basic", 32, 16, 32),
+            vector("pairing-v1 short ref", 20, 32, 32),
+            vector("pairing-v1 long ref and group", 64, 255, 133),
         ],
     }
     out = pathlib.Path(__file__).with_name("pairing-v1.json")

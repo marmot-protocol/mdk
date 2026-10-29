@@ -21,6 +21,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("cgka_convergence_passes", Side::Protocol),
     ("cgka_convergence_policies", Side::Protocol),
     ("cgka_deferred_peel_generations", Side::Protocol),
+    ("cgka_device_group_welcome_expectations", Side::Protocol),
     ("cgka_disband_candidates", Side::Protocol),
     ("cgka_disband_requests", Side::Protocol),
     ("cgka_disband_tombstones", Side::Protocol),

@@ -841,6 +841,37 @@ pub trait AccountDeviceSignerStorage {
     ) -> StorageResult<Option<AccountDeviceSignerBinding>>;
 }
 
+// ── DeviceGroupWelcomeStorage ──────────────────────────────────────────────
+
+/// The Welcome a new device waits for after a confirmed device link
+/// (mdk#2628 D28, D30): into `group_id`, a group that requires the device
+/// roster, sent by the leaf whose MLS signature key is
+/// `sender_signature_key`, before `expires_at` (Unix seconds).
+///
+/// While it is stored, it reserves `group_id`: the engine joins no other
+/// Welcome into that group. The join that matches it consumes it in the
+/// join's own transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceGroupWelcomeExpectation {
+    pub group_id: GroupId,
+    pub sender_signature_key: Vec<u8>,
+    pub expires_at: u64,
+}
+
+pub trait DeviceGroupWelcomeStorage {
+    /// Store `expectation`, replacing any for the same group.
+    fn put_device_group_welcome_expectation(
+        &self,
+        expectation: &DeviceGroupWelcomeExpectation,
+    ) -> StorageResult<()>;
+    fn device_group_welcome_expectation(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<DeviceGroupWelcomeExpectation>>;
+    /// Whether an expectation for `group_id` was there to delete.
+    fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool>;
+}
+
 // ── KeyPackageBundleStorage ────────────────────────────────────────────────
 
 /// Account-device-local enumeration of persisted OpenMLS KeyPackage bundles.
@@ -1000,6 +1031,7 @@ pub trait StorageProvider:
     + DeferredPeelGenerationStorage
     + MemberValidationCacheStorage
     + AccountDeviceSignerStorage
+    + DeviceGroupWelcomeStorage
     + KeyPackageBundleStorage
     + Send
     + Sync

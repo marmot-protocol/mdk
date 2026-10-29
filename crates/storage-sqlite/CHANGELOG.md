@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- Migration 0129 advances account storage to schema 129 (mdk#2628 item 3.3b).
+  It adds `cgka_device_group_welcome_expectations`, one row per device group a
+  confirmed link waits to join: the sender leaf's signature key and the end of
+  the wait. `SqliteAccountStorage` implements the new
+  `DeviceGroupWelcomeStorage` trait over it. The engine consumes a row with
+  the join it admits, and the app deletes it when a link is withdrawn or its
+  wait ends. No rows are seeded.
 - Migration 0128 advances account storage to schema 128 (mdk#2660 phase 4).
   It adds `route_state` to `account_delivery_loss_evidence`, which existing
   rows leave 0, and `account_delivery_loss_evidence_routes`: the routes a loss

@@ -6,7 +6,7 @@ use marmot_pairing::{
     AccountKey, ConfirmSender, ExistingDeviceEvent, ExistingDevicePairing, KIND_PAIRING_ANSWER,
     KIND_PAIRING_CONFIRM, KIND_PAIRING_REQUEST, KIND_PAIRING_REVEAL, KeyPackageEventId,
     KeyPackageRef, NewDeviceConfirmation, NewDeviceEvent, NewDevicePairing, PairingMessage,
-    PublishedKeyPackage, SAS_EMOJI, SessionId, SlotId, commitment,
+    PublishedKeyPackage, SAS_EMOJI, SessionId, SignatureKey, SlotId, commitment,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -43,6 +43,8 @@ fn pairing_vectors_match_both_state_machines() {
             KeyPackageRef::new(bytes(vector, "key_package_ref")).expect("valid ref");
         let slot = SlotId::new(array(vector, "existing_device_slot"));
         let device_group_id = GroupId::new(bytes(vector, "device_group_id"));
+        let signature_key =
+            SignatureKey::new(bytes(vector, "signature_key")).expect("valid signature key");
 
         let (mut new, request) = NewDevicePairing::start_pinned(
             session_id,
@@ -160,7 +162,12 @@ fn pairing_vectors_match_both_state_machines() {
             "{name}"
         );
         let existing_confirm = existing
-            .confirm_link(&session_id, device_group_id.clone(), T0)
+            .confirm_link(
+                &session_id,
+                device_group_id.clone(),
+                signature_key.clone(),
+                T0,
+            )
             .expect("existing device confirms");
         assert_eq!(
             existing_confirm.mac,
@@ -170,7 +177,8 @@ fn pairing_vectors_match_both_state_machines() {
         assert_eq!(
             existing_confirm.sender,
             ConfirmSender::ExistingDevice {
-                device_group_id: device_group_id.clone()
+                device_group_id: device_group_id.clone(),
+                signature_key: signature_key.clone(),
             }
         );
         let existing_confirm_message = PairingMessage::Confirm(existing_confirm);
@@ -218,8 +226,12 @@ fn pairing_vectors_match_both_state_machines() {
             "{name}"
         );
         assert_eq!(new_link.device_group_id, device_group_id, "{name}");
+        assert_eq!(new_link.welcome_sender_key, signature_key, "{name}");
         assert_eq!(new_link.existing_device_slot, slot, "{name}");
-        assert!(new.accepts_welcome_for(&device_group_id), "{name}");
+        assert!(
+            new.accepts_welcome_for(&device_group_id, signature_key.as_slice()),
+            "{name}"
+        );
     }
 }
 
