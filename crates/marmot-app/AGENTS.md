@@ -241,7 +241,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   is the test-visible comparison with pending obligations; a scope holds proof only as completion would count it once
   loss invalidates by route (its predicate at the current route, inventory and obligation revisions; newer loss voids
   it only where storage's `recovery_loss_reach_after` says loss imported after the scope's loss revision, retired or
-  not, reached its route inside its window). A loss obligation's scope on a route its own loss
+  not, reached its route inside its window; a scope that would hold but whose newer loss was since acknowledged is not
+  comparable, because acknowledgment deletes where it reached). A loss obligation's scope on a route its own loss
   (`recovery_loss_reach`) never reached there is not comparable, and loss goals are restored only on reached routes,
   from their reach. A scope whose floor is unknown or older than the
   retained window is owed from the retention floor. Before it prunes, it passes the current routes and

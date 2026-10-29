@@ -653,7 +653,9 @@ checkpoints captured at the account's current route and inventory revisions and 
 obligation's own revision. Each loss import stamps the generations it charged with the loss
 revision it left, so a checkpoint from before newer loss stops counting only where loss
 imported after its revision, retired since or not, may have lost an event on the scope's route
-at or before the scope's end. A loss obligation owes every route, so its scope on a route its loss never reached
+at or before the scope's end. Acknowledgment deletes the evidence that says where loss reached
+and keeps only the highest stamp it deleted, so a scope that would hold but has newer loss
+acknowledged since is not comparable until a pass captures it again. A loss obligation owes every route, so its scope on a route its loss never reached
 at or before the scope's end is not comparable, and the report restores a loss goal only on
 the routes the loss reached, from where it reached each. A scope whose
 floor is unknown or older than the retained window is owed from that window's floor. On each

@@ -1801,8 +1801,9 @@ mod tests {
         use rusqlite::types::Value::{Integer, Null};
         assert_eq!(
             &state[0][retry_before[0].len()..],
-            &[Null, Integer(0), Integer(0)],
-            "route identity and qualified observation allocators must start empty"
+            &[Null, Integer(0), Integer(0), Integer(loss_revision)],
+            "route identity and qualified observation allocators must start empty, \
+             and acknowledgment at the loss revision"
         );
         assert!(conn.execute("INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms) VALUES ('explicit:second',3,1001,1001)",[]).is_err());
         assert_eq!(

@@ -469,20 +469,29 @@ impl SqliteAppStorage {
     /// Where loss of every cause that an import charged after `loss_revision`
     /// may have lost events, by route: what a checkpoint captured at that
     /// revision has not seen. Retired loss still counts, since retiring it
-    /// proves nothing; acknowledged loss is gone, and the pass that recovered
-    /// it proved its routes again. Loss no import has charged yet is left
-    /// out; its import raises the revision first.
+    /// proves nothing. Loss no import has charged yet is left out; its import
+    /// raises the revision first. `None` when an acknowledgment has since
+    /// deleted loss charged after `loss_revision`: where that loss reached is
+    /// no longer known.
     pub fn recovery_loss_reach_after(
         &self,
         label: &str,
         loss_revision: u64,
-    ) -> StorageResult<RecoveryLossReach> {
+    ) -> StorageResult<Option<RecoveryLossReach>> {
+        let loss_revision = sqlite_integer(loss_revision)?;
         let conn = self.lock()?;
-        reach(
-            &conn,
-            label,
-            ReachOf::ImportedAfter(sqlite_integer(loss_revision)?),
-        )
+        let acknowledged: i64 = conn
+            .query_row_cached(
+                "SELECT acknowledged_import_revision FROM account_recovery_state
+                 WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if acknowledged > loss_revision {
+            return Ok(None);
+        }
+        reach(&conn, label, ReachOf::ImportedAfter(loss_revision)).map(Some)
     }
 
     pub fn recovery_loss_watermarks(
@@ -608,6 +617,16 @@ impl SqliteAppStorage {
             if !matches(&conn, &label, cause)? {
                 return Ok(false);
             }
+            // The rows say where this loss reached; keep how recent it was.
+            conn.execute_cached(
+                "UPDATE account_recovery_state SET acknowledged_import_revision =
+                    MAX(acknowledged_import_revision, COALESCE(
+                        (SELECT MAX(import_revision) FROM account_delivery_loss_evidence
+                         WHERE account_label=?1 AND cause=?2), 0))
+                 WHERE singleton=1",
+                params![label, cause as i64],
+            )
+            .storage()?;
             conn.execute_cached(
                 "DELETE FROM account_delivery_loss_evidence WHERE account_label=?1 AND cause=?2",
                 params![label, cause as i64],
@@ -769,7 +788,11 @@ mod tests {
         let app = store.app_storage();
         app.ensure_account_projection("alice").unwrap();
         let group = |byte| TransportReconciliationRoute::Group([byte; 32]);
-        let after = |revision| app.recovery_loss_reach_after("alice", revision).unwrap();
+        let after = |revision| {
+            app.recovery_loss_reach_after("alice", revision)
+                .unwrap()
+                .expect("nothing acknowledged")
+        };
         let import = || {
             app.synchronize_account_delivery_loss("alice").unwrap();
             app.recovery_revision_fence().unwrap().loss_revision

@@ -32,7 +32,8 @@ const TARGET: &str = "marmot_app::recovery_coverage";
 /// How the ledger and the obligations compare, in aggregate. Each compared
 /// scope is counted once; known-event, maintenance-boundary and unresolved
 /// scopes are not comparable, nor is a loss obligation's scope on a route its
-/// loss never reached inside the scope's window.
+/// loss never reached inside the scope's window, nor a scope whose proof
+/// hangs on where acknowledged loss reached.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CoverageShadowReport {
     pub(crate) scopes_compared: u64,
@@ -839,6 +840,32 @@ impl AppClient {
                     report.not_comparable += 1;
                     continue;
                 }
+                // Whether loss newer than the scope's checkpoints reached it;
+                // unknown once an acknowledgment deleted that loss's evidence.
+                let newer_loss_reaches = if scope.loss_revision == fence.loss_revision {
+                    Some(false)
+                } else {
+                    let newer = match newer_loss.entry(scope.loss_revision) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                            app.recovery_loss_reach_after(&self.state.label, scope.loss_revision)?,
+                        ),
+                    };
+                    newer
+                        .as_ref()
+                        .map(|newer| newer.reaches(&route, scope.plan.until_seconds))
+                };
+                let holds = obligation_holds(
+                    &scope,
+                    demand.predicate,
+                    &fence,
+                    demand.ticket.revision,
+                    newer_loss_reaches.unwrap_or(false),
+                );
+                if holds && newer_loss_reaches.is_none() {
+                    report.not_comparable += 1;
+                    continue;
+                }
                 // The ledger keeps nothing below the retained window: an
                 // older or unknown floor owes everything still retained.
                 let since = scope.plan.since_seconds.unwrap_or(floor).max(floor);
@@ -861,22 +888,6 @@ impl AppClient {
                         break;
                     }
                 }
-                let newer_loss_reaches = scope.loss_revision != fence.loss_revision && {
-                    let newer = match newer_loss.entry(scope.loss_revision) {
-                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                        std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
-                            app.recovery_loss_reach_after(&self.state.label, scope.loss_revision)?,
-                        ),
-                    };
-                    newer.reaches(&route, scope.plan.until_seconds)
-                };
-                let holds = obligation_holds(
-                    &scope,
-                    demand.predicate,
-                    &fence,
-                    demand.ticket.revision,
-                    newer_loss_reaches,
-                );
                 match (holds, ledger) {
                     (false, false) => report.agree_owed += 1,
                     (true, true) => report.agree_covered += 1,
