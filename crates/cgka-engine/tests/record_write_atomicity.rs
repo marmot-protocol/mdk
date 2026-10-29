@@ -30,9 +30,9 @@ use cgka_traits::storage::{
     ConvergencePassStorage, ConvergencePolicyStorage, DisbandCandidate, DisbandCandidateStorage,
     DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef,
     GroupStorage, KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage,
-    MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
-    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
-    WelcomeStorage,
+    MemberValidationCacheStorage, MessageStorage, OpenMlsContentFilter, OutboundFanoutStorage,
+    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
+    StoredKeyPackageBundle, WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -370,8 +370,8 @@ struct PreparationDelay {
     graph_ms: Arc<AtomicUsize>,
     metadata_calls: Arc<AtomicUsize>,
     graph_calls: Arc<AtomicUsize>,
-    /// Rows `list_commits_and_proposals_inserted_after` has returned.
-    positional_rows: Arc<AtomicUsize>,
+    /// `list_disband_candidates` calls, the first read of every reseed.
+    disband_candidate_reads: Arc<AtomicUsize>,
 }
 
 impl MessageStorage for FaultStorage {
@@ -405,23 +405,28 @@ impl MessageStorage for FaultStorage {
         self.inner
             .list_messages_in_states(group_id, states, at_or_after_epoch)
     }
-    fn list_commits_and_proposals_inserted_after(
+    /// A failed batch's input check reads through the backend's filter. Every
+    /// other listing keeps the trait default, so `graph_calls` still counts
+    /// each reseed's graph listing.
+    fn list_openmls_messages_in_states(
         &self,
         group_id: &GroupId,
         states: &[MessageState],
         at_or_after_epoch: EpochId,
-        after: Option<u64>,
-    ) -> StorageResult<Option<Vec<(u64, MessageRecord)>>> {
-        let rows = self.inner.list_commits_and_proposals_inserted_after(
-            group_id,
-            states,
-            at_or_after_epoch,
-            after,
-        )?;
-        self.preparation_delay
-            .positional_rows
-            .fetch_add(rows.as_ref().map_or(0, Vec::len), Ordering::SeqCst);
-        Ok(rows)
+        filter: OpenMlsContentFilter,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        if matches!(
+            filter,
+            OpenMlsContentFilter::CommitsAndProposalsBetween { .. }
+        ) {
+            return self.inner.list_openmls_messages_in_states(
+                group_id,
+                states,
+                at_or_after_epoch,
+                filter,
+            );
+        }
+        self.list_messages_in_states(group_id, states, at_or_after_epoch)
     }
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
         if self.leave_write_fault.should_fail() {
@@ -663,6 +668,9 @@ impl DisbandCandidateStorage for FaultStorage {
         self.inner.disband_candidate(group_id, commit_id)
     }
     fn list_disband_candidates(&self, group_id: &GroupId) -> StorageResult<Vec<DisbandCandidate>> {
+        self.preparation_delay
+            .disband_candidate_reads
+            .fetch_add(1, Ordering::SeqCst);
         if self.post_commit_disband_read_fault.remaining() > 0
             && self.inner.get_group(group_id)?.removed
             && self.post_commit_disband_read_fault.should_fail()

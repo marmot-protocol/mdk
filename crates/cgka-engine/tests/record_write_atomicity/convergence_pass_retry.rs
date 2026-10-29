@@ -72,6 +72,48 @@ fn build_carol(
         .expect("build carol")
 }
 
+/// `msg`'s unpeeled bytes stored under its content id at epoch 1, as the
+/// direct path, where a wrapper and its content share one id, leaves them.
+fn deferred_row_under_content_id(msg: &TransportMessage, group_id: &GroupId) -> MessageRecord {
+    use cgka_traits::message::{DeferredPeelLifecycle, StoredMessagePayload};
+    use sha2::{Digest, Sha256};
+    MessageRecord {
+        id: MessageId::new(Sha256::digest(&msg.payload).to_vec()),
+        group_id: group_id.clone(),
+        epoch: EpochId(1),
+        state: MessageState::PeelDeferred,
+        payload: StoredMessagePayload::raw_transport(msg.clone())
+            .encode()
+            .unwrap(),
+        // Held well past the test, so no residence sweep retires it.
+        deferred_peel: Some(DeferredPeelLifecycle {
+            first_observed_wall_ms: 1_700_000_000_000,
+            wall_high_water_ms: 1_700_000_000_000,
+            clock_instance_id: 0,
+            residence_deadline_monotonic_ms: u64::MAX,
+            residence_deadline_wall_ms: u64::MAX,
+            distinct_context_attempts: 0,
+            last_context_fingerprint: None,
+            live_context_attempts: 0,
+            last_live_context_fingerprint: None,
+        }),
+    }
+}
+
+/// The deferred row's content as the direct path rewrites it in place once
+/// the bytes peel: the same id, now a stored proposal awaiting processing.
+fn peeled_in_place(deferred: &MessageRecord, msg: &TransportMessage) -> MessageRecord {
+    use cgka_traits::message::StoredMessagePayload;
+    MessageRecord {
+        state: MessageState::Created,
+        payload: StoredMessagePayload::openmls_wire(msg.clone())
+            .encode()
+            .unwrap(),
+        deferred_peel: None,
+        ..deferred.clone()
+    }
+}
+
 fn routed(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
     TransportMessage {
         envelope: TransportEnvelope::GroupMessage {
@@ -92,6 +134,10 @@ enum FrankLeaves {
     /// As [`Self::Later`], but Carol asked to leave before her batch opened,
     /// so she schedules no auto-commit of her own for Frank's proposal.
     LaterWhileCarolLeaves,
+    /// As [`Self::Later`], but his proposal's bytes reached Carol before her
+    /// batch opened and wait unpeeled under its content id, where the direct
+    /// path later rewrites that row in place.
+    LaterUnderAnOlderDeferredRow,
 }
 
 /// Carol at epoch 1 holds Alice's epoch-1 invite in a frozen pass whose next
@@ -102,7 +148,7 @@ struct FailingCatchUp {
     carol: cgka_engine::Engine<FaultStorage>,
     handle: SqliteAccountStorage,
     fault: PutGroupFault,
-    /// Counts Carol's full graph listings, which every reseed makes.
+    /// Counts Carol's reseeds and her full graph listings.
     preparation: PreparationDelay,
     clock: ManualConvergenceClock,
     audit_path: PathBuf,
@@ -198,6 +244,12 @@ async fn failing_catch_up_with(label: &str, frank_leaves: Option<FrankLeaves>) -
             "got {outcome:?}"
         );
     }
+    if frank_leaves == Some(FrankLeaves::LaterUnderAnOlderDeferredRow) {
+        let leave = frank_leave.clone().unwrap();
+        handle
+            .put_message(&deferred_row_under_content_id(&leave, &group_id))
+            .unwrap();
+    }
 
     let david_kp = david.fresh_key_package().await.unwrap();
     let invite_david = routed(
@@ -257,9 +309,11 @@ impl FailingCatchUp {
         self.preparation.graph_calls.load(Ordering::SeqCst)
     }
 
-    /// Stored commits and proposals Carol has read to look for new input.
-    fn input_rows_read(&self) -> usize {
-        self.preparation.positional_rows.load(Ordering::SeqCst)
+    /// Reseeds Carol has started, including ones that find nothing to open.
+    fn reseeds(&self) -> usize {
+        self.preparation
+            .disband_candidate_reads
+            .load(Ordering::SeqCst)
     }
 
     fn pass_generation(&self) -> u64 {
@@ -508,9 +562,9 @@ async fn new_commit_input_reopens_a_parked_pass_and_an_application_does_not() {
 
 /// Every runtime load of a failed pass checks for new selection input, so a
 /// proposal processed at the current epoch, which no convergence admission
-/// sees, still reopens a parked batch at its next schedule read. Loads with
-/// nothing new since the last check read no stored input the batch already
-/// judged and pay for no reseed.
+/// sees, still reopens a parked batch at its next schedule read. Loads that
+/// find every commit and proposal of the horizon in the batch pay for no
+/// reseed.
 #[tokio::test]
 async fn a_current_epoch_proposal_reopens_a_parked_pass_and_idle_loads_reseed_nothing() {
     current_epoch_proposal_reopens_a_parked_pass("retry-proposal", FrankLeaves::Later).await;
@@ -535,8 +589,8 @@ async fn current_epoch_proposal_reopens_a_parked_pass(label: &str, frank_leaves:
     let parked_generation = case.pass_generation();
 
     // Neither the schedule read, nor the gate, nor live application traffic
-    // rereads or reseeds a batch that has judged everything stored.
-    let (listings, rows_read) = (case.graph_listings(), case.input_rows_read());
+    // reseeds a batch that holds every stored commit and proposal it could.
+    let (listings, reseeds) = (case.graph_listings(), case.reseeds());
     for _ in 0..3 {
         assert_eq!(case.scheduled_delay_ms(), None);
         case.attempt().expect("a parked pass waits");
@@ -544,9 +598,9 @@ async fn current_epoch_proposal_reopens_a_parked_pass(label: &str, frank_leaves:
     case.carol.ingest(case.app_at_two.clone()).await.unwrap();
     assert_eq!(case.scheduled_delay_ms(), None);
     assert_eq!(
-        (case.graph_listings(), case.input_rows_read()),
-        (listings, rows_read),
-        "no load reread or reseeded the batch"
+        (case.graph_listings(), case.reseeds()),
+        (listings, reseeds),
+        "no load reseeded the batch"
     );
     assert!(case.carol.convergence_pass_parked(&case.group_id).unwrap());
 
@@ -578,17 +632,14 @@ async fn current_epoch_proposal_reopens_a_parked_pass(label: &str, frank_leaves:
             .unwrap();
         assert!(pending.runnable_work > 0, "{pending:?}");
     }
-    let (listings, rows_read) = (case.graph_listings(), case.input_rows_read());
+    let (listings, reseeds) = (case.graph_listings(), case.reseeds());
     assert!(case.scheduled_delay_ms().is_some_and(|delay| delay > 0));
     assert_eq!(
-        case.input_rows_read(),
-        rows_read + 1,
-        "only Frank's row is new"
+        case.reseeds(),
+        reseeds + 1,
+        "the proposal paid for one reseed"
     );
-    assert!(
-        case.graph_listings() > listings,
-        "the proposal paid for a reseed"
-    );
+    assert!(case.graph_listings() > listings);
     let reopened = case
         .handle
         .convergence_pass(&case.group_id)
@@ -598,6 +649,53 @@ async fn current_epoch_proposal_reopens_a_parked_pass(label: &str, frank_leaves:
     assert_eq!(reopened.generation, parked_generation + 1);
     assert_eq!(reopened.retry, None);
     assert!(!case.carol.convergence_pass_parked(&case.group_id).unwrap());
+}
+
+/// A row rewritten in place keeps its storage position. Frank's proposal
+/// waited unpeeled under its content id since before Carol's batch opened,
+/// so the batch's own commits were stored after it and every load has read
+/// them. When the direct path rewrites that older row into the stored
+/// proposal, the next load still reopens the batch.
+#[tokio::test]
+async fn a_proposal_rewritten_into_an_older_row_reopens_a_parked_pass() {
+    let mut case = failing_catch_up_with(
+        "retry-rewrite",
+        Some(FrankLeaves::LaterUnderAnOlderDeferredRow),
+    )
+    .await;
+    case.fault.arm(ALWAYS);
+    case.fail_until_parked();
+    case.fault.arm(0);
+    let parked_generation = case.pass_generation();
+    let reseeds = case.reseeds();
+    for _ in 0..2 {
+        assert_eq!(case.scheduled_delay_ms(), None);
+    }
+    assert_eq!(case.reseeds(), reseeds, "an unpeeled row is no input");
+
+    let leave = case.frank_leave.clone().unwrap();
+    let deferred = case
+        .handle
+        .get_message(&deferred_row_under_content_id(&leave, &case.group_id).id)
+        .unwrap();
+    assert_eq!(
+        deferred.state,
+        MessageState::PeelDeferred,
+        "nothing peeled it"
+    );
+    case.handle
+        .put_message(&peeled_in_place(&deferred, &leave))
+        .unwrap();
+
+    assert!(case.scheduled_delay_ms().is_some_and(|delay| delay > 0));
+    let reopened = case
+        .handle
+        .convergence_pass(&case.group_id)
+        .unwrap()
+        .expect("the reopened pass is stored");
+    assert_eq!(reopened.phase, ConvergencePassPhase::Collecting);
+    assert_eq!(reopened.generation, parked_generation + 1);
+    assert_eq!(reopened.retry, None);
 }
 
 #[tokio::test]

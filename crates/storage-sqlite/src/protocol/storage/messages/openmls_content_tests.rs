@@ -325,44 +325,21 @@ fn openmls_listing_leaves_out_only_rows_the_filter_excludes() {
     );
 }
 
-/// The convergence check for new selection input behind a failed batch
-/// (mdk#2684) reads commits and proposals by insertion position.
+/// A failed convergence batch looks for new selection input (mdk#2684) by
+/// listing the commits and proposals inside its horizon as they are stored
+/// now, so a row rewritten in place counts as much as a new one.
 #[test]
-fn positional_listing_returns_commits_and_proposals_inserted_after_a_position() {
+fn horizon_listing_returns_commits_and_proposals_in_an_epoch_range() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let mut labels = seed_listing_rows(&store);
-    let read = |labels: &[(u8, &'static str)],
-                states: &[MessageState],
-                at_or_after_epoch: u64,
-                after: Option<u64>| {
-        store
-            .list_commits_and_proposals_inserted_after(
-                &gid(1),
-                states,
-                EpochId(at_or_after_epoch),
-                after,
-            )
-            .unwrap()
-            .expect("SQLite keeps insertion positions")
-            .into_iter()
-            .map(|(position, record)| {
-                let label = labels
-                    .iter()
-                    .find(|(id, _)| record.id.as_slice() == [*id; 4])
-                    .unwrap()
-                    .1;
-                (position, label)
-            })
-            .collect::<Vec<_>>()
-    };
-    let label_list = |rows: &[(u64, &'static str)]| -> Vec<&'static str> {
-        rows.iter().map(|(_, label)| *label).collect()
+    let between = |from, through| OpenMlsContentFilter::CommitsAndProposalsBetween {
+        from: EpochId(from),
+        through: EpochId(through),
     };
 
     // Rows the backend cannot classify come back for the caller to judge.
-    let all = read(&labels, &GRAPH_STATES, 0, None);
     assert_eq!(
-        label_list(&all),
+        listed(&store, &labels, &GRAPH_STATES, 0, between(0, 9)),
         [
             "commit@2",
             "proposal@3",
@@ -371,42 +348,77 @@ fn positional_listing_returns_commits_and_proposals_inserted_after_a_position() 
             "pending app@1"
         ]
     );
-    assert!(all.windows(2).all(|pair| pair[0].0 < pair[1].0));
     assert_eq!(
-        label_list(&read(&labels, &GRAPH_STATES, 0, Some(all[1].0))),
-        ["fresh commit@3", "unreadable", "pending app@1"]
+        listed(&store, &labels, &GRAPH_STATES, 0, between(3, 3)),
+        [
+            "proposal@3",
+            "fresh commit@3",
+            "unreadable",
+            "pending app@1"
+        ]
     );
-
-    // Rewriting a row keeps its position. A new row takes a greater one than
-    // every row before it, even once the newest of them is gone.
-    let newest = all.last().unwrap().0;
-    store
-        .update_message_state(
-            &MessageId::new(vec![7; 4]),
-            MessageState::ConvergenceDeferred,
-        )
-        .unwrap();
-    assert_eq!(read(&labels, &GRAPH_STATES, 0, Some(all[1].0)), all[2..]);
-    store.delete_message(&MessageId::new(vec![11; 4])).unwrap();
-    store
-        .put_message(&row(
-            12,
-            3,
-            MessageState::Created,
-            wire_payload(private_message(3, PROPOSAL)),
-        ))
-        .unwrap();
-    labels.push((12, "late proposal@3"));
-    let late = read(&labels, &GRAPH_STATES, 0, Some(newest));
-    assert_eq!(label_list(&late), ["late proposal@3"]);
-    assert!(late[0].0 > newest);
-
+    assert_eq!(
+        listed(&store, &labels, &GRAPH_STATES, 0, between(0, 2)),
+        ["commit@2", "unreadable", "pending app@1"]
+    );
+    // No classified row holds an epoch beyond SQLite's INTEGER range, and a
+    // bound beyond it keeps every one below.
+    assert_eq!(
+        listed(
+            &store,
+            &labels,
+            &GRAPH_STATES,
+            0,
+            between(u64::MAX, u64::MAX)
+        ),
+        ["unreadable", "pending app@1"]
+    );
+    assert_eq!(
+        listed(&store, &labels, &GRAPH_STATES, 0, between(3, u64::MAX)),
+        [
+            "proposal@3",
+            "fresh commit@3",
+            "unreadable",
+            "pending app@1"
+        ]
+    );
     // The row epoch floor and the state list still apply.
     assert_eq!(
-        label_list(&read(&labels, &[MessageState::Processed], 3, None)),
-        ["proposal@3"]
+        listed(&store, &labels, &GRAPH_STATES, 3, between(0, 9)),
+        ["proposal@3", "fresh commit@3"]
     );
-    assert!(read(&labels, &[], 0, None).is_empty());
+    assert!(listed(&store, &labels, &[], 0, between(0, 9)).is_empty());
+
+    // A row rewritten in place into a commit is listed, in the order it was
+    // first stored.
+    let deferred = row(
+        12,
+        3,
+        MessageState::PeelDeferred,
+        StoredMessagePayload::raw_transport(transport(12, vec![12]))
+            .encode()
+            .unwrap(),
+    );
+    store.put_message(&deferred).unwrap();
+    labels.push((12, "peeled commit@3"));
+    assert!(!listed(&store, &labels, &GRAPH_STATES, 0, between(3, 3)).contains(&"peeled commit@3"));
+    store
+        .put_message(&MessageRecord {
+            state: MessageState::Created,
+            payload: wire_payload(private_message(3, COMMIT)),
+            ..deferred
+        })
+        .unwrap();
+    assert_eq!(
+        listed(&store, &labels, &GRAPH_STATES, 0, between(3, 3)),
+        [
+            "proposal@3",
+            "fresh commit@3",
+            "unreadable",
+            "pending app@1",
+            "peeled commit@3"
+        ]
+    );
 }
 
 #[test]

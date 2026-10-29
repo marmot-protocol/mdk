@@ -259,6 +259,9 @@ pub enum OpenMlsContentFilter {
     WithoutProcessedApplications,
     /// Only applications whose epoch is this one.
     ApplicationsAt(EpochId),
+    /// Only commits and proposals whose epoch is from `from` through
+    /// `through`, the selection input inside a convergence pass's horizon.
+    CommitsAndProposalsBetween { from: EpochId, through: EpochId },
 }
 
 /// Messages + epoch-scoped snapshot/rollback hooks.
@@ -336,9 +339,10 @@ pub trait MessageStorage {
     /// The filter only narrows what is read: a backend may return rows it
     /// excludes, and the default returns every row, so callers classify each
     /// returned row themselves. It must not leave out any other row.
-    /// Convergence pass seeding, the send gate, and the deferred-peel commit
-    /// fingerprint list through this, so a backend that classifies rows does
-    /// not hand them the group's whole delivered history.
+    /// Convergence pass seeding, the send gate, the deferred-peel commit
+    /// fingerprint and a failed batch's check for new selection input list
+    /// through this, so a backend that classifies rows does not hand them the
+    /// group's whole delivered history.
     fn list_openmls_messages_in_states(
         &self,
         group_id: &GroupId,
@@ -347,28 +351,6 @@ pub trait MessageStorage {
         _filter: OpenMlsContentFilter,
     ) -> StorageResult<Vec<MessageRecord>> {
         self.list_messages_in_states(group_id, states, at_or_after_epoch)
-    }
-
-    /// Commit and proposal rows for `group_id` in `states` at or after
-    /// `at_or_after_epoch` that were inserted after position `after` (all of
-    /// them when `None`), in insertion order and each with its insertion
-    /// position. `None` when the backend keeps no positions.
-    ///
-    /// A row takes its position when it is first inserted, greater than every
-    /// position before it, and keeps it when rewritten; a snapshot restore puts
-    /// rows back at theirs. A backend may also return rows whose content it
-    /// cannot tell apart, so callers classify each row themselves. Convergence
-    /// keeps the newest position it has read to learn what selection input
-    /// reached a failed batch without rereading the group's history (mdk#2684).
-    fn list_commits_and_proposals_inserted_after(
-        &self,
-        group_id: &GroupId,
-        states: &[MessageState],
-        at_or_after_epoch: EpochId,
-        after: Option<u64>,
-    ) -> StorageResult<Option<Vec<(u64, MessageRecord)>>> {
-        let _ = (group_id, states, at_or_after_epoch, after);
-        Ok(None)
     }
 
     /// Visit matching rows in insertion order (see the trait doc), stopping as

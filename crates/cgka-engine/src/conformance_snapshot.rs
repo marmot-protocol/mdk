@@ -690,8 +690,7 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
                 .failed_convergence_pass_new_input(active, &policy)
                 .map_err(|error| {
                     EngineError::Backend(format!("read failed pass input for snapshot: {error}"))
-                })?
-                .0;
+                })?;
     }
     let messages = engine.storage.list_messages(group_id, EpochId(0))?;
     let pending_work = capture_pending_work_snapshot_from(

@@ -131,14 +131,15 @@ fn convergence_listing_query_work() {
     }
 }
 
-/// A failed convergence batch checks for new selection input on every load by
-/// reading commits and proposals past the newest one it judged (mdk#2684).
-/// Applications delivered after that mark are never read: the check returns
-/// only the newer commit, and its VM work stays flat as they grow sixteenfold.
+/// A failed convergence batch checks for new selection input on every load
+/// by listing the commits and proposals inside its horizon (mdk#2684). The
+/// group's older commits and its applications are never read: the check
+/// returns only the horizon's commits, and its VM work stays flat as both
+/// grow sixteenfold.
 #[test]
-fn positional_listing_query_work() {
+fn horizon_listing_query_work() {
     use cgka_traits::message::MessageState;
-    use cgka_traits::storage::MessageStorage;
+    use cgka_traits::storage::{MessageStorage, OpenMlsContentFilter};
     use cgka_traits::types::{EpochId, GroupId};
 
     const GRAPH_STATES: [MessageState; 5] = [
@@ -154,35 +155,36 @@ fn positional_listing_query_work() {
     for count in [256, 4_096] {
         let store = SqliteAccountStorage::in_memory().unwrap();
         seed_query_history(&store.lock().unwrap(), count);
+        // Every other row is a commit, the rest applications.
         store
             .lock()
             .unwrap()
-            .execute(
-                "UPDATE cgka_messages SET openmls_epoch = epoch, openmls_content =
-                     CASE WHEN insert_order IN (1, ?1) THEN 1 ELSE 3 END",
-                [count],
+            .execute_batch(
+                "UPDATE cgka_messages SET openmls_epoch = epoch,
+                     openmls_content = CASE WHEN insert_order % 2 = 0 THEN 1 ELSE 3 END",
             )
             .unwrap();
+        let from = u64::try_from(count - 4).unwrap();
+        let through = u64::try_from(count).unwrap();
 
         let (rows, work) = measure(&store, || {
             store
-                .list_commits_and_proposals_inserted_after(
+                .list_openmls_messages_in_states(
                     &group,
                     &GRAPH_STATES,
-                    EpochId(0),
-                    Some(1),
+                    EpochId(from),
+                    OpenMlsContentFilter::CommitsAndProposalsBetween {
+                        from: EpochId(from),
+                        through: EpochId(through),
+                    },
                 )
                 .unwrap()
-                .unwrap()
         });
-        let positions: Vec<_> = rows.iter().map(|(position, _)| *position).collect();
-        assert_eq!(positions, [u64::try_from(count).unwrap()]);
-        assert!(work < 300, "{work}");
+        let epochs: Vec<_> = rows.iter().map(|record| record.epoch.0).collect();
+        assert_eq!(epochs, [from, from + 2, through]);
+        assert!(work < 500, "{work}");
         if let Some(previous) = previous.replace(work) {
-            assert_eq!(
-                work, previous,
-                "positional work must not grow with applications"
-            );
+            assert_eq!(work, previous, "horizon work must not grow with history");
         }
     }
 }
