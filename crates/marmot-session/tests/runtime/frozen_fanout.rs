@@ -1,3 +1,152 @@
+#[tokio::test]
+async fn retained_welcome_retry_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("retained Welcome scheduling key").unwrap();
+    let path = dir.path().join("alice.sqlite");
+    let mut alice = session(&path, &key, b"welcome-retry-alice");
+    let mut bob = session(dir.path().join("bob.sqlite"), &key, b"welcome-retry-bob");
+    let mut carol = session(
+        dir.path().join("carol.sqlite"),
+        &key,
+        b"welcome-retry-carol",
+    );
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "retained Welcome".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group = created.group_id;
+    let PublishWork::GroupCreated { pending, .. } = &created.effects.publish[0] else {
+        panic!("expected group creation");
+    };
+    alice.confirm_published(*pending).await.unwrap();
+    let effects = alice
+        .send(SendIntent::Invite {
+            group_id: group.clone(),
+            key_packages: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let PublishWork::GroupEvolution { welcomes, .. } = &effects.publish[0] else {
+        panic!("expected invite");
+    };
+    assert_eq!(welcomes.len(), 2);
+    let unfinished = welcomes[0].id.clone();
+    let rejected = welcomes[1].clone();
+    let inbox = TransportEndpoint("wss://welcome-retry-inbox.example".into());
+    let endpoint = TransportEndpoint("wss://welcome-retry-group.example".into());
+    let policy = StaticTransportRouting::new(vec![inbox.clone()])
+        .with_inbox_route(bob.self_id(), vec![inbox.clone()])
+        .with_inbox_route(carol.self_id(), vec![inbox.clone()])
+        .with_group_route(group.clone(), group.as_slice().to_vec(), vec![endpoint]);
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_as(
+        vec![inbox],
+        TransportEndpointFailureKind::RetryableUnavailable,
+    );
+    let wall = Arc::new(TestWallClock::new(100));
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy.clone(),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    // A failed completion persist retains the confirmed parent. The other
+    // recipient's real rejection still persists its own attempt/backoff.
+    runtime.arm_finish_stage_failure(unfinished.clone());
+    let error = runtime.publish_session_effects(effects).await.unwrap_err();
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::Storage(
+            cgka_traits::storage::StorageError::Busy(_)
+        ))
+    ));
+    let fanouts = runtime
+        .session()
+        .outbound_fanouts_for_group(&group)
+        .unwrap();
+    assert_eq!(fanouts.len(), 1);
+    assert!(matches!(fanouts[0].mls_state(), FanoutMlsState::Confirmed));
+    assert_eq!(fanouts[0].outcome().outstanding_targets, 0);
+    assert_eq!(fanouts[0].pending_post_confirmation_welcomes().len(), 2);
+    assert!(runtime.has_pending_outbound_fanouts(&group).unwrap());
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        None
+    );
+    drop(runtime);
+
+    let adapter = RecordingAdapter::default();
+    let mut runtime = AccountDeviceRuntime::new(
+        session(&path, &key, b"welcome-retry-alice"),
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    // Complete only the recipient whose bookkeeping failed. The retained
+    // sibling must now schedule from its rejection, not the accepted commit.
+    let delivered = runtime.redeliver_welcome(&unfinished).await.unwrap();
+    assert!(delivered.welcome_failures.is_empty());
+    assert!(runtime.has_pending_outbound_fanouts(&group).unwrap());
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        Some(30_000)
+    );
+    wall.set(129);
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        Some(1_000)
+    );
+    assert_eq!(adapter.publishes().len(), 1);
+    wall.set(130);
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        Some(0)
+    );
+    let retried = runtime.resume_outbound_fanouts().await.unwrap();
+    assert!(retried.failures.is_empty());
+    assert!(retried.welcome_failures.is_empty());
+    let publishes = adapter.publishes();
+    assert_eq!(
+        publishes.len(),
+        2,
+        "neither the commit nor delivered sibling is republished"
+    );
+    assert_eq!(publishes[1].message, rejected);
+    assert!(!runtime.has_pending_outbound_fanouts(&group).unwrap());
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        None
+    );
+    let deliveries = runtime.outstanding_welcome_deliveries().unwrap();
+    assert!(
+        deliveries
+            .iter()
+            .all(|(_, message)| message.id != rejected.id)
+    );
+    runtime.resume_outbound_fanouts().await.unwrap();
+    assert_eq!(adapter.publishes().len(), 2);
+}
 #[derive(Clone, Default)]
 struct CrashDuringFanoutPublishAdapter {
     publishes: Arc<Mutex<Vec<TransportPublishRequest>>>,
