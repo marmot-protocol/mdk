@@ -637,6 +637,9 @@ wn daemon stop
 - When a daemon socket exists for a home, normal `wn --home <path> ...` commands are forwarded to it. `wn daemon status`,
   `wn daemon stop`, and `wn tui` handle daemon access directly. Use `--socket` or `WN_SOCKET` to target a specific
   daemon.
+- `wnd` answers on its socket as soon as it binds it, before it has opened its accounts, which the runtime allows 45
+  seconds. Meanwhile `wn daemon status` prints `daemon starting` (`"starting": true` in `--json`), `wn daemon stop`
+  stops it, and other commands wait until the accounts are open.
 - `wn daemon status --json` includes `last_runtime_activity`, background `stream_watches`, and a redacted `relay_health`
   object with aggregate relay counts and connection-status buckets. It does not include relay URLs, account ids, group
   ids, subscription ids, or message ids.

@@ -177,8 +177,8 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     write_pid_file(&pid_path)?;
     let defaults = DaemonDefaults {
         home,
-        socket: socket.clone(),
-        pid_path: pid_path.clone(),
+        socket,
+        pid_path,
         log_path,
         relay: Some(relay),
         discovery_relays,
@@ -189,27 +189,57 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     let state = Arc::new(Mutex::new(DaemonState {
         pid: std::process::id(),
         started_at: unix_now(),
+        starting: true,
         last_runtime_activity: None,
     }));
-    let events = DaemonEventHub::new();
-    let workers = SharedDaemonWorkers::default();
-    {
-        let mut workers_guard = workers.lock().await;
-        reconcile_app_runtime(
-            &defaults,
-            state.clone(),
-            events.clone(),
-            &mut workers_guard.runtime,
-        )
-        .await;
-    }
+    serve_daemon(
+        listener,
+        defaults,
+        state,
+        DaemonEventHub::new(),
+        SharedDaemonWorkers::default(),
+    )
+    .await
+}
+
+/// Serve `listener` until a client asks the daemon to stop, then shut down and
+/// remove the socket and pid file.
+///
+/// The accept loop starts before the app runtime has opened its accounts,
+/// which the runtime allows 45 s. Until then status, ping and stop answer at
+/// once, status reports `starting`, and requests that need the runtime wait
+/// for it on the workers lock. A stop during startup cancels the start; the
+/// runtime's start is cancel-safe, and `abort_all` shuts down whatever it had
+/// begun.
+async fn serve_daemon(
+    listener: UnixListener,
+    defaults: DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    workers: SharedDaemonWorkers,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut startup = tokio::spawn(start_app_runtime(
+        defaults.clone(),
+        state.clone(),
+        events.clone(),
+        workers.clone(),
+    ));
     let mut worker_tasks: Vec<JoinHandle<()>> = Vec::new();
     let connection_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_DAEMON_CONNECTIONS));
     let subscription_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_DAEMON_SUBSCRIPTIONS));
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
+    let mut startup_running = true;
     let shutdown_result = loop {
         worker_tasks.retain(|task| !task.is_finished());
         tokio::select! {
+            // Only a panic fails the startup task; the daemon then stops, as
+            // it did when the reconcile ran inline.
+            joined = &mut startup, if startup_running => {
+                startup_running = false;
+                if joined.is_err() {
+                    break Err("app runtime startup panicked".into());
+                }
+            }
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
                     Ok(accepted) => accepted,
@@ -272,11 +302,32 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         task.abort();
         let _ = task.await;
     }
+    if startup_running {
+        startup.abort();
+        let _ = startup.await;
+    }
     let mut workers = workers.lock().await;
     workers.abort_all().await;
-    let _ = std::fs::remove_file(&socket);
-    let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(&defaults.socket);
+    let _ = std::fs::remove_file(&defaults.pid_path);
     shutdown_result
+}
+
+/// The daemon's first app-runtime reconcile: open the runtime and its
+/// accounts, then clear `starting`.
+async fn start_app_runtime(
+    defaults: DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    workers: SharedDaemonWorkers,
+) {
+    {
+        let mut workers_guard = workers.lock().await;
+        reconcile_app_runtime(&defaults, state.clone(), events, &mut workers_guard.runtime).await;
+    }
+    if let Ok(mut state) = state.lock() {
+        state.starting = false;
+    }
 }
 
 async fn handle_daemon_connection(

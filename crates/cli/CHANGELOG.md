@@ -156,6 +156,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   message, and the socket refusals (a world-accessible or group-writable socket directory, a file in the socket's
   place, a socket already in use), which printed only an `io_kind=`, say what to change. The line still carries no
   paths, account ids or relay URLs.
+- `wnd` answers `wn daemon status`, `wn daemon stop` and pings while it is still opening its accounts, which the
+  runtime allows 45 seconds (part of mdk#2696). It used to bind its socket and accept nothing until then, so those
+  commands connected and waited with no reply. `wn daemon status` now prints `daemon starting` in that window, and
+  `--json` carries a new `starting` field. Other commands wait for the accounts as before. A stop during startup
+  cancels the start and shuts down what it had opened.
 
 ## [0.14.0] - 2026-10-23
 

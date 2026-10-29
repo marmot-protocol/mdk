@@ -909,6 +909,7 @@ async fn daemon_status_response_does_not_wait_for_busy_workers() {
     let state = Arc::new(Mutex::new(DaemonState {
         pid: 42,
         started_at: 7,
+        starting: false,
         last_runtime_activity: None,
     }));
     let workers = SharedDaemonWorkers::default();
@@ -948,6 +949,7 @@ async fn daemon_execute_local_command_runs_without_holding_worker_lock() {
     let state = Arc::new(Mutex::new(DaemonState {
         pid: 1,
         started_at: 0,
+        starting: false,
         last_runtime_activity: None,
     }));
     let events = DaemonEventHub::new();
@@ -1032,6 +1034,7 @@ async fn disabled_app_runtime_skips_relay_validation_and_preserves_nsec_sidecar(
         Arc::new(Mutex::new(DaemonState {
             pid: 1,
             started_at: 0,
+            starting: false,
             last_runtime_activity: None,
         })),
         DaemonEventHub::new(),
@@ -1301,6 +1304,7 @@ async fn finish_stream_compose_removes_session_for_invalid_terminal_report() {
         let state = Arc::new(Mutex::new(DaemonState {
             pid: 0,
             started_at: 0,
+            starting: false,
             last_runtime_activity: None,
         }));
         let mut runtime_host = AppRuntimeHost::default();
@@ -1362,6 +1366,7 @@ async fn finish_stream_compose_keeps_session_when_marker_publish_fails() {
     let state = Arc::new(Mutex::new(DaemonState {
         pid: 0,
         started_at: 0,
+        starting: false,
         last_runtime_activity: None,
     }));
     let events = DaemonEventHub::new();
@@ -1533,6 +1538,7 @@ fn account_error_activity_message_excludes_account_identity() {
     let state = Arc::new(Mutex::new(DaemonState {
         pid: 0,
         started_at: 0,
+        starting: false,
         last_runtime_activity: None,
     }));
     record_runtime_activity_error(&state, recorded.clone());
@@ -2026,5 +2032,178 @@ fn background_stream_watch_requires_account_scope() {
     assert_eq!(
         new_stream_watch_start(&cli).unwrap_err(),
         "background stream watch requires --account"
+    );
+}
+
+fn gated_daemon(home: &Path) -> (DaemonDefaults, Arc<StartGate>) {
+    let defaults = DaemonDefaults {
+        home: home.to_path_buf(),
+        socket: home.join("wnd.sock"),
+        pid_path: home.join("wnd.pid"),
+        log_path: home.join("wnd.log"),
+        relay: Some("wss://relay.example".to_owned()),
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: Some(crate::SecretStoreKind::File),
+        keychain_service: Some("wn-test-keychain".to_owned()),
+    };
+    (defaults, Arc::new(StartGate::default()))
+}
+
+async fn serve_gated_daemon(
+    defaults: &DaemonDefaults,
+    gate: &Arc<StartGate>,
+) -> (
+    JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    SharedDaemonWorkers,
+) {
+    let listener = UnixListener::bind(&defaults.socket).expect("bind daemon socket");
+    write_pid_file(&defaults.pid_path).expect("write pid file");
+    let workers = SharedDaemonWorkers::default();
+    workers.lock().await.runtime.start_gate = Some(gate.clone());
+    let state = Arc::new(Mutex::new(DaemonState {
+        pid: std::process::id(),
+        started_at: 0,
+        starting: true,
+        last_runtime_activity: None,
+    }));
+    let server = tokio::spawn(serve_daemon(
+        listener,
+        defaults.clone(),
+        state,
+        DaemonEventHub::new(),
+        workers.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), gate.entered.acquire())
+        .await
+        .expect("runtime start reaches the gate")
+        .expect("gate open")
+        .forget();
+    (server, workers)
+}
+
+async fn status_of(socket: &Path) -> DaemonStatus {
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_request(socket, &DaemonRequest::Status),
+    )
+    .await
+    .expect("status answers while the runtime starts")
+    .expect("status request succeeds");
+    serde_json::from_str(output.stdout.trim()).expect("status JSON")
+}
+
+#[tokio::test]
+async fn daemon_status_reports_starting_until_its_runtime_has_started() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (defaults, gate) = gated_daemon(home.path());
+    let (server, _workers) = serve_gated_daemon(&defaults, &gate).await;
+
+    let status = status_of(&defaults.socket).await;
+    assert!(status.running);
+    assert!(status.starting);
+
+    gate.release.add_permits(1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while status_of(&defaults.socket).await.starting {
+        assert!(Instant::now() < deadline, "daemon never finished starting");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    send_request(&defaults.socket, &DaemonRequest::Shutdown)
+        .await
+        .expect("shutdown request succeeds");
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("daemon stops")
+        .expect("server task does not panic")
+        .expect("server shuts down cleanly");
+}
+
+#[tokio::test]
+async fn daemon_stop_during_startup_shuts_down_the_runtime_it_was_starting() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (defaults, gate) = gated_daemon(home.path());
+    let (server, workers) = serve_gated_daemon(&defaults, &gate).await;
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_request(&defaults.socket, &DaemonRequest::Shutdown),
+    )
+    .await
+    .expect("stop answers while the runtime starts")
+    .expect("shutdown request succeeds");
+    assert_eq!(output.code, 0);
+    tokio::time::timeout(Duration::from_secs(15), server)
+        .await
+        .expect("a stop during startup does not wait for the start")
+        .expect("server task does not panic")
+        .expect("server shuts down cleanly");
+
+    assert!(!defaults.socket.exists(), "socket removed");
+    assert!(!defaults.pid_path.exists(), "pid file removed");
+    let workers = workers.lock().await;
+    assert!(workers.runtime.starting.is_none());
+    assert!(workers.runtime.runtime.is_none());
+}
+
+#[tokio::test]
+async fn daemon_exits_with_an_error_when_its_runtime_startup_panics() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (defaults, gate) = gated_daemon(home.path());
+    gate.panic.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (server, workers) = serve_gated_daemon(&defaults, &gate).await;
+    assert!(status_of(&defaults.socket).await.starting);
+
+    gate.release.add_permits(1);
+    let err = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("daemon exits after its startup panics")
+        .expect("server task does not panic")
+        .expect_err("a startup panic is an error");
+    assert_eq!(err.to_string(), "app runtime startup panicked");
+    assert!(!defaults.socket.exists(), "socket removed");
+    assert!(!defaults.pid_path.exists(), "pid file removed");
+    assert!(workers.lock().await.runtime.starting.is_none());
+}
+
+#[tokio::test]
+async fn abort_all_shuts_down_a_runtime_whose_start_was_cancelled() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (defaults, gate) = gated_daemon(home.path());
+    let workers = SharedDaemonWorkers::default();
+    workers.lock().await.runtime.start_gate = Some(gate.clone());
+    let state = Arc::new(Mutex::new(DaemonState {
+        pid: 0,
+        started_at: 0,
+        starting: true,
+        last_runtime_activity: None,
+    }));
+    let start = tokio::spawn(start_app_runtime(
+        defaults.clone(),
+        state.clone(),
+        DaemonEventHub::new(),
+        workers.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), gate.entered.acquire())
+        .await
+        .expect("runtime start reaches the gate")
+        .expect("gate open")
+        .forget();
+    start.abort();
+    let _ = start.await;
+
+    let mut workers = workers.lock().await;
+    let runtime = workers
+        .runtime
+        .starting
+        .clone()
+        .expect("a cancelled start leaves its runtime for abort_all");
+    workers.abort_all().await;
+    assert!(runtime.is_stopping());
+    assert!(workers.runtime.starting.is_none());
+    assert!(
+        state.lock().unwrap().starting,
+        "a cancelled start never finished"
     );
 }

@@ -377,6 +377,7 @@ pub(crate) async fn status_daemon(json: bool, socket: &Path) -> CliOutput {
                 .and_then(|home| read_pid_file(&default_pid_path(home)).ok().flatten());
             DaemonStatus {
                 running: false,
+                starting: false,
                 socket: socket.to_path_buf(),
                 pid: None,
                 pid_file: home.as_deref().map(default_pid_path),
@@ -390,7 +391,9 @@ pub(crate) async fn status_daemon(json: bool, socket: &Path) -> CliOutput {
             }
         }
     };
-    let plain = if status.running {
+    let plain = if status.running && status.starting {
+        format!("daemon starting\nsocket: {}", socket.display())
+    } else if status.running {
         format!("daemon running\nsocket: {}", socket.display())
     } else {
         "daemon not running".to_owned()
@@ -428,6 +431,7 @@ pub(crate) fn daemon_output(
 pub(crate) fn daemon_status_json(status: DaemonStatus) -> serde_json::Value {
     serde_json::json!({
         "running": status.running,
+        "starting": status.starting,
         "socket": status.socket,
         "pid": status.pid,
         "pid_file": status.pid_file,
@@ -448,17 +452,18 @@ pub(crate) async fn server_status(
     stream_workers: &StreamWatchWorkers,
 ) -> DaemonStatus {
     stream_workers.reap_finished();
-    let (pid, started_at, last_runtime_activity) = state
+    let (pid, started_at, starting, last_runtime_activity) = state
         .lock()
         .ok()
         .map(|state| {
             (
                 Some(state.pid),
                 Some(state.started_at),
+                state.starting,
                 state.last_runtime_activity.clone(),
             )
         })
-        .unwrap_or((None, None, None));
+        .unwrap_or((None, None, false, None));
     let relay_health = if let Some(runtime) = runtime {
         let shared = runtime.shared_services();
         Some(shared.relay_plane().relay_health().await)
@@ -470,6 +475,7 @@ pub(crate) async fn server_status(
         .unwrap_or_default();
     DaemonStatus {
         running: true,
+        starting,
         socket: defaults.socket.clone(),
         pid,
         pid_file: Some(defaults.pid_path.clone()),
