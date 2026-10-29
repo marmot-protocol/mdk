@@ -43,6 +43,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   `linked_devices` in `marmot-app`, UniFFI and C, with this device first, and a `LinkedDevicesChanged` event to
   re-read it, since the device group's own events never reach hosts. Release builds list nothing until the roster's
   spec lands.
+- Hosts can tell the user when the device group has held this device's KeyPackage refresh back for a week (mdk#2628
+  item 3.4): `key_package_refresh_overdue` in `marmot-app`, UniFFI and C, and a `KeyPackageRefreshOverdueChanged`
+  event to re-read it. It is false in release builds until the roster's spec lands.
 - `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
   one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
   pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster

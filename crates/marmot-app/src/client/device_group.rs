@@ -680,11 +680,14 @@ impl AppClient {
 
     /// Whether this device's KeyPackage refresh is overdue because its device
     /// group can't take the announcement, so the host warns the user (D31
-    /// choice 6). Always false while device groups are off.
+    /// choice 6). Always false while device groups are off. It names the
+    /// device group first, so a change of trust since the last maintenance
+    /// pass counts.
     pub(crate) fn key_package_refresh_overdue(&mut self) -> Result<bool, AppError> {
         if !self.app.device_groups_enabled() {
             return Ok(false);
         }
+        self.sync_key_package_announcement_group()?;
         Ok(self.runtime.key_package_refresh_overdue()?)
     }
 

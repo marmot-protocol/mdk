@@ -263,11 +263,12 @@ where
             return Ok(false);
         }
         let now = self.wall_clock.now();
-        Ok(lifecycle
-            .authored_event_created_at
-            .is_none_or(|published| {
-                published.0.saturating_add(super::KEY_PACKAGE_REFRESH_MAX_SECS) <= now.0
-            }))
+        Ok(lifecycle.authored_event_created_at.is_none_or(|published| {
+            published
+                .0
+                .saturating_add(super::KEY_PACKAGE_REFRESH_MAX_SECS)
+                <= now.0
+        }))
     }
 
     fn key_package_announcement(&mut self, key_package_ref: &[u8]) -> AccountResult<Announcement> {

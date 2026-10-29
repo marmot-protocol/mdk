@@ -1025,7 +1025,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
 /// roster's spec lands, nothing is listed and no change is announced, even on
 /// a device that trusts a device group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_groups_off_list_no_devices() {
+async fn device_groups_off_list_no_devices_and_no_overdue_refresh() {
     let Devices {
         _dirs,
         relay,
@@ -1049,6 +1049,9 @@ async fn device_groups_off_list_no_devices() {
     assert!(phone.linked_devices().unwrap().is_empty());
     assert!(phone.linked_devices_changed);
     assert!(!phone.take_linked_devices_changed());
+    assert!(!phone.key_package_refresh_overdue().unwrap());
+    assert!(phone.key_package_refresh_overdue_changed);
+    assert!(!phone.take_key_package_refresh_overdue_changed());
 }
 
 /// Through the runtime, the new device's account worker announces the join it
@@ -1220,7 +1223,8 @@ async fn a_restart_that_settles_trust_announces_it() {
 /// A reconnect opens a new client, which announces once with no command or
 /// delivery after it. A reconnect attempt that settles trust and then fails
 /// transport drops its client, flag and all; the client that replaces it
-/// cannot see that change, so every open announces.
+/// cannot see that change, so every open announces. The overdue-refresh
+/// answer is announced the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reconnect_announces_again() {
     let Devices {
@@ -1243,30 +1247,59 @@ async fn a_reconnect_announces_again() {
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
     next_linked_devices_changed(&mut events, &account_id_hex).await;
+    next_key_package_refresh_overdue_changed(&mut events, &account_id_hex).await;
     assert_eq!(runtime.linked_devices("alice").await.unwrap().len(), 2);
+    assert!(!runtime.key_package_refresh_overdue("alice").await.unwrap());
 
     runtime
         .shared_services()
         .relay_plane()
         .simulate_notification_consumer_exit_for_test();
     next_linked_devices_changed(&mut events, &account_id_hex).await;
+    next_key_package_refresh_overdue_changed(&mut events, &account_id_hex).await;
     assert_eq!(runtime.linked_devices("alice").await.unwrap().len(), 2);
     runtime.shutdown().await;
 }
 
-/// Waits for the account's next `LinkedDevicesChanged`. The device group's own
-/// events must never reach the host meanwhile.
+/// Waits for the account's next `LinkedDevicesChanged`.
 async fn next_linked_devices_changed(
     events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
     account_id_hex: &str,
 ) {
+    next_device_group_change(events, "LinkedDevicesChanged", |event| {
+        matches!(event, MarmotAppEvent::LinkedDevicesChanged {
+            account_id_hex: changed,
+            account_label,
+        } if changed == account_id_hex && account_label == "alice")
+    })
+    .await;
+}
+
+/// Waits for the account's next `KeyPackageRefreshOverdueChanged`.
+async fn next_key_package_refresh_overdue_changed(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    account_id_hex: &str,
+) {
+    next_device_group_change(events, "KeyPackageRefreshOverdueChanged", |event| {
+        matches!(event, MarmotAppEvent::KeyPackageRefreshOverdueChanged {
+            account_id_hex: changed,
+            account_label,
+        } if changed == account_id_hex && account_label == "alice")
+    })
+    .await;
+}
+
+/// Waits for the next event `wanted` accepts. The device group's own events
+/// must never reach the host meanwhile.
+async fn next_device_group_change(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    name: &str,
+    wanted: impl Fn(&MarmotAppEvent) -> bool,
+) {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             match events.recv().await {
-                Ok(MarmotAppEvent::LinkedDevicesChanged {
-                    account_id_hex: changed,
-                    account_label,
-                }) if changed == account_id_hex && account_label == "alice" => break,
+                Ok(event) if wanted(&event) => break,
                 Ok(MarmotAppEvent::GroupJoined { .. }) => {
                     panic!("the device group reached the host")
                 }
@@ -1276,7 +1309,7 @@ async fn next_linked_devices_changed(
         }
     })
     .await
-    .expect("LinkedDevicesChanged");
+    .unwrap_or_else(|_| panic!("{name}"));
 }
 
 /// A phone and laptop in one device group, the laptop joined.

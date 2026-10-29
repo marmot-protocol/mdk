@@ -451,6 +451,11 @@ cargo run --release -p marmot-c --example nip46_smoke
 is empty until this device trusts a device group, and in every release build until the roster's spec lands. Re-read
 it on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`. See the [shared contract](../marmot-uniffi/README.md#linked-devices).
 
+`marmot_key_package_refresh_overdue` blocks on the account worker, reads local state only, and writes whether this
+device's device group has held its KeyPackage refresh back for a week. Re-read it on
+`MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED`. See the
+[shared contract](../marmot-uniffi/README.md#overdue-keypackage-refresh).
+
 ## History may be incomplete notices
 
 `marmot_history_notices` blocks on the account worker, reads local durable state only, and writes an owned

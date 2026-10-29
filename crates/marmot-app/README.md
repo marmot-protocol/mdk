@@ -409,6 +409,18 @@ until the roster's spec lands. The device group's own events never reach hosts; 
 says to re-read. It also fires once each time the account's worker opens or reconnects, so it may fire with no visible
 change.
 
+### Overdue KeyPackage refresh
+
+While this device trusts a device group, each KeyPackage it publishes is first announced in its own roster entry there,
+so a device group that can't take that Commit holds the refresh back.
+`MarmotAppRuntime::key_package_refresh_overdue(account_ref)` is true once a refresh is owed, the KeyPackage it would
+publish is still unannounced, and the slot's newest publication by this device is a week old, or there is none. Inviters stop treating the device as fresh at 30
+days, so tell the user. A routine refresh announces and publishes in one maintenance pass and never shows; one that is
+announced but failing at the relays doesn't count. The client recomputes the answer after each maintenance pass, and
+`MarmotAppEvent::KeyPackageRefreshOverdueChanged` says to re-read. Like `LinkedDevicesChanged`, it also fires once each
+time the account's worker opens or reconnects. It is false, and the event silent, in every release build until the
+roster's spec lands.
+
 ## History may be incomplete notices
 
 Recovery parks an obligation after its fixed budget of fruitless attempts instead of retrying forever.

@@ -76,6 +76,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   opens with it set: a client dropped before a drain (a reconnect attempt whose transport fails) takes its change with
   it, and its replacement cannot see that change. Startup and reconnect settle trust with no command after them, so a
   new seam that settles trust must reach one of those two.
+- The overdue-refresh warning (`key_package_refresh_overdue`) asks the runtime's announcement gate, never a copy of
+  the roster. The client recomputes it after each maintenance pass; a change sets
+  `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
+  `KeyPackageRefreshOverdueChanged`. It opens set, for the same reason as `linked_devices_changed`.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.
