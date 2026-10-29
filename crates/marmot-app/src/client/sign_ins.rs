@@ -630,6 +630,7 @@ fn rejected_slot(
         RejectedSlotV1 {
             reason: RejectedSlotReasonV1::NotMe,
             rejected_at,
+            tag_signature_key: None,
         },
     )))
 }
@@ -690,6 +691,7 @@ mod tests {
             RejectedSlotV1 {
                 reason: RejectedSlotReasonV1::NotMe,
                 rejected_at: 1,
+                tag_signature_key: None,
             },
         );
         roster.rejected_key_packages.insert(
@@ -841,7 +843,8 @@ mod tests {
                 [5; 32],
                 RejectedSlotV1 {
                     reason: RejectedSlotReasonV1::NotMe,
-                    rejected_at: 3
+                    rejected_at: 3,
+                    tag_signature_key: None,
                 }
             ))
         );
