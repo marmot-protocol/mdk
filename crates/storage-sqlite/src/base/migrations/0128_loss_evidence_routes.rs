@@ -7,14 +7,10 @@
 //! good once one did not, or once the generation touched more routes than a
 //! row may list. Rows from before this migration are 0.
 //!
-//! Un-covering is owed per write, not per count: a restored generation
-//! restarts its process-local count under the same marker, so a write can
-//! bring new loss without raising `dropped_count`. Each write marks what it
-//! brought as owed (`owed` on its route rows, `uncover_owed` on the evidence
-//! row), and the next import un-covers it: only the owed routes, each from its
-//! own bound, while `route_state` is 1, and every route from the generation's
-//! floor otherwise. A row whose count is not fully imported owes an un-cover
-//! whatever its flag says, so earlier rows need no backfill.
+//! An import un-covers only the listed routes, each from its own bound, while
+//! `route_state` is 1, and every route from the generation's floor otherwise.
+//! Imports stay count-driven: the relay plane gives an adopted marker's new
+//! drops a fresh token, so new loss always raises some token's count.
 use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
@@ -23,8 +19,6 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         "ALTER TABLE account_delivery_loss_evidence
             ADD COLUMN route_state INTEGER NOT NULL DEFAULT 0 CHECK (route_state IN (0, 1));
-        ALTER TABLE account_delivery_loss_evidence
-            ADD COLUMN uncover_owed INTEGER NOT NULL DEFAULT 0 CHECK (uncover_owed IN (0, 1));
         CREATE TABLE account_delivery_loss_evidence_routes (
             account_label TEXT NOT NULL,
             cause INTEGER NOT NULL,
@@ -32,7 +26,6 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             route_kind INTEGER NOT NULL CHECK (route_kind IN (0, 1)),
             route_id BLOB NOT NULL,
             bound_seconds INTEGER NOT NULL CHECK (bound_seconds >= 0),
-            owed INTEGER NOT NULL DEFAULT 1 CHECK (owed IN (0, 1)),
             PRIMARY KEY (account_label, cause, marker_token, route_kind, route_id),
             FOREIGN KEY (account_label, cause, marker_token)
                 REFERENCES account_delivery_loss_evidence (account_label, cause, marker_token)
@@ -47,8 +40,8 @@ mod tests {
     use crate::base::migrations::{MIGRATIONS, run};
     use rusqlite::Connection;
 
-    /// Earlier evidence imports account-wide and owes nothing by flag, and a
-    /// generation's route rows go with it.
+    /// Earlier evidence imports account-wide, and a generation's route rows
+    /// go with it.
     #[test]
     fn earlier_evidence_is_unrouted_and_route_rows_cascade() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -63,19 +56,16 @@ mod tests {
         )
         .unwrap();
         run(&mut conn, &MIGRATIONS[..=before]).unwrap();
-        let states: Vec<(i64, i64)> = conn
-            .prepare(
-                "SELECT route_state, uncover_owed FROM account_delivery_loss_evidence
-                 ORDER BY marker_token",
-            )
+        let states: Vec<i64> = conn
+            .prepare("SELECT route_state FROM account_delivery_loss_evidence ORDER BY marker_token")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| row.get(0))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(states, vec![(0, 0), (0, 0)]);
+        assert_eq!(states, vec![0, 0]);
         conn.execute(
-            "INSERT INTO account_delivery_loss_evidence_routes VALUES ('alice', 0, 7, 0, x'', 5, 1)",
+            "INSERT INTO account_delivery_loss_evidence_routes VALUES ('alice', 0, 7, 0, x'', 5)",
             [],
         )
         .unwrap();

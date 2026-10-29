@@ -164,8 +164,7 @@ impl AppClient {
     /// from the floor, so its goal widens here; if this write
     /// is lost, the pending loss scopes widen it at the next comparison. Every
     /// account-wide import is new evidence, even with nothing counted or no
-    /// demand changed: a notification lag charges no delivery count, and a
-    /// restored generation's new loss can leave its count where it was.
+    /// demand changed: a notification lag charges no delivery count.
     pub(crate) fn record_coverage_loss(&self, imports: &[RecoveryLossImport]) {
         // Routed loss widened its own routes' goals in the import.
         let floors = imports

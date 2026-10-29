@@ -238,6 +238,60 @@ async fn account_delivery_recovery_metrics_report_retry_outcomes_without_identit
     assert_eq!(overflow.metrics.dropped.load(Ordering::Relaxed), 3);
 }
 
+/// An adopted durable marker counted its drops in another process or an
+/// acknowledged attempt, so the first new drop takes a fresh token whose count
+/// starts from zero, and an attempt against the adopted marker cannot settle.
+#[tokio::test]
+async fn an_adopted_marker_gives_new_drops_a_fresh_token() {
+    let overflow = AccountDeliveryOverflowState::default();
+    let written = Arc::new(StdMutex::new(Vec::new()));
+    let recorded = written.clone();
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |token, dropped, _, routes| {
+        recorded
+            .lock()
+            .unwrap()
+            .push((token, dropped, routes.map(<[_]>::to_vec)));
+        Ok(())
+    });
+    let drop_on_inbox = |at| {
+        if let Some(generation) = overflow.record_drop(
+            ACCOUNT_DELIVERY_BUFFER,
+            Some(at),
+            Some(DeliveryRoute::Inbox),
+        ) {
+            overflow.consume_signal(generation);
+        }
+    };
+
+    // Reopened after a restart.
+    let attempt = overflow.start_recovery(7);
+    assert_eq!((attempt.marker_token, attempt.dropped), (7, 0));
+    drop_on_inbox(500);
+    drop_on_inbox(400);
+    assert!(overflow.start_marker_persistence());
+    overflow.persist_marker_before_drop(marker.clone()).await;
+    let (fresh, dropped, routes) = written.lock().unwrap().pop().unwrap();
+    assert_ne!(fresh, 7);
+    assert_eq!(
+        (dropped, routes),
+        (2, Some(vec![(DeliveryRoute::Inbox, 400)]))
+    );
+    assert!(overflow.finish_recovery(attempt).is_none());
+
+    // Settled, then restored when its acknowledgment failed.
+    let attempt = overflow.start_recovery(fresh);
+    assert_eq!(attempt.marker_token, fresh);
+    assert!(overflow.finish_recovery(attempt).is_some());
+    overflow.restore_recovery_guard(fresh);
+    drop_on_inbox(600);
+    assert!(overflow.start_marker_persistence());
+    overflow.persist_marker_before_drop(marker).await;
+    let (again, dropped, _) = written.lock().unwrap().pop().unwrap();
+    assert!(again != fresh && again != 7);
+    assert_eq!(dropped, 1);
+    assert_eq!(overflow.pending_generation().unwrap().marker_token, again);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overflow_marker_uses_one_worker_and_stops_when_storage_closes() {
     let overflow = AccountDeliveryOverflowState::default();

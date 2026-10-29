@@ -253,12 +253,11 @@ async fn routed_queue_loss_uncovers_only_its_routes() {
     }
 }
 
-/// A restored generation counts again from zero under its durable marker, so
-/// its new loss leaves the stored count where it was. Each write still costs
-/// coverage: first the new route it names, then every route once a drop
-/// names none.
+/// A restored generation's new drops arrive under a fresh token, so they
+/// import as new loss and cost coverage: first the route they name, then
+/// every route once a drop names none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restored_generation_still_uncovers_its_new_loss() {
+async fn a_restored_generations_new_loss_uncovers_its_routes() {
     let fixture = fixture().await;
     let app = fixture.storage.app_storage();
     let routes = routes(&fixture.client);
@@ -270,11 +269,11 @@ async fn a_restored_generation_still_uncovers_its_new_loss() {
     let inbox = TransportReconciliationRoute::Inbox;
     assert!(routes.contains(&inbox));
     let floor = unix_now_seconds().saturating_sub(30);
-    let lose = |count, lost: Option<&[(TransportReconciliationRoute, u64)]>| {
+    let lose = |token, count, lost: Option<&[(TransportReconciliationRoute, u64)]>| {
         app.record_account_recovery_loss_routed(
             "alice",
             storage_sqlite::RecoveryLossCause::Queue,
-            41,
+            token,
             count,
             unix_now_seconds(),
             Some(floor),
@@ -288,13 +287,15 @@ async fn a_restored_generation_still_uncovers_its_new_loss() {
             .unwrap()
             .is_empty()
     };
-    lose(50, Some(&[(group.clone(), floor)]));
+    lose(41, 50, Some(&[(group.clone(), floor)]));
     fixture.client.record_native_coverage(&app).await;
     assert!(!owed(&inbox));
 
-    lose(1, Some(&[(inbox.clone(), floor)]));
+    // Restored after a restart: the plane counts new drops under a fresh
+    // token.
+    lose(42, 1, Some(&[(inbox.clone(), floor)]));
     assert!(owed(&inbox), "the restored generation lost the inbox");
-    lose(2, None);
+    lose(42, 2, None);
     for route in &routes {
         assert!(owed(route), "a drop that named no route costs every route");
     }

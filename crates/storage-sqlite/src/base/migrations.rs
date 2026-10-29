@@ -1723,11 +1723,10 @@ mod tests {
             }
             if *table == "account_delivery_loss_evidence" {
                 // Older loss has no known created_at, so it bounds no goal,
-                // none of it was retired, it named no routes, and it carries
-                // no un-cover flag.
+                // none of it was retired, and it named no routes.
                 for row in &mut upgraded {
                     use rusqlite::types::Value::{Integer, Null};
-                    row.extend([Integer(2), Null, Null, Integer(0), Integer(0)]);
+                    row.extend([Integer(2), Null, Null, Integer(0)]);
                 }
             }
             if *table == "account_recovery_obligations" {
@@ -2025,12 +2024,8 @@ mod tests {
                             rusqlite::types::Value::Integer(0),
                         ]);
                     } else {
-                        // No existing generation named its routes or carries
-                        // an un-cover flag.
-                        row.extend([
-                            rusqlite::types::Value::Integer(0),
-                            rusqlite::types::Value::Integer(0),
-                        ]);
+                        // No existing generation named its routes.
+                        row.push(rusqlite::types::Value::Integer(0));
                     }
                     row
                 })

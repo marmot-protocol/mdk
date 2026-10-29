@@ -65,7 +65,7 @@ pub struct RecoveryLossImport {
     /// route lost coverage from its floor. When `false`, only the routes its
     /// generations named did, and their goals widened in the same
     /// transaction. An import whose `transition` is `Unchanged` is reported
-    /// only for this: a write owed an un-cover its count did not show.
+    /// only for this, so the owner can widen current routes' goals.
     pub every_route: bool,
 }
 

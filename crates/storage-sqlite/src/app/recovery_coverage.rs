@@ -1473,9 +1473,10 @@ mod tests {
         );
     }
 
-    /// Shorthand for a queue-loss marker write on generation 41.
+    /// Shorthand for a queue-loss marker write.
     fn lose(
         app: &SqliteAppStorage,
+        token: u64,
         count: u64,
         bound: u64,
         routes: Option<&[(TransportReconciliationRoute, u64)]>,
@@ -1483,7 +1484,7 @@ mod tests {
         app.record_account_recovery_loss_routed(
             "alice",
             crate::RecoveryLossCause::Queue,
-            41,
+            token,
             count,
             1_000,
             Some(bound),
@@ -1506,26 +1507,27 @@ mod tests {
         }
     }
 
-    /// A restored generation counts again from zero under its durable marker.
-    /// Its new loss un-covers what each write names although the stored count
-    /// never moves: a new route from its bound, then every route from the
-    /// generation's floor once a drop names no route.
+    /// A restored generation's new drops arrive under a fresh token, so they
+    /// import as new loss: the obligation moves, and only the routes they
+    /// name lose coverage until one names none.
     #[test]
-    fn a_restored_generation_uncovers_loss_its_count_does_not_show() {
+    fn new_loss_after_a_restore_imports_under_its_own_token() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         let app = storage.app_storage();
         app.ensure_account_projection("alice").unwrap();
         let (first, second, third) = (group(1), group(2), group(3));
         prove(&app, &[&first, &second, &third], 1);
-        lose(&app, 50, 700, Some(&[(first.clone(), 700)]));
+        lose(&app, 41, 50, 700, Some(&[(first.clone(), 700)]));
         app.synchronize_account_delivery_loss("alice").unwrap();
         prove(&app, &[&first], 2);
 
-        lose(&app, 1, 500, Some(&[(second.clone(), 500)]));
-        assert!(
-            app.synchronize_account_delivery_loss("alice")
-                .unwrap()
-                .is_empty()
+        lose(&app, 42, 1, 500, Some(&[(second.clone(), 500)]));
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(imports.len(), 1);
+        assert!(!imports[0].every_route);
+        assert_ne!(
+            imports[0].transition,
+            crate::RecoveryDemandTransition::Unchanged
         );
         assert_eq!(
             ranges(&app, &first, RELAY_A),
@@ -1537,25 +1539,16 @@ mod tests {
         );
         assert_eq!(app.recovery_coverage_goal(&second).unwrap(), Some(500));
 
-        lose(&app, 2, 300, None);
+        lose(&app, 42, 2, 300, None);
         let imports = app.synchronize_account_delivery_loss("alice").unwrap();
         assert_eq!(imports.len(), 1);
         assert!(imports[0].every_route);
-        assert_eq!(
-            imports[0].transition,
-            crate::RecoveryDemandTransition::Unchanged
-        );
         for route in [&first, &second, &third] {
             assert_eq!(
                 ranges(&app, route, RELAY_A),
                 vec![(100, 299, RecoveryCoverageProof::Comparison)]
             );
         }
-        assert!(
-            app.synchronize_account_delivery_loss("alice")
-                .unwrap()
-                .is_empty()
-        );
     }
 
     /// A worker observation past the durable count imports drops whose routes
@@ -1568,7 +1561,7 @@ mod tests {
         app.ensure_account_projection("alice").unwrap();
         let (first, second) = (group(1), group(2));
         prove(&app, &[&first, &second], 1);
-        lose(&app, 1, 700, Some(&[(first.clone(), 700)]));
+        lose(&app, 41, 1, 700, Some(&[(first.clone(), 700)]));
         app.synchronize_account_delivery_loss("alice").unwrap();
         prove(&app, &[&first], 2);
 
@@ -1585,6 +1578,7 @@ mod tests {
         }
         lose(
             &app,
+            41,
             2,
             500,
             Some(&[(first.clone(), 700), (second.clone(), 500)]),
@@ -1605,14 +1599,14 @@ mod tests {
         app.ensure_account_projection("alice").unwrap();
         let route = group(1);
         prove(&app, &[&route], 1);
-        lose(&app, 1, 600, Some(&[(route.clone(), 600)]));
+        lose(&app, 41, 1, 600, Some(&[(route.clone(), 600)]));
         app.synchronize_account_delivery_loss("alice").unwrap();
         prove(&app, &[&route], 2);
         assert_eq!(
             ranges(&app, &route, RELAY_A),
             vec![(100, 900, RecoveryCoverageProof::Comparison)]
         );
-        lose(&app, 2, 600, Some(&[(route.clone(), 600)]));
+        lose(&app, 41, 2, 600, Some(&[(route.clone(), 600)]));
         app.synchronize_account_delivery_loss("alice").unwrap();
         assert_eq!(
             ranges(&app, &route, RELAY_A),
@@ -1648,6 +1642,33 @@ mod tests {
             vec![(100, 499, RecoveryCoverageProof::Comparison)]
         );
         assert_eq!(app.recovery_coverage_goal(&inbox).unwrap(), Some(500));
+    }
+
+    /// A legacy clear un-covers each generation it restores as an import
+    /// does, so a routed one gives its named routes their goals, even a route
+    /// the ledger does not hold.
+    #[test]
+    fn legacy_clear_gives_a_restored_routed_generation_its_goals() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let (kept, left) = (group(1), group(2));
+        prove(&app, &[&kept], 1);
+        app.mark_account_delivery_recovery_bounded("alice", 11, 3, Some(800))
+            .unwrap();
+        prove(&app, &[&kept], 2);
+        lose(&app, 12, 1, 600, Some(&[(left.clone(), 600)]));
+        assert!(!app.clear_account_delivery_recovery("alice", 11).unwrap());
+        assert_eq!(app.recovery_coverage_goal(&left).unwrap(), Some(600));
+        assert_eq!(
+            ranges(&app, &kept, RELAY_A),
+            vec![(100, 900, RecoveryCoverageProof::Comparison)]
+        );
+        assert!(
+            app.synchronize_account_delivery_loss("alice")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn slice<'a>(

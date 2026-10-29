@@ -11,6 +11,8 @@ not depend on `marmot-app` or `storage-sqlite`. The app supplies storage and pol
 (`AccountDeliverySpillStore`, `AccountDeliveryRecoveryMarker`, `RelayExportGate`). A queue-loss marker carries each
 dropped delivery's route (`DeliveryRoute::of`, the same rule `marmot-app` keys reconciliation by) with the earliest
 `created_at` dropped there, or no routes once any drop had none or a generation passed `MAX_DELIVERY_LOSS_ROUTES`.
+A generation that adopted a durable marker (a restart, or a failed acknowledgment) takes a fresh token at its first new
+drop: storage imports loss by count, so a token's count must cover every drop under it.
 
 ## Key files
 

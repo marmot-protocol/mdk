@@ -214,7 +214,9 @@ struct AccountDeliveryRoute {
 /// earliest wire `created_at` among the dropped deliveries (`None` if any is
 /// unknown), and each route they arrived on with the earliest `created_at`
 /// dropped there (`None` if any had no route or time, or they touched more
-/// than [`MAX_DELIVERY_LOSS_ROUTES`]).
+/// than [`MAX_DELIVERY_LOSS_ROUTES`]). Each write covers every drop under its
+/// token: the plane never writes a token whose earlier drops it did not count,
+/// so new loss always raises the count.
 pub type AccountDeliveryRecoveryMarker = Arc<
     dyn Fn(
             u64,
@@ -356,6 +358,11 @@ struct AccountDeliveryOverflowInner {
     started_at: Option<Instant>,
     recovery_started_at: Option<Instant>,
     marker_token: u64,
+    /// The generation carries a durable marker adopted after a restart or a
+    /// failed acknowledgment, whose earlier drops this process never counted.
+    /// Its first new drop takes a fresh token, so every token's count grows
+    /// from zero and a new drop always raises the count storage sees.
+    marker_adopted: bool,
     marker_in_progress: bool,
     marker_durable: bool,
     marker_closed: bool,
@@ -765,6 +772,7 @@ impl AccountDeliveryOverflowState {
             Self::reset_notification_loss(&mut state);
             state.started_at = Some(Instant::now());
             state.marker_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
+            state.marker_adopted = false;
             state.marker_in_progress = false;
             state.marker_durable = false;
             state.marker_closed = false;
@@ -784,6 +792,9 @@ impl AccountDeliveryOverflowState {
                 }
             }
             AccountDeliveryLossCharge::Drop { created_at, route } => {
+                if std::mem::take(&mut state.marker_adopted) {
+                    state.marker_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
+                }
                 state.dropped = state.dropped.saturating_add(1);
                 match created_at {
                     Some(at) => {
@@ -1075,6 +1086,7 @@ impl AccountDeliveryOverflowState {
             // loaded after a restart; the process-local generation is already
             // covered before its first recovery subscription is issued.
             state.marker_token = durable_marker_token;
+            state.marker_adopted = true;
             state.marker_durable = true;
             state.marker_closed = false;
         }
@@ -1097,6 +1109,7 @@ impl AccountDeliveryOverflowState {
             state.queue_depth = 0;
             state.started_at = Some(Instant::now());
             state.marker_token = durable_marker_token;
+            state.marker_adopted = true;
             state.marker_durable = true;
             state.marker_closed = false;
             state.recovery_in_progress = false;

@@ -280,11 +280,10 @@ pub(super) fn payload_is_qualified(
     }
 }
 
-/// No loss waits on an import: neither a count nor an un-cover a write owes.
 pub(super) fn no_unimported_loss(conn: &Connection) -> StorageResult<bool> {
     conn.query_row_cached(
         "SELECT NOT EXISTS(SELECT 1 FROM account_delivery_loss_evidence
-         WHERE imported_count IS NULL OR dropped_count > imported_count OR uncover_owed = 1)",
+         WHERE imported_count IS NULL OR dropped_count > imported_count)",
         [],
         |row| row.get(0),
     )
