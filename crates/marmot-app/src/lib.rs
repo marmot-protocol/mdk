@@ -2049,6 +2049,8 @@ impl MarmotApp {
             history_notice_baseline: None,
             // A fresh client cannot know what hosts last read.
             linked_devices_changed: true,
+            key_package_refresh_overdue: None,
+            key_package_refresh_overdue_changed: true,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),

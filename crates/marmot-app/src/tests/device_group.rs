@@ -9,6 +9,7 @@
 use super::canonical_membership::{deliver_new, published_key_package};
 use super::*;
 use crate::{ConfirmedDeviceLink, LinkedDevice, LinkedDeviceStatus};
+use cgka_traits::TransportFanoutAttemptState;
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
     DeviceSettingsV1, DeviceStatusV1, decode_device_roster_v1, encode_device_roster_update_v1,
@@ -1158,7 +1159,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
 /// roster's spec lands, nothing is listed and no change is announced, even on
 /// a device that trusts a device group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_groups_off_list_no_devices() {
+async fn device_groups_off_list_no_devices_and_no_overdue_refresh() {
     let Devices {
         _dirs,
         relay,
@@ -1182,6 +1183,9 @@ async fn device_groups_off_list_no_devices() {
     assert!(phone.linked_devices().unwrap().is_empty());
     assert!(phone.linked_devices_changed);
     assert!(!phone.take_linked_devices_changed());
+    assert!(!phone.key_package_refresh_overdue().unwrap());
+    assert!(phone.key_package_refresh_overdue_changed);
+    assert!(!phone.take_key_package_refresh_overdue_changed());
 }
 
 /// Through the runtime, the new device's account worker announces the join it
@@ -1353,7 +1357,8 @@ async fn a_restart_that_settles_trust_announces_it() {
 /// A reconnect opens a new client, which announces once with no command or
 /// delivery after it. A reconnect attempt that settles trust and then fails
 /// transport drops its client, flag and all; the client that replaces it
-/// cannot see that change, so every open announces.
+/// cannot see that change, so every open announces. The overdue-refresh
+/// answer is announced the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reconnect_announces_again() {
     let Devices {
@@ -1376,30 +1381,59 @@ async fn a_reconnect_announces_again() {
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
     next_linked_devices_changed(&mut events, &account_id_hex).await;
+    next_key_package_refresh_overdue_changed(&mut events, &account_id_hex).await;
     assert_eq!(runtime.linked_devices("alice").await.unwrap().len(), 2);
+    assert!(!runtime.key_package_refresh_overdue("alice").await.unwrap());
 
     runtime
         .shared_services()
         .relay_plane()
         .simulate_notification_consumer_exit_for_test();
     next_linked_devices_changed(&mut events, &account_id_hex).await;
+    next_key_package_refresh_overdue_changed(&mut events, &account_id_hex).await;
     assert_eq!(runtime.linked_devices("alice").await.unwrap().len(), 2);
     runtime.shutdown().await;
 }
 
-/// Waits for the account's next `LinkedDevicesChanged`. The device group's own
-/// events must never reach the host meanwhile.
+/// Waits for the account's next `LinkedDevicesChanged`.
 async fn next_linked_devices_changed(
     events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
     account_id_hex: &str,
 ) {
+    next_device_group_change(events, "LinkedDevicesChanged", |event| {
+        matches!(event, MarmotAppEvent::LinkedDevicesChanged {
+            account_id_hex: changed,
+            account_label,
+        } if changed == account_id_hex && account_label == "alice")
+    })
+    .await;
+}
+
+/// Waits for the account's next `KeyPackageRefreshOverdueChanged`.
+async fn next_key_package_refresh_overdue_changed(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    account_id_hex: &str,
+) {
+    next_device_group_change(events, "KeyPackageRefreshOverdueChanged", |event| {
+        matches!(event, MarmotAppEvent::KeyPackageRefreshOverdueChanged {
+            account_id_hex: changed,
+            account_label,
+        } if changed == account_id_hex && account_label == "alice")
+    })
+    .await;
+}
+
+/// Waits for the next event `wanted` accepts. The device group's own events
+/// must never reach the host meanwhile.
+async fn next_device_group_change(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    name: &str,
+    wanted: impl Fn(&MarmotAppEvent) -> bool,
+) {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             match events.recv().await {
-                Ok(MarmotAppEvent::LinkedDevicesChanged {
-                    account_id_hex: changed,
-                    account_label,
-                }) if changed == account_id_hex && account_label == "alice" => break,
+                Ok(event) if wanted(&event) => break,
                 Ok(MarmotAppEvent::GroupJoined { .. }) => {
                     panic!("the device group reached the host")
                 }
@@ -1409,7 +1443,7 @@ async fn next_linked_devices_changed(
         }
     })
     .await
-    .expect("LinkedDevicesChanged");
+    .unwrap_or_else(|_| panic!("{name}"));
 }
 
 /// A phone and laptop in one device group, the laptop joined.
@@ -1634,4 +1668,81 @@ async fn an_unreadable_device_group_refuses_publication() {
     let before = relay.published_events.lock().unwrap().len();
     assert!(phone.publish_key_package().await.is_err());
     assert!(published_kinds(&relay, before).is_empty());
+}
+
+/// Make this device's newest slot publication `days` days old.
+fn age_publication(app: &MarmotApp, days: u64) {
+    let storage = app.account_storage("alice").unwrap();
+    let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
+    let now = unix_now_seconds();
+    lifecycle.authored_event_created_at = Some(Timestamp(now - days * 24 * 60 * 60));
+    storage.put_key_package_lifecycle(&lifecycle).unwrap();
+}
+
+/// A refresh is overdue once the device group has held its announcement back
+/// and the slot's publication is a week old. A routine refresh announces and
+/// publishes in one pass, so it never shows; nor does a held-back one while
+/// the publication is younger than a week. The maintenance pass that finds it
+/// overdue owes hosts a change, and so does the one that publishes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_held_back_a_week_is_overdue_until_it_publishes() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            laptop_app,
+            mut laptop,
+            ..
+        },
+        _group,
+    ) = linked_devices().await;
+    assert!(laptop.take_key_package_refresh_overdue_changed());
+    laptop.run_due_maintenance().await.unwrap();
+    let _ = laptop.take_key_package_refresh_overdue_changed();
+
+    age_publication(&laptop_app, 8);
+    let before = relay.published_events.lock().unwrap().len();
+    laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        published_kinds(&relay, before),
+        vec![transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE, 30443]
+    );
+    assert!(!laptop.key_package_refresh_overdue().unwrap());
+    assert!(!laptop.take_key_package_refresh_overdue_changed());
+
+    relay.reject_next_publish();
+    laptop.rotate_key_package().await.unwrap_err();
+    assert!(!laptop.key_package_refresh_overdue().unwrap());
+
+    age_publication(&laptop_app, 8);
+    relay.reject_next_publish();
+    let before = relay.published_events.lock().unwrap().len();
+    laptop.run_due_maintenance().await.unwrap();
+    assert!(published_kinds(&relay, before).is_empty());
+    assert!(laptop.key_package_refresh_overdue().unwrap());
+    assert!(laptop.take_key_package_refresh_overdue_changed());
+
+    // Retry backoff at the relays doesn't hide it: here every target was
+    // just tried, so maintenance owes nothing until the backoff ends.
+    let storage = laptop_app.account_storage("alice").unwrap();
+    let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
+    let pending = lifecycle.pending_replacement.as_mut().unwrap();
+    assert!(pending.signed_event.is_some());
+    for target in &mut pending.targets {
+        target.state = TransportFanoutAttemptState::AttemptedFailed;
+        target.attempt_count = 1;
+        target.last_attempt_at = Some(Timestamp(unix_now_seconds()));
+    }
+    storage.put_key_package_lifecycle(&lifecycle).unwrap();
+    assert!(
+        !laptop
+            .runtime
+            .key_package_network_maintenance_due()
+            .unwrap()
+    );
+    assert!(laptop.key_package_refresh_overdue().unwrap());
+
+    laptop.run_due_maintenance().await.unwrap();
+    assert!(!laptop.key_package_refresh_overdue().unwrap());
+    assert!(laptop.take_key_package_refresh_overdue_changed());
 }

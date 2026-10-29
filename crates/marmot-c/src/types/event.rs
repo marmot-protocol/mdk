@@ -324,6 +324,14 @@ pub enum MarmotEvent {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
+    /// Whether this device's KeyPackage refresh is overdue may have changed;
+    /// re-read `marmot_key_package_refresh_overdue`. Also fires once each
+    /// time the account's worker opens or reconnects, and may fire with no
+    /// change.
+    KeyPackageRefreshOverdueChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
 }
 
 impl From<MarmotEventFfi> for MarmotEvent {
@@ -438,6 +446,13 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 account_id_hex: owned_c_string(account_id_hex),
                 account_label: owned_c_string(account_label),
             },
+            F::KeyPackageRefreshOverdueChanged {
+                account_id_hex,
+                account_label,
+            } => Self::KeyPackageRefreshOverdueChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
         }
     }
 }
@@ -491,6 +506,10 @@ impl CFree for MarmotEvent {
                     account_label,
                 }
                 | Self::LinkedDevicesChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::KeyPackageRefreshOverdueChanged {
                     account_id_hex,
                     account_label,
                 } => {
@@ -612,6 +631,37 @@ mod tests {
             assert_eq!(
                 std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
                 "carol"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn key_package_refresh_overdue_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(
+            MarmotEventFfi::KeyPackageRefreshOverdueChanged {
+                account_id_hex: "ae".repeat(32),
+                account_label: "dave".to_owned(),
+            },
+        ));
+        unsafe {
+            let MarmotEvent::KeyPackageRefreshOverdueChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "ae".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "dave"
             );
             marmot_event_free(event);
         }

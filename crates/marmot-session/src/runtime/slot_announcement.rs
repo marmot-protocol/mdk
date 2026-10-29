@@ -233,6 +233,43 @@ where
         self.announce_key_package_holding(held).await
     }
 
+    /// Whether this device's KeyPackage refresh is overdue because its
+    /// announcement is held back, so the host can warn the user (D31 choice
+    /// 6). That is: a device group is set and the slot isn't withdrawn, the
+    /// KeyPackage this device would publish (the pending replacement, else the
+    /// current one) is not announced, and this device's newest publication in
+    /// the slot is older than the weekly refresh bound, or there is none. A
+    /// publication is then always owed, so retry backoff at the relays never
+    /// hides it. A routine refresh announces and publishes in one maintenance
+    /// pass, so it never shows. One that is announced but failing at the
+    /// relays is not held back by the announcement, so it does not count.
+    pub fn key_package_refresh_overdue(&mut self) -> AccountResult<bool> {
+        if self.key_package_announcement_group.is_none() || self.key_package_slot_withdrawn {
+            return Ok(false);
+        }
+        let Some(lifecycle) = self.session.key_package_lifecycle()? else {
+            return Ok(false);
+        };
+        let Some(key_package_ref) = lifecycle
+            .pending_replacement
+            .as_ref()
+            .map(|pending| pending.key_package_ref.clone())
+            .or_else(|| lifecycle.current_key_package_ref.clone())
+        else {
+            return Ok(false);
+        };
+        if self.key_package_announced(&key_package_ref)? {
+            return Ok(false);
+        }
+        let now = self.wall_clock.now();
+        Ok(lifecycle.authored_event_created_at.is_none_or(|published| {
+            published
+                .0
+                .saturating_add(super::KEY_PACKAGE_REFRESH_MAX_SECS)
+                <= now.0
+        }))
+    }
+
     fn key_package_announcement(&mut self, key_package_ref: &[u8]) -> AccountResult<Announcement> {
         let Some(group_id) = self.key_package_announcement_group.clone() else {
             return Ok(Announcement::Announced);

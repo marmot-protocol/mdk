@@ -786,6 +786,9 @@ pub(crate) async fn handle_app_runtime_event(
         // The account's linked devices may have changed; the devices are read
         // from the runtime.
         marmot_app::MarmotAppEvent::LinkedDevicesChanged { .. } => {}
+        // Whether this device's KeyPackage refresh is overdue may have
+        // changed; the answer is read from the runtime.
+        marmot_app::MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. } => {}
     }
 }
 

@@ -987,6 +987,16 @@ the device group this device trusts, for a Devices screen:
   device or group identities. It also fires once each time the account's worker opens or reconnects, so it may fire
   with no visible change.
 
+### Overdue KeyPackage refresh
+
+While this device trusts a device group, it announces each KeyPackage in its own roster entry before publishing it, so
+a device group that can't take that Commit holds the refresh back. `key_package_refresh_overdue(account_ref)` is true
+once the KeyPackage this device would publish is still unannounced and its slot's newest publication is a week old.
+Inviters stop treating the device as fresh at 30 days, so tell the user. A routine refresh never shows, and neither
+does one that is announced but failing at the relays. Re-read on `MarmotEventFfi::KeyPackageRefreshOverdueChanged`,
+which carries no device or group identities and also fires once each time the account's worker opens or reconnects.
+It is false in every release build until the roster's spec lands.
+
 ## History may be incomplete notices
 
 Automatic recovery stops retrying an obligation after a fixed budget of attempts that

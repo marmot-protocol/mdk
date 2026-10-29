@@ -1550,6 +1550,13 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// Whether this device's KeyPackage refresh is overdue may have changed:
+    /// re-read `key_package_refresh_overdue`. Also fires once each time the
+    /// account's worker opens or reconnects, and may fire with no change.
+    KeyPackageRefreshOverdueChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
 }
 
 impl MarmotAppRuntime {
@@ -2473,6 +2480,19 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<Vec<crate::LinkedDevice>, AppError> {
         self.accounts.linked_devices(account_ref).await
+    }
+
+    /// Whether this device's KeyPackage refresh is overdue because its device
+    /// group can't take the announcement that must come first. While it is,
+    /// the device keeps its old KeyPackage in its slot, and after 30 days
+    /// inviters stop treating it as fresh, so a host warns the user. True
+    /// once its publication is a week old with the refresh still held back;
+    /// a routine refresh never shows.
+    /// Always false until this device trusts a device group, and in release
+    /// builds until the device group's spec lands. Refresh on
+    /// `KeyPackageRefreshOverdueChanged`.
+    pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
+        self.accounts.key_package_refresh_overdue(account_ref).await
     }
 
     /// Record that the user accepts the risk of changing a group that is still
