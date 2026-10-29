@@ -537,6 +537,12 @@ pub(crate) struct ScriptedPushRelayClient {
     pub(crate) indexer_publish_release: tokio::sync::Notify,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     scoped_subscriptions: std::sync::Mutex<Vec<(String, NostrSubscription)>>,
+    /// When set, [`report_scripted_eose`] answers each REQ still awaiting
+    /// EOSE with one stored event created at this second before its EOSE.
+    pub(crate) stored_before_eose: std::sync::Mutex<Option<u64>>,
+    /// Every relay reads as connected on this attempt, as its own state, so
+    /// moving it is a reconnect no notification reports.
+    pub(crate) connection_attempt: std::sync::atomic::AtomicUsize,
     subscription_attempts: std::sync::Mutex<Vec<NostrSubscription>>,
     block_next_subscribe: std::sync::atomic::AtomicBool,
     blocked_subscribe_count: std::sync::atomic::AtomicUsize,
@@ -1146,6 +1152,17 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for ScriptedPushRelayClient {
+    fn relay_connection(
+        &self,
+        _: &MemberId,
+        _: &TransportEndpoint,
+    ) -> Option<transport_nostr_adapter::RelayConnection> {
+        let attempt = self
+            .connection_attempt
+            .load(std::sync::atomic::Ordering::SeqCst);
+        Some(transport_nostr_adapter::RelayConnection::new(0, attempt))
+    }
+
     async fn acquire_history(
         &self,
         request: transport_nostr_adapter::NostrAcquisitionRequest,
@@ -1596,13 +1613,21 @@ pub(crate) async fn report_scripted_eose(
     relay: &ScriptedPushRelayClient,
     accept: fn(&NostrSubscription) -> bool,
 ) {
+    let stored = *relay.stored_before_eose.lock().unwrap();
+    let eose = |endpoint: TransportEndpoint, id: String| async move {
+        // Counts only a REQ still awaiting EOSE on that relay.
+        if let Some(created_at) = stored {
+            plane
+                .count_stored_replay_event_for_test(endpoint.clone(), id.clone(), created_at)
+                .await;
+        }
+        plane.handle_relay_eose_for_test(endpoint, id).await;
+    };
     let scoped = relay.scoped_subscriptions.lock().unwrap().clone();
     for (id, subscription) in scoped {
         if accept(&subscription) {
             for endpoint in subscription.endpoints() {
-                plane
-                    .handle_relay_eose_for_test(endpoint.clone(), id.clone())
-                    .await;
+                eose(endpoint.clone(), id.clone()).await;
             }
         }
     }
@@ -1611,9 +1636,7 @@ pub(crate) async fn report_scripted_eose(
             continue;
         }
         for endpoint in subscription.endpoints() {
-            plane
-                .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
-                .await;
+            eose(endpoint.clone(), subscription.subscription_id()).await;
         }
     }
 }

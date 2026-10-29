@@ -200,8 +200,24 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   un-cover mark when it is selected (`AttemptGrant::coverage_mark`); its certificates are recorded through
   `record_recovery_coverage_since`, which leaves out whatever was un-covered after that. Its writes are best effort
   and nothing schedules, retries or fences on the ledger; do not read it from recovery decisions until phase 4
-  replaces the obligations. It records no live boundary while a loss obligation is pending, and storage keeps a
-  released receipt's second out of every live boundary; only a fetch proof covers it, on its own relay. `coverage_shadow_report`
+  replaces the obligations. A live boundary proves only what its relay's count does, once per generation: from the
+  second after the oldest event counted (never before the REQ's `since`) through the second before the count's
+  `requested_at`. An empty count proves nothing, and no NIP-11 limit is read: the relay pool drops some frames
+  uncounted, so a count cannot show a reply was not cut, and relays are assumed to cut newest first. Read the
+  un-cover mark before each look at the adapter and write through `record_recovery_coverage_since`; a generation that
+  loss imported since the last look may have reached never proves again (`LiveCoverage`), and the log is read again
+  after the look so loss imported during it gives no tail. Past the request an open,
+  healthy REQ vouches only provisionally: `LiveTails`, held in memory and never written to the ledger, because nothing
+  proves when an open REQ stopped delivering. A tail starts at the count's `live_from`, which for a REQ the relay pool
+  sent again is its EOSE, never the request stamp, and stands only while the adapter reports the count streaming
+  (`ReplayEndpointView::streaming`: the relay client still names the connection its serial started on); a count
+  that is not streaming is recorded as ended. A tail can outlive its REQ by the time the adapter takes to process
+  notifications already queued for that relay, an accepted limit: a forwarder that falls behind records loss, which
+  breaks it, and a tail never reaches the ledger. Read tails at every debt read; they lapse without an event. Debt that drives work reads the ledger only up to
+  `LiveTails::owed_until`, refreshed by `AppClient::live_tails`; without it an idle connected account owes its own
+  live frames. Storage keeps a released receipt's second out of every live boundary, and a tail starts past the
+  newest one on its route; only a fetch proof covers it, on its own relay. Live-boundary tests live in
+  `recovery_coverage/live_boundary_tests.rs`. `coverage_shadow_report`
   is the test-visible comparison with pending obligations; a scope holds proof only as completion would count it (its
   predicate at the current loss, route, inventory and obligation revisions), and a scope whose floor is unknown or
   older than the retained window is owed from the retention floor. Before it prunes, it passes the current routes and

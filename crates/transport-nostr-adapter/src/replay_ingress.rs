@@ -929,6 +929,7 @@ mod tests {
             id.clone(),
             &source,
             HashMap::from([(RelayIndex(0), RelayReplay::Awaiting)]),
+            &HashMap::new(),
         );
         (coverage, id)
     }
@@ -1275,6 +1276,7 @@ mod tests {
                 id.clone(),
                 &source,
                 HashMap::from([(RelayIndex(0), RelayReplay::Awaiting)]),
+                &HashMap::new(),
             );
         assert!(
             old.delivery().is_none(),
