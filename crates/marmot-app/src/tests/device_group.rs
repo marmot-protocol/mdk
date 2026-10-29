@@ -12,8 +12,8 @@ use crate::{ConfirmedDeviceLink, LinkedDevice, LinkedDeviceStatus};
 use cgka_traits::TransportFanoutAttemptState;
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
-    DeviceRosterV1, DeviceSettingsV1, DeviceStatusV1, DeviceTagClaim, decode_device_roster_v1,
-    encode_device_roster_update_v1,
+    DeviceRosterV1, DeviceSettingsV1, DeviceStatusV1, DeviceTagClaim, RejectedSlotReasonV1,
+    RejectedSlotV1, decode_device_roster_v1, encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
 use storage_sqlite::DeviceGroupTrust;
@@ -2167,4 +2167,94 @@ async fn an_open_names_the_device_group_to_tag_from_once_it_is_hydrated() {
     phone.runtime.set_device_tag_group(None).unwrap();
     phone.run_due_maintenance().await.unwrap();
     assert_eq!(phone.runtime.device_tag_group(), Some(&group));
+}
+
+/// A `removed` slot record is dropped once 30 days have passed since its
+/// `rejected_at`, by the dropping device's own clock (mdk#2628 3.1d), so the
+/// roster does not keep every device the account ever removed. Any device
+/// drops it, in one commit, once the device group can take a commit from it.
+/// A younger record and every `not_me` record stay, and once the expired one
+/// is gone, maintenance owes the roster nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_device_record_is_dropped_after_30_days() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = tagging_devices().await;
+    let now = unix_now_seconds();
+    let rejected = |reason, days_ago: u64, tag_signature_key| RejectedSlotV1 {
+        reason,
+        rejected_at: now - days_ago * 24 * 60 * 60,
+        tag_signature_key,
+    };
+    let (expired, young, not_me) = ([7; 32], [8; 32], [9; 32]);
+    let update = encode_device_roster_update_v1(
+        &DeviceRosterUpdateV1::new(vec![
+            DeviceRosterOperationV1::SetRejectedSlot(
+                expired,
+                rejected(RejectedSlotReasonV1::Removed, 31, Some(vec![7; 32])),
+            ),
+            DeviceRosterOperationV1::SetRejectedSlot(
+                young,
+                rejected(RejectedSlotReasonV1::Removed, 29, Some(vec![8; 32])),
+            ),
+            DeviceRosterOperationV1::SetRejectedSlot(
+                not_me,
+                rejected(RejectedSlotReasonV1::NotMe, 31, None),
+            ),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let mut laptop_cursor = relay.published_events.lock().unwrap().len();
+    let effects = phone
+        .runtime
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: update,
+            }],
+        })
+        .await
+        .unwrap();
+    phone
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+
+    let mut phone_cursor = relay.published_events.lock().unwrap().len();
+    // A held device group takes no roster commit from this device.
+    laptop
+        .runtime
+        .run_due_maintenance_holding(std::slice::from_ref(&group))
+        .await
+        .unwrap();
+    assert!(published_kinds(&relay, phone_cursor).is_empty());
+    assert_eq!(roster(&laptop, &group).rejected_slots.len(), 3);
+
+    laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        published_kinds(&relay, phone_cursor),
+        vec![transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE]
+    );
+    deliver_new(&mut phone, &relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    for client in [&phone, &laptop] {
+        let kept: Vec<_> = roster(client, &group).rejected_slots.into_keys().collect();
+        assert_eq!(kept, vec![young, not_me]);
+    }
+
+    let before = relay.published_events.lock().unwrap().len();
+    phone.run_due_maintenance().await.unwrap();
+    laptop.run_due_maintenance().await.unwrap();
+    assert!(published_kinds(&relay, before).is_empty());
 }

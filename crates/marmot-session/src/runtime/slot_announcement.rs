@@ -49,7 +49,7 @@ where
         };
         // Every failure to read the roster holds publication back.
         Ok(self
-            .device_roster(&group_id)
+            .merged_device_roster(&group_id)
             .and_then(|mut roster| roster.devices.remove(&slot))
             .is_some_and(|entry| entry.announced_key_package.as_deref() == Some(key_package_ref)))
     }

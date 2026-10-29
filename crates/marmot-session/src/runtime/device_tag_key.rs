@@ -12,9 +12,7 @@
 //! No KeyPackage is staged while the key is due and not yet in the merged
 //! roster: it would be built untagged and published after the key was set.
 
-use cgka_traits::app_components::{
-    DEVICE_ROSTER_COMPONENT_ID, DeviceSlotId, decode_device_roster_v1,
-};
+use cgka_traits::app_components::DeviceSlotId;
 use cgka_traits::{GroupId, TransportAdapter};
 
 use super::device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked};
@@ -175,25 +173,10 @@ where
     }
 
     fn device_tag_key(&mut self, group_id: &GroupId) -> AccountResult<TagKey> {
-        let Some(slot) = self
-            .session
-            .key_package_lifecycle()?
-            .and_then(|lifecycle| hex::decode(lifecycle.stable_slot_id).ok())
-            .and_then(|bytes| DeviceSlotId::try_from(bytes).ok())
-        else {
+        let Some(slot) = self.own_device_slot()? else {
             return Ok(TagKey::Blocked("slot_unavailable"));
         };
-        let roster = self
-            .session
-            .ensure_group_hydrated(group_id)
-            .ok()
-            .and_then(|_| {
-                self.session
-                    .app_component(group_id, DEVICE_ROSTER_COMPONENT_ID)
-                    .ok()
-            })
-            .flatten()
-            .and_then(|bytes| decode_device_roster_v1(&bytes).ok());
+        let roster = self.merged_device_roster(group_id);
         let Some(mut roster) = roster else {
             return Ok(TagKey::Blocked("device_group_unreadable"));
         };

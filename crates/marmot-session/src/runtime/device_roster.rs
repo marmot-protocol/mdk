@@ -1,5 +1,13 @@
-//! The one roster write path (mdk#2628 3.4, 3.6): a commit that replaces one
-//! device entry in the roster of this device's device group.
+//! This device's reads and writes of its device group's roster (mdk#2628):
+//! its slot there, the roster as the merged group state holds it, the gate
+//! its roster commits wait behind, and the sends.
+//!
+//! Device entries have one write path (3.4, 3.6, 3.1d):
+//! [`AccountDeviceRuntime::edit_device_roster_entry`], a commit that replaces
+//! one entry. Slot announcements, the tag signature key and the host's device
+//! edits all use it. Rejected-slot records (3.1d's expiry) go through
+//! [`AccountDeviceRuntime::send_device_roster_update`] and never touch a
+//! device entry.
 //!
 //! `SetDevice` replaces an entry whole, so a commit computed from an older
 //! read would put back whatever a sibling or an earlier commit of this device
@@ -16,14 +24,15 @@
 //! ([`DeviceSelfReport`]); each announcement of its KeyPackage writes them.
 
 use cgka_traits::app_components::{
-    DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterV1, DeviceSlotId,
-    decode_device_roster_v1,
+    AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
+    DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, decode_device_roster_v1,
+    encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
 use cgka_traits::{EngineError, EpochState, FanoutMlsState, GroupId, TransportAdapter};
 
 use super::{AccountDeviceEffects, AccountDeviceRuntime};
-use crate::error::AccountResult;
+use crate::error::{AccountError, AccountResult};
 use crate::key_package::KeyPackagePublisher;
 use crate::routing::TransportRoutingPolicy;
 use crate::session::SessionError;
@@ -104,7 +113,7 @@ where
         held: &[GroupId],
         edit: impl FnOnce(&mut DeviceEntryV1),
     ) -> AccountResult<DeviceRosterEdit> {
-        let Some(mut roster) = self.device_roster(group_id) else {
+        let Some(mut roster) = self.merged_device_roster(group_id) else {
             return Ok(DeviceRosterEdit::Blocked(
                 DeviceRosterEditBlocked::Unreadable,
             ));
@@ -139,9 +148,9 @@ where
     }
 
     /// Whether this device may commit in the device group `group_id` now:
-    /// it is stable and not held, and nothing of this device's is queued or
-    /// unconfirmed there.
-    pub fn device_group_takes_commit(
+    /// it is stable and not held, quarantined or settling, and nothing of
+    /// this device's is queued or unconfirmed there.
+    pub(super) fn device_group_takes_commit(
         &mut self,
         group_id: &GroupId,
         held: &[GroupId],
@@ -164,9 +173,9 @@ where
                 .any(|fanout| matches!(fanout.mls_state(), FanoutMlsState::Pending(_)))))
     }
 
-    /// The roster of `group_id` as the engine holds it now. Any failure to
-    /// read it is `None`.
-    pub(super) fn device_roster(&mut self, group_id: &GroupId) -> Option<DeviceRosterV1> {
+    /// `group_id`'s roster as its merged state holds it, or `None` when it
+    /// cannot be read.
+    pub(super) fn merged_device_roster(&mut self, group_id: &GroupId) -> Option<DeviceRosterV1> {
         self.session
             .ensure_group_hydrated(group_id)
             .ok()
@@ -187,5 +196,32 @@ where
             .key_package_lifecycle()?
             .and_then(|lifecycle| hex::decode(lifecycle.stable_slot_id).ok())
             .and_then(|bytes| DeviceSlotId::try_from(bytes).ok()))
+    }
+
+    /// Commit rejected-slot `operations` to `group_id`'s roster as one
+    /// update. The returned effects carry the commit. A device entry is
+    /// never written here: [`Self::edit_device_roster_entry`] replaces one
+    /// only while it is still the entry it read.
+    pub(super) async fn send_device_roster_update(
+        &mut self,
+        group_id: GroupId,
+        operations: Vec<DeviceRosterOperationV1>,
+    ) -> AccountResult<AccountDeviceEffects> {
+        debug_assert!(operations.iter().all(|operation| matches!(
+            operation,
+            DeviceRosterOperationV1::SetRejectedSlot(..)
+                | DeviceRosterOperationV1::RemoveRejectedSlot(_)
+        )));
+        let update = DeviceRosterUpdateV1::new(operations)
+            .and_then(|update| encode_device_roster_update_v1(&update))
+            .map_err(|error| AccountError::Engine(cgka_traits::EngineError::Serialize(error)))?;
+        self.send(SendIntent::UpdateAppComponents {
+            group_id,
+            updates: vec![AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: update,
+            }],
+        })
+        .await
     }
 }

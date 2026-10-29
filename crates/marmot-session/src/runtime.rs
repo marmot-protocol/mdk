@@ -71,6 +71,7 @@ use crate::time::{
 mod device_roster;
 pub use device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport};
 mod device_tag_key;
+mod removed_slot_expiry;
 mod slot_announcement;
 
 const TRACE_TARGET: &str = "marmot_session::runtime";
@@ -2350,6 +2351,10 @@ where
             }
         }
         self.retry_confirmed_transport_fanouts(&mut output).await?;
+        // Roster housekeeping waits behind the KeyPackage steps' commits
+        // (mdk#2628 3.1d).
+        let expired = self.drop_expired_removed_slots_for_maintenance(held).await;
+        output.absorb_account_effects(expired);
 
         // Old groups have no enrollment row and are intentionally excluded.
         let active_obligations = self.session.maintenance_obligations()?;

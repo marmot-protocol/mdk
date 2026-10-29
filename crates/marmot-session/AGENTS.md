@@ -31,20 +31,25 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   - `runtime/slot_announcement.rs` — the slot-announcement gate (mdk#2628 3.4): while the host names a device group,
     no KeyPackage reaches this device's slot until this device's own roster entry there names it. Maintenance
     announces first.
-  - `runtime/device_roster.rs` — the one roster write path (`edit_device_roster_entry`, mdk#2628 3.4, 3.6): one
-    `SetDevice` commit replacing one device entry with an edit applied to the roster as read now. It sends nothing
-    unless the device group is stable with nothing of this device's in flight, and sends the edit as
-    `SendIntent::ReplaceDeviceEntry` naming the entry it read: the engine stages it only while the slot still holds
+  - `runtime/device_roster.rs` — this device's reads and writes of its device group's roster: its slot, the merged
+    roster, the gate its roster commits wait behind (not stable, held, quarantined, settling, or a change of this
+    device's still queued or unconfirmed), and the sends. The runtime's roster-writing steps use these rather than
+    their own copies. Device entries have one write path (`edit_device_roster_entry`, mdk#2628 3.4, 3.6): one
+    `SetDevice` commit replacing one device entry with an edit applied to the roster as read now, sent as
+    `SendIntent::ReplaceDeviceEntry` naming the entry it read. The engine stages it only while the slot still holds
     that entry, so an entry is never replaced from a stale read (`DeviceEntryChanged` maps to `Busy`). Announcements,
     the tag signature key and the host's device edits all go through it; don't add another device-entry commit. Each
     announcement also writes the host's `DeviceSelfReport` (this device's client and platform) into its own entry.
+    `send_device_roster_update` carries rejected-slot operations only.
   - `runtime/device_tag_key.rs` — this device's tag signature key (mdk#2628 3.1d): the host names the device group to
     tag from (`set_device_tag_group`). Maintenance, and the host before each KeyPackage publication
     (`set_device_tag_key_holding`), set this device's MLS signature key in its own roster entry when the entry lacks
-    it, through `edit_device_roster_entry` like the announcement. No KeyPackage is staged, announced or published while the key is due and not
-    in the merged roster, or while another device's entry carries it (the engine tags from whichever entry does), and
-    a staged one that no longer advertises what this device would build is replaced. A refresh held back this way
-    counts toward `key_package_refresh_overdue` like one held back by its announcement.
+    it, through `edit_device_roster_entry` like the announcement. No KeyPackage is staged, announced or published
+    while the key is due and not in the merged roster, or while another device's entry carries it (the engine tags
+    from whichever entry does), and a staged one that no longer advertises what this device would build is replaced.
+    A refresh held back this way counts toward `key_package_refresh_overdue` like one held back by its announcement.
+  - `runtime/removed_slot_expiry.rs` — maintenance drops `removed` slot records 30 days after their `rejected_at`, by
+    this device's clock (device-roster-v1.md), in one roster update after the KeyPackage steps. `not_me` records stay.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.

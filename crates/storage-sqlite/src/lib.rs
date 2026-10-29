@@ -22,11 +22,11 @@ pub use app::account_recovery::{
     RECOVERY_PARK_AFTER_ATTEMPTS, RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryCause,
     RecoveryComparison, RecoveryComparisonOutcome, RecoveryComparisonPlan, RecoveryDemand,
     RecoveryDemandTicket, RecoveryDemandTransition, RecoveryEligibility,
-    RecoveryEndpointCheckpoint, RecoveryLossCause, RecoveryLossImport, RecoveryLossSnapshot,
-    RecoveryLossWatermark, RecoveryObligationState, RecoveryObligationStatus, RecoveryPassProgress,
-    RecoveryPredicate, RecoveryReplayPlacement, RecoveryRequest, RecoveryRetryState,
-    RecoveryRevisionFence, RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan,
-    RecoveryScopeToken, StoredRecoveryScope,
+    RecoveryEndpointCheckpoint, RecoveryLossCause, RecoveryLossImport, RecoveryLossReach,
+    RecoveryLossSnapshot, RecoveryLossWatermark, RecoveryObligationState, RecoveryObligationStatus,
+    RecoveryPassProgress, RecoveryPredicate, RecoveryReplayPlacement, RecoveryRequest,
+    RecoveryRetryState, RecoveryRevisionFence, RecoveryScopeCheckpoint, RecoveryScopeOutcome,
+    RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
 };
 pub use app::local_submissions::LocalSubmission;
 pub use app::media_catalog::{SlotPublication, SqliteMediaCatalog, media_storage_error};

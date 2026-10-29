@@ -648,8 +648,16 @@ At settlement the recorder compares the ledger with every pending obligation's s
 aggregate counts: scopes owed or proved by both, scopes the obligation still owes that the
 ledger proved (ledger ahead), scopes the obligation proved that the ledger has not (ledger
 behind), and current routes with ledger debt that no pending scope covers. A scope holds proof
-only as completion would count it: its predicate over checkpoints captured at the account's
-current loss, route and inventory revisions and the obligation's own revision. A scope whose
+only as completion would count it once loss invalidates by route: its predicate over
+checkpoints captured at the account's current route and inventory revisions and the
+obligation's own revision. Each loss import stamps the generations it charged with the loss
+revision it left, so a checkpoint from before newer loss stops counting only where loss
+imported after its revision, retired since or not, may have lost an event on the scope's route
+at or before the scope's end. Acknowledgment deletes the evidence that says where loss reached
+and keeps only the highest stamp it deleted, so a scope that would hold but has newer loss
+acknowledged since is not comparable until a pass captures it again. A loss obligation owes every route, so its scope on a route its loss never reached
+at or before the scope's end is not comparable, and the report restores a loss goal only on
+the routes the loss reached, from where it reached each. A scope whose
 floor is unknown or older than the retained window is owed from that window's floor. On each
 required relay the ledger is read only up to that relay's live tail, which vouches for the
 rest provisionally, as replay admission does for the obligation; unowed debt is read the same
@@ -659,10 +667,12 @@ a bounded loss, a certified pass) the two agree at every step.
 
 Known disagreements, expected until later phases remove their cause:
 
-- **Certificates voided by an unrelated loss.** A new loss bumps the account-wide loss
-  revision, so no earlier certificate qualifies any more; the ledger keeps coverage below the
-  loss floor, including a running pass's certificates below it. Pending scopes whose windows
-  end below the floor show as ledger ahead. Phase 4 deletes the global invalidation.
+- **Loss obligations re-owe every route they reached.** The report invalidates checkpoints by
+  route and window, but a loss obligation still owes account-wide: newer loss of its own cause
+  bumps its revision, so its scopes stop holding proof on every route, and it owes every
+  generation it has not acknowledged, including one a pass already recovered. Its scopes on
+  routes that older loss reached and the newer loss did not show as ledger ahead until a pass
+  captures them again. Phase 4 deletes the global invalidation.
 - **Route and inventory revisions.** A route-policy change or a released inventory journal
   bumps an account-wide revision, so pending scopes stop holding proof until the next pass
   captures it again. The ledger keeps per-relay coverage, so a covered window is ledger ahead

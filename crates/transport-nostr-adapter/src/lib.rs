@@ -8053,13 +8053,21 @@ mod batch_tests {
                 .account_replay_coverage
                 .insert(account.clone(), coverage);
         }
-        // Per relay: whether it holds a live count, and whether it streams.
+        // Per relay, a then b: whether it holds a live count, and whether it
+        // streams. `endpoints()` comes in no fixed order, so sort by relay.
         let streams = || async {
             let status = adapter.take_replay_status(&account).await;
             let source = status.sources().next().expect("one live REQ");
             source
                 .endpoints()
-                .map(|endpoint| (endpoint.live_count().is_some(), endpoint.streaming()))
+                .map(|endpoint| {
+                    (
+                        endpoint.endpoint().clone(),
+                        (endpoint.live_count().is_some(), endpoint.streaming()),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_values()
                 .collect::<Vec<_>>()
         };
         assert_eq!(streams().await, [(true, true), (true, false)]);
