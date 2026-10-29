@@ -5187,8 +5187,9 @@ where
         Ok(output)
     }
 
-    /// Withdraw one retained current-profile outbound Welcome, owed or still
-    /// staged with its commit, so that no path publishes it again: not
+    /// Withdraw one retained delivery-aware outbound Welcome (see
+    /// `Engine::withdraw_sent_welcome`), owed or still staged with its
+    /// commit, so that no path publishes it again: not
     /// startup recovery, maintenance retries, explicit redelivery, nor
     /// release after its commit confirms. Its remaining relay retries are
     /// dropped with it. A relay attempt already started cannot be recalled;

@@ -561,3 +561,96 @@ async fn legacy_create_welcome_cannot_be_withdrawn() {
             .unwrap()
     );
 }
+
+/// Withdrawal needs no hydration: a restart can stop a Welcome before its
+/// group is hydrated, and nothing publishes it afterwards, hydrated or not.
+#[tokio::test]
+async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot unhydrated withdrawal key").unwrap();
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob-unhydrated");
+    let bob_inbox = TransportEndpoint("wss://bob-inbox.example".into());
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_inbox_route(bob.self_id(), vec![bob_inbox.clone()]);
+    let adapter = RecordingAdapter::default();
+    adapter.accept_next(0);
+    let wall = Arc::new(TestWallClock::new(300_000));
+    let open = |session: AccountDeviceSession| {
+        AccountDeviceRuntime::new(
+            session,
+            adapter.clone(),
+            policy.clone(),
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        )
+    };
+    let mut runtime = open(current_session(&database, &key, b"alice-unhydrated"));
+    let (group_id, created) = runtime
+        .create_group(CreateGroupRequest {
+            name: "unhydrated withdrawal".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.welcome_failures.len(), 1);
+    let welcome = welcome_publishes(&adapter)
+        .pop()
+        .expect("creation tried Bob's Welcome");
+    drop(runtime);
+
+    adapter.accept_only_endpoints(vec![bob_inbox]);
+    let mut runtime = open(deferred_current_session(
+        &database,
+        &key,
+        b"alice-unhydrated",
+    ));
+    assert_eq!(runtime.session().unhydrated_group_ids(), vec![group_id.clone()]);
+    assert_eq!(
+        runtime.withdraw_welcome(&welcome.id).unwrap(),
+        WelcomeWithdrawal::Withdrawn
+    );
+    assert!(
+        runtime
+            .session()
+            .transport_fanout(&welcome.id)
+            .unwrap()
+            .is_none()
+    );
+    runtime
+        .publish_welcome_messages_with_audit_context(
+            vec![welcome.clone()],
+            Some(group_id.clone()),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    runtime
+        .retry_welcome_messages_with_audit_context(vec![welcome.clone()], Default::default())
+        .await
+        .unwrap();
+    let task = runtime
+        .prepare_welcome_retry_task_with_audit_context(vec![welcome.clone()], Default::default())
+        .unwrap();
+    assert!(task.message_ids().is_empty(), "no detached relay attempt");
+    runtime.resume_outbound_fanouts().await.unwrap();
+    wall.set(300_100);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(welcome_publishes(&adapter).len(), 1);
+    assert_eq!(runtime.session().unhydrated_group_ids(), vec![group_id]);
+    drop(runtime);
+
+    let mut runtime = open(current_session(&database, &key, b"alice-unhydrated"));
+    assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(welcome_publishes(&adapter).len(), 1);
+}

@@ -3451,10 +3451,10 @@ impl<S: StorageProvider> Engine<S> {
     /// flight cannot be recalled; its later delivered mark fails, because
     /// the row is no longer `Sent`.
     ///
-    /// Only delivery-aware Welcomes (current-profile founding and invite
-    /// Welcomes) can be withdrawn. A legacy-profile create's Welcome is the
-    /// create's own publication, carried on its frozen fanout, so withdrawing
-    /// it could not stop it.
+    /// Only delivery-aware Welcomes (invite Welcomes, and a current-profile
+    /// create's founding Welcomes) can be withdrawn. A legacy-profile
+    /// create's Welcome is the create's own publication, carried on its
+    /// frozen fanout, so withdrawing it could not stop it.
     ///
     /// Withdrawal touches only the Welcome's own row, never group state, so
     /// it works for a group not hydrated yet: a restart must be able to stop
