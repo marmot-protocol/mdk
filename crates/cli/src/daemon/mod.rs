@@ -402,11 +402,14 @@ async fn handle_daemon_connection(
             .await;
         }
         DaemonRequest::Shutdown => {
+            let ack = DaemonShutdownAck {
+                pid: std::process::id(),
+            };
             write_daemon_output(
                 &mut stream,
                 &CliOutput {
                     code: 0,
-                    stdout: String::new(),
+                    stdout: serde_json::to_string(&ack).unwrap_or_default(),
                     stderr: String::new(),
                 },
             )

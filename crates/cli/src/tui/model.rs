@@ -420,6 +420,8 @@ pub(crate) struct ChatLastMessage {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DaemonView {
     pub(crate) running: bool,
+    /// The daemon is still opening its accounts.
+    pub(crate) starting: bool,
     pub(crate) pid: Option<u64>,
     pub(crate) last_runtime_activity: Option<DaemonRuntimeActivityView>,
     pub(crate) stream_watches: Vec<DaemonStreamWatchView>,
@@ -4401,6 +4403,10 @@ pub(crate) fn parse_daemon_view(value: &Value) -> DaemonView {
     DaemonView {
         running: value
             .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        starting: value
+            .get("starting")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         pid: value.get("pid").and_then(Value::as_u64),

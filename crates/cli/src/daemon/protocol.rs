@@ -112,6 +112,14 @@ pub struct DaemonStatus {
     pub stream_watches: Vec<DaemonStreamWatchReport>,
 }
 
+/// The daemon's answer to [`DaemonRequest::Shutdown`]: its pid, so
+/// `wn daemon stop` can wait for that process to exit. A daemon answers
+/// before it shuts down.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DaemonShutdownAck {
+    pub(crate) pid: u32,
+}
+
 pub type DaemonStreamWatchReport = marmot_app::AgentStreamWatchReport;
 
 pub type DaemonOutgoingStreamReport = StreamComposeReport;

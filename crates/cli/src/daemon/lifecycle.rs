@@ -222,6 +222,40 @@ pub(crate) fn blocked_daemon_execute_command(
     }
 }
 
+/// How long `wn daemon start` waits for the `wnd` it spawned to answer while
+/// that daemon is still running. A warm start answers in well under a second,
+/// but the first launch of a freshly linked binary on a loaded macOS machine
+/// waited up to 8.5 s before reaching `main` (mdk#2696), and the daemon answers
+/// only after its app runtime starts, which waits up to 45 s for each account
+/// to open (`APP_RUNTIME_ACCOUNT_READY_WAIT` in `marmot-app`). The cap covers
+/// both, so it stops only a daemon that has outlived its own startup budget. A
+/// daemon that exits fails the start at once.
+pub(crate) const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Explicit test builds only: `WN_DEV_DAEMON_START_TIMEOUT_MS` replaces
+/// [`DAEMON_START_TIMEOUT`] so CLI tests can reach the cap without waiting for
+/// it. Like `WN_DEV_SETTLEMENT_QUIESCENCE_MS`, it is an error in normal
+/// binaries.
+pub(crate) fn resolve_daemon_start_timeout(
+    value: Option<&str>,
+    dev_overrides_enabled: bool,
+) -> Result<Duration, String> {
+    match value {
+        None => Ok(DAEMON_START_TIMEOUT),
+        Some(_) if !dev_overrides_enabled => Err(
+            "WN_DEV_DAEMON_START_TIMEOUT_MS requires a test-policy-overrides build; unset it in normal binaries"
+                .to_owned(),
+        ),
+        Some(value) => Ok(value
+            .trim()
+            .parse()
+            .map(Duration::from_millis)
+            .unwrap_or(DAEMON_START_TIMEOUT)),
+    }
+}
+
 pub(crate) async fn start_daemon(
     cli: &Cli,
     home: &Path,
@@ -230,6 +264,21 @@ pub(crate) async fn start_daemon(
     mut default_account_relays: Vec<String>,
     logs_dir: Option<PathBuf>,
 ) -> CliOutput {
+    let start_timeout = match resolve_daemon_start_timeout(
+        std::env::var("WN_DEV_DAEMON_START_TIMEOUT_MS")
+            .ok()
+            .as_deref(),
+        cfg!(feature = "test-policy-overrides"),
+    ) {
+        Ok(timeout) => timeout,
+        Err(message) => {
+            return daemon_error(
+                cli.json,
+                "dev_daemon_start_timeout_override_in_release",
+                message,
+            );
+        }
+    };
     if let Ok(status) = DaemonClient::new(socket).status().await {
         return daemon_output(
             cli.json,
@@ -322,43 +371,263 @@ pub(crate) async fn start_daemon(
     };
     command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
 
-    if let Err(err) = command.spawn() {
-        return daemon_error(cli.json, "daemon_start_failed", err.to_string());
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Ok(status) = DaemonClient::new(socket).status().await {
-            return daemon_output(cli.json, "daemon started", daemon_status_json(status), 0);
+    // Ctrl-C stops the daemon this command starts: it runs in its own process
+    // group, so the terminal's SIGINT does not reach it. Register before the
+    // spawn so no SIGINT can end this process with the daemon left starting.
+    let sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+    let interrupted = async move {
+        let received = match sigint {
+            Ok(mut sigint) => sigint.recv().await.is_some(),
+            Err(_) => false,
+        };
+        if !received {
+            std::future::pending::<()>().await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    };
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => return daemon_error(cli.json, "daemon_start_failed", err.to_string()),
+    };
 
-    daemon_error(
-        cli.json,
-        "daemon_start_failed",
-        format!(
-            "daemon did not become ready at {}; log: {}{}",
-            socket.display(),
-            log_path.display(),
-            daemon_log_hint(&log_path)
+    match wait_for_spawned_daemon(socket, &mut child, start_timeout, interrupted).await {
+        SpawnedDaemon::Ready(status) => {
+            daemon_output(cli.json, "daemon started", daemon_status_json(status), 0)
+        }
+        SpawnedDaemon::AlreadyRunning(status) => daemon_output(
+            cli.json,
+            "daemon already running",
+            daemon_status_json(status),
+            0,
         ),
+        SpawnedDaemon::Exited(exit) => daemon_error(
+            cli.json,
+            "daemon_start_failed",
+            format!(
+                "wnd exited before it became ready ({exit}); log: {}{}",
+                log_path.display(),
+                daemon_log_hint(&log_path)
+            ),
+        ),
+        SpawnedDaemon::Stopped => daemon_error(
+            cli.json,
+            "daemon_start_timeout",
+            format!(
+                "daemon did not become ready at {} within {start_timeout:?}, so it was stopped; log: {}{}",
+                socket.display(),
+                log_path.display(),
+                daemon_log_hint(&log_path)
+            ),
+        ),
+        SpawnedDaemon::Interrupted => daemon_error(
+            cli.json,
+            "daemon_start_interrupted",
+            format!(
+                "interrupted before the daemon at {} became ready, so it was stopped; log: {}",
+                socket.display(),
+                log_path.display()
+            ),
+        ),
+    }
+}
+
+/// How the `wnd` that `start_daemon` spawned turned out.
+#[derive(Debug)]
+pub(crate) enum SpawnedDaemon {
+    /// It answered on the socket and has opened its accounts.
+    Ready(DaemonStatus),
+    /// Another daemon answers on the socket: two starts raced for it and the
+    /// other one won. The spawned `wnd` has exited or been stopped.
+    AlreadyRunning(DaemonStatus),
+    /// It exited before it answered.
+    Exited(std::process::ExitStatus),
+    /// It was still running but not ready when the timeout passed, so it was
+    /// killed and reaped.
+    Stopped,
+    /// The wait was interrupted, so it was killed and reaped.
+    Interrupted,
+}
+
+/// Wait for the `wnd` that `start_daemon` spawned to answer on `socket` with
+/// its accounts open. It fails as soon as the daemon exits, and stops the
+/// daemon once `timeout` passes or `interrupt` completes, so a failed start
+/// never leaves a daemon running.
+pub(crate) async fn wait_for_spawned_daemon(
+    socket: &Path,
+    child: &mut std::process::Child,
+    timeout: Duration,
+    interrupt: impl std::future::Future<Output = ()>,
+) -> SpawnedDaemon {
+    let deadline = Instant::now() + timeout;
+    let client = DaemonClient::new(socket);
+    tokio::pin!(interrupt);
+    // At most one status probe is in flight, checked alongside the child, the
+    // deadline and the interrupt: a daemon from before status answered during
+    // startup holds the probe until it has opened its accounts.
+    let mut probe = Box::pin(client.status());
+    loop {
+        tokio::select! {
+            status = &mut probe => {
+                match status {
+                    Ok(status) if status.pid == Some(child.id()) && !status.starting => {
+                        return SpawnedDaemon::Ready(status);
+                    }
+                    Ok(status) if status.pid == Some(child.id()) => {}
+                    Ok(status) => {
+                        // Another daemon holds the socket. Stop ours, which
+                        // could otherwise take the socket over once that one
+                        // stops.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return SpawnedDaemon::AlreadyRunning(status);
+                    }
+                    Err(_) => {}
+                }
+                tokio::time::sleep(DAEMON_POLL_INTERVAL).await;
+                probe = Box::pin(client.status());
+            }
+            () = tokio::time::sleep(DAEMON_POLL_INTERVAL) => {}
+            () = &mut interrupt => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return SpawnedDaemon::Interrupted;
+            }
+        }
+        if let Ok(Some(exit)) = child.try_wait() {
+            return match tokio::time::timeout(DAEMON_POLL_INTERVAL * 10, client.status()).await {
+                Ok(Ok(status)) => SpawnedDaemon::AlreadyRunning(status),
+                _ => SpawnedDaemon::Exited(exit),
+            };
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return SpawnedDaemon::Stopped;
+        }
+    }
+}
+
+/// How long `wn daemon stop` waits for the daemon to exit after it accepts the
+/// request. The daemon answers before it shuts down its app runtime, which
+/// gives its account workers 5 s and its relay connections 2 s, side by side;
+/// a daemon on a live relay exited within 0.2 s of answering on a heavily
+/// loaded machine (mdk#2696).
+pub(crate) const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(crate) async fn stop_daemon(json: bool, socket: &Path) -> CliOutput {
+    stop_daemon_within(json, socket, DAEMON_STOP_TIMEOUT).await
+}
+
+/// Ask the daemon on `socket` to stop, and report it stopped only once its
+/// process has exited.
+pub(crate) async fn stop_daemon_within(json: bool, socket: &Path, timeout: Duration) -> CliOutput {
+    // The daemon answers before it shuts down, with the pid to wait for.
+    let pid = match DaemonClient::new(socket).shutdown().await {
+        Ok(output) => serde_json::from_str::<DaemonShutdownAck>(output.stdout.trim())
+            .ok()
+            .map(|ack| ack.pid),
+        Err(err @ DaemonClientError::ServerBusy) => {
+            return daemon_error(json, DAEMON_SERVER_BUSY_CODE, err.to_string());
+        }
+        Err(err) => return daemon_error(json, "daemon_unavailable", err.to_string()),
+    };
+    let exited = match pid {
+        Some(pid) => wait_for_process_exit(pid, timeout).await,
+        // A daemon built before its answer carried a pid removes its socket
+        // as the last step of its shutdown.
+        None => wait_for_socket_removal(socket, timeout).await,
+    };
+    if !exited {
+        let daemon = pid.map_or_else(|| "daemon".to_owned(), |pid| format!("daemon {pid}"));
+        return daemon_error(
+            json,
+            "daemon_stop_timeout",
+            format!(
+                "{daemon} at {} accepted the stop request but is still running after {timeout:?}",
+                socket.display()
+            ),
+        );
+    }
+    daemon_output(
+        json,
+        "daemon stopped",
+        serde_json::json!({"running": false, "socket": socket}),
+        0,
     )
 }
 
-pub(crate) async fn stop_daemon(json: bool, socket: &Path) -> CliOutput {
-    match DaemonClient::new(socket).shutdown().await {
-        Ok(_) => daemon_output(
-            json,
-            "daemon stopped",
-            serde_json::json!({"running": false, "socket": socket}),
-            0,
-        ),
-        Err(err @ DaemonClientError::ServerBusy) => {
-            daemon_error(json, DAEMON_SERVER_BUSY_CODE, err.to_string())
+/// Whether process `pid` exits within `timeout`.
+async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while process_running(pid) {
+        if Instant::now() >= deadline {
+            return false;
         }
-        Err(err) => daemon_error(json, "daemon_unavailable", err.to_string()),
+        tokio::time::sleep(DAEMON_POLL_INTERVAL).await;
     }
+    true
+}
+
+/// Whether the socket file is removed within `timeout`. It is watched rather
+/// than connected to: a daemon shutting down no longer accepts, so probe
+/// connections would fill its backlog and fail as if it had closed.
+async fn wait_for_socket_removal(socket: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match std::fs::symlink_metadata(socket) {
+            Err(err) if err.kind() == ErrorKind::NotFound => return true,
+            _ if Instant::now() >= deadline => return false,
+            _ => tokio::time::sleep(DAEMON_POLL_INTERVAL).await,
+        }
+    }
+}
+
+/// Whether process `pid` is still running. A process that has exited but that
+/// its parent has not reaped yet (a zombie) is not: a parent can wait for
+/// `wn daemon stop` before reaping, and some container init processes never
+/// reap.
+#[cfg(target_os = "macos")]
+fn process_running(pid: u32) -> bool {
+    let Ok(pid) = libc::c_int::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: `proc_bsdinfo` holds only integers and byte arrays, so all
+    // zeroes is a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size as libc::c_int,
+        )
+    };
+    usize::try_from(written).is_ok_and(|written| written == size) && info.pbi_status != libc::SZOMB
+}
+
+#[cfg(target_os = "linux")]
+fn process_running(pid: u32) -> bool {
+    // The state follows the command name, which is in parentheses and may
+    // itself contain spaces or parentheses.
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next())
+            .is_some_and(|state| !matches!(state, 'Z' | 'X'))
+    })
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn process_running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill with signal 0 sends nothing and touches no memory.
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
 }
 
 pub(crate) async fn status_daemon(json: bool, socket: &Path) -> CliOutput {
