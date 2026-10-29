@@ -1502,3 +1502,60 @@ async fn an_unreadable_device_group_refuses_publication() {
     assert!(phone.publish_key_package().await.is_err());
     assert!(published_kinds(&relay, before).is_empty());
 }
+
+/// Make this device's newest slot publication `days` days old.
+fn age_publication(app: &MarmotApp, days: u64) {
+    let storage = app.account_storage("alice").unwrap();
+    let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
+    let now = unix_now_seconds();
+    lifecycle.authored_event_created_at = Some(Timestamp(now - days * 24 * 60 * 60));
+    storage.put_key_package_lifecycle(&lifecycle).unwrap();
+}
+
+/// A refresh is overdue once the device group has held its announcement back
+/// and the slot's publication is a week old. A routine refresh announces and
+/// publishes in one pass, so it never shows; nor does a held-back one while
+/// the publication is younger than a week. The maintenance pass that finds it
+/// overdue owes hosts a change, and so does the one that publishes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_held_back_a_week_is_overdue_until_it_publishes() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            laptop_app,
+            mut laptop,
+            ..
+        },
+        _group,
+    ) = linked_devices().await;
+    assert!(laptop.take_key_package_refresh_overdue_changed());
+    laptop.run_due_maintenance().await.unwrap();
+    let _ = laptop.take_key_package_refresh_overdue_changed();
+
+    age_publication(&laptop_app, 8);
+    let before = relay.published_events.lock().unwrap().len();
+    laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        published_kinds(&relay, before),
+        vec![transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE, 30443]
+    );
+    assert!(!laptop.key_package_refresh_overdue().unwrap());
+    assert!(!laptop.take_key_package_refresh_overdue_changed());
+
+    relay.reject_next_publish();
+    laptop.rotate_key_package().await.unwrap_err();
+    assert!(!laptop.key_package_refresh_overdue().unwrap());
+
+    age_publication(&laptop_app, 8);
+    relay.reject_next_publish();
+    let before = relay.published_events.lock().unwrap().len();
+    laptop.run_due_maintenance().await.unwrap();
+    assert!(published_kinds(&relay, before).is_empty());
+    assert!(laptop.key_package_refresh_overdue().unwrap());
+    assert!(laptop.take_key_package_refresh_overdue_changed());
+
+    laptop.run_due_maintenance().await.unwrap();
+    assert!(!laptop.key_package_refresh_overdue().unwrap());
+    assert!(laptop.take_key_package_refresh_overdue_changed());
+}
