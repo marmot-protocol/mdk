@@ -426,9 +426,17 @@ impl<S: StorageProvider> Engine<S> {
                 group_id: group_id.clone(),
             });
         }
-        if record.is_terminal()
-            || record.unrecoverable
-            || self.leave_in_progress(group_id)?
+        if record.is_terminal() {
+            return Err(EngineError::NotAMember {
+                group_id: group_id.clone(),
+            });
+        }
+        if record.unrecoverable || self.epoch_manager.is_unrecoverable(group_id) {
+            return Err(EngineError::GroupUnrecoverableRepairRequired {
+                group_id: group_id.clone(),
+            });
+        }
+        if self.leave_in_progress(group_id)?
             || self.disbanding_in_progress(group_id)?
             || !self
                 .epoch_manager
@@ -613,12 +621,19 @@ impl<S: StorageProvider> Engine<S> {
         use openmls_traits::signatures::Signer as _;
         self.ensure_group_live(group_id)?;
         let record = self.storage.get_group(group_id)?;
-        if !record.unrecoverable
-            || !self.epoch_manager.is_unrecoverable(group_id)
-            || record.is_terminal()
-            || self.leave_in_progress(group_id)?
-            || self.disbanding_in_progress(group_id)?
-        {
+        if record.is_terminal() {
+            return Err(EngineError::NotAMember {
+                group_id: group_id.clone(),
+            });
+        }
+        if !record.unrecoverable || !self.epoch_manager.is_unrecoverable(group_id) {
+            // A grant cannot authorize replacing a usable local copy. Waiting
+            // for its epoch to settle never makes this same grant eligible.
+            return Err(EngineError::GroupRecoverySourceMismatch {
+                group_id: group_id.clone(),
+            });
+        }
+        if self.leave_in_progress(group_id)? || self.disbanding_in_progress(group_id)? {
             return Err(EngineError::GroupRecoveryUnsettled {
                 group_id: group_id.clone(),
             });

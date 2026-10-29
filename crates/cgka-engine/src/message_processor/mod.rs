@@ -985,6 +985,9 @@ impl<S: StorageProvider> Engine<S> {
         // silently un-quarantine it out of band (mdk#364).
         self.ensure_group_live(&group_id)?;
         if self.storage.disband_tombstone(&group_id)?.is_some() {
+            if matches!(intent, SendIntent::RecoverMembers { .. }) {
+                return Err(EngineError::NotAMember { group_id });
+            }
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Disbanded",
@@ -1003,6 +1006,11 @@ impl<S: StorageProvider> Engine<S> {
         // no add (including a re-add) may be staged or queued.
         // One record read serves this gate and the two terminal gates below.
         let group = self.stored_group_record(&group_id)?;
+        if matches!(intent, SendIntent::RecoverMembers { .. })
+            && group.as_ref().is_some_and(|group| group.is_terminal())
+        {
+            return Err(EngineError::NotAMember { group_id });
+        }
         if self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
             && matches!(
                 intent,

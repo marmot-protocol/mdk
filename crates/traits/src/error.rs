@@ -360,8 +360,9 @@ impl EngineError {
 
     /// Whether this error reflects transient backend contention or a recovery
     /// source waiting for group evolution to settle, rather than a durable
-    /// failure. A mismatched recovery source is not transient: it requires a
-    /// fresh authenticated challenge, not another attempt with the same grant.
+    /// failure. Ineligible copies and mismatched recovery authority are not
+    /// transient: recheck eligibility and, when appropriate, obtain a fresh
+    /// authenticated challenge rather than retrying the same grant.
     /// Callers driving the
     /// publish-before-apply lifecycle use this to retry `confirm_published`
     /// instead of surfacing a lock blip as a fatal failure — the confirm path

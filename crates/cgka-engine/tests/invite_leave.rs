@@ -1335,13 +1335,14 @@ async fn member_recovery_needs_proof() {
             device_signature: vec![],
         },
     };
-    assert!(
-        matches!(
-            claimant.sign_group_recovery(&group_id, &admin.self_id(), &unsigned),
-            Err(EngineError::GroupRecoveryUnsettled { .. })
-        ),
-        "usable copies never sign automatic recovery"
-    );
+    let refusal = claimant
+        .sign_group_recovery(&group_id, &admin.self_id(), &unsigned)
+        .expect_err("usable copies never sign automatic recovery");
+    assert!(!refusal.is_transient());
+    assert!(matches!(
+        refusal,
+        EngineError::GroupRecoverySourceMismatch { .. }
+    ));
     for mutation in 0..3 {
         let mut replay = valid.clone();
         match mutation {
@@ -1372,6 +1373,90 @@ async fn member_recovery_needs_proof() {
         admin.validate_member_recovery(&group_id, &expired),
         Err(EngineError::GroupRecoverySourceMismatch { .. })
     ));
+}
+
+#[tokio::test]
+async fn recovery_halted_coordinator() {
+    let (admin, storage, target, _, group_id, _) = member_recovery_fixture().await;
+    let device_key = target.own_recovery_key_hash(&group_id).unwrap();
+    admin
+        .group_recovery_source(&group_id, &target.self_id(), &device_key)
+        .unwrap();
+    drop(admin);
+    let mut record = storage.get_group(&group_id).unwrap();
+    record.unrecoverable = true;
+    storage.put_group(&record).unwrap();
+    let mut admin = EngineBuilder::new(storage.clone())
+        .identity(pad32(b"recovery-admin"))
+        .account_identity_proof_signer(proof_signer(b"recovery-admin"))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    admin.hydrate_all_stored_groups().unwrap();
+    let refusal = admin
+        .group_recovery_source(&group_id, &target.self_id(), &device_key)
+        .unwrap_err();
+    assert!(!refusal.is_transient());
+    assert!(matches!(
+        refusal,
+        EngineError::GroupUnrecoverableRepairRequired { .. }
+    ));
+    assert_eq!(storage.get_group(&group_id).unwrap(), record);
+}
+
+#[tokio::test]
+async fn recovery_removed_coordinator() {
+    let (mut admin, storage, mut target, _, group_id, target_storage) =
+        member_recovery_fixture().await;
+    let device_key = target.own_recovery_key_hash(&group_id).unwrap();
+    let source = admin
+        .group_recovery_source(&group_id, &target.self_id(), &device_key)
+        .unwrap();
+    let grant = signed_member_recovery(
+        &target_storage,
+        &group_id,
+        &admin.self_id(),
+        &target.self_id(),
+        source,
+        target.fresh_key_package().await.unwrap(),
+    );
+    let SendResult::GroupEvolution { msg, pending, .. } = target
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![admin.self_id()],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("remove coordinator")
+    };
+    target.confirm_published(pending).await.unwrap();
+    admin.ingest(msg).await.unwrap();
+    converge_buffered_commit(&mut admin, &group_id);
+    let record = storage.get_group(&group_id).unwrap();
+    assert!(record.removed);
+    let refusal = admin
+        .group_recovery_source(&group_id, &target.self_id(), &device_key)
+        .unwrap_err();
+    assert!(!refusal.is_transient());
+    assert!(matches!(refusal, EngineError::NotAMember { .. }));
+    let refusal = admin
+        .send(SendIntent::RecoverMembers {
+            group_id: group_id.clone(),
+            members: vec![grant],
+        })
+        .await
+        .unwrap_err();
+    assert!(!refusal.is_transient());
+    assert!(matches!(refusal, EngineError::NotAMember { .. }));
+    assert_eq!(storage.get_group(&group_id).unwrap(), record);
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1580,21 +1665,36 @@ async fn member_recovery_refuses_stale() {
     else {
         panic!("self update")
     };
+    let unsettled = admin
+        .group_recovery_source(
+            &group_id,
+            &target.self_id(),
+            &target.own_recovery_key_hash(&group_id).unwrap(),
+        )
+        .unwrap_err();
+    assert!(unsettled.is_transient());
     assert!(matches!(
-        admin
-            .send(SendIntent::RecoverMembers {
-                group_id: group_id.clone(),
-                members: vec![signed_member_recovery(
-                    &target_storage,
-                    &group_id,
-                    &admin.self_id(),
-                    &target.self_id(),
-                    source.clone(),
-                    fresh.clone(),
-                )]
-            })
-            .await,
-        Err(EngineError::GroupRecoveryUnsettled { .. })
+        unsettled,
+        EngineError::GroupRecoveryUnsettled { .. }
+    ));
+    let unsettled = admin
+        .send(SendIntent::RecoverMembers {
+            group_id: group_id.clone(),
+            members: vec![signed_member_recovery(
+                &target_storage,
+                &group_id,
+                &admin.self_id(),
+                &target.self_id(),
+                source.clone(),
+                fresh.clone(),
+            )],
+        })
+        .await
+        .unwrap_err();
+    assert!(unsettled.is_transient());
+    assert!(matches!(
+        unsettled,
+        EngineError::GroupRecoveryUnsettled { .. }
     ));
     assert!(
         storage
