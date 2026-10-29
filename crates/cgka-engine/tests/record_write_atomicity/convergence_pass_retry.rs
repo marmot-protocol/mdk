@@ -698,6 +698,40 @@ async fn a_proposal_rewritten_into_an_older_row_reopens_a_parked_pass() {
     assert_eq!(reopened.retry, None);
 }
 
+/// The park and the explicit retry pass the engine's liveness gate. A group
+/// only seeded at open reports no park until a schedule read hydrates it;
+/// a quarantined group reports none and its stored pass takes no retry.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn an_unvalidated_group_reports_no_park_and_takes_no_retry() {
+    let mut case = failing_catch_up("retry-liveness").await;
+    case.fault.arm(ALWAYS);
+    case.fail_until_parked();
+    case.fault.arm(0);
+
+    case.restart(0);
+    assert!(!case.carol.convergence_pass_parked(&case.group_id).unwrap());
+    assert_eq!(case.scheduled_delay_ms(), None);
+    assert!(case.carol.convergence_pass_parked(&case.group_id).unwrap());
+
+    // A wire profile that no longer matches the stored group fails its
+    // validation at the next hydration, which quarantines it.
+    let mut mismatched = case.handle.get_group(&case.group_id).unwrap();
+    mismatched.protocol_profile = cgka_traits::group::ProtocolProfile::Current;
+    case.handle.put_group(&mismatched).unwrap();
+    case.restart(0);
+    let parked = case.retry();
+    assert!(
+        !case
+            .carol
+            .retry_failed_convergence_pass(&case.group_id)
+            .unwrap()
+    );
+    assert!(case.carol.check_group_live(&case.group_id).is_err());
+    assert!(!case.carol.convergence_pass_parked(&case.group_id).unwrap());
+    assert_eq!(case.retry(), parked, "the stored pass is left as it was");
+}
+
 #[tokio::test]
 async fn input_beyond_the_pass_horizon_leaves_a_parked_pass_parked() {
     let mut case = failing_catch_up("retry-horizon").await;
@@ -808,8 +842,8 @@ async fn a_failed_pass_keeps_its_backoff_and_park_across_a_restart() {
     case.fail_until_parked();
     let failures = ALWAYS - case.fault.remaining();
     case.restart(60 * 60 * 1_000);
-    assert!(case.carol.convergence_pass_parked(&case.group_id).unwrap());
     assert_eq!(case.scheduled_delay_ms(), None);
+    assert!(case.carol.convergence_pass_parked(&case.group_id).unwrap());
     case.attempt()
         .expect("a parked pass stays parked after restart");
     assert_eq!(ALWAYS - case.fault.remaining(), failures);

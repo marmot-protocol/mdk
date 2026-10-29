@@ -375,7 +375,14 @@ impl<S: StorageProvider> Engine<S> {
     /// Whether this group's active pass spent its failure budget and waits for
     /// new selection input or an explicit retry (mdk#2684). Hosts show it as
     /// the group's status and leave the group unscheduled while it holds.
+    ///
+    /// A group the engine has not validated, quarantined or not yet hydrated,
+    /// reports no park and its pass is not read, as the other scheduling reads
+    /// report no work for it; hydration happens at the next schedule read.
     pub fn convergence_pass_parked(&self, group_id: &GroupId) -> Result<bool, StorageError> {
+        if self.ensure_group_live(group_id).is_err() {
+            return Ok(false);
+        }
         Ok(self
             .storage
             .convergence_pass(group_id)?
@@ -388,10 +395,18 @@ impl<S: StorageProvider> Engine<S> {
     /// and keeps the failure count, so a parked batch that fails again parks
     /// again at once instead of starting a fresh budget. Returns whether a
     /// failed batch was due for it.
+    ///
+    /// A seeded-but-unhydrated group is promoted first. A group that is
+    /// quarantined, or that fails that hydration and is quarantined by it,
+    /// has no batch to retry and its stored pass is left as it was.
     pub fn retry_failed_convergence_pass(
         &mut self,
         group_id: &GroupId,
     ) -> Result<bool, StorageError> {
+        let _ = self.ensure_hydrated(group_id);
+        if self.ensure_group_live(group_id).is_err() {
+            return Ok(false);
+        }
         let Some(mut pass) = self.storage.convergence_pass(group_id)? else {
             return Ok(false);
         };

@@ -125,7 +125,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     frozen batch whose apply keeps failing backs off and parks after its budget, reopens on a commit or a
     current-epoch proposal it does not hold, including one a direct-path peel rewrote into an older row, but not on
     application traffic or input beyond its horizon, reseeds nothing on loads with no new input, takes one explicit
-    retry, and keeps its count, delay and park across a
+    retry (none for a quarantined group, whose park reads as none), and keeps its count, delay and park across a
     restart; with `test-conformance-snapshot`, structural progress reports the backoff as a wake, the park as idle,
     a due SelfRemove auto-commit behind either as waiting, and new input as runnable (mdk#2684)
 
