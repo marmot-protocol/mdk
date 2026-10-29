@@ -2586,6 +2586,16 @@ Free a value of this type returned by this library. NULL is a no-op.
 
 [Header contract](include/marmot.h#L12569)
 
+### `marmot_key_package_refresh_overdue`
+
+```c
+MarmotStatus marmot_key_package_refresh_overdue(const struct MarmotClient *client, const char *account_ref, bool *out);
+```
+
+Write whether this device's device group has held its KeyPackage refresh back for a week, so the app warns the user before inviters stop treating the device as fresh at 30 days; blocks on the account worker without network I/O. Always false until this device trusts a device group, and in release builds until the roster's spec lands. Re-read on `MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED`.
+
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotkey_package_refresh_overdue) · [Header contract](include/marmot.h#L7467)
+
 </details>
 
 <details>
@@ -2695,16 +2705,6 @@ Free a list returned by this library. NULL is a no-op.
 
 <details>
 <summary>marmot_m…</summary>
-
-### `marmot_key_package_refresh_overdue`
-
-```c
-MarmotStatus marmot_key_package_refresh_overdue(const struct MarmotClient *client, const char *account_ref, bool *out);
-```
-
-Write whether this device's device group has held its KeyPackage refresh back for a week, so the app warns the user before inviters stop treating the device as fresh at 30 days; blocks on the account worker without network I/O. Always false until this device trusts a device group, and in release builds until the roster's spec lands. Re-read on `MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED`.
-
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotkey_package_refresh_overdue) · [Header contract](include/marmot.h#L7467)
 
 ### `marmot_mark_timeline_message_read`
 
