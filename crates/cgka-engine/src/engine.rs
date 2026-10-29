@@ -2443,7 +2443,8 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// Returns `Ok(false)` for legacy staged commits that predate durable
     /// evolution records; the caller keeps the existing compatibility
-    /// recovery for those.
+    /// recovery for those. Incomplete non-recovery evolution artifacts use
+    /// the same fallback; recovery evolutions instead quarantine the group.
     fn restore_durable_group_evolution_on_hydrate(
         &mut self,
         group_id: &GroupId,
@@ -2524,9 +2525,11 @@ impl<S: StorageProvider> Engine<S> {
         if mls_group.pending_commit().is_none() {
             return recovery_failed();
         }
-        let welcomes = self
-            .staged_welcomes_for_evolution(group_id, source_epoch, &message_id)
-            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        let welcomes = match self.staged_welcomes_for_evolution(group_id, source_epoch, &message_id)
+        {
+            Ok(welcomes) => welcomes,
+            Err(_) => return recovery_failed(),
+        };
         if let cgka_traits::maintenance::GroupEvolutionSemantic::RecoverMembers {
             request_ids, ..
         } = &evolution.semantic
