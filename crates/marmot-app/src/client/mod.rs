@@ -1322,9 +1322,9 @@ impl AppClient {
             // stable slot that has not promoted a current package yet. Resume
             // or prepare that replacement; republish_key_package deliberately
             // rejects pending rotations and requires a current package.
-            Ok(self.runtime.publish_fresh_key_package().await?)
+            self.publish_fresh_key_package_announced().await
         } else {
-            Ok(self.runtime.republish_key_package().await?)
+            self.republish_key_package_announced().await
         }
     }
 
@@ -1419,6 +1419,7 @@ impl AppClient {
             crate::ProductUnit::Attempt,
         );
         let held = self.epoch_gap_held_groups()?;
+        self.sync_key_package_announcement_group()?;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
         let mut activity = self.runtime.take_maintenance_activity();
         activity.absorb(previous);
@@ -1872,7 +1873,7 @@ impl AppClient {
         // SQLCipher lifecycle state is authoritative. On first rollout the
         // publisher imports only the legacy JSON `d` slot, then performs the
         // recorded upgrade replacement under that same slot.
-        Ok(self.runtime.publish_fresh_key_package().await?)
+        self.publish_fresh_key_package_announced().await
     }
 
     /// Ask the relays to stop serving this device's KeyPackage slot before it
