@@ -513,6 +513,11 @@ impl AccountRecoveryOwner {
         self.wall_anchor_ms += elapsed.as_millis() as u64;
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_replay_complete(&self) -> bool {
+        self.replay_complete
+    }
+
     pub(super) fn logical_now_ms(&self, now: Instant) -> StorageResult<u64> {
         let elapsed = now
             .checked_duration_since(self.monotonic_anchor)
@@ -4531,33 +4536,6 @@ mod tests {
         verify_post_join_boundary_and_grace().await;
     }
 
-    /// Let end-of-stored-events admit the live REQs' native replay before a
-    /// test's first grant. A job that starts before a source's EOSE captures
-    /// that source; the scripted relay serves no history, so the capture
-    /// leaves it incomplete and no later EOSE admits it. Its
-    /// `SubscriptionReplay` duty would then join every grant (mdk#2693).
-    async fn settle_live_replay(
-        app: &crate::MarmotApp,
-        relay: &crate::tests::ScriptedPushRelayClient,
-        client: &mut AppClient,
-    ) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            crate::tests::report_scripted_eose(
-                &app.relay_plane,
-                relay,
-                crate::tests::every_subscription,
-            )
-            .await;
-            client.synchronize_native_replay().await.unwrap();
-            if client.recovery_owner.replay_complete {
-                return;
-            }
-            assert!(Instant::now() < deadline, "the live REQs' replay settles");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
     async fn verify_maintenance_boundary_request(incremental: bool) {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
@@ -4586,7 +4564,7 @@ mod tests {
             .create_group("maintenance predicate", &[])
             .await
             .unwrap();
-        settle_live_replay(&app, &relay, &mut client).await;
+        crate::tests::settle_live_replay(&app.relay_plane, &relay, &mut client).await;
         let storage = app.account_storage("alice").unwrap();
         let job = cgka_traits::MaintenanceObligation {
             id: cgka_traits::MessageId::new(vec![55; 32]),
@@ -6597,7 +6575,7 @@ mod tests {
         app.save_state(&state).unwrap();
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.create_group("certified loss", &[]).await.unwrap();
-        settle_live_replay(&app, &relay, &mut client).await;
+        crate::tests::settle_live_replay(&app.relay_plane, &relay, &mut client).await;
         let storage = app.account_storage("alice").unwrap().app_storage();
         // The lost deliveries are inside every route's retained window, which
         // starts when the account first retained that route.
@@ -6997,7 +6975,7 @@ mod tests {
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.create_group("withheld history", &[]).await.unwrap();
-        settle_live_replay(&app, &relay, &mut client).await;
+        crate::tests::settle_live_replay(&app.relay_plane, &relay, &mut client).await;
         client.request_bounded_comparison().unwrap();
         let storage = app.account_storage("alice").unwrap();
         let history = || {
