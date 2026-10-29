@@ -79,11 +79,11 @@
 
 ### Added
 
-- `MessageStorage::list_commits_and_proposals_inserted_after` returns a group's
-  commit and proposal rows inserted after an `insert_order` position, each with
-  its position (mdk#2684). Convergence keeps the newest position it has judged
-  on a failed pass's retry record, so it looks for new selection input without
-  rereading the group's history. Backends without positions return `None`.
+- `OpenMlsContentFilter::CommitsAndProposalsBetween` lists only the commits and
+  proposals whose MLS epoch falls in a range, plus the rows SQLite cannot
+  classify (mdk#2684). A failed convergence batch checks its horizon through it
+  on every load, reading neither the group's applications nor its older
+  history.
 - `queue_current_push_registration_share_for_group` queues the stored
   registration for one joined group again, including a revision whose share
   already completed. It does nothing while native push is off or without a
