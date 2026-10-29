@@ -16,8 +16,8 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::OutboundFanout;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
-    CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest, SendIntent,
-    SendResult,
+    CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest, GroupEvent,
+    SendIntent, SendResult,
 };
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group::{Group, Member};
@@ -3008,6 +3008,69 @@ async fn own_intent_record_failure_releases_the_unreturned_pending_commit() {
     };
     engine.confirm_published(pending).await.unwrap();
     assert!(engine.epoch(&group_id).unwrap() > epoch);
+}
+
+/// A queued intent whose preparation fails on storage is held, not refused
+/// (mdk#2694): the drain reports the failure, the record stays queued with no
+/// refusal announced, and the next drain prepares it.
+#[tokio::test]
+async fn a_queued_intent_held_by_a_storage_failure_stays_queued() {
+    let fault = LeaveWriteFault::default();
+    let (mut engine, storage, group_id) = setup_own_intent_fault_case(fault.clone()).await;
+    storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: MessageId::new(b"queued-held-edit".to_vec()),
+            group_id: group_id.clone(),
+            intent: SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("held edit".into()),
+                description: None,
+            },
+            created_at_ms: 0,
+            reissue_attempts: 0,
+        })
+        .unwrap();
+    engine.drain_events();
+
+    // The first intent-store write during preparation is the edit's own
+    // commit intent, recorded after staging.
+    fault.arm_on_write(1);
+    assert!(matches!(
+        engine
+            .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+            .await,
+        Err(EngineError::Storage(StorageError::Busy(_)))
+    ));
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "a storage failure keeps the intent queued"
+    );
+    assert!(
+        !engine
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::QueuedIntentRefused { .. }))
+    );
+
+    let drained = engine
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
+        .await
+        .expect("the held intent prepares once storage recovers");
+    let [SendResult::GroupEvolution { pending, .. }] = drained.as_slice() else {
+        panic!("the held edit stages on the next drain: {drained:?}")
+    };
+    engine.confirm_published(*pending).await.unwrap();
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(engine.group_record(&group_id).unwrap().name, "held edit");
 }
 
 #[tokio::test]

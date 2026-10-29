@@ -666,6 +666,15 @@ fn snapshot_group_events() {
         GroupEvent::LocalGroupCopyRestored { group_id: gid() }
     );
     insta::assert_json_snapshot!(
+        "event_queued_intent_refused",
+        GroupEvent::QueuedIntentRefused {
+            group_id: gid(),
+            intent_id: mid(),
+            intent_kind: "update_group_data".into(),
+            reason: "not_group_admin".into(),
+        }
+    );
+    insta::assert_json_snapshot!(
         "event_group_member_leaves_removed",
         GroupEvent::GroupMemberLeavesRemoved {
             group_id: gid(),

@@ -58,15 +58,17 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `upgrade.rs` | `do_upgrade_group_capabilities` (MLS primitives via `GroupContextExtensions`, app components via `AppDataUpdate`) |
 | `update_group_data.rs` | `SendIntent::UpdateGroupData`: stages an `AppDataUpdate` for `marmot.group.profile.v1`; admin-policy and routing updates are out of scope |
 | `disband.rs` | Durable terminal group-disband workflow |
-| `account_devices_activation.rs` | `SendIntent::EnableAccountDevices`: one admin Commit that requires 0x800d (and removes a stray GroupContext entry under its id) through the AppDataUpdate path; one aggregate eligibility check, `account_devices_activation_refusal`, serves the host's read and the refusal before staging; no `OwnCommitIntent` re-issue |
+| `account_devices_activation.rs` | `SendIntent::EnableAccountDevices`: one admin Commit that requires 0x800d (and removes a stray GroupContext entry under its id) through the AppDataUpdate path; one aggregate eligibility check, `account_devices_activation_refusal`, serves the host's read and the refusal before staging; a send queued behind convergence is checked before it is queued, and a drain-time refusal is retired like any other (`queued_intent_refusal.rs`); no `OwnCommitIntent` re-issue |
 | `link_device.rs` | `SendIntent::LinkDevice`: one admin Commit in a device group that adds the KeyPackage a link confirmed and sets its roster entry, through the shared Adds-plus-AppDataUpdates staging, taking nothing from the proposal store; refused unless the group requires 0x800e, the KeyPackage is this account's and supports the group, and the update sets exactly one device entry; never queued (`LinkDeviceUnsettled` while the group settles or an own Commit is in flight); no `OwnCommitIntent` re-issue |
 | `own_commit_intent.rs` | `OwnCommitIntent` records and re-issue of own commits superseded by branch selection (mdk#1734) |
+| `queued_intent_refusal.rs` | What the outbound drain does with a queued intent whose preparation fails on the settled state (mdk#2694): retire and announce (`GroupEvent::QueuedIntentRefused`) a refusal, keep a failure the device or a closed group-wide gate caused; check an intent's KeyPackages before it is queued |
 | `own_account_devices.rs` | `SendIntent::AddOwnAccountDevices` / `RemoveOwnAccountDevices`: a by-value same-account Commit that leaves the proposal store alone, refused unless the classifier calls it same-account (so only while the group requires 0x800d); no `OwnCommitIntent` re-issue |
 | `maintenance.rs` | KeyPackage replacement staging and promotion (OpenMLS material and the lifecycle record in one transaction), the own-leaf hash, and mandatory sender-ratchet rotation after own-checkpoint installation. Replay rotation uses a durable Manual obligation whose phase cannot release the restored epoch's application-send gate; its private epoch-bound id is pruned only after exact checkpoints at the same horizon. Ordinary scheduling and other account records live above the engine; it adds no storage forwards for them (mdk#2602) |
 | `group_authority.rs` | Advisory live-engine authority facts for conversation capture; mutations still validate authority |
 | `app_components.rs` | `app_data_dictionary` helpers, LeafNode/group `app_components` bytes, group profile and admin-policy bytes, the resulting-state check every send path and replay call (`validate_current_profile_invariants_for_staged_commit`, including the account-devices and device-roster rules) and its join-time twin (`validate_joined_group_invariants`), the Welcome author check, standalone proposal admission, and `resolved_app_data_update` / `apply_app_data_updates`, the one place every send, inbound and replay path turns an AppDataUpdate into resulting GroupContext bytes (whole replacement, except the device roster's diff) |
 | `commit_class.rs` | The one Commit classifier (self-update, SelfRemove-only, same-account, admin-required) read from the parent state. Replay, every send path's own check (`authorize_own_staged_commit`) and the publish stamp call it; the class decides both whether an admin must commit and the branch priority (`privileged` exactly for admin-required). Same-account exists only while the parent requires 0x800d. In a device group, `authorize_own_staged_commit` also holds every own Commit that adds a leaf to the link shape: one Add, by value, whose roster entry the same Commit sets for a new slot, announcing it |
 | `account_identity_proof.rs` | Legacy LeafNode identity-proof extension + current app-data component; strict profile classification (mixed rejected) |
+| `device_tag.rs` | Device tags (0x800f, mdk#2628 3.1d): `seal_device_tag` and `device_tag_claim`, which reads a leaf's tag against the device group's roster as a device, a removed slot or unclaimed, never an error; `Engine::member_device_tag_claim` reads a member leaf of the current tree. No group may require 0x800f, and a GroupContext entry under it is unknown data the engine never writes (`NEVER_REQUIRED_APP_COMPONENTS` in `app_components.rs`) |
 | `app_payload.rs` | `validate_app_payload_for_sender`: `MarmotAppEvent` sender validation |
 | `group_context_view.rs` | `GroupContext` snapshot view; `exporter_secret(label, length)` returns `None` rather than truncating |
 | `snapshot_guard.rs` | `SnapshotRollbackGuard` (roll back + release on `Drop`) and `RewindSite`, the closed set of guard sites that `openmls_projection::recover_interrupted_rewind_guard` classifies at open |
@@ -119,7 +121,8 @@ Load-bearing departures from the original plan; each is also documented at its s
    require a component only when asked and never add account-devices (0x800d). Creation requires account-devices,
    unasked, exactly when the creator's leaf and every founding KeyPackage advertise it (`group_lifecycle.rs`). The
    device roster (0x800e, mdk#2628 3.1) is advertisable only in `test-policy-overrides` builds until its spec is
-   adopted (`DEVICE_ROSTER_ADVERTISABLE`), so no release build creates or joins a device group.
+   adopted (`DEVICE_ROSTER_ADVERTISABLE`), so no release build creates or joins a device group. The device tag
+   (0x800f) is not advertisable at all until the engine puts tags in its own leaves.
 
 ## Publish-before-apply
 
@@ -416,6 +419,20 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   two overwritable states or no state (inbound apply behind `can_ingest`, the outbound drain behind its `Stable`-only
   re-check, hydration on fresh state, create/join), so a fired refusal means a new caller lost that gate — fix the
   caller, don't relax the refusal.
+- **A queued intent the settled state refuses is retired, never retried.** The drain's preparation is the send, so a
+  failure is a refusal when the device could evaluate the intent and every gate that holds back all of the group's
+  sends was open (`queued_intent_refusal.rs`): the drain deletes the record, announces
+  `GroupEvent::QueuedIntentRefused` with the id `SendResult::Queued` returned, and goes on with the next record; with
+  the fairness slot, the refusal uses up the attempt. A failure whose error reports the device or the group's lifecycle
+  (`reports_the_device`, an exhaustive match: classify a new `EngineError` variant there), or that came while a
+  group-wide gate was closed, keeps the record and fails the drain as before. Classify by the gates, never by an
+  error's text: one `InvalidTransition` is a hold or a verdict depending on its source. Returning a refusal from the
+  drain instead wedges the group's queue, every later drain failing on the same record (mdk#2694). `Backend` is a
+  refusal, not a hold: the engine maps every OpenMLS error to it, verdicts included (a bad KeyPackage signature, a
+  same-account Add of a device already in the group). An intent's KeyPackages are also checked before it is queued
+  (`check_queued_key_packages`), so a bad one is answered at once. Pinned by
+  `tests/distributed_convergence/refused_queued_intents.rs` and
+  `tests/record_write_atomicity.rs::a_queued_intent_held_by_a_storage_failure_stays_queued`.
 - **A held publication and an unresolved convergence input are mutually exclusive**, which is why
   `converge_stored_openmls_messages*` needs no held-publication gate. Outbound: `should_queue_outbound_intent` settles
   convergence before staging, so an unresolved input diverts the intent to the retention queue and `begin_pending` is

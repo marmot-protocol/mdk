@@ -5202,6 +5202,12 @@ typedef enum MarmotGroupEventKind_Tag {
   MARMOT_GROUP_EVENT_KIND_LOCAL_GROUP_COPY_TERMINATED,
   MARMOT_GROUP_EVENT_KIND_LOCAL_GROUP_COPY_RESTORED,
   MARMOT_GROUP_EVENT_KIND_GROUP_MEMBER_LEAVES_REMOVED,
+  /**
+   * A send that waited for the group to settle was dropped unsent: the
+   * settled state refused it. Nothing retries it; the user may try again.
+   * `intent_kind` names the action and `reason` is a stable tag.
+   */
+  MARMOT_GROUP_EVENT_KIND_QUEUED_INTENT_REFUSED,
 } MarmotGroupEventKind_Tag;
 
 typedef struct MarmotGroupEventKind_GroupJoined_Body {
@@ -5285,6 +5291,12 @@ typedef struct MarmotGroupEventKind_GroupMemberLeavesRemoved_Body {
   uint64_t epoch;
 } MarmotGroupEventKind_GroupMemberLeavesRemoved_Body;
 
+typedef struct MarmotGroupEventKind_QueuedIntentRefused_Body {
+  char *intent_id_hex;
+  char *intent_kind;
+  char *reason;
+} MarmotGroupEventKind_QueuedIntentRefused_Body;
+
 typedef struct MarmotGroupEventKind {
   MarmotGroupEventKind_Tag tag;
   union {
@@ -5302,6 +5314,7 @@ typedef struct MarmotGroupEventKind {
     MarmotGroupEventKind_GroupHydrationRecovered_Body GROUP_HYDRATION_RECOVERED;
     MarmotGroupEventKind_LocalGroupCopyTerminated_Body LOCAL_GROUP_COPY_TERMINATED;
     MarmotGroupEventKind_GroupMemberLeavesRemoved_Body GROUP_MEMBER_LEAVES_REMOVED;
+    MarmotGroupEventKind_QueuedIntentRefused_Body QUEUED_INTENT_REFUSED;
   };
 } MarmotGroupEventKind;
 

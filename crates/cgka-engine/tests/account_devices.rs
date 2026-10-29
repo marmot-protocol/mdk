@@ -103,6 +103,10 @@ mod link_device;
 #[path = "account_devices/device_group_welcome.rs"]
 mod device_group_welcome;
 
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/device_tag.rs"]
+mod device_tag;
+
 const ACCOUNT_DEVICES: Feature = Feature("account-devices");
 
 fn pad32(name: &[u8]) -> Vec<u8> {

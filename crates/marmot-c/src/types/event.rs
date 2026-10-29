@@ -81,6 +81,14 @@ pub enum MarmotGroupEventKind {
     GroupMemberLeavesRemoved {
         epoch: u64,
     },
+    /// A send that waited for the group to settle was dropped unsent: the
+    /// settled state refused it. Nothing retries it; the user may try again.
+    /// `intent_kind` names the action and `reason` is a stable tag.
+    QueuedIntentRefused {
+        intent_id_hex: *mut c_char,
+        intent_kind: *mut c_char,
+        reason: *mut c_char,
+    },
 }
 
 impl From<GroupEventKindFfi> for MarmotGroupEventKind {
@@ -91,6 +99,15 @@ impl From<GroupEventKindFfi> for MarmotGroupEventKind {
                 Self::LocalGroupCopyTerminated { voluntary }
             }
             F::LocalGroupCopyRestored => Self::LocalGroupCopyRestored,
+            F::QueuedIntentRefused {
+                intent_id_hex,
+                intent_kind,
+                reason,
+            } => Self::QueuedIntentRefused {
+                intent_id_hex: owned_c_string(intent_id_hex),
+                intent_kind: owned_c_string(intent_kind),
+                reason: owned_c_string(reason),
+            },
             F::GroupMemberLeavesRemoved { epoch } => Self::GroupMemberLeavesRemoved { epoch },
             F::GroupCreated => Self::GroupCreated,
             F::GroupJoined {
@@ -198,6 +215,15 @@ impl CFree for MarmotGroupEventKind {
                 } => {
                     free_c_string(*message_id_hex);
                     free_c_string(*resource);
+                }
+                Self::QueuedIntentRefused {
+                    intent_id_hex,
+                    intent_kind,
+                    reason,
+                } => {
+                    free_c_string(*intent_id_hex);
+                    free_c_string(*intent_kind);
+                    free_c_string(*reason);
                 }
                 Self::MessageReceived { sender_id_hex, .. } => free_c_string(*sender_id_hex),
                 Self::AppMessageInvalidated {

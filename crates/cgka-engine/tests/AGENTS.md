@@ -92,6 +92,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     would pick the phantom still applies on its first attempt. Also an ignored measurement of host advances and
     wall time to the first delivered message over a widened group.
 
+- **File:** `distributed_convergence/refused_queued_intents.rs`
+  - **Owns:** A queued admin change the settled state refuses (the sender was demoted while it waited) is retired and
+    announced as `GroupEvent::QueuedIntentRefused` for each admin intent kind, the work queued behind it still drains,
+    and no later drain prepares it again (mdk#2694). The storage-held counterpart lives in `record_write_atomicity.rs`.
+
 - **File:** `distributed_convergence/encrypted_media_source_secret.rs`
   - **Owns:** A replayed media application carries its source-epoch encrypted-media secret on `MessageReceived`
     even when the same pass advances past the anchor horizon and prunes that epoch's retained anchor.
@@ -214,6 +219,13 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     able to join. Also that this engine signs every leaf of a device with its one signature key (an implementation
     fact, not a protocol rule, mdk#2628 D33), which lets a first link's Confirm name the creator's key before the
     group exists.
+
+- **File:** `account_devices/device_tag.rs` (test-policy builds only)
+  - **Owns:** `marmot.member.device-tag.v1` (0x800f, mdk#2628 item 3.1d) through the engine: a member leaf whose tag
+    verifies under a roster device's key reads as that device, against the current tree only; a tag that doesn't
+    open never invalidates a Commit; another account's leaf is unclaimed; a Commit, standalone proposal or Welcome
+    that requires 0x800f is rejected; a GroupContext entry under it is unknown data the engine never writes. The tag
+    crypto and the spec vector are unit-tested in `src/device_tag.rs`.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and

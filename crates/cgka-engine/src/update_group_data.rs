@@ -124,6 +124,7 @@ impl<S: StorageProvider> Engine<S> {
                     group_id: group_id.clone(),
                 });
             }
+            crate::app_components::refuse_local_group_context_entry(update.component_id)?;
             crate::app_components::validate_app_component_update(update)?;
         }
 

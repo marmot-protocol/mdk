@@ -22,7 +22,9 @@ pub use cgka_engine::key_package::{
     KeyPackageRequirements, durably_owned_key_packages, key_package_metadata,
 };
 use cgka_engine::{Engine, EngineBuilder};
-use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
+use cgka_traits::app_components::{
+    AppComponentId, AppComponentSet, DeviceRosterV1, DeviceTagClaim, default_group_components,
+};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage,
     SendIntent, SendResult, SupersededIntentReport,
@@ -910,6 +912,19 @@ impl AccountDeviceSession {
 
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> SessionResult<Vec<[u8; 32]>> {
         Ok(self.engine.admin_pubkeys(group_id)?)
+    }
+
+    /// See [`cgka_engine::engine::Engine::member_device_tag_claim`].
+    pub fn member_device_tag_claim(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> SessionResult<Option<DeviceTagClaim>> {
+        Ok(self
+            .engine
+            .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
     }
 
     pub fn app_component(
