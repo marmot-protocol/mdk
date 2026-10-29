@@ -2106,6 +2106,7 @@ impl MarmotApp {
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
             unpublished_welcome_delivery: None,
+            own_key_package_slot_check_due: None,
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
             pending_recovery_arm_writes: HashMap::new(),
@@ -2155,6 +2156,7 @@ impl MarmotApp {
         }
         // Hosts read the notice list after open; later changes raise an event.
         client.take_history_notice_changes();
+        client.sync_key_package_announcement_group()?;
         Ok(client)
     }
 
@@ -2184,7 +2186,7 @@ impl MarmotApp {
                     .app
                     .clear_key_package_cutover_replacement_pending(&client.state.label);
             } else {
-                match client.runtime.publish_fresh_key_package().await {
+                match client.publish_fresh_key_package_announced().await {
                     Ok(_) => tracing::info!(
                         target: "marmot_app::key_packages",
                         method = "finish_client_open_network_maintenance",
@@ -2193,7 +2195,7 @@ impl MarmotApp {
                     Err(error) => tracing::warn!(
                         target: "marmot_app::key_packages",
                         method = "finish_client_open_network_maintenance",
-                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        error_kind = error.privacy_safe_kind(),
                         "deferred current key package replacement after strict cutover"
                     ),
                 }
@@ -2222,16 +2224,16 @@ impl MarmotApp {
         if self.cursor_persistence() == CursorPersistence::Advance {
             let result = async {
                 if client.runtime.key_package_generation_upgrade_due()? {
-                    client.runtime.publish_fresh_key_package().await?;
+                    client.publish_fresh_key_package_announced().await?;
                 }
-                Ok::<_, marmot_session::AccountError>(())
+                Ok::<_, AppError>(())
             }
             .await;
             if let Err(error) = result {
                 tracing::warn!(
                     target: "marmot_app::key_packages",
                     method = "finish_client_open_network_maintenance",
-                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    error_kind = error.privacy_safe_kind(),
                     "key package generator upgrade remains retryable"
                 );
             }
@@ -5546,6 +5548,54 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
         method: &'static str,
     ) -> Result<Vec<nostr_directory::FetchedKeyPackage>, AppError> {
+        let (account_id_hex, source_relays) = self
+            .account_key_package_source_relays(label, bootstrap_relays)
+            .await?;
+        let mut relay_records = self
+            .directory()
+            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
+            .await?;
+        sort_directory_records(&mut relay_records);
+        let mut packages = Vec::new();
+        for record in relay_records {
+            match key_package_from_record(record) {
+                Ok(fetched) => packages.push(fetched),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = method,
+                        error_kind = err.privacy_safe_kind(),
+                        "skipping invalid key package event while listing account packages"
+                    );
+                }
+            }
+        }
+        Ok(packages)
+    }
+
+    /// The signed publications in one of the account's KeyPackage slots, read
+    /// from the relays its KeyPackages are listed from. They are not checked
+    /// as KeyPackages: a publication that is not one still occupies the slot.
+    pub(crate) async fn fetch_account_key_package_slot_events(
+        &self,
+        label: &str,
+        slot: &str,
+    ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, AppError> {
+        let (account_id_hex, source_relays) = self
+            .account_key_package_source_relays(label, Vec::new())
+            .await?;
+        Ok(self
+            .directory()
+            .fetch_key_package_slot_events_for_account_id(&account_id_hex, slot, &source_relays)
+            .await?)
+    }
+
+    /// The account id and the relays its KeyPackages are listed from.
+    async fn account_key_package_source_relays(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<(String, Vec<TransportEndpoint>), AppError> {
         let account = self.account_home().account(label)?;
         let account_id_hex = account.account_id_hex;
 
@@ -5594,27 +5644,7 @@ impl MarmotApp {
                 MissingRelayListKind::Nip65,
             ]));
         }
-
-        let mut relay_records = self
-            .directory()
-            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
-            .await?;
-        sort_directory_records(&mut relay_records);
-        let mut packages = Vec::new();
-        for record in relay_records {
-            match key_package_from_record(record) {
-                Ok(fetched) => packages.push(fetched),
-                Err(err) => {
-                    tracing::warn!(
-                        target: "marmot_app::key_packages",
-                        method = method,
-                        error_kind = err.privacy_safe_kind(),
-                        "skipping invalid key package event while listing account packages"
-                    );
-                }
-            }
-        }
-        Ok(packages)
+        Ok((account_id_hex, source_relays))
     }
 
     pub async fn account_key_package_records(

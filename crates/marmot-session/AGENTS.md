@@ -28,6 +28,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
 - `routing.rs` — `TransportRoutingPolicy` trait, `TransportRoutingError`, and `StaticTransportRouting`.
 - `runtime.rs` — `AccountDeviceRuntime` plus its effect aggregates (`AccountDeviceEffects`, `AccountIngestEffects`,
   `PublishFailure`, `PendingResolution`), durable maintenance, and KeyPackage generator upgrades.
+  - `runtime/slot_announcement.rs` — the slot-announcement gate (mdk#2628 3.4): while the host names a device group,
+    no KeyPackage reaches this device's slot until this device's own roster entry there names it. Maintenance
+    announces first. A foreign publication the host finds in the slot is replaced by a newer one.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.

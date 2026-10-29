@@ -951,6 +951,10 @@ pub struct AppClient {
     /// Canonical create/invite work whose Welcome fanout has not run yet.
     /// The managed account worker replies first, then drives this delivery.
     pub(crate) unpublished_welcome_delivery: Option<UnpublishedWelcomeDelivery>,
+    /// When maintenance next reads this device's own KeyPackage slot for a
+    /// publication it did not make (mdk#2628 3.4). `None` reads it on the
+    /// first pass after open.
+    pub(crate) own_key_package_slot_check_due: Option<std::time::Instant>,
     /// Per-group detector for the epoch-gap backfill (commit-loss recovery): it
     /// counts the distinct undecryptable messages a group accumulates at a
     /// stalled epoch. Ephemeral session state, like the pending sets above.
@@ -1322,9 +1326,9 @@ impl AppClient {
             // stable slot that has not promoted a current package yet. Resume
             // or prepare that replacement; republish_key_package deliberately
             // rejects pending rotations and requires a current package.
-            Ok(self.runtime.publish_fresh_key_package().await?)
+            self.publish_fresh_key_package_announced().await
         } else {
-            Ok(self.runtime.republish_key_package().await?)
+            self.republish_key_package_announced().await
         }
     }
 
@@ -1419,6 +1423,8 @@ impl AppClient {
             crate::ProductUnit::Attempt,
         );
         let held = self.epoch_gap_held_groups()?;
+        self.sync_key_package_announcement_group()?;
+        self.check_own_key_package_slot_when_due().await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
         let mut activity = self.runtime.take_maintenance_activity();
         activity.absorb(previous);
@@ -1872,7 +1878,7 @@ impl AppClient {
         // SQLCipher lifecycle state is authoritative. On first rollout the
         // publisher imports only the legacy JSON `d` slot, then performs the
         // recorded upgrade replacement under that same slot.
-        Ok(self.runtime.publish_fresh_key_package().await?)
+        self.publish_fresh_key_package_announced().await
     }
 
     /// Ask the relays to stop serving this device's KeyPackage slot before it
