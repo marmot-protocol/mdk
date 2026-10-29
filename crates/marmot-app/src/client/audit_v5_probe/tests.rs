@@ -129,6 +129,7 @@ async fn blocked_inbox_demux() {
             keys: recipient,
             consumed: Arc::new(Mutex::new(HashSet::new())),
             denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            gate: Arc::default(),
         }),
         slot: Arc::new(Mutex::new(PeelSlot::default())),
         storage: storage.clone(),
@@ -232,6 +233,7 @@ async fn blocked_inbox_single_unseal() {
                     keys: bob_keys,
                     consumed: consumed.clone(),
                     denied: denied.clone(),
+                    gate: Arc::default(),
                 },
             )
             .await
