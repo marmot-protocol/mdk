@@ -119,6 +119,10 @@ impl DirectoryResources for MarmotApp {
             .send(account_id_hex.to_owned());
         self.presentation_signals.wake();
     }
+
+    fn account_key_package_published(&self, account_id_hex: &str) {
+        self.sign_in_nudges.nudge(account_id_hex);
+    }
 }
 
 /// Directory analytics go to the app's usage-diagnostics collector, under the

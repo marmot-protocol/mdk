@@ -80,6 +80,7 @@ mod receipts;
 pub(crate) mod recovery;
 mod recovery_coverage;
 mod retention;
+pub(crate) mod sign_ins;
 mod sync;
 #[cfg(test)]
 mod upload_cleanup_tests;
@@ -788,6 +789,9 @@ pub struct AppClient {
     /// set, since a fresh client cannot know what hosts last read.
     pub(crate) key_package_refresh_overdue: Option<bool>,
     pub(crate) key_package_refresh_overdue_changed: bool,
+    /// When this device next checks its account's KeyPackages for new
+    /// sign-ins (mdk#2628 3.2).
+    pub(crate) sign_in_schedule: sign_ins::SignInSchedule,
     /// Account-queue placement counts at this client's previous
     /// `transport_cursor_advanced` row (or its open), so each row reports
     /// what changed since.
@@ -1423,6 +1427,7 @@ impl AppClient {
             "sweep",
             crate::ProductUnit::Attempt,
         );
+        self.drive_sign_ins().await;
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
@@ -7116,6 +7121,13 @@ impl AppClient {
         effects: &marmot_session::AccountDeviceEffects,
     ) {
         for report in &effects.superseded_intents {
+            // A roster update this device made may have carried a sign-in
+            // rejection (mdk#2628 3.2).
+            if report.kind == cgka_traits::engine::SupersededIntentKind::AppComponents
+                && self.is_device_group(&report.group_id).unwrap_or(true)
+            {
+                self.rearm_sign_in_rejections();
+            }
             if !self.host_may_see_group(&report.group_id) {
                 continue;
             }

@@ -274,6 +274,8 @@ mod migration_0128_loss_evidence_routes;
 mod migration_0129_device_group_welcome_expectations;
 #[path = "migrations/0130_recovery_coverage_remainders.rs"]
 mod migration_0130_recovery_coverage_remainders;
+#[path = "migrations/0131_account_sign_ins.rs"]
+mod migration_0131_account_sign_ins;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1074,6 +1076,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0130_recovery_coverage_remainders",
         suspend_foreign_keys: &[],
         apply: migration_0130_recovery_coverage_remainders::apply,
+    },
+    Migration {
+        version: 131,
+        name: "0131_account_sign_ins",
+        suspend_foreign_keys: &[],
+        apply: migration_0131_account_sign_ins::apply,
     },
 ];
 

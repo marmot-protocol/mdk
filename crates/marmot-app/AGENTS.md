@@ -88,6 +88,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the roster. The client recomputes it after each maintenance pass; a change sets
   `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
   `KeyPackageRefreshOverdueChanged`. It opens set, for the same reason as `linked_devices_changed`.
+- New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under
+  the inviter's rules; a live KeyPackage from the directory subscription only brings a check forward
+  (`SignInNudges`). The first check's baseline, never a publication time, separates devices that were here first from
+  new sign-ins. Rejections are recorded locally first, then committed to the trusted roster only while the device
+  group is quiet (`device_group_quiet`); a device with no device group keeps them until `create_device_group` founds
+  the roster with them or it trusts a group it joined. A slot the roster holds as a device is never rejected here.
+  A rejection stays pending until the roster shows it, and a superseded roster update re-arms every rejection
+  (`note_superseded_intent_reports`). A slot is its `d` as published, compared as bytes; one the roster cannot name is
+  rejected on this device only. A KeyPackage this device made or the roster announces is never rejected
+  (`protected_key_package`): the account key can copy it into any slot.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

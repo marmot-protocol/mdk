@@ -230,6 +230,7 @@ pub use client::AppClient;
 #[doc(hidden)]
 pub use client::device_group::ConfirmedDeviceLink;
 pub use client::device_group::{LinkedDevice, LinkedDeviceStatus};
+pub use client::sign_ins::{SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
 pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
@@ -595,6 +596,9 @@ pub struct MarmotApp {
     audit_v5_peel_slot: Option<(String, Arc<Mutex<client::audit_v5_probe::PeelSlot>>)>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
+    /// Live KeyPackages of this app's accounts that their clients have not
+    /// checked for new sign-ins yet (mdk#2628 3.2).
+    pub(crate) sign_in_nudges: Arc<client::sign_ins::SignInNudges>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
@@ -1667,6 +1671,7 @@ impl MarmotApp {
             audit_v5_peel_slot: None,
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
+            sign_in_nudges: Arc::new(Default::default()),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
@@ -1768,6 +1773,7 @@ impl MarmotApp {
             audit_v5_peel_slot: None,
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
+            sign_in_nudges: Arc::new(Default::default()),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
@@ -2051,6 +2057,7 @@ impl MarmotApp {
             linked_devices_changed: true,
             key_package_refresh_overdue: None,
             key_package_refresh_overdue_changed: true,
+            sign_in_schedule: Default::default(),
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
@@ -5549,6 +5556,53 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
         method: &'static str,
     ) -> Result<Vec<nostr_directory::FetchedKeyPackage>, AppError> {
+        let (account_id_hex, source_relays) = self
+            .account_key_package_source_relays(label, bootstrap_relays)
+            .await?;
+        let mut relay_records = self
+            .directory()
+            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
+            .await?;
+        sort_directory_records(&mut relay_records);
+        let mut packages = Vec::new();
+        for record in relay_records {
+            match key_package_from_record(record) {
+                Ok(fetched) => packages.push(fetched),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = method,
+                        error_kind = err.privacy_safe_kind(),
+                        "skipping invalid key package event while listing account packages"
+                    );
+                }
+            }
+        }
+        Ok(packages)
+    }
+
+    /// Read every KeyPackage slot of the account for new sign-ins (mdk#2628
+    /// 3.2), from the relays its KeyPackages are listed from, under the
+    /// inviter's rules.
+    pub(crate) async fn read_account_key_package_slots(
+        &self,
+        label: &str,
+    ) -> Result<nostr_directory::AccountKeyPackageSlots, AppError> {
+        let (account_id_hex, source_relays) = self
+            .account_key_package_source_relays(label, Vec::new())
+            .await?;
+        Ok(self
+            .directory()
+            .read_account_key_package_slots(&account_id_hex, &source_relays)
+            .await?)
+    }
+
+    /// The account id and the relays its KeyPackages are listed from.
+    async fn account_key_package_source_relays(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<(String, Vec<TransportEndpoint>), AppError> {
         let account = self.account_home().account(label)?;
         let account_id_hex = account.account_id_hex;
 
@@ -5597,27 +5651,7 @@ impl MarmotApp {
                 MissingRelayListKind::Nip65,
             ]));
         }
-
-        let mut relay_records = self
-            .directory()
-            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
-            .await?;
-        sort_directory_records(&mut relay_records);
-        let mut packages = Vec::new();
-        for record in relay_records {
-            match key_package_from_record(record) {
-                Ok(fetched) => packages.push(fetched),
-                Err(err) => {
-                    tracing::warn!(
-                        target: "marmot_app::key_packages",
-                        method = method,
-                        error_kind = err.privacy_safe_kind(),
-                        "skipping invalid key package event while listing account packages"
-                    );
-                }
-            }
-        }
-        Ok(packages)
+        Ok((account_id_hex, source_relays))
     }
 
     pub async fn account_key_package_records(

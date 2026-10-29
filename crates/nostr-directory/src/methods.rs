@@ -22,8 +22,9 @@ use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, O
 use super::resources::DirectoryResources;
 use crate::ids::parse_account_id_hex;
 use crate::published_records::{
-    fresh_or_cached_key_package, fresh_relay_list_status_from_records, key_package_queries,
-    merge_relay_list_status, relay_list_queries, select_key_packages_from_records,
+    AccountKeyPackageSlots, account_key_package_slots_from_records, fresh_or_cached_key_package,
+    fresh_relay_list_status_from_records, key_package_queries, merge_relay_list_status,
+    relay_list_queries, select_key_packages_from_records,
 };
 use crate::records::{
     CachedIdentityProjection, CurrentFollowList, FetchedFollowList, MAX_CACHED_IDENTITY_PAGE_SIZE,
@@ -847,6 +848,34 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             )
             .await
             .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key packages: {e}")))
+    }
+
+    /// Read every KeyPackage slot of `account_id_hex` from `source_relays`
+    /// (the directory relays when empty) in one inviter's read: one page of
+    /// KeyPackages and one of their deletion requests, each relay to its end
+    /// of stored events. See [`AccountKeyPackageSlots`].
+    pub async fn read_account_key_package_slots(
+        &self,
+        account_id_hex: &str,
+        source_relays: &[TransportEndpoint],
+    ) -> Result<AccountKeyPackageSlots, DirectoryError> {
+        let account = PublicKey::parse(account_id_hex)
+            .map_err(|_| DirectoryError::InvalidPublicKey)?
+            .to_hex();
+        let outcome = self
+            .relay_plane
+            .fetch_directory_events_with_completion(
+                self.directory_source_relays(source_relays),
+                key_package_queries(vec![account.clone()]),
+            )
+            .await
+            .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key packages: {e}")))?;
+        Ok(account_key_package_slots_from_records(
+            &account,
+            &outcome.records,
+            outcome.complete,
+            self.directory_freshness(),
+        ))
     }
 
     pub(crate) async fn fetch_follow_list_for_account_id(

@@ -29,11 +29,12 @@
 //! only the test-policy hook supplies one.
 
 use cgka_traits::app_components::{
-    AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterV1, DeviceSlotId,
-    DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID, decode_device_roster_v1, encode_device_roster_v1,
+    AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
+    DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID,
+    decode_device_roster_v1, encode_device_roster_update_v1, encode_device_roster_v1,
     encode_nostr_routing_v1,
 };
-use cgka_traits::engine::CreateGroupRequest;
+use cgka_traits::engine::{CreateGroupRequest, SendIntent};
 use cgka_traits::storage::{
     DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage as _, GroupStorage as _,
     MaintenanceStorage as _, StorageError,
@@ -292,6 +293,8 @@ impl AppClient {
                 ..DeviceEntryV1::default()
             },
         );
+        // Rejections this device made before it had a device group (3.2).
+        self.founding_sign_in_rejections(&mut roster)?;
         let roster = encode_device_roster_v1(&roster)
             .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
         let routing = encode_nostr_routing_v1(&self.app.new_nostr_routing(None)?)
@@ -745,6 +748,42 @@ impl AppClient {
         Ok(Some((group_id, roster)))
     }
 
+    /// One roster commit in the trusted device group `group_id`, carrying
+    /// `operations` as one diff update: the one way to write the roster.
+    /// Callers read `group_id` from [`Self::trusted_device_roster`] and check
+    /// the group is quiet first.
+    pub(crate) async fn commit_device_roster_update(
+        &mut self,
+        group_id: GroupId,
+        operations: Vec<DeviceRosterOperationV1>,
+        action: &'static str,
+    ) -> Result<(), AppError> {
+        let update = DeviceRosterUpdateV1::new(operations)
+            .and_then(|update| encode_device_roster_update_v1(&update))
+            .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
+        let audit_context = Self::local_human_action_context(
+            action,
+            vec!["app_component"],
+            vec![DEVICE_ROSTER_COMPONENT_ID],
+            None,
+        );
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::UpdateAppComponents {
+                    group_id,
+                    updates: vec![AppComponentData {
+                        component_id: DEVICE_ROSTER_COMPONENT_ID,
+                        data: update,
+                    }],
+                },
+                audit_context,
+            )
+            .await?;
+        self.observe_drained_session_events(&effects).await?;
+        Ok(())
+    }
+
     /// This account's devices from the trusted device group's roster: this
     /// device first, then by when each was linked, then by slot. Empty when
     /// [`Self::trusted_device_roster`] has no roster.
@@ -839,7 +878,7 @@ fn requires_roster(group: &Group) -> bool {
 }
 
 /// A KeyPackage slot as the roster keys it: 32 bytes, the Nostr `d`.
-fn device_slot(slot_hex: &str) -> Result<DeviceSlotId, AppError> {
+pub(super) fn device_slot(slot_hex: &str) -> Result<DeviceSlotId, AppError> {
     hex::decode(slot_hex)
         .ok()
         .and_then(|bytes| DeviceSlotId::try_from(bytes).ok())
