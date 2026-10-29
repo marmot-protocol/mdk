@@ -35,7 +35,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     tag from (`set_device_tag_group`). Maintenance, and the host before each KeyPackage publication
     (`set_device_tag_key_holding`), set this device's MLS signature key in its own roster entry when the entry lacks
     it, under the announcement's gates. No KeyPackage is staged, announced or published while the key is due and not
-    in the merged roster, and a staged one that no longer advertises what this device would build is replaced.
+    in the merged roster, or while another device's entry carries it (the engine tags from whichever entry does), and
+    a staged one that no longer advertises what this device would build is replaced. A refresh held back this way
+    counts toward `key_package_refresh_overdue` like one held back by its announcement.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.

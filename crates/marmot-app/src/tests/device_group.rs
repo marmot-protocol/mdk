@@ -2027,6 +2027,109 @@ async fn an_untagged_staged_key_package_is_replaced_once_the_device_tags() {
     );
 }
 
+/// A refresh waiting for this device's tag signature key (mdk#2628 3.1d) is
+/// held back like one waiting for its announcement: once the slot's
+/// publication is a week old it is overdue, though the current KeyPackage is
+/// announced. It clears once the key is set and a tagged KeyPackage publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_waiting_for_the_tag_signature_key_is_overdue_after_a_week() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            laptop_app,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let laptop_slot = slot_of(&laptop);
+    let _ = laptop.take_key_package_refresh_overdue_changed();
+    age_publication(&laptop_app, 8);
+    assert_eq!(announced(&laptop, &group, &laptop), current_ref(&laptop));
+    relay.reject_next_publish();
+    laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
+        None
+    );
+    assert!(laptop.key_package_refresh_overdue().unwrap());
+    assert!(laptop.take_key_package_refresh_overdue_changed());
+
+    laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        key_package_claim(&laptop, &roster(&laptop, &group)),
+        DeviceTagClaim::Device(laptop_slot)
+    );
+    assert!(!laptop.key_package_refresh_overdue().unwrap());
+    assert!(laptop.take_key_package_refresh_overdue_changed());
+}
+
+/// The engine tags from whichever roster entry carries this device's tag
+/// signature key, so while another device's entry carries it, a KeyPackage
+/// built now would read as that device's (mdk#2628 3.1d). This device then
+/// stages and publishes none, and sets nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_held_by_another_device_stages_no_key_package() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let laptop_slot = slot_of(&laptop);
+    let update = encode_device_roster_update_v1(
+        &DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
+            [9; 32],
+            DeviceEntryV1 {
+                tag_signature_key: Some(laptop.runtime.own_signature_key()),
+                ..DeviceEntryV1::default()
+            },
+        )])
+        .unwrap(),
+    )
+    .unwrap();
+    let mut laptop_cursor = relay.published_events.lock().unwrap().len();
+    let effects = phone
+        .runtime
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: update,
+            }],
+        })
+        .await
+        .unwrap();
+    phone
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    let current = current_ref(&laptop);
+
+    let before = relay.published_events.lock().unwrap().len();
+    laptop.run_due_maintenance().await.unwrap();
+    let error = laptop.publish_key_package().await.unwrap_err();
+    assert_eq!(
+        error.privacy_safe_kind(),
+        "account_key_package_announcement_pending"
+    );
+    assert!(published_kinds(&relay, before).is_empty());
+    let status = laptop.key_package_maintenance_status().unwrap().unwrap();
+    assert!(status.pending_replacement.is_none(), "nothing is staged");
+    assert_eq!(current_ref(&laptop), current);
+    assert_eq!(
+        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
+        None
+    );
+}
+
 /// An eager open names the device group to tag from before it returns; a
 /// deferred one only once hydration has run, since naming hydrates it. Each
 /// maintenance pass names it again, as it does the group it announces in.
