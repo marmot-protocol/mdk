@@ -4899,6 +4899,7 @@ impl MarmotApp {
             Box::new(client::audit_v5_probe::ProbePeeler {
                 inner: peeler,
                 slot: audit_v5_peel_slot.clone(),
+                storage: self.account_storage(label)?.app_storage(),
             });
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
         // The engine gets its own connection to `session.sqlite`, which no

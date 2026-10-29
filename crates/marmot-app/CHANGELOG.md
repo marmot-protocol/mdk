@@ -330,6 +330,12 @@
   dropped and announced as `GroupEvent::QueuedIntentRefused`, carrying the
   `intent_id` its queued result returned; nothing retries it.
 
+- Incoming Welcomes use one authenticated unwrap for invitation policy and
+  MLS admission, including rejoin offers that need confirmation. Accounts
+  with blocked users no longer request the same external-signer decryption
+  twice. Blocked invitations remain durably dismissed after unblocking.
+- Rejoin confirmation and retries after trusted removal hold account block-list
+  updates until both MLS admission and the app projection have completed.
 - Account recovery no longer retries a native capture the pass cutoff always
   cuts every ~20 s forever (mdk#2660). A cut capture records no notification
   loss until its source is readmitted without it, counts nothing toward a

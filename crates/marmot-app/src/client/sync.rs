@@ -3916,33 +3916,8 @@ impl AppClient {
                     inventory_record: None,
                 });
             }
-            // Dismissals remain authoritative after unblock. With no current
-            // blocks the normal ingress peeler is sufficient.
-            if storage.has_blocked_users()? {
-                let account = client.app.account_home().account(&client.state.label)?;
-                let peeler = transport_nostr_peeler::NostrMlsPeeler::new().with_welcome_signer_arc(
-                    client
-                        .app
-                        .account_signer_for_summary(&account)?
-                        .as_nostr_signer(),
-                );
-                // The seal's authenticated sender is authoritative, never the outer gift-wrap key.
-                // A peel failure proceeds to normal admission, which rejects invalid envelopes.
-                if let Ok(peeled) =
-                    cgka_traits::peeler::TransportPeeler::peel_welcome(&peeler, &delivery.message)
-                        .await
-                    && let Some(sender) = peeled.sender
-                    && storage.is_user_blocked(&hex::encode(sender.as_slice()))?
-                {
-                    storage.dismiss_blocked_welcome(&source_message_id_hex)?;
-                    return Ok(DeliveryIngest {
-                        routes_dirty: false,
-                        must_stay_fetchable: false,
-                        refused_group: None,
-                        inventory_record: None,
-                    });
-                }
-            }
+            // Dismissals stay authoritative after unblock. The installed app
+            // peeler checks inviter policy after its one authenticated decode.
         }
         let rejoin_offers_before = if welcome {
             Some(client.rejoin_offer_snapshot()?)
