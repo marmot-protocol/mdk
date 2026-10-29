@@ -120,7 +120,12 @@ impl AppClient {
 
     /// Merge an update's or a snapshot's items, from any device of the
     /// trusted device group.
-    pub(crate) fn receive_small_state_items(&mut self, content: &str) -> Result<(), AppError> {
+    pub(crate) fn receive_small_state_items(
+        &mut self,
+        group_id: &GroupId,
+        content: &str,
+    ) -> Result<(), AppError> {
+        self.ensure_small_state_group(group_id)?;
         let items = decode_small_state_items(content)?;
         self.sync_small_state(&items)
     }
@@ -128,13 +133,27 @@ impl AppClient {
     /// Take a snapshot request: owe a snapshot when it asks this device.
     pub(crate) fn receive_small_state_snapshot_request(
         &mut self,
+        group_id: &GroupId,
         content: &str,
     ) -> Result<(), AppError> {
+        self.ensure_small_state_group(group_id)?;
         let to = decode_snapshot_request(content)?;
         if self.own_device_slot()? == Some(to) {
             self.small_state_snapshot_answer_owed = true;
         }
         Ok(())
+    }
+
+    /// Refuse a small-state message from anywhere but the device group this
+    /// device trusts.
+    fn ensure_small_state_group(&self, group_id: &GroupId) -> Result<(), AppError> {
+        if self.app.device_groups_enabled()
+            && self.trusted_device_group()?.as_ref() == Some(group_id)
+        {
+            Ok(())
+        } else {
+            Err(AppError::DeviceGroupRefused("not_trusted_device_group"))
+        }
     }
 
     /// This device's slot, if it has one.

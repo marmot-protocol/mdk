@@ -129,7 +129,7 @@ impl SmallStateItem {
     pub fn is_valid(&self) -> bool {
         let number = |value: u64| value <= MAX_SMALL_STATE_NUMBER;
         let chat = !self.group_id_hex.is_empty()
-            && self.group_id_hex.len() % 2 == 0
+            && self.group_id_hex.len().is_multiple_of(2)
             && is_lower_hex(&self.group_id_hex);
         let value = match &self.value {
             SmallStateValue::Read(position) => {
@@ -274,31 +274,33 @@ impl SqliteAppStorage {
     /// Mark `items` sent, where each still holds the value that was sent. A
     /// newer local change made since stays owed.
     pub fn mark_small_state_sent(&self, items: &[SmallStateItem]) -> StorageResult<()> {
-        self.set_small_state_unsent(items, false)
-    }
-
-    /// Owe `items` to the siblings again, where each still holds the value:
-    /// the update that carried them was invalidated. They keep their version
-    /// and change id.
-    pub fn owe_small_state_items(&self, items: &[SmallStateItem]) -> StorageResult<()> {
-        self.set_small_state_unsent(items, true)
-    }
-
-    fn set_small_state_unsent(&self, items: &[SmallStateItem], unsent: bool) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for item in items {
                 if held_item_tx(&conn, &item.group_id_hex, item.name())?.as_ref() == Some(item) {
                     conn.execute_cached(
-                        "UPDATE small_state_items SET unsent = ?3
+                        "UPDATE small_state_items SET unsent = 0
                          WHERE group_id_hex = ?1 AND item = ?2",
-                        params![item.group_id_hex, item.name().as_str(), i64::from(unsent)],
+                        params![item.group_id_hex, item.name().as_str()],
                     )
                     .storage()?;
                 }
             }
             Ok(())
         })
+    }
+
+    /// Owe the siblings again every value this device's user set that it
+    /// still holds, with its version and change id: an update that carried
+    /// some of them was invalidated. A value a sibling's beat is no longer
+    /// held, so it is not sent again. Returns how many are owed again.
+    pub fn owe_own_small_state_items(&self) -> StorageResult<usize> {
+        self.lock()?
+            .execute_cached(
+                "UPDATE small_state_items SET unsent = 1 WHERE own = 1 AND unsent = 0",
+                [],
+            )
+            .storage()
     }
 }
 
@@ -569,12 +571,13 @@ fn items_tx(conn: &Connection, unsent_only: bool) -> StorageResult<Vec<SmallStat
     Ok(items)
 }
 
-/// Write `item` as the held value. `observed` and `unsent` as given.
+/// Write `item` as the held value: this device's user's change, owed to the
+/// siblings (`own`), or a sibling's that won.
 fn write_item_tx(
     conn: &Connection,
     item: &SmallStateItem,
     observed: Option<&str>,
-    unsent: bool,
+    own: bool,
     now: u64,
 ) -> StorageResult<()> {
     let (flag, mute_until, read) = match &item.value {
@@ -591,9 +594,9 @@ fn write_item_tx(
     conn.execute_cached(
         "INSERT INTO small_state_items (
             group_id_hex, item, version, change_id, flag, mute_until,
-            read_epoch, read_at, read_message_id_hex, observed, unsent, updated_at
+            read_epoch, read_at, read_message_id_hex, observed, unsent, own, updated_at
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)
          ON CONFLICT(group_id_hex, item) DO UPDATE SET
             version = excluded.version,
             change_id = excluded.change_id,
@@ -604,6 +607,7 @@ fn write_item_tx(
             read_message_id_hex = excluded.read_message_id_hex,
             observed = excluded.observed,
             unsent = excluded.unsent,
+            own = excluded.own,
             updated_at = excluded.updated_at",
         params![
             item.group_id_hex,
@@ -619,7 +623,7 @@ fn write_item_tx(
             read.map(|position| u64_to_i64(position.at)).transpose()?,
             read.map(|position| position.message_id_hex.as_str()),
             observed,
-            i64::from(unsent),
+            i64::from(own),
             u64_to_i64(now)?,
         ],
     )

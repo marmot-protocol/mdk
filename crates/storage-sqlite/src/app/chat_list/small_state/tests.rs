@@ -254,11 +254,20 @@ fn a_local_change_raises_the_version_and_stays_owed_until_sent() {
     assert!(app.unsent_small_state_items().unwrap().is_empty());
     assert_eq!(app.small_state_items().unwrap(), second);
 
-    // An invalidated update is owed again, unchanged.
-    app.owe_small_state_items(&second).unwrap();
+    // After an invalidated update, this device's own values are owed again,
+    // unchanged; a sibling's that won is not.
+    sync(
+        &store,
+        &[versioned("22", SmallStateValue::Archive(true), 1, 9)],
+        &rule,
+    );
+    assert_eq!(app.owe_own_small_state_items().unwrap(), 1);
     assert_eq!(app.unsent_small_state_items().unwrap(), second);
-    app.owe_small_state_items(&first).unwrap();
-    assert_eq!(app.unsent_small_state_items().unwrap(), second);
+    let beaten = versioned("11", SmallStateValue::Pin(true), 3, 9);
+    sync(&store, std::slice::from_ref(&beaten), &rule);
+    app.mark_small_state_sent(&second).unwrap();
+    assert_eq!(app.owe_own_small_state_items().unwrap(), 0);
+    assert!(app.unsent_small_state_items().unwrap().is_empty());
 }
 
 #[test]
