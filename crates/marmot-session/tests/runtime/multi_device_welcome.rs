@@ -17,6 +17,17 @@ fn nostr_peeler(account: &[u8]) -> transport_nostr_peeler::NostrMlsPeeler {
         .with_welcome_signer(deterministic_nostr_keys(account))
 }
 
+async fn recovery_control(
+    account: &[u8],
+    carrier: &TransportMessage,
+) -> cgka_traits::AuthenticatedGroupRecovery {
+    let peeled = nostr_peeler(account).peel_welcome(carrier).await.unwrap();
+    let PeeledContent::GroupRecovery { recovery } = peeled.content else {
+        panic!("expected authenticated recovery control");
+    };
+    *recovery
+}
+
 fn nostr_device_session_with_peeler(
     path: impl Into<std::path::PathBuf>,
     key: &SqlCipherKey,

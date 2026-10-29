@@ -27,7 +27,7 @@ pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutin
 pub use runtime::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, AccountIngestPhase,
     CompletedWelcomePublishTask, DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport,
-    FailedApplicationMessage, ForeignSlotOutcome, ForeignSlotPublication, MaintenanceActivity,
+    FailedApplicationMessage, ForeignSlotOutcome, ForeignSlotPublication, GroupRejoinStatus, MaintenanceActivity,
     MaintenanceAttemptDuration, MaintenanceTiming, OversizedArtifact, OversizedEvent,
     PendingResolution, PreparedSessionCommit, PreparedSessionSend, PreparedWelcomePublishTask,
     PublishFailure, PublishedApplicationMessage, UndeliveredCommit, UnresolvedApplicationMessage,

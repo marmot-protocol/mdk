@@ -793,6 +793,7 @@ impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
 
 include!("runtime/frozen_fanout.rs");
 include!("runtime/hydrated_welcome.rs");
+include!("support/recovery_challenge.rs");
 include!("runtime/key_package_generation_upgrade.rs");
 include!("runtime/component_migration.rs");
 include!("runtime/multi_device_welcome.rs");
@@ -800,6 +801,8 @@ include!("runtime/tagged_siblings.rs");
 include!("runtime/key_package_slot.rs");
 include!("runtime/key_package_slot_withdrawal.rs");
 include!("runtime/own_slot.rs");
+include!("runtime/recovery_eligibility.rs");
+include!("runtime/rejoin_budget.rs");
 include!("runtime/account_devices_advertising.rs");
 include!("runtime/welcome_withdrawal.rs");
 include!("runtime/staged_invite_welcome.rs");
