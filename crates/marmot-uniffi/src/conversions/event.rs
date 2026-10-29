@@ -129,6 +129,13 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
+    /// Whether this device's KeyPackage refresh is overdue may have changed:
+    /// re-read `key_package_refresh_overdue`. Also fires once each time the
+    /// account's worker opens or reconnects, and may fire with no change.
+    KeyPackageRefreshOverdueChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
 }
 
 /// FFI projection of [`cgka_traits::engine::GroupEvent`]. The previous FFI
@@ -466,6 +473,13 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_id_hex,
                 account_label,
             } => Self::LinkedDevicesChanged {
+                account_id_hex,
+                account_label,
+            },
+            MarmotAppEvent::KeyPackageRefreshOverdueChanged {
+                account_id_hex,
+                account_label,
+            } => Self::KeyPackageRefreshOverdueChanged {
                 account_id_hex,
                 account_label,
             },
