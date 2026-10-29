@@ -29,12 +29,20 @@
 //! Welcome path's retryable errors (`terminal_welcome_error`); a
 //! deterministic `Backend` failure is an engine defect, not a refusal.
 //!
+//! KeyPackage validation is the known exception: a bad signature surfaces as
+//! `Backend`. Its checks read nothing of the group's state, so an intent's
+//! KeyPackages are checked before it is queued
+//! ([`Engine::check_queued_key_packages`]), answered as a direct send would
+//! answer them then, and a drain does not meet that failure. A lifetime is
+//! checked against the clock at both points: a package not yet valid is
+//! refused when queued, and one that expires while queued is refused at drain.
+//!
 //! The announcement rides `events_buf` like `LocalGroupCopyTerminated`'s: a
 //! crash between the durable retirement and the host draining events loses
 //! it, and the record is already gone.
 
 use crate::engine::Engine;
-use cgka_traits::engine::GroupEvent;
+use cgka_traits::engine::{GroupEvent, SendIntent};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::{QueuedOutboundIntent, StorageProvider};
@@ -95,6 +103,22 @@ fn reports_the_device(error: &EngineError) -> bool {
 }
 
 impl<S: StorageProvider> Engine<S> {
+    /// Refuse now an intent whose KeyPackages a direct send would refuse now.
+    /// Run before it is queued: the drain holds the `Backend` error a bad
+    /// signature raises, so a queued intent carrying one would never leave
+    /// the queue.
+    pub(crate) fn check_queued_key_packages(&self, intent: &SendIntent) -> Result<(), EngineError> {
+        let (SendIntent::Invite { key_packages, .. }
+        | SendIntent::AddOwnAccountDevices { key_packages, .. }) = intent
+        else {
+            return Ok(());
+        };
+        for key_package in key_packages {
+            self.parse_key_package(key_package)?;
+        }
+        Ok(())
+    }
+
     /// Classify a failed drain-time preparation of a queued intent in
     /// `group_id`. A gate this cannot read counts as closed: when in doubt,
     /// the record stays queued.

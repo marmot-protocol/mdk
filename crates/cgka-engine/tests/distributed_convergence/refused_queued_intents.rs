@@ -230,3 +230,41 @@ async fn a_queued_admin_policy_edit_refused_after_demotion_is_retired() {
     .await;
     assert_refused_and_retired(&drain, "update_app_components");
 }
+
+/// An Invite whose KeyPackage a direct send would refuse is refused when sent
+/// during convergence, not queued: a bad signature fails as `Backend`, which
+/// the drain holds, so the queued Invite would never leave the queue.
+#[tokio::test]
+async fn an_invite_with_a_bad_key_package_signature_is_refused_before_it_is_queued() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut dave, _dave_storage) = build_client(b"dave");
+    let group_id = create_reservation_test_group(&mut alice, &mut carol, "bad-key-package").await;
+    let rename = alice_rename_commit(&mut alice, &group_id, "unsettled").await;
+    assert!(matches!(
+        carol.ingest(rename).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+
+    let mut key_package = dave.fresh_key_package().await.unwrap();
+    // The KeyPackage's signature is its last field.
+    *key_package.bytes.last_mut().unwrap() ^= 0x01;
+    let sent = carol
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![key_package],
+            initial_admins: vec![],
+        })
+        .await;
+    assert!(
+        matches!(sent, Err(cgka_traits::error::EngineError::Backend(_))),
+        "{sent:?}"
+    );
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "nothing was queued"
+    );
+}

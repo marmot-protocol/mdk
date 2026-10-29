@@ -548,7 +548,8 @@ async fn self_updates_and_leaves_never_hold_the_fairness_slot() {
 /// Without the requirement a queued same-account intent is not authorized,
 /// so it takes no fairness attempt: alone it holds nothing, behind it an
 /// admin intent gets the slot exactly as it would alone, and preparing it
-/// later fails with the requirement's typed error.
+/// later refuses it with the requirement's typed error and retires it
+/// (mdk#2694).
 #[tokio::test]
 async fn without_account_devices_a_same_account_intent_takes_no_fairness_attempt() {
     let mut m = members(false).await;
@@ -570,18 +571,43 @@ async fn without_account_devices_a_same_account_intent_takes_no_fairness_attempt
         .engine
         .converge_stored_openmls_messages_at(&gid, 2_000_000)
         .unwrap();
+    m.alice.engine.drain_events();
     let prepared = m
         .alice
         .engine
         .converge_and_drain_queued_outbound_intents(&gid, 2_000_100)
-        .await;
+        .await
+        .unwrap();
+    assert!(prepared.is_empty(), "{prepared:?}");
+    let refusals = m
+        .alice
+        .engine
+        .drain_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            GroupEvent::QueuedIntentRefused {
+                intent_id,
+                intent_kind,
+                reason,
+                ..
+            } => Some((intent_id, intent_kind, reason)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        refusals,
+        vec![(
+            MessageId::new(b"queued-0".to_vec()),
+            "add_own_account_devices".to_string(),
+            "invalid_transition".to_string()
+        )]
+    );
     assert!(
-        matches!(
-            &prepared,
-            Err(EngineError::InvalidTransition(transition))
-                if transition.from == "AccountDevicesNotRequired"
-        ),
-        "{prepared:?}"
+        m.alice
+            .storage
+            .list_queued_outbound_intents(&gid)
+            .unwrap()
+            .is_empty()
     );
 
     let mut m = members(false).await;

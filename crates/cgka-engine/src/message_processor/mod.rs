@@ -909,6 +909,8 @@ impl<S: StorageProvider> Engine<S> {
             if matches!(&intent, SendIntent::EnableAccountDevices { .. }) {
                 self.check_account_devices_activation(&group_id)?;
             }
+            // So is a KeyPackage it carries; see `check_queued_key_packages`.
+            self.check_queued_key_packages(&intent)?;
             let queued = self.queue_outbound_intent(group_id, intent, 0)?;
             reason.trace();
             return Ok(queued);
