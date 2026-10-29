@@ -162,6 +162,24 @@ versioning through the workspace version in the root `Cargo.toml`.
   message, and the socket refusals (a world-accessible or group-writable socket directory, a file in the socket's
   place, a socket already in use), which printed only an `io_kind=`, say what to change. The line still carries no
   paths, account ids or relay URLs.
+- `wnd` answers `wn daemon status`, `wn daemon stop` and pings while it is still opening its accounts, which the
+  runtime allows 45 seconds (part of mdk#2696). It used to bind its socket and accept nothing until then, so those
+  commands connected and waited with no reply. `wn daemon status` and the TUI status line now say `daemon starting`
+  in that window, and `--json` carries a new `starting` field. Other commands wait for the accounts as before. A stop during startup
+  cancels the start and shuts down what it had opened.
+- `wn daemon start` no longer reports a failed start while the daemon it launched keeps starting (mdk#2696). It gave
+  up after five seconds with `daemon_start_failed`, but the first launch of a newly built `wnd` on a loaded macOS
+  machine can wait longer than that before it runs, and the daemon then came up behind the error. The command now
+  watches the `wnd` it launched: it reports `daemon started` once that daemon reports its accounts open, fails at
+  once with `daemon_start_failed` and the log's last lines if it exits, and stops it and fails with
+  `daemon_start_timeout` if it is not ready after 60 seconds, which covers the runtime's own 45-second wait for
+  accounts to open. Ctrl-C stops it as well and fails with `daemon_start_interrupted`; the daemon runs in its own
+  process group, so it used to keep starting behind the interrupted command. When another start wins the socket, it
+  stops its own `wnd` and reports `daemon already running`.
+- `wn daemon stop` no longer reports `daemon stopped` while the daemon is still running (mdk#2696). It reported
+  success as soon as the daemon accepted the request, before the daemon shut down its runtime and exited, so a slow
+  or stuck shutdown left a daemon behind a successful stop. It now waits for the process to exit, and fails with
+  `daemon_stop_timeout` if it is still running after 30 seconds.
 
 ## [0.14.0] - 2026-10-23
 

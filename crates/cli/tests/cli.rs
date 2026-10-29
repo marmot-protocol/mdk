@@ -1807,26 +1807,38 @@ fn wait_until_projected_agent_stream_message(
     );
 }
 
+/// How long a test daemon may stay up without answering before the test gives
+/// up on it, matching `wn daemon start`. A daemon the test spawned that exits
+/// fails at once; this bounds only one that never answers. The first launch of
+/// a freshly linked `wnd` on a loaded macOS machine can wait several seconds
+/// before it runs (mdk#2696).
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn daemon_answers(socket: &std::path::Path) -> bool {
+    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .arg("--socket")
+        .arg(socket)
+        .arg("--json")
+        .args(["daemon", "status"])
+        .output()
+        .expect("wn daemon status should start");
+    output.status.success()
+        && serde_json::from_slice::<Value>(&output.stdout)
+            .expect("status stdout should be JSON")["result"]["running"]
+            .as_bool()
+            == Some(true)
+}
+
 fn wait_for_daemon(socket: &std::path::Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        let output = Command::new(env!("CARGO_BIN_EXE_wn"))
-            .arg("--socket")
-            .arg(socket)
-            .arg("--json")
-            .args(["daemon", "status"])
-            .output()
-            .expect("wn daemon status should start");
-        if output.status.success() {
-            let value: Value =
-                serde_json::from_slice(&output.stdout).expect("status stdout should be JSON");
-            if value["result"]["running"].as_bool() == Some(true) {
-                return;
-            }
-        }
+    let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+    while !daemon_answers(socket) {
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not become ready at {}",
+            socket.display()
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("daemon did not become ready at {}", socket.display());
 }
 
 /// How long a test daemon gets to exit after `wn daemon stop` before its guard
@@ -1868,17 +1880,33 @@ impl DaemonGuard {
         let mut command = Command::new(env!("CARGO_BIN_EXE_wnd"));
         command.arg("--socket").arg(socket);
         let child = configure(&mut command).spawn().expect("wnd should start");
-        let guard = Self {
+        let mut guard = Self {
             socket: socket.to_owned(),
             process: DaemonProcess::Child(child),
         };
-        wait_for_daemon(socket);
+        let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+        while !daemon_answers(socket) {
+            if let DaemonProcess::Child(child) = &mut guard.process
+                && let Ok(Some(exit)) = child.try_wait()
+            {
+                panic!(
+                    "wnd exited before it answered at {} ({exit})",
+                    socket.display()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon did not become ready at {}",
+                socket.display()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
         guard
     }
 
     /// Guard the daemon a `wn daemon start` for `socket` spawns. Take it
-    /// before running the start: a start that misses its readiness deadline
-    /// under load leaves a daemon that is still coming up.
+    /// before running the start: the test can fail, or the start can be
+    /// killed, while that daemon is still coming up.
     fn detached(socket: &std::path::Path) -> Self {
         Self {
             socket: socket.to_owned(),
@@ -7037,6 +7065,133 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         stop.status.success(),
         "daemon stop failed\n{}",
         command_output_summary(&stop)
+    );
+    // `daemon stop` reports success only once the daemon has exited, so a
+    // passing run leaves nothing for the guard to clean up.
+    assert_eq!(wnd_pids_for_socket(&socket), Vec::<libc::pid_t>::new());
+}
+
+/// `wn --json daemon start` for `home` on `socket`, against the test relay.
+fn daemon_start_command(home: &std::path::Path, socket: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wn"));
+    command
+        .arg("--home")
+        .arg(home)
+        .arg("--socket")
+        .arg(socket)
+        .arg("--secret-store")
+        .arg("file")
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        .arg("--json")
+        .args([
+            "daemon",
+            "start",
+            "--discovery-relays",
+            test_relay_url(),
+            "--default-account-relays",
+            test_relay_url(),
+        ]);
+    command
+}
+
+#[cfg(feature = "test-policy-overrides")]
+fn daemon_start_error(start: &Output) -> (String, String) {
+    assert!(
+        !start.status.success(),
+        "daemon start unexpectedly succeeded\n{}",
+        command_output_summary(start)
+    );
+    let value: Value = serde_json::from_slice(&start.stdout).expect("start stdout should be JSON");
+    let field = |name: &str| {
+        value["error"][name]
+            .as_str()
+            .unwrap_or_else(|| panic!("error {name}\n{}", command_output_summary(start)))
+            .to_owned()
+    };
+    (field("code"), field("message"))
+}
+
+#[test]
+fn daemon_start_reports_the_daemon_it_spawned_once_it_answers() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("wnd.sock");
+    let _daemon = DaemonGuard::detached(&socket);
+
+    let start = daemon_start_command(home.path(), &socket)
+        .output()
+        .expect("wn daemon start should run");
+
+    assert!(
+        start.status.success(),
+        "daemon start failed\n{}",
+        command_output_summary(&start)
+    );
+    let value: Value = serde_json::from_slice(&start.stdout).expect("start stdout should be JSON");
+    assert_eq!(value["result"]["running"], true);
+    let pid = value["result"]["pid"]
+        .as_i64()
+        .and_then(|pid| libc::pid_t::try_from(pid).ok())
+        .expect("started daemon pid");
+    assert_eq!(wnd_pids_for_socket(&socket), vec![pid]);
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[test]
+fn daemon_start_fails_at_once_when_the_daemon_it_spawned_exits() {
+    let home = tempfile::tempdir().expect("tempdir");
+    // wnd cannot make its socket under a regular file, so it exits at startup.
+    let not_a_dir = home.path().join("not-a-dir");
+    std::fs::write(&not_a_dir, b"").expect("write file");
+    let socket = not_a_dir.join("wnd.sock");
+    let _daemon = DaemonGuard::detached(&socket);
+
+    let started = Instant::now();
+    let start = daemon_start_command(home.path(), &socket)
+        // A cap long enough that waiting for it would fail the test.
+        .env("WN_DEV_DAEMON_START_TIMEOUT_MS", "600000")
+        .output()
+        .expect("wn daemon start should run");
+    let elapsed = started.elapsed();
+
+    let (code, message) = daemon_start_error(&start);
+    assert_eq!(code, "daemon_start_failed");
+    assert!(
+        message.contains("exited before it became ready"),
+        "{message}"
+    );
+    assert!(message.contains("Not a directory"), "{message}");
+    assert!(
+        elapsed < Duration::from_secs(120),
+        "an exited daemon must not wait for the cap: {elapsed:?}"
+    );
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[test]
+fn daemon_start_stops_the_daemon_it_spawned_at_the_cap() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("wnd.sock");
+    let _daemon = DaemonGuard::detached(&socket);
+
+    let start = daemon_start_command(home.path(), &socket)
+        // Reach the cap before the spawned daemon can answer.
+        .env("WN_DEV_DAEMON_START_TIMEOUT_MS", "0")
+        .output()
+        .expect("wn daemon start should run");
+
+    let (code, message) = daemon_start_error(&start);
+    assert_eq!(code, "daemon_start_timeout");
+    assert!(message.contains("so it was stopped"), "{message}");
+    assert_eq!(wnd_pids_for_socket(&socket), Vec::<libc::pid_t>::new());
+
+    // Whatever the stopped daemon left behind does not block the next start.
+    let restart = daemon_start_command(home.path(), &socket)
+        .output()
+        .expect("wn daemon start should run");
+    assert!(
+        restart.status.success(),
+        "daemon restart failed\n{}",
+        command_output_summary(&restart)
     );
 }
 
