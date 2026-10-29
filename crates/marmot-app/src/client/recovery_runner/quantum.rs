@@ -16,7 +16,9 @@
 //! including full replies a halving discards, replies a budget cut short,
 //! saturated seconds and duplicates: each staged slice carries what was read
 //! since the last one, and settlement charges the rest. A best-effort relay is
-//! never charged.
+//! never charged. The one exception is the reply in flight when the deadline
+//! or a preemption drops its request: the sweep relay counts a reply only once
+//! it ends, so at most one partial reply per quantum goes uncharged (mdk#2719).
 //!
 //! The relay wrapper also keeps whether the last reply was a `rate-limited:`
 //! CLOSED. A quantum that reaches its deadline right after one was rate
@@ -367,6 +369,12 @@ pub(super) async fn run<H: RunnerHost>(
             break;
         }
     }
+    // A request the deadline or a preemption dropped never reached `read`:
+    // what its relay already counted (a second's completed chunks) is still
+    // there.
+    meter
+        .bytes
+        .fetch_add(relay.relay.take_fetched_bytes(), Ordering::Relaxed);
     report.newly_covered_seconds = sink.newly_covered_seconds;
     report.stop = sink.stop;
     report.rate_limited = meter.rate_limited.into_inner();

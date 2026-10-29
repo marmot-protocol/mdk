@@ -237,7 +237,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
   reached right after a `rate-limited:` reply settles `RateLimited`. Every event byte a required relay sends is
   charged to the account's rolling hour, cut and discarded replies included; best-effort relays are never charged.
-  Logs carry aggregates only.
+  The one uncharged reply is the one in flight when a quantum is cut (mdk#2719). Logs carry aggregates only.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown

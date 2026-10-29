@@ -389,6 +389,11 @@ struct ModelRelay {
     reachable: AtomicBool,
     /// Requests, by index, that get `rate-limited:` back.
     limited: Range<usize>,
+    /// Event bytes each request reads before it waits out the gate, as a
+    /// second's completed chunks are read before a later one is held.
+    read_before_reply: u64,
+    /// Bytes read that `take_fetched_bytes` has not reported yet.
+    unreported: AtomicU64,
     latency: Duration,
     requests: AtomicUsize,
     queries: Mutex<Vec<SliceQuery>>,
@@ -411,6 +416,8 @@ impl ModelRelay {
             events: Vec::new(),
             reachable: AtomicBool::new(true),
             limited: 0..0,
+            read_before_reply: 0,
+            unreported: AtomicU64::new(0),
             latency: Duration::ZERO,
             requests: AtomicUsize::new(0),
             queries: Mutex::new(Vec::new()),
@@ -443,6 +450,11 @@ impl ModelRelay {
 
     fn rate_limiting_requests(mut self, requests: Range<usize>) -> Self {
         self.limited = requests;
+        self
+    }
+
+    fn reading_before_reply(mut self, bytes: u64) -> Self {
+        self.read_before_reply = bytes;
         self
     }
 
@@ -516,6 +528,8 @@ impl ModelRelay {
     /// answer, if anything.
     async fn arrive(&self) -> Option<ClosedOrUnreachable> {
         let index = self.requests.fetch_add(1, Ordering::SeqCst);
+        self.unreported
+            .fetch_add(self.read_before_reply, Ordering::SeqCst);
         self.gate.pass(index).await;
         if !self.latency.is_zero() {
             tokio::time::sleep(self.latency).await;
@@ -598,6 +612,10 @@ impl SweepRelay for Swept {
 
     async fn fetch_second(&self, route: SweepRoute, second: u64, _cap: Option<u32>) -> SecondReply {
         self.relay.fetch_second(route, second).await
+    }
+
+    fn take_fetched_bytes(&self) -> u64 {
+        self.relay.unreported.swap(0, Ordering::SeqCst)
     }
 }
 
@@ -1875,6 +1893,41 @@ async fn recovery_runner_charges_returned_bytes_to_required_units_alone() {
     assert!(account.app.staged_recovery_total().unwrap().events > 0);
     assert_eq!(usage().event_bytes, charged, "best effort is never charged");
     assert_eq!(usage().attempts, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_charges_what_a_dropped_request_already_read() {
+    const READ: u64 = 4096;
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    // The first request reads, then outlasts the quantum: an id fetch whose
+    // earlier chunks completed and whose next one never comes back.
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .reading_before_reply(READ)
+        .build();
+    relay.gate.hold_from(0);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, t0 - HOUR);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Unanswered);
+    assert_eq!(relay.gate.waiting(), 0, "the deadline dropped the request");
+    assert_eq!(
+        account
+            .app
+            .recovery_account_usage(clock.now())
+            .unwrap()
+            .event_bytes,
+        READ
+    );
 }
 
 // A paused clock (Tokio allows one only on the current-thread runtime) lets

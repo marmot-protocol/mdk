@@ -738,7 +738,9 @@ the live tails again, plans the unit's owed ranges from its ledger cursor, reads
 mark and charges the attempt. It sweeps those ranges oldest first under one 10 s deadline,
 stages each proven slice with its coverage through that mark, and applies the outcome table
 above. Progress is newly covered seconds on the unit's own relay, so live traffic, other routes
-and reconnects reset nothing.
+and reconnects reset nothing. Every event byte a required relay sends counts toward the
+account's rolling-hour budget, including replies a budget cut short and replies a halving
+discards. The one exception is the reply still in flight when a quantum is cut (mdk#2719).
 
 Debt subtracts the healthy live tails. They are a process-local query that every debt turn
 asks again and nothing keeps across an await, since a tail can lapse with no event when its
