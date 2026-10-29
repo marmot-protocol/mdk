@@ -15,7 +15,7 @@ pub use cgka_engine::account_identity_proof::{
 };
 pub use cgka_engine::application_message_len;
 pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
-pub use cgka_engine::engine::WelcomeDeliveryIndex;
+pub use cgka_engine::engine::{WelcomeDeliveryIndex, WelcomeWithdrawal};
 pub use cgka_engine::feature_registry::FeatureRegistry;
 pub use cgka_engine::group_authority::{CanonicalGroupMembership, GroupAuthoritySnapshot};
 pub use cgka_engine::key_package::{
@@ -831,6 +831,16 @@ impl AccountDeviceSession {
     /// transport reports the required acknowledgements.
     pub fn mark_sent_welcome_delivered(&self, id: &MessageId) -> SessionResult<()> {
         Ok(self.engine.mark_sent_welcome_delivered(id)?)
+    }
+
+    /// See `Engine::withdraw_sent_welcome`.
+    pub fn withdraw_sent_welcome(&self, id: &MessageId) -> SessionResult<WelcomeWithdrawal> {
+        Ok(self.engine.withdraw_sent_welcome(id)?)
+    }
+
+    /// See `Engine::sent_welcome_withdrawn`.
+    pub fn sent_welcome_withdrawn(&self, id: &MessageId) -> SessionResult<bool> {
+        Ok(self.engine.sent_welcome_withdrawn(id)?)
     }
 
     /// Stored groups that failed session-open hydration and were skipped

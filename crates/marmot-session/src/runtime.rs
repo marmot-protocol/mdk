@@ -9,7 +9,7 @@ pub enum AccountIngestPhase {
 }
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cgka_traits::AppComponentId;
@@ -61,7 +61,7 @@ use crate::session::{
     AccountDeviceSession, CanonicalGroupMembership, CreateGroupEffects, GroupAuthorityView,
     HydrationProgress, IngestEffects, KeyPackageMetadata, KeyPackageRequirements, PublishWork,
     QueuedIntentRef, SessionConfig, SessionEffects, SessionError, SessionOpenTimings,
-    SessionResult,
+    SessionResult, WelcomeWithdrawal,
 };
 use crate::time::{
     MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
@@ -201,6 +201,9 @@ struct PublishStatus {
     possible_ambiguous_exposure: bool,
     retry_deferred: bool,
     terminal_failure: bool,
+    /// The Welcome was withdrawn or retired, so nothing was published and
+    /// nothing is owed.
+    withdrawn: bool,
     /// The Welcome is staged with its unconfirmed commit, so nothing was
     /// published and nothing is recorded or owed yet.
     awaits_commit: bool,
@@ -280,7 +283,10 @@ pub struct PreparedWelcomePublishTask {
     adapter: Arc<dyn TransportAdapter>,
     prepared: PreparedWelcomePublish,
     message_ids: Vec<cgka_traits::MessageId>,
+    withdrawals: DetachedWelcomeWithdrawals,
 }
+
+type DetachedWelcomeWithdrawals = Arc<Mutex<HashSet<cgka_traits::MessageId>>>;
 
 /// Opaque relay results from [`PreparedWelcomePublishTask::run`].
 #[doc(hidden)]
@@ -299,7 +305,10 @@ impl PreparedWelcomePublishTask {
     /// SQLite state and is therefore safe to poll beside the account worker.
     pub async fn run(self) -> CompletedWelcomePublishTask {
         CompletedWelcomePublishTask {
-            completed: self.prepared.publish(self.adapter.as_ref()).await,
+            completed: self
+                .prepared
+                .publish(self.adapter.as_ref(), Some(&self.withdrawals))
+                .await,
             message_ids: self.message_ids,
         }
     }
@@ -313,10 +322,24 @@ impl PreparedWelcomePublish {
             .collect()
     }
 
-    async fn publish(mut self, adapter: &dyn TransportAdapter) -> CompletedWelcomePublish {
+    /// `withdrawals` names Welcomes withdrawn after preparation; one whose
+    /// relay attempt has not started is skipped and reported withdrawn.
+    async fn publish(
+        mut self,
+        adapter: &dyn TransportAdapter,
+        withdrawals: Option<&Mutex<HashSet<cgka_traits::MessageId>>>,
+    ) -> CompletedWelcomePublish {
         let publish = |index, attempt: Box<PreparedLegacyPublishAttempt>| async move {
+            if withdrawals.is_some_and(|withdrawals| {
+                withdrawals
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .contains(&attempt.message_id)
+            }) {
+                return (index, attempt, None);
+            }
             let result = adapter.publish(attempt.request.clone()).await;
-            (index, attempt, result)
+            (index, attempt, Some(result))
         };
         let mut in_flight = FuturesUnordered::new();
         while in_flight.len() < WELCOME_PUBLISH_CONCURRENCY {
@@ -326,7 +349,13 @@ impl PreparedWelcomePublish {
             in_flight.push(publish(index, attempt));
         }
         while let Some((index, attempt, result)) = in_flight.next().await {
-            self.completions[index] = Some(LegacyPublishCompletion::Network(attempt, result));
+            self.completions[index] = Some(match result {
+                Some(result) => LegacyPublishCompletion::Network(attempt, result),
+                None => LegacyPublishCompletion::Complete(PublishStatus {
+                    withdrawn: true,
+                    ..PublishStatus::default()
+                }),
+            });
             if let Some((next_index, next_attempt)) = self.pending.pop_front() {
                 in_flight.push(publish(next_index, next_attempt));
             }
@@ -488,6 +517,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// paths skip these ids until their results are reconciled, preventing two
     /// concurrent publications of the same retained event.
     detached_welcome_publishes: HashSet<cgka_traits::MessageId>,
+    /// Detached Welcomes withdrawn after their task was prepared. The task
+    /// skips each one whose relay attempt has not started.
+    detached_welcome_withdrawals: DetachedWelcomeWithdrawals,
     /// Test-only fault injection: while armed, the finish stage of a prepared
     /// legacy publish for this message id fails with a transient storage
     /// error. Never set by production code.
@@ -553,6 +585,7 @@ where
             component_migration_checked_at: HashMap::new(),
             pending_leaf_reconciliations: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
+            detached_welcome_withdrawals: DetachedWelcomeWithdrawals::default(),
             finish_stage_failure: None,
             publication_progress: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -3446,6 +3479,7 @@ where
             adapter: Arc::new(self.adapter.clone()),
             prepared,
             message_ids,
+            withdrawals: self.detached_welcome_withdrawals.clone(),
         })
     }
 
@@ -3470,8 +3504,13 @@ where
     /// cancelled or panics. Durable fanout remains retryable.
     #[doc(hidden)]
     pub fn abandon_welcome_publish_task(&mut self, message_ids: &[cgka_traits::MessageId]) {
+        let mut withdrawals = self
+            .detached_welcome_withdrawals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for message_id in message_ids {
             self.detached_welcome_publishes.remove(message_id);
+            withdrawals.remove(message_id);
         }
     }
 
@@ -4740,7 +4779,7 @@ where
         force_retry: bool,
     ) -> AccountResult<()> {
         let prepared = self.prepare_welcome_publish(welcomes, group_id, context, force_retry)?;
-        let completed = prepared.publish(&self.adapter).await;
+        let completed = prepared.publish(&self.adapter, None).await;
         self.finish_welcome_publish(completed, output).await
     }
 
@@ -4826,6 +4865,7 @@ where
                 }
             };
             if let Some(status) = status
+                && !status.withdrawn
                 && !status.awaits_commit
             {
                 if status.met_required_acks {
@@ -4981,6 +5021,14 @@ where
         let Some(mut fanout) = self.session.transport_fanout(message_id)? else {
             return Ok(());
         };
+        if matches!(
+            fanout.exact_message.envelope,
+            TransportEnvelope::Welcome { .. }
+        ) && self.session.sent_welcome_withdrawn(message_id)?
+        {
+            self.session.delete_transport_fanout(message_id)?;
+            return Ok(());
+        }
         let remaining = fanout
             .targets
             .iter()
@@ -5148,7 +5196,9 @@ where
             .await?;
         if status.met_required_acks {
             self.mark_welcome_delivered_best_effort(message_id);
-        } else if let Some(recipient) = recipient {
+        } else if !status.withdrawn
+            && let Some(recipient) = recipient
+        {
             let failure = self.welcome_delivery_failure(
                 message_id.clone(),
                 recipient,
@@ -5159,6 +5209,38 @@ where
             output.welcome_failures.push(failure);
         }
         Ok(output)
+    }
+
+    /// Withdraw one retained delivery-aware outbound Welcome (see
+    /// `Engine::withdraw_sent_welcome`), owed or still staged with its
+    /// commit, so that no path publishes it again: not
+    /// startup recovery, maintenance retries, explicit redelivery, nor
+    /// release after its commit confirms. Its remaining relay retries are
+    /// dropped with it. A relay attempt already started cannot be recalled;
+    /// a detached startup retry skips every attempt it has not started.
+    ///
+    /// This touches only the Welcome, never group state, so it works before
+    /// hydration reaches the Welcome's group.
+    pub fn withdraw_welcome(
+        &self,
+        message_id: &cgka_traits::MessageId,
+    ) -> AccountResult<WelcomeWithdrawal> {
+        let withdrawal = self.session.withdraw_sent_welcome(message_id)?;
+        if withdrawal == WelcomeWithdrawal::AlreadyDelivered {
+            return Ok(withdrawal);
+        }
+        if self.detached_welcome_publishes.contains(message_id) {
+            // A detached startup publish holds the Welcome and its record: it
+            // skips the attempt if not started, and the next maintenance pass
+            // drops the record.
+            self.detached_welcome_withdrawals
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(message_id.clone());
+        } else {
+            self.session.delete_transport_fanout(message_id)?;
+        }
+        Ok(withdrawal)
     }
 
     /// Retained outbound Welcome obligations that have not met their
@@ -5610,6 +5692,7 @@ where
             retry_deferred: fanout_outcome.outstanding_targets > 0,
             terminal_failure: report.accepted_count() == 0
                 && fanout_outcome.outstanding_targets == 0,
+            withdrawn: false,
             awaits_commit: false,
         };
         let publish_failure_reason =
@@ -5778,9 +5861,18 @@ where
                 ..PublishStatus::default()
             }));
         }
-        // Every Welcome publish passes through here. A Welcome staged with
-        // its invite commit waits for that commit to confirm, whoever asks
-        // for it (mdk#2726).
+        // Every Welcome publish passes here, whichever path still holds the
+        // Welcome, so a withdrawn or retired one is never published again.
+        if matches!(message.envelope, TransportEnvelope::Welcome { .. })
+            && self.session.sent_welcome_withdrawn(&message_id)?
+        {
+            return Ok(PreparedLegacyPublish::Complete(PublishStatus {
+                withdrawn: true,
+                ..PublishStatus::default()
+            }));
+        }
+        // A Welcome staged with its invite commit waits for that commit to
+        // confirm, whoever asks for it (mdk#2726).
         if matches!(message.envelope, TransportEnvelope::Welcome { .. })
             && self.session.sent_welcome_awaits_commit(&message_id)?
         {
@@ -5985,6 +6077,7 @@ where
                 possible_ambiguous_exposure: fanout.possible_exposure,
                 retry_deferred,
                 terminal_failure: false,
+                withdrawn: false,
                 awaits_commit: false,
             }));
         }
@@ -6196,6 +6289,7 @@ where
                     possible_ambiguous_exposure: true,
                     retry_deferred: false,
                     terminal_failure: false,
+                    withdrawn: false,
                     awaits_commit: false,
                 });
             }
@@ -6283,6 +6377,7 @@ where
             possible_ambiguous_exposure: fanout.possible_exposure,
             retry_deferred: false,
             terminal_failure: !published && !accepted_by_any_endpoint && !fanout.possible_exposure,
+            withdrawn: false,
             awaits_commit: false,
         })
     }

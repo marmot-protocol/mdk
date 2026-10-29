@@ -40,7 +40,7 @@ use marmot_session::{
     KeyPackageSlotWithdrawal, MaintenanceRandom, MaintenanceTiming, MonotonicClock,
     NoopKeyPackagePublisher, PendingResolution, PublishWork, PublishedApplicationMessage,
     SessionConfig, SessionError, StaticTransportRouting, TransportRoutingError,
-    TransportRoutingPolicy, WallClock,
+    TransportRoutingPolicy, WallClock, WelcomeWithdrawal,
 };
 use nostr::prelude::FinalizeEvent;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
@@ -732,6 +732,7 @@ include!("runtime/multi_device_welcome.rs");
 include!("runtime/key_package_slot.rs");
 include!("runtime/key_package_slot_withdrawal.rs");
 include!("runtime/account_devices_advertising.rs");
+include!("runtime/welcome_withdrawal.rs");
 include!("runtime/staged_invite_welcome.rs");
 
 #[derive(Clone, Default)]

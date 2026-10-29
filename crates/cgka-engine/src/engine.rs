@@ -67,6 +67,18 @@ pub struct WelcomeDeliveryIndex {
     pub tracked_ids: Vec<MessageId>,
 }
 
+/// What [`Engine::withdraw_sent_welcome`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WelcomeWithdrawal {
+    /// The Welcome was still owed, or staged with its commit, and is now
+    /// withdrawn: nothing publishes it again.
+    Withdrawn,
+    /// The Welcome already met its delivery policy; there is nothing to stop.
+    AlreadyDelivered,
+    /// The Welcome was already withdrawn, or retired with its staged commit.
+    AlreadyWithdrawn,
+}
+
 #[derive(Clone, Copy)]
 enum SendAcceptance {
     Prepare,
@@ -3456,6 +3468,83 @@ impl<S: StorageProvider> Engine<S> {
         // terminal delivery state.
         let _ = self.stored_sent_welcome(id)?;
         self.update_stored_message_state(id, MessageState::Processed)
+    }
+
+    /// Withdraw one retained outbound Welcome, owed or still staged with its
+    /// commit, so that nothing publishes it again: its row becomes `Failed`,
+    /// as a staged Welcome's does when its commit rolls back. A staged one is
+    /// then never promoted when its commit confirms. A publish already in
+    /// flight cannot be recalled; its later delivered mark fails, because
+    /// the row is no longer `Sent`.
+    ///
+    /// Only delivery-aware Welcomes (invite Welcomes, and a current-profile
+    /// create's founding Welcomes) can be withdrawn. A legacy-profile
+    /// create's Welcome is the create's own publication, carried on its
+    /// frozen fanout, so withdrawing it could not stop it.
+    ///
+    /// Withdrawal touches only the Welcome's own row, never group state, so
+    /// it works for a group not hydrated yet: a restart must be able to stop
+    /// a Welcome before hydration reaches its group.
+    pub fn withdraw_sent_welcome(&self, id: &MessageId) -> Result<WelcomeWithdrawal, EngineError> {
+        let record = self.storage.get_message(id)?;
+        let payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
+        let message = match &payload {
+            StoredMessagePayload::OutboundWelcome(message)
+            | StoredMessagePayload::StagedInviteWelcome { message, .. } => Some(message),
+            StoredMessagePayload::RawTransport(_)
+            | StoredMessagePayload::OpenMlsWire(_)
+            | StoredMessagePayload::SignedOpenMlsWire { .. }
+            | StoredMessagePayload::OwnCommitWire { .. } => None,
+        };
+        if !message
+            .is_some_and(|message| matches!(message.envelope, TransportEnvelope::Welcome { .. }))
+        {
+            return Err(EngineError::Backend(
+                "stored message is not a delivery-aware outbound Welcome".into(),
+            ));
+        }
+        match record.state {
+            MessageState::Sent => {
+                self.update_stored_message_state(id, MessageState::Failed)?;
+                Ok(WelcomeWithdrawal::Withdrawn)
+            }
+            MessageState::Processed => Ok(WelcomeWithdrawal::AlreadyDelivered),
+            MessageState::Failed => Ok(WelcomeWithdrawal::AlreadyWithdrawn),
+            _ => Err(EngineError::Backend(
+                "stored message is not an outbound sent record".into(),
+            )),
+        }
+    }
+
+    /// Whether `id` names a retained outbound Welcome that must never be
+    /// published again: withdrawn, or retired with its staged commit. A
+    /// missing row is not withdrawn, so a caller publishing an artifact this
+    /// engine never retained behaves as before.
+    pub fn sent_welcome_withdrawn(&self, id: &MessageId) -> Result<bool, EngineError> {
+        let record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(false),
+            Err(error) => return Err(EngineError::Storage(error)),
+        };
+        if record.state != MessageState::Failed {
+            return Ok(false);
+        }
+        // The caller is about to publish a Welcome under this id. A `Failed`
+        // row it cannot read still forbids that, so fail closed.
+        let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+            return Ok(true);
+        };
+        Ok(match &payload {
+            StoredMessagePayload::OutboundWelcome(message)
+            | StoredMessagePayload::StagedInviteWelcome { message, .. }
+            | StoredMessagePayload::RawTransport(message) => {
+                matches!(message.envelope, TransportEnvelope::Welcome { .. })
+            }
+            StoredMessagePayload::OpenMlsWire(_)
+            | StoredMessagePayload::SignedOpenMlsWire { .. }
+            | StoredMessagePayload::OwnCommitWire { .. } => false,
+        })
     }
 
     /// Liveness-gated read-only access to the group's `MlsGroup`, served from
