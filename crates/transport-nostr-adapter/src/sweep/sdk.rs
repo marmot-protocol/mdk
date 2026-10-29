@@ -1,4 +1,6 @@
-//! [`SweepRelay`] over one relay of a [`NostrSdkRelayClient`]'s pool.
+//! [`SweepRelay`] over one relay of a [`NostrSdkRelayClient`]'s pool, and the
+//! same relay as a [`CompareRelay`] for the recovery runner's NIP-77
+//! comparisons.
 //!
 //! It dials nothing: the endpoint must already be in the client's pool, which
 //! admits relays only through the dial-safety chokepoint. An endpoint missing
@@ -18,16 +20,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use nostr_sdk::prelude::{
     AcquisitionEnd, AcquisitionLimits, Client, Event, EventId, Filter, RelayAcquisition, RelayUrl,
-    ReqTarget, SyncDirection, SyncOptions,
+    ReqTarget, SyncDirection, SyncOptions, Timestamp,
 };
 use tokio::sync::Semaphore;
 
 use super::hint_tap::{EoseHints, HintWatch};
 use super::{
-    ClosedReason, RelayCaps, SecondReply, SliceQuery, SliceReply, SweepRelay, SweepRoute,
-    UnreachableKind,
+    ClosedReason, RelayCaps, SecondReply, SliceQuery, SliceReply, SweepRange, SweepRelay,
+    SweepRoute, UnreachableKind,
 };
 use crate::NostrSdkRelayClient;
+use crate::compare::{CompareRelay, CompareReply, IdsReply, LocalItem};
 use crate::sdk_client::{neg_sync_dry_run, sweep_eose_hints, sweep_neg_credit};
 
 /// Default bytes one reply may carry. A full wok page is 5,000 events.
@@ -75,6 +78,15 @@ impl SdkSweepRelay {
     pub fn with_reply_max_bytes(mut self, bytes: usize) -> Self {
         self.reply_max_bytes = bytes.max(1);
         self
+    }
+
+    /// A NIP-77 comparison that downloads nothing, under the request timeout.
+    fn dry_run(&self) -> SyncOptions {
+        SyncOptions::new()
+            .initial_timeout(self.request_timeout)
+            .idle_timeout(self.request_timeout)
+            .direction(SyncDirection::Down)
+            .dry_run()
     }
 
     /// One bounded REQ to this relay, closed at EOSE.
@@ -166,25 +178,21 @@ impl SweepRelay for SdkSweepRelay {
         let Ok(Some(relay)) = self.client.relay(&self.endpoint).await else {
             return SecondReply::Unreachable(UnreachableKind::Disconnected);
         };
-        let options = SyncOptions::new()
-            .initial_timeout(self.request_timeout)
-            .idle_timeout(self.request_timeout)
-            .direction(SyncDirection::Down)
-            .dry_run();
         let deadline = tokio::time::Instant::now() + self.request_timeout;
         let ids = match neg_sync_dry_run(
             &relay,
             route.second_filter(second, second).limit(SECOND_NEG_LIMIT),
-            options,
+            Vec::new(),
+            self.dry_run(),
             self.neg_credit.clone(),
             deadline,
         )
         .await
         {
-            Ok(ids) => ids,
+            Ok(compared) => compared.remote,
             Err(NegFailure::Closed(reason)) => return SecondReply::Closed(reason),
             Err(NegFailure::Unreachable(kind)) => return SecondReply::Unreachable(kind),
-            Err(NegFailure::Unproven) => return SecondReply::Unproven,
+            Err(NegFailure::Unproven | NegFailure::Local) => return SecondReply::Unproven,
         };
         if ids.len() >= SECOND_NEG_LIMIT {
             return SecondReply::Unproven;
@@ -243,10 +251,93 @@ impl SweepRelay for SdkSweepRelay {
     }
 }
 
-/// Why a NIP-77 comparison of one second failed.
+#[async_trait]
+impl CompareRelay for SdkSweepRelay {
+    fn caps(&self) -> RelayCaps {
+        self.caps
+    }
+
+    async fn compare(
+        &self,
+        route: SweepRoute,
+        window: SweepRange,
+        local: &[LocalItem],
+        limit: usize,
+    ) -> CompareReply {
+        let Ok(Some(relay)) = self.client.relay(&self.endpoint).await else {
+            return CompareReply::Unreachable(UnreachableKind::Disconnected);
+        };
+        let items = local
+            .iter()
+            .map(|item| (item.id, Timestamp::from_secs(item.created_at)))
+            .collect();
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        match neg_sync_dry_run(
+            &relay,
+            route.second_filter(window.since, window.until).limit(limit),
+            items,
+            self.dry_run(),
+            self.neg_credit.clone(),
+            deadline,
+        )
+        .await
+        {
+            Ok(compared) => CompareReply::Compared {
+                missing: compared.remote.into_iter().collect(),
+                relay_set: compared.relay_set,
+            },
+            Err(NegFailure::Closed(reason)) => CompareReply::Closed(reason),
+            Err(NegFailure::Unreachable(kind)) => CompareReply::Unreachable(kind),
+            Err(NegFailure::Unproven) => CompareReply::Unsupported,
+            // Not the relay's fault: retried like a dropped connection.
+            Err(NegFailure::Local) => CompareReply::Unreachable(UnreachableKind::Disconnected),
+        }
+    }
+
+    async fn fetch_ids(&self, route: SweepRoute, window: SweepRange, ids: &[EventId]) -> IdsReply {
+        let mut events = Vec::with_capacity(ids.len());
+        let mut pending = vec![ids.to_vec()];
+        while let Some(chunk) = pending.pop() {
+            if chunk.is_empty() {
+                continue;
+            }
+            // An explicit limit, so a relay's default page cannot short the chunk.
+            let filter = route
+                .second_filter(window.since, window.until)
+                .ids(chunk.iter().copied())
+                .limit(chunk.len());
+            let Some(reply) = self.acquire(filter, chunk.len().saturating_add(1)).await else {
+                return IdsReply::Unreachable(UnreachableKind::Disconnected);
+            };
+            match failed_end(reply.end) {
+                Ok(()) => events.extend(reply.events),
+                Err(FailedEnd::Closed(reason)) => return IdsReply::Closed(reason),
+                Err(FailedEnd::Unreachable(kind)) => return IdsReply::Unreachable(kind),
+                // Large events can outgrow the byte budget: split the chunk
+                // and ask again. One id that still does not fit is left out,
+                // and the caller reads it as withheld.
+                Err(FailedEnd::Cut) if chunk.len() > 1 => {
+                    let (older, newer) = chunk.split_at(chunk.len() / 2);
+                    pending.push(newer.to_vec());
+                    pending.push(older.to_vec());
+                }
+                Err(FailedEnd::Cut) => {}
+            }
+        }
+        IdsReply::Answered(events)
+    }
+
+    fn take_fetched_bytes(&self) -> u64 {
+        SweepRelay::take_fetched_bytes(self)
+    }
+}
+
+/// Why a NIP-77 comparison failed.
 pub(crate) enum NegFailure {
     Closed(ClosedReason),
     Unreachable(UnreachableKind),
     /// No NIP-77, or a protocol error: the second stays unproven.
     Unproven,
+    /// A local fault, not the relay's.
+    Local,
 }

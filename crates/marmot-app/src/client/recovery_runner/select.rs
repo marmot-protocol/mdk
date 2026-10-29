@@ -9,7 +9,8 @@
 //! A class always goes before the next one. Within a class, every eligible
 //! unit runs once per round, so a large group is served every round and
 //! cannot starve small debts. A held group stays first only until its fence
-//! clears, which bounds its debt.
+//! clears, which bounds its debt. A re-check ([`super::recheck`]) runs only
+//! when no debt unit is eligible, least recently served first.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,8 +21,11 @@ use storage_sqlite::{
 };
 use transport_nostr_adapter::sweep::{RelayCaps, SweepRange};
 
+use super::compare::{self, ComparePlan, PlannedRange};
 use super::quantum::QuantumReport;
-use super::{DebtTurn, PriorityHints, RecoveryRunnerPolicy, RunnerRoute, UnitKey, recovery_caps};
+use super::{
+    DebtTurn, PriorityHints, RecoveryRunnerPolicy, RunnerRoute, UnitKey, recheck, recovery_caps,
+};
 use storage_sqlite::RecoveryUnitOutcome;
 
 /// One owing unit, as the survey found it. Not `Debug`: it carries its unit.
@@ -39,11 +43,16 @@ pub(super) struct Candidate {
     /// It waits for new evidence, not for time: a broken unit without a probe,
     /// a suspended group, or a relay staging holds back.
     pub(super) blocked: bool,
+    /// A re-check pass rather than debt: `owed_seconds` are what it still
+    /// checks and `position` where it resumes.
+    pub(super) recheck: bool,
 }
 
 /// Every owing unit of the current routes, read in one debt turn.
 pub(super) struct Survey {
     pub(super) candidates: Vec<Candidate>,
+    /// Re-check units, due or not.
+    pub(super) rechecks: Vec<Candidate>,
     /// The account breaker's pause, while a cap is reached.
     pub(super) paused_until: Option<u64>,
 }
@@ -69,15 +78,66 @@ pub(super) struct Memory {
     /// made no progress. A loss that moves it earlier is new debt; growth at
     /// the newest end, or an un-cover after it, is not.
     best_effort: BTreeMap<UnitKey, u64>,
+    /// Relays that would not compare since they last reconnected: their debt
+    /// is swept and they are not re-checked.
+    uncomparable: BTreeSet<String>,
+    /// Re-checks held back after quanta that moved their pass nowhere: until
+    /// when, and how many in a row.
+    recheck_holds: BTreeMap<UnitKey, (u64, u32)>,
+    /// Re-checks served in the current explicit pass.
+    rechecks_served: BTreeSet<UnitKey>,
 }
 
 impl Memory {
     pub(super) fn new_round(&mut self) {
         self.served.clear();
+        self.rechecks_served.clear();
     }
 
     pub(super) fn relay_reconnected(&mut self, relay: &str) {
         self.best_effort.retain(|key, _| key.relay != relay);
+        self.uncomparable.remove(relay);
+        self.recheck_holds.retain(|key, _| key.relay != relay);
+    }
+
+    /// Whether the relay may compare.
+    pub(super) fn compares(&self, relay: &str) -> bool {
+        !self.uncomparable.contains(relay)
+    }
+
+    /// The relay would not compare (`compare::would_not_compare`).
+    pub(super) fn would_not_compare(&mut self, relay: &str) {
+        self.uncomparable.insert(relay.to_owned());
+    }
+
+    /// Record a settled re-check quantum. An answer that moved its pass clears
+    /// the hold; one the runner preempted changes nothing; any other (a
+    /// failure, or an answer that moved nothing) is held back on the unit
+    /// backoff's doubling.
+    pub(super) fn recheck_settled(
+        &mut self,
+        key: &UnitKey,
+        moved: bool,
+        outcome: RecoveryUnitOutcome,
+        now: u64,
+        policy: &RecoveryRunnerPolicy,
+    ) {
+        use RecoveryUnitOutcome as Outcome;
+        match outcome {
+            Outcome::Unanswered => {}
+            Outcome::Advanced | Outcome::NoProgress | Outcome::NothingOwed if moved => {
+                self.recheck_holds.remove(key);
+            }
+            _ => {
+                let failures = self
+                    .recheck_holds
+                    .get(key)
+                    .map_or(0, |(_, failures)| *failures)
+                    .saturating_add(1);
+                let until = now.saturating_add(policy.recheck_backoff_seconds(failures));
+                self.recheck_holds.insert(key.clone(), (until, failures));
+            }
+        }
     }
 
     /// Record a settled quantum.
@@ -138,7 +198,7 @@ impl Memory {
 
 /// The routes a sweep can serve: group routes. The inbox stays on NIP-77
 /// comparison (PR 6).
-fn sweepable(routes: &[RunnerRoute]) -> impl Iterator<Item = &RunnerRoute> {
+pub(super) fn sweepable(routes: &[RunnerRoute]) -> impl Iterator<Item = &RunnerRoute> {
     routes
         .iter()
         .filter(|route| matches!(route.route, TransportReconciliationRoute::Group(_)))
@@ -146,7 +206,7 @@ fn sweepable(routes: &[RunnerRoute]) -> impl Iterator<Item = &RunnerRoute> {
 
 /// Whether the route's group is suspended (Unrecoverable). PR 5 fills this
 /// from the group's lifecycle; until then every group is eligible.
-fn suspended(_route: &RunnerRoute) -> bool {
+pub(super) fn suspended(_route: &RunnerRoute) -> bool {
     false
 }
 
@@ -163,7 +223,7 @@ fn backpressured(
 }
 
 /// When the relay's cooldown ends, if one is running at `now`.
-fn cooldown_until(
+pub(super) fn cooldown_until(
     app: &SqliteAppStorage,
     seen: &mut BTreeMap<String, Option<u64>>,
     relay: &str,
@@ -223,11 +283,13 @@ pub(super) fn survey(turn: &DebtTurn<'_>, policy: &RecoveryRunnerPolicy) -> Stor
                 last_served_at: unit.as_ref().and_then(|unit| unit.last_served_at_seconds),
                 due_at: retry_at.max(cooldown.unwrap_or(0)),
                 blocked: broken || suspended(route) || backpressured(app, route, relay, policy)?,
+                recheck: false,
             });
         }
     }
     Ok(Survey {
         candidates,
+        rechecks: recheck::survey(turn, policy)?,
         paused_until,
     })
 }
@@ -264,6 +326,7 @@ pub(super) fn pick(
     }
     let mut next_due: Option<u64> = None;
     let mut eligible = Vec::new();
+    let rechecks = survey.rechecks;
     for candidate in survey.candidates {
         let tried = candidate.best_effort
             && memory.best_effort.get(&candidate.key) == Some(&candidate.position);
@@ -281,8 +344,12 @@ pub(super) fn pick(
         }
         eligible.push(candidate);
     }
+    if !new_round {
+        // An explicit pass serves each unit once, whatever its class.
+        eligible.retain(|candidate| !memory.served.contains(&candidate.key));
+    }
     if eligible.is_empty() {
-        return Pick::Idle { next_due };
+        return pick_recheck(rechecks, memory, now, new_round, next_due);
     }
     if new_round {
         // Rounds run within the first class that has an eligible unit: once
@@ -300,12 +367,6 @@ pub(super) fn pick(
             for candidate in &eligible {
                 memory.served.remove(&candidate.key);
             }
-        }
-    } else {
-        // An explicit pass serves each unit once, whatever its class.
-        eligible.retain(|candidate| !memory.served.contains(&candidate.key));
-        if eligible.is_empty() {
-            return Pick::Idle { next_due: None };
         }
     }
     let mut route_size: BTreeMap<&TransportReconciliationRoute, u64> = BTreeMap::new();
@@ -341,7 +402,46 @@ pub(super) fn pick(
     Pick::Unit(chosen)
 }
 
-/// What one quantum will fetch, planned in the begin turn. Not `Debug`.
+/// Pick a due re-check, least recently served first, once no debt unit is
+/// eligible. `next_due` is the debt's; the re-checks' due times join it.
+fn pick_recheck(
+    rechecks: Vec<Candidate>,
+    memory: &mut Memory,
+    now: u64,
+    new_round: bool,
+    mut next_due: Option<u64>,
+) -> Pick {
+    let mut eligible = Vec::new();
+    for candidate in rechecks {
+        if candidate.blocked
+            || !memory.compares(&candidate.key.relay)
+            || !new_round && memory.rechecks_served.contains(&candidate.key)
+        {
+            continue;
+        }
+        let held = memory
+            .recheck_holds
+            .get(&candidate.key)
+            .map_or(0, |(until, _)| *until);
+        let due = candidate.due_at.max(held);
+        if due > now {
+            next_due = Some(next_due.map_or(due, |next| next.min(due)));
+            continue;
+        }
+        eligible.push(candidate);
+    }
+    let Some(chosen) = eligible.into_iter().min_by(|left, right| {
+        (left.last_served_at, &left.key).cmp(&(right.last_served_at, &right.key))
+    }) else {
+        return Pick::Idle { next_due };
+    };
+    if !new_round {
+        memory.rechecks_served.insert(chosen.key.clone());
+    }
+    Pick::Unit(chosen)
+}
+
+/// What one debt quantum will fetch, planned in the begin turn. Not `Debug`.
 pub(super) struct SweepPlan {
     pub(super) key: UnitKey,
     pub(super) nostr_group_id: [u8; 32],
@@ -355,17 +455,22 @@ pub(super) struct SweepPlan {
     /// The un-cover generation before the fetch: staging subtracts every range
     /// un-covered after it.
     pub(super) mark: RecoveryCoverageMark,
+    /// The same ranges compared by NIP-77 instead of swept, when the relay
+    /// compares and the account holds events there (`compare::plan_debt`).
+    pub(super) compare: Option<ComparePlan>,
 }
 
 /// Plan the quantum on `key` and record the attempt, or `None` when it no
 /// longer owes anything or is no longer eligible. `caps` are the relay's
 /// NIP-11 caps as just read; known ones are recorded first, which re-arms
-/// the relay's units that were planned with other caps.
+/// the relay's units that were planned with other caps. `compares` is
+/// whether the relay may compare at all.
 pub(super) fn begin(
     turn: &DebtTurn<'_>,
     key: &UnitKey,
     best_effort: bool,
     caps: Option<RelayCaps>,
+    compares: bool,
     policy: &RecoveryRunnerPolicy,
 ) -> StorageResult<Option<SweepPlan>> {
     let app = turn.app;
@@ -421,6 +526,26 @@ pub(super) fn begin(
     if ranges.is_empty() {
         return Ok(None);
     }
+    let compare = if compares {
+        compare::plan_debt(app, key, &ranges, now)?.map(|(caps, local)| ComparePlan {
+            key: key.clone(),
+            nostr_group_id,
+            best_effort,
+            caps,
+            ranges: ranges
+                .iter()
+                .map(|&range| PlannedRange {
+                    range,
+                    covered: false,
+                })
+                .collect(),
+            local,
+            mark,
+            recheck: false,
+        })
+    } else {
+        None
+    };
     if !best_effort {
         app.begin_recovery_unit_attempt(&key.route, &key.relay, planned, now)?;
     }
@@ -435,5 +560,6 @@ pub(super) fn begin(
             .unwrap_or(policy.sweep.initial_delta),
         observed_cap: unit.as_ref().and_then(|unit| unit.observed_cap),
         mark,
+        compare,
     }))
 }

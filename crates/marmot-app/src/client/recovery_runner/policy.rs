@@ -1,10 +1,12 @@
 //! The runner's starting values (decision 7 of mdk#2660's phase 4 plan),
-//! registered as convergence-ledger decision A19. They are tuned in the
-//! simulator once the runner admits what it fetches (PR 4b or PR 5).
+//! registered as convergence-ledger decision A19, and its re-check schedule
+//! (decision 5), registered as A20. They are tuned in the simulator once the
+//! runner admits what it fetches (PR 4b or PR 5).
 
 use std::time::Duration;
 
 use storage_sqlite::RecoveryUnitPolicy;
+use transport_nostr_adapter::compare::ComparePolicy;
 use transport_nostr_adapter::sweep::SweepPolicy;
 
 /// The first no-progress backoff of a unit; each further one doubles it.
@@ -34,11 +36,17 @@ pub(crate) const RUNNER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const RUNNER_LOCAL_FAILURE_BACKOFF_BASE_SECS: u64 = 1;
 pub(crate) const RUNNER_LOCAL_FAILURE_BACKOFF_CAP_SECS: u64 = 60;
 /// Staged events one relay may hold for a group before it waits for the
-/// group's laggard (PR 4b).
+/// group's laggard (PR 4b). One comparison quantum fetches at most these.
 pub(crate) const RUNNER_STAGED_GROUP_EVENTS: u64 = 2_048;
 pub(crate) const RUNNER_STAGED_GROUP_BYTES: u64 = 8 * 1024 * 1024;
 /// Staged bytes the whole account may hold (PR 4b).
 pub(crate) const RUNNER_STAGED_ACCOUNT_BYTES: u64 = 64 * 1024 * 1024;
+/// A unit's next re-check pass falls due this long after its last full one
+/// (decision 5).
+pub(crate) const RUNNER_RECHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
+/// A relay cooldown that lasted longer than this makes a re-check of each of
+/// the relay's units due once the relay answers or reconnects.
+pub(crate) const RUNNER_RECHECK_AFTER_COOLDOWN_SECS: u64 = 60 * 60;
 
 /// How much fetched history may wait in staging (PR 4b reads these).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +67,7 @@ pub(crate) struct RecoveryRunnerPolicy {
     pub(crate) local_failure_backoff_cap_seconds: u64,
     pub(crate) staging: RecoveryStagingBounds,
     pub(crate) sweep: SweepPolicy,
+    pub(crate) recheck_interval_seconds: u64,
 }
 
 impl Default for RecoveryRunnerPolicy {
@@ -74,6 +83,7 @@ impl Default for RecoveryRunnerPolicy {
                 cooldown_cap_seconds: RUNNER_COOLDOWN_CAP_SECS,
                 max_attempts_per_hour: RUNNER_MAX_QUANTA_PER_HOUR,
                 max_event_bytes_per_hour: RUNNER_MAX_EVENT_BYTES_PER_HOUR,
+                recheck_after_cooldown_seconds: RUNNER_RECHECK_AFTER_COOLDOWN_SECS,
             },
             quantum: RUNNER_QUANTUM,
             request_timeout: RUNNER_REQUEST_TIMEOUT,
@@ -85,6 +95,7 @@ impl Default for RecoveryRunnerPolicy {
                 account_bytes: RUNNER_STAGED_ACCOUNT_BYTES,
             },
             sweep: SweepPolicy::default(),
+            recheck_interval_seconds: RUNNER_RECHECK_INTERVAL_SECS,
         }
     }
 }
@@ -98,5 +109,29 @@ impl RecoveryRunnerPolicy {
         self.local_failure_backoff_base_seconds
             .saturating_mul(doubled)
             .min(self.local_failure_backoff_cap_seconds)
+    }
+
+    /// One comparison quantum's limits: at most what one relay may stage for
+    /// a group, paced as a sweep is.
+    pub(crate) fn compare(&self) -> ComparePolicy {
+        ComparePolicy {
+            pacing: self.sweep,
+            ..ComparePolicy::new(
+                usize::try_from(self.staging.group_events).unwrap_or(usize::MAX),
+                self.staging.group_bytes,
+            )
+        }
+    }
+
+    /// The in-memory hold after `failures` re-check quanta in a row that
+    /// moved their pass nowhere: the unit backoff's doubling.
+    pub(crate) fn recheck_backoff_seconds(&self, failures: u32) -> u64 {
+        let doubled = 1u64
+            .checked_shl(failures.saturating_sub(1))
+            .unwrap_or(u64::MAX);
+        self.unit
+            .backoff_base_seconds
+            .saturating_mul(doubled)
+            .min(self.unit.backoff_cap_seconds)
     }
 }

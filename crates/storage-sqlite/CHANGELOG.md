@@ -4,6 +4,16 @@
 
 ### Breaking changes
 
+- Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
+  It adds `recheck_revision` to `account_recovery_units`, which existing rows
+  start at 0. Every request that makes a re-check pass due bumps it
+  (`make_recovery_recheck_due`, `rearm_all_recovery_units`, and a cooldown
+  longer than `RecoveryUnitPolicy::recheck_after_cooldown_seconds` ending),
+  and `RecoveryRecheckPass::revision` reports it. `record_recovery_recheck`
+  takes the revision its quantum began on, records nothing once it moved, and
+  returns whether it recorded. Ending a long cooldown, by an answer or by
+  `record_recovery_relay_reconnected` (which now takes the policy and the
+  time), makes every re-check on the relay due in the same transaction.
 - Migration 0132 advances account storage to schema 132 (mdk#2660 phase 4).
   It adds `import_revision` to `account_delivery_loss_evidence`: the loss
   revision the import that last charged a generation left. Existing imported
@@ -132,6 +142,11 @@
 
 ### Added
 
+- `settle_recovery_recheck` applies one re-check quantum's outcome to its
+  relay and the account's rolling-hour budget, never to its unit's retry
+  state (mdk#2660 phase 4). `staged_recovery_items` lists the ids and times a
+  route has staged in a range, from every relay. `make_recovery_recheck_due`
+  keeps what a due or running pass would check below an epoch gap's bound.
 - `OpenMlsContentFilter::CommitsAndProposalsBetween` lists only the commits and
   proposals whose MLS epoch falls in a range, plus the rows SQLite cannot
   classify (mdk#2684). A failed convergence batch checks its horizon through it

@@ -263,7 +263,7 @@ fn stage(
 }
 
 /// Seconds of `range` the ledger does not cover on the unit's relay.
-fn uncovered_seconds(
+pub(super) fn uncovered_seconds(
     app: &SqliteAppStorage,
     key: &UnitKey,
     range: RecoveryCoverageRange,
