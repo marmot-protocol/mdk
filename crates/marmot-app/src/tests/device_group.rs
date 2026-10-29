@@ -18,6 +18,8 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::SendIntent;
 use storage_sqlite::DeviceGroupTrust;
 
+mod devices;
+
 fn device_group_app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
     MarmotApp::with_relay_and_config(
         dir.path(),

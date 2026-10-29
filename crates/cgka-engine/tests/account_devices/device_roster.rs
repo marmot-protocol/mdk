@@ -14,12 +14,15 @@
 //! is shown from the committer's side and the receiver's side, as in the
 //! account-devices tests.
 
+use super::activation::{buffer_unsettled, queued_intents};
 use super::*;
+use cgka_engine::ManualConvergenceClock;
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
     DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1, decode_device_roster_v1,
     encode_device_roster_update_v1, encode_device_roster_v1,
 };
+use cgka_traits::engine::{SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport};
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, GroupStorage as _};
 
 /// A device of `account` that advertises the device roster beside
@@ -31,17 +34,36 @@ pub(super) fn roster_device(account: &[u8]) -> Device {
 /// [`roster_device`] over `storage`, as a reopened session builds it. The
 /// caller hydrates its groups.
 pub(super) fn roster_device_on(storage: SqliteAccountStorage, account: &[u8]) -> Device {
+    build_roster_device(storage, account, None)
+}
+
+/// [`roster_device`] on a manual convergence clock.
+fn clocked_roster_device(account: &[u8], clock: &ManualConvergenceClock) -> Device {
+    build_roster_device(
+        SqliteAccountStorage::in_memory().unwrap(),
+        account,
+        Some(clock),
+    )
+}
+
+fn build_roster_device(
+    storage: SqliteAccountStorage,
+    account: &[u8],
+    clock: Option<&ManualConvergenceClock>,
+) -> Device {
     let mut supported: Vec<_> = default_group_components().into_iter().collect();
     supported.extend([ACCOUNT_DEVICES_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID]);
-    let engine = EngineBuilder::new(storage.clone())
+    let mut builder = EngineBuilder::new(storage.clone())
         .identity(pad32(account))
         .account_identity_proof_signer(proof_signer(account))
         .protocol_profile(ProtocolProfile::Current)
         .feature_registry(registry())
         .supported_app_components(supported)
-        .peeler(Box::<MockPeeler>::default())
-        .build()
-        .unwrap();
+        .peeler(Box::<MockPeeler>::default());
+    if let Some(clock) = clock {
+        builder = builder.convergence_clock(std::sync::Arc::new(clock.clone()));
+    }
+    let engine = builder.build().unwrap();
     Device { engine, storage }
 }
 
@@ -696,5 +718,247 @@ async fn roster_bytes_are_unknown_data_in_other_groups() {
     assert!(
         error.to_string().contains("optional device roster"),
         "{error}"
+    );
+}
+
+fn replace(gid: &GroupId, n: u8, expected: &str, label: &str) -> SendIntent {
+    SendIntent::ReplaceDeviceEntry {
+        group_id: gid.clone(),
+        slot: slot(n),
+        expected: Box::new(entry(expected)),
+        entry: Box::new(entry(label)),
+    }
+}
+
+fn now_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn refused_replacement(events: &[GroupEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(event, GroupEvent::QueuedIntentRefused { intent_kind, reason, .. }
+            if intent_kind == "replace_device_entry" && reason == "device_entry_changed")
+    })
+}
+
+/// A device entry replacement names the entry it was computed from, because
+/// `SetDevice` replaces an entry whole. A sibling's rename of the same entry
+/// is still buffered when the replacement is sent, so the replacement waits
+/// in the queue. The drain applies the rename first and then refuses the
+/// replacement: it is retired and announced, and the rename stands. Computed
+/// again from the new entry, the edit goes out.
+#[tokio::test]
+async fn a_queued_device_entry_replacement_never_lands_on_a_changed_entry() {
+    let clock = ManualConvergenceClock::new(1_000_000, now_wall_ms());
+    let mut phone = clocked_roster_device(b"alice", &clock);
+    let mut laptop = roster_device(b"alice");
+    let gid = found_device_group(
+        &mut phone,
+        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        &mut [&mut laptop],
+    )
+    .await;
+    let laptop_rename = send_commit(&mut laptop, replace(&gid, 2, "Laptop", "Mine"), &gid).await;
+    buffer_unsettled(&mut phone, &laptop_rename).await;
+
+    let queued = phone
+        .engine
+        .send(replace(&gid, 2, "Laptop", "Work"))
+        .await
+        .unwrap();
+    assert!(matches!(queued, SendResult::Queued { .. }), "{queued:?}");
+    assert_eq!(queued_intents(&phone, &gid).len(), 1);
+    phone.engine.drain_events();
+
+    clock.advance_ms(30_000);
+    let drained = phone.engine.advance_convergence(&gid).await.unwrap();
+    assert!(drained.is_empty(), "{drained:?}");
+    assert!(queued_intents(&phone, &gid).is_empty());
+    assert!(refused_replacement(&phone.engine.drain_events()));
+    assert_eq!(roster_of(&phone, &gid).devices[&slot(2)].label, "Mine");
+
+    let SendResult::GroupEvolution { pending, .. } = phone
+        .engine
+        .send(replace(&gid, 2, "Mine", "Work"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected GroupEvolution")
+    };
+    phone.engine.confirm_published(pending).await.unwrap();
+    assert_eq!(roster_of(&phone, &gid).devices[&slot(2)].label, "Work");
+}
+
+/// Every send settles the group's convergence input first, deferred peels
+/// included, and that can apply a sibling's rename of the entry being
+/// replaced. The replacement is then refused and nothing is kept.
+#[tokio::test]
+async fn a_device_entry_replacement_never_lands_on_an_entry_its_send_changed() {
+    let clock = ManualConvergenceClock::new(1_000_000, now_wall_ms());
+    let mut phone = clocked_roster_device(b"alice", &clock);
+    let mut laptop = roster_device(b"alice");
+    let gid = found_device_group(
+        &mut phone,
+        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        &mut [&mut laptop],
+    )
+    .await;
+    let read_at = phone.engine.epoch(&gid).unwrap();
+    let laptop_rename = send_commit(&mut laptop, replace(&gid, 2, "Laptop", "Mine"), &gid).await;
+    buffer_unsettled(&mut phone, &laptop_rename).await;
+    clock.advance_ms(30_000);
+
+    let refused = phone.engine.send(replace(&gid, 2, "Laptop", "Work")).await;
+    assert!(
+        matches!(&refused, Err(EngineError::DeviceEntryChanged { group_id }) if *group_id == gid),
+        "{refused:?}"
+    );
+    assert!(
+        phone.engine.epoch(&gid).unwrap() > read_at,
+        "the send applied the laptop's rename"
+    );
+    assert_eq!(roster_of(&phone, &gid).devices[&slot(2)].label, "Mine");
+    assert!(queued_intents(&phone, &gid).is_empty());
+}
+
+/// The settlement a send runs can also switch the group to a rival branch at
+/// the same epoch: a sibling's rename forked from the parent of the
+/// self-update this device adopted, and a privileged commit outranks an
+/// ordinary one. The epoch does not move, the entry does, and the
+/// replacement is refused.
+#[tokio::test]
+async fn a_device_entry_replacement_never_lands_on_a_rival_branch_at_the_same_epoch() {
+    let clock = ManualConvergenceClock::new(1_000_000, now_wall_ms());
+    let mut phone = clocked_roster_device(b"alice", &clock);
+    let mut laptop = roster_device(b"alice");
+    let mut tablet = roster_device(b"alice");
+    let gid = found_device_group(
+        &mut phone,
+        &roster(&[(1, "Phone"), (2, "Laptop"), (3, "Tablet")]),
+        &mut [&mut laptop, &mut tablet],
+    )
+    .await;
+    let laptop_rename = send_commit(&mut laptop, replace(&gid, 2, "Laptop", "Mine"), &gid).await;
+    let tablet_update = send_commit(
+        &mut tablet,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    buffer_unsettled(&mut phone, &tablet_update).await;
+    clock.advance_ms(30_000);
+    phone.engine.advance_convergence_inputs(&gid).await.unwrap();
+    let read_at = phone.engine.epoch(&gid).unwrap();
+    assert_eq!(roster_of(&phone, &gid).devices[&slot(2)].label, "Laptop");
+    buffer_unsettled(&mut phone, &laptop_rename).await;
+    clock.advance_ms(30_000);
+
+    let refused = phone.engine.send(replace(&gid, 2, "Laptop", "Work")).await;
+    assert!(
+        matches!(&refused, Err(EngineError::DeviceEntryChanged { group_id }) if *group_id == gid),
+        "{refused:?}"
+    );
+    assert_eq!(
+        phone.engine.epoch(&gid).unwrap(),
+        read_at,
+        "the same height"
+    );
+    assert_eq!(roster_of(&phone, &gid).devices[&slot(2)].label, "Mine");
+    assert!(queued_intents(&phone, &gid).is_empty());
+}
+
+/// The phone replaces the entry of `phone_slot` and the laptop the entry of
+/// `laptop_slot`, both from the same epoch, and each adjudicates the
+/// other's commit. Both are one account, so which commit wins is up to the
+/// tip digest; returns the loser, the winner, the group and the loser's
+/// supersession report.
+async fn race_entry_replacements(
+    phone_slot: u8,
+    laptop_slot: u8,
+) -> (Device, Device, GroupId, SupersededIntentReport) {
+    let mut phone = roster_device(b"alice");
+    let mut laptop = roster_device(b"alice");
+    let gid = found_device_group(
+        &mut phone,
+        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        &mut [&mut laptop],
+    )
+    .await;
+    let label = |n: u8| if n == 1 { "Phone" } else { "Laptop" };
+    let phone_commit = send_commit(
+        &mut phone,
+        replace(&gid, phone_slot, label(phone_slot), "By phone"),
+        &gid,
+    )
+    .await;
+    let laptop_commit = send_commit(
+        &mut laptop,
+        replace(&gid, laptop_slot, label(laptop_slot), "By laptop"),
+        &gid,
+    )
+    .await;
+    for (device, rival) in [(&mut phone, &laptop_commit), (&mut laptop, &phone_commit)] {
+        device
+            .engine
+            .buffer_openmls_convergence_message_at(&gid, rival.clone(), 500)
+            .unwrap();
+        device
+            .engine
+            .converge_stored_openmls_messages_at(&gid, 1_000_000)
+            .unwrap();
+    }
+    let phone_reports = phone
+        .engine
+        .reissue_superseded_own_commits_from_state()
+        .unwrap();
+    let laptop_reports = laptop
+        .engine
+        .reissue_superseded_own_commits_from_state()
+        .unwrap();
+    match (phone_reports.as_slice(), laptop_reports.as_slice()) {
+        ([report], []) => (phone, laptop, gid, report.clone()),
+        ([], [report]) => (laptop, phone, gid, report.clone()),
+        other => panic!("exactly one commit loses: {other:?}"),
+    }
+}
+
+/// A superseded replacement is re-issued when the winning branch left its
+/// entry alone, even though the winner changed the roster.
+#[tokio::test]
+async fn a_superseded_device_entry_replacement_is_reissued_when_the_winner_left_its_entry_alone() {
+    let (mut loser, _winner, gid, report) = race_entry_replacements(1, 2).await;
+    assert_eq!(report.kind, SupersededIntentKind::AppComponents);
+    assert_eq!(report.outcome, SupersededIntentOutcome::Reissued);
+    assert_eq!(queued_intents(&loser, &gid).len(), 1);
+
+    let drained = loser
+        .engine
+        .converge_and_drain_queued_outbound_intents(&gid, 2_000_000)
+        .await
+        .unwrap();
+    let [SendResult::GroupEvolution { pending, .. }] = drained.as_slice() else {
+        panic!("the re-issued replacement is prepared: {drained:?}")
+    };
+    loser.engine.confirm_published(*pending).await.unwrap();
+    let devices = roster_of(&loser, &gid).devices;
+    assert_eq!(devices[&slot(1)].label, "By phone");
+    assert_eq!(devices[&slot(2)].label, "By laptop");
+}
+
+/// A superseded replacement whose entry the winning branch changed is a
+/// conflict: the winner's entry stands and nothing is queued.
+#[tokio::test]
+async fn a_superseded_device_entry_replacement_of_an_entry_the_winner_changed_is_a_conflict() {
+    let (loser, winner, gid, report) = race_entry_replacements(2, 2).await;
+    assert_eq!(report.outcome, SupersededIntentOutcome::Conflict);
+    assert!(queued_intents(&loser, &gid).is_empty());
+    assert_eq!(
+        roster_of(&loser, &gid).devices[&slot(2)].label,
+        roster_of(&winner, &gid).devices[&slot(2)].label
     );
 }

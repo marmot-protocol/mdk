@@ -17,6 +17,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use super::MAX_LEAVES_PER_ACCOUNT;
 use super::codec::{decode_var_bytes, encode_var_bytes};
 
@@ -47,7 +49,7 @@ pub struct DeviceRosterV1 {
 }
 
 /// One linked device, keyed by its slot.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceEntryV1 {
     /// The name the user gave the device. UTF-8.
     pub label: String,
@@ -71,14 +73,14 @@ pub struct DeviceEntryV1 {
 }
 
 /// A device's settings, one bit each on the wire.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceSettingsV1 {
     pub add_to_all_chats: bool,
     pub bring_history: bool,
     pub keep_while_inactive: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceStatusV1 {
     #[default]
     Active,

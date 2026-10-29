@@ -20,6 +20,19 @@
 
 ### Added
 
+- `MarmotAppConfig::device_platform` (`with_device_platform`) names the
+  platform this device runs on. Each device writes it and
+  `key_package_client_name` into its own roster entry with its next KeyPackage
+  announcement, so `linked_devices` shows every device's client and platform
+  (mdk#2628 item 3.6). Blank or over 64 bytes once trimmed is left out.
+- `MarmotAppRuntime::rename_linked_device` renames one of this account's
+  devices, this one included, with one roster commit in the device group
+  (mdk#2628 item 3.6). It goes through the runtime's one roster write path,
+  the one slot announcements use, and is refused with nothing sent
+  (`device_group_busy`) while an earlier change of this device's in the
+  device group is in flight. A rename whose commit loses a fork to one that
+  also changes that device's entry is not made again, and the winning label
+  stands. Refused in release builds until the roster's spec lands.
 - `MarmotAppRuntime::linked_devices` lists this account's own devices as
   `LinkedDevice`s, from the roster of the device group this device trusts,
   this device first (mdk#2628 item 3.1). `LinkedDevicesChanged` says to

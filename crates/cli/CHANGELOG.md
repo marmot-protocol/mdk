@@ -79,6 +79,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   device group is settling, it is refused with the new `EngineError::LinkDeviceUnsettled`, and the caller retries
   while the new device still waits for its Welcome. The device gets its Welcome as an invited device does. Like the
   roster, it is reachable only in test-policy builds until the device group's spec is adopted.
+- New `SendIntent::ReplaceDeviceEntry` replaces one entry of a device group's roster while the roster still holds
+  the entry it was computed from (mdk#2628). The engine compares the entry each time it prepares the commit: on the
+  send after it settles convergence input, when a queued copy drains, and when it re-issues the edit after a lost
+  fork. Otherwise the new `EngineError::DeviceEntryChanged` refuses it and nothing is staged; a drained copy is
+  retired with `QueuedIntentRefused`. A lost edit is re-issued when the winner left that entry alone, even if it
+  changed others. The device roster's write path uses it, so an entry read before a sibling's change never
+  overwrites it.
 - The engine can create a group under a group id the host chose before the group exists
   (`create_group_with_chosen_id_and_audit_context`), as a device link needs (mdk#2628). The id has 1 to 255 bytes.
   An id that names any group this device holds, a removed or forgotten copy included, is refused before anything is

@@ -88,6 +88,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the roster. The client recomputes it after each maintenance pass; a change sets
   `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
   `KeyPackageRefreshOverdueChanged`. It opens set, for the same reason as `linked_devices_changed`.
+- Write a device entry of the roster only through the runtime's `edit_device_roster_entry` (renaming, announcements).
+  It refuses while the device group has anything of this device's in flight; surface that as `device_group_busy`.
+  The engine stages a `ReplaceDeviceEntry` only while the entry is still the one the edit read, so a whole-entry
+  replacement never undoes a change that lands in between. A rename (`client/device_renames.rs`) whose commit loses a
+  fork to one that also changes that device's entry is not made again; the engine re-issues it only when the winner
+  left that entry alone.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

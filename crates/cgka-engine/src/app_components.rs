@@ -5,16 +5,16 @@ use cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID,
     AppComponentData, AppComponentId, AppComponentSet, DEVICE_ROSTER_COMPONENT_ID,
-    DEVICE_TAG_COMPONENT_ID, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, GROUP_LIFECYCLE_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupLifecycleV1,
-    GroupProfileV1, MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
-    PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID, apply_device_roster_update_v1,
-    decode_components_list, decode_device_roster_v1, decode_encrypted_media_policy_v1,
-    decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
-    decode_group_lifecycle_v1, decode_group_profile_v1, decode_nostr_routing_v1,
-    decode_quic_varint, encode_component_vectors, encode_components_list,
+    DEVICE_TAG_COMPONENT_ID, DeviceEntryV1, DeviceSlotId, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    GROUP_LIFECYCLE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    GroupLifecycleV1, GroupProfileV1, MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID,
+    NostrRoutingV1, PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID,
+    apply_device_roster_update_v1, decode_components_list, decode_device_roster_v1,
+    decode_encrypted_media_policy_v1, decode_encrypted_media_policy_v2, decode_group_avatar_url_v1,
+    decode_group_blossom_image_v1, decode_group_lifecycle_v1, decode_group_profile_v1,
+    decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors, encode_components_list,
     encode_group_lifecycle_v1, encode_group_profile_v1,
 };
 use cgka_traits::error::EngineError;
@@ -295,6 +295,17 @@ pub(crate) fn app_component_data_of_group(
     component_id: AppComponentId,
 ) -> Option<Vec<u8>> {
     app_component_bytes(mls_group, component_id).map(ToOwned::to_owned)
+}
+
+/// The entry of `slot` in the device roster `mls_group` holds. `None` when
+/// the roster lists no device there or cannot be read.
+pub(crate) fn device_entry_of_group(
+    mls_group: &MlsGroup,
+    slot: &DeviceSlotId,
+) -> Option<DeviceEntryV1> {
+    app_component_bytes(mls_group, DEVICE_ROSTER_COMPONENT_ID)
+        .and_then(|bytes| decode_device_roster_v1(bytes).ok())
+        .and_then(|mut roster| roster.devices.remove(slot))
 }
 
 pub(crate) fn message_retention_seconds_of_group(

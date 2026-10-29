@@ -1579,9 +1579,9 @@ typedef struct MarmotSecretStore {
 
 /**
  * Borrowed construction options. Zero initialization selects public-only
- * endpoints, an advancing cursor, no client label, and the platform keychain
- * (under the deployment's keychain service). The deployment itself is a
- * separate, required argument.
+ * endpoints, an advancing cursor, no client label or device platform, and the
+ * platform keychain (under the deployment's keychain service). The deployment
+ * itself is a separate, required argument.
  * Use this struct only with the matching header/library version.
  */
 typedef struct MarmotClientOptions {
@@ -1605,6 +1605,12 @@ typedef struct MarmotClientOptions {
    * 0 = NativeAutomatic (default), 1 = HostManaged (initially denied).
    */
   uint32_t attachment_acquisition_mode;
+  /**
+   * Optional UTF-8 short name of the platform this device runs on, such as
+   * "iOS", for this device's entry on the account's Devices screen; NULL,
+   * blank or over 64 bytes leaves it out.
+   */
+  const char *device_platform;
 } MarmotClientOptions;
 
 /**
@@ -7480,6 +7486,27 @@ MarmotStatus marmot_linked_devices(const struct MarmotClient *client,
 MarmotStatus marmot_key_package_refresh_overdue(const struct MarmotClient *client,
                                                 const char *account_ref,
                                                 bool *out);
+
+/**
+ * Rename one of this account's devices, this one included, by its
+ * `slot_id_hex` from `marmot_linked_devices`: one roster commit in the
+ * device group. The label is at most 64 bytes of UTF-8; an empty
+ * string clears it. Fails while device groups are off, for an unknown
+ * device, or while the device group has an earlier change in flight
+ * (retry later). A rename whose commit loses a fork to one that also
+ * changes that device's entry is not made again. Re-read on the
+ * `LinkedDevicesChanged` event.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_rename_linked_device(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *slot_id_hex,
+                                         const char *label);
 
 /**
  * Accept a pending group invite; writes the now-confirmed group

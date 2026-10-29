@@ -71,6 +71,7 @@ mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
 pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
+mod device_renames;
 pub(crate) mod epoch_stall;
 pub(crate) mod history_notices;
 mod invite_recovery;

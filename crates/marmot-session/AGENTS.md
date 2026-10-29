@@ -31,6 +31,13 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   - `runtime/slot_announcement.rs` — the slot-announcement gate (mdk#2628 3.4): while the host names a device group,
     no KeyPackage reaches this device's slot until this device's own roster entry there names it. Maintenance
     announces first.
+  - `runtime/device_roster.rs` — the one roster write path (`edit_device_roster_entry`, mdk#2628 3.4, 3.6): one
+    `SetDevice` commit replacing one device entry with an edit applied to the roster as read now. It sends nothing
+    unless the device group is stable with nothing of this device's in flight, and sends the edit as
+    `SendIntent::ReplaceDeviceEntry` naming the entry it read: the engine stages it only while the slot still holds
+    that entry, so an entry is never replaced from a stale read (`DeviceEntryChanged` maps to `Busy`). Announcements
+    and the host's device edits both go through it; don't add another roster commit. Each
+    announcement also writes the host's `DeviceSelfReport` (this device's client and platform) into its own entry.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.

@@ -1068,6 +1068,25 @@ impl AccountManager {
         local_account_worker_response(response).await
     }
 
+    pub async fn rename_linked_device(
+        &self,
+        account_ref: &str,
+        slot_id_hex: String,
+        label: String,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RenameLinkedDevice {
+                slot_id_hex,
+                label,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn acknowledge_group_catching_up(
         &self,
         account_ref: &str,

@@ -67,6 +67,8 @@ use crate::time::{
     WallClock,
 };
 
+mod device_roster;
+pub use device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport};
 mod slot_announcement;
 
 const TRACE_TARGET: &str = "marmot_session::runtime";
@@ -465,6 +467,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// publishes them (mdk#2628 3.4). The host sets it; `None` publishes as
     /// a device with no device group does.
     key_package_announcement_group: Option<GroupId>,
+    /// What this device says about itself in its roster entry there (mdk#2628
+    /// 3.6); every announcement writes it too.
+    device_self_report: DeviceSelfReport,
     maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
     /// Monotonic time each group's own-leaf currency was last read from the
@@ -539,6 +544,7 @@ where
             maintenance_paused: false,
             key_package_slot_withdrawn: false,
             key_package_announcement_group: None,
+            device_self_report: DeviceSelfReport::default(),
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
             component_migration_checked_at: HashMap::new(),
@@ -6748,6 +6754,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::RemoveOwnAccountDevices { .. }
             | SendIntent::SelfUpdate { .. }
             | SendIntent::UpdateAppComponents { .. }
+            | SendIntent::ReplaceDeviceEntry { .. }
             | SendIntent::UpdateGroupData { .. }
             | SendIntent::EnableDisbanding { .. }
             | SendIntent::EnableAccountDevices { .. }
