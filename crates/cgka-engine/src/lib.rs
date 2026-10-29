@@ -75,6 +75,7 @@ pub mod own_commit_intent;
 pub mod pending_commit_guard;
 pub mod provider;
 pub mod publish;
+mod queued_intent_refusal;
 pub mod self_update;
 pub mod snapshot_guard;
 pub(crate) mod test_crash_hooks;

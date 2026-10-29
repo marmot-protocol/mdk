@@ -9,6 +9,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `MarmotGroupEventKind` adds `QueuedIntentRefused { intent_id_hex,
+  intent_kind, reason }` (mdk#2694), freed with its event. Handle the new tag
+  and use matching regenerated headers and libraries.
+
 - `marmot_deployment_set_key_package_client_preference` is removed
   (mdk#2628): the KeyPackage `client` tag no longer ranks invite candidates.
   Drop the call and use matching regenerated headers and libraries.

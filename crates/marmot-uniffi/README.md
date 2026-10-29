@@ -866,6 +866,15 @@ Use them to refresh presentation, and handle the new variants when regenerating
 Swift/Kotlin bindings. Retained-history engine rollback is separate from automatic
 terminal-copy recovery through the managed scheduler.
 
+## Queued sends the group refuses
+
+A send made while the group settles reports `AcceptedPending`, and MDK sends it
+once the group settles. If the settled group refuses it (the user stopped being
+an admin meanwhile, or the change no longer applies), MDK drops it and emits
+`GroupEventKindFfi::QueuedIntentRefused { intent_id_hex, intent_kind, reason }`
+for that group. Nothing retries it: tell the user, who may try again. `reason`
+is a stable tag such as `not_group_admin`.
+
 ## Members are accounts
 
 An account can have several devices in one group, each its own MLS leaf. Member

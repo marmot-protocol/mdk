@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- `GroupEvent` adds `QueuedIntentRefused { group_id, intent_id, intent_kind,
+  reason }` (mdk#2694), forwarded to hosts as `MarmotAppEvent::GroupEvent`.
+  Exhaustive matches add an arm for it.
+
 - `MarmotAppEvent` adds `LinkedDevicesChanged { account_id_hex, account_label }`
   (mdk#2628). Exhaustive matches add an arm for it.
 - `MarmotAppEvent` adds `KeyPackageRefreshOverdueChanged { account_id_hex,
@@ -307,6 +311,13 @@
   `Unknown` without dialing. Every send through a runtime is unchanged.
 
 ### Fixed
+
+- A send that waited for the group to settle and is then refused by the
+  settled state no longer blocks the group's queued sends (mdk#2694). An admin
+  change queued by an admin who was demoted before it went out used to fail
+  every later drain, holding back the messages queued behind it. It is now
+  dropped and announced as `GroupEvent::QueuedIntentRefused`, carrying the
+  `intent_id` its queued result returned; nothing retries it.
 
 - Account recovery no longer retries a native capture the pass cutoff always
   cuts every ~20 s forever (mdk#2660). A cut capture records no notification

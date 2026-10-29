@@ -960,6 +960,145 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
     assert!(advanced.queued.is_empty());
 }
 
+/// The admin policy component value naming `admins` as the group's admins.
+fn admin_policy(admins: &[MemberId]) -> Vec<u8> {
+    let mut admins = admins
+        .iter()
+        .map(|admin| admin.as_slice().to_vec())
+        .collect::<Vec<_>>();
+    admins.sort();
+    let admin_bytes = admins.concat();
+    let mut out = Vec::new();
+    cgka_traits::app_components::encode_quic_varint(admin_bytes.len() as u64, &mut out);
+    out.extend_from_slice(&admin_bytes);
+    out
+}
+
+/// A queued admin change the settled group refuses no longer fails
+/// convergence: the session's effects announce it to the host, and nothing
+/// stays queued (mdk#2694).
+#[tokio::test]
+async fn session_advance_convergence_announces_a_refused_queued_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("session refused queued key").unwrap();
+    let mut alice =
+        AccountDeviceSession::open(config(dir.path().join("alice.sqlite"), &key, b"alice"))
+            .unwrap();
+    let mut carol =
+        AccountDeviceSession::open(config(dir.path().join("carol.sqlite"), &key, b"carol"))
+            .unwrap();
+
+    let carol_key_package = carol.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "refused-queued".into(),
+            description: "".into(),
+            members: vec![carol_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![carol.self_id()],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let (pending, welcomes) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes.clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .ingest(welcome_for(&welcomes, &carol.self_id()))
+        .await
+        .unwrap();
+
+    // Alice leaves only herself an admin; carol queues a rename behind it.
+    let demotion = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group_id.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: admin_policy(&[alice.self_id()]),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match &demotion.publish[0] {
+        PublishWork::GroupEvolution { msg, pending, .. } => (msg.clone(), *pending),
+        other => panic!("expected GroupEvolution publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    // Hold convergence open while carol queues; see
+    // `session_advance_convergence_releases_queued_outbound_work`.
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 3_600_000,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    let buffered = carol.ingest(route(commit, &group_id)).await.unwrap();
+    assert!(matches!(
+        buffered.outcome,
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
+    ));
+    let queued = carol
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("renamed by a demoted admin".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(queued.queued.len(), 1);
+    let refused = queued.queued[0].clone();
+
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut events = Vec::new();
+    loop {
+        let advanced = carol
+            .advance_convergence(&group_id)
+            .await
+            .expect("a refused queued intent must not fail convergence");
+        assert!(advanced.publish.is_empty(), "{:?}", advanced.publish);
+        events.extend(advanced.events);
+        if !carol.has_queued_outbound_intents(&group_id).unwrap() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the refused intent was not retired within the convergence deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let refusals = events
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::QueuedIntentRefused {
+                group_id,
+                intent_id,
+                intent_kind,
+                reason,
+            } => Some((group_id, intent_id, intent_kind.as_str(), reason.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        refusals,
+        vec![(
+            &refused.group_id,
+            &refused.intent_id,
+            "update_group_data",
+            "not_group_admin"
+        )]
+    );
+}
+
 #[test]
 fn open_rejects_invalid_convergence_policy_before_storage_open() {
     // mdk#970 / PR review: policy must fail closed before durable open work.

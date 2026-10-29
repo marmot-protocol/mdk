@@ -56,6 +56,7 @@ use crate::convergence_input::{ClassifiedConvergenceInput, ConvergenceInputConte
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::engine_metrics::DeferredPeelCapacityResource;
 use crate::openmls_projection::decode_openmls_wire_projection;
+use crate::queued_intent_refusal::QueuedPreparationFailure;
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
@@ -908,6 +909,8 @@ impl<S: StorageProvider> Engine<S> {
             if matches!(&intent, SendIntent::EnableAccountDevices { .. }) {
                 self.check_account_devices_activation(&group_id)?;
             }
+            // So is a KeyPackage it carries; see `check_queued_key_packages`.
+            self.check_queued_key_packages(&intent)?;
             let queued = self.queue_outbound_intent(group_id, intent, 0)?;
             reason.trace();
             return Ok(queued);
@@ -1184,36 +1187,27 @@ impl<S: StorageProvider> Engine<S> {
             );
             let result = match prepared {
                 Ok(result) => result,
-                Err(error)
-                    if crate::account_devices_activation::is_refused_queued_activation(
-                        &record.intent,
-                        &error,
-                    ) =>
-                {
-                    // Nothing was staged. Retire the intent like a direct
-                    // send's refusal; the host reads the outcome back from
-                    // `account_devices_activation_refusal`.
-                    self.storage.delete_queued_outbound_intent(&record.id)?;
-                    tracing::info!(
-                        target: "cgka_engine::message_processor",
-                        method = "converge_and_drain_with_deadline",
-                        error_kind = error.privacy_safe_kind(),
-                        "queued account-devices activation refused on the settled state; retired"
-                    );
+                Err(error) => {
+                    // A refusal by the settled state retires the intent, as a
+                    // direct send's refusal leaves nothing behind; anything
+                    // else keeps it queued (mdk#2694, `queued_intent_refusal`).
+                    let refused = self.queued_preparation_failure(group_id, &error)
+                        == QueuedPreparationFailure::Refused;
+                    if refused {
+                        self.retire_refused_queued_intent(&record, &error)?;
+                    }
                     if reservation.is_available() {
+                        // The protocol grants one preparation attempt, not an
+                        // indefinite reservation. Consume the slot and let
+                        // retained inbound work proceed.
                         reservation.consume_attempt(self, group_id, false)?;
                         break;
                     }
-                    continue;
+                    if refused {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                Err(_) if reservation.is_available() => {
-                    // The protocol grants one preparation attempt, not an
-                    // indefinite reservation. Keep the durable intent queued,
-                    // consume the slot, and let retained inbound work proceed.
-                    reservation.consume_attempt(self, group_id, false)?;
-                    break;
-                }
-                Err(error) => return Err(error),
             };
             let pauses_for_pending_publish = matches!(result, SendResult::GroupEvolution { .. });
             // The queued path bypasses the public send entry point. Record
