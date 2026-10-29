@@ -39,6 +39,8 @@ use cgka_traits::storage::{
     MaintenanceStorage as _, StorageError,
 };
 use cgka_traits::{EpochId, Group, GroupId, KeyPackage, TransportGroupSubscription};
+use rand::RngCore as _;
+use rand::rngs::OsRng;
 use storage_sqlite::{DeviceGroupRecord, DeviceGroupTrust};
 
 use super::{AppClient, UnpublishedWelcomeDelivery, UnpublishedWelcomeKind, group_is_terminal};
@@ -270,6 +272,7 @@ impl AppClient {
 
         let now = unix_now_seconds();
         let mut roster = DeviceRosterV1::default();
+        OsRng.fill_bytes(&mut roster.leaf_tag_key);
         // Each founding entry announces the KeyPackage in that device's slot
         // (3.4), so neither device owes a roster commit before it publishes.
         roster.devices.insert(
@@ -769,6 +772,38 @@ impl AppClient {
     /// at open and by every hidden device-group event and change of trust.
     pub(crate) fn take_linked_devices_changed(&mut self) -> bool {
         std::mem::take(&mut self.linked_devices_changed) && self.app.device_groups_enabled()
+    }
+
+    /// Whether this device's KeyPackage refresh is overdue because its device
+    /// group can't take the announcement, so the host warns the user (D31
+    /// choice 6). Always false while device groups are off. It names the
+    /// device group first, so a change of trust since the last maintenance
+    /// pass counts.
+    pub(crate) fn key_package_refresh_overdue(&mut self) -> Result<bool, AppError> {
+        if !self.app.device_groups_enabled() {
+            return Ok(false);
+        }
+        self.sync_key_package_announcement_group()?;
+        Ok(self.runtime.key_package_refresh_overdue()?)
+    }
+
+    /// Recompute [`Self::key_package_refresh_overdue`] after a maintenance
+    /// pass, and owe hosts a `KeyPackageRefreshOverdueChanged` when it
+    /// changed. A failed read keeps the last answer.
+    pub(crate) fn note_key_package_refresh_overdue(&mut self) {
+        let Ok(overdue) = self.key_package_refresh_overdue() else {
+            return;
+        };
+        if self.key_package_refresh_overdue.replace(overdue) != Some(overdue) {
+            self.key_package_refresh_overdue_changed = true;
+        }
+    }
+
+    /// Whether the overdue-refresh answer may have changed since the last
+    /// call. Set at open and when a maintenance pass changes it.
+    pub(crate) fn take_key_package_refresh_overdue_changed(&mut self) -> bool {
+        std::mem::take(&mut self.key_package_refresh_overdue_changed)
+            && self.app.device_groups_enabled()
     }
 }
 

@@ -1058,6 +1058,16 @@ impl AccountManager {
         local_account_worker_response(response).await
     }
 
+    pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::KeyPackageRefreshOverdue { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
     pub async fn acknowledge_group_catching_up(
         &self,
         account_ref: &str,

@@ -486,6 +486,9 @@ pub(crate) enum AccountWorkerCommand {
     LinkedDevices {
         respond: oneshot::Sender<Result<Vec<crate::LinkedDevice>, AppError>>,
     },
+    KeyPackageRefreshOverdue {
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
     DismissHistoryNotice {
         notice_id: String,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -5748,6 +5751,15 @@ fn account_worker_command_future<'a>(
             );
             true
         }),
+        AccountWorkerCommand::KeyPackageRefreshOverdue { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.key_package_refresh_overdue(),
+            );
+            true
+        }),
         AccountWorkerCommand::AcknowledgeGroupCatchingUp { group_id, respond } => {
             Box::pin(async move {
                 let _ = respond_diagnosed(
@@ -7872,7 +7884,7 @@ fn publish_client_pending_applied_summary(
     publish_app_runtime_summary_with_v5(client, events, account_id_hex, account_label, &summary);
     // Startup and reconnect reconcile device-group trust before reaching
     // here, and no account-level seam follows them until the next command.
-    publish_linked_device_changes(client, events, account_id_hex, account_label);
+    publish_device_group_changes(client, events, account_id_hex, account_label);
 }
 
 /// Announce account-level changes. A change in the parked recovery set
@@ -7881,7 +7893,7 @@ fn publish_client_pending_applied_summary(
 /// disappeared, so hosts re-read that group's `GroupRecoveryStatus`. Parking,
 /// un-parking by new evidence and dismissal all surface at the next seam that
 /// calls this; each call is one indexed read of the parked set. It also
-/// announces linked-device changes ([`publish_linked_device_changes`]).
+/// announces device-group changes ([`publish_device_group_changes`]).
 fn publish_account_level_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -7890,7 +7902,7 @@ fn publish_account_level_changes(
 ) {
     // Record queued subscription refusals off relay paths.
     client.record_subscription_refusals();
-    publish_linked_device_changes(client, events, account_id_hex, account_label);
+    publish_device_group_changes(client, events, account_id_hex, account_label);
     let Some(groups) = client.take_history_notice_changes() else {
         return;
     };
@@ -7904,10 +7916,12 @@ fn publish_account_level_changes(
 }
 
 /// One `LinkedDevicesChanged` for a hidden device-group event or a change of
-/// device-group trust since the last call. Both the account-level seam and
-/// the applied-summary seam drain it, so startup, reconnect and every command
-/// and delivery announce it.
-fn publish_linked_device_changes(
+/// device-group trust since the last call, and one
+/// `KeyPackageRefreshOverdueChanged` for a maintenance pass that changed the
+/// overdue-refresh answer. Both the account-level seam and the
+/// applied-summary seam drain them, so startup, reconnect, maintenance and
+/// every command and delivery announce them.
+fn publish_device_group_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -7915,6 +7929,12 @@ fn publish_linked_device_changes(
 ) {
     if client.take_linked_devices_changed() {
         let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+    if client.take_key_package_refresh_overdue_changed() {
+        let _ = events.send(MarmotAppEvent::KeyPackageRefreshOverdueChanged {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
         });

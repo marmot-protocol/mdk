@@ -1496,6 +1496,12 @@ fn daemon_status_json_becomes_status_text() {
         daemon_status_sentence(&parse_daemon_view(&serde_json::json!({"running": false}))),
         "daemon not running"
     );
+    assert_eq!(
+        daemon_status_sentence(&parse_daemon_view(
+            &serde_json::json!({"running": true, "starting": true})
+        )),
+        "daemon starting"
+    );
 }
 
 #[test]

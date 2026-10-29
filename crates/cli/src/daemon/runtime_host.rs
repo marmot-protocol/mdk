@@ -7,18 +7,51 @@ use crate::ImportNsec;
 pub(crate) struct DaemonState {
     pub(crate) pid: u32,
     pub(crate) started_at: u64,
+    /// True until the daemon's first app-runtime reconcile has finished,
+    /// whatever its outcome. Requests that need the runtime wait for it.
+    pub(crate) starting: bool,
     pub(crate) last_runtime_activity: Option<DaemonRuntimeActivityReport>,
 }
 
 #[derive(Default)]
 pub(crate) struct AppRuntimeHost {
     pub(crate) runtime: Option<marmot_app::MarmotAppRuntime>,
+    /// A runtime whose `start` is in progress. If that start is cancelled (a
+    /// stop during startup), the runtime stays here so `abort_all` can shut it
+    /// down.
+    pub(crate) starting: Option<marmot_app::MarmotAppRuntime>,
     pub(crate) bridge: Option<JoinHandle<()>>,
     pub(crate) stream_watch: StreamWatchWorkers,
+    /// Holds a runtime start until the test releases it.
+    #[cfg(test)]
+    pub(crate) start_gate: Option<Arc<StartGate>>,
+}
+
+/// Test hook: a runtime start adds a permit to `entered`, then waits for one
+/// on `release`, then panics if `panic` is set.
+#[cfg(test)]
+pub(crate) struct StartGate {
+    pub(crate) entered: tokio::sync::Semaphore,
+    pub(crate) release: tokio::sync::Semaphore,
+    pub(crate) panic: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl Default for StartGate {
+    fn default() -> Self {
+        Self {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            panic: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
 }
 
 impl AppRuntimeHost {
     pub(crate) async fn abort_all(&mut self) {
+        if let Some(runtime) = self.starting.take() {
+            runtime.shutdown().await;
+        }
         if let Some(runtime) = &self.runtime {
             runtime.shutdown().await;
         }
@@ -542,7 +575,19 @@ pub(crate) async fn reconcile_app_runtime(
             }
         };
         let receiver = runtime.subscribe();
-        if let Err(err) = runtime.start().await {
+        host.starting = Some(runtime.clone());
+        #[cfg(test)]
+        if let Some(gate) = host.start_gate.clone() {
+            gate.entered.add_permits(1);
+            let _ = gate.release.acquire().await;
+            assert!(
+                !gate.panic.load(std::sync::atomic::Ordering::SeqCst),
+                "start gate panics"
+            );
+        }
+        let started = runtime.start().await;
+        host.starting = None;
+        if let Err(err) = started {
             record_runtime_activity_error(&state, err.to_string());
             return;
         }
@@ -741,6 +786,9 @@ pub(crate) async fn handle_app_runtime_event(
         // The account's linked devices may have changed; the devices are read
         // from the runtime.
         marmot_app::MarmotAppEvent::LinkedDevicesChanged { .. } => {}
+        // Whether this device's KeyPackage refresh is overdue may have
+        // changed; the answer is read from the runtime.
+        marmot_app::MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. } => {}
     }
 }
 

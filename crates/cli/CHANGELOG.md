@@ -27,12 +27,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   that messages are delivered.
 - The engine implements `marmot.account.device-roster.v1` (0x800e), the roster of an account's device group
   (mdk#2628 item 3.1). A group that requires it is a device group. It holds the roster from creation and keeps
-  requiring it, and only one account's devices may be members. A roster update is a list of operations that each set
-  or remove one entry: a device keyed by its KeyPackage slot, a leaf-map entry keyed by a device's slot and a group,
-  a rejected slot or a rejected KeyPackage. Every member applies the operations to the parent's roster. A roster may
-  hold at most 20 devices, and each leaf-map entry belongs to a device or to a slot recorded as removed. Until the component's spec
-  is adopted, only test-policy builds may advertise it. A release build can't create or join a device group, and it
-  treats roster bytes in other groups as unknown data, so nothing ships the format.
+  requiring it, and only one account's devices may be members. The roster holds the key that seals the account's
+  device tags, which no update changes. A roster update is a list of operations that each set or remove one entry: a
+  device keyed by its KeyPackage slot, with the key it signs its device tags with, a rejected slot (a removed device's
+  keeps that key) or a rejected KeyPackage. Every member applies the operations to the parent's roster. A roster may
+  hold at most 20 devices, no two with one tag signature key. The device that creates a device group draws its tag key
+  at random. Until the component's spec is adopted, only test-policy builds may advertise it. A release build can't
+  create or join a device group, and it treats roster bytes in other groups as unknown data, so nothing ships the
+  format.
 - `marmot-app` keeps an account's device group (mdk#2628 item 3.1). A confirmed device link creates it under the
   group id the link chose, and the founding Add takes this account's own device only through the exact confirmed
   KeyPackage. The device that created the group trusts it, and so does a device that joined through the Welcome a
@@ -49,6 +51,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   `linked_devices` in `marmot-app`, UniFFI and C, with this device first, and a `LinkedDevicesChanged` event to
   re-read it, since the device group's own events never reach hosts. Release builds list nothing until the roster's
   spec lands.
+- Hosts can tell the user when the device group has held this device's KeyPackage refresh back for a week (mdk#2628
+  item 3.4): `key_package_refresh_overdue` in `marmot-app`, UniFFI and C, and a `KeyPackageRefreshOverdueChanged`
+  event to re-read it. It is false in release builds until the roster's spec lands.
 - `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
   one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
   pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster
@@ -162,6 +167,24 @@ versioning through the workspace version in the root `Cargo.toml`.
   message, and the socket refusals (a world-accessible or group-writable socket directory, a file in the socket's
   place, a socket already in use), which printed only an `io_kind=`, say what to change. The line still carries no
   paths, account ids or relay URLs.
+- `wnd` answers `wn daemon status`, `wn daemon stop` and pings while it is still opening its accounts, which the
+  runtime allows 45 seconds (part of mdk#2696). It used to bind its socket and accept nothing until then, so those
+  commands connected and waited with no reply. `wn daemon status` and the TUI status line now say `daemon starting`
+  in that window, and `--json` carries a new `starting` field. Other commands wait for the accounts as before. A stop during startup
+  cancels the start and shuts down what it had opened.
+- `wn daemon start` no longer reports a failed start while the daemon it launched keeps starting (mdk#2696). It gave
+  up after five seconds with `daemon_start_failed`, but the first launch of a newly built `wnd` on a loaded macOS
+  machine can wait longer than that before it runs, and the daemon then came up behind the error. The command now
+  watches the `wnd` it launched: it reports `daemon started` once that daemon reports its accounts open, fails at
+  once with `daemon_start_failed` and the log's last lines if it exits, and stops it and fails with
+  `daemon_start_timeout` if it is not ready after 60 seconds, which covers the runtime's own 45-second wait for
+  accounts to open. Ctrl-C stops it as well and fails with `daemon_start_interrupted`; the daemon runs in its own
+  process group, so it used to keep starting behind the interrupted command. When another start wins the socket, it
+  stops its own `wnd` and reports `daemon already running`.
+- `wn daemon stop` no longer reports `daemon stopped` while the daemon is still running (mdk#2696). It reported
+  success as soon as the daemon accepted the request, before the daemon shut down its runtime and exited, so a slow
+  or stuck shutdown left a daemon behind a successful stop. It now waits for the process to exit, and fails with
+  `daemon_stop_timeout` if it is still running after 30 seconds.
 
 ## [0.14.0] - 2026-10-23
 

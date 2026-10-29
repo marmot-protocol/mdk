@@ -1,12 +1,12 @@
 //! `marmot.account.device-roster.v1` (0x800e), the roster of an account's
-//! device group (mdk#2628 item 3.1, D16, D21 and D23).
+//! device group (mdk#2628 item 3.1, D16, D21 and D32).
 //!
 //! A group that requires the roster is a device group. For such a group:
 //! - the roster is GroupContext state from creation, and an update is a diff
 //!   of keyed entries that every member applies to the parent's roster;
 //! - the roster keeps its own invariants (at most `MAX_LEAVES_PER_ACCOUNT`
-//!   devices, no slot both a device and rejected, every leaf-map entry held
-//!   by a device or a slot rejected as removed);
+//!   devices, no slot both a device and rejected, no two devices with one tag
+//!   signature key);
 //! - every leaf is the same account;
 //! - the group requires the roster from creation or never.
 //!
@@ -17,8 +17,8 @@
 use super::*;
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
-    DeviceRosterV1, DeviceSlotId, LeafMapKeyV1, RejectedSlotReasonV1, RejectedSlotV1,
-    decode_device_roster_v1, encode_device_roster_update_v1, encode_device_roster_v1,
+    DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1, decode_device_roster_v1,
+    encode_device_roster_update_v1, encode_device_roster_v1,
 };
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, GroupStorage as _};
 
@@ -58,15 +58,6 @@ pub(super) fn slot(n: u8) -> DeviceSlotId {
     [n; 32]
 }
 
-/// The leaf-map key for the device in slot `n` in a group with id bytes
-/// `group`.
-fn leaf(n: u8, group: u8) -> LeafMapKeyV1 {
-    LeafMapKeyV1 {
-        slot: slot(n),
-        group_id: vec![group; 16],
-    }
-}
-
 pub(super) fn entry(label: &str) -> DeviceEntryV1 {
     DeviceEntryV1 {
         label: label.into(),
@@ -75,9 +66,11 @@ pub(super) fn entry(label: &str) -> DeviceEntryV1 {
     }
 }
 
-/// A roster with one device per `(slot, label)`.
+/// A roster with one device per `(slot, label)`. Its leaf tag key is not
+/// zero, so a test that compares rosters sees it carried through updates.
 pub(super) fn roster(devices: &[(u8, &str)]) -> DeviceRosterV1 {
     DeviceRosterV1 {
+        leaf_tag_key: [0x33; 32],
         devices: devices
             .iter()
             .map(|(n, label)| (slot(*n), entry(label)))
@@ -311,15 +304,14 @@ async fn a_roster_update_sets_and_removes_single_entries() {
     let rejected = RejectedSlotV1 {
         reason: RejectedSlotReasonV1::NotMe,
         rejected_at: 1_700_000_000,
+        tag_signature_key: None,
     };
     let operations = vec![
-        DeviceRosterOperationV1::SetRejectedSlot(slot(9), rejected),
-        DeviceRosterOperationV1::SetLeafMapEntry(leaf(2, 0x01), vec![0x0a; 32]),
+        DeviceRosterOperationV1::SetRejectedSlot(slot(9), rejected.clone()),
         DeviceRosterOperationV1::SetDevice(slot(2), entry("Work laptop")),
     ];
     let mut expected = roster_of(&phone, &gid);
     expected.devices.insert(slot(2), entry("Work laptop"));
-    expected.leaf_map.insert(leaf(2, 0x01), vec![0x0a; 32]);
     expected.rejected_slots.insert(slot(9), rejected);
 
     let commit = send_commit(&mut phone, roster_update(&gid, operations), &gid).await;
@@ -341,10 +333,10 @@ async fn a_roster_update_sets_and_removes_single_entries() {
     )
     .await;
     assert_accepted(&mut phone, &commit, &gid).await;
+    // No update touches the leaf tag key.
     let expected = DeviceRosterV1 {
         devices: [(slot(2), entry("Work laptop"))].into_iter().collect(),
-        leaf_map: [(leaf(2, 0x01), vec![0x0a; 32])].into_iter().collect(),
-        ..DeviceRosterV1::default()
+        ..roster(&[])
     };
     assert_eq!(roster_of(&phone, &gid), expected);
     assert_eq!(roster_of(&laptop, &gid), expected);
@@ -368,16 +360,40 @@ async fn the_committer_refuses_a_roster_update_that_breaks_the_roster() {
                 RejectedSlotV1 {
                     reason: RejectedSlotReasonV1::Removed,
                     rejected_at: 0,
+                    tag_signature_key: None,
+                },
+            )],
+        ),
+        (
+            "a not-me slot a tag signature key",
+            vec![DeviceRosterOperationV1::SetRejectedSlot(
+                slot(9),
+                RejectedSlotV1 {
+                    reason: RejectedSlotReasonV1::NotMe,
+                    rejected_at: 0,
+                    tag_signature_key: Some(vec![0x0c; 32]),
                 },
             )],
         ),
         ("more than 20 devices", too_many),
         (
-            "neither a device nor removed",
-            vec![DeviceRosterOperationV1::SetLeafMapEntry(
-                leaf(7, 0x01),
-                vec![0x0a; 32],
-            )],
+            "one tag signature key",
+            vec![
+                DeviceRosterOperationV1::SetDevice(
+                    slot(1),
+                    DeviceEntryV1 {
+                        tag_signature_key: Some(vec![0x0a; 32]),
+                        ..entry("Phone")
+                    },
+                ),
+                DeviceRosterOperationV1::SetDevice(
+                    slot(2),
+                    DeviceEntryV1 {
+                        tag_signature_key: Some(vec![0x0a; 32]),
+                        ..entry("Laptop")
+                    },
+                ),
+            ],
         ),
     ] {
         let error = roster_error(phone.engine.send(roster_update(&gid, operations)).await);

@@ -8,6 +8,10 @@
   (mdk#2628). Update exhaustive Swift/Kotlin handling and regenerate bindings
   with the matching native library.
 
+- `MarmotEventFfi` adds `KeyPackageRefreshOverdueChanged { account_id_hex,
+  account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
+  regenerate bindings with the matching native library.
+
 - `MarmotKitError` adds `AccountDevicesActivationRefused { group_id_hex, reason }`
   for an `enable_account_devices` call the group cannot take now (mdk#2628).
   Update exhaustive Swift/Kotlin handling and regenerate bindings with the
@@ -40,6 +44,12 @@
   trusts, this device first (mdk#2628 item 3.1). Re-read it on
   `LinkedDevicesChanged`. It is empty in release builds until the roster's
   spec lands.
+
+- `key_package_refresh_overdue(account_ref)` says when this device's device
+  group has held its KeyPackage refresh back for a week (mdk#2628 item 3.4),
+  so the app can tell the user before inviters stop treating the device as
+  fresh at 30 days. Re-read it on `KeyPackageRefreshOverdueChanged`. It is
+  false in release builds until the roster's spec lands.
 
 - An admin can turn on account-devices in an existing group (mdk#2628):
   `enable_account_devices(account_ref, group_id_hex)` sends one admin Commit,

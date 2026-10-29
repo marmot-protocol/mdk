@@ -5350,6 +5350,13 @@ typedef enum MarmotEvent_Tag {
    * may fire with no visible change.
    */
   MARMOT_EVENT_LINKED_DEVICES_CHANGED,
+  /**
+   * Whether this device's KeyPackage refresh is overdue may have changed;
+   * re-read `marmot_key_package_refresh_overdue`. Also fires once each
+   * time the account's worker opens or reconnects, and may fire with no
+   * change.
+   */
+  MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -5426,6 +5433,11 @@ typedef struct MarmotEvent_LinkedDevicesChanged_Body {
   char *account_label;
 } MarmotEvent_LinkedDevicesChanged_Body;
 
+typedef struct MarmotEvent_KeyPackageRefreshOverdueChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_KeyPackageRefreshOverdueChanged_Body;
+
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
   union {
@@ -5441,6 +5453,7 @@ typedef struct MarmotEvent {
     MarmotEvent_GroupChangeSuperseded_Body GROUP_CHANGE_SUPERSEDED;
     MarmotEvent_HistoryNoticesChanged_Body HISTORY_NOTICES_CHANGED;
     MarmotEvent_LinkedDevicesChanged_Body LINKED_DEVICES_CHANGED;
+    MarmotEvent_KeyPackageRefreshOverdueChanged_Body KEY_PACKAGE_REFRESH_OVERDUE_CHANGED;
   };
 } MarmotEvent;
 
@@ -7442,6 +7455,23 @@ MarmotStatus marmot_dismiss_history_notice(const struct MarmotClient *client,
 MarmotStatus marmot_linked_devices(const struct MarmotClient *client,
                                    const char *account_ref,
                                    struct MarmotLinkedDeviceList **out);
+
+/**
+ * Whether this device's KeyPackage refresh is overdue because its device
+ * group can't take the announcement that must come first; warn the user
+ * while it is. Always false until this device trusts a device group,
+ * and in release builds until the device group's spec lands. Re-read on
+ * the `KeyPackageRefreshOverdueChanged` event.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_key_package_refresh_overdue(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                bool *out);
 
 /**
  * Accept a pending group invite; writes the now-confirmed group

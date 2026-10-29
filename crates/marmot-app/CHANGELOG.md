@@ -6,6 +6,8 @@
 
 - `MarmotAppEvent` adds `LinkedDevicesChanged { account_id_hex, account_label }`
   (mdk#2628). Exhaustive matches add an arm for it.
+- `MarmotAppEvent` adds `KeyPackageRefreshOverdueChanged { account_id_hex,
+  account_label }` (mdk#2628). Exhaustive matches add an arm for it.
 
 - `MarmotDeployment::key_package_client_preference` and
   `KeyPackageClientPreference` are removed (mdk#2628). The KeyPackage `client`
@@ -24,6 +26,11 @@
   this device first (mdk#2628 item 3.1). `LinkedDevicesChanged` says to
   re-read it, since the device group's own events never reach hosts. Both are
   empty and silent in release builds until the roster's spec lands.
+- `MarmotAppRuntime::key_package_refresh_overdue` says when this device's
+  device group has held its KeyPackage refresh back for a week (mdk#2628 item
+  3.4), so hosts can tell the user before inviters stop treating the device as
+  fresh at 30 days. `KeyPackageRefreshOverdueChanged` says to re-read it. Both
+  are false and silent in release builds until the roster's spec lands.
 - An admin can turn on `marmot.group.account-devices.v1` in an existing group
   (mdk#2628). `AppClient::enable_account_devices` and
   `MarmotAppRuntime::enable_account_devices` send one admin Commit, only when

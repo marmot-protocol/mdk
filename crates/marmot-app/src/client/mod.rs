@@ -788,6 +788,11 @@ pub struct AppClient {
     /// what hosts last read. The worker's account-level and applied-summary
     /// seams drain it into one `LinkedDevicesChanged`.
     pub(crate) linked_devices_changed: bool,
+    /// The last overdue-refresh answer a maintenance pass computed, and
+    /// whether hosts owe a `KeyPackageRefreshOverdueChanged`. The flag starts
+    /// set, since a fresh client cannot know what hosts last read.
+    pub(crate) key_package_refresh_overdue: Option<bool>,
+    pub(crate) key_package_refresh_overdue_changed: bool,
     /// Account-queue placement counts at this client's previous
     /// `transport_cursor_advanced` row (or its open), so each row reports
     /// what changed since.
@@ -1430,6 +1435,7 @@ impl AppClient {
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
+        self.note_key_package_refresh_overdue();
         let mut activity = self.runtime.take_maintenance_activity();
         activity.absorb(previous);
         // Timed executions replace their matching count-only sample, never add
