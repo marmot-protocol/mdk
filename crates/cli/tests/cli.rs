@@ -1850,16 +1850,11 @@ struct DaemonGuard {
 enum DaemonProcess {
     /// A `wnd` the test spawned itself.
     Child(Child),
-    /// The detached `wnd` that `wn daemon start` spawns. It is not the test's
-    /// child, so the guard finds it through the pid file it writes on binding
-    /// its socket, read once when the guard drops. A daemon that has not bound
-    /// its socket by then has no pid file and is not found. A stale pid file
-    /// survives only a daemon that crashed during the test, too recently for
-    /// its pid to have been reused.
-    Detached {
-        pid_path: std::path::PathBuf,
-        pid: Option<libc::pid_t>,
-    },
+    /// The detached `wnd` that `wn daemon start` spawns, filled in when the
+    /// guard drops. It is not the test's child, and under load it may not have
+    /// bound its socket or written its pid file yet, so the guard looks it up
+    /// in the process table by the socket it was started for.
+    Detached { pids: Vec<libc::pid_t> },
 }
 
 impl DaemonGuard {
@@ -1881,16 +1876,13 @@ impl DaemonGuard {
         guard
     }
 
-    /// Guard the daemon a `wn daemon start` for `home` and `socket` spawns.
-    /// Take it before running the start: a start that misses its readiness
-    /// deadline under load leaves a daemon that is still coming up.
-    fn detached(home: &std::path::Path, socket: &std::path::Path) -> Self {
+    /// Guard the daemon a `wn daemon start` for `socket` spawns. Take it
+    /// before running the start: a start that misses its readiness deadline
+    /// under load leaves a daemon that is still coming up.
+    fn detached(socket: &std::path::Path) -> Self {
         Self {
             socket: socket.to_owned(),
-            process: DaemonProcess::Detached {
-                pid_path: wn_cli::daemon::default_pid_path(home),
-                pid: None,
-            },
+            process: DaemonProcess::Detached { pids: Vec::new() },
         }
     }
 
@@ -1899,26 +1891,27 @@ impl DaemonGuard {
     fn stop(self) {
         drop(self);
     }
-}
 
-impl DaemonProcess {
     fn running(&mut self) -> bool {
-        match self {
-            Self::Child(child) => matches!(child.try_wait(), Ok(None)),
-            Self::Detached { pid, .. } => pid.is_some_and(process_alive),
+        match &mut self.process {
+            DaemonProcess::Child(child) => matches!(child.try_wait(), Ok(None)),
+            DaemonProcess::Detached { pids } => pids.iter().any(|pid| process_alive(*pid)),
         }
     }
 
     fn kill(&mut self) {
-        match self {
-            Self::Child(child) => {
+        match &mut self.process {
+            DaemonProcess::Child(child) => {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            Self::Detached { pid, .. } => {
-                if let Some(pid) = pid.filter(|pid| process_alive(*pid)) {
+            DaemonProcess::Detached { .. } => {
+                // Look the daemon up again instead of reusing the pids found
+                // before the grace period, so only a process that is still
+                // this socket's `wnd` is killed.
+                for pid in wnd_pids_for_socket(&self.socket) {
                     // SAFETY: `kill` has no memory-safety preconditions, and
-                    // `pid` is a positive pid read from the daemon's pid file.
+                    // `pid` is a positive pid of a `wnd` the test started.
                     unsafe { libc::kill(pid, libc::SIGKILL) };
                 }
             }
@@ -1928,13 +1921,10 @@ impl DaemonProcess {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
-        if let DaemonProcess::Detached { pid_path, pid } = &mut self.process {
-            *pid = std::fs::read_to_string(pid_path)
-                .ok()
-                .and_then(|contents| contents.trim().parse::<libc::pid_t>().ok())
-                .filter(|pid| *pid > 0);
+        if let DaemonProcess::Detached { pids } = &mut self.process {
+            *pids = wnd_pids_for_socket(&self.socket);
         }
-        if self.process.running() {
+        if self.running() {
             // `wn daemon stop` has no read timeout, so a daemon that is still
             // starting up could hold it forever; bound it with the daemon.
             let mut stop = Command::new(env!("CARGO_BIN_EXE_wn"))
@@ -1947,7 +1937,7 @@ impl Drop for DaemonGuard {
                 .spawn()
                 .ok();
             let deadline = Instant::now() + DAEMON_STOP_GRACE;
-            while self.process.running() && Instant::now() < deadline {
+            while self.running() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
             }
             if let Some(stop) = stop.as_mut() {
@@ -1955,8 +1945,37 @@ impl Drop for DaemonGuard {
                 let _ = stop.wait();
             }
         }
-        self.process.kill();
+        self.kill();
     }
+}
+
+/// The pids of running `wnd` processes started with `--socket <socket>`. A
+/// zombie has no arguments left to match, so it is never returned.
+fn wnd_pids_for_socket(socket: &std::path::Path) -> Vec<libc::pid_t> {
+    let Ok(ps) = Command::new("ps")
+        .args(["-A", "-ww", "-o", "pid=", "-o", "command="])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    let socket_arg = format!(" --socket {}", socket.display());
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, command) = line.trim_start().split_once(char::is_whitespace)?;
+            let command = command.trim_start();
+            let program = command.split(' ').next()?;
+            let serves_socket = command.match_indices(&socket_arg).any(|(at, arg)| {
+                let rest = &command[at + arg.len()..];
+                rest.is_empty() || rest.starts_with(' ')
+            });
+            if std::path::Path::new(program).file_name() != Some("wnd".as_ref()) || !serves_socket {
+                return None;
+            }
+            pid.parse::<libc::pid_t>().ok().filter(|pid| *pid > 0)
+        })
+        .collect()
 }
 
 /// Whether `pid` names a live process (a zombie still counts).
@@ -2051,7 +2070,7 @@ fn daemon_guard_stops_a_detached_wnd_when_its_test_panics() {
     let socket = home.path().join("dev").join("wnd.sock");
 
     let pid = pid_after_panicking_with(|| {
-        let daemon = DaemonGuard::detached(home.path(), &socket);
+        let daemon = DaemonGuard::detached(&socket);
         let start = Command::new(env!("CARGO_BIN_EXE_wn"))
             .arg("--home")
             .arg(home.path())
@@ -2081,6 +2100,12 @@ fn daemon_guard_stops_a_detached_wnd_when_its_test_panics() {
             .as_i64()
             .and_then(|pid| libc::pid_t::try_from(pid).ok())
             .expect("daemon pid");
+        // Make it look like a daemon still starting up under load: it has no
+        // pid file and does not answer `wn daemon stop`.
+        // SAFETY: `kill` has no memory-safety preconditions.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        std::fs::remove_file(wn_cli::daemon::default_pid_path(home.path()))
+            .expect("remove daemon pid file");
         (daemon, pid)
     });
 
@@ -6857,7 +6882,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
 
-    let _daemon = DaemonGuard::detached(home.path(), &socket);
+    let _daemon = DaemonGuard::detached(&socket);
     let start = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
@@ -7007,7 +7032,7 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
 
-    let daemon = DaemonGuard::detached(home.path(), &socket);
+    let daemon = DaemonGuard::detached(&socket);
     let start = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
@@ -8121,6 +8146,7 @@ fn daemon_real_relay_keeps_live_subscriptions_without_polling_knobs() {
     let bob = create_account_with_real_relay(home.path(), relay);
     run_json_with_relay(home.path(), relay, &["--account", &bob, "keys", "publish"]);
 
+    let daemon = DaemonGuard::detached(&socket);
     let start = wn_with_relay(home.path(), relay)
         .args(["daemon", "start"])
         .output()
@@ -8163,7 +8189,7 @@ fn daemon_real_relay_keeps_live_subscriptions_without_polling_knobs() {
     let messages = wait_until_projected_message(home.path(), relay, &bob, group_id, &body);
     assert_message_plaintexts(&messages, &[&body]);
 
-    let _ = wn(home.path()).args(["daemon", "stop"]).output();
+    daemon.stop();
 }
 
 #[test]
@@ -8508,10 +8534,7 @@ fn daemon_human_startup_errors_sanitize_hostile_relays_without_changing_json() {
     const SANITIZED_WND: &str = "wnd: invalid relay URL: not-a-relay]52;c;YXR0YWNr\n";
     // Every start below must fail validation; the guard only matters if one
     // regresses into spawning a daemon.
-    let _daemon = DaemonGuard::detached(
-        home.path(),
-        &wn_cli::daemon::default_socket_path(home.path()),
-    );
+    let _daemon = DaemonGuard::detached(&wn_cli::daemon::default_socket_path(home.path()));
 
     let ordinary = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
