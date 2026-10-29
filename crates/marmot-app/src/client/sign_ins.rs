@@ -117,9 +117,10 @@ pub(crate) enum SlotOutcome {
     /// This device's slot, holding a KeyPackage it did not make.
     OwnSlotForeign,
     /// A roster device's slot. `announced` compares the KeyPackage with the
-    /// one its roster entry announced: a refresh matches. Until devices
-    /// announce each KeyPackage (3.4), an entry names only the one it was
-    /// linked with.
+    /// one its roster entry announces now. A device announces each
+    /// KeyPackage before publishing it (3.4), so a slot still serving the
+    /// previous one differs until this device keeps the announcements it
+    /// has seen (D31 item 7).
     KnownDevice {
         announced: Announcement,
     },
