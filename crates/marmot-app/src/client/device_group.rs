@@ -17,6 +17,9 @@
 //!   Welcome after the fact.
 //! - The founding Add may hold this account's own device only through the
 //!   exact `KeyPackageRef` a confirmed link names (D14, D21).
+//! - While this device trusts one, it names each KeyPackage in its own roster
+//!   entry before that KeyPackage reaches its slot (3.4). The runtime holds
+//!   publication until the roster does; this module tells it which group.
 //!
 //! - The host reads the roster only as [`LinkedDevice`]s, this account's own
 //!   devices, from the device group this device trusts. The group's own events
@@ -35,7 +38,7 @@ use cgka_traits::storage::{
     DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage as _, GroupStorage as _,
     MaintenanceStorage as _, StorageError,
 };
-use cgka_traits::{EpochId, Group, GroupId, TransportGroupSubscription};
+use cgka_traits::{EpochId, Group, GroupId, KeyPackage, TransportGroupSubscription};
 use storage_sqlite::{DeviceGroupRecord, DeviceGroupTrust};
 
 use super::{AppClient, UnpublishedWelcomeDelivery, UnpublishedWelcomeKind, group_is_terminal};
@@ -254,13 +257,12 @@ impl AppClient {
         {
             return Err(AppError::DeviceGroupRefused("key_package_not_confirmed"));
         }
-        let own_slot = self
+        let own_lifecycle = self
             .app
             .account_storage(&self.state.label)?
             .key_package_lifecycle()?
-            .map(|lifecycle| lifecycle.stable_slot_id)
             .ok_or(AppError::DeviceGroupRefused("slot_unavailable"))?;
-        let own_slot = device_slot(&own_slot)?;
+        let own_slot = device_slot(&own_lifecycle.stable_slot_id)?;
         let sibling_slot = device_slot(&sibling.key_package_id)?;
         if own_slot == sibling_slot {
             return Err(AppError::DeviceGroupRefused("key_package_not_confirmed"));
@@ -268,10 +270,13 @@ impl AppClient {
 
         let now = unix_now_seconds();
         let mut roster = DeviceRosterV1::default();
+        // Each founding entry announces the KeyPackage in that device's slot
+        // (3.4), so neither device owes a roster commit before it publishes.
         roster.devices.insert(
             own_slot,
             DeviceEntryV1 {
                 linked_at: now,
+                announced_key_package: own_lifecycle.current_key_package_ref,
                 ..DeviceEntryV1::default()
             },
         );
@@ -605,6 +610,78 @@ impl AppClient {
         self.withdraw_confirmed_device_link(group_id)
     }
 
+    /// Tell the runtime which device group this device announces its
+    /// KeyPackages in (mdk#2628 3.4): the one [`Self::rostered_device_group`]
+    /// picks. Every path that publishes a KeyPackage calls this first, so a
+    /// change of trust holds from the next publication. The runtime reads the
+    /// roster itself when it publishes, and holds publication back while it
+    /// cannot.
+    pub(crate) fn sync_key_package_announcement_group(&mut self) -> Result<(), AppError> {
+        let group = self.rostered_device_group()?;
+        self.runtime.set_key_package_announcement_group(group);
+        Ok(())
+    }
+
+    /// Publish a fresh KeyPackage for an app path that does not wait for
+    /// maintenance, announcing it first in this device's device group. If
+    /// the announcement cannot be made now, the publication is refused with
+    /// nothing sent, and maintenance makes both later.
+    pub(crate) async fn publish_fresh_key_package_announced(
+        &mut self,
+    ) -> Result<KeyPackage, AppError> {
+        self.announce_key_package(true).await?;
+        Ok(self.runtime.publish_fresh_key_package().await?)
+    }
+
+    /// [`Self::publish_fresh_key_package_announced`] for a republication of
+    /// the current KeyPackage. When the runtime would publish a fresh one
+    /// instead, that one is announced.
+    pub(crate) async fn republish_key_package_announced(&mut self) -> Result<KeyPackage, AppError> {
+        self.sync_key_package_announcement_group()?;
+        if self.runtime.key_package_announcement_group().is_some()
+            && self.runtime.key_package_republish_falls_back()?
+        {
+            return self.publish_fresh_key_package_announced().await;
+        }
+        self.announce_key_package(false).await?;
+        Ok(self.runtime.republish_key_package().await?)
+    }
+
+    /// Announce the KeyPackage about to go out: a fresh one, staged now if
+    /// none is, or the current one. A failed read of this device's device
+    /// group refuses the publication, since the runtime treats no group as
+    /// nothing to announce. A failed announcement leaves the runtime's gate to
+    /// refuse it.
+    async fn announce_key_package(&mut self, fresh: bool) -> Result<(), AppError> {
+        self.sync_key_package_announcement_group()?;
+        if self.runtime.key_package_announcement_group().is_none() {
+            return Ok(());
+        }
+        let result = async {
+            let held = self.epoch_gap_held_groups()?;
+            let effects = if fresh {
+                self.runtime
+                    .announce_fresh_key_package_holding(&held)
+                    .await?
+            } else {
+                self.runtime.announce_key_package_holding(&held).await?
+            };
+            self.observe_drained_session_events(&effects)
+                .await
+                .map(drop)
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(
+                target: "marmot_app::client::device_group",
+                method = "announce_key_package",
+                error_kind = error.privacy_safe_kind(),
+                "could not announce this device's key package; maintenance retries"
+            );
+        }
+        Ok(())
+    }
+
     /// This account's device group, if this device trusts one.
     pub(crate) fn trusted_device_group(&self) -> Result<Option<GroupId>, AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
@@ -616,6 +693,27 @@ impl AppClient {
             .transpose()
     }
 
+    /// The device group whose roster this device reads: the one it trusts,
+    /// while device groups are on and it is stored, not terminal, and
+    /// requires the roster. A group that cannot be looked up is
+    /// `roster_unavailable`, an error that never names the group.
+    fn rostered_device_group(&self) -> Result<Option<GroupId>, AppError> {
+        if !self.app.device_groups_enabled() {
+            return Ok(None);
+        }
+        let Some(group_id) = self.trusted_device_group()? else {
+            return Ok(None);
+        };
+        if self
+            .stored_group(&group_id)
+            .map_err(|_| AppError::DeviceGroupRefused("roster_unavailable"))?
+            .is_none_or(|group| group.is_terminal() || !requires_roster(&group))
+        {
+            return Ok(None);
+        }
+        Ok(Some(group_id))
+    }
+
     /// The device group this device trusts and its roster: the one way to
     /// read the roster. None when device groups are off, when this device
     /// trusts none, or when that group is terminal. A roster that cannot be
@@ -623,20 +721,10 @@ impl AppClient {
     pub(crate) fn trusted_device_roster(
         &mut self,
     ) -> Result<Option<(GroupId, DeviceRosterV1)>, AppError> {
-        if !self.app.device_groups_enabled() {
-            return Ok(None);
-        }
-        let Some(group_id) = self.trusted_device_group()? else {
+        let Some(group_id) = self.rostered_device_group()? else {
             return Ok(None);
         };
         let unavailable = || AppError::DeviceGroupRefused("roster_unavailable");
-        if self
-            .stored_group(&group_id)
-            .map_err(|_| unavailable())?
-            .is_none_or(|group| group.is_terminal() || !requires_roster(&group))
-        {
-            return Ok(None);
-        }
         if !self
             .runtime
             .ensure_group_hydrated(&group_id)

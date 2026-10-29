@@ -66,6 +66,8 @@ use crate::time::{
     WallClock,
 };
 
+mod slot_announcement;
+
 const TRACE_TARGET: &str = "marmot_session::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
 const KEY_PACKAGE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
@@ -458,6 +460,10 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// it publishes nothing more, whether or not a relay accepted. The next
     /// runtime for the account republishes.
     key_package_slot_withdrawn: bool,
+    /// The device group this device announces its KeyPackages in before it
+    /// publishes them (mdk#2628 3.4). The host sets it; `None` publishes as
+    /// a device with no device group does.
+    key_package_announcement_group: Option<GroupId>,
     maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
     /// Monotonic time each group's own-leaf currency was last read from the
@@ -531,6 +537,7 @@ where
             maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
             key_package_slot_withdrawn: false,
+            key_package_announcement_group: None,
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
             component_migration_checked_at: HashMap::new(),
@@ -957,6 +964,22 @@ where
         Ok(())
     }
 
+    /// Why [`Self::republish_key_package`] publishes a fresh KeyPackage
+    /// instead of the current one, if it does for a reason the current
+    /// lifecycle shows.
+    fn current_key_package_republish_fallback(
+        &self,
+        lifecycle: &KeyPackageLifecycleState,
+    ) -> Option<&'static str> {
+        current_key_package_republish_blocker(lifecycle, self.wall_clock.now()).or_else(|| {
+            lifecycle
+                .current_key_package
+                .as_ref()
+                .is_some_and(|current| !self.advertises_current_capabilities(current))
+                .then_some("advertised_capabilities_changed")
+        })
+    }
+
     /// Re-send the exact current durable authored KeyPackage event to the
     /// current authoritative publication targets without staging a replacement.
     ///
@@ -982,16 +1005,7 @@ where
             )
             .into());
         }
-        let now = self.wall_clock.now();
-        let fallback_reason =
-            current_key_package_republish_blocker(&lifecycle, now).or_else(|| {
-                lifecycle
-                    .current_key_package
-                    .as_ref()
-                    .is_some_and(|current| !self.advertises_current_capabilities(current))
-                    .then_some("advertised_capabilities_changed")
-            });
-        if let Some(fallback_reason) = fallback_reason {
+        if let Some(fallback_reason) = self.current_key_package_republish_fallback(&lifecycle) {
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "republish_key_package",
@@ -1037,6 +1051,12 @@ where
             );
             return self.publish_fresh_key_package().await;
         };
+        self.ensure_key_package_announced(
+            lifecycle
+                .current_key_package_ref
+                .as_deref()
+                .unwrap_or_default(),
+        )?;
 
         lifecycle.phase = cgka_traits::MaintenancePhase::Fanout;
         self.session.put_key_package_lifecycle(&lifecycle)?;
@@ -1314,6 +1334,9 @@ where
                 .pending_replacement
                 .as_ref()
                 .expect("pending replacement exists");
+            // A device group's roster names it before it reaches the slot;
+            // maintenance announces it.
+            self.ensure_key_package_announced(&pending.key_package_ref)?;
             let artifact = pending
                 .signed_event
                 .as_ref()
@@ -1715,6 +1738,15 @@ where
         let Some(key_package) = lifecycle.current_key_package.clone() else {
             return Ok(());
         };
+        // An unannounced event waits for maintenance to announce it.
+        if !self.key_package_announced(
+            lifecycle
+                .current_key_package_ref
+                .as_deref()
+                .unwrap_or_default(),
+        )? {
+            return Ok(());
+        }
         lifecycle.phase = cgka_traits::MaintenancePhase::Fanout;
         self.session.put_key_package_lifecycle(&lifecycle)?;
         let publication = KeyPackagePublication {
@@ -2203,6 +2235,10 @@ where
         // it is where a stranded evolution would otherwise do its damage.
         let superseded = self.reconcile_superseded_maintenance_from_state(now)?;
         output.superseded_intents.extend(superseded);
+        // While a device group is set, its roster names a KeyPackage before
+        // it reaches the slot (mdk#2628 3.4), so announce first.
+        let announced = self.announce_key_package_for_maintenance(held).await?;
+        output.absorb_account_effects(announced);
         // Fanout of an already-acknowledged exact event is publication
         // recovery, not a new preparation, so it continues while paused.
         if self.key_package_has_pending_fanout()? {
@@ -2237,20 +2273,30 @@ where
             });
         if key_package_due && (!self.maintenance_paused || key_package_prepared) {
             let started = self.monotonic_clock.elapsed();
-            let result = self.publish_fresh_key_package().await;
-            self.note_key_package_maintenance_attempt(result.is_err());
-            self.note_maintenance_duration(started, true, result.is_err());
-            if let Err(error) = result {
-                tracing::warn!(
+            match self.publish_fresh_key_package().await {
+                // Nothing went out: the announcement above is not confirmed
+                // yet, and a later pass publishes.
+                Err(AccountError::KeyPackageAnnouncementPending) => tracing::debug!(
                     target: TRACE_TARGET,
                     method = "run_due_maintenance",
-                    error_kind = if matches!(error, AccountError::ClockSkewBlocked) {
-                        "clock_skew_blocked"
-                    } else {
-                        "key_package_retry"
-                    },
-                    "key package maintenance remains retryable"
-                );
+                    "key package publication waits for its announcement"
+                ),
+                result => {
+                    self.note_key_package_maintenance_attempt(result.is_err());
+                    self.note_maintenance_duration(started, true, result.is_err());
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            method = "run_due_maintenance",
+                            error_kind = if matches!(error, AccountError::ClockSkewBlocked) {
+                                "clock_skew_blocked"
+                            } else {
+                                "key_package_retry"
+                            },
+                            "key package maintenance remains retryable"
+                        );
+                    }
+                }
             }
         }
         self.retry_confirmed_transport_fanouts(&mut output).await?;

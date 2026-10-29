@@ -2155,6 +2155,7 @@ impl MarmotApp {
         }
         // Hosts read the notice list after open; later changes raise an event.
         client.take_history_notice_changes();
+        client.sync_key_package_announcement_group()?;
         Ok(client)
     }
 
@@ -2184,7 +2185,7 @@ impl MarmotApp {
                     .app
                     .clear_key_package_cutover_replacement_pending(&client.state.label);
             } else {
-                match client.runtime.publish_fresh_key_package().await {
+                match client.publish_fresh_key_package_announced().await {
                     Ok(_) => tracing::info!(
                         target: "marmot_app::key_packages",
                         method = "finish_client_open_network_maintenance",
@@ -2193,7 +2194,7 @@ impl MarmotApp {
                     Err(error) => tracing::warn!(
                         target: "marmot_app::key_packages",
                         method = "finish_client_open_network_maintenance",
-                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        error_kind = error.privacy_safe_kind(),
                         "deferred current key package replacement after strict cutover"
                     ),
                 }
@@ -2222,16 +2223,16 @@ impl MarmotApp {
         if self.cursor_persistence() == CursorPersistence::Advance {
             let result = async {
                 if client.runtime.key_package_generation_upgrade_due()? {
-                    client.runtime.publish_fresh_key_package().await?;
+                    client.publish_fresh_key_package_announced().await?;
                 }
-                Ok::<_, marmot_session::AccountError>(())
+                Ok::<_, AppError>(())
             }
             .await;
             if let Err(error) = result {
                 tracing::warn!(
                     target: "marmot_app::key_packages",
                     method = "finish_client_open_network_maintenance",
-                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    error_kind = error.privacy_safe_kind(),
                     "key package generator upgrade remains retryable"
                 );
             }

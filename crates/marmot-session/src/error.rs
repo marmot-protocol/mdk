@@ -26,6 +26,10 @@ pub enum AccountError {
     ClockSkewBlocked,
     #[error("key package rotation is already in progress")]
     KeyPackageRotationInProgress,
+    /// This device's roster entry in its device group does not name the
+    /// KeyPackage yet, so it may not reach the slot (mdk#2628 3.4).
+    #[error("key package is not announced in the device group yet")]
+    KeyPackageAnnouncementPending,
     #[error("transport delivery was addressed to a different account")]
     WrongAccountDelivery,
 }
