@@ -5556,7 +5556,7 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
         method: &'static str,
     ) -> Result<Vec<nostr_directory::FetchedKeyPackage>, AppError> {
-        let (account_id_hex, source_relays) = self
+        let (account_id_hex, source_relays, _) = self
             .account_key_package_source_relays(label, bootstrap_relays)
             .await?;
         let mut relay_records = self
@@ -5583,26 +5583,32 @@ impl MarmotApp {
 
     /// Read every KeyPackage slot of the account for new sign-ins (mdk#2628
     /// 3.2), from the relays its KeyPackages are listed from, under the
-    /// inviter's rules.
+    /// inviter's rules. A read of the configured directory relays, when the
+    /// account lists none, is never complete: they need not be where its
+    /// KeyPackages are.
     pub(crate) async fn read_account_key_package_slots(
         &self,
         label: &str,
     ) -> Result<nostr_directory::AccountKeyPackageSlots, AppError> {
-        let (account_id_hex, source_relays) = self
+        let (account_id_hex, source_relays, listed) = self
             .account_key_package_source_relays(label, Vec::new())
             .await?;
-        Ok(self
+        let mut slots = self
             .directory()
             .read_account_key_package_slots(&account_id_hex, &source_relays)
-            .await?)
+            .await?;
+        slots.complete &= listed;
+        Ok(slots)
     }
 
-    /// The account id and the relays its KeyPackages are listed from.
+    /// The account id, the relays its KeyPackages are listed from, and
+    /// whether those are the account's own listed relays rather than the
+    /// configured directory relays it falls back to.
     async fn account_key_package_source_relays(
         &self,
         label: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
-    ) -> Result<(String, Vec<TransportEndpoint>), AppError> {
+    ) -> Result<(String, Vec<TransportEndpoint>, bool), AppError> {
         let account = self.account_home().account(label)?;
         let account_id_hex = account.account_id_hex;
 
@@ -5643,7 +5649,8 @@ impl MarmotApp {
                 .collect(),
             "account key package listing",
         );
-        if source_relays.is_empty() {
+        let listed = !source_relays.is_empty();
+        if !listed {
             source_relays = self.directory().directory_source_relays(&[]);
         }
         if source_relays.is_empty() {
@@ -5651,7 +5658,7 @@ impl MarmotApp {
                 MissingRelayListKind::Nip65,
             ]));
         }
-        Ok((account_id_hex, source_relays))
+        Ok((account_id_hex, source_relays, listed))
     }
 
     pub async fn account_key_package_records(

@@ -507,6 +507,34 @@ async fn a_sign_in_that_goes_stale_stays_signed_in() {
     assert!(sign_ins[0].signed_in);
 }
 
+/// An account that lists no relays has its KeyPackages read from the
+/// configured directory relays, and that read is never complete: they need
+/// not be where its KeyPackages are, so it signs no sign-in out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_of_relays_the_account_does_not_list_is_never_complete() {
+    let account = Account::new(1, true);
+    let app = &account.apps[0];
+    assert!(
+        !app.read_account_key_package_slots("alice")
+            .await
+            .unwrap()
+            .complete
+    );
+    let mut relay_lists = AccountRelayListStatus::empty();
+    relay_lists.nip65.created_at = 1;
+    relay_lists.nip65.relays = vec!["wss://relay.example".to_owned()];
+    relay_lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&account.alice_id, &relay_lists)
+        .unwrap();
+    assert!(
+        app.read_account_key_package_slots("alice")
+            .await
+            .unwrap()
+            .complete
+    );
+}
+
 /// A device with no device group keeps its rejection and never prompts about
 /// that slot again. When it creates a device group, the founding roster
 /// carries the rejection, and nothing is left to commit. A rejection of the
