@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use cgka_traits::GroupId;
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId};
 use cgka_traits::storage::MaintenanceStorage as _;
+use marmot_session::CanonicalizationPolicy;
 use storage_sqlite::{SmallStateItem, SmallStateItemName};
 
 use super::AppClient;
@@ -33,7 +34,10 @@ impl AppClient {
         if self.runtime.maintenance_is_paused() {
             return;
         }
-        if let Err(error) = self.sync_small_state(&[]) {
+        if let Err(error) = self
+            .sync_small_state(&[])
+            .and_then(|()| self.owe_small_state_round_when_due())
+        {
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "drive_small_state",
@@ -41,6 +45,31 @@ impl AppClient {
                 "small state was not synced; retrying at the next maintenance pass"
             );
         }
+    }
+
+    /// Owe a new snapshot round once the device group's tip is more than the
+    /// app-payload window past the last round's. A device-group message is
+    /// lost to that window only as the tip moves, so these rounds recover what
+    /// a lost message carried whether or not this device saw it go.
+    pub(crate) fn owe_small_state_round_when_due(&mut self) -> Result<(), AppError> {
+        if !self.app.device_groups_enabled() {
+            return Ok(());
+        }
+        let Some(group_id) = self.trusted_device_group()? else {
+            return Ok(());
+        };
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let Some(round_tip) = storage.small_state_snapshot_round_tip()? else {
+            return Ok(());
+        };
+        let window = CanonicalizationPolicy::default().app_message_past_epoch_limit;
+        if self
+            .stored_group(&group_id)?
+            .is_some_and(|group| group.epoch.0 > round_tip.saturating_add(window))
+        {
+            storage.owe_small_state_snapshots()?;
+        }
+        Ok(())
     }
 
     /// Run one small-state pass with `incoming`, items just received from

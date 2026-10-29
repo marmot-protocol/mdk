@@ -192,8 +192,10 @@ fn nothing_is_recorded_or_applied_before_small_state_starts() {
     assert!(!app.start_small_state().unwrap());
     assert!(app.small_state_started().unwrap());
     assert!(app.small_state_snapshot_owed().unwrap());
-    app.begin_small_state_snapshots(&[]).unwrap();
+    assert_eq!(app.small_state_snapshot_round_tip().unwrap(), None);
+    app.begin_small_state_snapshots(&[], 4).unwrap();
     assert!(!app.small_state_snapshot_owed().unwrap());
+    assert_eq!(app.small_state_snapshot_round_tip().unwrap(), Some(4));
     assert!(!app.start_small_state().unwrap());
     assert!(!app.small_state_snapshot_owed().unwrap());
 }
@@ -302,7 +304,8 @@ fn a_snapshot_is_needed_from_each_sibling_until_its_answer_is_whole() {
 
     // Beginning asks every sibling given and owes every item held.
     assert!(app.small_state_snapshot_owed().unwrap());
-    app.begin_small_state_snapshots(&[tablet, phone]).unwrap();
+    app.begin_small_state_snapshots(&[tablet, phone], 1)
+        .unwrap();
     assert!(!app.small_state_snapshot_owed().unwrap());
     assert_eq!(app.unsent_small_state_items().unwrap().len(), 1);
     let unasked = |to| SmallStateSnapshotRequest {
@@ -386,12 +389,15 @@ fn a_snapshot_is_needed_from_each_sibling_until_its_answer_is_whole() {
     // ones.
     app.owe_small_state_snapshots().unwrap();
     assert!(app.small_state_snapshot_owed().unwrap());
-    app.begin_small_state_snapshots(&[phone]).unwrap();
+    app.begin_small_state_snapshots(&[phone], 7).unwrap();
     assert_eq!(
         app.small_state_snapshot_requests().unwrap(),
         vec![unasked(phone)]
     );
-    app.begin_small_state_snapshots(&[tablet]).unwrap();
+    assert_eq!(app.small_state_snapshot_round_tip().unwrap(), Some(7));
+    // Nothing owed: a second begin changes nothing.
+    app.begin_small_state_snapshots(&[tablet], 9).unwrap();
+    assert_eq!(app.small_state_snapshot_round_tip().unwrap(), Some(7));
     assert_eq!(
         app.small_state_snapshot_requests().unwrap(),
         vec![unasked(phone)]
