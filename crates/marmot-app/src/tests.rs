@@ -29,6 +29,8 @@ mod quarantine_receive;
 mod relay_plane_runtime;
 mod replaceable_delivery;
 mod report_backfill;
+#[cfg(feature = "test-policy-overrides")]
+mod sign_ins;
 mod suspension_close;
 mod unreachable_group_relays;
 mod user_blocks;
