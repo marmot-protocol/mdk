@@ -570,14 +570,21 @@ impl MessageStorage for SqliteAccountStorage {
             .collect::<Vec<_>>()
             .join(", ");
         // `insert_order` is AUTOINCREMENT, so a new row's is greater than any
-        // row's before it, deleted rows included.
+        // row's before it, deleted rows included. The row ids come from the
+        // covering `(group_id, state, openmls_content, openmls_epoch)` index,
+        // which holds `insert_order` too, so the applications delivered after
+        // the position are never visited. The unary `+` keeps the planner from
+        // walking every row after the position by rowid instead.
         let sql = format!(
             "SELECT insert_order, {MESSAGE_COLUMNS} FROM cgka_messages
-             WHERE group_id = ?1 AND state IN ({states}) AND epoch >= ?2 AND insert_order > ?3
-               AND openmls_content IN (
-                   {OPENMLS_CONTENT_COMMIT}, {OPENMLS_CONTENT_PROPOSAL},
-                   {OPENMLS_CONTENT_PENDING}, {OPENMLS_CONTENT_UNCLASSIFIED}
-               )
+             WHERE insert_order IN (
+                 SELECT insert_order FROM cgka_messages
+                 WHERE group_id = ?1 AND state IN ({states}) AND +insert_order > ?3
+                   AND openmls_content IN (
+                       {OPENMLS_CONTENT_COMMIT}, {OPENMLS_CONTENT_PROPOSAL},
+                       {OPENMLS_CONTENT_PENDING}, {OPENMLS_CONTENT_UNCLASSIFIED}
+                   )
+             ) AND epoch >= ?2
              ORDER BY insert_order"
         );
         let after = after.map_or(0, |after| i64::try_from(after).unwrap_or(i64::MAX));

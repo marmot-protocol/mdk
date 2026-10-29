@@ -157,8 +157,9 @@ applications), reading row ids from the covering
 `(group_id, state, openmls_content, openmls_epoch)` index. Classes `-1` and `4`
 are always returned, and the engine re-classifies every returned row from its
 payload, so a derivation gap costs reads, not correctness.
-`list_commits_and_proposals_inserted_after` reads the same index for classes
-`1`, `2`, `-1` and `4` past an `insert_order` position. `insert_order` is
+`list_commits_and_proposals_inserted_after` selects row ids from the same
+index for classes `1`, `2`, `-1` and `4` past an `insert_order` position, so
+applications delivered after that position cost no reads. `insert_order` is
 `AUTOINCREMENT`, so a new row's position is greater than any earlier row's,
 deleted rows included; a failed convergence pass keeps the newest one it has
 judged (mdk#2684).

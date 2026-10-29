@@ -131,6 +131,62 @@ fn convergence_listing_query_work() {
     }
 }
 
+/// A failed convergence batch checks for new selection input on every load by
+/// reading commits and proposals past the newest one it judged (mdk#2684).
+/// Applications delivered after that mark are never read: the check returns
+/// only the newer commit, and its VM work stays flat as they grow sixteenfold.
+#[test]
+fn positional_listing_query_work() {
+    use cgka_traits::message::MessageState;
+    use cgka_traits::storage::MessageStorage;
+    use cgka_traits::types::{EpochId, GroupId};
+
+    const GRAPH_STATES: [MessageState; 5] = [
+        MessageState::Sent,
+        MessageState::Created,
+        MessageState::Retryable,
+        MessageState::ConvergenceDeferred,
+        MessageState::Processed,
+    ];
+    let _measurement = QUERY_MEASUREMENT.lock().unwrap();
+    let group = GroupId::new(vec![0xaa]);
+    let mut previous = None;
+    for count in [256, 4_096] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        seed_query_history(&store.lock().unwrap(), count);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE cgka_messages SET openmls_epoch = epoch, openmls_content =
+                     CASE WHEN insert_order IN (1, ?1) THEN 1 ELSE 3 END",
+                [count],
+            )
+            .unwrap();
+
+        let (rows, work) = measure(&store, || {
+            store
+                .list_commits_and_proposals_inserted_after(
+                    &group,
+                    &GRAPH_STATES,
+                    EpochId(0),
+                    Some(1),
+                )
+                .unwrap()
+                .unwrap()
+        });
+        let positions: Vec<_> = rows.iter().map(|(position, _)| *position).collect();
+        assert_eq!(positions, [u64::try_from(count).unwrap()]);
+        assert!(work < 300, "{work}");
+        if let Some(previous) = previous.replace(work) {
+            assert_eq!(
+                work, previous,
+                "positional work must not grow with applications"
+            );
+        }
+    }
+}
+
 #[test]
 fn maintenance_query_work() {
     let _measurement = QUERY_MEASUREMENT.lock().unwrap();
