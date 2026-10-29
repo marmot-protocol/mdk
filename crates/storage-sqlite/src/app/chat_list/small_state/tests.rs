@@ -185,14 +185,14 @@ fn nothing_is_recorded_or_applied_before_small_state_starts() {
     assert_eq!(pins(&store), vec!["11"]);
 
     assert!(!app.small_state_snapshot_owed().unwrap());
-    app.set_small_state_snapshot_owed(true).unwrap();
+    app.owe_small_state_snapshots().unwrap();
     assert!(!app.small_state_snapshot_owed().unwrap());
 
     assert!(app.start_small_state().unwrap());
     assert!(!app.start_small_state().unwrap());
     assert!(app.small_state_started().unwrap());
     assert!(app.small_state_snapshot_owed().unwrap());
-    app.set_small_state_snapshot_owed(false).unwrap();
+    app.begin_small_state_snapshots(&[]).unwrap();
     assert!(!app.small_state_snapshot_owed().unwrap());
     assert!(!app.start_small_state().unwrap());
     assert!(!app.small_state_snapshot_owed().unwrap());
@@ -254,20 +254,148 @@ fn a_local_change_raises_the_version_and_stays_owed_until_sent() {
     assert!(app.unsent_small_state_items().unwrap().is_empty());
     assert_eq!(app.small_state_items().unwrap(), second);
 
-    // After an invalidated update, this device's own values are owed again,
-    // unchanged; a sibling's that won is not.
-    sync(
-        &store,
-        &[versioned("22", SmallStateValue::Archive(true), 1, 9)],
-        &rule,
+    // After a small-state message is withdrawn, every item held is owed
+    // again unchanged, a sibling's included.
+    let sibling = versioned("22", SmallStateValue::Archive(true), 1, 9);
+    sync(&store, std::slice::from_ref(&sibling), &rule);
+    assert_eq!(app.owe_all_small_state_items().unwrap(), 2);
+    assert_eq!(
+        app.unsent_small_state_items().unwrap(),
+        vec![second[0].clone(), sibling]
     );
-    assert_eq!(app.owe_own_small_state_items().unwrap(), 1);
-    assert_eq!(app.unsent_small_state_items().unwrap(), second);
-    let beaten = versioned("11", SmallStateValue::Pin(true), 3, 9);
-    sync(&store, std::slice::from_ref(&beaten), &rule);
-    app.mark_small_state_sent(&second).unwrap();
-    assert_eq!(app.owe_own_small_state_items().unwrap(), 0);
+    assert_eq!(app.owe_all_small_state_items().unwrap(), 0);
+}
+
+#[test]
+fn an_item_at_the_highest_version_cannot_be_changed() {
+    let store = started_store(&[("11", false)]);
+    let app = store.app_storage();
+    let rule = TestRule::new();
+    let fixed = versioned("11", SmallStateValue::Pin(true), MAX_SMALL_STATE_NUMBER, 9);
+    sync(&store, std::slice::from_ref(&fixed), &rule);
+    assert_eq!(pins(&store), vec!["11"]);
+
+    // The user's unpin is put back, and nothing is owed.
+    app.set_chat_pinned("11", false).unwrap();
+    let outcome = sync(&store, &[], &rule);
+    assert_eq!(outcome.recorded, 0);
+    assert_eq!(
+        outcome.applied.get("11"),
+        Some(&BTreeSet::from([SmallStateItemName::Pin]))
+    );
+    assert_eq!(pins(&store), vec!["11"]);
+    assert_eq!(app.small_state_items().unwrap(), vec![fixed]);
     assert!(app.unsent_small_state_items().unwrap().is_empty());
+    assert_eq!(sync(&store, &[], &rule), SmallStateSync::default());
+}
+
+#[test]
+fn a_snapshot_is_needed_from_each_sibling_until_its_answer_is_whole() {
+    let store = started_store(&[("11", false)]);
+    let app = store.app_storage();
+    let rule = TestRule::new();
+    app.set_chat_pinned("11", true).unwrap();
+    sync(&store, &[], &rule);
+    app.mark_small_state_sent(&app.unsent_small_state_items().unwrap())
+        .unwrap();
+    let (phone, tablet) = ([1; 32], [2; 32]);
+
+    // Beginning asks every sibling given and owes every item held.
+    assert!(app.small_state_snapshot_owed().unwrap());
+    app.begin_small_state_snapshots(&[tablet, phone]).unwrap();
+    assert!(!app.small_state_snapshot_owed().unwrap());
+    assert_eq!(app.unsent_small_state_items().unwrap().len(), 1);
+    let unasked = |to| SmallStateSnapshotRequest {
+        to,
+        request: None,
+        asked_at: None,
+    };
+    assert_eq!(
+        app.small_state_snapshot_requests().unwrap(),
+        vec![unasked(phone), unasked(tablet)]
+    );
+
+    app.record_small_state_snapshot_asked(&phone, &[1; 16], 100)
+        .unwrap();
+    app.record_small_state_snapshot_asked(&tablet, &[2; 16], 100)
+        .unwrap();
+    // Parts of an answer to no request, or out of range, do not count.
+    assert!(
+        !app.record_small_state_snapshot_part(&[9; 16], 1, 1)
+            .unwrap()
+    );
+    assert!(
+        !app.record_small_state_snapshot_part(&[1; 16], 3, 2)
+            .unwrap()
+    );
+    assert!(
+        !app.record_small_state_snapshot_part(&[1; 16], 0, 2)
+            .unwrap()
+    );
+    assert!(
+        !app.record_small_state_snapshot_part(&[1; 16], 1, 2)
+            .unwrap()
+    );
+    assert!(
+        !app.record_small_state_snapshot_part(&[1; 16], 1, 2)
+            .unwrap()
+    );
+    // A part of an answer with another part count belongs to another answer.
+    assert!(
+        !app.record_small_state_snapshot_part(&[1; 16], 2, 3)
+            .unwrap()
+    );
+    assert!(
+        app.record_small_state_snapshot_part(&[1; 16], 2, 2)
+            .unwrap()
+    );
+    assert!(
+        !app.record_small_state_snapshot_part(&[1; 16], 2, 2)
+            .unwrap()
+    );
+
+    // The tablet's request was withdrawn: ask again at once. A new request
+    // starts its answer over.
+    assert!(app.record_small_state_snapshot_part(&[2; 16], 1, 2).is_ok());
+    assert!(app.withdraw_small_state_snapshot_request(&[2; 16]).unwrap());
+    assert!(!app.withdraw_small_state_snapshot_request(&[1; 16]).unwrap());
+    assert_eq!(
+        app.small_state_snapshot_requests().unwrap(),
+        vec![SmallStateSnapshotRequest {
+            to: tablet,
+            request: Some([2; 16]),
+            asked_at: None,
+        }]
+    );
+    app.record_small_state_snapshot_asked(&tablet, &[3; 16], 200)
+        .unwrap();
+    assert!(
+        !app.record_small_state_snapshot_part(&[2; 16], 2, 2)
+            .unwrap()
+    );
+    assert!(
+        !app.record_small_state_snapshot_part(&[3; 16], 2, 2)
+            .unwrap()
+    );
+
+    // A sibling that is no longer active is not waited for.
+    app.drop_small_state_snapshot_request(&tablet).unwrap();
+    assert!(app.small_state_snapshot_requests().unwrap().is_empty());
+
+    // Losing messages again owes requests, and beginning them forgets old
+    // ones.
+    app.owe_small_state_snapshots().unwrap();
+    assert!(app.small_state_snapshot_owed().unwrap());
+    app.begin_small_state_snapshots(&[phone]).unwrap();
+    assert_eq!(
+        app.small_state_snapshot_requests().unwrap(),
+        vec![unasked(phone)]
+    );
+    app.begin_small_state_snapshots(&[tablet]).unwrap();
+    assert_eq!(
+        app.small_state_snapshot_requests().unwrap(),
+        vec![unasked(phone)]
+    );
 }
 
 #[test]

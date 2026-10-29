@@ -12,13 +12,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_traits::GroupId;
-use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceStatusV1};
+use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId};
 use cgka_traits::storage::MaintenanceStorage as _;
 use storage_sqlite::{SmallStateItem, SmallStateItemName};
 
 use super::AppClient;
 use super::device_group::device_slot;
-use crate::small_state::{SmallStateMergeRule, decode_small_state_items, decode_snapshot_request};
+use crate::small_state::{
+    KIND_SMALL_STATE_SNAPSHOT, KIND_SMALL_STATE_SNAPSHOT_REQUEST, KIND_SMALL_STATE_UPDATE,
+    SmallStateMergeRule, decode_small_state_snapshot, decode_small_state_update,
+    decode_snapshot_request,
+};
 use crate::{AppError, AppProjectionUpdate, ChatListUpdateTrigger, MarmotApp};
 
 const TRACE_TARGET: &str = "marmot_app::client::small_state";
@@ -118,28 +122,68 @@ impl AppClient {
         Ok(())
     }
 
-    /// Merge an update's or a snapshot's items, from any device of the
-    /// trusted device group.
-    pub(crate) fn receive_small_state_items(
+    /// Merge an update's items, from any device of the trusted device group.
+    pub(crate) fn receive_small_state_update(
         &mut self,
         group_id: &GroupId,
         content: &str,
     ) -> Result<(), AppError> {
         self.ensure_small_state_group(group_id)?;
-        let items = decode_small_state_items(content)?;
+        let items = decode_small_state_update(content)?;
         self.sync_small_state(&items)
     }
 
-    /// Take a snapshot request: owe a snapshot when it asks this device.
+    /// Merge a snapshot's items, whoever asked for it, and count the part
+    /// when it answers one of this device's requests.
+    pub(crate) fn receive_small_state_snapshot(
+        &mut self,
+        group_id: &GroupId,
+        content: &str,
+    ) -> Result<(), AppError> {
+        self.ensure_small_state_group(group_id)?;
+        let snapshot = decode_small_state_snapshot(content)?;
+        self.sync_small_state(&snapshot.items)?;
+        self.app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .record_small_state_snapshot_part(&snapshot.request, snapshot.part, snapshot.parts)?;
+        Ok(())
+    }
+
+    /// Take a snapshot request: owe an answer when it asks this device.
     pub(crate) fn receive_small_state_snapshot_request(
         &mut self,
         group_id: &GroupId,
         content: &str,
     ) -> Result<(), AppError> {
         self.ensure_small_state_group(group_id)?;
-        let to = decode_snapshot_request(content)?;
+        let (to, request) = decode_snapshot_request(content)?;
         if self.own_device_slot()? == Some(to) {
-            self.small_state_snapshot_answer_owed = true;
+            self.small_state_snapshot_answers_owed.insert(request);
+        }
+        Ok(())
+    }
+
+    /// Branch selection withdrew a small-state message this device sent or
+    /// merged: owe every item held again, or ask again at once for a request
+    /// of this device's.
+    pub(crate) fn small_state_message_withdrawn(
+        &mut self,
+        group_id: &GroupId,
+        kind: u64,
+        content: &str,
+    ) -> Result<(), AppError> {
+        self.ensure_small_state_group(group_id)?;
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        match kind {
+            KIND_SMALL_STATE_UPDATE | KIND_SMALL_STATE_SNAPSHOT => {
+                storage.owe_all_small_state_items()?;
+            }
+            KIND_SMALL_STATE_SNAPSHOT_REQUEST => {
+                let (_, request) = decode_snapshot_request(content)?;
+                storage.withdraw_small_state_snapshot_request(&request)?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -165,21 +209,19 @@ impl AppClient {
             .and_then(|lifecycle| device_slot(&lifecycle.stable_slot_id).ok()))
     }
 
-    /// The sibling to ask for a snapshot: the first active device in slot
-    /// order other than this one, else the first other device.
-    pub(crate) fn small_state_snapshot_target(
+    /// The siblings to ask for snapshots: every device in the roster other
+    /// than this one, whatever its status, since any of them may hold a value
+    /// no other device does.
+    pub(crate) fn small_state_snapshot_targets(
         &self,
         roster: &DeviceRosterV1,
-    ) -> Result<Option<DeviceSlotId>, AppError> {
+    ) -> Result<Vec<DeviceSlotId>, AppError> {
         let own_slot = self.own_device_slot()?;
-        let mut siblings = roster
+        Ok(roster
             .devices
-            .iter()
-            .filter(|(slot, _)| Some(**slot) != own_slot);
-        let first = siblings.clone().next().map(|(slot, _)| *slot);
-        Ok(siblings
-            .find(|(_, entry)| entry.status == DeviceStatusV1::Active)
-            .map(|(slot, _)| *slot)
-            .or(first))
+            .keys()
+            .filter(|slot| Some(**slot) != own_slot)
+            .copied()
+            .collect())
     }
 }
