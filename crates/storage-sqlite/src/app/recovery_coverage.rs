@@ -2295,10 +2295,16 @@ mod tests {
             Some(vec![])
         );
 
+        // A second inside the retained window, so the release is logged.
+        let second = i64_to_u64(crate::base::codec::unix_now_seconds_i64()).unwrap() - 60;
         storage
             .connection
-            .with_transaction(|| uncover_second_tx(&*storage.lock()?, &released, 500))
+            .with_transaction(|| uncover_second_tx(&*storage.lock()?, &released, second))
             .unwrap();
+        assert!(
+            app.recovery_coverage_mark().unwrap() > start,
+            "the release is in the log"
+        );
         assert_eq!(
             app.recovery_coverage_lost_since(start).unwrap(),
             Some(vec![]),
