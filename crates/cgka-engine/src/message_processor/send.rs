@@ -148,6 +148,14 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::EnableAccountDevices { group_id } => {
                 self.do_enable_account_devices(group_id).await
             }
+            SendIntent::LinkDevice {
+                group_id,
+                key_package,
+                roster_update,
+            } => {
+                self.do_send_link_device(group_id, key_package, roster_update)
+                    .await
+            }
             SendIntent::Disband { group_id } => self.do_request_disband(group_id),
         };
         if let (

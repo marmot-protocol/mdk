@@ -896,6 +896,13 @@ impl<S: StorageProvider> Engine<S> {
                     expected: *expected,
                 });
             }
+            // A link never waits in the queue (device-group.md, "Linking a
+            // device"): the new device stops waiting for its Welcome, and a
+            // link drained after that would add a device that never joins.
+            // The caller retries while the new device still waits.
+            if matches!(&intent, SendIntent::LinkDevice { .. }) {
+                return Err(EngineError::LinkDeviceUnsettled { group_id });
+            }
             // An activation the current state already refuses is answered now,
             // not accepted and then refused at drain.
             if matches!(&intent, SendIntent::EnableAccountDevices { .. }) {
@@ -1042,6 +1049,31 @@ impl<S: StorageProvider> Engine<S> {
                     from: "Leaving",
                     to: crate::audit_helpers::send_intent_kind_str(intent),
                     reason: "leave requested",
+                },
+            ));
+        }
+        // device-group.md, "Linking a device": a device joins the device
+        // group only through `LinkDevice`. The sender rule in
+        // `authorize_own_staged_commit` refuses every other own Commit that
+        // adds a leaf there; this answers an Invite or a same-account Add
+        // before anything is queued, with a reason that names it.
+        let adds_devices = match intent {
+            SendIntent::Invite { key_packages, .. }
+            | SendIntent::AddOwnAccountDevices { key_packages, .. } => !key_packages.is_empty(),
+            _ => false,
+        };
+        if adds_devices
+            && group.is_some()
+            && self.with_mls_group(
+                &group_id,
+                crate::app_components::group_requires_device_roster,
+            )?
+        {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "DeviceGroup",
+                    to: crate::audit_helpers::send_intent_kind_str(intent),
+                    reason: "a device joins the device group only through LinkDevice",
                 },
             ));
         }
@@ -4111,6 +4143,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::UpdateGroupData { group_id, .. }
         | SendIntent::EnableDisbanding { group_id }
         | SendIntent::EnableAccountDevices { group_id }
+        | SendIntent::LinkDevice { group_id, .. }
         | SendIntent::Disband { group_id } => group_id,
     }
 }
@@ -4133,6 +4166,7 @@ pub(crate) fn is_fair_scheduled_intent(
         | SendIntent::UpdateGroupData { .. }
         | SendIntent::EnableDisbanding { .. }
         | SendIntent::EnableAccountDevices { .. }
+        | SendIntent::LinkDevice { .. }
         | SendIntent::Disband { .. } => true,
         SendIntent::AddOwnAccountDevices { .. } | SendIntent::RemoveOwnAccountDevices { .. } => {
             account_devices_required

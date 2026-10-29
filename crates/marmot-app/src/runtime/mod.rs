@@ -1541,6 +1541,15 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's linked devices may have changed: re-read
+    /// `linked_devices`. The device group's own events never reach hosts, so
+    /// this is their only cue. Also fires once each time the account's worker
+    /// opens or reconnects. Carries no device or group identities, and may
+    /// fire with no visible change.
+    LinkedDevicesChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
 }
 
 impl MarmotAppRuntime {
@@ -2452,6 +2461,18 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<Vec<crate::HistoryNotice>, AppError> {
         self.accounts.history_notices(account_ref).await
+    }
+
+    /// This account's own devices, from the roster of the device group this
+    /// device trusts: this device first, then by when each was linked. Empty
+    /// until this device trusts a device group, and always empty in release
+    /// builds until the roster's spec lands. Refresh on `LinkedDevicesChanged`.
+    /// An unreadable roster is `DeviceGroupRefused("roster_unavailable")`.
+    pub async fn linked_devices(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::LinkedDevice>, AppError> {
+        self.accounts.linked_devices(account_ref).await
     }
 
     /// Record that the user accepts the risk of changing a group that is still

@@ -320,7 +320,7 @@ fn record_range(
     Ok(())
 }
 
-fn widen_goal(
+pub(crate) fn widen_goal(
     conn: &Connection,
     route: &TransportReconciliationRoute,
     since_seconds: u64,
@@ -521,6 +521,21 @@ pub(crate) fn uncover_loss_tx(conn: &Connection, floor_seconds: u64) -> StorageR
         &[(floor_seconds, None)],
         i64_to_u64(crate::base::codec::unix_now_seconds_i64())?,
     )
+}
+
+/// Loss on one route from `floor_seconds` upward, inside the transaction
+/// that imports it: the route loses its coverage from the floor up, its goal
+/// widens to the floor, and the log records it, so a fetch already running on
+/// that route keeps the debt. Other routes keep everything.
+pub(crate) fn uncover_route_loss_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    floor_seconds: u64,
+    now_seconds: u64,
+) -> StorageResult<()> {
+    remove_coverage_tx(conn, Some(route), floor_seconds, None)?;
+    widen_goal(conn, route, floor_seconds)?;
+    log_uncover_tx(conn, Some(route), &[(floor_seconds, None)], now_seconds)
 }
 
 /// A released receipt lets its event be delivered and admitted again, so the
@@ -755,9 +770,7 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for route in routes {
-                remove_coverage_tx(&conn, Some(route), floor_seconds, None)?;
-                widen_goal(&conn, route, floor_seconds)?;
-                log_uncover_tx(&conn, Some(route), &[(floor_seconds, None)], now)?;
+                uncover_route_loss_tx(&conn, route, floor_seconds, now)?;
             }
             Ok(())
         })
@@ -1279,6 +1292,391 @@ mod tests {
         }
     }
 
+    /// A generation that names its routes un-covers only those, each from
+    /// its own bound, and widens their goals itself. Other routes keep
+    /// everything.
+    #[test]
+    fn routed_loss_uncovers_only_its_routes_from_their_bounds() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let (inbox, lost, kept) = (TransportReconciliationRoute::Inbox, group(1), group(2));
+        for route in [&inbox, &lost, &kept] {
+            record(
+                &app,
+                route,
+                RELAY_A,
+                100,
+                900,
+                RecoveryCoverageProof::Comparison,
+                1,
+            );
+        }
+        app.record_account_recovery_loss_routed(
+            "alice",
+            crate::RecoveryLossCause::Queue,
+            41,
+            3,
+            1_000,
+            Some(400),
+            Some(&[(inbox.clone(), 600), (lost.clone(), 400)]),
+        )
+        .unwrap();
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(imports.len(), 1);
+        assert!(!imports[0].every_route);
+        assert_eq!(
+            ranges(&app, &inbox, RELAY_A),
+            vec![(100, 599, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(
+            ranges(&app, &lost, RELAY_A),
+            vec![(100, 399, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(
+            ranges(&app, &kept, RELAY_A),
+            vec![(100, 900, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(app.recovery_coverage_goal(&inbox).unwrap(), Some(600));
+        assert_eq!(app.recovery_coverage_goal(&lost).unwrap(), Some(400));
+        assert_eq!(app.recovery_coverage_goal(&kept).unwrap(), None);
+    }
+
+    /// One charge that names no route makes its whole generation account-wide,
+    /// and a routed generation imported beside it still un-covers its routes
+    /// below that floor.
+    #[test]
+    fn an_unrouted_charge_makes_its_generation_account_wide() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let (first, second) = (group(1), group(2));
+        for route in [&first, &second] {
+            record(
+                &app,
+                route,
+                RELAY_A,
+                100,
+                900,
+                RecoveryCoverageProof::Comparison,
+                1,
+            );
+        }
+        let routed =
+            |token, count, bound, routes: Option<&[(TransportReconciliationRoute, u64)]>| {
+                app.record_account_recovery_loss_routed(
+                    "alice",
+                    crate::RecoveryLossCause::Queue,
+                    token,
+                    count,
+                    1_000,
+                    Some(bound),
+                    routes,
+                )
+                .unwrap()
+            };
+        routed(41, 1, 700, Some(&[(first.clone(), 700)]));
+        routed(41, 2, 700, None);
+        routed(42, 1, 300, Some(&[(second.clone(), 300)]));
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(imports[0].every_route);
+        assert_eq!(
+            ranges(&app, &first, RELAY_A),
+            vec![(100, 699, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(
+            ranges(&app, &second, RELAY_A),
+            vec![(100, 299, RecoveryCoverageProof::Comparison)]
+        );
+    }
+
+    /// A named route the ledger does not hold yet still gets a goal when an
+    /// unrouted generation imported beside it reaches below its bound.
+    #[test]
+    fn a_mixed_import_gives_an_unrecorded_named_route_its_goal() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let (held, named) = (group(1), group(2));
+        prove(&app, &[&held], 1);
+        app.record_account_recovery_loss_routed(
+            "alice",
+            crate::RecoveryLossCause::Queue,
+            41,
+            1,
+            1_000,
+            Some(700),
+            Some(&[(named.clone(), 700)]),
+        )
+        .unwrap();
+        app.record_account_recovery_loss_routed(
+            "alice",
+            crate::RecoveryLossCause::Queue,
+            42,
+            1,
+            1_000,
+            Some(500),
+            None,
+        )
+        .unwrap();
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(imports[0].every_route);
+        assert_eq!(app.recovery_coverage_goal(&named).unwrap(), Some(500));
+        assert_eq!(app.recovery_coverage_goal(&held).unwrap(), Some(500));
+        assert_eq!(
+            ranges(&app, &held, RELAY_A),
+            vec![(100, 499, RecoveryCoverageProof::Comparison)]
+        );
+    }
+
+    /// A generation that touches more routes than it may list is
+    /// account-wide.
+    #[test]
+    fn a_generation_past_the_route_cap_is_account_wide() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let kept = group(255);
+        record(
+            &app,
+            &kept,
+            RELAY_A,
+            100,
+            900,
+            RecoveryCoverageProof::Comparison,
+            1,
+        );
+        let routes = (0..=crate::MAX_LOSS_ROUTES)
+            .map(|i| {
+                let mut id = [0; 32];
+                id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                (TransportReconciliationRoute::Group(id), 500)
+            })
+            .collect::<Vec<_>>();
+        for chunk in routes.chunks(crate::MAX_LOSS_ROUTES / 2 + 1) {
+            app.record_account_recovery_loss_routed(
+                "alice",
+                crate::RecoveryLossCause::Queue,
+                41,
+                1,
+                1_000,
+                Some(500),
+                Some(chunk),
+            )
+            .unwrap();
+        }
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(imports[0].every_route);
+        assert_eq!(
+            ranges(&app, &kept, RELAY_A),
+            vec![(100, 499, RecoveryCoverageProof::Comparison)]
+        );
+    }
+
+    /// A routed write that lists no route names none, so its generation is
+    /// account-wide.
+    #[test]
+    fn an_empty_route_list_is_account_wide() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let kept = group(1);
+        prove(&app, &[&kept], 1);
+        lose(&app, 41, 1, 500, Some(&[]));
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(imports[0].every_route);
+        assert_eq!(
+            ranges(&app, &kept, RELAY_A),
+            vec![(100, 499, RecoveryCoverageProof::Comparison)]
+        );
+    }
+
+    /// One import can charge more generations, naming more distinct routes,
+    /// than one generation may list. Each named route still loses coverage
+    /// from its own bound and gets its goal, and a route none named keeps its
+    /// coverage.
+    #[test]
+    fn an_import_of_many_routed_generations_uncovers_each_route() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let kept = group(255);
+        let named = (0..crate::MAX_LOSS_ROUTES as u64 + 10)
+            .map(|i| {
+                let mut id = [0; 32];
+                id[..8].copy_from_slice(&i.to_be_bytes());
+                (TransportReconciliationRoute::Group(id), 500 + i)
+            })
+            .collect::<Vec<_>>();
+        let (first, last) = (&named[0].0, &named[named.len() - 1].0);
+        prove(&app, &[&kept, first, last], 1);
+        for (i, lost) in named.iter().enumerate() {
+            lose(
+                &app,
+                1_000 + i as u64,
+                1,
+                lost.1,
+                Some(std::slice::from_ref(lost)),
+            );
+        }
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(!imports[0].every_route);
+        for (route, bound) in &named {
+            assert_eq!(app.recovery_coverage_goal(route).unwrap(), Some(*bound));
+        }
+        for (route, bound) in [&named[0], &named[named.len() - 1]] {
+            assert_eq!(
+                ranges(&app, route, RELAY_A),
+                vec![(100, bound - 1, RecoveryCoverageProof::Comparison)]
+            );
+        }
+        assert_eq!(
+            ranges(&app, &kept, RELAY_A),
+            vec![(100, 900, RecoveryCoverageProof::Comparison)]
+        );
+    }
+
+    /// Shorthand for a queue-loss marker write.
+    fn lose(
+        app: &SqliteAppStorage,
+        token: u64,
+        count: u64,
+        bound: u64,
+        routes: Option<&[(TransportReconciliationRoute, u64)]>,
+    ) {
+        app.record_account_recovery_loss_routed(
+            "alice",
+            crate::RecoveryLossCause::Queue,
+            token,
+            count,
+            1_000,
+            Some(bound),
+            routes,
+        )
+        .unwrap();
+    }
+
+    fn prove(app: &SqliteAppStorage, routes: &[&TransportReconciliationRoute], now: u64) {
+        for route in routes {
+            record(
+                app,
+                route,
+                RELAY_A,
+                100,
+                900,
+                RecoveryCoverageProof::Comparison,
+                now,
+            );
+        }
+    }
+
+    /// A restored generation's new drops arrive under a fresh token, so they
+    /// import as new loss: the obligation moves, and only the routes they
+    /// name lose coverage until one names none.
+    #[test]
+    fn new_loss_after_a_restore_imports_under_its_own_token() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let (first, second, third) = (group(1), group(2), group(3));
+        prove(&app, &[&first, &second, &third], 1);
+        lose(&app, 41, 50, 700, Some(&[(first.clone(), 700)]));
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        prove(&app, &[&first], 2);
+
+        lose(&app, 42, 1, 500, Some(&[(second.clone(), 500)]));
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(imports.len(), 1);
+        assert!(!imports[0].every_route);
+        assert_ne!(
+            imports[0].transition,
+            crate::RecoveryDemandTransition::Unchanged
+        );
+        assert_eq!(
+            ranges(&app, &first, RELAY_A),
+            vec![(100, 900, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(
+            ranges(&app, &second, RELAY_A),
+            vec![(100, 499, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(app.recovery_coverage_goal(&second).unwrap(), Some(500));
+
+        lose(&app, 42, 2, 300, None);
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(imports.len(), 1);
+        assert!(imports[0].every_route);
+        for route in [&first, &second, &third] {
+            assert_eq!(
+                ranges(&app, route, RELAY_A),
+                vec![(100, 299, RecoveryCoverageProof::Comparison)]
+            );
+        }
+    }
+
+    /// A worker observation past the durable count imports drops whose routes
+    /// no marker write has named, so it un-covers every route; the delayed
+    /// write that names them later leaves nothing covered.
+    #[test]
+    fn an_observation_past_the_durable_count_uncovers_every_route() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let (first, second) = (group(1), group(2));
+        prove(&app, &[&first, &second], 1);
+        lose(&app, 41, 1, 700, Some(&[(first.clone(), 700)]));
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        prove(&app, &[&first], 2);
+
+        let observed = app
+            .mark_account_delivery_recovery_observed("alice", 41, 2, Some(500))
+            .unwrap()
+            .unwrap();
+        assert!(observed.every_route);
+        for route in [&first, &second] {
+            assert_eq!(
+                ranges(&app, route, RELAY_A),
+                vec![(100, 499, RecoveryCoverageProof::Comparison)]
+            );
+        }
+        lose(
+            &app,
+            41,
+            2,
+            500,
+            Some(&[(first.clone(), 700), (second.clone(), 500)]),
+        );
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(
+            ranges(&app, &second, RELAY_A),
+            vec![(100, 499, RecoveryCoverageProof::Comparison)]
+        );
+    }
+
+    /// A route proved again after its loss loses coverage again when a later
+    /// drop lands on it, from the route's bound.
+    #[test]
+    fn a_new_drop_on_a_proven_route_uncovers_it_again() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let route = group(1);
+        prove(&app, &[&route], 1);
+        lose(&app, 41, 1, 600, Some(&[(route.clone(), 600)]));
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        prove(&app, &[&route], 2);
+        assert_eq!(
+            ranges(&app, &route, RELAY_A),
+            vec![(100, 900, RecoveryCoverageProof::Comparison)]
+        );
+        lose(&app, 41, 2, 600, Some(&[(route.clone(), 600)]));
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(
+            ranges(&app, &route, RELAY_A),
+            vec![(100, 599, RecoveryCoverageProof::Comparison)]
+        );
+    }
+
     #[test]
     fn legacy_clear_that_restores_loss_uncovers_the_ledger() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
@@ -1307,6 +1705,33 @@ mod tests {
             vec![(100, 499, RecoveryCoverageProof::Comparison)]
         );
         assert_eq!(app.recovery_coverage_goal(&inbox).unwrap(), Some(500));
+    }
+
+    /// A legacy clear un-covers each generation it restores as an import
+    /// does, so a routed one gives its named routes their goals, even a route
+    /// the ledger does not hold.
+    #[test]
+    fn legacy_clear_gives_a_restored_routed_generation_its_goals() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let (kept, left) = (group(1), group(2));
+        prove(&app, &[&kept], 1);
+        app.mark_account_delivery_recovery_bounded("alice", 11, 3, Some(800))
+            .unwrap();
+        prove(&app, &[&kept], 2);
+        lose(&app, 12, 1, 600, Some(&[(left.clone(), 600)]));
+        assert!(!app.clear_account_delivery_recovery("alice", 11).unwrap());
+        assert_eq!(app.recovery_coverage_goal(&left).unwrap(), Some(600));
+        assert_eq!(
+            ranges(&app, &kept, RELAY_A),
+            vec![(100, 900, RecoveryCoverageProof::Comparison)]
+        );
+        assert!(
+            app.synchronize_account_delivery_loss("alice")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn slice<'a>(

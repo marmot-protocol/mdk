@@ -15,7 +15,7 @@ use cgka_traits::convergence_pass::ConvergencePassPhase;
 use cgka_traits::storage::{ConvergencePassStorage, OutboundIntentStorage, QueuedOutboundIntent};
 use openmls::prelude::ProposalOrRefType;
 
-fn pending_proposals(device: &Device, gid: &GroupId) -> usize {
+pub(super) fn pending_proposals(device: &Device, gid: &GroupId) -> usize {
     load_group(device, gid).pending_proposals().count()
 }
 
@@ -56,7 +56,7 @@ async fn key_package_without_account_devices(account: &[u8]) -> KeyPackage {
 
 /// Put an Add of `kp` in `device`'s OpenMLS proposal store, where a replayed
 /// proposal waits for a Commit.
-fn store_pending_add(device: &Device, gid: &GroupId, kp: &KeyPackage) {
+pub(super) fn store_pending_add(device: &Device, gid: &GroupId, kp: &KeyPackage) {
     let crypto = RustCrypto::default();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, device.storage.mls_storage());

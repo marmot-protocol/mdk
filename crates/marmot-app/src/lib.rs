@@ -229,6 +229,7 @@ pub use client::AppClient;
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::device_group::ConfirmedDeviceLink;
+pub use client::device_group::{LinkedDevice, LinkedDeviceStatus};
 pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
@@ -2048,6 +2049,8 @@ impl MarmotApp {
             announced_convergence_parks: std::collections::HashSet::new(),
             pending_convergence_park_notices: std::collections::HashSet::new(),
             history_notice_baseline: None,
+            // A fresh client cannot know what hosts last read.
+            linked_devices_changed: true,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
@@ -2156,6 +2159,7 @@ impl MarmotApp {
         }
         // Hosts read the notice list after open; later changes raise an event.
         client.take_history_notice_changes();
+        client.sync_key_package_announcement_group()?;
         Ok(client)
     }
 
@@ -2185,7 +2189,7 @@ impl MarmotApp {
                     .app
                     .clear_key_package_cutover_replacement_pending(&client.state.label);
             } else {
-                match client.runtime.publish_fresh_key_package().await {
+                match client.publish_fresh_key_package_announced().await {
                     Ok(_) => tracing::info!(
                         target: "marmot_app::key_packages",
                         method = "finish_client_open_network_maintenance",
@@ -2194,7 +2198,7 @@ impl MarmotApp {
                     Err(error) => tracing::warn!(
                         target: "marmot_app::key_packages",
                         method = "finish_client_open_network_maintenance",
-                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        error_kind = error.privacy_safe_kind(),
                         "deferred current key package replacement after strict cutover"
                     ),
                 }
@@ -2223,16 +2227,16 @@ impl MarmotApp {
         if self.cursor_persistence() == CursorPersistence::Advance {
             let result = async {
                 if client.runtime.key_package_generation_upgrade_due()? {
-                    client.runtime.publish_fresh_key_package().await?;
+                    client.publish_fresh_key_package_announced().await?;
                 }
-                Ok::<_, marmot_session::AccountError>(())
+                Ok::<_, AppError>(())
             }
             .await;
             if let Err(error) = result {
                 tracing::warn!(
                     target: "marmot_app::key_packages",
                     method = "finish_client_open_network_maintenance",
-                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    error_kind = error.privacy_safe_kind(),
                     "key package generator upgrade remains retryable"
                 );
             }
@@ -4972,15 +4976,23 @@ impl MarmotApp {
             let recovery_storage = self.account_storage(label)?;
             let recovery_label = label.to_owned();
             let recovery_marker: transport_nostr::AccountDeliveryRecoveryMarker =
-                Arc::new(move |marker_token, dropped, earliest_created_at| {
+                Arc::new(move |marker_token, dropped, earliest_created_at, routes| {
+                    let routes = routes.map(|routes| {
+                        routes
+                            .iter()
+                            .map(|(route, earliest)| (reconciliation_route(*route), *earliest))
+                            .collect::<Vec<_>>()
+                    });
                     recovery_storage
                         .app_storage()
-                        .record_account_delivery_loss_bounded(
+                        .record_account_recovery_loss_routed(
                             &recovery_label,
+                            storage_sqlite::RecoveryLossCause::Queue,
                             marker_token,
                             dropped,
                             unix_now_seconds(),
                             earliest_created_at,
+                            routes.as_deref(),
                         )
                         .map_err(|error| {
                             if error.is_closed() {
@@ -8307,6 +8319,24 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
 fn empty_key_package_lifecycle(stable_slot_id: String) -> cgka_traits::KeyPackageLifecycleState {
     cgka_traits::KeyPackageLifecycleState::slot_only(stable_slot_id)
 }
+
+/// The coverage ledger's key for a route the relay plane placed a delivery
+/// on.
+pub(crate) fn reconciliation_route(
+    route: transport_nostr::DeliveryRoute,
+) -> storage_sqlite::TransportReconciliationRoute {
+    match route {
+        transport_nostr::DeliveryRoute::Inbox => {
+            storage_sqlite::TransportReconciliationRoute::Inbox
+        }
+        transport_nostr::DeliveryRoute::Group(id) => {
+            storage_sqlite::TransportReconciliationRoute::Group(id)
+        }
+    }
+}
+
+// Storage lists every route a loss generation the plane records may name.
+const _: () = assert!(transport_nostr::MAX_DELIVERY_LOSS_ROUTES == storage_sqlite::MAX_LOSS_ROUTES);
 
 fn unix_now_seconds() -> u64 {
     SystemTime::now()

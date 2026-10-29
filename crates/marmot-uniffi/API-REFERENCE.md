@@ -2281,6 +2281,23 @@ Dismiss one notice after the user accepts that this history may be incomplete. T
 </details>
 
 <details>
+<summary>commands/linked_device.rs</summary>
+
+### `Marmot::linked_devices`
+
+**Current.**
+
+```rust
+pub async fn linked_devices( &self, account_ref: String, ) -> Result<Vec<LinkedDeviceFfi>, MarmotKitError>
+```
+
+List this account's own devices for a Devices screen, from the roster of the device group this device trusts: this device first (`is_this_device`), then by `linked_at`. Every entry is this account's own device, never another account's, and it is read from local group state with no network I/O, so it is cheap to re-read. `slot_id_hex` is the device's KeyPackage slot and the handle later device actions take; `label`, `client` and `platform` are empty until set, and `linked_by_slot_id_hex` is `None` for the device that founded the group. The list is empty until this device trusts a device group (a single-device account has none), once that group is terminal, and always in release builds until the roster's spec lands. The device group's own events never reach hosts: refresh on `MarmotEventFfi::LinkedDevicesChanged`, which may fire with no visible change. A roster that cannot be read is `DeviceGroupRefused` with reason `roster_unavailable`. Runs on the account worker.
+
+[Source](src/commands/linked_device.rs#L14)
+
+</details>
+
+<details>
 <summary>commands/media.rs</summary>
 
 ### `parse_media_imeta_tag`

@@ -6,10 +6,10 @@
 
 use super::canonical_membership::{deliver_new, published_key_package};
 use super::*;
-use crate::ConfirmedDeviceLink;
+use crate::{ConfirmedDeviceLink, LinkedDevice, LinkedDeviceStatus};
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
-    decode_device_roster_v1, encode_device_roster_update_v1,
+    DeviceSettingsV1, DeviceStatusV1, decode_device_roster_v1, encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
 use storage_sqlite::DeviceGroupTrust;
@@ -220,11 +220,15 @@ async fn a_device_group_no_link_named_stays_untrusted_and_hidden() {
         Some(DeviceGroupTrust::Untrusted)
     );
     assert_eq!(laptop.trusted_device_group().unwrap(), None);
+    assert!(laptop.linked_devices().unwrap().is_empty());
     assert_hidden(&laptop_app, &laptop, &group);
 
+    laptop.take_linked_devices_changed();
     laptop.dev_record_confirmed_device_link(link).unwrap();
     assert_eq!(trust(&laptop_app, &group), Some(DeviceGroupTrust::Linked));
     assert_eq!(laptop.trusted_device_group().unwrap(), Some(group));
+    assert!(laptop.take_linked_devices_changed());
+    assert_eq!(laptop.linked_devices().unwrap().len(), 2);
 }
 
 /// The founding Add takes only the KeyPackage the link confirmed, and only
@@ -348,8 +352,10 @@ async fn an_interrupted_creation_settles_on_restart() {
             .unwrap()
     );
     assert!(storage.insert_device_group(&creating(&group)).unwrap());
+    phone.take_linked_devices_changed();
     phone.reconcile_device_groups().unwrap();
     assert_eq!(trust(&phone_app, &group), Some(DeviceGroupTrust::Created));
+    assert!(phone.take_linked_devices_changed());
 
     // The engine never created it.
     let never = GroupId::new(vec![0x7c; 16]);
@@ -361,6 +367,7 @@ async fn an_interrupted_creation_settles_on_restart() {
     assert!(storage.insert_device_group(&creating(&never)).unwrap());
     phone.reconcile_device_groups().unwrap();
     assert_eq!(trust(&phone_app, &never), None);
+    assert!(!phone.take_linked_devices_changed());
 
     // The engine holds a chat under the id: the chat stays a chat.
     let chat = phone.create_group("chat", &[]).await.unwrap();
@@ -497,8 +504,10 @@ async fn a_join_the_app_never_saw_settles() {
             .delete_device_group(&group_hex, DeviceGroupTrust::Untrusted)
             .unwrap()
     );
+    laptop.take_linked_devices_changed();
     laptop.dev_record_confirmed_device_link(link).unwrap();
     assert_eq!(trust(&laptop_app, &group), Some(DeviceGroupTrust::Linked));
+    assert!(laptop.take_linked_devices_changed());
     assert_hidden(&laptop_app, &laptop, &group);
 }
 
@@ -837,4 +846,666 @@ async fn the_host_never_learns_of_the_device_group() {
         .map(|quarantined| quarantined.group_id_hex)
         .collect();
     assert_eq!(quarantined, vec![chat_hex]);
+}
+
+fn stable_slot(app: &MarmotApp) -> String {
+    app.account_storage("alice")
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap()
+        .stable_slot_id
+}
+
+/// Each device lists the trusted roster's devices, itself first, then by when
+/// each was linked. Every roster field reaches the host, and every hidden
+/// device-group event raises the change flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_device_lists_the_trusted_roster_itself_first() {
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        mut phone,
+        mut laptop,
+        link,
+    } = phone_and_laptop().await;
+    let phone_slot = stable_slot(&phone_app);
+    let laptop_slot = stable_slot(&laptop_app);
+    // An open owes hosts one announcement; reading raises none.
+    assert!(phone.take_linked_devices_changed());
+    assert!(phone.linked_devices().unwrap().is_empty());
+    assert!(!phone.take_linked_devices_changed());
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
+    assert!(laptop.linked_devices().unwrap().is_empty());
+
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    assert!(phone.take_linked_devices_changed());
+    laptop.take_linked_devices_changed();
+    let mut cursor = 0;
+    deliver_new(&mut laptop, &relay, &mut cursor).await;
+    laptop.sync().await.unwrap();
+    assert!(laptop.take_linked_devices_changed());
+
+    let founding = phone.linked_devices().unwrap();
+    let linked_at = founding[0].linked_at;
+    assert!(linked_at > 0);
+    let founder = |this| LinkedDevice {
+        slot_id_hex: phone_slot.clone(),
+        is_this_device: this,
+        label: String::new(),
+        client: String::new(),
+        platform: String::new(),
+        linked_at,
+        linked_by_slot_id_hex: None,
+        status: LinkedDeviceStatus::Active,
+        add_to_all_chats: false,
+        bring_history: false,
+        keep_while_inactive: false,
+    };
+    let new_device = |this| LinkedDevice {
+        slot_id_hex: laptop_slot.clone(),
+        is_this_device: this,
+        linked_by_slot_id_hex: Some(phone_slot.clone()),
+        ..founder(this)
+    };
+    assert_eq!(founding, vec![founder(true), new_device(false)]);
+    assert_eq!(
+        laptop.linked_devices().unwrap(),
+        vec![new_device(true), founder(false)]
+    );
+
+    // Two more devices, linked earlier than both, with every field set.
+    let phone_slot_bytes: [u8; 32] = hex::decode(&phone_slot).unwrap().try_into().unwrap();
+    let entry = |label: &str, linked_at, status, settings| DeviceEntryV1 {
+        label: label.into(),
+        client: format!("{label} client"),
+        platform: format!("{label} platform"),
+        linked_at,
+        linked_by: Some(phone_slot_bytes),
+        settings,
+        status,
+        announced_key_package: Some(vec![7; 32]),
+        history_key: Some(vec![8; 32]),
+    };
+    let update = encode_device_roster_update_v1(
+        &DeviceRosterUpdateV1::new(vec![
+            DeviceRosterOperationV1::SetDevice(
+                [9; 32],
+                entry(
+                    "Tablet",
+                    1,
+                    DeviceStatusV1::Inactive,
+                    DeviceSettingsV1 {
+                        add_to_all_chats: true,
+                        bring_history: true,
+                        keep_while_inactive: false,
+                    },
+                ),
+            ),
+            DeviceRosterOperationV1::SetDevice(
+                [8; 32],
+                entry(
+                    "Desk",
+                    2,
+                    DeviceStatusV1::Leaving,
+                    DeviceSettingsV1 {
+                        add_to_all_chats: false,
+                        bring_history: true,
+                        keep_while_inactive: true,
+                    },
+                ),
+            ),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let effects = phone
+        .runtime
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: update,
+            }],
+        })
+        .await
+        .unwrap();
+    phone
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    deliver_new(&mut laptop, &relay, &mut cursor).await;
+    laptop.sync().await.unwrap();
+    assert!(laptop.take_linked_devices_changed());
+
+    let tablet = LinkedDevice {
+        slot_id_hex: "09".repeat(32),
+        is_this_device: false,
+        label: "Tablet".into(),
+        client: "Tablet client".into(),
+        platform: "Tablet platform".into(),
+        linked_at: 1,
+        linked_by_slot_id_hex: Some(phone_slot.clone()),
+        status: LinkedDeviceStatus::Inactive,
+        add_to_all_chats: true,
+        bring_history: true,
+        keep_while_inactive: false,
+    };
+    let desk = LinkedDevice {
+        slot_id_hex: "08".repeat(32),
+        label: "Desk".into(),
+        client: "Desk client".into(),
+        platform: "Desk platform".into(),
+        linked_at: 2,
+        status: LinkedDeviceStatus::Leaving,
+        add_to_all_chats: false,
+        bring_history: true,
+        keep_while_inactive: true,
+        ..tablet.clone()
+    };
+    assert_eq!(
+        laptop.linked_devices().unwrap(),
+        vec![
+            new_device(true),
+            tablet.clone(),
+            desk.clone(),
+            founder(false)
+        ]
+    );
+    assert_eq!(
+        phone.linked_devices().unwrap(),
+        vec![founder(true), tablet, desk, new_device(false)]
+    );
+
+    // A restart reads the same roster.
+    drop(laptop);
+    let mut laptop = laptop_app.client("alice").await.unwrap();
+    assert_eq!(laptop.linked_devices().unwrap()[0], new_device(true));
+    assert_eq!(laptop.linked_devices().unwrap().len(), 4);
+}
+
+/// With device groups switched off, as in every release build until the
+/// roster's spec lands, nothing is listed and no change is announced, even on
+/// a device that trusts a device group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_groups_off_list_no_devices() {
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    phone.dev_create_device_group(link).await.unwrap();
+    assert_eq!(phone.linked_devices().unwrap().len(), 2);
+    drop(phone);
+
+    let phone_app = MarmotApp::with_relay_and_config(
+        _dirs[0].path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0),
+    )
+    .with_test_relay_client(relay);
+    let mut phone = phone_app.client("alice").await.unwrap();
+    assert!(phone.linked_devices().unwrap().is_empty());
+    assert!(phone.linked_devices_changed);
+    assert!(!phone.take_linked_devices_changed());
+}
+
+/// Through the runtime, the new device's account worker announces the join it
+/// hid, and `linked_devices` reads the roster the Welcome brought.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_runtime_announces_a_device_group_join_and_lists_its_devices() {
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        mut phone,
+        mut laptop,
+        link,
+    } = phone_and_laptop().await;
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
+    drop(laptop);
+    let account_id_hex = laptop_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let _eose = scripted_eose_pump(
+        laptop_app.relay_plane.clone(),
+        relay.clone(),
+        every_subscription,
+    );
+    let runtime = MarmotAppRuntime::new(laptop_app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    assert!(runtime.linked_devices("alice").await.unwrap().is_empty());
+    next_linked_devices_changed(&mut events, &account_id_hex).await;
+
+    phone.dev_create_device_group(link).await.unwrap();
+    // Separate apps share no live relay: route the founding Welcome in.
+    let welcome = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| {
+            event.kind == 1059
+                && event.tags.iter().any(|tag| {
+                    tag.first().is_some_and(|v| v == "p") && tag.get(1) == Some(&account_id_hex)
+                })
+        })
+        .cloned()
+        .expect("the founding Welcome");
+    laptop_app
+        .relay_plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+            subscription_id: Some("device-group-welcome".to_owned()),
+            event: welcome,
+        })
+        .await
+        .unwrap();
+    next_linked_devices_changed(&mut events, &account_id_hex).await;
+
+    let devices = runtime.linked_devices("alice").await.unwrap();
+    assert_eq!(
+        devices
+            .iter()
+            .map(|device| (device.slot_id_hex.clone(), device.is_this_device))
+            .collect::<Vec<_>>(),
+        vec![
+            (stable_slot(&laptop_app), true),
+            (stable_slot(&phone_app), false)
+        ]
+    );
+    runtime.shutdown().await;
+}
+
+/// A trusted device group whose roster cannot be read refuses with a fixed
+/// code that never names the group, whether the read's own hydration or the
+/// open quarantined it, and a terminal one lists nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_nothing() {
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        mut phone,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    let storage = phone_app.account_storage("alice").unwrap();
+    let stored = || cgka_traits::storage::GroupStorage::get_group(&storage, &group).unwrap();
+    let unavailable = |phone: &mut AppClient| {
+        let error = phone.linked_devices().unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::DeviceGroupRefused("roster_unavailable")
+        ));
+        assert!(!error.to_string().contains(&hex::encode(group.as_slice())));
+    };
+
+    // The group fails hydration: first in the read itself, on a deferred
+    // open, then at an eager one.
+    let mut damaged = stored();
+    damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    cgka_traits::storage::GroupStorage::put_group(&storage, &damaged).unwrap();
+    drop(phone);
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut phone = phone_app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    assert!(phone.runtime.group_record(&group).is_err());
+    unavailable(&mut phone);
+    unavailable(&mut phone);
+    drop(phone);
+    let mut phone = phone_app.client("alice").await.unwrap();
+    unavailable(&mut phone);
+
+    let mut removed = stored();
+    removed.removed = true;
+    cgka_traits::storage::GroupStorage::put_group(&storage, &removed).unwrap();
+    assert!(phone.linked_devices().unwrap().is_empty());
+}
+
+/// A restart that settles device-group trust announces it with no command or
+/// delivery after the open: an interrupted creation becomes `created` in the
+/// worker's startup reconcile, and the end of startup says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_that_settles_trust_announces_it() {
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        mut phone,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    assert!(
+        phone_app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .set_device_group_trust(
+                &hex::encode(group.as_slice()),
+                DeviceGroupTrust::Created,
+                DeviceGroupTrust::Creating,
+                None,
+                1,
+            )
+            .unwrap()
+    );
+    drop(phone);
+    let account_id_hex = phone_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let _eose = scripted_eose_pump(phone_app.relay_plane.clone(), relay, every_subscription);
+    let runtime = MarmotAppRuntime::new(phone_app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    next_linked_devices_changed(&mut events, &account_id_hex).await;
+    assert_eq!(trust(&phone_app, &group), Some(DeviceGroupTrust::Created));
+    runtime.shutdown().await;
+}
+
+/// A reconnect opens a new client, which announces once with no command or
+/// delivery after it. A reconnect attempt that settles trust and then fails
+/// transport drops its client, flag and all; the client that replaces it
+/// cannot see that change, so every open announces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_announces_again() {
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        mut phone,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    phone.dev_create_device_group(link).await.unwrap();
+    drop(phone);
+    let account_id_hex = phone_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let _eose = scripted_eose_pump(phone_app.relay_plane.clone(), relay, every_subscription);
+    let runtime = MarmotAppRuntime::new(phone_app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    next_linked_devices_changed(&mut events, &account_id_hex).await;
+    assert_eq!(runtime.linked_devices("alice").await.unwrap().len(), 2);
+
+    runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_consumer_exit_for_test();
+    next_linked_devices_changed(&mut events, &account_id_hex).await;
+    assert_eq!(runtime.linked_devices("alice").await.unwrap().len(), 2);
+    runtime.shutdown().await;
+}
+
+/// Waits for the account's next `LinkedDevicesChanged`. The device group's own
+/// events must never reach the host meanwhile.
+async fn next_linked_devices_changed(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    account_id_hex: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::LinkedDevicesChanged {
+                    account_id_hex: changed,
+                    account_label,
+                }) if changed == account_id_hex && account_label == "alice" => break,
+                Ok(MarmotAppEvent::GroupJoined { .. }) => {
+                    panic!("the device group reached the host")
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("events closed"),
+            }
+        }
+    })
+    .await
+    .expect("LinkedDevicesChanged");
+}
+
+/// A phone and laptop in one device group, the laptop joined.
+async fn linked_devices() -> (Devices, GroupId) {
+    let mut devices = phone_and_laptop().await;
+    devices
+        .laptop
+        .dev_record_confirmed_device_link(devices.link.clone())
+        .unwrap();
+    let group = devices
+        .phone
+        .dev_create_device_group(devices.link.clone())
+        .await
+        .unwrap();
+    let mut cursor = 0;
+    deliver_new(&mut devices.laptop, &devices.relay, &mut cursor).await;
+    devices.laptop.sync().await.unwrap();
+    assert_eq!(
+        trust(&devices.laptop_app, &group),
+        Some(DeviceGroupTrust::Linked)
+    );
+    (devices, group)
+}
+
+fn own_slot(client: &AppClient) -> String {
+    client
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap()
+        .stable_slot_id
+}
+
+/// The KeyPackage `reader`'s copy of the roster announces for `device`.
+fn announced(reader: &AppClient, group: &GroupId, device: &AppClient) -> Option<String> {
+    let bytes = reader
+        .runtime
+        .app_component(group, DEVICE_ROSTER_COMPONENT_ID)
+        .unwrap()
+        .unwrap();
+    let slot: [u8; 32] = hex::decode(own_slot(device)).unwrap().try_into().unwrap();
+    decode_device_roster_v1(&bytes).unwrap().devices[&slot]
+        .announced_key_package
+        .as_ref()
+        .map(hex::encode)
+}
+
+fn current_ref(client: &AppClient) -> Option<String> {
+    client
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap()
+        .current_key_package_ref
+        .map(hex::encode)
+}
+
+/// The kinds published since `since`, in order.
+fn published_kinds(relay: &ScriptedPushRelayClient, since: usize) -> Vec<u64> {
+    relay.published_events.lock().unwrap()[since..]
+        .iter()
+        .map(|event| event.kind)
+        .collect()
+}
+
+/// A device's roster entry names each KeyPackage before it reaches the slot.
+/// The founding roster names both devices' current ones, so maintenance owes
+/// no commit. A rotation sends the roster commit first, then the KeyPackage
+/// the sibling sees announced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_package_is_announced_before_it_reaches_the_slot() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    for client in [&phone, &laptop] {
+        assert_eq!(announced(client, &group, &laptop), current_ref(&laptop));
+        assert_eq!(announced(client, &group, &phone), current_ref(&phone));
+    }
+    let mut phone_cursor = relay.published_events.lock().unwrap().len();
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_kinds(&relay, phone_cursor).is_empty());
+
+    let rotated = laptop.rotate_key_package().await.unwrap();
+    let rotated_ref = marmot_session::key_package_metadata(&rotated)
+        .unwrap()
+        .key_package_ref_hex;
+    assert_eq!(current_ref(&laptop), Some(rotated_ref.clone()));
+    assert_eq!(
+        published_kinds(&relay, phone_cursor),
+        vec![transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE, 30443],
+        "the roster commit goes out before the KeyPackage"
+    );
+    deliver_new(&mut phone, &relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    assert_eq!(announced(&phone, &group, &laptop), Some(rotated_ref));
+}
+
+/// A KeyPackage whose announcement fails never reaches the slot. The relay
+/// rejects the roster commit, so nothing is published; the next maintenance
+/// pass announces again and then publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_package_waits_for_its_announcement() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let before = relay.published_events.lock().unwrap().len();
+    let announced_before = announced(&laptop, &group, &laptop);
+    relay.reject_next_publish();
+    let error = laptop.rotate_key_package().await.unwrap_err();
+    assert_eq!(
+        error.privacy_safe_kind(),
+        "account_key_package_announcement_pending"
+    );
+    assert!(published_kinds(&relay, before).is_empty());
+    assert_eq!(announced(&laptop, &group, &laptop), announced_before);
+    let pending = laptop
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap()
+        .pending_replacement
+        .unwrap();
+
+    laptop.run_due_maintenance().await.unwrap();
+    let pending_ref = hex::encode(&pending.key_package_ref);
+    assert_eq!(current_ref(&laptop), Some(pending_ref.clone()));
+    assert_eq!(announced(&laptop, &group, &laptop), Some(pending_ref));
+    assert_eq!(
+        published_kinds(&relay, before),
+        vec![transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE, 30443]
+    );
+}
+
+/// A host publication that must send a fresh KeyPackage announces that one,
+/// not the current one, and sends it in the same call: here because the
+/// device group's Welcome consumed the laptop's KeyPackage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_republish_that_needs_a_fresh_key_package_announces_that_one() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    assert!(laptop.runtime.key_package_republish_falls_back().unwrap());
+    assert_fresh_publication_is_announced(&mut laptop, &relay, &group, 0).await;
+    assert!(!phone.runtime.key_package_republish_falls_back().unwrap());
+}
+
+/// One host `publish_key_package` call commits the announcement of a fresh
+/// KeyPackage newer than `newer_than`, then publishes it.
+async fn assert_fresh_publication_is_announced(
+    device: &mut AppClient,
+    relay: &ScriptedPushRelayClient,
+    group: &GroupId,
+    newer_than: u64,
+) {
+    let previous = current_ref(device);
+    let before = relay.published_events.lock().unwrap().len();
+    let published = device.publish_key_package().await.unwrap();
+    let published_ref = marmot_session::key_package_metadata(&published)
+        .unwrap()
+        .key_package_ref_hex;
+    assert_ne!(previous, Some(published_ref.clone()));
+    assert_eq!(current_ref(device), Some(published_ref.clone()));
+    assert_eq!(announced(device, group, device), Some(published_ref));
+    assert!(
+        device
+            .key_package_maintenance_status()
+            .unwrap()
+            .unwrap()
+            .authored_event_created_at
+            .unwrap()
+            .0
+            > newer_than
+    );
+    assert_eq!(
+        published_kinds(relay, before),
+        vec![transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE, 30443]
+    );
+}
+
+/// Without a readable device group the runtime would see nothing to
+/// announce in, so a host publication is refused instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_device_group_refuses_publication() {
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        mut phone,
+        ..
+    } = phone_and_laptop().await;
+    assert!(
+        phone_app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .insert_device_group(&storage_sqlite::DeviceGroupRecord {
+                group_id_hex: "not a group id".to_owned(),
+                trust: DeviceGroupTrust::Created,
+                key_package_ref_hex: Some("00".repeat(32)),
+                recorded_at: 1,
+            })
+            .unwrap()
+    );
+
+    let before = relay.published_events.lock().unwrap().len();
+    assert!(phone.publish_key_package().await.is_err());
+    assert!(published_kinds(&relay, before).is_empty());
 }

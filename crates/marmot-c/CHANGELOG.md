@@ -19,7 +19,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   group whose convergence pass spent its failure budget (mdk#2684). Show it as
   stuck syncing; `marmot_retry_group_convergence` grants one more attempt.
   The struct grows, so use matching regenerated headers and libraries.
-
+- `marmot_linked_devices` writes this account's own devices as a
+  `MarmotLinkedDeviceList` (free with `marmot_linked_device_list_free`), from
+  the roster of the device group this device trusts, this device first
+  (mdk#2628 item 3.1). The new `MARMOT_EVENT_LINKED_DEVICES_CHANGED` event says
+  to re-read it. The list is empty in release builds until the roster's spec
+  lands. Use matching regenerated headers and libraries.
 - `marmot_account_devices_activation` and `marmot_enable_account_devices` let
   an admin turn on account-devices in an existing group, only when the user
   asks (mdk#2628). The first writes a `MarmotAccountDevicesActivation` that

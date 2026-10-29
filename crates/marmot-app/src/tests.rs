@@ -1565,7 +1565,9 @@ pub(crate) async fn client_on_app_relay_plane(app: &MarmotApp, label: &str) -> c
 /// signal itself. The pump reports EOSE for every subscription the relay has accepted
 /// and `accept` selects, on every endpoint it was issued to, and keeps doing so
 /// as later subscriptions are registered. Repeat reports are ignored by the
-/// adapter, so this is safe to run for the whole test.
+/// adapter, so this is safe to run for the whole test, but each still takes
+/// the adapter's state lock, which can defer a cursor seal
+/// ([`LiveCursorFixture::stop_eose_pump`]).
 pub(crate) struct ScriptedEosePump(tokio::task::JoinHandle<()>);
 
 impl Drop for ScriptedEosePump {
@@ -13288,7 +13290,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         let attempts = marker_attempts.clone();
         let storage = app.account_storage("alice").unwrap();
         let marker: transport_nostr::AccountDeliveryRecoveryMarker =
-            Arc::new(move |marker_token, dropped, _| {
+            Arc::new(move |marker_token, dropped, _, _| {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if !release.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable);
@@ -13612,6 +13614,19 @@ impl LiveCursorFixture {
             _eose: eose,
             _dir: dir,
         }
+    }
+
+    /// Stop the scripted EOSE pump, which [`Self::open`] leaves running after
+    /// every subscription is past end-of-stored-events. A cursor seal reads
+    /// replay admission without waiting and defers its commit while the
+    /// adapter's state lock is taken, and each of the pump's repeat reports
+    /// takes that lock. A REQ issued afterwards never reaches EOSE. Other
+    /// tasks, such as the replay supervisor, still take the lock, so a test
+    /// that asserts what one commit persists also runs on one thread, where
+    /// none of them runs between the commit's readiness read and its seal.
+    pub(crate) async fn stop_eose_pump(&mut self) {
+        self._eose.0.abort();
+        let _ = (&mut self._eose.0).await;
     }
 
     pub(crate) fn persisted(&self) -> Option<u64> {
@@ -14072,7 +14087,7 @@ fn live_ingest_keeps_the_cursor_behind_a_queue_omission_after_replay() {
         );
         let marker_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts = marker_attempts.clone();
-        let marker: transport_nostr::AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
+        let marker: transport_nostr::AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _, _| {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable)
         });

@@ -186,6 +186,22 @@ pub enum SendIntent {
         group_id: GroupId,
         leaf_signature_keys: Vec<Vec<u8>>,
     },
+    /// Add a newly linked device of this account to the account's device
+    /// group and write its roster entry, in one admin Commit (mdk#2628 item
+    /// 3.3b, D21). That Commit is the link's approval.
+    ///
+    /// `key_package` is the one KeyPackage device pairing confirmed: it must
+    /// belong to this device's account and advertise everything the group
+    /// requires. `roster_update` is a `marmot.account.device-roster.v1`
+    /// update with exactly one operation, setting the device entry of a slot
+    /// the roster does not list yet, whose announced KeyPackage is
+    /// `key_package`'s `KeyPackageRef`. The group must require the roster.
+    /// The added device gets its Welcome as an [`Self::Invite`]'s devices do.
+    LinkDevice {
+        group_id: GroupId,
+        key_package: KeyPackage,
+        roster_update: Vec<u8>,
+    },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
     /// Rotate only this sender's MLS LeafNode key material.

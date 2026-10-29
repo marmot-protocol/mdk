@@ -13,10 +13,9 @@
 use std::collections::HashSet;
 
 use storage_sqlite::{
-    RecoveryCause, RecoveryCoverageProof, RecoveryCoverageSlice, RecoveryDemandTransition,
-    RecoveryLossImport, RecoveryPredicate, RecoveryRevisionFence, RecoveryScopeOutcome,
-    SqliteAppStorage, StoredRecoveryScope, TRANSPORT_RECONCILIATION_RETENTION_SECS,
-    TransportReconciliationRoute,
+    RecoveryCause, RecoveryCoverageProof, RecoveryCoverageSlice, RecoveryLossImport,
+    RecoveryPredicate, RecoveryRevisionFence, RecoveryScopeOutcome, SqliteAppStorage,
+    StoredRecoveryScope, TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationRoute,
 };
 
 use super::AppClient;
@@ -158,16 +157,19 @@ impl AppClient {
         self.app.account_storage(&self.state.label)
     }
 
-    /// Storage un-covered every ledger route from the loss's floor upward in
-    /// the import's own transaction. A current route the ledger does not hold
-    /// yet still owes from the floor, so its goal widens here; if this write
+    /// Storage un-covered the loss in the import's own transaction: only the
+    /// routes a routed generation named, each from its own bound, with their
+    /// goals; and every ledger route from the floor of a generation that named
+    /// none. For that, a current route the ledger does not hold yet still owes
+    /// from the floor, so its goal widens here; if this write
     /// is lost, the pending loss scopes widen it at the next comparison. Every
-    /// import that changed demand is new evidence, even with nothing counted:
-    /// a notification lag charges no delivery count.
+    /// account-wide import is new evidence, even with nothing counted or no
+    /// demand changed: a notification lag charges no delivery count.
     pub(crate) fn record_coverage_loss(&self, imports: &[RecoveryLossImport]) {
+        // Routed loss widened its own routes' goals in the import.
         let floors = imports
             .iter()
-            .filter(|import| import.transition != RecoveryDemandTransition::Unchanged)
+            .filter(|import| import.every_route)
             .map(|import| import.goal_floor.unwrap_or(0))
             .collect::<Vec<_>>();
         let Some(floor) = floors.into_iter().min() else {

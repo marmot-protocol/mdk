@@ -1,0 +1,29 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendIntent::LinkDevice\n{\n    group_id: gid(), key_package: KeyPackage::new(vec![0xEF; 4]),\n    roster_update: vec![0x5C; 4],\n}"
+---
+{
+  "LinkDevice": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "key_package": {
+      "bytes": [
+        239,
+        239,
+        239,
+        239
+      ],
+      "protocol_profile": "legacy"
+    },
+    "roster_update": [
+      92,
+      92,
+      92,
+      92
+    ]
+  }
+}

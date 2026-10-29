@@ -664,6 +664,23 @@ These are real simulator scenarios that are still tied to Rust harness details.
 - Reason: this is production-shaped Nostr-wrapper and multi-client coverage; the 250ms blocked-peeler timing boundary
   remains a deterministic engine integration test rather than a portable protocol assertion.
 
+### Asymmetric relay release (`tests/asymmetric_relay_release.rs`)
+
+- Setup: Carol is offline while Alice and Bob produce history. Relay A holds every event except a chosen set that only
+  relay B holds. Carol is released on A's coverage, ingesting A's events oldest first, and B's events arrive afterwards.
+- Pressure: B's late events are an older application message, an older sender generation, a run from one sender, a
+  commit A lacks, a rival commit at the same epoch, or the longer branch of a partition fork.
+- Expected: a late application message opens up to five epochs back and not six; a late sender message opens up to 99
+  generations behind that sender's last decrypted message and not 100; every A event behind a commit only B holds is
+  deferred and opens once the commit arrives (the test defers eight, marmot-app's stall-backfill threshold when written;
+  the app layer itself is not exercised); a late rival commit,
+  and a fork whose losing branch is five commits deep, are adjudicated as the online members did.
+- Sweeps: ignored tests walk each window and assert where it flips, including the sender ratchet's 1,000-generation
+  forward distance, the deferred-peel row cap (with `test-policy-overrides`), and chain recovery stranding events 32
+  epochs above a gap commit. Run them with
+  `cargo test -p cgka-conformance-simulator --features test-policy-overrides --test asymmetric_relay_release -- --ignored`.
+- Reason: these windows decide whether the recovery runner can release a held group on one relay's coverage (#2660).
+
 ## Generated Scenario Families
 
 Generated cases are deterministic for a fixed family name, independent generator version, seed, and case index, plus

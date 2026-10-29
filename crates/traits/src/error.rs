@@ -164,6 +164,16 @@ pub enum EngineError {
     )]
     AppMessageEpochUnsettled { expected: EpochId },
 
+    /// A [`SendIntent::LinkDevice`](crate::engine::SendIntent::LinkDevice)
+    /// refused instead of queued, because the device group has a Commit in
+    /// flight or convergence input still unsettled. Nothing was persisted.
+    /// A link never waits in the outbound queue: the new device stops waiting
+    /// for its Welcome, and a link sent after that would add a device that
+    /// never joins. Retry once the group settles, while the new device still
+    /// waits.
+    #[error("linking a device refused while the device group is unsettled")]
+    LinkDeviceUnsettled { group_id: GroupId },
+
     /// Epoch fork detected that the current recovery manager could not
     /// resolve, usually because no pre-commit snapshot was available.
     /// Recoverable same-epoch commit races roll back and replay internally.
@@ -299,6 +309,7 @@ impl EngineError {
             EngineError::NoDataAppComponent { .. } => "no_data_app_component",
             EngineError::AppMessageEpochMismatch { .. } => "app_message_epoch_mismatch",
             EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
+            EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
             EngineError::ForkedEpoch { .. } => "forked_epoch",
             EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
             EngineError::GroupUnrecoverableRepairRequired { .. } => {
