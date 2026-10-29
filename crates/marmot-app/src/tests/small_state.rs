@@ -195,9 +195,20 @@ async fn snapshots_and_withdrawals_settle_this_devices_requests() {
     let phone = &mut devices.phone;
     let (group, _) = phone.trusted_device_roster().unwrap().unwrap();
     phone.sync_small_state(&[]).unwrap();
+    // A round begun at the device group's tip is not due again until the tip
+    // moves past the app-payload window.
+    let tip = phone_app
+        .account_storage("alice")
+        .unwrap()
+        .get_group(&group)
+        .unwrap()
+        .epoch
+        .0;
     storage()
-        .begin_small_state_snapshots(&[laptop_slot])
+        .begin_small_state_snapshots(&[laptop_slot], tip)
         .unwrap();
+    phone.owe_small_state_round_when_due().unwrap();
+    assert!(!storage().small_state_snapshot_owed().unwrap());
     storage()
         .record_small_state_snapshot_asked(&laptop_slot, &[3; 16], 100)
         .unwrap();

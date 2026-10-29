@@ -235,17 +235,18 @@ impl SqliteAppStorage {
         Ok(())
     }
 
-    /// Begin owed snapshot requests: this device needs a whole snapshot from
-    /// each sibling in `to`, and owes its siblings every item it holds. Earlier
-    /// requests are forgotten. Does nothing unless requests are owed.
-    pub fn begin_small_state_snapshots(&self, to: &[[u8; 32]]) -> StorageResult<()> {
+    /// Begin owed snapshot requests at the device group's tip epoch `tip`:
+    /// this device needs a whole snapshot from each sibling in `to`, and owes
+    /// its siblings every item it holds. Earlier requests are forgotten. Does
+    /// nothing unless requests are owed.
+    pub fn begin_small_state_snapshots(&self, to: &[[u8; 32]], tip: u64) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let begun = conn
                 .execute_cached(
-                    "UPDATE small_state_sync SET snapshot_owed = 0
+                    "UPDATE small_state_sync SET snapshot_owed = 0, snapshot_round_tip = ?1
                      WHERE id = 1 AND snapshot_owed = 1",
-                    [],
+                    params![u64_to_i64(tip)?],
                 )
                 .storage()?;
             if begun == 0 {
@@ -267,6 +268,22 @@ impl SqliteAppStorage {
             .storage()?;
             Ok(())
         })
+    }
+
+    /// The device group's tip epoch when this device last began asking for
+    /// snapshots; `None` before the first time.
+    pub fn small_state_snapshot_round_tip(&self) -> StorageResult<Option<u64>> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT snapshot_round_tip FROM small_state_sync WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .storage()?
+            .flatten()
+            .map(i64_to_u64)
+            .transpose()
     }
 
     /// The siblings whose whole snapshot this device still needs, in slot

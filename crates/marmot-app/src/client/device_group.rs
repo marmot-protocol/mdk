@@ -134,7 +134,7 @@ impl AppClient {
     /// The engine's durable record of `group_id`. Every device-group decision
     /// reads it rather than the live group, which a deferred open has not
     /// hydrated yet and a quarantine hides, so neither changes a verdict.
-    fn stored_group(&self, group_id: &GroupId) -> Result<Option<Group>, AppError> {
+    pub(super) fn stored_group(&self, group_id: &GroupId) -> Result<Option<Group>, AppError> {
         match self
             .app
             .account_storage(&self.state.label)?

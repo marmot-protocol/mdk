@@ -17,7 +17,8 @@
 //!   - `unsent` is 1 while this device still owes its siblings the value.
 //! - `small_state_sync`: at most one row, written when this device starts to
 //!   take part in small state. `snapshot_owed` is 1 while this device still
-//!   has to ask its siblings for snapshots.
+//!   has to ask its siblings for snapshots, and `snapshot_round_tip` is the
+//!   device group's tip epoch when it last began asking.
 //! - `small_state_snapshot_requests`: one row per sibling (`to_slot`) whose
 //!   whole snapshot this device still needs. `request` is the random id of
 //!   the latest request to it and `asked_at` when, in seconds; NULL in both
@@ -66,7 +67,8 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         CREATE TABLE small_state_sync (
             id INTEGER PRIMARY KEY CHECK(id = 1),
             started_at INTEGER NOT NULL CHECK(started_at >= 0),
-            snapshot_owed INTEGER NOT NULL CHECK(snapshot_owed IN (0, 1))
+            snapshot_owed INTEGER NOT NULL CHECK(snapshot_owed IN (0, 1)),
+            snapshot_round_tip INTEGER CHECK(snapshot_round_tip IS NULL OR snapshot_round_tip >= 0)
         );
 
         CREATE TABLE small_state_snapshot_requests (
