@@ -14,6 +14,7 @@
 use storage_sqlite::{SqliteAppStorage, TransportReconciliationRoute};
 
 use crate::client::AppClient;
+use crate::client::recovery_coverage::LiveTails;
 
 /// One worker turn's read of the live tails.
 pub(crate) trait LiveTailRead: Send + Sync {
@@ -22,32 +23,24 @@ pub(crate) trait LiveTailRead: Send + Sync {
     fn owed_until(&self, route: &TransportReconciliationRoute, relay: &str, now: u64) -> u64;
 }
 
-/// No tail stands: everything through `now` is owed. This subtracts nothing,
-/// so the runner never treats an unproven second as covered.
-pub(crate) struct OwedThroughNow;
-
-impl LiveTailRead for OwedThroughNow {
-    fn owed_until(&self, _route: &TransportReconciliationRoute, _relay: &str, now: u64) -> u64 {
-        now
+impl LiveTailRead for LiveTails {
+    fn owed_until(&self, route: &TransportReconciliationRoute, relay: &str, now: u64) -> u64 {
+        LiveTails::owed_until(self, route, relay, now)
     }
 }
 
 impl AppClient {
-    /// The live tails a runner's debt turn subtracts, read now. The worker
-    /// calls this at the start of every debt turn and drops the answer with
-    /// the turn.
-    ///
-    /// Until the capped live boundary (PR 2d) lands this owes everything;
-    /// then it returns `AppClient::live_tails(app, now)`, which re-observes
-    /// the adapter and asks the relay client whether each generation's relay
-    /// is still connected.
-    // The account worker's runner host calls this from PR 5 (mdk#2660).
-    #[allow(dead_code)]
+    /// The live tails a runner's debt turn subtracts, read now: it
+    /// re-observes the adapter and asks the relay client whether each
+    /// generation's relay is still connected
+    /// ([`AppClient::live_tails`](crate::client::AppClient)). The worker calls
+    /// this at the start of every debt turn and drops the answer with the
+    /// turn; the account worker's runner host calls it from PR 5 (mdk#2660).
     pub(crate) async fn recovery_runner_live_tails(
         &self,
-        _app: &SqliteAppStorage,
-        _now: u64,
+        app: &SqliteAppStorage,
+        now: u64,
     ) -> Box<dyn LiveTailRead> {
-        Box::new(OwedThroughNow)
+        Box::new(self.live_tails(app, now).await)
     }
 }

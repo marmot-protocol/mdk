@@ -27,22 +27,22 @@ pub(super) const RELAY: &str = "wss://relay.example";
 pub(super) const STORED_AT: u64 = 1;
 
 /// The ledger's spelling of the fixture relay.
-pub(super) fn relay() -> String {
+pub(in crate::client) fn relay() -> String {
     transport_nostr::canonical_relay(RELAY)
 }
 
-pub(super) struct Fixture {
-    pub(super) _dir: tempfile::TempDir,
-    pub(super) _pump: ScriptedEosePump,
-    pub(super) relay: Arc<ScriptedPushRelayClient>,
-    pub(super) client: AppClient,
-    pub(super) storage: SqliteAccountStorage,
-    pub(super) group: cgka_traits::GroupId,
+pub(in crate::client) struct Fixture {
+    pub(in crate::client) _dir: tempfile::TempDir,
+    pub(in crate::client) _pump: ScriptedEosePump,
+    pub(in crate::client) relay: Arc<ScriptedPushRelayClient>,
+    pub(in crate::client) client: AppClient,
+    pub(in crate::client) storage: SqliteAccountStorage,
+    pub(in crate::client) group: cgka_traits::GroupId,
 }
 
 /// One account with one group and a checkpointed cursor whose live
 /// subscriptions have reached owner admission: the normal caught-up state.
-pub(super) async fn fixture() -> Fixture {
+pub(in crate::client) async fn fixture() -> Fixture {
     fixture_with_stored(Some(STORED_AT)).await
 }
 
@@ -117,7 +117,7 @@ pub(super) async fn reactivate(fixture: &mut Fixture) {
     .expect("the new generation reaches owner admission");
 }
 
-pub(super) fn routes(client: &AppClient) -> Vec<TransportReconciliationRoute> {
+pub(in crate::client) fn routes(client: &AppClient) -> Vec<TransportReconciliationRoute> {
     client
         .current_coverage_routes()
         .into_iter()

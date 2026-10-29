@@ -744,7 +744,8 @@ discards. The one exception is the reply still in flight when a quantum is cut (
 
 Debt subtracts the healthy live tails. They are a process-local query that every debt turn
 asks again and nothing keeps across an await, since a tail can lapse with no event when its
-relay disconnects. Until the capped live boundary lands, the query owes everything through now.
+relay disconnects. The runner reads them through the live boundary's own query
+(`AppClient::live_tails`).
 Units are served by class: held groups, then open conversation windows and the inbox, then the
 rest, then best-effort relays. Within a class each eligible unit runs once per round, smallest
 route debt first, so a large group is served every round. The runner sleeps until a bump, a

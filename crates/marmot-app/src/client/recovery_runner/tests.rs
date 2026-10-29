@@ -1,6 +1,7 @@
 //! The runner over real account storage, against a model relay and a fake
-//! live-tail source. The host runs worker turns inline and reads the tails
-//! once at the start of each debt turn, as the account worker will.
+//! live-tail source (or, in one test, an account's real live tails). The host
+//! runs worker turns inline and reads the tails once at the start of each debt
+//! turn, as the account worker will.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -30,8 +31,8 @@ use transport_nostr_adapter::sweep::{
 
 use super::policy::{RUNNER_BACKOFF_BASE_SECS, RUNNER_QUANTUM, RUNNER_REQUEST_TIMEOUT};
 use super::quantum::{SinkStop, classify};
-use super::tails::OwedThroughNow;
 use super::*;
+use crate::client::AppClient;
 use crate::runtime::account_worker::recovery_credits::{
     self, RecoveryCreditPool, available_credits, hold_all_credits_for_test,
 };
@@ -624,6 +625,8 @@ struct TestHost {
     clock: Clock,
     routes: Mutex<Vec<RunnerRoute>>,
     tails: TailSource,
+    /// When set, debt turns read this client's real live tails instead.
+    client: Option<Arc<AppClient>>,
     relays: BTreeMap<&'static str, Arc<ModelRelay>>,
     debt_turns: AtomicUsize,
     /// How long a NIP-11 read takes.
@@ -640,11 +643,33 @@ impl TestHost {
         routes: Vec<RunnerRoute>,
         relays: &[&Arc<ModelRelay>],
     ) -> Arc<Self> {
+        Self::reading(account.app.clone(), None, clock, routes, relays)
+    }
+
+    /// A host over `client`'s account whose debt turns read its live tails.
+    fn on_client(
+        app: SqliteAppStorage,
+        client: AppClient,
+        clock: &Clock,
+        routes: Vec<RunnerRoute>,
+        relays: &[&Arc<ModelRelay>],
+    ) -> Arc<Self> {
+        Self::reading(app, Some(Arc::new(client)), clock, routes, relays)
+    }
+
+    fn reading(
+        app: SqliteAppStorage,
+        client: Option<Arc<AppClient>>,
+        clock: &Clock,
+        routes: Vec<RunnerRoute>,
+        relays: &[&Arc<ModelRelay>],
+    ) -> Arc<Self> {
         Arc::new(Self {
-            app: account.app.clone(),
+            app,
             clock: clock.clone(),
             routes: Mutex::new(routes),
             tails: TailSource::default(),
+            client,
             relays: relays
                 .iter()
                 .map(|relay| (relay.url, Arc::clone(relay)))
@@ -701,13 +726,17 @@ impl RunnerHost for TestHost {
         F: FnOnce(&DebtTurn<'_>) -> T + Send + 'static,
         T: Send + 'static,
     {
-        let tails = self.tails.read();
+        let now = self.clock.now();
+        let tails: Box<dyn LiveTailRead> = match &self.client {
+            Some(client) => client.recovery_runner_live_tails(&self.app, now).await,
+            None => Box::new(self.tails.read()),
+        };
         let routes = self.routes.lock().unwrap().clone();
         let answer = turn(&DebtTurn {
             app: &self.app,
             routes: &routes,
-            now: self.clock.now(),
-            tails: &tails,
+            now,
+            tails: &*tails,
         });
         self.debt_turns.fetch_add(1, Ordering::SeqCst);
         Some(answer)
@@ -854,6 +883,60 @@ async fn recovery_runner_never_charges_an_idle_connected_account_for_its_own_tai
             .first()
             .map(|range| range.since_seconds),
         Some(opened)
+    );
+}
+
+/// The test above against the account's real live tails: while its live
+/// REQs stand nothing is owed, and once the relay client reports another
+/// connection the tails lapse and their seconds are owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_never_charges_an_idle_connected_account_for_its_real_tail() {
+    use crate::client::recovery_coverage::scenario_tests::{Fixture, fixture, relay, routes};
+    let before = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let Fixture {
+        _dir,
+        _pump,
+        relay: scripted,
+        client,
+        storage,
+        ..
+    } = fixture().await;
+    let app = storage.app_storage();
+    let url: &'static str = Box::leak(relay().into_boxed_str());
+    let groups = routes(&client)
+        .into_iter()
+        .filter(|route| matches!(route, Route::Group(_)))
+        .collect::<Vec<_>>();
+    assert!(!groups.is_empty());
+    let clock = Clock::new();
+    app.widen_recovery_coverage_goals(&groups, clock.now() - DAY)
+        .unwrap();
+    let model = ModelRelay::new(url, caps(500, true)).build();
+    let host = TestHost::on_client(
+        app.clone(),
+        client,
+        &clock,
+        groups.iter().map(|route| required(route, &[url])).collect(),
+        &[&model],
+    );
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    for _ in 0..2 {
+        assert_eq!(idle(runner.step().await), None);
+        clock.advance(HOUR);
+    }
+    assert!(model.queries().is_empty());
+    assert_eq!(app.recovery_account_usage(clock.now()).unwrap().attempts, 0);
+
+    scripted.connection_attempt.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
+    let first = model.queries()[0];
+    assert!(
+        first.since >= before,
+        "only the tail's seconds are owed; the live boundary proved the rest"
     );
 }
 
@@ -2108,12 +2191,6 @@ fn recovery_runner_classifies_every_sweep_end() {
              stop {stop:?}, owed {still_owed}"
         );
     }
-}
-
-#[test]
-fn recovery_runner_stub_tails_owe_through_now() {
-    let tails = OwedThroughNow;
-    assert_eq!(tails.owed_until(&group(1), RELAY, 1_000), 1_000);
 }
 
 #[test]
