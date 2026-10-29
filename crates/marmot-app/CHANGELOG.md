@@ -64,6 +64,8 @@
   label and two settings, both on by default (`link_device`), or Not now (`decline_device_link`).
   `device_link_snapshot` reads both sides as `DeviceLinkSnapshot`. A first link creates the device group; a later one
   adds the device in one commit, retried while the device group settles until the new device stops waiting. The
+  prompt shows the device linked only once its first change in the device group arrives, which the new device makes
+  as soon as it joins; one that makes none within an hour is removed again, and both sides show `LinkFailed`. The
   prompt says why a client can't be linked, refuses a 21st device, and on other
   devices changes to who added it. `MarmotAppEvent::DeviceLinkChanged` says to re-read linking; it also fires once
   each time the account's worker opens or reconnects, which ends any link in progress. Nothing reaches a release

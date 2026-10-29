@@ -616,8 +616,9 @@ typedef enum MarmotDeviceLinkEndReason {
    */
   MARMOT_DEVICE_LINK_END_REASON_REJECTED,
   /**
-   * Both users confirmed, but adding the device failed, or its Welcome
-   * did not reach the relays before the new device stopped waiting.
+   * Both users confirmed, but adding the device failed, or the new device
+   * made no change in the device group within an hour of being added, so
+   * the device that added it removed it again.
    */
   MARMOT_DEVICE_LINK_END_REASON_LINK_FAILED,
 } MarmotDeviceLinkEndReason;
@@ -2777,7 +2778,9 @@ typedef enum MarmotNewDeviceLinkState_Tag {
    */
   MARMOT_NEW_DEVICE_LINK_STATE_JOINING,
   /**
-   * This device joined the account's device group.
+   * This device joined the account's device group. The device that added
+   * it shows the link made once this device's first change there reaches
+   * it.
    */
   MARMOT_NEW_DEVICE_LINK_STATE_LINKED,
   MARMOT_NEW_DEVICE_LINK_STATE_ENDED,
@@ -2833,13 +2836,13 @@ typedef enum MarmotDeviceLinkPromptState_Tag {
   MARMOT_DEVICE_LINK_PROMPT_STATE_TOO_MANY_DEVICES,
   /**
    * This user chose Link device. Waiting for the new device's
-   * confirmation, then for relays to confirm the change that adds it and
-   * take its Welcome.
+   * confirmation, then, for up to an hour, for it to join and make its
+   * first change in the device group.
    */
   MARMOT_DEVICE_LINK_PROMPT_STATE_LINKING,
   /**
-   * This device added it: relays confirmed the change and took its
-   * Welcome.
+   * This device added it, and the new device's first change in the device
+   * group arrived.
    */
   MARMOT_DEVICE_LINK_PROMPT_STATE_LINKED,
   /**
