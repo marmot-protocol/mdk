@@ -781,7 +781,10 @@ notice, as a sweep's saturated second does. What those parts fetched stays stage
 
 Re-checks look for late input on history already covered or retired. Each group (route,
 relay) on a required relay with NIP-77 has one resumable pass over its covered and retired
-ranges inside the retention window. Best-effort relays get none, and a relay that can only
+ranges inside the route's complete reconciliation inventory: the retention window, raised past
+whatever the inventory compacted beyond its 16,384 ids. That is the window inside which
+automatic late-publication repair is guaranteed; below it the held set is incomplete, so
+nothing is re-checked there, and an epoch gap's bound below it is raised to it. Best-effort relays get none, and a relay that can only
 prove by count is never re-checked. A pass falls due 6 h after the last full pass, and at once
 after an epoch gap (that group, from the gap's bound), explicit repair, or a cooldown of its
 relay longer than an hour. Storage makes them due in the write that ends the cooldown, and each

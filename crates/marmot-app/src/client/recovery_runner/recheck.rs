@@ -1,7 +1,14 @@
 //! Re-check units (decision 5 of mdk#2660's phase 4 plan): one resumable
 //! pass per (group route, required relay) over the unit's covered and retired
-//! ranges inside the retention window, by NIP-77 comparison with what the
-//! account holds there.
+//! ranges inside the route's complete inventory window, by NIP-77 comparison
+//! with what the account holds there.
+//!
+//! - The window is `transport_reconciliation_inventory`'s: the retention
+//!   window, raised past whatever the inventory compacted away. Automatic
+//!   late-publication repair is guaranteed only inside it, as for the
+//!   comparison job. Below its floor the account's held set is incomplete,
+//!   so a comparison would fetch what the account holds; nothing there is
+//!   re-checked, and an epoch gap's bound below it is raised to it.
 //!
 //! - Only a required relay whose recorded caps show NIP-77 is re-checked. A
 //!   cap-only relay's count proofs cannot re-check anything (decision 2), and
