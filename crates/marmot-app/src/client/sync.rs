@@ -1457,16 +1457,28 @@ impl AppClient {
             self.record_recovery_loss_imports(marked.into_iter().collect());
         }
         if overflow.notification_losses > 0 {
-            // The lag's REQ floors bound the loss from below. Each lag mints a
-            // fresh token, so a lower floor always imports as new loss with a
-            // new obligation revision rather than rewriting a frozen goal.
-            app.record_account_recovery_loss_bounded(
+            // The lag's REQ floors bound the loss from below, per route when
+            // every REQ that could have delivered it named its routes. Each
+            // lag mints a fresh token, so a lower floor always imports as new
+            // loss with a new obligation revision rather than rewriting a
+            // frozen goal.
+            let routes = self
+                .adapter
+                .notification_loss_routes(&overflow)
+                .map(|routes| {
+                    routes
+                        .into_iter()
+                        .map(|(route, since)| (crate::reconciliation_route(route), since))
+                        .collect::<Vec<_>>()
+                });
+            app.record_account_recovery_loss_routed(
                 &self.state.label,
                 storage_sqlite::RecoveryLossCause::NotificationConsumer,
                 overflow.notification_token,
                 0,
                 unix_now_seconds(),
                 overflow.notification_floor,
+                routes.as_deref(),
             )?;
             self.synchronize_recovery_loss(&app)?;
             self.adapter.notification_loss_persisted(overflow);

@@ -24,20 +24,23 @@
 //! - The host reads the roster only as [`LinkedDevice`]s, this account's own
 //!   devices, from the device group this device trusts. The group's own events
 //!   never reach the host; `LinkedDevicesChanged` stands in for them.
-//! - The host changes the roster only by renaming a device (3.6, in
-//!   `device_renames.rs`), through the runtime's one roster write path, the one
+//! - The host changes a device entry only by renaming a device (3.6, in
+//!   `device_renames.rs`), through the runtime's roster write path, the one
 //!   slot announcements use. Each announcement also writes this device's
-//!   client and platform from the app's config into its own entry.
+//!   client and platform from the app's config into its own entry. Rejected
+//!   sign-ins (3.2) are written as rejected slots, never device entries, by
+//!   `commit_device_roster_update`.
 //!
 //! A confirmed link comes from device pairing. Until pairing reaches the app,
 //! only the test-policy hook supplies one.
 
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
-    DeviceRosterV1, DeviceSlotId, DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID,
-    decode_device_roster_v1, encode_device_roster_v1, encode_nostr_routing_v1,
+    DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, DeviceStatusV1,
+    NOSTR_ROUTING_COMPONENT_ID, decode_device_roster_v1, encode_device_roster_update_v1,
+    encode_device_roster_v1, encode_nostr_routing_v1,
 };
-use cgka_traits::engine::CreateGroupRequest;
+use cgka_traits::engine::{CreateGroupRequest, SendIntent};
 use cgka_traits::storage::{
     DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage as _, GroupStorage as _,
     MaintenanceStorage as _, StorageError,
@@ -297,6 +300,8 @@ impl AppClient {
                 ..DeviceEntryV1::default()
             },
         );
+        // Rejections this device made before it had a device group (3.2).
+        self.founding_sign_in_rejections(&mut roster)?;
         let roster = encode_device_roster_v1(&roster)
             .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
         let routing = encode_nostr_routing_v1(&self.app.new_nostr_routing(None)?)
@@ -768,6 +773,44 @@ impl AppClient {
             .and_then(|bytes| decode_device_roster_v1(&bytes).ok())
             .ok_or_else(unavailable)?;
         Ok(Some((group_id, roster)))
+    }
+
+    /// One roster commit in the trusted device group `group_id`, carrying
+    /// `operations` as one diff update: the way to write rejected slots.
+    /// Device entries go through the runtime's `edit_device_roster_entry`
+    /// instead, which replaces an entry only while it is the one it read.
+    /// Callers read `group_id` from [`Self::trusted_device_roster`] and check
+    /// the group is quiet first.
+    pub(crate) async fn commit_device_roster_update(
+        &mut self,
+        group_id: GroupId,
+        operations: Vec<DeviceRosterOperationV1>,
+        action: &'static str,
+    ) -> Result<(), AppError> {
+        let update = DeviceRosterUpdateV1::new(operations)
+            .and_then(|update| encode_device_roster_update_v1(&update))
+            .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
+        let audit_context = Self::local_human_action_context(
+            action,
+            vec!["app_component"],
+            vec![DEVICE_ROSTER_COMPONENT_ID],
+            None,
+        );
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::UpdateAppComponents {
+                    group_id,
+                    updates: vec![AppComponentData {
+                        component_id: DEVICE_ROSTER_COMPONENT_ID,
+                        data: update,
+                    }],
+                },
+                audit_context,
+            )
+            .await?;
+        self.observe_drained_session_events(&effects).await?;
+        Ok(())
     }
 
     /// This account's devices from the trusted device group's roster: this

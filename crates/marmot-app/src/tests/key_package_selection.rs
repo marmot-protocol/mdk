@@ -174,6 +174,70 @@ async fn selection_keeps_the_highest_ranked_slots_up_to_the_cap() {
     );
 }
 
+/// A device's read of its own account's slots (new sign-ins, mdk#2628 3.2)
+/// keeps every fresh, valid slot: none past the inviter's cap, none dropped
+/// for sharing a signature key with another slot, and none for a `d` the
+/// device roster could not name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_account_slot_read_keeps_every_valid_slot() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    let mut events = (0..MAX_KEY_PACKAGES_PER_ACCOUNT as u64 + 2)
+        .map(|age| {
+            candidate(
+                account,
+                device_package(&app, account, true),
+                &format!("device-{age}"),
+                None,
+                now - age,
+            )
+        })
+        .collect::<Vec<_>>();
+    let package = device_package(&app, account, true);
+    events.push(candidate(account, package.clone(), "first", None, now));
+    events.push(candidate(account, package, "copy", None, now - 10));
+    let stale = candidate(
+        account,
+        device_package(&app, account, true),
+        "stale",
+        None,
+        now - KEY_PACKAGE_FRESHNESS.as_secs() - 60,
+    );
+    let records = events
+        .iter()
+        .chain([&stale])
+        .map(|event| RelayEventRecord {
+            event: event.clone(),
+            endpoints: vec![],
+        })
+        .collect::<Vec<_>>();
+    let slots = nostr_directory::account_key_package_slots_from_records(
+        &account.account_id_hex,
+        &records,
+        true,
+        app.directory().directory_freshness_for_test(),
+    );
+    assert!(slots.complete && slots.reached);
+    // Every slot the read returned, the stale one included, though only fresh
+    // ones count.
+    assert!(slots.returned_slots.contains("stale"));
+    assert_eq!(slots.returned_slots.len(), events.len() + 1);
+    // Every slot holding a valid publication, fresh or not: the slots still
+    // signed in.
+    assert!(slots.current_slots.contains("stale"));
+    assert_eq!(slots.current_slots.len(), slots.key_packages.len() + 1);
+    let mut read = slots
+        .key_packages
+        .into_iter()
+        .map(|slot| slot.fetched.key_package_event_id)
+        .collect::<Vec<_>>();
+    read.sort();
+    let mut every = ids(&events.iter().collect::<Vec<_>>());
+    every.sort();
+    assert_eq!(read, every);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_slots_are_a_single_fallback_only_when_none_is_fresh() {
     let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;

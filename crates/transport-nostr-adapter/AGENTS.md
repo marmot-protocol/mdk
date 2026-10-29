@@ -166,11 +166,13 @@ for reconnect/backoff and relay status mechanics.
   cursor seal; import its loss before another await, then drop it. Notify only wakes the router; it never
   consumes evidence. `ack_replay_delivery` follows actual pinned queue/spill placement or recorded loss, never
   merely adapter enqueue.
-- Record each REQ's filter `since` in its SDK account context before the REQ goes out, find it by subscription
-  id when the REQ closes, and keep a closed REQ's floor for the rest of the context's life: routing is
-  content-keyed, and a closed REQ's buffered or in-flight notifications have no deadline, so they can still be
-  lost in a lag. Do not add a time-based expiry. Read `notification_loss_floor` at the lag; an unfloored REQ
-  or missing evidence is `Unbounded`, never "no loss".
+- Record each REQ's filter `since` and the routes it selects (`NostrSubscription::delivery_routes`) in its SDK
+  account context before the REQ goes out, find it by subscription id when the REQ closes, and keep a closed
+  REQ's floors for the rest of the context's life: routing is content-keyed, and a closed REQ's buffered or
+  in-flight notifications have no deadline, so they can still be lost in a lag. Do not add a time-based expiry.
+  Read `notification_loss_bounds` at the lag; an unfloored REQ or missing evidence is `Unbounded`, never "no
+  loss". Per-route floors are known only while every REQ the context ever issued had a floor and known routes,
+  within `MAX_DELIVERY_LOSS_ROUTES`; otherwise the lag is loss on every route from the floor.
 - Expose allocation-free guarded source views and a coalescing change watch. Membership, query windows and
   ordered epochs change a process-monotonic generation; paging/ACK progress does not. Generation identity
   must survive activation replacement. Only an account-bound frozen ReplayCapturePlan grants recovery IO;

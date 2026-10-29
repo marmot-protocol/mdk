@@ -4,6 +4,17 @@
 
 ### Breaking changes
 
+- Migration 0131 advances account storage to schema 131 (mdk#2628 item 3.2).
+  It adds `account_sign_ins`, one row per KeyPackage slot of the account that
+  this device found and does not recognize: whether this device's first check
+  returned its slot, its client name, when it appeared and last published, its newest
+  KeyPackage, whether it is still signed in, and this device's answer, with
+  whether the device group's roster records a rejection yet.
+  `account_sign_in_baseline` holds when the first check ran, and
+  `account_sign_in_baseline_slots` every slot its read returned.
+  `SqliteAppStorage` gains `record_sign_in_check`, `sign_ins`, `sign_in`,
+  `answer_sign_in`, `settle_sign_in_rejection`,
+  `rearm_sign_in_rejections` and `sign_in_baseline`.
 - Migration 0130 advances account storage to schema 130 (mdk#2660 phase 4).
   It adds `account_recovery_coverage_remainders`, each route's parked
   remainder, and `settled_below_seconds` to
