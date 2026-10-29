@@ -353,6 +353,47 @@ async fn an_expired_or_withdrawn_link_joins_no_welcome() {
     assert_not_held(&laptop_app, &laptop, &group);
 }
 
+/// A waiting row with no engine expectation behind it, as a crash between
+/// a record's two writes leaves, admits nothing. The next open drops it, so
+/// it never refuses a new link until its wait runs out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_row_left_without_its_expectation_is_dropped() {
+    let Devices {
+        _dirs,
+        relay,
+        laptop_app,
+        mut phone,
+        laptop,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    assert!(
+        laptop_app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .insert_device_group(&storage_sqlite::DeviceGroupRecord {
+                group_id_hex: hex::encode(link.device_group_id.as_slice()),
+                trust: DeviceGroupTrust::AwaitingWelcome,
+                key_package_ref_hex: Some(link.key_package_ref_hex.clone()),
+                recorded_at: crate::unix_now_seconds(),
+            })
+            .unwrap()
+    );
+    drop(laptop);
+    let mut laptop = laptop_app.client("alice").await.unwrap();
+    assert_eq!(trust(&laptop_app, &link.device_group_id), None);
+
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    let mut cursor = 0;
+    deliver_new(&mut laptop, &relay, &mut cursor).await;
+    laptop.sync().await.unwrap();
+    assert_eq!(trust(&laptop_app, &group), Some(DeviceGroupTrust::Linked));
+}
+
 /// The founding Add takes only the KeyPackage the link confirmed, and only
 /// from a device that advertises the roster and has no device group yet. Each
 /// refusal comes before anything is published or recorded.

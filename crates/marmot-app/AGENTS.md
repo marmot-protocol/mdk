@@ -66,7 +66,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   records the engine's `DeviceGroupWelcomeExpectation` (group, the existing device's leaf signature key,
   `WELCOME_WAIT_SECS`), deleting the row if that fails. Withdrawing a link and ending a wait
   (`withdraw_confirmed_device_link`, `end_welcome_waits` on every record and reconcile) delete the expectation before
-  the row, so once either returns no Welcome under the link joins, and a row a failure leaves admits nothing. Decide
+  the row, so once either returns no Welcome under the link joins. A row a crash or failure leaves without its
+  expectation admits nothing, and `end_welcome_waits` drops it at once rather than at the wait's end. Decide
   from the engine's durable group record (`stored_group`), never the live group a deferred open has not hydrated, and
   settle trust in one place (`settle_held_device_group`: the live join and the restart reconcile). A held device group
   with an `awaiting_welcome` row joined in time, whatever the row's age. A held device group with no row stays

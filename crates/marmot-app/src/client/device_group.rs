@@ -32,7 +32,8 @@ use cgka_traits::app_components::{
 };
 use cgka_traits::engine::CreateGroupRequest;
 use cgka_traits::storage::{
-    DeviceGroupWelcomeExpectation, GroupStorage as _, MaintenanceStorage as _, StorageError,
+    DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage as _, GroupStorage as _,
+    MaintenanceStorage as _, StorageError,
 };
 use cgka_traits::{EpochId, Group, GroupId, TransportGroupSubscription};
 use storage_sqlite::{DeviceGroupRecord, DeviceGroupTrust};
@@ -383,8 +384,9 @@ impl AppClient {
     /// never joins and never takes it.
     ///
     /// The group must be new to this device. Its waiting row is written
-    /// first and removed again if the engine cannot record the expectation,
-    /// so a row never waits with no expectation behind it once this fails.
+    /// first and removed again if the engine cannot record the expectation.
+    /// A crash between the two writes leaves a row with no expectation
+    /// behind it, which admits nothing and which the next sweep drops.
     #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
     pub(crate) fn record_confirmed_device_link(
         &mut self,
@@ -447,24 +449,34 @@ impl AppClient {
         Ok(true)
     }
 
-    /// End every wait for a link's Welcome that ran out by `now` with no
-    /// group joined: the engine's expectation, then the waiting row. A group
-    /// the engine holds under a waiting row joined in time, since the engine
-    /// joins none after the wait, and settles as linked instead.
+    /// End every wait for a link's Welcome that can no longer join a group:
+    /// one that ran out by `now`, whose engine expectation goes first, and one
+    /// with no expectation behind it, as a crash inside a record or a
+    /// withdrawal leaves. Neither admits a Welcome, and a row left waiting
+    /// would refuse a new link until the wait ran out. A group the engine
+    /// holds under a waiting row joined in time, since the engine joins none
+    /// after the wait or without the expectation, and settles as linked
+    /// instead.
     pub(crate) fn end_welcome_waits(&mut self, now: u64) -> Result<(), AppError> {
-        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let account_storage = self.app.account_storage(&self.state.label)?;
+        let storage = account_storage.app_storage();
         for record in storage.device_groups()? {
-            if record.trust != DeviceGroupTrust::AwaitingWelcome
-                || now < record.recorded_at.saturating_add(WELCOME_WAIT_SECS)
-            {
+            if record.trust != DeviceGroupTrust::AwaitingWelcome {
                 continue;
             }
             let group_id = GroupId::new(hex::decode(&record.group_id_hex)?);
-            if self.stored_group(&group_id)?.is_none() {
-                self.runtime.withdraw_device_group_welcome(&group_id)?;
-                storage
-                    .delete_device_group(&record.group_id_hex, DeviceGroupTrust::AwaitingWelcome)?;
+            if self.stored_group(&group_id)?.is_some() {
+                continue;
             }
+            if now >= record.recorded_at.saturating_add(WELCOME_WAIT_SECS) {
+                self.runtime.withdraw_device_group_welcome(&group_id)?;
+            } else if account_storage
+                .device_group_welcome_expectation(&group_id)?
+                .is_some()
+            {
+                continue;
+            }
+            storage.delete_device_group(&record.group_id_hex, DeviceGroupTrust::AwaitingWelcome)?;
         }
         Ok(())
     }

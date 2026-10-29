@@ -85,7 +85,7 @@ only telemetry, a closed operation and timing metadata, never a client or storag
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
-| `cgka_device_group_welcome_expectations` | One row per device group a confirmed link waits to join: a group id, the expected sender's signature key and a deadline. The app records one only alongside its `awaiting_welcome` row, and an account holds at most one such row, so at most one in practice. | The join it admits deletes it in the same transaction. The app deletes it before the row when the link is withdrawn or its 10-minute wait ends (`end_welcome_waits`, on every new link and every reconcile). |
+| `cgka_device_group_welcome_expectations` | One row per device group a confirmed link waits to join: a group id, the expected sender's signature key and a deadline. The app records one only alongside its `awaiting_welcome` row, and an account holds at most one such row, so at most one in practice. | The join it admits deletes it in the same transaction. The app deletes it before the row when the link is withdrawn or its 10-minute wait ends (`end_welcome_waits`, on every new link and every reconcile), which also drops a waiting row left without its expectation. |
 
 ### `storage-sqlite` durable moderation (`src/timeline/reports.rs`, `src/timeline.rs`)
 
