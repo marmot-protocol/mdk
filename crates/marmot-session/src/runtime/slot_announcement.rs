@@ -11,12 +11,8 @@
 //! an announcement that convergence dropped holds publication back until it
 //! is made again. With no device group, publication runs as before.
 
-use cgka_traits::app_components::{
-    AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
-    DeviceRosterUpdateV1, DeviceSlotId, decode_device_roster_v1, encode_device_roster_update_v1,
-};
-use cgka_traits::engine::SendIntent;
-use cgka_traits::{FanoutMlsState, GroupId, TransportAdapter};
+use cgka_traits::app_components::{DeviceEntryV1, DeviceRosterOperationV1, DeviceSlotId};
+use cgka_traits::{GroupId, TransportAdapter};
 
 use super::{AccountDeviceEffects, AccountDeviceRuntime, TRACE_TARGET};
 use crate::error::{AccountError, AccountResult};
@@ -161,43 +157,21 @@ where
                 return Ok(AccountDeviceEffects::default());
             }
         };
-        if held.contains(&group_id)
-            || self
-                .session
-                .quarantined_groups()
-                .iter()
-                .any(|(quarantined, _)| quarantined == &group_id)
-            || self.session.has_pending_convergence_inputs(&group_id)?
-            || self.session.has_queued_outbound_intents(&group_id)?
-            || self
-                .session
-                .outbound_fanouts_for_group(&group_id)?
-                .iter()
-                .any(|fanout| matches!(fanout.mls_state(), FanoutMlsState::Pending(_)))
-        {
+        if !self.device_group_takes_commit(&group_id, held)? {
             return Ok(AccountDeviceEffects::default());
         }
         // The commit replaces the entry whole: every other field stays as
         // the roster holds it.
         entry.announced_key_package = Some(key_package_ref);
-        let update =
-            DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(slot, entry)])
-                .and_then(|update| encode_device_roster_update_v1(&update))
-                .map_err(|error| {
-                    AccountError::Engine(cgka_traits::EngineError::Serialize(error))
-                })?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "announce_key_package",
             "announcing this device's key package in its device group"
         );
-        self.send(SendIntent::UpdateAppComponents {
+        self.send_device_roster_update(
             group_id,
-            updates: vec![AppComponentData {
-                component_id: DEVICE_ROSTER_COMPONENT_ID,
-                data: update,
-            }],
-        })
+            vec![DeviceRosterOperationV1::SetDevice(slot, entry)],
+        )
         .await
     }
 
@@ -276,26 +250,11 @@ where
         let Some(group_id) = self.key_package_announcement_group.clone() else {
             return Ok(Announcement::Announced);
         };
-        let Some(slot) = self
-            .session
-            .key_package_lifecycle()?
-            .and_then(|lifecycle| hex::decode(lifecycle.stable_slot_id).ok())
-            .and_then(|bytes| DeviceSlotId::try_from(bytes).ok())
-        else {
+        let Some(slot) = self.own_device_slot()? else {
             return Ok(Announcement::Blocked("slot_unavailable"));
         };
         // Every failure to read the roster holds publication back.
-        let roster = self
-            .session
-            .ensure_group_hydrated(&group_id)
-            .ok()
-            .and_then(|_| {
-                self.session
-                    .app_component(&group_id, DEVICE_ROSTER_COMPONENT_ID)
-                    .ok()
-            })
-            .flatten()
-            .and_then(|bytes| decode_device_roster_v1(&bytes).ok());
+        let roster = self.merged_device_roster(&group_id);
         let Some(mut roster) = roster else {
             return Ok(Announcement::Blocked("device_group_unreadable"));
         };
