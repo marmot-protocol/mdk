@@ -88,7 +88,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Hosts can link a new device of the account through pairing (mdk#2628 item 3.3b): `start_device_link`,
   `confirm_device_link_match` and `cancel_device_link` on the new device, `link_device` and `decline_device_link` on a
   device already signed in, and `device_link_snapshot`, in `marmot-app`, UniFFI and C, with a `DeviceLinkChanged`
-  event to re-read it. Every call is refused in release builds until the pairing and device-group specs land.
+  event to re-read it. A link shows as made only once the new device's first change in the device group arrives; one
+  with none within an hour is removed again. Every call is refused in release builds until the pairing and
+  device-group specs land.
 - `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
   one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
   pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster
@@ -105,6 +107,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   retired with `QueuedIntentRefused`. A lost edit is re-issued when the winner left that entry alone, even if it
   changed others. The device roster's write path uses it, so an entry read before a sibling's change never
   overwrites it.
+- `SendIntent::UnlinkDevice` removes a device whose link failed, with its roster entry, in one admin Commit
+  (mdk#2628 item 3.3b): the new device made no commit in the device group by the link's deadline. It takes the
+  device's leaf signature key and a roster update that removes exactly one listed slot, adds no member and makes no
+  Welcome. Like a link, it is never queued: while the device group is settling it is refused with
+  `EngineError::LinkDeviceUnsettled`, and the caller retries. It is reachable only in test-policy builds.
 - The engine can create a group under a group id the host chose before the group exists
   (`create_group_with_chosen_id_and_audit_context`), as a device link needs (mdk#2628). The id has 1 to 255 bytes.
   An id that names any group this device holds, a removed or forgotten copy included, is refused before anything is

@@ -1032,8 +1032,9 @@ land:
   and `Linked`, or `Ended` with a reason.
 - A device already signed in shows each entry in `prompts`. `Comparing` shows the code; offer a label field, "Add to
   all my chats" and "Bring chat history" (both on by default), Link device (`link_device`) and Not now
-  (`decline_device_link`). Other states say why Link isn't offered, or `AddedElsewhere`: "<device_label> was added
-  by <added_by_label>".
+  (`decline_device_link`). After Link device it shows `Linking` until the new device's first change in the device group
+  arrives, then `Linked`; with none within an hour, the device is removed again and both sides show `LinkFailed`.
+  Other states say why Link isn't offered, or `AddedElsewhere`: "<device_label> was added by <added_by_label>".
 - Each emoji carries an English `description` for screen readers. Users compare the pictures, not the descriptions.
 - `device_link_snapshot(account_ref)` reads linking without changing it. Re-read on `MarmotEventFfi::DeviceLinkChanged`,
   which carries no device, session or group identities. It also fires once each time the account's worker opens or

@@ -51,7 +51,9 @@ pub enum NewDeviceLinkState {
     WaitingForOtherDevice,
     /// Both users confirmed. Waiting for the other device to add this one.
     Joining,
-    /// This device joined the account's device group.
+    /// This device joined the account's device group. The device that added
+    /// it shows the link made once this device's first change there reaches
+    /// it.
     Linked,
     Ended {
         reason: DeviceLinkEndReason,
@@ -77,8 +79,9 @@ pub enum DeviceLinkEndReason {
     CannotLink,
     /// The sign-in was rejected on one of this account's devices.
     Rejected,
-    /// Both users confirmed, but adding the device failed, or its Welcome
-    /// did not reach the relays before the new device stopped waiting.
+    /// Both users confirmed, but adding the device failed, or the new device
+    /// made no change in the device group within an hour of being added, so
+    /// the device that added it removed it again.
     LinkFailed,
 }
 
@@ -121,11 +124,11 @@ pub enum DeviceLinkPromptState {
     /// The account has 20 linked devices. Remove one first.
     TooManyDevices,
     /// This user chose Link device. Waiting for the new device's
-    /// confirmation, then for relays to confirm the change that adds it and
-    /// take its Welcome.
+    /// confirmation, then, for up to an hour, for it to join and make its
+    /// first change in the device group.
     Linking,
-    /// This device added it: relays confirmed the change and took its
-    /// Welcome.
+    /// This device added it, and the new device's first change in the device
+    /// group arrived.
     Linked,
     /// Another device added it: "<device_label> was added by
     /// <added_by_label>". A label the roster lacks is empty.
@@ -217,8 +220,9 @@ impl AppClient {
     }
 
     /// Move linking on: read the pairing messages the Welcome peeler split
-    /// off, send what is owed, run the timers, retry KeyPackage checks, and
-    /// record links that settled. The worker calls it after each delivery and
+    /// off, send what is owed, run the timers, retry KeyPackage checks,
+    /// decide the links this device made, and nudge this device's first
+    /// commit in a device group it joined. The worker calls it after each delivery and
     /// on its maintenance tick.
     pub(crate) async fn drive_device_pairing(&mut self) {
         #[cfg(feature = "unreleased-device-pairing")]

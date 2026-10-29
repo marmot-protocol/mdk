@@ -16,12 +16,15 @@
   time), makes every re-check on the relay due in the same transaction.
 - Migration 0133 advances account storage to schema 133 (mdk#2628 item 3.3b).
   It adds `device_links`, one row per device this device approved adding to
-  the account's device group, written before the approving commit, with
-  whether that commit has settled:
-  `pending`, `settled` or `reversed`. `SqliteAppStorage` gains
-  `record_device_link`, `device_link`, `device_links` and
-  `settle_device_link`. A local forget removes the group's rows. No rows are
-  seeded.
+  the account's device group, written before the approving commit, with the
+  added leaf's signature key, the link's Welcome once the commit made it, and
+  its outcome: `pending`, `linked` or `failed`. It also adds
+  `device_group_joins`, the device groups this device joined through a link
+  whose first commit there has not landed yet. `SqliteAppStorage` gains
+  `record_device_link`, `record_device_link_welcome`, `device_link`,
+  `device_links`, `decide_device_link`, `record_device_group_join`,
+  `device_group_joins` and `delete_device_group_join`. A local forget removes
+  the group's rows. No rows are seeded.
 - Migration 0132 advances account storage to schema 132 (mdk#2660 phase 4).
   It adds `import_revision` to `account_delivery_loss_evidence`: the loss
   revision the import that last charged a generation left. Existing imported

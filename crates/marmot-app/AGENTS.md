@@ -128,26 +128,32 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   A device adds a sibling only after both users confirmed the code and the new device's confirmation verified, through
   exactly the confirmed `KeyPackageRef`: a first link creates the device group, a later one sends one
   `SendIntent::LinkDevice` commit, sent through `runtime.send_with_audit_context` so the runtime releases its Welcome
-  only once the commit is confirmed (never split the Welcome off for app delivery). On both paths a prompt becomes
-  `Linked` only through `link_publication_state`: the device group is stable with the link in its roster, and the relays
-  took every Welcome the link sent (the engine's tracked Welcome ids after the link and not before). A commit the
-  runtime kept to retry keeps it `Linking`. Publish an undelivered Welcome again every few seconds until the new
-  device's Welcome wait ends; a link not confirmed by then, or whose commit rolled back, ends as `LinkFailed`, cancels
-  with `CannotLink` and settles its record as reversed. Settling a link whose prompt is gone (a restart) holds the same
-  rule: a roster entry settles only once the device group owes no Welcome, and is reversed once the new device's wait
-  has passed. `drive_unpublished_welcome_delivery` returns a `#[must_use]` `WelcomeDelivery`; chat creation goes on
-  either way, as the Welcome stays owed. Prompt ids are random, so an id a host kept from before a reopen names no
-  prompt. The engine refuses a link with `LinkDeviceUnsettled` rather than queue it; retry it on each drive until a
+  only once the commit is confirmed (never split the Welcome off for app delivery). On both paths the prompt stays
+  `Linking` after the commit: `decide_device_links` is the one gate for every link in `device_links`, prompt or not
+  (D40). A link is `Linked` once the new device's first commit, which sets its roster entry's `tag_signature_key` to
+  the leaf key the link added (`leaf_signature_key_hex`), is on the selected branch: the device group is `Stable` with
+  no pending convergence input. It fails when its group was never made, when the quiet roster has not listed it as
+  this device's link for a whole settlement window (`MarmotApp::settlement_quiescence_ms`, in milliseconds, whose
+  override only test-policy builds read), or when that commit is still absent `LINK_DEADLINE_SECS` after the entry's
+  `linked_at`. A decided link never changes. A failed link ends its prompt as `LinkFailed` with a `CannotLink` cancel,
+  withdraws its Welcome (`withdraw_welcome`, by the id stored after the commit), and, while the roster lists the
+  device as this device's link, removes its leaf and entry in one `SendIntent::UnlinkDevice` commit (a roster-only
+  update when no leaf is left), retried on each drive. Publish an undelivered Welcome again every few seconds until
+  the new device's Welcome wait ends; neither its publication nor its delivery decides a link.
+  `drive_unpublished_welcome_delivery` returns a `#[must_use]` `WelcomeDelivery`; chat creation goes on either way, as
+  the Welcome stays owed. Prompt ids are random, so an id a host kept from before a reopen names no prompt. The engine
+  refuses a link or an unlink with `LinkDeviceUnsettled` rather than queue it; retry a link on each drive until a
   minute before the new device's Welcome wait ends, counted from when the new device sent its confirmation, never
   attempt it after that, and cancel it as `LinkFailed`. The existing device's confirmation names `own_signature_key`,
-  its leaf key in the device group, and the new device records it with the link (`record_confirmed_device_link`). Ending
-  the new device's wait (cancel, a withdrawn link, timeout) withdraws the engine's expectation first and keeps the wait
-  until that succeeds, retrying on each drive. Record each link in `device_links` before its commit, so a crash cannot
-  lose it; one whose commit never lands settles as reversed. Decide a settlement only once the device group has been
-  quiet for the engine's settlement window, in milliseconds (`MarmotApp::settlement_quiescence_ms`, whose override only
-  test-policy builds read). Each drive ends by comparing linking as hosts read it with `DevicePairing::last_view` and
-  sets `device_link_changed` when it differs; the client opens with that flag set, and the same two seams as
-  `linked_devices_changed` drain it into `DeviceLinkChanged`.
+  its leaf key in the device group, and the new device records it with the link (`record_confirmed_device_link`).
+  Ending the new device's wait (cancel, a withdrawn link, timeout) withdraws the engine's expectation first and keeps
+  the wait until that succeeds, retrying on each drive. Record each link in `device_links` before its commit, so a
+  crash cannot lose it. The new device records a `device_group_joins` row before it trusts the group it joined, nudges
+  its first commit there (`set_device_tag_key`) on each drive rather than waiting for maintenance, and drops the row
+  once that commit landed. Removed from the device group, it forgets its copy (`forget_group_local`); removed before
+  its first commit landed, it shows `Ended { LinkFailed }`. Each drive ends by comparing linking as hosts read it with
+  `DevicePairing::last_view` and sets `device_link_changed` when it differs; the client opens with that flag set, and
+  the same two seams as `linked_devices_changed` drain it into `DeviceLinkChanged`.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.
