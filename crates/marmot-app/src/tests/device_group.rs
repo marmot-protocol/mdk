@@ -7,6 +7,7 @@
 use super::canonical_membership::{deliver_new, published_key_package};
 use super::*;
 use crate::{ConfirmedDeviceLink, LinkedDevice, LinkedDeviceStatus};
+use cgka_traits::TransportFanoutAttemptState;
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
     DeviceSettingsV1, DeviceStatusV1, decode_device_roster_v1, encode_device_roster_update_v1,
@@ -1587,6 +1588,26 @@ async fn a_refresh_held_back_a_week_is_overdue_until_it_publishes() {
     assert!(published_kinds(&relay, before).is_empty());
     assert!(laptop.key_package_refresh_overdue().unwrap());
     assert!(laptop.take_key_package_refresh_overdue_changed());
+
+    // Retry backoff at the relays doesn't hide it: here every target was
+    // just tried, so maintenance owes nothing until the backoff ends.
+    let storage = laptop_app.account_storage("alice").unwrap();
+    let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
+    let pending = lifecycle.pending_replacement.as_mut().unwrap();
+    assert!(pending.signed_event.is_some());
+    for target in &mut pending.targets {
+        target.state = TransportFanoutAttemptState::AttemptedFailed;
+        target.attempt_count = 1;
+        target.last_attempt_at = Some(Timestamp(unix_now_seconds()));
+    }
+    storage.put_key_package_lifecycle(&lifecycle).unwrap();
+    assert!(
+        !laptop
+            .runtime
+            .key_package_network_maintenance_due()
+            .unwrap()
+    );
+    assert!(laptop.key_package_refresh_overdue().unwrap());
 
     laptop.run_due_maintenance().await.unwrap();
     assert!(!laptop.key_package_refresh_overdue().unwrap());

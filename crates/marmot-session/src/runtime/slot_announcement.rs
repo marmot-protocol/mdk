@@ -235,17 +235,16 @@ where
 
     /// Whether this device's KeyPackage refresh is overdue because its
     /// announcement is held back, so the host can warn the user (D31 choice
-    /// 6). That is: a device group is set, a publication to the slot is owed,
-    /// the KeyPackage it would publish (the pending replacement, else the
+    /// 6). That is: a device group is set and the slot isn't withdrawn, the
+    /// KeyPackage this device would publish (the pending replacement, else the
     /// current one) is not announced, and this device's newest publication in
     /// the slot is older than the weekly refresh bound, or there is none. A
-    /// routine refresh announces and publishes in one maintenance pass, so it
-    /// never shows. One that is announced but failing at the relays is not
-    /// held back by the announcement, so it does not count.
+    /// publication is then always owed, so retry backoff at the relays never
+    /// hides it. A routine refresh announces and publishes in one maintenance
+    /// pass, so it never shows. One that is announced but failing at the
+    /// relays is not held back by the announcement, so it does not count.
     pub fn key_package_refresh_overdue(&mut self) -> AccountResult<bool> {
-        if self.key_package_announcement_group.is_none()
-            || !self.key_package_network_maintenance_due()?
-        {
+        if self.key_package_announcement_group.is_none() || self.key_package_slot_withdrawn {
             return Ok(false);
         }
         let Some(lifecycle) = self.session.key_package_lifecycle()? else {
