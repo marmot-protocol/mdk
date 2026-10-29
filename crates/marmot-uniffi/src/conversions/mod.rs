@@ -399,6 +399,7 @@ mod tests {
                 sender: "bb".repeat(32),
                 plaintext: "parent text".to_owned(),
                 kind: 9,
+                tags: Vec::new(),
                 source_epoch: None,
                 media: None,
                 agent_text_stream: None,

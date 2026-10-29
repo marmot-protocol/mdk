@@ -64,6 +64,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 media-store.workspace = true
+sonar-stickers.workspace = true
+nostr044 = { package = "nostr", version = "0.44", default-features = false, features = ["std"] }
 storage-sqlite.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true

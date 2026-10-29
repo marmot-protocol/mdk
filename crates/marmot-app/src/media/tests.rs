@@ -3399,3 +3399,86 @@ async fn file_upload_idle_watchdog_allows_setup_then_rejects_a_stalled_body() {
         AppError::MediaUploadTimedOut
     ));
 }
+
+/// Sticker-sized fetches share the media transfer bound: a body that keeps
+/// progressing after candidate startup must not be cut off by that shorter
+/// startup bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limited_fetch_survives_a_body_that_outlasts_candidate_startup() {
+    let body = Arc::new(vec![7_u8; 64 * 1024]);
+    let (url, _requests, server) =
+        spawn_progressing_http_server(body.clone(), Duration::from_millis(900)).await;
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(200),
+        Duration::from_secs(5),
+    )
+    .with_download_limit(1024 * 1024);
+
+    let fetched = super::blossom::fetch_blossom_blob_limited_with_transport(
+        &format!("{url}/blob"),
+        &transport,
+    )
+    .await
+    .expect("a progressing body inside the transfer bound completes");
+    server.abort();
+    assert_eq!(fetched, *body);
+}
+
+/// The overall deadline is the transfer bound, not a fixed startup interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limited_fetch_is_bounded_by_the_transport_transfer_deadline() {
+    let body = Arc::new(vec![7_u8; 64 * 1024]);
+    let (url, _requests, server) =
+        spawn_progressing_http_server(body, Duration::from_secs(3)).await;
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(200),
+        Duration::from_millis(500),
+    )
+    .with_download_limit(1024 * 1024);
+
+    let started = Instant::now();
+    let result = super::blossom::fetch_blossom_blob_limited_with_transport(
+        &format!("{url}/blob"),
+        &transport,
+    )
+    .await;
+    server.abort();
+    assert!(
+        result.is_err(),
+        "a body longer than the transfer bound must fail"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the transfer bound, not a longer fixed deadline, ends the fetch"
+    );
+}
+
+/// The byte ceiling the transport carries is the one enforced on the body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limited_fetch_enforces_the_transport_download_limit() {
+    let body = Arc::new(vec![7_u8; 4 * 1024]);
+    let (url, _requests, server) =
+        spawn_progressing_http_server(body, Duration::from_millis(50)).await;
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+    )
+    .with_download_limit(1024);
+
+    let result = super::blossom::fetch_blossom_blob_limited_with_transport(
+        &format!("{url}/blob"),
+        &transport,
+    )
+    .await;
+    server.abort();
+    assert!(
+        result.is_err(),
+        "a body above the transport limit must be refused"
+    );
+}

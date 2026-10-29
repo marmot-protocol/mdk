@@ -4600,9 +4600,9 @@ impl AppClient {
             AppMessageIntent::Report { .. } | AppMessageIntent::DismissReports { .. } => {
                 (Family::MessageAction, "custom")
             }
-            AppMessageIntent::Chat { .. } | AppMessageIntent::TaggedChat { .. } => {
-                (Family::MessageAction, "text")
-            }
+            AppMessageIntent::Chat { .. }
+            | AppMessageIntent::TaggedChat { .. }
+            | AppMessageIntent::Sticker { .. } => (Family::MessageAction, "text"),
             AppMessageIntent::Reply { .. } => (Family::MessageAction, "reply"),
             AppMessageIntent::Reaction { .. } => (Family::MessageAction, "reaction"),
             AppMessageIntent::Unreact { .. } | AppMessageIntent::DeleteReactions { .. } => {
@@ -4750,6 +4750,10 @@ impl AppClient {
         F: FnMut(crate::AppProjectionUpdate),
     {
         self.ensure_group_application_messages_allowed(group_id)?;
+        if let AppMessageIntent::Sticker { sticker_ref } = &intent {
+            self.app
+                .authorize_sticker_ref(&self.state.label, sticker_ref)?;
+        }
         // Capture the human-action descriptor before `Unreact` is rewritten to
         // `DeleteReactions` below, so the audit log records the user's actual
         // intent.

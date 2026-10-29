@@ -2727,6 +2727,13 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::MissingKeyPackage { .. } => "missing_key_package",
         AppError::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
         AppError::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
+        AppError::InvalidSticker(_) => "invalid_sticker",
+        AppError::StickerNotFound => "sticker_not_found",
+        AppError::StickerRelay(_) => "sticker_relay",
+        AppError::StickerImport(_) => "sticker_import",
+        AppError::StickerExternalSignerImportUnsupported => {
+            "sticker_external_signer_import_unsupported"
+        }
         _ => "app_runtime_operation",
     }
 }
@@ -2805,6 +2812,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::MediaDownloadFailed(_)
         | AppError::AuditLogUpload(_)
         | AppError::ExternalSignerUnavailable(_)
+        | AppError::StickerRelay(_)
         | AppError::BlockingTask(_) => SubjectFailureCategory::Resource,
         AppError::ProductAnalytics(_)
         | AppError::Json(_)
@@ -2831,6 +2839,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::MediaUnfetchable(_)
         | AppError::UnsafeMediaFetch(_)
         | AppError::InvalidAppMessagePayload(_)
+        | AppError::InvalidSticker(_)
         | AppError::InvalidPushToken(_)
         | AppError::InvalidPushServer(_)
         | AppError::InvalidPushGossip(_)
@@ -2867,6 +2876,9 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::AccountSetupResetNotApplicable
         | AppError::AccountSetupKeyPackageRecoveryAvailable
         | AppError::ReactionNotFound
+        | AppError::StickerNotFound
+        | AppError::StickerImport(_)
+        | AppError::StickerExternalSignerImportUnsupported
         | AppError::InvalidReportedPublicKey
         | AppError::CannotReportSelf
         | AppError::ModerationReportRateLimited
@@ -3182,6 +3194,43 @@ mod tests {
             assert_ne!(resource.code, denied.code);
         }
         assert_ne!(environment.code, denied.code);
+
+        // Sticker failures keep stable labels and never serialize their details.
+        for (failure, kind, category) in [
+            (
+                AppError::InvalidSticker(marker.into()),
+                "invalid_sticker",
+                SubjectFailureCategory::Protocol,
+            ),
+            (
+                AppError::StickerNotFound,
+                "sticker_not_found",
+                SubjectFailureCategory::ExpectedRefusal,
+            ),
+            (
+                AppError::StickerRelay(marker.into()),
+                "sticker_relay",
+                SubjectFailureCategory::Resource,
+            ),
+            (
+                AppError::StickerImport(marker.into()),
+                "sticker_import",
+                SubjectFailureCategory::ExpectedRefusal,
+            ),
+            (
+                AppError::StickerExternalSignerImportUnsupported,
+                "sticker_external_signer_import_unsupported",
+                SubjectFailureCategory::ExpectedRefusal,
+            ),
+        ] {
+            assert_eq!(app_error_kind(&failure), kind);
+            let classified = app_error(failure);
+            assert_eq!(classified.category, category, "{kind}");
+            assert!(
+                !classified.message.contains(marker),
+                "{kind} leaked its details"
+            );
+        }
 
         assert_eq!(app_error_kind(&AppError::UserBlocked), "user_blocked");
         let blocked = app_error(AppError::UserBlocked);

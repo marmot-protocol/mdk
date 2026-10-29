@@ -998,6 +998,7 @@ mod tests {
             sender: "bob".to_owned(),
             plaintext: "original".to_owned(),
             kind: 9,
+            tags: Vec::new(),
             // The previewed (target) message lives in its own epoch, distinct
             // from the replying message's epoch.
             source_epoch: Some(3),
