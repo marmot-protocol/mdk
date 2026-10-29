@@ -75,10 +75,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   would add: each slot's newest publication, not deleted, valid and fresh, with no cap on how many. A slot that is
   neither this device's nor in its device group's roster is an unrecognized sign-in. Slots this device's first check found are devices that were
   there before it; later ones are new sign-ins, whatever their publication times say. Malformed input and client
-  tags never raise one. Rejecting a sign-in records its slot and KeyPackage as rejected in the device group's roster
-  in one commit, or keeps it on the device until it has a device group; a device that later creates one founds the
-  roster with it. A rejection whose commit convergence drops is committed again. Rejecting a copy of a device's own
-  KeyPackage rejects only the slot the copy appeared in. A sign-in another device answered keeps its prompt, saying so, until dismissed, and one whose slot
+  tags never raise one. Rejecting a sign-in records its slot as rejected in the device group's roster in one commit,
+  or keeps it on the device until it has a device group; a device that later creates one founds the roster with it.
+  A rejection whose commit convergence drops is committed again. A rejection names the slot alone, never its
+  KeyPackage, which may be a copy of a real device's, and a rejected KeyPackage never makes another slot rejected. A
+  sign-in another device answered keeps its prompt, saying so, until dismissed, and one whose slot
   empties stays listed as no longer signed in. Hosts can't reach it yet, and only test-policy builds run it.
 - `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
   one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device

@@ -96,8 +96,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the roster with them or it trusts a group it joined. A slot the roster holds as a device is never rejected here.
   A rejection stays pending until the roster shows it, and a superseded roster update re-arms every rejection
   (`note_superseded_intent_reports`). A slot is its `d` as published, compared as bytes; one the roster cannot name is
-  rejected on this device only. A KeyPackage this device made or the roster announces is never rejected
-  (`protected_key_package`): the account key can copy it into any slot.
+  rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a rejected KeyPackage never
+  makes another slot rejected: the account key can copy any KeyPackage, a real device's included, into a slot the
+  user rejects. Rejected KeyPackages are Scene 8's (3.7).
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

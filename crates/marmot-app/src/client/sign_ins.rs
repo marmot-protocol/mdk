@@ -14,17 +14,19 @@
 //!   still have it?"). Every slot first found later is a new sign-in ("Was this
 //!   you?"). Publication times never decide which, since the key holder
 //!   chooses them.
-//! - **Answers.** Not now keeps it listed. Reject records the slot and the
-//!   KeyPackage it had as rejected (`not_me`) in the trusted device group's
-//!   roster, in one commit made once that group is quiet. A device with no
-//!   device group keeps the rejection here; it goes into the founding roster
-//!   when this device creates one, and is committed once this device trusts
-//!   one it joined. A slot the roster cannot name (a `d` that is not 32
-//!   bytes of lowercase hex) is rejected here only, and a KeyPackage this
-//!   device made or the roster announces for a device is never rejected.
-//!   Linking is device pairing's (3.3b).
+//! - **Answers.** Not now keeps it listed. Reject records the slot as
+//!   rejected (`not_me`) in the trusted device group's roster, in one commit
+//!   made once that group is quiet. A device with no device group keeps the
+//!   rejection here; it goes into the founding roster when this device
+//!   creates one, and is committed once this device trusts one it joined. A
+//!   slot the roster cannot name (a `d` that is not 32 bytes of lowercase
+//!   hex) is rejected here only. Linking is device pairing's (3.3b).
 //! - **Slots.** A slot is its `d` exactly as published, compared as bytes the
-//!   way relays compare it.
+//!   way relays compare it. A rejection names the slot alone, never its
+//!   KeyPackage, and a rejected KeyPackage never makes another slot rejected:
+//!   whoever holds the account key can copy any KeyPackage, a real device's
+//!   included, into a slot the user rejects. Rejected KeyPackages are Scene
+//!   8's (3.7).
 //! - **Any one device's answer.** A prompt for a slot another device linked or
 //!   rejected stays up, saying so, until dismissed.
 //! - **Gone.** A sign-in whose slot a complete read finds empty stays listed,
@@ -36,8 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use cgka_traits::app_components::{
-    DeviceRosterOperationV1, DeviceRosterV1, DeviceSlotId, RejectedKeyPackageV1,
-    RejectedSlotReasonV1, RejectedSlotV1,
+    DeviceRosterOperationV1, DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1,
 };
 use cgka_traits::storage::MaintenanceStorage as _;
 use cgka_traits::{EpochState, FanoutMlsState, GroupId};
@@ -101,7 +102,7 @@ pub enum UnrecognizedSignInState {
 pub enum SignInResponse {
     /// Keep it listed, with no prompt.
     NotNow,
-    /// It was not the user: record its slot and KeyPackage as rejected.
+    /// It was not the user: record its slot as rejected.
     Reject,
     /// End a prompt another device already answered.
     Dismiss,
@@ -124,7 +125,8 @@ pub(crate) enum SlotOutcome {
     KnownDevice {
         announced: Announcement,
     },
-    /// A slot or KeyPackage the roster or this device rejected.
+    /// A slot the roster or this device rejected, or a rejected KeyPackage
+    /// in a roster device's slot.
     Rejected,
     Unrecognized,
 }
@@ -245,7 +247,7 @@ impl AppClient {
         let own = self.own_key_packages()?;
         let roster = self.trusted_device_roster()?.map(|(_, roster)| roster);
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        let rejected_here = rejected_here(&storage.sign_ins()?);
+        let rejected_here = rejected_slots_here(&storage.sign_ins()?);
 
         let mut report = SignInCheckReport {
             slots: BTreeMap::new(),
@@ -381,9 +383,9 @@ impl AppClient {
     /// here.
     pub(crate) async fn commit_sign_in_rejections(&mut self) -> Result<(), AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        let pending: Vec<_> = storage
-            .sign_ins()?
-            .into_iter()
+        let records = storage.sign_ins()?;
+        let pending: Vec<_> = records
+            .iter()
             .filter(|record| record.roster_pending)
             .collect();
         if pending.is_empty() {
@@ -392,13 +394,15 @@ impl AppClient {
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Ok(());
         };
-        let own = self.own_key_packages()?;
         let mut operations = Vec::new();
-        for record in &pending {
-            let operations_before = operations.len();
-            rejection_operations(record, &roster, &own.refs, &mut operations)?;
-            if operations.len() == operations_before {
-                storage.settle_sign_in_rejection(&record.slot_id_hex)?;
+        for record in pending {
+            match rejected_slot(record, &roster)? {
+                Some((slot, rejected)) => {
+                    operations.push(DeviceRosterOperationV1::SetRejectedSlot(slot, rejected));
+                }
+                None => {
+                    storage.settle_sign_in_rejection(&record.slot_id_hex)?;
+                }
             }
         }
         if operations.is_empty() || !self.device_group_quiet(&group_id)? {
@@ -437,26 +441,13 @@ impl AppClient {
         if !self.app.device_groups_enabled() {
             return Ok(());
         }
-        let own = self.own_key_packages()?;
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         for record in storage.sign_ins()? {
             if !record.roster_pending {
                 continue;
             }
-            let mut operations = Vec::new();
-            rejection_operations(&record, roster, &own.refs, &mut operations)?;
-            for operation in operations {
-                match operation {
-                    DeviceRosterOperationV1::SetRejectedSlot(slot, rejected) => {
-                        roster.rejected_slots.insert(slot, rejected);
-                    }
-                    DeviceRosterOperationV1::SetRejectedKeyPackage(key_package_ref, rejected) => {
-                        roster
-                            .rejected_key_packages
-                            .insert(key_package_ref, rejected);
-                    }
-                    _ => {}
-                }
+            if let Some((slot, rejected)) = rejected_slot(&record, roster)? {
+                roster.rejected_slots.insert(slot, rejected);
             }
         }
         Ok(())
@@ -515,20 +506,13 @@ impl AppClient {
     }
 }
 
-/// The slots and KeyPackages this device rejected.
-fn rejected_here(records: &[SignInRecord]) -> (BTreeSet<String>, BTreeSet<String>) {
-    let rejected = records
+/// The slots this device rejected.
+fn rejected_slots_here(records: &[SignInRecord]) -> BTreeSet<String> {
+    records
         .iter()
-        .filter(|record| record.answer == SignInAnswer::Rejected);
-    (
-        rejected
-            .clone()
-            .map(|record| record.slot_id_hex.clone())
-            .collect(),
-        rejected
-            .filter_map(|record| record.rejected_key_package_ref_hex.clone())
-            .collect(),
-    )
+        .filter(|record| record.answer == SignInAnswer::Rejected)
+        .map(|record| record.slot_id_hex.clone())
+        .collect()
 }
 
 fn classify(
@@ -536,7 +520,7 @@ fn classify(
     key_package_ref_hex: &str,
     own: &OwnKeyPackages,
     roster: Option<&DeviceRosterV1>,
-    (rejected_slots, rejected_key_packages): &(BTreeSet<String>, BTreeSet<String>),
+    rejected_slots: &BTreeSet<String>,
 ) -> SlotOutcome {
     if own.slot.as_deref() == Some(slot_hex) {
         return if own.refs.contains(key_package_ref_hex) {
@@ -547,20 +531,21 @@ fn classify(
     }
     let slot = roster_slot(slot_hex);
     let key_package_ref = hex::decode(key_package_ref_hex).ok();
-    // A rejected KeyPackage in a device's slot is rejected, not the device.
-    let rejected_by_roster = roster.is_some_and(|roster| {
-        slot.is_some_and(|slot| roster.rejected_slots.contains_key(&slot))
-            || key_package_ref.as_ref().is_some_and(|key_package_ref| {
-                roster.rejected_key_packages.contains_key(key_package_ref)
-            })
-    });
-    if rejected_by_roster {
+    if roster
+        .is_some_and(|roster| slot.is_some_and(|slot| roster.rejected_slots.contains_key(&slot)))
+    {
         return SlotOutcome::Rejected;
     }
     let device = roster
         .zip(slot)
-        .and_then(|(roster, slot)| roster.devices.get(&slot));
-    if let Some(device) = device {
+        .and_then(|(roster, slot)| roster.devices.get(&slot).map(|device| (roster, device)));
+    if let Some((roster, device)) = device {
+        // A rejected KeyPackage in a device's slot is rejected, not the device.
+        if key_package_ref.as_ref().is_some_and(|key_package_ref| {
+            roster.rejected_key_packages.contains_key(key_package_ref)
+        }) {
+            return SlotOutcome::Rejected;
+        }
         return SlotOutcome::KnownDevice {
             announced: match &device.announced_key_package {
                 None => Announcement::None,
@@ -571,32 +556,13 @@ fn classify(
             },
         };
     }
-    let rejected_key_package = rejected_key_packages.contains(key_package_ref_hex)
-        && !protected_key_package(key_package_ref_hex, &own.refs, roster);
-    if rejected_slots.contains(slot_hex) || rejected_key_package {
+    // A rejected KeyPackage elsewhere rejects nothing here: it may be a real
+    // device's, copied into the slot the user rejected.
+    if rejected_slots.contains(slot_hex) {
         SlotOutcome::Rejected
     } else {
         SlotOutcome::Unrecognized
     }
-}
-
-/// A KeyPackage this device made (`own_refs`) or a roster device announced.
-/// Whoever holds the account key can copy one into any slot, so rejecting
-/// that slot never rejects the KeyPackage.
-fn protected_key_package(
-    key_package_ref_hex: &str,
-    own_refs: &BTreeSet<String>,
-    roster: Option<&DeviceRosterV1>,
-) -> bool {
-    own_refs.contains(key_package_ref_hex)
-        || roster.is_some_and(|roster| {
-            roster.devices.values().any(|device| {
-                device
-                    .announced_key_package
-                    .as_ref()
-                    .is_some_and(|announced| hex::encode(announced) == key_package_ref_hex)
-            })
-        })
 }
 
 /// The roster's name for `slot_hex`: only a `d` of 32 bytes in lowercase
@@ -640,60 +606,36 @@ fn listed_state(
     Some(waiting)
 }
 
-/// The roster operations that record `record`'s rejection, if the roster
-/// lacks it and does not hold its slot as a device. A slot the roster holds as
-/// a device was linked: the conflicting answers are Scene 8's (3.7). A slot
-/// the roster cannot name stays rejected here only, and a
-/// [`protected_key_package`] is never rejected.
-fn rejection_operations(
+/// The rejected slot that records `record`'s rejection, if the roster lacks
+/// it and does not hold its slot as a device. A slot the roster holds as a
+/// device was linked: the conflicting answers are Scene 8's (3.7). A slot
+/// the roster cannot name stays rejected here only.
+fn rejected_slot(
     record: &SignInRecord,
     roster: &DeviceRosterV1,
-    own_refs: &BTreeSet<String>,
-    operations: &mut Vec<DeviceRosterOperationV1>,
-) -> Result<(), AppError> {
-    let rejected = || AppError::DeviceGroupRefused("sign_in_unknown");
+) -> Result<Option<(DeviceSlotId, RejectedSlotV1)>, AppError> {
     let Some(slot) = roster_slot(&record.slot_id_hex) else {
-        return Ok(());
+        return Ok(None);
     };
-    if roster.devices.contains_key(&slot) {
-        return Ok(());
+    if roster.devices.contains_key(&slot) || roster.rejected_slots.contains_key(&slot) {
+        return Ok(None);
     }
-    let key_package_ref_hex = record
-        .rejected_key_package_ref_hex
-        .as_deref()
-        .ok_or_else(rejected)?;
-    let key_package_ref = hex::decode(key_package_ref_hex)?;
-    let rejected_at = record.answered_at.ok_or_else(rejected)?;
-    if !roster.rejected_slots.contains_key(&slot) {
-        operations.push(DeviceRosterOperationV1::SetRejectedSlot(
-            slot,
-            RejectedSlotV1 {
-                reason: RejectedSlotReasonV1::NotMe,
-                rejected_at,
-            },
-        ));
-    }
-    // One update sets an entry once: a KeyPackage several slots published
-    // is rejected once.
-    let in_this_update = operations.iter().any(|operation| {
-        matches!(operation, DeviceRosterOperationV1::SetRejectedKeyPackage(listed, _) if *listed == key_package_ref)
-    });
-    if !protected_key_package(key_package_ref_hex, own_refs, Some(roster))
-        && !roster.rejected_key_packages.contains_key(&key_package_ref)
-        && !in_this_update
-    {
-        operations.push(DeviceRosterOperationV1::SetRejectedKeyPackage(
-            key_package_ref,
-            RejectedKeyPackageV1 { slot, rejected_at },
-        ));
-    }
-    Ok(())
+    let rejected_at = record
+        .answered_at
+        .ok_or(AppError::DeviceGroupRefused("sign_in_unknown"))?;
+    Ok(Some((
+        slot,
+        RejectedSlotV1 {
+            reason: RejectedSlotReasonV1::NotMe,
+            rejected_at,
+        },
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cgka_traits::app_components::DeviceEntryV1;
+    use cgka_traits::app_components::{DeviceEntryV1, RejectedKeyPackageV1};
 
     fn slot(byte: u8) -> String {
         hex::encode([byte; 32])
@@ -800,6 +742,8 @@ mod tests {
         assert_eq!(classify(2, 9, Some(&roster)), SlotOutcome::Rejected);
         assert_eq!(classify(3, 3, Some(&roster)), SlotOutcome::Rejected);
         assert_eq!(classify(5, 5, Some(&roster)), SlotOutcome::Unrecognized);
+        // A rejected KeyPackage in any other slot leaves that slot a sign-in.
+        assert_eq!(classify(5, 9, Some(&roster)), SlotOutcome::Unrecognized);
         // Without a roster, every other slot is unrecognized unless rejected
         // here.
         assert_eq!(classify(2, 2, None), SlotOutcome::Unrecognized);
@@ -823,14 +767,13 @@ mod tests {
                 outcome
             );
         }
-        // Rejecting a copy of this device's KeyPackage rejected its slot only.
-        let copy = rejected_here(&[record(1, SignInAnswer::Rejected, false)]);
-        assert_eq!(
-            super::classify(&slot(6), &key_package(1), &own, None, &copy),
-            SlotOutcome::Unrecognized
-        );
-        let here = rejected_here(&[record(5, SignInAnswer::Rejected, false)]);
-        for (slot_byte, key_package_byte) in [(5, 6), (6, 5)] {
+        // A slot rejected here is rejected whatever it holds; its KeyPackage
+        // in another slot leaves that slot a sign-in.
+        let here = rejected_slots_here(&[record(5, SignInAnswer::Rejected, false)]);
+        for (slot_byte, key_package_byte, outcome) in [
+            (5, 6, SlotOutcome::Rejected),
+            (6, 5, SlotOutcome::Unrecognized),
+        ] {
             assert_eq!(
                 super::classify(
                     &slot(slot_byte),
@@ -839,7 +782,7 @@ mod tests {
                     None,
                     &here
                 ),
-                SlotOutcome::Rejected
+                outcome
             );
         }
     }
@@ -887,71 +830,27 @@ mod tests {
     }
 
     #[test]
-    fn a_rejection_the_roster_lacks_becomes_its_operations() {
+    fn a_rejection_the_roster_lacks_becomes_its_slot() {
         let roster = roster();
-        let own_refs = BTreeSet::from([key_package(1)]);
-        let mut operations = Vec::new();
-        rejection_operations(
-            &record(5, SignInAnswer::Rejected, false),
-            &roster,
-            &own_refs,
-            &mut operations,
-        )
-        .unwrap();
+        let rejected = rejected_slot(&record(5, SignInAnswer::Rejected, false), &roster).unwrap();
         assert_eq!(
-            operations,
-            [
-                DeviceRosterOperationV1::SetRejectedSlot(
-                    [5; 32],
-                    RejectedSlotV1 {
-                        reason: RejectedSlotReasonV1::NotMe,
-                        rejected_at: 3
-                    }
-                ),
-                DeviceRosterOperationV1::SetRejectedKeyPackage(
-                    vec![5; 32],
-                    RejectedKeyPackageV1 {
-                        slot: [5; 32],
-                        rejected_at: 3
-                    }
-                ),
-            ]
+            rejected,
+            Some((
+                [5; 32],
+                RejectedSlotV1 {
+                    reason: RejectedSlotReasonV1::NotMe,
+                    rejected_at: 3
+                }
+            ))
         );
         // Recorded already, linked by another device, or a slot the roster
         // cannot name: nothing to commit.
-        let mut operations = Vec::new();
         for byte in [3, 4, 6] {
             let mut rejected = record(byte, SignInAnswer::Rejected, false);
-            rejected.rejected_key_package_ref_hex = Some(key_package(9));
             if byte == 6 {
                 rejected.slot_id_hex = "not-a-slot".into();
             }
-            rejection_operations(&rejected, &roster, &own_refs, &mut operations).unwrap();
-        }
-        assert!(operations.is_empty(), "{operations:?}");
-        // Two slots publishing one KeyPackage make one valid update.
-        let mut operations = Vec::new();
-        for byte in [5, 6] {
-            let mut rejected = record(byte, SignInAnswer::Rejected, false);
-            rejected.rejected_key_package_ref_hex = Some(key_package(8));
-            rejection_operations(&rejected, &roster, &own_refs, &mut operations).unwrap();
-        }
-        assert_eq!(operations.len(), 3, "{operations:?}");
-        assert!(cgka_traits::app_components::DeviceRosterUpdateV1::new(operations).is_ok());
-        // A copy of this device's KeyPackage, or of one a device announced,
-        // rejects only the slot it appeared in.
-        for key_package_byte in [1, 2] {
-            let mut copy = record(7, SignInAnswer::Rejected, false);
-            copy.rejected_key_package_ref_hex = Some(key_package(key_package_byte));
-            let mut operations = Vec::new();
-            rejection_operations(&copy, &roster, &own_refs, &mut operations).unwrap();
-            assert!(
-                matches!(
-                    operations.as_slice(),
-                    [DeviceRosterOperationV1::SetRejectedSlot(slot, _)] if *slot == [7; 32]
-                ),
-                "{operations:?}"
-            );
+            assert_eq!(rejected_slot(&rejected, &roster).unwrap(), None);
         }
     }
 

@@ -10,8 +10,7 @@ use super::*;
 use crate::client::sign_ins::{Announcement, SlotOutcome};
 use crate::{ConfirmedDeviceLink, SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
 use cgka_traits::app_components::{
-    DEVICE_ROSTER_COMPONENT_ID, DeviceRosterV1, RejectedKeyPackageV1, RejectedSlotReasonV1,
-    decode_device_roster_v1,
+    DEVICE_ROSTER_COMPONENT_ID, DeviceRosterV1, RejectedSlotReasonV1, decode_device_roster_v1,
 };
 use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
 
@@ -342,6 +341,75 @@ async fn a_copy_of_this_devices_key_package_never_rejects_it() {
     assert_eq!(report.slots[&phone_slot], SlotOutcome::OwnSlot);
 }
 
+/// Someone holding the account key copies a real device's KeyPackage into a
+/// new slot. Rejecting that slot leaves the real device a sign-in, and the
+/// founding roster rejects the slot only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_of_another_devices_key_package_rejects_only_its_slot() {
+    let account = Account::new(3, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+    phone.check_sign_ins().await.unwrap();
+    let mut laptop = account.open(1).await;
+    let laptop_key_package = published_key_package(&mut laptop, relay).await;
+    let mut tablet = account.open(2).await;
+    published_key_package(&mut tablet, relay).await;
+    let tablet_slot = own_slot(&tablet);
+    let original = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|event| event.kind == 30443 && event.tag_value("d") == Some(tablet_slot.as_str()))
+        .unwrap()
+        .clone();
+    let copy_slot = "c1".repeat(32);
+    let mut tags = original.tags.clone();
+    tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = copy_slot.clone();
+    relay
+        .published_events
+        .lock()
+        .unwrap()
+        .push(NostrTransportEvent::new_unsigned_at(
+            original.pubkey.clone(),
+            original.kind,
+            tags,
+            original.content.clone(),
+            unix_now_seconds(),
+        ));
+
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!(report.slots[&tablet_slot], SlotOutcome::Unrecognized);
+    assert_eq!(report.slots[&copy_slot], SlotOutcome::Unrecognized);
+    phone
+        .answer_sign_in(&copy_slot, SignInResponse::Reject)
+        .await
+        .unwrap();
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!(report.slots[&copy_slot], SlotOutcome::Rejected);
+    assert_eq!(report.slots[&tablet_slot], SlotOutcome::Unrecognized);
+
+    let link = link_for(&laptop_key_package, 0x5a, &phone);
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    let founded = roster(&phone, &group);
+    assert_eq!(
+        founded
+            .rejected_slots
+            .keys()
+            .map(hex::encode)
+            .collect::<Vec<_>>(),
+        [copy_slot]
+    );
+    assert!(founded.rejected_key_packages.is_empty(), "{founded:?}");
+    assert!(
+        listed(&mut phone)
+            .iter()
+            .any(|(slot, _, _)| *slot == tablet_slot)
+    );
+}
+
 /// A sign-in whose slot a complete read finds empty stays listed, marked as
 /// no longer signed in, and can still be rejected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -397,7 +465,7 @@ async fn a_rejection_before_any_device_group_founds_the_roster() {
     let mut laptop = account.open(1).await;
     let laptop_key_package = published_key_package(&mut laptop, relay).await;
     let mut tablet = account.open(2).await;
-    let tablet_key_package = published_key_package(&mut tablet, relay).await;
+    published_key_package(&mut tablet, relay).await;
     phone.check_sign_ins().await.unwrap();
     let tablet_slot = own_slot(&tablet);
     phone
@@ -427,11 +495,8 @@ async fn a_rejection_before_any_device_group_founds_the_roster() {
         roster.rejected_slots[&tablet_slot_id].reason,
         RejectedSlotReasonV1::NotMe
     );
-    let tablet_ref = hex::decode(key_package_ref(&tablet_key_package)).unwrap();
-    assert!(matches!(
-        roster.rejected_key_packages[&tablet_ref],
-        RejectedKeyPackageV1 { slot, .. } if slot == tablet_slot_id
-    ));
+    // The slot alone: its KeyPackage could be a copy of a real device's.
+    assert!(roster.rejected_key_packages.is_empty(), "{roster:?}");
     assert_eq!(roster.devices.len(), 2);
 
     phone.commit_sign_in_rejections().await.unwrap();
