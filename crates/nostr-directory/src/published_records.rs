@@ -743,6 +743,10 @@ pub struct AccountKeyPackageSlots {
     /// slot is here: none is capped, or dropped for sharing a signature key
     /// with another.
     pub key_packages: Vec<SlotKeyPackage>,
+    /// Every slot whose newest publication is a valid KeyPackage by the
+    /// inviter's rules, fresh or not: the slots still signed in. Freshness
+    /// is a publication time, so it never signs a slot out.
+    pub current_slots: BTreeSet<String>,
     /// The `d` of every KeyPackage publication of the account the read
     /// returned, whether or not it counts: which slots exist, whatever their
     /// publications' times.
@@ -774,8 +778,13 @@ pub fn account_key_package_slots_from_records(
 ) -> AccountKeyPackageSlots {
     let complete = complete && !key_package_read_page_full(account, records);
     let reached = complete || records.iter().any(|record| record.event.pubkey == account);
-    let key_packages = slot_candidates(account, records, freshness, None)
-        .candidates
+    let candidates = slot_candidates(account, records, freshness, None).candidates;
+    let current_slots = candidates
+        .iter()
+        .map(|candidate| candidate.fetched.key_package_id.clone())
+        .filter(|slot| !slot.is_empty())
+        .collect();
+    let key_packages = candidates
         .into_iter()
         .map(|candidate| candidate.fetched)
         .filter(|fetched| freshness.is_fresh_key_package(fetched.created_at))
@@ -799,6 +808,7 @@ pub fn account_key_package_slots_from_records(
         .collect();
     AccountKeyPackageSlots {
         key_packages,
+        current_slots,
         returned_slots,
         complete,
         reached,

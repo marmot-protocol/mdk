@@ -454,6 +454,59 @@ async fn a_sign_in_that_signs_out_stays_listed() {
     assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
 }
 
+/// A listed sign-in whose publication is still valid but no longer fresh is
+/// still signed in: it has not signed out, it just has not been opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sign_in_that_goes_stale_stays_signed_in() {
+    let account = Account::new(2, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+    phone.check_sign_ins().await.unwrap();
+    let mut laptop = account.open(1).await;
+    published_key_package(&mut laptop, relay).await;
+    phone.check_sign_ins().await.unwrap();
+    let slot = own_slot(&laptop);
+    // Every publication in the laptop's slot ages past freshness, signed as
+    // a relay holds it.
+    let stale_at = unix_now_seconds() - nostr_directory::KEY_PACKAGE_FRESHNESS.as_secs() - 60;
+    let mut aged = 0;
+    for event in relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .filter(|event| {
+            event.kind == 30443
+                && event
+                    .tags
+                    .iter()
+                    .any(|tag| tag.len() >= 2 && tag[0] == "d" && tag[1] == slot)
+        })
+    {
+        let stale = EventBuilder::new(Kind::Custom(30443), event.content.clone())
+            .tags(
+                event
+                    .tags
+                    .iter()
+                    .map(|tag| Tag::parse(tag.clone()).unwrap()),
+            )
+            .custom_created_at(Timestamp::from_secs(stale_at))
+            .finalize(&account.keys)
+            .unwrap();
+        *event = NostrTransportEvent::from_nostr_event(&stale).unwrap();
+        aged += 1;
+    }
+    assert!(aged > 0);
+
+    let report = phone.check_sign_ins().await.unwrap();
+    assert!(report.complete);
+    let sign_ins = phone.unrecognized_sign_ins().unwrap();
+    assert_eq!(sign_ins.len(), 1);
+    assert_eq!(sign_ins[0].slot_id_hex, slot);
+    assert!(sign_ins[0].signed_in);
+}
+
 /// A device with no device group keeps its rejection and never prompts about
 /// that slot again. When it creates a device group, the founding roster
 /// carries the rejection, and nothing is left to commit. A rejection of the

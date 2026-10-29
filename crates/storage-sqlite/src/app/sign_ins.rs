@@ -58,8 +58,8 @@ pub struct SignInRecord {
     pub last_published_at: u64,
     pub key_package_event_id_hex: String,
     pub key_package_ref_hex: String,
-    /// Cleared once a complete read found no fresh, valid publication in the
-    /// slot.
+    /// Cleared once a complete read found no valid publication in the slot,
+    /// fresh or not, and set again only by a complete read that finds one.
     pub signed_in: bool,
     pub answer: SignInAnswer,
     pub answered_at: Option<u64>,
@@ -82,13 +82,13 @@ pub struct ObservedSignIn {
 #[derive(Clone, Copy, Debug)]
 pub struct SignInCheck<'a> {
     pub unrecognized: &'a [ObservedSignIn],
-    /// Every slot the check found a fresh, valid publication in, recognized
-    /// or not.
+    /// Every slot the check found a valid publication in, fresh or not,
+    /// recognized or not.
     pub present_slots: &'a BTreeSet<String>,
     /// Every slot the read returned, whether or not its publication counted.
     /// The first check keeps them as the baseline.
     pub returned_slots: &'a BTreeSet<String>,
-    /// Whether the read was complete. Only a complete read clears
+    /// Whether the read was complete. Only a complete read changes
     /// `signed_in`.
     pub complete: bool,
     pub now: u64,
@@ -115,11 +115,10 @@ impl SqliteAppStorage {
 
     /// Record one check: take the baseline if none is taken, so every slot
     /// this check's read returned is a device that was here before this one,
-    /// whenever it counts; add or refresh
-    /// each unrecognized slot; mark every listed slot in `present_slots`, now
-    /// recognized or not, as signed in; and, on a complete read, mark every
-    /// slot missing from it as no longer signed in. Returns whether anything a
-    /// host shows changed.
+    /// whenever it counts; add or refresh each unrecognized slot; and, on a
+    /// complete read only, mark every listed slot in `present_slots`, now
+    /// recognized or not, as signed in and every slot missing from it as no
+    /// longer signed in. Returns whether anything a host shows changed.
     pub fn record_sign_in_check(&self, check: &SignInCheck<'_>) -> StorageResult<bool> {
         let now = u64_to_i64(check.now)?;
         let mut conn = self.lock()?;
@@ -165,17 +164,17 @@ impl SqliteAppStorage {
                 .storage()?
                 != 0;
         }
-        for slot in check.present_slots {
-            changed |= tx
-                .execute_cached(
-                    "UPDATE account_sign_ins SET signed_in = 1
-                     WHERE slot_id_hex = ?1 AND signed_in = 0",
-                    params![slot],
-                )
-                .storage()?
-                != 0;
-        }
         if check.complete {
+            for slot in check.present_slots {
+                changed |= tx
+                    .execute_cached(
+                        "UPDATE account_sign_ins SET signed_in = 1
+                         WHERE slot_id_hex = ?1 AND signed_in = 0",
+                        params![slot],
+                    )
+                    .storage()?
+                    != 0;
+            }
             let signed_in: Vec<String> = {
                 let mut stmt = tx
                     .prepare_cached("SELECT slot_id_hex FROM account_sign_ins WHERE signed_in = 1")
@@ -324,10 +323,8 @@ const UPSERT_SIGN_IN: &str = "INSERT INTO account_sign_ins (
                  OR (excluded.last_published_at = last_published_at
                      AND excluded.key_package_event_id_hex < key_package_event_id_hex))
              THEN excluded.key_package_ref_hex ELSE key_package_ref_hex END,
-         last_published_at = MAX(last_published_at, excluded.last_published_at),
-         signed_in = 1
+         last_published_at = MAX(last_published_at, excluded.last_published_at)
      WHERE excluded.appeared_at < appeared_at
-         OR signed_in = 0
          OR excluded.last_published_at > last_published_at
          OR (excluded.last_published_at = last_published_at
              AND excluded.key_package_event_id_hex < key_package_event_id_hex)";
@@ -548,19 +545,22 @@ mod tests {
         assert!(check(&store, &[observed("aa", 10, "e1")], true, 500));
         assert!(store.sign_in("aa").unwrap().unwrap().signed_in);
         // A slot that returns recognized (another device linked it) is signed
-        // in again, from any read.
+        // in again, but only by a complete read.
         assert!(check(&store, &[], true, 600));
-        assert!(
+        let recognized = |complete, now| {
             store
                 .record_sign_in_check(&SignInCheck {
                     unrecognized: &[],
                     present_slots: &present,
                     returned_slots: &present,
-                    complete: false,
-                    now: 700,
+                    complete,
+                    now,
                 })
                 .unwrap()
-        );
+        };
+        assert!(!recognized(false, 700));
+        assert!(!store.sign_in("aa").unwrap().unwrap().signed_in);
+        assert!(recognized(true, 800));
         assert!(store.sign_in("aa").unwrap().unwrap().signed_in);
     }
 

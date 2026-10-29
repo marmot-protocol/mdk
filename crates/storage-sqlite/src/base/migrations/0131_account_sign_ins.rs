@@ -10,8 +10,8 @@
 //!   - `appeared_at` is the earliest publication time this device saw in the
 //!     slot, never later than when it first saw it; `last_published_at` is the
 //!     newest. The KeyPackage columns name the newest publication.
-//!   - `signed_in` is 0 once a complete read found no fresh, valid publication
-//!     in the slot.
+//!   - `signed_in` is 0 once a complete read found no valid publication in
+//!     the slot, fresh or not; only a complete read sets it again.
 //!   - `answer` is this device's: `none`, `not_now`, `rejected` or
 //!     `dismissed`. A rejection names the slot alone, and `roster_pending` is
 //!     1 until the device group's roster records it.

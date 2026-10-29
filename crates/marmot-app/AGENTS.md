@@ -91,8 +91,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription only brings a check forward (`SignInNudges`). The
   first check's baseline, every slot id its read returned whether or not it counted, never a publication time,
-  separates devices that were here first from new sign-ins. Rejections
-  are recorded locally first, then committed to the trusted roster only while the device group is quiet
+  separates devices that were here first from new sign-ins. Only a complete read changes whether a listed sign-in is
+  still signed in, and a slot holding a valid publication that is merely stale (`current_slots`) stays signed in.
+  Rejections are recorded locally first, then committed to the trusted roster only while the device group is quiet
   (`device_group_quiet`); a device with no device group keeps them until `create_device_group` founds the roster with
   them or it trusts a group it joined. A rejection is committed only while the roster has no entry for the slot, and
   never replaces one; a slot the roster holds as a device ends it, since the user confirmed that link. A rejection stays

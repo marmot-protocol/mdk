@@ -81,8 +81,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   user confirmed, and commits one again whenever the roster has no entry for the slot; it never replaces an entry. A
   rejection names the slot alone, never its KeyPackage, which may be a copy of a real device's, and a rejected
   KeyPackage never makes another slot rejected. A sign-in another device answered keeps its prompt, saying so, until
-  dismissed, and is listed again if the roster loses that answer; one whose slot empties stays listed as no longer
-  signed in. Hosts can't reach it yet, and only test-policy builds run it.
+  dismissed, and is listed again if the roster loses that answer; one whose slot a complete check finds empty stays
+  listed as no longer signed in. A publication that is only stale never signs a slot out. Hosts can't reach it yet,
+  and only test-policy builds run it.
 - `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
   one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
   pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster

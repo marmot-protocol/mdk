@@ -223,6 +223,10 @@ async fn the_account_slot_read_keeps_every_valid_slot() {
     // ones count.
     assert!(slots.returned_slots.contains("stale"));
     assert_eq!(slots.returned_slots.len(), events.len() + 1);
+    // Every slot holding a valid publication, fresh or not: the slots still
+    // signed in.
+    assert!(slots.current_slots.contains("stale"));
+    assert_eq!(slots.current_slots.len(), slots.key_packages.len() + 1);
     let mut read = slots
         .key_packages
         .into_iter()

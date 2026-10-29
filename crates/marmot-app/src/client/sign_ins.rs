@@ -36,8 +36,10 @@
 //!   rejected stays up, saying so, until dismissed. That answer holds only
 //!   while the roster does: a sign-in dismissed here is listed again once the
 //!   roster has no entry for its slot.
-//! - **Gone.** A sign-in whose slot a complete read finds empty stays listed,
-//!   marked as no longer signed in.
+//! - **Gone.** A sign-in whose slot a complete read finds holding no valid
+//!   KeyPackage, fresh or not, stays listed, marked as no longer signed in.
+//!   A stale publication never signs a slot out, and only a complete read
+//!   changes that mark.
 //!
 //! Everything here runs only while device groups are on.
 
@@ -261,7 +263,6 @@ impl AppClient {
             complete: read.complete,
         };
         let mut unrecognized = Vec::new();
-        let mut present = BTreeSet::new();
         for slot_key_package in read.key_packages {
             let fetched = slot_key_package.fetched;
             let slot_hex = fetched.key_package_id;
@@ -281,12 +282,11 @@ impl AppClient {
                     key_package_ref_hex: fetched.key_package_ref_hex,
                 });
             }
-            present.insert(slot_hex.clone());
             report.slots.insert(slot_hex, outcome);
         }
         storage.record_sign_in_check(&SignInCheck {
             unrecognized: &unrecognized,
-            present_slots: &present,
+            present_slots: &read.current_slots,
             returned_slots: &read.returned_slots,
             complete: read.complete,
             now: unix_now_seconds(),
