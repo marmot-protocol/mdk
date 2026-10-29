@@ -53,9 +53,7 @@ the cancels to send.
 ## Code tables
 
 `src/emoji.rs` is Matrix's emoji table, `data-definitions/sas-emoji.json` from
-[matrix-org/matrix-spec](https://github.com/matrix-org/matrix-spec), copyright The Matrix.org Foundation C.I.C. and
-used under the Apache License 2.0 in [`LICENSE-MATRIX-SPEC`](LICENSE-MATRIX-SPEC). The rest of the crate is MIT, as
-the workspace is.
+[matrix-org/matrix-spec](https://github.com/matrix-org/matrix-spec).
 
 ## Tests
 

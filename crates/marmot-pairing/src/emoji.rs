@@ -3,11 +3,9 @@
 //! Copied from the Matrix Specification's `data-definitions/sas-emoji.json`
 //! (<https://github.com/matrix-org/matrix-spec>, commit
 //! `7aaeac07608f97942eff88634a56b630a745ce56`): each entry's number, emoji,
-//! English description and code points. Copyright The Matrix.org Foundation
-//! C.I.C., licensed under the Apache License, Version 2.0; a copy of that
-//! licence is in this crate's `LICENSE-MATRIX-SPEC`. Translated descriptions
-//! live in the same Matrix file and are not copied here. Do not edit an entry:
-//! the table is part of the pairing wire format.
+//! English description and code points. Translated descriptions live in the
+//! same Matrix file and are not copied here. Do not edit an entry: the table is
+//! part of the pairing wire format.
 
 /// One emoji of the table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
