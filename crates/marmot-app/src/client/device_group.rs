@@ -27,6 +27,8 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::CreateGroupRequest;
 use cgka_traits::storage::{GroupStorage as _, MaintenanceStorage as _, StorageError};
 use cgka_traits::{EpochId, Group, GroupId, TransportGroupSubscription};
+use rand::RngCore as _;
+use rand::rngs::OsRng;
 use storage_sqlite::{DeviceGroupRecord, DeviceGroupTrust};
 
 use super::{AppClient, UnpublishedWelcomeDelivery, UnpublishedWelcomeKind, group_is_terminal};
@@ -250,6 +252,7 @@ impl AppClient {
 
         let now = unix_now_seconds();
         let mut roster = DeviceRosterV1::default();
+        OsRng.fill_bytes(&mut roster.leaf_tag_key);
         roster.devices.insert(
             own_slot,
             DeviceEntryV1 {

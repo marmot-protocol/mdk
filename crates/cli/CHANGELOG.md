@@ -26,12 +26,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   that messages are delivered.
 - The engine implements `marmot.account.device-roster.v1` (0x800e), the roster of an account's device group
   (mdk#2628 item 3.1). A group that requires it is a device group. It holds the roster from creation and keeps
-  requiring it, and only one account's devices may be members. A roster update is a list of operations that each set
-  or remove one entry: a device keyed by its KeyPackage slot, a leaf-map entry keyed by a device's slot and a group,
-  a rejected slot or a rejected KeyPackage. Every member applies the operations to the parent's roster. A roster may
-  hold at most 20 devices, and each leaf-map entry belongs to a device or to a slot recorded as removed. Until the component's spec
-  is adopted, only test-policy builds may advertise it. A release build can't create or join a device group, and it
-  treats roster bytes in other groups as unknown data, so nothing ships the format.
+  requiring it, and only one account's devices may be members. The roster holds the key that seals the account's
+  device tags, which no update changes. A roster update is a list of operations that each set or remove one entry: a
+  device keyed by its KeyPackage slot, with the key it signs its device tags with, a rejected slot or a rejected
+  KeyPackage. Every member applies the operations to the parent's roster. A roster may hold at most 20 devices, no two
+  with one tag signature key. The device that creates a device group draws its tag key at random. Until the
+  component's spec is adopted, only test-policy builds may advertise it. A release build can't create or join a device
+  group, and it treats roster bytes in other groups as unknown data, so nothing ships the format.
 - `marmot-app` keeps an account's device group (mdk#2628 item 3.1). A confirmed device link creates it under the
   group id the link chose, and the founding Add takes this account's own device only through the exact confirmed
   KeyPackage. The device that created the group trusts it, and so does a device that joined through the Welcome a

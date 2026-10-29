@@ -186,7 +186,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `account_devices/device_roster.rs` (test-policy builds only)
   - **Owns:** `marmot.account.device-roster.v1` (0x800e, mdk#2628 item 3.1): a device group holds its roster from
     creation; a roster update is a diff every member applies to the parent's roster, and a committer that writes the
-    update's bytes as the state is dropped; the roster's own invariants, leaf-map entries included; every leaf is one
+    update's bytes as the state is dropped; the roster's own invariants, one tag signature key per device included; every leaf is one
     account, at creation, on invite, on replay and at join; the roster is required from creation or never, for
     Commits and standalone proposals; and outside a device group roster bytes are unknown data. The `Parts::app_data_state` override in
     `account_devices.rs` lets a crafted Commit write resulting bytes of its own.

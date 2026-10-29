@@ -922,6 +922,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         settings,
         status,
         announced_key_package: Some(vec![7; 32]),
+        tag_signature_key: Some(label.as_bytes().to_vec()),
         history_key: Some(vec![8; 32]),
     };
     let update = encode_device_roster_update_v1(

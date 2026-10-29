@@ -47,10 +47,10 @@ pub use codec::{
     encode_quic_varint,
 };
 pub use device_roster::{
-    AccountEntryV1, DEVICE_ROSTER_KEY_PACKAGE_REF_MAX_LEN, DEVICE_ROSTER_LEAF_MAP_VALUE_MAX_LEN,
-    DEVICE_ROSTER_RESERVED_KEY_MAX_LEN, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
+    AccountEntryV1, DEVICE_ROSTER_KEY_PACKAGE_REF_MAX_LEN, DEVICE_ROSTER_RESERVED_KEY_MAX_LEN,
+    DEVICE_ROSTER_TAG_SIGNATURE_KEY_MAX_LEN, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
     DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1, DeviceSettingsV1, DeviceSlotId,
-    DeviceStatusV1, LeafMapKeyV1, RejectedKeyPackageV1, RejectedSlotReasonV1, RejectedSlotV1,
+    DeviceStatusV1, RejectedKeyPackageV1, RejectedSlotReasonV1, RejectedSlotV1,
     apply_device_roster_update_v1, decode_device_roster_update_v1, decode_device_roster_v1,
     encode_device_roster_update_v1, encode_device_roster_v1,
 };

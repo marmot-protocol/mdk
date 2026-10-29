@@ -274,8 +274,7 @@ impl<S: StorageProvider> Drop for NewGroupCleanupGuard<S> {
     }
 }
 
-/// The longest group id a host may choose: the bound a device-roster
-/// leaf-map key puts on the group ids it names.
+/// The longest group id a host may choose.
 pub(crate) const MAX_CHOSEN_GROUP_ID_LEN: usize = 255;
 
 impl<S: StorageProvider> Engine<S> {
