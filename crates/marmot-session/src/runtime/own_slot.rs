@@ -21,6 +21,15 @@
 //!   the request goes out, and put back if no relay accepts.
 //! - Otherwise the finding lives in memory only: the host reads the slot
 //!   again at open, and finds any foreign publication still there.
+//! - **Known gap.** A deletion a relay honored but never acknowledged, or
+//!   one made while a replacement is already on its way, can leave that
+//!   relay's slot empty until the weekly refresh: the rollback assumes no
+//!   acknowledgement means nothing was deleted, and promoting the in-flight
+//!   replacement reschedules the refresh. Reading the slot cannot show the
+//!   gap, since an empty slot holds no foreign publication. The slot
+//!   withdrawal's rollback has the same gap. A read that refills a relay
+//!   that accepted this device's latest publication but serves nothing is
+//!   mdk#2628's follow-up under 3.4.
 
 use cgka_traits::{MessageId, Timestamp, TransportAdapter};
 
