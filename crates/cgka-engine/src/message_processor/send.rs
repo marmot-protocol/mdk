@@ -162,8 +162,9 @@ impl<S: StorageProvider> Engine<S> {
                 group_id,
                 key_package,
                 roster_update,
+                deliver_until,
             } => {
-                self.do_send_link_device(group_id, key_package, roster_update)
+                self.do_send_link_device(group_id, key_package, roster_update, deliver_until)
                     .await
             }
             SendIntent::UnlinkDevice {
@@ -451,6 +452,7 @@ impl<S: StorageProvider> Engine<S> {
                 &welcome_bytes,
                 &key_packages,
                 &parsed_kps,
+                None,
             )
             .await?;
 
@@ -515,7 +517,9 @@ impl<S: StorageProvider> Engine<S> {
     /// Wrap a staged Commit's Welcome once per added KeyPackage, addressed to
     /// that KeyPackage's account and naming its publication, and record each
     /// as staged delivery work of `commit_id`. Invites and same-account Adds
-    /// deliver their Welcomes this way (joining.md, "Delivery").
+    /// deliver their Welcomes this way (joining.md, "Delivery"). A device
+    /// link's Welcome records `deliver_until`, after which it is never
+    /// published.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn wrap_staged_welcomes(
         &mut self,
@@ -526,6 +530,7 @@ impl<S: StorageProvider> Engine<S> {
         welcome_bytes: &[u8],
         key_packages: &[cgka_traits::engine::KeyPackage],
         parsed_kps: &[openmls::prelude::KeyPackage],
+        deliver_until: Option<cgka_traits::transport::Timestamp>,
     ) -> Result<Vec<TransportMessage>, EngineError> {
         let mut welcomes = Vec::with_capacity(parsed_kps.len());
         let welcome_relays = crate::group_lifecycle::welcome_relays_for_group(mls_group)?;
@@ -557,6 +562,7 @@ impl<S: StorageProvider> Engine<S> {
                 crate::key_package::key_package_ref(parsed_kp)?
                     .as_slice()
                     .to_vec(),
+                deliver_until,
                 group_id,
                 source_epoch,
             )?;

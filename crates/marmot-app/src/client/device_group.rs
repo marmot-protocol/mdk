@@ -50,7 +50,7 @@ use cgka_traits::storage::{
     DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage as _, GroupStorage as _,
     MaintenanceStorage as _, StorageError,
 };
-use cgka_traits::{EpochId, Group, GroupId, KeyPackage, TransportGroupSubscription};
+use cgka_traits::{EpochId, Group, GroupId, KeyPackage, Timestamp, TransportGroupSubscription};
 use marmot_session::DeviceSelfReport;
 use rand::RngCore as _;
 use rand::rngs::OsRng;
@@ -237,7 +237,8 @@ impl AppClient {
     /// The existing device's side of a confirmed link: create the device group
     /// under the id the link chose, adding the new device's KeyPackage, the
     /// one with the confirmed `KeyPackageRef` and no other, with the label
-    /// and settings its user chose.
+    /// and settings its user chose. The founding Welcome is never published
+    /// from `wait_ends` on, when the new device stops waiting for it (D40).
     ///
     /// Refused unless this device advertises the roster, has no device group
     /// of its own yet, and finds that KeyPackage published by this account.
@@ -246,6 +247,7 @@ impl AppClient {
         &mut self,
         link: &ConfirmedDeviceLink,
         choices: &DeviceLinkChoices,
+        wait_ends: u64,
     ) -> Result<GroupId, AppError> {
         if !self.app.device_groups_enabled() {
             return Err(AppError::DeviceGroupRefused("roster_unsupported"));
@@ -380,6 +382,7 @@ impl AppClient {
             .prepare_create_group_with_chosen_id_and_audit_context(
                 request,
                 link.device_group_id.clone(),
+                Timestamp(wait_ends),
                 audit_context.clone(),
             )
             .await
@@ -631,8 +634,8 @@ impl AppClient {
     }
 
     /// Test-policy hook: act on `link` as the existing device, as if pairing
-    /// had confirmed it, and deliver the founding Welcome. The new device's
-    /// roster entry has no label and both settings off.
+    /// had confirmed it now, and deliver the founding Welcome. The new
+    /// device's roster entry has no label and both settings off.
     #[cfg(feature = "test-policy-overrides")]
     #[doc(hidden)]
     pub async fn dev_create_device_group(
@@ -644,7 +647,8 @@ impl AppClient {
             add_to_all_chats: false,
             bring_history: false,
         };
-        let group_id = self.create_device_group(&link, &choices).await?;
+        let wait_ends = unix_now_seconds().saturating_add(WELCOME_WAIT_SECS);
+        let group_id = self.create_device_group(&link, &choices, wait_ends).await?;
         // The device group stands either way: an undelivered Welcome stays owed.
         let _ = self.drive_unpublished_welcome_delivery(None).await;
         Ok(group_id)

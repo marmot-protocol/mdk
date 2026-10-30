@@ -224,6 +224,7 @@ impl<S: StorageProvider> Engine<S> {
                     &welcome_bytes,
                     &key_packages,
                     &parsed_kps,
+                    None,
                 )
                 .await?
             }

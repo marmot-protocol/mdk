@@ -137,12 +137,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   override only test-policy builds read), or when that commit is still absent `LINK_DEADLINE_SECS` after the entry's
   `linked_at`. A decided link never changes, and a link whose approval still waits to be retried is not decided. A
   failed link ends its prompt as `LinkFailed` with a `CannotLink` cancel. Its Welcome, found by the `KeyPackageRef`
-  recorded before the commit (`welcomes_for_key_package`), is withdrawn before the failure is recorded, then again on
-  each drive until that succeeds and marks it withdrawn; never rely on a Welcome id written after the commit, which a
-  crash can lose. Welcome publishers (startup recovery, a maintenance pass, a fanout retry) run before the gate, so
-  every client open, before it returns the client and whether or not device groups are on, withdraws the Welcome of
-  every failed link not marked withdrawn and every pending link past its deadline (`withdraw_expired_link_welcomes`);
-  a new publisher must not run before open returns. While the roster
+  recorded before the commit (`welcomes_for_key_package`), is withdrawn before the failure is recorded. While the
+  Welcome's deadline may be ahead (before `linked_at` plus `WELCOME_WAIT_SECS`), a failure is recorded only once that
+  withdrawal succeeds: until then the link stays pending and the next drive decides it again. From then on the runtime
+  refuses the Welcome, so the failure is recorded and the removal does not wait for the withdrawal. Never rely on a Welcome id written after the commit, which a crash can lose. Welcome publishers (startup
+  recovery, a maintenance pass, a fanout retry) run before the gate and whether or not device groups are on, so the
+  gate never guards delivery: both link paths pass the new device's wait end (`Approval::wait_ends`) to the engine as
+  the Welcome's `deliver_until`, and the runtime's publish check refuses it from then on. While the roster
   lists the device as this device's link, it also removes its entry, and its leaf if the engine's tree still has one, in
   one `SendIntent::UnlinkDevice` commit; never decide the leaf from the stored member list, which a staged removal has
   already changed. A withdrawal that fails never holds the removal back. A link refused as
