@@ -181,7 +181,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   crash cannot lose it. The new device records a `device_group_joins` row before it trusts the group it joined, nudges
   its first commit there (`set_device_tag_key`) on each drive rather than waiting for maintenance, and drops the row
   once that commit landed. Removed from the device group, it forgets its copy (`forget_group_local`); removed before
-  its first commit landed, it shows `Ended { LinkFailed }`. Each drive ends by comparing linking as hosts read it with
+  its first commit landed, it shows `Ended { LinkFailed }`. A later link's Welcome into that group is a first join,
+  held by the engine to the link rather than to the forget's date. A new device never starts a link by a KeyPackage it
+  already joined by (`last_consumed_key_package_ref`): the link binds its Welcome by KeyPackage alone, so a used one
+  would also admit the Welcome that installed the forgotten copy. The start waits for the replacement's publication
+  (`key_package_not_published`). Each drive ends by comparing linking as hosts read it with
   `DevicePairing::last_view` and sets `device_link_changed` when it differs; the client opens with that flag set, and
   the same two seams as `linked_devices_changed` drain it into `DeviceLinkChanged`.
 - Keep outbound Welcomes on the engine's Welcome rows (mdk#2628 3.5a). The invite slot of

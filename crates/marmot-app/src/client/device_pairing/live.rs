@@ -475,6 +475,14 @@ impl AppClient {
             .app
             .account_storage(&self.state.label)?
             .key_package_lifecycle()?;
+        // Never a KeyPackage this device already joined by: the link binds
+        // its Welcome by KeyPackage alone, so a used one would also admit the
+        // Welcome that installed a discarded copy of the same device group.
+        // The start waits for its replacement's publication.
+        let lifecycle = lifecycle.filter(|lifecycle| {
+            lifecycle.last_consumed_key_package_ref.is_none()
+                || lifecycle.current_key_package_ref != lifecycle.last_consumed_key_package_ref
+        });
         let (Some(event_id), Some(key_package_ref)) = (
             lifecycle
                 .as_ref()

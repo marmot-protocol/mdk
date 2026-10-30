@@ -1421,8 +1421,18 @@ impl<S: StorageProvider> Engine<S> {
                 return Err(EngineError::InvalidWelcome);
             }
 
+            // A forgotten group takes only a Welcome its author dated after
+            // the forget. A device link's Welcome is held to its link
+            // instead (5f): the existing device's leaf key and the
+            // KeyPackage the link confirmed, which is never one the device
+            // joined by, so the Welcome that installed the discarded copy
+            // stays out and the two devices' clocks never decide a link.
             let reset_cutoff = storage.group_local_reset_cutoff(&group_id)?;
-            if let Some(cutoff) = reset_cutoff
+            let awaited_by_a_link = storage
+                .device_group_welcome_expectation(&group_id)?
+                .is_some_and(|expected| expected.key_package_ref == consumed_key_package_ref);
+            let dated_reset = reset_cutoff.filter(|_| !awaited_by_a_link);
+            if let Some(cutoff) = dated_reset
                 && welcome_created_at.is_none_or(|created_at| created_at <= cutoff)
             {
                 return Err(EngineError::InvalidWelcome);
@@ -1518,7 +1528,7 @@ impl<S: StorageProvider> Engine<S> {
             // Bind the timestamp's authenticated author to the MLS inviter;
             // an unrelated sender rewrapping old Welcome bytes cannot make
             // those bytes a fresh invitation across a reset boundary.
-            if reset_cutoff.is_some() && peeled.sender.as_ref() != Some(&welcome_sender_id) {
+            if dated_reset.is_some() && peeled.sender.as_ref() != Some(&welcome_sender_id) {
                 return Err(EngineError::InvalidWelcome);
             }
             let mls_group = staged
