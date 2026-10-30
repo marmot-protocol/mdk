@@ -79,21 +79,14 @@ pub use runtime::RuntimeBlockListSubscription;
 pub use user_blocks::{BlockListSnapshot, BlockedUser};
 mod agent_streams;
 mod app_outcome;
-mod app_telemetry;
-mod collector_host_safety;
 mod network_proxy;
-pub mod product_analytics;
-pub use product_analytics::*;
 mod usage_diagnostics;
 pub use usage_diagnostics::configure_product_analytics_from_environment;
 mod audit_log;
-pub mod audit_otlp_sender;
-mod audit_upload;
 mod chat_presentation;
 mod client;
 mod config;
 mod deployment;
-mod export_config;
 pub use deployment::{MarmotDeployment, NEUTRAL_KEYCHAIN_SERVICE_NAME, OpenRankingProvider};
 pub mod conversation_presentation;
 mod conversions;
@@ -132,18 +125,11 @@ mod nostr_secret;
 mod nostr_verification;
 mod notifications;
 #[cfg(test)]
-mod observability_crossings_tests;
-#[cfg(any(test, feature = "test-support"))]
-#[cfg_attr(not(test), allow(unused_imports))]
-mod observability_test_support;
-#[cfg(test)]
 mod observability_tests;
-mod observer;
 mod profile_publication;
 mod projection;
 mod publisher_sequences;
 mod relay_caps;
-mod relay_telemetry_export;
 mod root_closers;
 mod root_runtime_lease;
 mod runtime;
@@ -155,7 +141,6 @@ pub use startup_diagnostics::{
 mod stickers;
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
-mod wiring;
 
 pub use cgka_traits::engine::{
     SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
@@ -222,12 +207,6 @@ pub use agent_streams::{
     AgentStreamDelta, AgentStreamUpdate, AgentStreamWatchCompletion, AgentStreamWatchManager,
     AgentStreamWatchReport, AgentStreamWatchStart,
 };
-pub use app_telemetry::{
-    AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
-    HostPerformanceOperation, HostPerformanceOutcome, RuntimePerformanceOperation,
-    RuntimePerformanceSnapshot, SyncErrorClass, SyncFailureClassification, SyncFailureCount,
-    SyncFailureStage,
-};
 pub use audit_log::{
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
     AuditLogUploadResult, AuditOtlpTrackerResult,
@@ -259,10 +238,6 @@ pub use drafts::{
 pub use error::{
     AccountCatchUpFailure, AppError, FullHistoryRepairIncompleteReason, MissingKeyPackageReason,
 };
-pub use export_config::{
-    AuditLogUploadSource, RelayTelemetryExportConfig, RelayTelemetryResource,
-    RelayTelemetryRuntimeConfig,
-};
 pub use groups::{
     AppAccountDevicesActivation, AppAgentTextStreamComponent, AppBlobEndpoint,
     AppCreateGroupOptions, AppDisbandFailureReason, AppDisbandRequest,
@@ -278,6 +253,23 @@ pub use groups::{
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
+};
+pub use marmot_observability::{
+    AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
+    AuditLogUploadSource, DiagnosticsExporterStatus, DiagnosticsPermit, ExportHistogram,
+    ExportMetricPoint, ExportMetricValue, HostPerformanceOperation, HostPerformanceOutcome,
+    PRODUCT_DURATION_BOUNDS_MS, PRODUCT_OUTCOMES, PRODUCT_REGISTRY_VERSION, ProductAnalytics,
+    ProductAnalyticsActivity, ProductAnalyticsError, ProductAnalyticsMetadata,
+    ProductAnalyticsRuntimeConfig, ProductEvent, ProductEventMode, ProductEventSchema,
+    ProductFamily, ProductObservation, ProductPropertyRule, ProductPropertySchema,
+    ProductRecordResult, ProductUnit, RelayExportError, RelayTelemetryExportBatch,
+    RelayTelemetryExportConfig, RelayTelemetryExporter, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig, RuntimePerformanceOperation, RuntimePerformanceSnapshot,
+    SyncErrorClass, SyncFailureClassification, SyncFailureCount, SyncFailureStage,
+    USAGE_DIAGNOSTICS_DISCLOSURE, USAGE_DIAGNOSTICS_POLICY, UsageDiagnosticsDecision,
+    UsageDiagnosticsSettings, UsageDiagnosticsStatus, approved_host_product_schemas,
+    audit_otlp_sender, build_export_batch, build_export_batch_with_app_performance, metric_names,
+    product_analytics, product_count_bucket, product_duration_bucket,
 };
 pub use media::file_transfer::{
     MAX_FILE_MEDIA_CIPHERTEXT_BYTES, MediaFileTransferControl, MediaFileUploadAttachmentRequest,
@@ -332,11 +324,6 @@ pub use notifications::{
     parse_provider_token, push_token_fingerprint,
 };
 pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym};
-pub use relay_telemetry_export::{
-    ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayExportError,
-    RelayTelemetryExportBatch, RelayTelemetryExporter, build_export_batch,
-    build_export_batch_with_app_performance, metric_names,
-};
 pub use storage_sqlite::{
     ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
     ChatListMessagePreview, ChatListQuery, ChatListRow, DeletionSource, ExistingDirectConversation,
@@ -619,7 +606,7 @@ pub struct MarmotApp {
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     audit_recorders: Arc<Mutex<HashMap<String, audit_log::AuditRecorderSlot>>>,
-    product_analytics: observer::ProductRecorder,
+    product_analytics: marmot_observability::observer::ProductRecorder,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
@@ -954,27 +941,29 @@ impl From<AppError> for SyncFailure {
 pub(crate) struct ClassifiedSyncFailure {
     pub(crate) partial_summary: SyncSummary,
     pub(crate) source: AppError,
-    classification: app_telemetry::SyncFailureClassification,
+    classification: marmot_observability::app_telemetry::SyncFailureClassification,
 }
 
 impl ClassifiedSyncFailure {
     pub(crate) fn at_stage(
         partial_summary: SyncSummary,
         source: AppError,
-        failure_stage: app_telemetry::SyncFailureStage,
+        failure_stage: marmot_observability::app_telemetry::SyncFailureStage,
     ) -> Self {
         let error_class = source.sync_error_class();
         Self {
             partial_summary,
             source,
-            classification: app_telemetry::SyncFailureClassification::new(
+            classification: marmot_observability::app_telemetry::SyncFailureClassification::new(
                 failure_stage,
                 error_class,
             ),
         }
     }
 
-    pub(crate) const fn classification(&self) -> app_telemetry::SyncFailureClassification {
+    pub(crate) const fn classification(
+        &self,
+    ) -> marmot_observability::app_telemetry::SyncFailureClassification {
         self.classification
     }
 }
@@ -1536,7 +1525,7 @@ impl MarmotApp {
         Ok(self
             .relay_telemetry_settings()?
             .export_config_with_runtime_and_endpoints(
-                export_config::RelayTelemetryRuntimeConfig::default(),
+                marmot_observability::export_config::RelayTelemetryRuntimeConfig::default(),
                 self.service_endpoints(),
             ))
     }
@@ -1645,9 +1634,11 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
-        collector_host_safety::hand_in_http_builder(network_proxy::http_builder);
-        let product_analytics = observer::ProductRecorder::default();
-        wiring::silence(
+        marmot_observability::collector_host_safety::hand_in_http_builder(
+            network_proxy::http_builder,
+        );
+        let product_analytics = marmot_observability::observer::ProductRecorder::default();
+        marmot_observability::wiring::silence(
             &product_analytics,
             config.usage_diagnostics_silent
                 || config.cursor_persistence == CursorPersistence::Frozen,
@@ -1748,9 +1739,11 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
-        collector_host_safety::hand_in_http_builder(network_proxy::http_builder);
-        let product_analytics = observer::ProductRecorder::default();
-        wiring::silence(
+        marmot_observability::collector_host_safety::hand_in_http_builder(
+            network_proxy::http_builder,
+        );
+        let product_analytics = marmot_observability::observer::ProductRecorder::default();
+        marmot_observability::wiring::silence(
             &product_analytics,
             config.usage_diagnostics_silent
                 || config.cursor_persistence == CursorPersistence::Frozen,
@@ -7154,7 +7147,7 @@ impl MarmotApp {
                 "publication",
                 ProductUnit::Transition,
             )
-            .map(crate::observer::ProductOperation::counts_only);
+            .map(marmot_observability::observer::ProductOperation::counts_only);
         let storage = self.account_storage(label)?;
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let authority_update = storage.app_storage().finalize_app_event_authority(

@@ -81,7 +81,9 @@ pub(crate) fn sqlcipher_migration_probe_counters() -> (u64, u64) {
 /// Counts one probe run or skip. The app-performance recorder gets the reader first, so no
 /// snapshot misses a count.
 fn count_sqlcipher_migration_probe(counter: &AtomicU64) {
-    crate::app_telemetry::hand_in_sqlcipher_probe_counters(sqlcipher_migration_probe_counters);
+    marmot_observability::app_telemetry::hand_in_sqlcipher_probe_counters(
+        sqlcipher_migration_probe_counters,
+    );
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -889,7 +891,7 @@ mod tests {
         let app = {
             let mut configured = app;
             configured.product_analytics =
-                crate::observability_test_support::test_product_collector();
+                marmot_observability::observability_test_support::test_product_collector();
             configured.set_usage_diagnostics_consent(true).unwrap();
             configured
         };

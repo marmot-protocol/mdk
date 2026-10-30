@@ -110,7 +110,7 @@ impl MarmotApp {
             Ok(created_at)
         };
         observed
-            .run_async(work, crate::observer::success_or_failure)
+            .run_async(work, marmot_observability::observer::success_or_failure)
             .await
     }
 

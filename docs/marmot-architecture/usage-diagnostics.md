@@ -98,7 +98,7 @@ account/database lock is retained by delivery.
 
 ## Collection and counting
 
-The source catalogue is `crates/marmot-app/src/product_analytics/catalogue.rs`;
+The source catalogue is `crates/marmot-observability/src/product_analytics/catalogue.rs`;
 `product-event-catalogue.json` is its versioned, machine-readable contract.
 `approved_host_product_schemas()` supplies the reviewed screen, onboarding,
 compose, search, attachment, settings, and notification-permission observations.

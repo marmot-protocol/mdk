@@ -597,6 +597,7 @@ jobs:
 
       - name: Test consent and both diagnostic exporters
         run: |
+          cargo test -p marmot-observability --features otlp-export,product-analytics-export --lib product_analytics:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib product_analytics:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib usage_diagnostics:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib backend_maintenance_collects --locked

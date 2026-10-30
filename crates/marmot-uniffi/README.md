@@ -182,7 +182,7 @@ started/completed counters, five outcomes, histogram and live gauges. Hosts repo
 the actual outcome; merely leaving a scope does not establish success. These
 completed-duration reports have no live observation, so their live gauges are zero.
 Hosts should record every stage they can observe, and only those. Nested stages overlap and
-must not be summed. See the [operation definitions](../marmot-app/src/app_telemetry.rs) and
+must not be summed. See the [operation definitions](../marmot-observability/src/app_telemetry.rs) and
 [metric catalog](../../docs/marmot-architecture/telemetry.md#registered-host-stage-metrics).
 
 Use typed presentation, capability, deletion and group-system fields rather than parsing English

@@ -89,7 +89,8 @@ database and releases file locks; `shutdown` alone does not. See
 reaches live subscriptions only after the write behind it has committed, so an update a host received that way is
 still stored after `shutdown_and_close`.
 
-For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on; the user directory is the [`nostr-directory`](../nostr-directory) crate) see
+For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on; the user directory is the [`nostr-directory`](../nostr-directory) crate
+and the diagnostics exporters are the [`marmot-observability`](../marmot-observability) crate) see
 [`AGENTS.md`](AGENTS.md).
 
 ## SOCKS5 routing

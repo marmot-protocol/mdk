@@ -7,7 +7,7 @@ publish.workspace = true
 
 [features]
 default = []
-product-analytics-export = []
+product-analytics-export = ["marmot-observability/product-analytics-export"]
 # Test-only convergence timing/rewind overrides. Never enable in app artifacts.
 # marmot-session forwards this to cgka-engine, which is a dev-dependency here.
 # Device pairing runs only behind `dev_device_groups`, itself test-policy only.
@@ -22,18 +22,17 @@ unreleased-device-pairing = [
 # Opt-in relay-telemetry OTLP exporter wire encoding and HTTP push. The
 # privacy-critical mapping and opt-in gate stay in the default build; this
 # feature only adds the OTLP protobuf dependencies and the push transport.
-otlp-export = ["dep:opentelemetry-proto", "dep:prost"]
+otlp-export = ["marmot-observability/otlp-export"]
 # Internal-only surface used by the repeatable media transport benchmark.
 media-benchmarks = []
 # The lower-stack error table that host crates check their classifiers
 # against, and the diagnostics test fixtures and hooks. Enable only as a
 # dev-dependency.
-test-support = []
+test-support = ["marmot-observability/test-support"]
 
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
-chrono.workspace = true
 marmot-session.workspace = true
 cgka-traits.workspace = true
 chacha20poly1305.workspace = true
@@ -42,20 +41,18 @@ fs-private.workspace = true
 fs4.workspace = true
 futures.workspace = true
 hex.workspace = true
-httpdate.workspace = true
 hkdf.workspace = true
 image.workspace = true
 jsonschema.workspace = true
 marmot-account.workspace = true
 marmot-forensics.workspace = true
 marmot-markdown.workspace = true
+marmot-observability.workspace = true
 marmot-pairing = { workspace = true, optional = true }
 nostr-directory.workspace = true
 nostr = { workspace = true, features = ["nip04"] }
 nostr-sdk.workspace = true
 openssl.workspace = true
-opentelemetry-proto = { workspace = true, optional = true }
-prost = { workspace = true, optional = true }
 psl.workspace = true
 rand.workspace = true
 reqwest.workspace = true
@@ -94,14 +91,14 @@ storage-sqlite = { workspace = true, features = ["test-support"] }
 tokio-tungstenite.workspace = true
 keyring-core.workspace = true
 marmot-forensics.workspace = true
+marmot-observability = { workspace = true, features = ["test-support"] }
 nostr-relay-builder.workspace = true
 openmls.workspace = true
 openmls_basic_credential.workspace = true
 openmls_rust_crypto.workspace = true
+opentelemetry-proto.workspace = true
 parking_lot = "0.12"
-proc-macro2.workspace = true
-quote.workspace = true
-syn = { workspace = true, features = ["visit"] }
+prost.workspace = true
 tls_codec.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

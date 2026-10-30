@@ -732,6 +732,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::disallowed_methods)]
     async fn upload_snapshot_excludes_unfinished_tail_and_recovers_it_later() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit-active.jsonl");
@@ -764,6 +765,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::disallowed_methods)]
     async fn upload_snapshot_keeps_the_opened_file_across_path_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit-active.jsonl");
