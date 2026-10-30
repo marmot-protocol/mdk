@@ -195,8 +195,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   pin, mute and archive the same on the account's devices, from the first maintenance pass after this device trusts a
   device group. A pass is one storage transaction (`sync_small_state`): a local state that differs from what this
   device last observed is its user's change, so no setter needs a hook and leaving a chat is never a change. Archives
-  go through `set_group_archived_unobserved`, keeping the worker's in-memory account state authoritative (mdk#178).
-  Each chat a pass changes gets one chat-list update through `pending_projection_updates`. The merge rule's tie-break
+  go through the worker's in-memory account state (`apply_sibling_archives`, one save, mdk#178) and, like pins and
+  mutes from siblings, record no product outcome. Each chat a pass changes gets one chat-list update through `pending_projection_updates`. The merge rule's tie-break
   (`tie_break`), its placement of a new pin (`new_pin_index`) and the broadcast schedule (`broadcast_due`) are each one
   function; change them nowhere else. Recovery is a broadcast of every held item, with no stopping condition and
   nothing tracked per sibling: at start, daily, when the device-group tip passes the app-payload window since the last
@@ -636,7 +636,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `wiring.rs`. Hosts can name `ProductAnalytics`, `AppPerformanceTelemetry`, `ProductObservation`, `DiagnosticsPermit`
   and `AuditOtlpSender`, so do not make their crate-private methods `pub` and do not call them from outside the
   moving set; add the method to a view or to `wiring.rs`. Items the rest of the crate names from a private module
-  in the set are `pub` there.
+  in the set are `pub` there. An operation recorded as one product outcome runs its body through
+  `ProductRecorder::observed` and an outcome rule (`success_or_failure`, `confirmed_or_failure`, `send_outcome` or
+  its own); do not write an `_unobserved` twin beside it.
 - Tests in the moving set need nothing else from this crate. Tests that need a `MarmotApp`, its runtime or the
   network-proxy policy live in `src/observability_tests/`, one module per set file, and reach the set as the rest of
   the crate does, plus the fixtures in `observability_test_support.rs` and the `_for_test` hooks. Those are gated

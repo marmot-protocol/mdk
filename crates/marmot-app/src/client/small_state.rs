@@ -156,29 +156,13 @@ impl AppClient {
         )?;
         let mut recorded = outcome.recorded;
         let mut changed = outcome.applied;
-        let mut archives_applied = false;
-        for (group_id_hex, archived) in outcome.archive_to_apply {
-            let applied = hex::decode(&group_id_hex)
-                .map_err(AppError::from)
-                .and_then(|group_id| {
-                    self.set_group_archived_unobserved(&GroupId::new(group_id), archived)
-                });
-            match applied {
-                Ok(_) => {
-                    archives_applied = true;
-                    changed
-                        .entry(group_id_hex)
-                        .or_default()
-                        .insert(SmallStateItemName::Archive);
-                }
-                // The next pass tries again.
-                Err(error) => tracing::warn!(
-                    target: TRACE_TARGET,
-                    method = "sync_small_state",
-                    error_kind = error.privacy_safe_kind(),
-                    "a sibling's archive was not applied"
-                ),
-            }
+        let archived = self.apply_sibling_archives(outcome.archive_to_apply);
+        let archives_applied = !archived.is_empty();
+        for group_id_hex in archived {
+            changed
+                .entry(group_id_hex)
+                .or_default()
+                .insert(SmallStateItemName::Archive);
         }
         // At once, before this device's user can change the chats again:
         // record the archives as applied, so a later change is taken for
@@ -206,6 +190,63 @@ impl AppClient {
             );
         }
         self.announce_small_state_changes(changed)
+    }
+
+    /// Apply the archive states siblings' items won with, in the worker's
+    /// in-memory account state as every archive is (mdk#178), and save them
+    /// once. A sibling's archive is not this device's user archiving a chat,
+    /// so it records no product outcome, as a sibling's pin or mute records
+    /// none. If the save fails, every flag goes back and the next pass tries
+    /// again. Returns the chats it archived or unarchived.
+    fn apply_sibling_archives(&mut self, archives: Vec<(String, bool)>) -> Vec<String> {
+        let mut previous = Vec::new();
+        for (group_id_hex, archived) in archives {
+            let Some(group) = self
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id_hex == group_id_hex)
+            else {
+                // The next pass tries again.
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "apply_sibling_archives",
+                    "a sibling's archive names no group here"
+                );
+                continue;
+            };
+            previous.push((group_id_hex, group.archived));
+            group.archived = archived;
+        }
+        if previous.is_empty() {
+            return Vec::new();
+        }
+        for (group_id_hex, _) in &previous {
+            self.mark_group_projection_dirty_hex(group_id_hex.clone());
+        }
+        if let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears() {
+            for (group_id_hex, archived) in &previous {
+                if let Some(group) = self
+                    .state
+                    .groups
+                    .iter_mut()
+                    .find(|group| group.group_id_hex == *group_id_hex)
+                {
+                    group.archived = *archived;
+                }
+            }
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "apply_sibling_archives",
+                error_kind = error.privacy_safe_kind(),
+                "siblings' archives were not applied"
+            );
+            return Vec::new();
+        }
+        previous
+            .into_iter()
+            .map(|(group_id_hex, _)| group_id_hex)
+            .collect()
     }
 
     /// One chat-list update for each chat a pass changed.

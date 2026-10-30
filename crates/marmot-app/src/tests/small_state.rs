@@ -169,6 +169,72 @@ async fn an_unarchive_right_after_a_siblings_archive_is_this_devices_change() {
     assert_eq!(owed[0].version.unwrap().version, 2);
 }
 
+/// A pass saves its siblings' archives together. If that save fails, every
+/// flag goes back, hosts hear of none, and the next pass applies them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn siblings_archives_are_saved_together_or_not_at_all() {
+    let mut devices = phone_and_laptop().await;
+    let (_bob_dir, chat) =
+        chat_with_bob(&devices.phone_app, &mut devices.phone, &devices.relay).await;
+    let notes = devices.phone.create_group("Notes", &[]).await.unwrap();
+    link(&mut devices).await;
+    let app = devices.phone_app.clone();
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    let phone = &mut devices.phone;
+    phone.sync_small_state(&[]).unwrap();
+    phone.take_pending_projection_updates();
+
+    // The save fails on the second chat it archives.
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_archive BEFORE UPDATE OF archived ON account_groups
+             WHEN NEW.archived = 1 AND NEW.group_id_hex = '{}'
+             BEGIN SELECT RAISE(FAIL, 'injected archive save failure'); END;",
+            hex::encode(notes.as_slice())
+        ))
+        .unwrap();
+    let archives = [&chat, &notes].map(|group| {
+        sibling_value(
+            &hex::encode(group.as_slice()),
+            SmallStateValue::Archive(true),
+        )
+    });
+    phone.sync_small_state(&archives).unwrap();
+    for group in [&chat, &notes] {
+        assert!(!phone.state_group_record(group).unwrap().archived);
+    }
+    assert!(triggers(phone).is_empty());
+
+    connection
+        .execute_batch("DROP TRIGGER fail_archive")
+        .unwrap();
+    phone.sync_small_state(&[]).unwrap();
+    for group in [&chat, &notes] {
+        assert!(phone.state_group_record(group).unwrap().archived);
+    }
+    let announced: BTreeMap<_, _> = triggers(phone).into_iter().collect();
+    let expected: BTreeMap<_, _> = [&chat, &notes]
+        .map(|group| {
+            (
+                hex::encode(group.as_slice()),
+                ChatListUpdateTrigger::ArchiveChanged,
+            )
+        })
+        .into();
+    assert_eq!(announced, expected);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pin_for_an_archived_chat_is_applied_once_it_is_unarchived() {
     let mut devices = phone_and_laptop().await;
