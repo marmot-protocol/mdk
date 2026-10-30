@@ -326,6 +326,21 @@ where
         Ok(withdrawal)
     }
 
+    /// The retained outbound Welcomes of `group_id` answering the KeyPackage
+    /// published as `key_package_event_id` (see
+    /// `Engine::sent_welcomes_for_key_package`), for a caller that lost a
+    /// Welcome's id and still has to withdraw it. Like withdrawal, it works
+    /// before hydration reaches the group.
+    pub fn welcomes_for_key_package(
+        &self,
+        group_id: &GroupId,
+        key_package_event_id: &cgka_traits::MessageId,
+    ) -> AccountResult<Vec<cgka_traits::MessageId>> {
+        Ok(self
+            .session
+            .sent_welcomes_for_key_package(group_id, key_package_event_id)?)
+    }
+
     /// Retained outbound Welcome obligations that have not met their
     /// acknowledgement policy. Unlike app projections, this list is rooted in
     /// the engine transaction that made the corresponding group state

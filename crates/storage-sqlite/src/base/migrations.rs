@@ -2375,7 +2375,7 @@ mod tests {
         // Call serde_json directly to pin the v1 envelope. The current
         // `StoredMessagePayload::encode` intentionally emits binary v2.
         let payload =
-            serde_json::to_vec(&StoredMessagePayload::outbound_welcome(transport)).unwrap();
+            serde_json::to_vec(&StoredMessagePayload::outbound_welcome(transport, None)).unwrap();
         MessageRecord {
             id: message_id,
             group_id: group_id.clone(),

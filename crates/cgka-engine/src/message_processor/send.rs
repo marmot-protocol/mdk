@@ -551,7 +551,16 @@ impl<S: StorageProvider> Engine<S> {
                 self.peeler.wrap_welcome(&payload, &recipient).await
             }
             .map_err(EngineError::Peeler)?;
-            self.record_staged_invite_welcome(&wrapped, commit_id, group_id, source_epoch)?;
+            self.record_staged_invite_welcome(
+                &wrapped,
+                commit_id,
+                source_kp
+                    .source
+                    .as_ref()
+                    .map(|source| source.event_id.clone()),
+                group_id,
+                source_epoch,
+            )?;
             welcomes.push(wrapped);
         }
         Ok(welcomes)

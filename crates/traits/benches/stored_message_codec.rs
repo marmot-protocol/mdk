@@ -4,16 +4,19 @@ use cgka_traits::types::{MemberId, MessageId};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 fn representative_welcome() -> StoredMessagePayload {
-    StoredMessagePayload::outbound_welcome(TransportMessage {
-        id: MessageId::new(vec![0x11; 32]),
-        payload: vec![0xA5; 16_727],
-        timestamp: Timestamp(1_723_456_789),
-        causal_deps: Vec::new(),
-        source: TransportSource("nostr".to_owned()),
-        envelope: TransportEnvelope::Welcome {
-            recipient: MemberId::new(vec![0x22; 32]),
+    StoredMessagePayload::outbound_welcome(
+        TransportMessage {
+            id: MessageId::new(vec![0x11; 32]),
+            payload: vec![0xA5; 16_727],
+            timestamp: Timestamp(1_723_456_789),
+            causal_deps: Vec::new(),
+            source: TransportSource("nostr".to_owned()),
+            envelope: TransportEnvelope::Welcome {
+                recipient: MemberId::new(vec![0x22; 32]),
+            },
         },
-    })
+        Some(MessageId::new(vec![0x33; 32])),
+    )
 }
 
 fn codecs(c: &mut Criterion) {

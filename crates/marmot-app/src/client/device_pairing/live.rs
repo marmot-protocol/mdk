@@ -31,7 +31,7 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr::prelude::PublicKey;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome, DeviceLinkRecord};
+use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome, DeviceLinkRecord, LinkedKeyPackage};
 use transport_nostr_adapter::pairing::{
     InboundPairingMessage, PairingEventError, read_pairing_rumor, wrap_pairing_message,
 };
@@ -1114,21 +1114,25 @@ impl AppClient {
         let leaf_signature_key = marmot_session::key_package_metadata(&key_package)
             .map_err(|_| AppError::DeviceGroupRefused("key_package_not_confirmed"))?
             .leaf_signature_key;
-        let earlier_welcomes = self.sent_welcome_ids()?;
-        let group_id_hex = hex::encode(link.device_group_id.as_slice());
-        let slot_hex = hex::encode(slot);
-        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let key_package_event_id_hex = hex::encode(link.key_package_event_id.as_bytes());
         // Record the approval before its commit, so no crash can lose it,
-        // with the leaf it adds: the new device's first commit sets that key
-        // as its tag key, and a failed link removes that leaf. One whose
-        // commit never lands fails.
-        storage.record_device_link(
-            &group_id_hex,
-            &slot_hex,
-            &key_package_ref_hex,
-            &hex::encode(&leaf_signature_key),
-            now,
-        )?;
+        // with the KeyPackage's event id, which names the link's Welcome, and
+        // the leaf it adds: the new device's first commit sets that key as
+        // its tag key, and a failed link removes that leaf. One whose commit
+        // never lands fails.
+        self.app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .record_device_link(
+                &hex::encode(link.device_group_id.as_slice()),
+                &hex::encode(slot),
+                LinkedKeyPackage {
+                    key_package_ref_hex: &key_package_ref_hex,
+                    key_package_event_id_hex: &key_package_event_id_hex,
+                    leaf_signature_key_hex: &hex::encode(&leaf_signature_key),
+                },
+                now,
+            )?;
         match roster_update {
             Some(update) => {
                 self.link_device_into_group(&link.device_group_id, key_package, update)
@@ -1136,7 +1140,7 @@ impl AppClient {
             }
             None => {
                 let confirmed = ConfirmedDeviceLink {
-                    key_package_event_id_hex: hex::encode(link.key_package_event_id.as_bytes()),
+                    key_package_event_id_hex,
                     key_package_ref_hex,
                     device_group_id: link.device_group_id.clone(),
                     welcome_sender_key: link.welcome_sender_key.as_slice().to_vec(),
@@ -1144,48 +1148,27 @@ impl AppClient {
                 self.create_device_group(&confirmed, choices).await?;
             }
         }
-        // The commit is made, so a failed read or write here must not end the
-        // link as though it were not: the link's gate never reads its Welcome,
-        // which is published only to reach the new device. With no Welcome
-        // recorded, a link that fails withdraws none; the new device refuses
-        // a Welcome once its wait ended.
-        let welcomes: HashSet<MessageId> = match self.sent_welcome_ids() {
-            Ok(sent) => sent.difference(&earlier_welcomes).cloned().collect(),
+        // The commit is made, so a failed read here must not end the link as
+        // though it were not: the link's gate never reads its Welcome, which
+        // is published only to reach the new device. A link that fails finds
+        // its Welcome by the KeyPackage's event id again to withdraw it.
+        let event_id = MessageId::new(link.key_package_event_id.as_bytes().to_vec());
+        let welcomes: HashSet<MessageId> = match self
+            .runtime
+            .welcomes_for_key_package(&link.device_group_id, &event_id)
+        {
+            Ok(welcomes) => welcomes.into_iter().collect(),
             Err(error) => {
                 tracing::warn!(
                     target: TARGET,
                     method = "add_linked_device",
-                    error_kind = error.privacy_safe_kind(),
-                    "could not read a link's Welcomes; none is published again"
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not read a link's Welcome; it is not published again"
                 );
                 HashSet::new()
             }
         };
-        // A link adds one KeyPackage, so it sends one Welcome.
-        if let [welcome] = welcomes.iter().collect::<Vec<_>>().as_slice()
-            && let Err(error) = storage.record_device_link_welcome(
-                &group_id_hex,
-                &slot_hex,
-                &hex::encode(welcome.as_slice()),
-            )
-        {
-            tracing::warn!(
-                target: TARGET,
-                method = "add_linked_device",
-                error_kind = AppError::from(error).privacy_safe_kind(),
-                "could not record a link's Welcome; a failed link withdraws none"
-            );
-        }
         Ok((link.device_group_id.clone(), welcomes))
-    }
-
-    /// The ids of every Welcome this device's engine tracks as sent.
-    fn sent_welcome_ids(&self) -> Result<HashSet<MessageId>, AppError> {
-        Ok(self
-            .runtime
-            .tracked_outbound_welcome_ids()?
-            .into_iter()
-            .collect())
     }
 
     /// Add the confirmed KeyPackage to the device group in one commit that
@@ -1481,8 +1464,8 @@ impl AppClient {
         own_slot: &DeviceSlotId,
         failed_now: bool,
     ) {
-        if let Some(welcome_id) = &link.welcome_id_hex {
-            self.withdraw_failed_link_welcome(link, welcome_id, failed_now);
+        if !link.welcome_withdrawn {
+            self.withdraw_failed_link_welcome(link, failed_now);
         }
         let result = async {
             let group_id = GroupId::new(hex::decode(&link.group_id_hex)?);
@@ -1497,31 +1480,14 @@ impl AppClient {
             if !listed {
                 return Ok(());
             }
-            // Only a quiet group's members say whether the leaf is still
-            // there: a removal kept to retry has already left it out of them.
-            let quiet = matches!(
-                self.runtime.epoch_state(&group_id),
-                Some(EpochState::Stable { .. })
-            ) && !self.runtime.has_pending_convergence_inputs(&group_id)?;
-            if !quiet {
-                return Ok(());
-            }
-            let leaf_signature_key = hex::decode(&link.leaf_signature_key_hex)?;
-            let has_leaf = self.stored_group(&group_id)?.is_some_and(|group| {
-                group
-                    .members
-                    .iter()
-                    .any(|member| member.credential == leaf_signature_key)
-            });
-            let operations = vec![DeviceRosterOperationV1::RemoveDevice(slot)];
-            if !has_leaf {
-                // No leaf to remove: write the entry away alone.
-                return self
-                    .commit_device_roster_update(group_id, operations, "unlink_device")
-                    .await;
-            }
-            self.unlink_device_from_group(&group_id, leaf_signature_key, operations)
-                .await
+            // The engine reads its own tree for the leaf and removes it only
+            // if it is there; the entry goes either way.
+            self.unlink_device_from_group(
+                &group_id,
+                hex::decode(&link.leaf_signature_key_hex)?,
+                vec![DeviceRosterOperationV1::RemoveDevice(slot)],
+            )
+            .await
         }
         .await;
         match result {
@@ -1547,44 +1513,39 @@ impl AppClient {
         }
     }
 
-    /// Withdraw a failed link's Welcome and forget it once withdrawn. A
-    /// Welcome the engine no longer retains is withdrawn: nothing can
-    /// publish it. Any other failure keeps it to withdraw on the next drive.
-    fn withdraw_failed_link_welcome(
-        &mut self,
-        link: &DeviceLinkRecord,
-        welcome_id: &str,
-        failed_now: bool,
-    ) {
-        let result = hex::decode(welcome_id)
-            .map_err(AppError::from)
-            .and_then(
-                |id| match self.runtime.withdraw_welcome(&MessageId::new(id)) {
-                    Ok(_) => Ok(()),
-                    Err(error) => match AppError::from(error) {
-                        error
-                            if matches!(
-                                error.as_engine_error(),
-                                Some(EngineError::Storage(StorageError::NotFound))
-                            ) =>
-                        {
-                            Ok(())
-                        }
-                        error => Err(error),
-                    },
-                },
-            )
-            .and_then(|()| {
-                self.app
-                    .account_storage(&self.state.label)?
-                    .app_storage()
-                    .clear_failed_device_link_welcome(
-                        &link.group_id_hex,
-                        &link.slot_hex,
-                        welcome_id,
-                    )?;
-                Ok(())
-            });
+    /// Withdraw a failed link's Welcome, found by its KeyPackage's event id,
+    /// and record it withdrawn. The lookup needs nothing written after the
+    /// commit, so a crash right after it still leaves the Welcome to find. A
+    /// Welcome the engine no longer retains is withdrawn: nothing can publish
+    /// it. Any other failure leaves it to withdraw on the next drive.
+    fn withdraw_failed_link_welcome(&mut self, link: &DeviceLinkRecord, failed_now: bool) {
+        let result = (|| -> Result<(), AppError> {
+            let group_id = GroupId::new(hex::decode(&link.group_id_hex)?);
+            let event_id = MessageId::new(hex::decode(&link.key_package_event_id_hex)?);
+            for welcome in self
+                .runtime
+                .welcomes_for_key_package(&group_id, &event_id)?
+            {
+                match self
+                    .runtime
+                    .withdraw_welcome(&welcome)
+                    .map_err(AppError::from)
+                {
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.as_engine_error(),
+                            Some(EngineError::Storage(StorageError::NotFound))
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            self.app
+                .account_storage(&self.state.label)?
+                .app_storage()
+                .mark_device_link_welcome_withdrawn(&link.group_id_hex, &link.slot_hex)?;
+            Ok(())
+        })();
         if let Err(error) = result {
             if failed_now {
                 tracing::warn!(
