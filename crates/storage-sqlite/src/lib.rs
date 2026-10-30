@@ -116,8 +116,8 @@ pub use app::recovery_staging::{
 pub use app::recovery_units::{
     RecoveryAccountUsage, RecoveryParkedRoute, RecoveryRecheckPass, RecoveryRelayCaps,
     RecoveryRelayHealth, RecoveryRouteRemainder, RecoverySpanRetirement, RecoveryUnit,
-    RecoveryUnitBreak, RecoveryUnitOutcome, RecoveryUnitPark, RecoveryUnitPolicy, RecoveryUnitSpan,
-    RecoveryUnitState,
+    RecoveryUnitBreak, RecoveryUnitFence, RecoveryUnitOutcome, RecoveryUnitPark,
+    RecoveryUnitPolicy, RecoveryUnitSpan, RecoveryUnitState,
 };
 pub use app::sign_ins::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord};
 pub use app::timeline::{

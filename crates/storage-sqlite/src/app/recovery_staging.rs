@@ -6,8 +6,9 @@
 //! loses nothing and refetches nothing: the ledger-derived cursor is past the
 //! slice and its events are durable. Staging is not admission. A staged row
 //! leaves only once its event is in the seen index, or, when it no longer
-//! decodes, by un-covering its second so the history is fetched again. Rows
-//! are encoded like spill rows, in the account's encrypted database.
+//! decodes or its route is no longer swept, by un-covering its second so the
+//! history is fetched again. Rows are encoded like spill rows, in the
+//! account's encrypted database.
 //!
 //! Only the recovery runner stages, and nothing starts it yet. Route ids,
 //! relay URLs and event ids are account-private and must never be logged.
@@ -28,6 +29,7 @@ use crate::{
 use cgka_traits::TransportDelivery;
 use cgka_traits::storage::StorageResult;
 use rusqlite::{OptionalExtension, params};
+use std::collections::BTreeSet;
 
 /// Artifact-local version of the `metadata` encoding, as for spill rows.
 const STAGED_FORMAT: i64 = 1;
@@ -302,6 +304,38 @@ impl SqliteAppStorage {
         })
     }
 
+    /// Give back what `routes` staged, routes the runner no longer lists:
+    /// their rows go, and each row's second is un-covered on its route, as
+    /// for a row that no longer decodes, so a route that comes back fetches it
+    /// again. Returns the rows removed.
+    pub fn reclaim_staged_recovery_routes(
+        &self,
+        routes: &[TransportReconciliationRoute],
+    ) -> StorageResult<usize> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let mut removed = 0;
+            for route in routes {
+                let (kind, id) = route.storage_key();
+                let seconds = conn
+                    .prepare_cached(
+                        "DELETE FROM account_recovery_staged WHERE route_kind = ?1 AND route_id = ?2
+                         RETURNING created_at_seconds",
+                    )
+                    .storage()?
+                    .query_map(params![kind, id], |row| row.get::<_, i64>(0))
+                    .storage()?
+                    .collect::<Result<Vec<_>, _>>()
+                    .storage()?;
+                removed += seconds.len();
+                for second in seconds.into_iter().collect::<BTreeSet<_>>() {
+                    uncover_second_tx(&conn, route, i64_to_u64(second)?)?;
+                }
+            }
+            Ok(removed)
+        })
+    }
+
     /// What is staged on `routes` (a group's routes), from `relay` when given.
     pub fn staged_recovery_usage(
         &self,
@@ -324,6 +358,25 @@ impl SqliteAppStorage {
             usage.bytes = usage.bytes.saturating_add(i64_to_u64(bytes)?);
         }
         Ok(usage)
+    }
+
+    /// The routes that have staged events.
+    pub fn staged_recovery_routes(&self) -> StorageResult<Vec<TransportReconciliationRoute>> {
+        self.lock()?
+            .prepare_cached(
+                "SELECT DISTINCT route_kind, route_id FROM account_recovery_staged
+                 ORDER BY route_kind, route_id",
+            )
+            .storage()?
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .storage()?
+            .map(|row| {
+                let (kind, id) = row.storage()?;
+                route_from(kind, &id)
+            })
+            .collect()
     }
 
     /// Everything staged on the account.

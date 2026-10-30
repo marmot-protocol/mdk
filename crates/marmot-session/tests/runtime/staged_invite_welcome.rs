@@ -563,3 +563,78 @@ async fn staged_invite_welcome_goes_out_again_after_its_fanout_expires() {
             .is_empty()
     );
 }
+
+/// mdk#2628 3.5a: a host that names an invite's Welcomes by id has the
+/// runtime publish only those the engine owes. One staged with its retained
+/// commit waits, an owed one goes out, and once delivered it is skipped.
+#[tokio::test]
+async fn welcomes_named_by_id_go_out_only_while_owed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut invite = retained_invite(dir.path()).await;
+    let ids = [invite.welcome.id.clone()];
+
+    let staged = invite
+        .runtime
+        .deliver_owed_welcomes_with_audit_context(
+            &ids,
+            invite.group_id.clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert!(staged.welcome_failures.is_empty());
+    assert!(
+        staged_welcome_publishes(&invite.adapter).is_empty(),
+        "no Welcome may be published before its Add commit confirms"
+    );
+
+    invite.confirm_commit().await;
+    for _ in 0..2 {
+        let effects = invite
+            .runtime
+            .deliver_owed_welcomes_with_audit_context(
+                &ids,
+                invite.group_id.clone(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert!(effects.welcome_failures.is_empty());
+    }
+    let sent = staged_welcome_publishes(&invite.adapter);
+    assert_eq!(sent.len(), 1, "a delivered Welcome is not sent again");
+    assert_eq!(sent[0].id, ids[0]);
+    assert!(
+        invite
+            .runtime
+            .outstanding_welcome_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A Welcome withdrawn while owed is skipped when a host names it by id.
+#[tokio::test]
+async fn a_withdrawn_welcome_named_by_id_stays_unsent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut invite = retained_invite(dir.path()).await;
+    let ids = [invite.welcome.id.clone()];
+    invite.confirm_commit().await;
+    assert_eq!(
+        invite.runtime.withdraw_welcome(&ids[0]).unwrap(),
+        WelcomeWithdrawal::Withdrawn
+    );
+
+    let effects = invite
+        .runtime
+        .deliver_owed_welcomes_with_audit_context(
+            &ids,
+            invite.group_id.clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert!(effects.welcome_failures.is_empty());
+    assert!(effects.failures.is_empty());
+    assert!(staged_welcome_publishes(&invite.adapter).is_empty());
+}
