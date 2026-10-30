@@ -321,7 +321,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`ReplayEndpointView::streaming`: the relay client still names the connection its serial started on); a count
   that is not streaming is recorded as ended. A tail can outlive its REQ by the time the adapter takes to process
   notifications already queued for that relay, an accepted limit: a forwarder that falls behind records loss, which
-  breaks it, and a tail never reaches the ledger. Read tails at every debt read; they lapse without an event. Debt that drives work reads the ledger only up to
+  breaks it, and a tail never reaches the ledger. Read tails at every debt read; they lapse without an event. A route whose group's live frames
+  the adapter's fence holds gets no live boundary until they are released, while its tail stands. Debt that drives work reads the ledger only up to
   `LiveTails::owed_until`, refreshed by `AppClient::live_tails`; without it an idle connected account owes its own
   live frames. Storage keeps a released receipt's second out of every live boundary, and a tail starts past the
   newest one on its route; only a fetch proof covers it, on its own relay. Live-boundary tests live in
@@ -361,7 +362,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   engine kept no trace of. Nothing is swept, compared or re-checked for a group admission cannot drain (held, or
   admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences; the fence is a query
   (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own
-  `LiveCount`, never the coverage recorder's facts. Logs carry aggregates only.
+  `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
+  with the adapter's fence ticket and held routes; `fence_live_frames` answers with that ticket. Nothing calls
+  them or `enable_live_fences` before the switch-over. Logs carry aggregates only.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown

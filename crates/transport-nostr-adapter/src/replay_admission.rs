@@ -88,6 +88,40 @@ pub struct ReplayLiveCount {
     pub live_from: u64,
 }
 
+impl ReplayLiveCount {
+    /// The relay sent a full replay page or more before EOSE, so it may have
+    /// clamped the reply. Native paging fetches such a window backwards; its
+    /// count never fences.
+    pub fn clamped(&self) -> bool {
+        self.events >= RELAY_REPLAY_PAGE_LIMIT
+    }
+}
+
+/// Which live counts an owner's observation could see as facts: read from the
+/// [`ReplayAdmissionStatus`] its fences were computed from. A fence plan
+/// answers only the counts its ticket covers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplayFenceTicket(pub(super) u64);
+
+/// One group's fence on its live frames, by any of the group's routes. Not
+/// `Debug`: it carries the route.
+#[derive(Clone, Copy)]
+pub struct ReplayFence {
+    /// A routing id of the group.
+    pub route: [u8; 32],
+    /// Frames sent before this second may be released; the rest stay held.
+    pub release_before: u64,
+}
+
+/// The account owner's fences on its groups' live frames (mdk#2660), as of
+/// the observation `ticket` came from. A group the plan does not name is not
+/// fenced by the owner. Not `Debug`: it carries routes.
+#[derive(Clone)]
+pub struct ReplayFencePlan {
+    pub ticket: ReplayFenceTicket,
+    pub fences: Vec<ReplayFence>,
+}
+
 /// A generation's count that ended while its boundary was admitted: the relay
 /// closed the REQ, or the connection dropped.
 #[derive(Clone, Copy)]
@@ -167,8 +201,34 @@ impl ReplayRequestView<'_> {
                         .iter()
                         .any(|delivery| delivery.group_id_hint.is_none())
             }
-            ReplayScope::Groups(_) => self.coverage.request_groups_placed(self.id),
+            ReplayScope::Groups(_) => self.coverage.request_groups_placed(self.id, false),
         }
+    }
+
+    /// [`Self::placed`], except that a group whose only buffered frames a
+    /// fence holds counts as placed: a fence holds one group, never the
+    /// request. Those groups' routes are [`Self::fenced_routes`], and nothing
+    /// on them is placed above the hold.
+    pub fn placed_apart_from_fences(&self) -> bool {
+        match &self.window.scope {
+            ReplayScope::Inbox => self.placed(),
+            ReplayScope::Groups(_) => self.coverage.request_groups_placed(self.id, true),
+        }
+    }
+
+    /// The routes this request carries whose group's live frames a fence
+    /// holds: their input is not placed while it does, even when
+    /// [`Self::placed_apart_from_fences`] holds for the rest of the request.
+    pub fn fenced_routes(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.coverage
+            .request_groups
+            .get(self.id)
+            .into_iter()
+            .flatten()
+            .filter_map(|group_id| self.coverage.groups.get(group_id))
+            .filter(|group| group.held_from().is_some())
+            .filter_map(|group| group.routes.get(self.id))
+            .flatten()
     }
 
     /// Every issued peer terminally refused this live request. Such a source
@@ -189,15 +249,24 @@ impl ReplayRequestView<'_> {
 impl AccountReplayCoverage {
     /// Every MLS group request `id` routes has reached durable placement and
     /// ordinary native admission: nothing for those groups is buffered, queued
-    /// natively, pinned or waiting in the outbox.
-    pub(super) fn request_groups_placed(&self, id: &str) -> bool {
+    /// natively, pinned or waiting in the outbox, except, when `held_placed`,
+    /// frames a fence holds.
+    pub(super) fn request_groups_placed(&self, id: &str, held_placed: bool) -> bool {
         self.request_groups.get(id).is_some_and(|groups| {
             !groups.is_empty()
                 && groups.iter().all(|group_id| {
                     self.groups.get(group_id).is_some_and(|group| {
                         self.group_ready(group)
-                            && group.events.is_empty()
-                            && group.placements == 0
+                            && group
+                                .events
+                                .values()
+                                .all(|event| held_placed && group.holds(event))
+                            && group.placements
+                                == if held_placed {
+                                    self.held_pins(group_id, group)
+                                } else {
+                                    0
+                                }
                             && !self.native_group_pending(group_id)
                             && !self
                                 .outbox
@@ -300,6 +369,39 @@ impl ReplayAdmissionStatus<'_> {
             .account_replay_coverage
             .get(self.account_id)
             .map_or(0, |coverage| coverage.wire_generation)
+    }
+
+    /// Which of this account's live counts this status shows as facts: hand
+    /// it back with the fences computed from them.
+    pub fn fence_ticket(&self) -> ReplayFenceTicket {
+        ReplayFenceTicket(
+            self._guard
+                .account_replay_coverage
+                .get(self.account_id)
+                .map_or(0, |coverage| coverage.fence_ticket),
+        )
+    }
+
+    /// The oldest frame a fence holds for this account at or after `floor`,
+    /// the second a restart already fetches from. A cursor commit stops there,
+    /// so a restart fetches it again.
+    pub fn fence_held_since(&self, floor: u64) -> Option<u64> {
+        self._guard
+            .account_replay_coverage
+            .get(self.account_id)
+            .and_then(|coverage| coverage.fence_held_since(floor))
+    }
+
+    /// The routes of every group whose live frames a fence holds now, a route
+    /// once per request that carries it. Allocates nothing.
+    pub fn fenced_routes(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self._guard
+            .account_replay_coverage
+            .get(self.account_id)
+            .into_iter()
+            .flat_map(|coverage| coverage.groups.values())
+            .filter(|group| group.held_from().is_some())
+            .flat_map(|group| group.routes.values().flatten())
     }
 
     /// This iterator and its endpoint views allocate nothing.
