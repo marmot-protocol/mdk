@@ -182,11 +182,7 @@ impl RunnerHost for AccountRunnerHost {
     }
 
     async fn relay_caps(&self, relay: &str) -> Option<RelayCaps> {
-        let caps = self.relay_caps.caps(relay, self.allow_loopback).await;
-        // The cache folds an unknown read into the default caps. Read those as
-        // unknown, which is never evidence of a change, until the read tells
-        // them apart (PR 5b).
-        (caps != RelayCaps::default()).then_some(caps)
+        self.relay_caps.caps(relay, self.allow_loopback).await
     }
 
     fn sweep_relay(
