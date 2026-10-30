@@ -240,6 +240,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 - SQLite `delete_group` now joins a caller's transaction instead of failing inside one. A current-profile group
   creation that failed after writing its MLS state used to leave that state behind, because its cleanup ran
   `delete_group` inside a transaction and only logged the failure; the group id stayed taken.
+- A device whose link failed can link again into the same device group (mdk#2628 item 3.3b). It forgets its removed
+  copy, and the engine refused the next link's Welcome into a forgotten group unless the existing device's clock dated
+  it after the forget. A Welcome a device link waits for is now held to that link alone: the existing device's leaf key
+  and the confirmed `KeyPackageRef`. A new device no longer starts a link by a KeyPackage it already joined by; it
+  waits for the replacement's publication. Only test-policy builds reach device groups.
 - `groups management` and the TUI group detail screen offer no member actions on a device that was removed while another
   device of its account stays in the group (mdk#2628). Both used to read that account's roster entry as this device, so
   the TUI could mark it "(you)" and refuse to leave as the group's only admin.
