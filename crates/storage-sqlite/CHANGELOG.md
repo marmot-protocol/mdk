@@ -4,6 +4,12 @@
 
 ### Breaking changes
 
+- `SqliteAccountStorage` implements the new
+  `DeviceGroupWelcomeStorage::device_group_welcome_expectations`, which lists
+  every stored expectation, expired ones included (mdk#2628 item 3.3b, D41).
+  An expectation's record gains `key_package_ref`, the confirmed KeyPackage's
+  `KeyPackageRef`; a record stored before it reads with an empty ref. No
+  migration: the field lives in the stored record.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`

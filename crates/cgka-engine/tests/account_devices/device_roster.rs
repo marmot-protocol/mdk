@@ -67,15 +67,21 @@ fn build_roster_device(
     Device { engine, storage }
 }
 
-/// `joiner` expects `author`'s Welcome into the device group `gid`, as a
-/// confirmed device link makes it (mdk#2628 D28, D30). The engine joins a
-/// device group only through such a Welcome.
-pub(super) fn expect_link_welcome(joiner: &mut Device, gid: &GroupId, author: &Device) {
+/// `joiner` expects `author`'s Welcome into the device group `gid`, adding
+/// it by `key_package`, as a confirmed device link makes it (mdk#2628 D28,
+/// D30, D41). The engine joins a device group only through such a Welcome.
+pub(super) fn expect_link_welcome(
+    joiner: &mut Device,
+    gid: &GroupId,
+    author: &Device,
+    key_package: &KeyPackage,
+) {
     joiner
         .engine
         .expect_device_group_welcome(&DeviceGroupWelcomeExpectation {
             group_id: gid.clone(),
             sender_signature_key: author.engine.own_signature_key(),
+            key_package_ref: key_package_ref(key_package),
             expires_at: u64::MAX,
         })
         .unwrap();
@@ -174,11 +180,13 @@ pub(super) async fn found_device_group(
         joiner_slots[0],
         announced_entry(initial, &joiner_slots[0], &key_package),
     )]);
+    let chosen = fresh_device_group_id();
+    expect_link_welcome(first, &chosen, creator, &key_package);
     let (gid, created) = creator
         .engine
         .create_group_with_chosen_id_and_audit_context(
             device_group_request(&founding, vec![key_package]),
-            fresh_device_group_id(),
+            chosen,
             Some(roster_update),
             NO_WELCOME_DEADLINE,
             None,
@@ -188,7 +196,6 @@ pub(super) async fn found_device_group(
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
-    expect_link_welcome(first, &gid, creator);
     assert_joins(first, &welcomes[0], &gid, creator).await;
     for index in 0..rest.len() {
         let (joined, waiting) = rest.split_at_mut(index);
@@ -199,6 +206,7 @@ pub(super) async fn found_device_group(
             joiner_slot,
             announced_entry(initial, &joiner_slot, &key_package),
         )]);
+        expect_link_welcome(joiner, &gid, creator, &key_package);
         let SendResult::GroupEvolution {
             msg,
             welcomes,
@@ -222,7 +230,6 @@ pub(super) async fn found_device_group(
         for member in joined.iter_mut() {
             assert_accepted(member, &commit, &gid).await;
         }
-        expect_link_welcome(joiner, &gid, creator);
         assert_joins(joiner, &welcomes[0], &gid, creator).await;
     }
     gid
@@ -263,6 +270,19 @@ pub(super) fn key_package_ref(key_package: &KeyPackage) -> Vec<u8> {
             .key_package_ref_hex,
     )
     .unwrap()
+}
+
+/// Whether `device` holds any OpenMLS state for `gid`.
+fn holds_mls_state(device: &Device, gid: &GroupId) -> bool {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, device.storage.mls_storage());
+    MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(gid.as_slice()),
+    )
+    .expect("load MLS group")
+    .is_some()
 }
 
 /// A device-group id no other founding in this test process uses.
@@ -388,7 +408,7 @@ async fn a_device_group_is_created_under_the_id_its_link_chose() {
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
-    expect_link_welcome(&mut laptop, &chosen, &phone);
+    expect_link_welcome(&mut laptop, &chosen, &phone, &key_package);
     assert_joins(&mut laptop, &welcomes[0], &chosen, &phone).await;
     let mut expected = initial.clone();
     expected
@@ -499,7 +519,11 @@ async fn a_device_groups_founding_add_sets_exactly_its_one_devices_entry() {
         assert!(refused.contains(error), "{case}: {refused}");
         assert!(
             phone.storage.get_group(&chosen).is_err(),
-            "{case}: nothing written"
+            "{case}: no group record"
+        );
+        assert!(
+            !holds_mls_state(&phone, &chosen),
+            "{case}: no MLS state ({refused})"
         );
     }
 
@@ -527,7 +551,7 @@ async fn a_device_groups_founding_add_sets_exactly_its_one_devices_entry() {
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
-    expect_link_welcome(&mut laptop, &gid, &phone);
+    expect_link_welcome(&mut laptop, &gid, &phone, &key_package);
     assert_joins(&mut laptop, &welcomes[0], &gid, &phone).await;
 }
 

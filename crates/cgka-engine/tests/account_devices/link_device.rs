@@ -143,7 +143,7 @@ async fn a_link_adds_the_device_and_writes_its_entry_in_one_commit() {
         CommitOrderingPriority::Privileged,
     )
     .await;
-    expect_link_welcome(&mut tablet, &gid, &phone);
+    expect_link_welcome(&mut tablet, &gid, &phone, &key_package);
     assert_joins(&mut tablet, &welcomes[0], &gid, &phone).await;
 
     expected.devices.insert(slot(3), tablet_entry);
@@ -689,7 +689,7 @@ async fn link_tablet(phone: &mut Device, laptop: &mut Device, gid: &GroupId) -> 
     };
     phone.engine.confirm_published(pending).await.unwrap();
     assert_accepted(laptop, &route_to_group(&msg, gid), gid).await;
-    expect_link_welcome(&mut tablet, gid, phone);
+    expect_link_welcome(&mut tablet, gid, phone, &key_package);
     assert_joins(&mut tablet, &welcomes[0], gid, phone).await;
     tablet
 }

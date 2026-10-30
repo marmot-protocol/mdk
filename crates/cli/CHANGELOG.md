@@ -141,6 +141,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   founding roster does not list, announcing the KeyPackage, and the founding Add meets the same sender rule as a link.
   Any other device-group founding with a member, and a roster update on any other create, is refused and leaves no
   group state behind. Reachable only in test-policy builds.
+- A new device now joins its device group only through a Welcome that adds it by the KeyPackage the link confirmed
+  (mdk#2628 item 3.3b, D41). `DeviceGroupWelcomeExpectation` gains `key_package_ref`, which `marmot-app` fills from
+  the confirmed link; an expectation stored without it matches no Welcome. While an expectation is unexpired, the
+  engine also refuses, with `EngineError::UnexpectedDeviceGroupWelcome`, a Welcome into any other group, a chat
+  included, that adds this device by that KeyPackage, so no other invite uses it up. Storage providers implement the
+  new `DeviceGroupWelcomeStorage::device_group_welcome_expectations`. Reachable only in test-policy builds.
 - The conformance simulator models `marmot.group.account-devices.v1` (0x800d) support per client (mdk#2628). Scenario
   IR v3 gains `set_account_devices_support`, `require_account_devices` and `expect_require_account_devices_error`, and
   vectors gain an `account_devices_state` expectation that checks the component's state rules on a client's exact

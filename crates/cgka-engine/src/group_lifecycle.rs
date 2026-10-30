@@ -1596,15 +1596,17 @@ impl<S: StorageProvider> Engine<S> {
             // 5f. A Welcome into a group that requires the device roster, or
             // into a group id a confirmed device link reserved, joins only as
             // that link's Welcome: into a device group, from the leaf whose
-            // signature key the link named, before its wait ends (mdk#2628
-            // D28, D30). The group id alone is no proof: anyone holding the
-            // account key can read it and found a group under it. The join
-            // consumes the expectation in this transaction.
+            // signature key the link named, adding this device by the
+            // KeyPackage the link confirmed, before its wait ends (mdk#2628
+            // D28, D30, D41). The group id alone is no proof: anyone holding
+            // the account key can read it and found a group under it. The
+            // join consumes the expectation in this transaction.
             let roster_required = crate::app_components::group_requires_device_roster(&mls_group)?;
             match storage.device_group_welcome_expectation(&group_id)? {
                 Some(expected)
                     if roster_required
                         && expected.sender_signature_key == welcome_sender_key
+                        && expected.key_package_ref == consumed_key_package_ref
                         && joined_at.0 < expected.expires_at =>
                 {
                     storage.delete_device_group_welcome_expectation(&group_id)?;
@@ -1612,6 +1614,20 @@ impl<S: StorageProvider> Engine<S> {
                 Some(_) => return Err(EngineError::UnexpectedDeviceGroupWelcome),
                 None if roster_required => return Err(EngineError::UnexpectedDeviceGroupWelcome),
                 None => {}
+            }
+            // While a link waits, the KeyPackage it confirmed is reserved for
+            // it: no Welcome into another group, a chat included, consumes
+            // it (D41).
+            if storage
+                .device_group_welcome_expectations()?
+                .iter()
+                .any(|waiting| {
+                    waiting.group_id != group_id
+                        && waiting.key_package_ref == consumed_key_package_ref
+                        && joined_at.0 < waiting.expires_at
+                })
+            {
+                return Err(EngineError::UnexpectedDeviceGroupWelcome);
             }
 
             if let Some(local_state_token) = confirmation_token {

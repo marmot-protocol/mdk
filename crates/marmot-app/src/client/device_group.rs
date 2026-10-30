@@ -439,10 +439,12 @@ impl AppClient {
 
     /// The new device's side of a confirmed link, before it sends its own
     /// confirmation: wait [`WELCOME_WAIT_SECS`] for the Welcome into the
-    /// device group the link names, from the leaf it names. The engine joins
-    /// that group only through that Welcome, and refuses every other Welcome
-    /// into its id meanwhile, so a group someone else founded under the id
-    /// never joins and never takes it.
+    /// device group the link names, from the leaf it names, adding this
+    /// device by the KeyPackage it confirmed. The engine joins that group only
+    /// through that Welcome, and refuses every other Welcome into its id
+    /// meanwhile, so a group someone else founded under the id never joins
+    /// and never takes it. Nor does any other Welcome that adds this device
+    /// by that KeyPackage, into any group (D41).
     ///
     /// The group must be new to this device. Its waiting row is written
     /// first and removed again if the engine cannot record the expectation.
@@ -461,6 +463,7 @@ impl AppClient {
         if self.stored_group(&link.device_group_id)?.is_some() {
             return Err(AppError::DeviceGroupRefused("device_group_exists"));
         }
+        let key_package_ref = hex::decode(&link.key_package_ref_hex)?;
         let group_id_hex = hex::encode(link.device_group_id.as_slice());
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         if !storage.insert_device_group(&DeviceGroupRecord {
@@ -476,6 +479,7 @@ impl AppClient {
             .expect_device_group_welcome(&DeviceGroupWelcomeExpectation {
                 group_id: link.device_group_id.clone(),
                 sender_signature_key: link.welcome_sender_key.clone(),
+                key_package_ref,
                 expires_at: now.saturating_add(WELCOME_WAIT_SECS),
             });
         if let Err(error) = expected {
