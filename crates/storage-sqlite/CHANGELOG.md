@@ -4,6 +4,25 @@
 
 ### Breaking changes
 
+- Migration 0136 advances account storage to schema 136 (mdk#2660 phase 4).
+  It adds `account_recovery_conversion`, the marker of the one-time upgrade
+  conversion (its next step, whether the changed "history may be incomplete"
+  notices still need announcing, whether a report is pending, and the shadow
+  rows and units the conversion counted), `account_recovery_conversion_counts`
+  (converted obligations by cause and disposition) and
+  `account_recovery_conversion_loss` (the loss watermarks of each account and
+  cause whose live loss it un-covered). Every database starts with the
+  conversion pending.
+  `SqliteAppStorage` gains `convert_recovery_obligations`, which takes a
+  `RecoveryConversionInput` of `RecoveryConversionRoute`s,
+  `recovery_conversion_pending`, `recovery_conversion_report` (a
+  `RecoveryConversionReport` of `RecoveryConvertedObligations` by cause),
+  `acknowledge_recovery_conversion_report`, `converted_recovery_loss` (each
+  account and cause's converted `RecoveryConvertedLoss` watermarks, until
+  reclaimed), `reclaim_converted_recovery_loss` (deletes each converted
+  generation still at its converted count), `recovery_conversion_notices_changed`
+  and `acknowledge_recovery_conversion_notices`. Nothing calls the conversion
+  yet.
 - Migration 0135 advances account storage to schema 135 (mdk#2660 phase 4).
   It replaces `account_recovery_units.fencing`, which nothing set, with
   `account_recovery_unit_fences`: each capture range a unit fences, one row
@@ -503,6 +522,10 @@ is unsupported. marmot-app also rekeys its databases once to raw SQLCipher keys
 
 ### Fixed
 
+- Sticker migrations run after the private KeyPackage schema, so upgrades
+  from schema `0140` create the pack and asset-history tables.
+- Winning sticker-pack replacements refresh asset URLs and metadata for an
+  unchanged exact hash. Older pack events cannot revert the replacement URL.
 - The timeline's modifier lookups (edits, reactions, deletions, reports), and
   the deleted-reaction and poll-vote queries, write their constant event kind
   into the SQL instead of binding it, so each kind keeps one cached statement.

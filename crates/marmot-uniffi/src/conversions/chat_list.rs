@@ -8,6 +8,7 @@ use marmot_app::{
 
 use super::common::{SelfMembershipFfi, markdown_content_tokens};
 use super::group::GroupLifecycleStateFfi;
+use crate::conversions::StickerRefFfi;
 use crate::markdown::MarkdownDocumentFfi;
 
 /// Group avatar reference. `image_key_hex` is the symmetric key that decrypts
@@ -61,6 +62,7 @@ pub struct ChatListMessagePreviewFfi {
     pub plaintext: String,
     pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
+    pub sticker: Option<StickerRefFfi>,
     pub timeline_at: u64,
     /// This message's pinned source-epoch retention. `None` is unknown (safe
     /// retain); `Some(0)` means retention was explicitly disabled.
@@ -120,6 +122,7 @@ impl From<ChatListMessageDeliveryState> for ChatListMessageDeliveryStateFfi {
 impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
     fn from(value: ChatListMessagePreview) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
+        let sticker = super::sticker::presented_sticker_ref(value.kind, &value.tags, value.deleted);
         Self {
             group_system: value.group_system.map(Into::into),
             message_id_hex: value.message_id_hex,
@@ -128,6 +131,7 @@ impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
             plaintext: value.plaintext,
             content_tokens,
             kind: value.kind,
+            sticker,
             timeline_at: value.timeline_at,
             retention_seconds: value.retention_seconds,
             retention_expires_at: value.retention_expires_at,
@@ -469,6 +473,45 @@ mod tests {
             muted_until_ms: None,
             leave_requested_at_ms: None,
         }
+    }
+
+    /// Deleted previews keep their raw tags in storage; the binding must not
+    /// expose the sticker those tags reference.
+    #[test]
+    fn chat_preview_sticker_is_hidden_once_deleted() {
+        let preview = |deleted: bool| ChatListMessagePreview {
+            group_system: None,
+            message_id_hex: "message".to_owned(),
+            sender: "sender".to_owned(),
+            sender_display_name: None,
+            plaintext: String::new(),
+            tags: vec![vec![
+                "sticker".to_owned(),
+                format!("30031:{}:cats", "ab".repeat(32)),
+                "wave".to_owned(),
+                "11".repeat(32),
+            ]],
+            kind: 9,
+            timeline_at: 1,
+            retention_seconds: None,
+            retention_expires_at: None,
+            deleted,
+            deletion_source: Default::default(),
+            attachment_kind: None,
+            attachment_count: 0,
+            delivery_state: ChatListMessageDeliveryState::NotApplicable,
+            media_json: None,
+        };
+        assert!(
+            ChatListMessagePreviewFfi::from(preview(false))
+                .sticker
+                .is_some()
+        );
+        assert!(
+            ChatListMessagePreviewFfi::from(preview(true))
+                .sticker
+                .is_none()
+        );
     }
 
     #[test]
