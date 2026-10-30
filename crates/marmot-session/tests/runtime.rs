@@ -40,7 +40,7 @@ use cgka_traits::{
     TransportPublishTarget,
 };
 use marmot_session::{
-    AccountDeviceRuntime, AccountDeviceSession, AccountError, ForeignSlotOutcome,
+    AccountDeviceEffects, AccountDeviceRuntime, AccountDeviceSession, AccountError, ForeignSlotOutcome,
     ForeignSlotPublication, KeyPackageEventDeletion, KeyPackagePublication, KeyPackagePublishError,
     KeyPackagePublishReceipt, KeyPackagePublisher, KeyPackageSlotWithdrawal, MaintenanceRandom,
     MaintenanceTiming, MonotonicClock, NoopKeyPackagePublisher, PendingResolution, PublishWork,

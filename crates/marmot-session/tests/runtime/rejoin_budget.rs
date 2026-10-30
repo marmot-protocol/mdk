@@ -1,11 +1,321 @@
 // Exercise the runtime owner: reservations precede lookup and survive request TTLs.
 #[tokio::test]
+async fn recovery_welcome_live_retry() {
+    let mut peers = recovery_peers(0).await;
+    peers.coordinator.run_due_maintenance().await.unwrap();
+    exchange_recovery(&mut peers).await;
+    let recipient = peers.recipient.self_id();
+    peers.adapter.error_for_endpoints(vec![TransportEndpoint(
+        "wss://recovery-inbox.example".into(),
+    )]);
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
+    let welcome = peers
+        .coordinator
+        .outstanding_welcome_deliveries()
+        .unwrap()
+        .into_iter()
+        .find(|(_, message)| {
+            matches!(
+                &message.envelope, TransportEnvelope::Welcome { recipient: target }
+                    if target == &recipient
+            )
+        })
+        .unwrap()
+        .1;
+    let fanout = peers
+        .coordinator
+        .session()
+        .transport_fanout(&welcome.id)
+        .unwrap()
+        .expect("failed Welcome publication retains its retry attempt");
+    peers.adapter.error_for_endpoints(Vec::new());
+    peers.wall.set(fanout.bounded_until.unwrap().0);
+    peers.coordinator.run_due_maintenance().await.unwrap();
+    let attempts = peers
+        .adapter
+        .publishes()
+        .into_iter()
+        .filter(|request| request.message.id == welcome.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempts.len(),
+        2,
+        "an expired attempt cannot strand an owed recovery Welcome until reopen"
+    );
+    assert!(attempts.iter().all(|request| request.message == welcome));
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(recipient, welcome))
+        .await
+        .unwrap();
+    assert!(
+        !peers
+            .recipient
+            .group_record(&peers.group)
+            .unwrap()
+            .unrecoverable
+    );
+    assert_recovery_chat(
+        &mut peers.coordinator,
+        &peers.adapter,
+        &mut peers.recipient,
+        &peers.group,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn recovery_announced_key() {
+    use cgka_traits::app_components::{
+        DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterV1, DeviceSlotId,
+        NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_device_roster_v1,
+        encode_device_roster_v1, encode_nostr_routing_v1,
+    };
+
+    let mut peers = recovery_peers(0).await;
+    let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
+    let lifecycle = peers
+        .recipient
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap();
+    drop(peers.recipient);
+    let mut components = default_group_components();
+    components.extend([DEVICE_ROSTER_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID]);
+    let mut session = AccountDeviceSession::open(
+        SessionConfig::new(
+            peers._dir.path().join("bob.sqlite"),
+            key,
+            pad32(b"cancel-bob"),
+            Box::new(nostr_peeler(b"cancel-bob")),
+        )
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: deterministic_nostr_keys(b"cancel-bob"),
+        }))
+        .protocol_profile(ProtocolProfile::Current)
+        .supported_app_components(components),
+    )
+    .unwrap();
+    let slot = DeviceSlotId::try_from(hex::decode(&lifecycle.stable_slot_id).unwrap()).unwrap();
+    let mut roster = DeviceRosterV1 {
+        leaf_tag_key: [0x31; 32],
+        ..DeviceRosterV1::default()
+    };
+    roster.devices.insert(
+        slot,
+        DeviceEntryV1 {
+            linked_at: peers.wall.now().0,
+            announced_key_package: lifecycle.current_key_package_ref,
+            ..DeviceEntryV1::default()
+        },
+    );
+    let created = session
+        .create_group(CreateGroupRequest {
+            name: "recovery device group".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: vec![
+                AppComponentData {
+                    component_id: DEVICE_ROSTER_COMPONENT_ID,
+                    data: encode_device_roster_v1(&roster).unwrap(),
+                },
+                AppComponentData {
+                    component_id: NOSTR_ROUTING_COMPONENT_ID,
+                    data: encode_nostr_routing_v1(
+                        &NostrRoutingV1::new(
+                            [0x6b; 32],
+                            vec!["wss://recovery-group.example".into()],
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                },
+            ],
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    match &created.effects.publish[..] {
+        [PublishWork::FoundingGroupCreated { .. }] => {}
+        [PublishWork::GroupCreated { pending, .. }] => {
+            session.confirm_published(*pending).await.unwrap();
+        }
+        _ => panic!("expected group creation publication"),
+    }
+    let device_group = created.group_id;
+    peers.recipient = AccountDeviceRuntime::new(
+        session,
+        peers.bob_adapter.clone(),
+        StaticTransportRouting::new(vec![TransportEndpoint(
+            "wss://recovery-inbox.example".into(),
+        )])
+        .key_package_endpoints(vec![TransportEndpoint(
+            "wss://recovery-inbox.example".into(),
+        )])
+        .with_group_route(
+            peers.group.clone(),
+            vec![0x5a; 32],
+            vec![TransportEndpoint("wss://recovery-group.example".into())],
+        )
+        .with_group_route(
+            device_group.clone(),
+            vec![0x6b; 32],
+            vec![TransportEndpoint("wss://recovery-group.example".into())],
+        )
+        .with_inbox_route(
+            peers.coordinator.self_id(),
+            vec![TransportEndpoint("wss://recovery-inbox.example".into())],
+        ),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        peers.wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    peers
+        .recipient
+        .set_key_package_announcement_group(Some(device_group.clone()));
+    peers
+        .recipient
+        .set_device_tag_group(Some(device_group.clone()))
+        .unwrap();
+
+    let challenge = issue_recovery_challenge(&mut peers).await;
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(
+            peers.recipient.self_id(),
+            challenge,
+        ))
+        .await
+        .unwrap();
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers
+        .recipient
+        .advance_group_recovery(
+            std::slice::from_ref(&device_group),
+            &mut AccountDeviceEffects::default(),
+        )
+        .await
+        .unwrap();
+    let waiting = peers
+        .recipient
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap();
+    assert!(
+        waiting.pending_replacement.is_none(),
+        "a held tag key must prevent staging"
+    );
+    let store = SqliteAccountStorage::open_encrypted(
+        peers._dir.path().join("bob.sqlite"),
+        &SqlCipherKey::new("live recovery cancellation key").unwrap(),
+    )
+    .unwrap();
+    let waiting = store
+        .list_group_recoveries()
+        .unwrap()
+        .into_iter()
+        .find(|record| {
+            record.group_id == peers.group
+                && record.role == storage_sqlite::GroupRecoveryRole::Recipient
+        })
+        .unwrap();
+    assert_eq!(waiting.phase, storage_sqlite::GroupRecoveryPhase::Challenge);
+    peers.wall.set(waiting.retry_at);
+    drop(store);
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers
+        .bob_adapter
+        .error_for_endpoints(vec![TransportEndpoint(
+            "wss://recovery-inbox.example".into(),
+        )]);
+    let mut effects = AccountDeviceEffects::default();
+    assert!(matches!(
+        peers
+            .recipient
+            .advance_group_recovery(&[], &mut effects)
+            .await,
+        Err(AccountError::Transport(TransportAdapterError::Publish(_)))
+    ));
+    let store = SqliteAccountStorage::open_encrypted(
+        peers._dir.path().join("bob.sqlite"),
+        &SqlCipherKey::new("live recovery cancellation key").unwrap(),
+    )
+    .unwrap();
+    let retained = store
+        .list_group_recoveries()
+        .unwrap()
+        .into_iter()
+        .find(|record| {
+            record.group_id == peers.group
+                && record.role == storage_sqlite::GroupRecoveryRole::Recipient
+        })
+        .unwrap();
+    assert_eq!(retained.phase, storage_sqlite::GroupRecoveryPhase::Grant);
+    let retry_at = retained.retry_at;
+    let artifact = retained.outbound.unwrap();
+    drop(store);
+    let grant = recovery_control(b"cancel-alice", &artifact).await;
+    let cgka_traits::GroupRecoveryBody::Grant { key_package, .. } = grant.message.body else {
+        panic!("the authenticated recipient must advance from Challenge to Grant");
+    };
+    let metadata = marmot_session::key_package_metadata(&key_package).unwrap();
+    let roster = peers
+        .recipient
+        .session_mut()
+        .app_component(&device_group, DEVICE_ROSTER_COMPONENT_ID)
+        .unwrap()
+        .unwrap();
+    let roster = decode_device_roster_v1(&roster).unwrap();
+    let entry = roster.devices.get(&slot).unwrap();
+    assert_eq!(
+        entry.announced_key_package,
+        Some(hex::decode(metadata.key_package_ref_hex).unwrap())
+    );
+    assert_eq!(
+        entry.tag_signature_key,
+        Some(peers.recipient.own_signature_key())
+    );
+    assert!(effects.events.iter().any(|event| matches!(event,
+        GroupEvent::EpochChanged { group_id, .. } if group_id == &device_group)));
+    assert!(
+        effects
+            .fanout
+            .iter()
+            .any(|outcome| outcome.mls_confirmed && outcome.fanout_complete)
+    );
+    peers.bob_adapter.error_for_endpoints(Vec::new());
+    peers.wall.set(retry_at);
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers
+        .recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        peers.bob_adapter.publishes().last().unwrap().message,
+        artifact
+    );
+}
+
+#[tokio::test]
 async fn rejoin_lower_winning_epoch() {
     let mut peers = recovery_peers(3).await;
     let frozen = peers.recipient.session().epoch(&peers.group).unwrap();
     assert!(frozen > EpochId(peers.before.0 + 1));
     exchange_recovery(&mut peers).await;
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let welcome = peers
         .adapter
         .publishes()
@@ -67,7 +377,11 @@ async fn rejoin_live_grant_budget() {
     );
     peers.recipient.retry_group_rejoin(&peers.group).unwrap();
     peers.recipient.prepare_group_recovery().unwrap();
-    peers.recipient.advance_group_recovery().await.unwrap();
+    peers
+        .recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let retried = recovery_control(
         b"cancel-alice",
         &peers.bob_adapter.publishes().last().unwrap().message,
@@ -78,7 +392,11 @@ async fn rejoin_live_grant_budget() {
         retried, original,
         "retry must retain the live signed grant and selected coordinator"
     );
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let welcome = peers
         .adapter
         .publishes()
@@ -107,7 +425,11 @@ async fn rejoin_withdrawn_expiry() {
     let started = peers.wall.now().0;
     exchange_recovery(&mut peers).await;
     peers.wall.set(started + 100);
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let path = peers._dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
     drop(peers.coordinator);
@@ -133,7 +455,11 @@ async fn rejoin_withdrawn_expiry() {
         peers.coordinator.prepare_group_recovery().unwrap(),
         vec![peers.recipient.self_id()]
     );
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     assert!(
         peers
             .coordinator
@@ -150,7 +476,11 @@ async fn rejoin_retry_epoch_poison() {
     let alice_id = peers.coordinator.self_id();
     let bob_id = peers.recipient.self_id();
     peers.recipient.prepare_group_recovery().unwrap();
-    peers.recipient.advance_group_recovery().await.unwrap();
+    peers
+        .recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let request = peers
         .bob_adapter
         .publishes()
@@ -168,7 +498,11 @@ async fn rejoin_retry_epoch_poison() {
         .await
         .unwrap();
     peers.coordinator.prepare_group_recovery().unwrap();
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let mut poisoned = recovery_control(
         b"cancel-bob",
         &peers.adapter.publishes().last().unwrap().message,
@@ -192,13 +526,18 @@ async fn rejoin_retry_epoch_poison() {
         .unwrap();
     assert!(matches!(
         accepted.outcome,
-        cgka_traits::IngestOutcome::Processed
+        cgka_traits::IngestOutcome::GroupRecovery { .. }
     ));
+    assert!(!accepted.left_object_unpersisted);
 
     // Retry while the poisoned grant is live. Preserve its authorization, but
     // do not carry the unverifiable epoch into the next nonce after expiry.
     peers.recipient.prepare_group_recovery().unwrap();
-    peers.recipient.advance_group_recovery().await.unwrap();
+    peers
+        .recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     peers.recipient.retry_group_rejoin(&peers.group).unwrap();
     let honest = peers.adapter.publishes().last().unwrap().message.clone();
     let accepted = peers
@@ -207,7 +546,10 @@ async fn rejoin_retry_epoch_poison() {
         .await
         .unwrap();
     assert!(
-        matches!(accepted.outcome, cgka_traits::IngestOutcome::Processed),
+        matches!(
+            accepted.outcome,
+            cgka_traits::IngestOutcome::GroupRecovery { .. }
+        ) && !accepted.left_object_unpersisted,
         "explicit live-grant retry must immediately release the poisoned epoch floor"
     );
     peers.wall.set(peers.wall.now().0 + 601);
@@ -225,7 +567,11 @@ async fn rejoin_retry_epoch_poison() {
     assert!(
         matches!(authenticated.body, cgka_traits::GroupRecoveryBody::Grant { source, .. } if source.epoch == peers.before)
     );
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     assert!(
         peers.coordinator.group_record(&peers.group).unwrap().epoch > peers.before,
         "the fresh grant must authorize real replacement Commit progress"
@@ -261,7 +607,11 @@ async fn rejoin_remote_epoch_budget() {
             .await
             .unwrap();
         peers.recipient.prepare_group_recovery().unwrap();
-        peers.recipient.advance_group_recovery().await.unwrap();
+        peers
+            .recipient
+            .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+            .await
+            .unwrap();
         if turn == 16 {
             drop(peers.recipient);
             peers.recipient = eligibility_runtime(
@@ -276,7 +626,11 @@ async fn rejoin_remote_epoch_budget() {
             for _ in 0..2 {
                 peers.wall.set(peers.wall.now().0 + 601);
                 let selected = peers.recipient.prepare_group_recovery().unwrap();
-                peers.recipient.advance_group_recovery().await.unwrap();
+                peers
+                    .recipient
+                    .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+                    .await
+                    .unwrap();
                 if selected == vec![alice_id.clone()] {
                     let carrier = peers
                         .bob_adapter
@@ -294,7 +648,11 @@ async fn rejoin_remote_epoch_budget() {
                         .await
                         .unwrap();
                     peers.coordinator.prepare_group_recovery().unwrap();
-                    peers.coordinator.advance_group_recovery().await.unwrap();
+                    peers
+                        .coordinator
+                        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+                        .await
+                        .unwrap();
                     let honest = peers.adapter.publishes().last().unwrap().message.clone();
                     let accepted = peers
                         .recipient
@@ -302,7 +660,10 @@ async fn rejoin_remote_epoch_budget() {
                         .await
                         .unwrap();
                     assert!(
-                        matches!(accepted.outcome, cgka_traits::IngestOutcome::Processed),
+                        matches!(
+                            accepted.outcome,
+                            cgka_traits::IngestOutcome::GroupRecovery { .. }
+                        ) && !accepted.left_object_unpersisted,
                         "a new nonce must accept the coordinator's lower real source without refilling its budget"
                     );
                     break;
@@ -343,7 +704,11 @@ async fn rejoin_commit_cooldown() {
     let metadata = peers.recipient.key_package_metadata(&key_package).unwrap();
     let device_key_hash = Sha256::digest(&metadata.leaf_signature_key).into();
     peers.wall.set(peers.wall.now().0 + 590);
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let now = peers.wall.now().0;
     // A hostile but authenticated account can immediately claim its freshly
     // installed signer is unusable; native recovery must not mint another Commit.
@@ -366,10 +731,8 @@ async fn rejoin_commit_cooldown() {
     assert!(
         matches!(
             result.outcome,
-            cgka_traits::IngestOutcome::Ignored {
-                category: cgka_traits::InputRejectionCategory::AuthorizationFailed
-            }
-        ),
+            cgka_traits::IngestOutcome::GroupRecovery { .. }
+        ) && result.left_object_unpersisted,
         "a different nonce and fresh device leaf must not bypass per-member Commit cooldown"
     );
     peers.wall.set(now + 11);
@@ -397,10 +760,8 @@ async fn rejoin_commit_cooldown() {
     assert!(
         matches!(
             retained.outcome,
-            cgka_traits::IngestOutcome::Ignored {
-                category: cgka_traits::InputRejectionCategory::AuthorizationFailed
-            }
-        ),
+            cgka_traits::IngestOutcome::GroupRecovery { .. }
+        ) && retained.left_object_unpersisted,
         "completed cooldown must survive request expiry and coordinator reopen"
     );
     peers.wall.set(now + 601);
@@ -420,8 +781,9 @@ async fn rejoin_commit_cooldown() {
         .unwrap();
     assert!(matches!(
         result.outcome,
-        cgka_traits::IngestOutcome::Processed
+        cgka_traits::IngestOutcome::GroupRecovery { .. }
     ));
+    assert!(!result.left_object_unpersisted);
 }
 
 #[tokio::test]
@@ -517,7 +879,9 @@ async fn rejoin_two_admin_accounts() {
         Arc::new(TestRandom::new(0)),
     );
     let selected = bob.prepare_group_recovery().unwrap().remove(0);
-    bob.advance_group_recovery().await.unwrap();
+    bob.advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let request = recovery_control(
         if selected == alice_id {
             b"two-alice"
@@ -538,7 +902,10 @@ async fn rejoin_two_admin_accounts() {
             .await
             .unwrap();
         admin.prepare_group_recovery().unwrap();
-        admin.advance_group_recovery().await.unwrap();
+        admin
+            .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+            .await
+            .unwrap();
     }
     let (chosen, other) = if selected == alice_id {
         (&alice_adapter, &carol_adapter)
@@ -554,10 +921,9 @@ async fn rejoin_two_admin_accounts() {
         .unwrap();
     assert!(matches!(
         rejected.outcome,
-        cgka_traits::IngestOutcome::Ignored {
-            category: cgka_traits::InputRejectionCategory::AuthorizationFailed
-        }
+        cgka_traits::IngestOutcome::GroupRecovery { .. }
     ));
+    assert!(rejected.left_object_unpersisted);
     let accepted = bob
         .ingest_delivery(&recovery_inbox_delivery(
             bob_id,
@@ -567,8 +933,9 @@ async fn rejoin_two_admin_accounts() {
         .unwrap();
     assert!(matches!(
         accepted.outcome,
-        cgka_traits::IngestOutcome::Processed
+        cgka_traits::IngestOutcome::GroupRecovery { .. }
     ));
+    assert!(!accepted.left_object_unpersisted);
     let mut tried = std::collections::HashSet::from([selected]);
     for turn in 1..32 {
         wall.set(now + turn * 601);
@@ -653,7 +1020,11 @@ async fn rejoin_removed_budget() {
         peers.wall.set(started + turn * 601);
         let selected = peers.recipient.prepare_group_recovery().unwrap();
         assert_eq!(selected.len(), 1);
-        peers.recipient.advance_group_recovery().await.unwrap();
+        peers
+            .recipient
+            .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+            .await
+            .unwrap();
         if selected[0] == alice_id {
             let request = peers
                 .bob_adapter
@@ -669,10 +1040,9 @@ async fn rejoin_removed_budget() {
                 .unwrap();
             assert!(matches!(
                 refused.outcome,
-                cgka_traits::IngestOutcome::Ignored {
-                    category: cgka_traits::InputRejectionCategory::AuthorizationFailed
-                }
+                cgka_traits::IngestOutcome::GroupRecovery { .. }
             ));
+            assert!(refused.left_object_unpersisted);
             assert!(
                 peers
                     .coordinator
@@ -704,7 +1074,11 @@ async fn rejoin_phase_budget() {
     let alice_id = peers.coordinator.self_id();
     let bob_id = peers.recipient.self_id();
     peers.recipient.prepare_group_recovery().unwrap();
-    peers.recipient.advance_group_recovery().await.unwrap();
+    peers
+        .recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let request = peers
         .bob_adapter
         .publishes()
@@ -718,7 +1092,11 @@ async fn rejoin_phase_budget() {
         .await
         .unwrap();
     peers.coordinator.prepare_group_recovery().unwrap();
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let challenge = peers.adapter.publishes().last().unwrap().message.clone();
     peers
         .recipient
@@ -796,7 +1174,11 @@ async fn rejoin_deferred_coordinator() {
         peers.coordinator.prepare_group_recovery().unwrap(),
         vec![bob_id.clone()]
     );
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
 
     let challenged = peers
         .recipient
@@ -805,10 +1187,15 @@ async fn rejoin_deferred_coordinator() {
         .unwrap();
     assert!(matches!(
         challenged.outcome,
-        cgka_traits::IngestOutcome::Processed
+        cgka_traits::IngestOutcome::GroupRecovery { .. }
     ));
+    assert!(!challenged.left_object_unpersisted);
     peers.recipient.prepare_group_recovery().unwrap();
-    peers.recipient.advance_group_recovery().await.unwrap();
+    peers
+        .recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let grant = peers.bob_adapter.publishes().pop().unwrap().message;
     let accepted = peers
         .coordinator
@@ -817,6 +1204,7 @@ async fn rejoin_deferred_coordinator() {
         .unwrap();
     assert!(matches!(
         accepted.outcome,
-        cgka_traits::IngestOutcome::Processed
+        cgka_traits::IngestOutcome::GroupRecovery { .. }
     ));
+    assert!(!accepted.left_object_unpersisted);
 }

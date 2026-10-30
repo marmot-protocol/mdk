@@ -1,6 +1,7 @@
 //! Account-addressed recovery of halted copies. MLS authorization stays in the engine.
 
 use super::*;
+use cgka_traits::EpochState;
 use cgka_traits::engine::CgkaEngine;
 use cgka_traits::group_recovery::{
     AuthenticatedGroupRecovery, GroupMemberRecovery, GroupRecoveryBody, GroupRecoveryMessage,
@@ -9,7 +10,6 @@ use cgka_traits::group_recovery::{
 use cgka_traits::storage::{
     GroupStorage, MaintenanceStorage, MessageStorage, OutboundFanoutStorage, StorageProvider,
 };
-use cgka_traits::{EpochState, InputRejectionCategory};
 use storage_sqlite::{
     GroupRecoveryPhase as Phase, GroupRecoveryRecord as Record, GroupRecoveryRole as Role,
 };
@@ -426,15 +426,20 @@ where
     }
 
     /// Advance only work reserved by `prepare_group_recovery` on this owner.
-    pub async fn advance_group_recovery(&mut self) -> AccountResult<AccountDeviceEffects> {
+    /// Host-held device groups cannot change their tag key or announcement.
+    /// Observe appended effects even when a later recovery step returns an error.
+    pub async fn advance_group_recovery(
+        &mut self,
+        held: &[GroupId],
+        output: &mut AccountDeviceEffects,
+    ) -> AccountResult<()> {
         let reserved = std::mem::take(&mut self.recovery_turn);
-        let mut output = AccountDeviceEffects::default();
         if self.maintenance_paused {
-            return Ok(output);
+            return Ok(());
         }
         let restored = self.session.drain();
         if !restored.is_empty() {
-            output.absorb_account_effects(self.publish_session_effects(restored).await?);
+            output.extend(self.publish_session_effects(restored).await?);
         }
         let mut ready = Vec::new();
         for record in reserved {
@@ -455,14 +460,14 @@ where
             && record.role == Role::Coordinator
             && !self.session.ensure_group_hydrated(&record.group_id)?
         {
-            return Ok(output);
+            return Ok(());
         }
         if ready
             .first()
             .is_some_and(|record| record.role == Role::Coordinator && record.phase == Phase::Grant)
         {
-            output.absorb_account_effects(self.stage_recovery_batch(ready).await?);
-            return Ok(output);
+            output.extend(self.stage_recovery_batch(ready).await?);
+            return Ok(());
         }
         for mut record in ready {
             if record.role == Role::Recipient {
@@ -487,6 +492,21 @@ where
                         .into());
                     };
                     let source = source.clone();
+                    output.extend(self.set_device_tag_key_holding(held).await?);
+                    if !self.device_tag_key_settled()? {
+                        continue;
+                    }
+                    if self.key_package_announcement_group().is_some() {
+                        output.extend(self.announce_fresh_key_package_holding(held).await?);
+                        if let Some(pending) = self
+                            .session
+                            .key_package_lifecycle()?
+                            .and_then(|state| state.pending_replacement)
+                            && !self.key_package_announced(&pending.key_package_ref)?
+                        {
+                            continue;
+                        }
+                    }
                     let mut key_package = self.publish_fresh_key_package().await?;
                     let event_id = self
                         .key_package_maintenance_status()?
@@ -526,13 +546,12 @@ where
                 if !self.recovery_commit_withdrawn(&record)? {
                     let restored = self.session.drain();
                     if !restored.is_empty() {
-                        output
-                            .absorb_account_effects(self.publish_session_effects(restored).await?);
+                        output.extend(self.publish_session_effects(restored).await?);
                     }
                     let (resumed, _) = self
                         .resume_outbound_fanouts_for_group(Some(&record.group_id))
                         .await?;
-                    output.absorb_account_effects(resumed);
+                    output.extend(resumed);
                 }
                 self.reconcile_recovery_commit(&mut record)?;
                 self.session
@@ -555,7 +574,7 @@ where
             }
             self.publish_recovery_control(&mut record).await?;
         }
-        Ok(output)
+        Ok(())
     }
 
     fn recipient_recovery_state(
@@ -683,17 +702,12 @@ where
     pub(super) async fn ingest_group_recovery(
         &mut self,
         carrier: &TransportMessage,
-        authenticated: AuthenticatedGroupRecovery,
-    ) -> AccountResult<AccountIngestEffects> {
-        let ignored = |category| AccountIngestEffects {
-            outcome: IngestOutcome::Ignored { category },
-            left_object_unpersisted: true,
-            effects: AccountDeviceEffects::default(),
-        };
+        authenticated: &AuthenticatedGroupRecovery,
+    ) -> AccountResult<bool> {
         if !matches!(&carrier.envelope, TransportEnvelope::Welcome { recipient }
             if recipient == &self.session.self_id())
         {
-            return Ok(ignored(InputRejectionCategory::WrongRecipient));
+            return Ok(false);
         }
         let AuthenticatedGroupRecovery { sender, message } = authenticated;
         let now = self.wall_clock.now().0;
@@ -701,7 +715,7 @@ where
             || message.expires_at
                 > now.saturating_add(REQUEST_LIFETIME_SECS + KEY_PACKAGE_MAX_FUTURE_SKEW_SECS)
         {
-            return Ok(ignored(InputRejectionCategory::AuthorizationFailed));
+            return Ok(false);
         }
         match self.session.ensure_group_hydrated(&message.group_id) {
             Ok(true) => {}
@@ -709,29 +723,21 @@ where
             | Err(SessionError::Engine(
                 EngineError::UnknownGroup(_) | EngineError::GroupNotHydrated(_),
             )) => {
-                return Ok(ignored(InputRejectionCategory::UnknownGroup));
+                return Ok(false);
             }
             Err(error) => return Err(error.into()),
         }
-        let accepted = match &message.body {
+        match &message.body {
             GroupRecoveryBody::Request { device_key_hash } => {
-                self.receive_recovery_request(&sender, &message, device_key_hash, now)
+                self.receive_recovery_request(sender, message, device_key_hash, now)
             }
             GroupRecoveryBody::Challenge { source } => {
-                self.receive_recovery_challenge(&sender, &message, source, now)
+                self.receive_recovery_challenge(sender, message, source, now)
             }
             GroupRecoveryBody::Grant { source, .. } => {
-                self.receive_recovery_grant(&sender, &message, source, now)
+                self.receive_recovery_grant(sender, message, source, now)
             }
-        }?;
-        if !accepted {
-            return Ok(ignored(InputRejectionCategory::AuthorizationFailed));
         }
-        Ok(AccountIngestEffects {
-            outcome: IngestOutcome::Processed,
-            left_object_unpersisted: false,
-            effects: AccountDeviceEffects::default(),
-        })
     }
 
     fn receive_recovery_request(
@@ -1103,6 +1109,12 @@ where
             let rollback = self.session.publish_failed(pending).await?;
             self.publish_session_effects(rollback).await?;
             return Err(SessionError::from(error).into());
+        }
+        // Direct recovery sends bypass the prepared-send Welcome watcher.
+        for work in &effects.publish {
+            if let PublishWork::GroupEvolution { welcomes, .. } = work {
+                self.watch_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
+            }
         }
         output.absorb_account_effects(self.publish_session_effects(effects).await?);
         for record in &mut records {
