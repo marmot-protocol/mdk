@@ -26,12 +26,13 @@
   `retry_group_convergence` grants the parked pass one more attempt, and a
   `GroupStateUpdated` follows a scheduled pass that parks.
 - While this device trusts a device group, it tags its KeyPackages and leaves
-  from that group's roster (mdk#2628 item 3.1d). The founder's entry carries
-  its tag signature key from the start; a device that joins sets its own on
-  its next maintenance pass or KeyPackage publication, before it stages a
-  KeyPackage, and each device then replaces its untagged KeyPackage with a
-  tagged one. Maintenance drops a removed device's roster record 30 days after
-  it was recorded. Release builds hold no device group and tag nothing.
+  from its own entry in that group's roster, the one at its KeyPackage slot
+  (mdk#2628 item 3.1d). The founder's entry carries its tag signature key
+  from the start; a device that joins sets its own on its next maintenance
+  pass or KeyPackage publication, before it stages a KeyPackage, and each
+  device then replaces its untagged KeyPackage with a tagged one. Maintenance
+  drops a removed device's roster record 30 days after it was recorded.
+  Release builds hold no device group and tag nothing.
 - `MarmotAppRuntime::linked_devices` lists this account's own devices as
   `LinkedDevice`s, from the roster of the device group this device trusts,
   this device first (mdk#2628 item 3.1). `LinkedDevicesChanged` says to

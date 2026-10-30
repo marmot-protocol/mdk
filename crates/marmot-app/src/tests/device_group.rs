@@ -2065,12 +2065,13 @@ async fn a_refresh_waiting_for_the_tag_signature_key_is_overdue_after_a_week() {
     assert!(laptop.take_key_package_refresh_overdue_changed());
 }
 
-/// The engine tags from whichever roster entry carries this device's tag
-/// signature key, so while another device's entry carries it, a KeyPackage
-/// built now would read as that device's (mdk#2628 3.1d). This device then
-/// stages and publishes none, and sets nothing.
+/// While another device's entry carries this device's tag signature key, this
+/// device cannot set the key in its own entry, since a roster gives each key
+/// one device (mdk#2628 3.1d). The engine tags only from this device's own
+/// entry, so maintenance does not hold the refresh back: it announces and
+/// publishes an untagged KeyPackage, never one that reads as that device's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_key_held_by_another_device_stages_no_key_package() {
+async fn a_key_held_by_another_device_leaves_key_packages_untagged() {
     let (
         Devices {
             _dirs,
@@ -2115,15 +2116,16 @@ async fn a_key_held_by_another_device_stages_no_key_package() {
 
     let before = relay.published_events.lock().unwrap().len();
     laptop.run_due_maintenance().await.unwrap();
-    let error = laptop.publish_key_package().await.unwrap_err();
+    assert_ne!(current_ref(&laptop), current);
+    assert_eq!(announced(&laptop, &group, &laptop), current_ref(&laptop));
     assert_eq!(
-        error.privacy_safe_kind(),
-        "account_key_package_announcement_pending"
+        key_package_claim(&laptop, &roster(&laptop, &group)),
+        DeviceTagClaim::Unclaimed
     );
-    assert!(published_kinds(&relay, before).is_empty());
-    let status = laptop.key_package_maintenance_status().unwrap().unwrap();
-    assert!(status.pending_replacement.is_none(), "nothing is staged");
-    assert_eq!(current_ref(&laptop), current);
+    assert_eq!(
+        published_kinds(&relay, before),
+        vec![transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE, 30443]
+    );
     assert_eq!(
         roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
         None

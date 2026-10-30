@@ -10,9 +10,11 @@
 //! [`DeviceTagClaim::Unclaimed`], never an error.
 //!
 //! This device signs its tags with its MLS signature key, so the roster's
-//! `tag_signature_key` for its entry is that key and [`OwnDeviceTag`] finds
-//! the entry by it. `SignWithLabel`'s label keeps a tag signature apart from
-//! every MLS signature made with the same key.
+//! `tag_signature_key` for its entry is that key. Its entry is the one at its
+//! slot, its KeyPackage publication slot: [`OwnDeviceTag`] tags from that
+//! entry once it carries the key, never from another entry that does.
+//! `SignWithLabel`'s label keeps a tag signature apart from every MLS
+//! signature made with the same key.
 
 use crate::engine::Engine;
 pub use cgka_traits::app_components::DeviceTagClaim;
@@ -101,8 +103,9 @@ fn seal_with_nonce(
 }
 
 /// This device's entry in its device group's roster, once it can tag
-/// (device-tag-v1.md, "Producing tags"): the roster holds `leaf_tag_key` and
-/// an entry whose `tag_signature_key` is this device's MLS signature key.
+/// (device-tag-v1.md, "Producing tags"): the roster holds `leaf_tag_key`, and
+/// the entry at this device's slot carries its MLS signature key as its
+/// `tag_signature_key`.
 #[derive(Clone, Debug)]
 pub(crate) struct OwnDeviceTag {
     roster: DeviceRosterV1,
@@ -110,15 +113,17 @@ pub(crate) struct OwnDeviceTag {
 }
 
 impl OwnDeviceTag {
-    /// The entry in `roster` that carries `own_signature_key`, or `None` while
-    /// none does. A valid roster never gives two entries the same key.
-    pub(crate) fn find(roster: DeviceRosterV1, own_signature_key: &[u8]) -> Option<Self> {
-        let slot = roster
-            .devices
-            .iter()
-            .find(|(_, device)| device.tag_signature_key.as_deref() == Some(own_signature_key))
-            .map(|(slot, _)| *slot)?;
-        Some(Self { roster, slot })
+    /// The entry at `own_slot` in `roster`, once it carries
+    /// `own_signature_key`; `None` while it does not, even if another entry
+    /// does.
+    pub(crate) fn find(
+        roster: DeviceRosterV1,
+        own_slot: Option<DeviceSlotId>,
+        own_signature_key: &[u8],
+    ) -> Option<Self> {
+        let slot = own_slot?;
+        let entry_key = roster.devices.get(&slot)?.tag_signature_key.as_deref();
+        (entry_key == Some(own_signature_key)).then_some(Self { roster, slot })
     }
 
     /// Whether `leaf`, one of this device's, carries a tag that reads as this
@@ -202,18 +207,20 @@ impl<S: StorageProvider> Engine<S> {
                 "the device group did not load; building untagged"
             );
         })?;
-        Ok(self.own_device_tag_after(&device_group, &[]))
+        let own_slot = own_device_slot(storage)?;
+        Ok(self.own_device_tag_after(&device_group, &[], own_slot))
     }
 
-    /// This device's entry in `device_group`'s roster as a Commit carrying
-    /// `proposals` leaves it, or `None` while it cannot tag. A Commit that
-    /// sets this device's key tags its own UpdatePath leaf under that key.
-    /// A roster that does not resolve leaves the device unable to tag rather
-    /// than failing what it was building.
+    /// This device's entry, the one at `own_slot`, in `device_group`'s roster
+    /// as a Commit carrying `proposals` leaves it, or `None` while it cannot
+    /// tag. A Commit that sets this device's key tags its own UpdatePath leaf
+    /// under that key. A roster that does not resolve leaves the device unable
+    /// to tag rather than failing what it was building.
     pub(crate) fn own_device_tag_after(
         &self,
         device_group: &MlsGroup,
         proposals: &[Proposal],
+        own_slot: Option<DeviceSlotId>,
     ) -> Option<OwnDeviceTag> {
         if !device_group.is_active()
             || !crate::app_components::group_requires_device_roster(device_group).ok()?
@@ -235,7 +242,7 @@ impl<S: StorageProvider> Engine<S> {
                 .ok()??;
         }
         let roster = decode_device_roster_v1(&roster).ok()?;
-        OwnDeviceTag::find(roster, self.identity.signer.public())
+        OwnDeviceTag::find(roster, own_slot, self.identity.signer.public())
     }
 
     /// The entry to tag this device's leaf in `mls_group` from, when a Commit
@@ -254,12 +261,28 @@ impl<S: StorageProvider> Engine<S> {
             .as_ref()
             .is_some_and(|group_id| group_id.as_slice() == mls_group.group_id().as_slice());
         let own = if in_device_group {
-            self.own_device_tag_after(mls_group, proposals)
+            let own_slot = own_device_slot(&self.storage).ok().flatten();
+            self.own_device_tag_after(mls_group, proposals, own_slot)
         } else {
             self.own_device_tag(&self.storage).ok().flatten()
         };
         own.filter(|own| !own.reads_as_own(leaf))
     }
+}
+
+/// This device's roster slot, the slot its KeyPackage lifecycle publishes
+/// under (`stable_slot_id`), or `None` while storage keeps no lifecycle or
+/// its slot is not a roster slot id.
+pub(crate) fn own_device_slot(
+    storage: &impl StorageProvider,
+) -> Result<Option<DeviceSlotId>, EngineError> {
+    let Some(maintenance) = storage.maintenance_storage() else {
+        return Ok(None);
+    };
+    Ok(maintenance
+        .key_package_lifecycle()?
+        .and_then(|lifecycle| hex::decode(lifecycle.stable_slot_id).ok())
+        .and_then(|bytes| DeviceSlotId::try_from(bytes).ok()))
 }
 
 /// Which roster slot `leaf` belongs to, as its device tag says
@@ -519,11 +542,11 @@ mod tests {
     }
 
     #[test]
-    fn this_devices_entry_is_the_one_carrying_its_key() {
+    fn this_devices_entry_is_the_one_at_its_slot_carrying_its_key() {
         let signer = tag_signer();
         let mut roster = roster_with_device(Some(tag_public_key()));
         roster.devices.insert([0x12; 32], DeviceEntryV1::default());
-        let own = OwnDeviceTag::find(roster.clone(), signer.public()).unwrap();
+        let own = OwnDeviceTag::find(roster.clone(), Some(SLOT), signer.public()).unwrap();
         assert_eq!(own.slot, SLOT);
         // Its MLS key signs the tag and is also the leaf's signature key.
         let tag = own.seal(&RustCrypto::default(), &signer).unwrap();
@@ -531,7 +554,13 @@ mod tests {
             read_entry(&tag, signer.public(), &roster),
             DeviceTagClaim::Device(SLOT)
         );
-        assert!(OwnDeviceTag::find(roster_with_device(None), signer.public()).is_none());
+        assert!(
+            OwnDeviceTag::find(roster_with_device(None), Some(SLOT), signer.public()).is_none()
+        );
+        // Another entry carrying its key is not its own, and neither is any
+        // entry while it has no slot.
+        assert!(OwnDeviceTag::find(roster.clone(), Some([0x12; 32]), signer.public()).is_none());
+        assert!(OwnDeviceTag::find(roster, None, signer.public()).is_none());
     }
 
     #[test]
