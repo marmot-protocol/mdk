@@ -179,6 +179,34 @@ async fn recovery_ingest_drains_native() {
 
     for mode in [OpenMode::Eager, OpenMode::Deferred] {
         let (dir, session, _, group, welcome) = hydrated_recovery_fixture().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let wall = Arc::new(TestWallClock::new(now));
+        let monotonic = Arc::new(TestMonotonicClock::default());
+        let obligation = MessageId::new(vec![0x94; 32]);
+        // A retained obligation can lack the optional own-leaf baseline.
+        session
+            .put_maintenance_obligation(&cgka_traits::maintenance::MaintenanceObligation {
+                id: obligation.clone(),
+                group_id: group.clone(),
+                trigger: cgka_traits::MaintenanceTrigger::Manual,
+                phase: cgka_traits::MaintenancePhase::Quiet,
+                created_at: Timestamp(now),
+                operational_target_at: None,
+                overdue: false,
+                eose_deadline_at: None,
+                grace_until: None,
+                quiet_since: Some(Timestamp(now)),
+                own_leaf_baseline_hash: None,
+                sampled_jitter_ms: 0,
+                not_before: None,
+                attempt_count: 0,
+                semantic_rearm_count: 0,
+                last_failure_code: None,
+            })
+            .unwrap();
         drop(session);
         let config = SessionConfig::new(
             dir.path().join("alice.sqlite"),
@@ -211,12 +239,17 @@ async fn recovery_ingest_drains_native() {
                     vec![endpoint],
                 ),
             RecordingKeyPackages::default(),
-        );
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            monotonic.clone(),
+            Arc::new(TestRandom::new(0)),
+        )
+        .with_maintenance_timing(MaintenanceTiming {
+            quiet: Duration::from_secs(60),
+            ..MaintenanceTiming::immediate()
+        });
         let account = runtime.self_id();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         let control = cgka_traits::GroupRecoveryMessage {
             group_id: group.clone(),
             request_id: [0x92; 32],
@@ -230,6 +263,20 @@ async fn recovery_ingest_drains_native() {
             .await
             .unwrap();
 
+        let connection = rusqlite::Connection::open(dir.path().join("alice.sqlite")).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &SqlCipherKey::new("hydrated welcome ownership key").unwrap(),
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_quiet_reset BEFORE UPDATE ON cgka_maintenance_obligations
+                 BEGIN SELECT RAISE(ABORT, 'injected quiet reset failure'); END;",
+            )
+            .unwrap();
+        wall.set(now + 10);
         let ingested = runtime
             .ingest_delivery(&recovery_inbox_delivery(account, carrier))
             .await
@@ -260,6 +307,62 @@ async fn recovery_ingest_drains_native() {
                 .fanout
                 .iter()
                 .any(|outcome| { outcome.mls_confirmed && outcome.fanout_complete })
+        );
+        assert_eq!(
+            runtime
+                .session()
+                .maintenance_obligation(&obligation)
+                .unwrap()
+                .unwrap()
+                .quiet_since,
+            Some(Timestamp(now)),
+            "the injected storage fault prevented the reset"
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_quiet_reset")
+            .unwrap();
+        runtime.run_due_maintenance().await.unwrap();
+        assert_eq!(
+            runtime
+                .session()
+                .maintenance_obligation(&obligation)
+                .unwrap()
+                .unwrap()
+                .quiet_since,
+            Some(Timestamp(now + 10)),
+            "maintenance must retain and retry the quiet-window reconciliation"
+        );
+        let resumed_epoch = runtime.session().epoch(&group).unwrap();
+        wall.set(now + 61);
+        monotonic.set_millis(51_000);
+        for _ in 0..3 {
+            runtime.run_due_maintenance().await.unwrap();
+        }
+        assert_eq!(
+            runtime.session().epoch(&group).unwrap(),
+            resumed_epoch,
+            "the resumed Commit restarts the obligation's full quiet window"
+        );
+        assert_eq!(
+            runtime
+                .session()
+                .maintenance_obligation(&obligation)
+                .unwrap()
+                .unwrap()
+                .phase,
+            cgka_traits::MaintenancePhase::Quiet
+        );
+        wall.set(now + 71);
+        monotonic.set_millis(61_000);
+        runtime.run_due_maintenance().await.unwrap();
+        assert_eq!(
+            runtime
+                .session()
+                .maintenance_obligation(&obligation)
+                .unwrap()
+                .unwrap()
+                .phase,
+            cgka_traits::MaintenancePhase::Jitter
         );
     }
 }

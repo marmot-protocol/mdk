@@ -35,6 +35,7 @@ the default.
 - Publishes fresh KeyPackages through an injected boundary, and drives KeyPackage generator upgrades.
 - Turns `SessionEffects.publish` work into `TransportPublishRequest`s, then confirms or rolls back pending session state
   from the adapter's publish reports.
+- Applies the ordinary maintenance quiet-window reset to epoch changes published while ingesting recovery controls.
 - Keeps a confirmed fanout scheduler-visible while linked Welcomes still await publication bookkeeping. Its retry
   cutoff follows the Welcomes' durable endpoint backoff; work without a stored cutoff uses the ordinary retry delay.
   Welcome backoff does not postpone earlier-ready group work; an incomplete group publication still orders later ones.
