@@ -466,6 +466,59 @@ async fn recovery_runner_reruns_a_recheck_pass_made_due_mid_quantum() {
     );
 }
 
+/// A comparison's fetch by id still reading when the quantum runs out is
+/// interrupted, and what it read is charged as a sweep's reply is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_charges_the_fetch_a_cut_comparison_was_reading() {
+    const READ: u64 = 4096;
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let held = every([1; 32], floor, t0, 60);
+    let missing = every([1; 32], floor + 30, t0, 60);
+    account.hold(&route, &held);
+    // Request 0 is the comparison; the fetch after it is held until the
+    // quantum is cut.
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(held.iter().chain(&missing).cloned().collect())
+        .interruptible(READ)
+        .build();
+    relay.gate.hold_from(1);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    account.rechecked(&route, RELAY, t0);
+    host.tails.stand(&route, RELAY, t0);
+    let policy = RecoveryRunnerPolicy {
+        quantum: Duration::from_millis(500),
+        ..test_policy()
+    };
+    let (mut runner, _handle) = runner(&host, policy);
+
+    assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
+    assert_eq!(relay.comparisons().len(), 1);
+    assert_eq!(
+        relay.fetched_ids().len(),
+        missing.len(),
+        "the fetch went out"
+    );
+    assert_eq!(account.staged_events(&route), 0);
+    assert_eq!(
+        account
+            .app
+            .recovery_account_usage(clock.now())
+            .unwrap()
+            .event_bytes,
+        READ
+    );
+}
+
 /// What a re-check finds is staged like any fetched history, so a full
 /// relay's re-check waits even where its own debt holds the group's frontier:
 /// the debt moves the frontier, the re-check never does.

@@ -16,13 +16,14 @@
 //! including full replies a halving discards, replies a budget cut short,
 //! saturated seconds and duplicates: each staged slice carries what was read
 //! since the last one, and settlement charges the rest. A best-effort relay is
-//! never charged. The one exception is the reply in flight when the deadline
-//! or a preemption drops its request: the sweep relay counts a reply only once
-//! it ends, so at most one partial reply per quantum goes uncharged (mdk#2719).
+//! never charged. The request in flight when the deadline, shutdown or a pass
+//! preemption cuts the quantum is interrupted, not dropped, so its relay
+//! reports the reply it was reading too (`SweepRelay::interrupt`).
 //!
 //! The relay wrapper also keeps whether the last reply was a `rate-limited:`
 //! CLOSED. A quantum that reaches its deadline right after one was rate
-//! limited and never cleared, whatever answers came before.
+//! limited and never cleared, whatever answers came before: an interrupted
+//! request is no answer.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -116,6 +117,8 @@ struct Meter {
     bytes: AtomicU64,
     /// The last reply was a `rate-limited:` CLOSED.
     rate_limited: AtomicBool,
+    /// The sweep cut the request in flight: what it returns is no answer.
+    interrupted: AtomicBool,
 }
 
 /// The unit's relay, metering every reply.
@@ -130,9 +133,11 @@ impl Metered<'_> {
     fn read(&self, kept: &[Event], rate_limited: bool) {
         let bytes = self.relay.take_fetched_bytes().max(event_bytes(kept));
         self.meter.bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.meter
-            .rate_limited
-            .store(rate_limited, Ordering::Relaxed);
+        if !self.meter.interrupted.load(Ordering::Relaxed) {
+            self.meter
+                .rate_limited
+                .store(rate_limited, Ordering::Relaxed);
+        }
     }
 }
 
@@ -160,6 +165,11 @@ impl SweepRelay for Metered<'_> {
             SecondReply::Unproven | SecondReply::Unreachable(_) => self.read(&[], false),
         }
         reply
+    }
+
+    fn interrupt(&self) -> bool {
+        self.meter.interrupted.store(true, Ordering::Relaxed);
+        self.relay.interrupt()
     }
 }
 
@@ -369,9 +379,9 @@ pub(super) async fn run<H: RunnerHost>(
             break;
         }
     }
-    // A request the deadline or a preemption dropped never reached `read`:
-    // what its relay already counted (a second's completed chunks) is still
-    // there.
+    // A cut request dropped rather than interrupted (its relay cannot end
+    // it, or did not within the grace) never reached `read`: what its relay
+    // already counted (a second's completed chunks) is still there.
     meter
         .bytes
         .fetch_add(relay.relay.take_fetched_bytes(), Ordering::Relaxed);

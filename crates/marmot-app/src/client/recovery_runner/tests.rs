@@ -28,8 +28,8 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 use transport_nostr_adapter::compare::{CompareRelay, CompareReply, IdsReply, LocalItem};
 use transport_nostr_adapter::sweep::{
-    ClosedReason, RelayCaps, SecondReply, SliceQuery, SliceReply, SweepEnd, SweepPolicy,
-    SweepRange, SweepRelay, SweepRoute, UnreachableKind,
+    ClosedReason, INTERRUPT_GRACE, RelayCaps, SecondReply, SliceQuery, SliceReply, SweepEnd,
+    SweepPolicy, SweepRange, SweepRelay, SweepRoute, UnreachableKind,
 };
 
 use super::admission::{Drained, LiveFence, Stalled, live_fences};
@@ -484,6 +484,10 @@ struct ModelRelay {
     /// Event bytes each request reads before it waits out the gate, as a
     /// second's completed chunks are read before a later one is held.
     read_before_reply: u64,
+    /// What `interrupt` answers. An interrupted request ends at once and
+    /// reports `read_until_cut` more bytes: what it read before the cut.
+    interruptible: bool,
+    read_until_cut: u64,
     /// Bytes read that `take_fetched_bytes` has not reported yet.
     unreported: AtomicU64,
     latency: Duration,
@@ -513,6 +517,8 @@ impl ModelRelay {
             reachable: AtomicBool::new(true),
             limited: 0..0,
             read_before_reply: 0,
+            interruptible: false,
+            read_until_cut: 0,
             unreported: AtomicU64::new(0),
             latency: Duration::ZERO,
             requests: AtomicUsize::new(0),
@@ -553,6 +559,12 @@ impl ModelRelay {
 
     fn reading_before_reply(mut self, bytes: u64) -> Self {
         self.read_before_reply = bytes;
+        self
+    }
+
+    fn interruptible(mut self, read_until_cut: u64) -> Self {
+        self.interruptible = true;
+        self.read_until_cut = read_until_cut;
         self
     }
 
@@ -630,15 +642,25 @@ impl ModelRelay {
         }
     }
 
-    /// Wait out the gate and the latency. What the relay says instead of an
-    /// answer, if anything.
-    async fn arrive(&self) -> Option<ClosedOrUnreachable> {
+    /// Wait out the gate and the latency, unless `cut` interrupts the wait.
+    /// What the relay says instead of an answer, if anything.
+    async fn arrive(&self, cut: &CancellationToken) -> Option<ClosedOrUnreachable> {
         let index = self.requests.fetch_add(1, Ordering::SeqCst);
         self.unreported
             .fetch_add(self.read_before_reply, Ordering::SeqCst);
-        self.gate.pass(index).await;
-        if !self.latency.is_zero() {
-            tokio::time::sleep(self.latency).await;
+        let wait = async {
+            self.gate.pass(index).await;
+            if !self.latency.is_zero() {
+                tokio::time::sleep(self.latency).await;
+            }
+        };
+        tokio::select! {
+            () = wait => {}
+            () = cut.cancelled(), if self.interruptible => {
+                self.unreported
+                    .fetch_add(self.read_until_cut, Ordering::SeqCst);
+                return Some(ClosedOrUnreachable::Unreachable);
+            }
         }
         if !self.reachable.load(Ordering::SeqCst) {
             Some(ClosedOrUnreachable::Unreachable)
@@ -649,11 +671,11 @@ impl ModelRelay {
         }
     }
 
-    async fn fetch_slice(&self, query: SliceQuery) -> SliceReply {
+    async fn fetch_slice(&self, query: SliceQuery, cut: &CancellationToken) -> SliceReply {
         let _flight = self.in_flight.enter();
         self.check_uncovered(query.route, query.since);
         self.queries.lock().unwrap().push(query);
-        match self.arrive().await {
+        match self.arrive(cut).await {
             Some(ClosedOrUnreachable::Unreachable) => {
                 return SliceReply::Unreachable(UnreachableKind::TimedOut);
             }
@@ -673,10 +695,15 @@ impl ModelRelay {
         }
     }
 
-    async fn fetch_second(&self, route: SweepRoute, second: u64) -> SecondReply {
+    async fn fetch_second(
+        &self,
+        route: SweepRoute,
+        second: u64,
+        cut: &CancellationToken,
+    ) -> SecondReply {
         let _flight = self.in_flight.enter();
         self.seconds.lock().unwrap().push(second);
-        match self.arrive().await {
+        match self.arrive(cut).await {
             Some(ClosedOrUnreachable::Unreachable) => {
                 return SecondReply::Unreachable(UnreachableKind::TimedOut);
             }
@@ -698,10 +725,11 @@ impl ModelRelay {
         window: SweepRange,
         local: &[LocalItem],
         limit: usize,
+        cut: &CancellationToken,
     ) -> CompareReply {
         let _flight = self.in_flight.enter();
         self.comparisons.lock().unwrap().push(window);
-        match self.arrive().await {
+        match self.arrive(cut).await {
             Some(ClosedOrUnreachable::Unreachable) => {
                 return CompareReply::Unreachable(UnreachableKind::TimedOut);
             }
@@ -727,10 +755,16 @@ impl ModelRelay {
         }
     }
 
-    async fn fetch_ids(&self, route: SweepRoute, window: SweepRange, ids: &[EventId]) -> IdsReply {
+    async fn fetch_ids(
+        &self,
+        route: SweepRoute,
+        window: SweepRange,
+        ids: &[EventId],
+        cut: &CancellationToken,
+    ) -> IdsReply {
         let _flight = self.in_flight.enter();
         self.fetched_ids.lock().unwrap().extend_from_slice(ids);
-        match self.arrive().await {
+        match self.arrive(cut).await {
             Some(ClosedOrUnreachable::Unreachable) => {
                 return IdsReply::Unreachable(UnreachableKind::TimedOut);
             }
@@ -760,6 +794,8 @@ fn rate_limited() -> ClosedReason {
 struct Swept {
     relay: Arc<ModelRelay>,
     caps: RelayCaps,
+    /// Interrupts this quantum's requests.
+    cut: CancellationToken,
 }
 
 #[async_trait]
@@ -769,15 +805,20 @@ impl SweepRelay for Swept {
     }
 
     async fn fetch_slice(&self, query: SliceQuery) -> SliceReply {
-        self.relay.fetch_slice(query).await
+        self.relay.fetch_slice(query, &self.cut).await
     }
 
     async fn fetch_second(&self, route: SweepRoute, second: u64, _cap: Option<u32>) -> SecondReply {
-        self.relay.fetch_second(route, second).await
+        self.relay.fetch_second(route, second, &self.cut).await
     }
 
     fn take_fetched_bytes(&self) -> u64 {
         self.relay.unreported.swap(0, Ordering::SeqCst)
+    }
+
+    fn interrupt(&self) -> bool {
+        self.cut.cancel();
+        self.relay.interruptible
     }
 }
 
@@ -785,6 +826,8 @@ impl SweepRelay for Swept {
 struct Compared {
     relay: Arc<ModelRelay>,
     caps: RelayCaps,
+    /// Interrupts this quantum's requests.
+    cut: CancellationToken,
 }
 
 #[async_trait]
@@ -800,15 +843,22 @@ impl CompareRelay for Compared {
         local: &[LocalItem],
         limit: usize,
     ) -> CompareReply {
-        self.relay.compare(route, window, local, limit).await
+        self.relay
+            .compare(route, window, local, limit, &self.cut)
+            .await
     }
 
     async fn fetch_ids(&self, route: SweepRoute, window: SweepRange, ids: &[EventId]) -> IdsReply {
-        self.relay.fetch_ids(route, window, ids).await
+        self.relay.fetch_ids(route, window, ids, &self.cut).await
     }
 
     fn take_fetched_bytes(&self) -> u64 {
         self.relay.unreported.swap(0, Ordering::SeqCst)
+    }
+
+    fn interrupt(&self) -> bool {
+        self.cut.cancel();
+        self.relay.interruptible
     }
 }
 
@@ -1016,7 +1066,11 @@ impl RunnerHost for TestHost {
         _request_timeout: Duration,
     ) -> Option<Box<dyn SweepRelay>> {
         let relay = self.relays.get(relay)?.clone();
-        Some(Box::new(Swept { relay, caps }))
+        Some(Box::new(Swept {
+            relay,
+            caps,
+            cut: CancellationToken::new(),
+        }))
     }
 
     fn compare_relay(
@@ -1026,7 +1080,11 @@ impl RunnerHost for TestHost {
         _request_timeout: Duration,
     ) -> Option<Box<dyn CompareRelay>> {
         let relay = self.relays.get(relay)?.clone();
-        Some(Box::new(Compared { relay, caps }))
+        Some(Box::new(Compared {
+            relay,
+            caps,
+            cut: CancellationToken::new(),
+        }))
     }
 
     async fn deliveries(&self, _relay: &str, event: Event) -> Vec<TransportDelivery> {
@@ -2351,6 +2409,90 @@ async fn recovery_runner_charges_what_a_dropped_request_already_read() {
 
     assert_eq!(ran(runner.step().await).outcome, Outcome::Unanswered);
     assert_eq!(relay.gate.waiting(), 0, "the deadline dropped the request");
+    assert_eq!(
+        account
+            .app
+            .recovery_account_usage(clock.now())
+            .unwrap()
+            .event_bytes,
+        READ
+    );
+}
+
+// The paused clock (Tokio allows one only on the current-thread runtime)
+// runs the quantum out without the test waiting in real time.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_charges_the_reply_a_cut_request_was_reading() {
+    const READ: u64 = 4096;
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    // The first request is still reading when the quantum runs out; its
+    // relay ends it when interrupted and reports what it read.
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .interruptible(READ)
+        .build();
+    relay.gate.hold_from(0);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, t0 - HOUR);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    let started = Instant::now();
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Unanswered);
+    assert!(
+        started.elapsed() < RUNNER_QUANTUM + INTERRUPT_GRACE,
+        "the interrupted request ended within the grace"
+    );
+    assert_eq!(relay.gate.waiting(), 0);
+    assert_eq!(
+        account
+            .app
+            .recovery_account_usage(clock.now())
+            .unwrap()
+            .event_bytes,
+        READ
+    );
+}
+
+// The paused clock (Tokio allows one only on the current-thread runtime)
+// waits out the rate limit and the quantum without the test doing so.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_reads_a_cut_retry_after_a_rate_limit_as_rate_limited() {
+    const READ: u64 = 4096;
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    // The first request is rate limited; the retry is still reading when the
+    // quantum runs out. Its interrupted end is no answer: the rate limit
+    // never cleared.
+    let relay = stalling_relay([1; 32], floor)
+        .rate_limiting_requests(0..1)
+        .interruptible(READ)
+        .build();
+    relay.gate.hold_from(1);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, RecoveryRunnerPolicy::default());
+
+    assert_eq!(ran(runner.step().await).outcome, Outcome::RateLimited);
+    assert_eq!(relay.requests(), 2);
+    let health = account.app.recovery_relay_health(RELAY).unwrap().unwrap();
+    assert!(health.cooldown.is_some(), "the relay cools down");
     assert_eq!(
         account
             .app

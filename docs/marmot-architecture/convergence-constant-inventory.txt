@@ -89,7 +89,8 @@ A17|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_NOTIFICATION_CAPACITY
 A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_QUIET_PASSES
 A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_UNSERVED_PASSES
 A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_ATTEMPTS
-# A19 is the recovery runner's starting values: unit retry, relay cooldown, account caps, quantum and staging.
+# A19 is the recovery runner's starting values: unit retry, relay cooldown, account caps, quantum, staging and
+# the grace a cut request gets to report what it read.
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BACKOFF_BASE_SECS
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BACKOFF_CAP_SECS
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BREAK_AFTER_NO_PROGRESS
@@ -108,6 +109,7 @@ A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_STAGED_GROUP_B
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_STAGED_ACCOUNT_BYTES
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_ADMISSION_PER_TURN
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_FENCES_PER_UNIT
+A19|crates/transport-nostr-adapter/src/sweep/mod.rs|INTERRUPT_GRACE
 # A20 is the runner's comparison windows and re-check schedule.
 A20|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_RECHECK_INTERVAL_SECS
 A20|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_RECHECK_AFTER_COOLDOWN_SECS

@@ -11,6 +11,11 @@
 //! built without the tap ([`NostrSdkRelayClient::new`]), a relay that sends no
 //! hint, or a REQ the tap can't single out reports none. Either way the sweep
 //! proves the slice by counting against the NIP-11 cap.
+//!
+//! An interrupted relay cancels its acquisition in flight rather than
+//! dropping it: a cancelled acquisition still reports every event byte it
+//! received, so a cut reply is metered like any other. Its NIP-77 exchanges
+//! carry ids, not events, and are dropped.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,10 +24,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use nostr_sdk::prelude::{
-    AcquisitionEnd, AcquisitionLimits, Client, Event, EventId, Filter, RelayAcquisition, RelayUrl,
-    ReqTarget, SyncDirection, SyncOptions, Timestamp,
+    AcquisitionEnd, AcquisitionLimits, Client, Event, EventId, Filter, Relay, RelayAcquisition,
+    RelayUrl, ReqTarget, SyncDirection, SyncOptions, Timestamp,
 };
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use super::hint_tap::{EoseHints, HintWatch};
 use super::{
@@ -31,7 +37,7 @@ use super::{
 };
 use crate::NostrSdkRelayClient;
 use crate::compare::{CompareRelay, CompareReply, IdsReply, LocalItem};
-use crate::sdk_client::{neg_sync_dry_run, sweep_eose_hints, sweep_neg_credit};
+use crate::sdk_client::{NegCompared, neg_sync_dry_run, sweep_eose_hints, sweep_neg_credit};
 
 /// Default bytes one reply may carry. A full wok page is 5,000 events.
 const REPLY_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -51,6 +57,9 @@ pub struct SdkSweepRelay {
     reply_max_bytes: usize,
     /// Event bytes read since [`SweepRelay::take_fetched_bytes`] last ran.
     fetched_bytes: AtomicU64,
+    /// Set by [`SweepRelay::interrupt`]: the acquisition in flight is
+    /// cancelled, and nothing more is asked.
+    interrupted: CancellationToken,
 }
 
 impl SdkSweepRelay {
@@ -70,6 +79,7 @@ impl SdkSweepRelay {
             request_timeout,
             reply_max_bytes: REPLY_MAX_BYTES,
             fetched_bytes: AtomicU64::new(0),
+            interrupted: CancellationToken::new(),
         }
     }
 
@@ -80,22 +90,58 @@ impl SdkSweepRelay {
         self
     }
 
-    /// A NIP-77 comparison that downloads nothing, under the request timeout.
-    fn dry_run(&self) -> SyncOptions {
-        SyncOptions::new()
+    /// A NIP-77 comparison of `filter` with `items` that downloads nothing,
+    /// under the request timeout. An interruption drops it: it carries ids,
+    /// not events, so there is nothing to meter.
+    async fn neg_compare(
+        &self,
+        relay: &Relay,
+        filter: Filter,
+        items: Vec<(EventId, Timestamp)>,
+    ) -> Result<NegCompared, NegFailure> {
+        let options = SyncOptions::new()
             .initial_timeout(self.request_timeout)
             .idle_timeout(self.request_timeout)
             .direction(SyncDirection::Down)
-            .dry_run()
+            .dry_run();
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        tokio::select! {
+            compared = neg_sync_dry_run(
+                relay,
+                filter,
+                items,
+                options,
+                self.neg_credit.clone(),
+                deadline,
+            ) => compared,
+            () = self.interrupted.cancelled() => {
+                Err(NegFailure::Unreachable(UnreachableKind::Disconnected))
+            }
+        }
     }
 
-    /// One bounded REQ to this relay, closed at EOSE.
+    /// One bounded REQ to this relay, closed at EOSE. An interruption cancels
+    /// it, and its partial reply still reports the bytes it read; `None` once
+    /// interrupted before it began.
     async fn acquire(&self, filter: Filter, max_items: usize) -> Option<RelayAcquisition> {
+        if self.interrupted.is_cancelled() {
+            return None;
+        }
         let limits =
             AcquisitionLimits::new(1, max_items, self.reply_max_bytes, self.request_timeout);
         let target = ReqTarget::manual([(self.endpoint.clone(), vec![filter])]);
         let handle = self.client.acquire_events(target, limits).await.ok()?;
-        let mut report = handle.finish().await.ok()?;
+        // Cancelling, unlike dropping the handle, keeps its report.
+        let canceller = handle.canceller();
+        let mut finish = std::pin::pin!(handle.finish());
+        let report = tokio::select! {
+            report = &mut finish => report,
+            () = self.interrupted.cancelled() => {
+                canceller.cancel();
+                finish.await
+            }
+        };
+        let mut report = report.ok()?;
         let reply = report.relays.remove(&self.endpoint)?;
         self.fetched_bytes.fetch_add(
             u64::try_from(reply.received_event_bytes).unwrap_or(u64::MAX),
@@ -178,16 +224,13 @@ impl SweepRelay for SdkSweepRelay {
         let Ok(Some(relay)) = self.client.relay(&self.endpoint).await else {
             return SecondReply::Unreachable(UnreachableKind::Disconnected);
         };
-        let deadline = tokio::time::Instant::now() + self.request_timeout;
-        let ids = match neg_sync_dry_run(
-            &relay,
-            route.second_filter(second, second).limit(SECOND_NEG_LIMIT),
-            Vec::new(),
-            self.dry_run(),
-            self.neg_credit.clone(),
-            deadline,
-        )
-        .await
+        let ids = match self
+            .neg_compare(
+                &relay,
+                route.second_filter(second, second).limit(SECOND_NEG_LIMIT),
+                Vec::new(),
+            )
+            .await
         {
             Ok(compared) => compared.remote,
             Err(NegFailure::Closed(reason)) => return SecondReply::Closed(reason),
@@ -249,6 +292,13 @@ impl SweepRelay for SdkSweepRelay {
     fn take_fetched_bytes(&self) -> u64 {
         self.fetched_bytes.swap(0, Ordering::Relaxed)
     }
+
+    /// Cancel the acquisition in flight, which then reports what it read, and
+    /// stop a second's id fetch issuing more chunks.
+    fn interrupt(&self) -> bool {
+        self.interrupted.cancel();
+        true
+    }
 }
 
 #[async_trait]
@@ -271,16 +321,13 @@ impl CompareRelay for SdkSweepRelay {
             .iter()
             .map(|item| (item.id, Timestamp::from_secs(item.created_at)))
             .collect();
-        let deadline = tokio::time::Instant::now() + self.request_timeout;
-        match neg_sync_dry_run(
-            &relay,
-            route.second_filter(window.since, window.until).limit(limit),
-            items,
-            self.dry_run(),
-            self.neg_credit.clone(),
-            deadline,
-        )
-        .await
+        match self
+            .neg_compare(
+                &relay,
+                route.second_filter(window.since, window.until).limit(limit),
+                items,
+            )
+            .await
         {
             Ok(compared) => CompareReply::Compared {
                 missing: compared.remote.into_iter().collect(),
@@ -329,6 +376,10 @@ impl CompareRelay for SdkSweepRelay {
 
     fn take_fetched_bytes(&self) -> u64 {
         SweepRelay::take_fetched_bytes(self)
+    }
+
+    fn interrupt(&self) -> bool {
+        SweepRelay::interrupt(self)
     }
 }
 
