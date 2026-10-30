@@ -243,6 +243,31 @@ enum MarmotStatus
    * names which members or devices hold the group back.
    */
   MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED = 110,
+  /**
+   * Sticker data failed validation: pack metadata, a reference, a link,
+   * or downloaded bytes that do not match the exact hash, MIME type, or
+   * dimensions. Retrying the same input cannot succeed.
+   */
+  MARMOT_STATUS_INVALID_STICKER = 111,
+  /**
+   * The sticker pack, or the exact `(pack, shortcode, plaintext hash)`
+   * asset, is not known locally and could not be resolved.
+   */
+  MARMOT_STATUS_STICKER_NOT_FOUND = 112,
+  /**
+   * A sticker relay or Blossom operation did not complete. Local intent is
+   * kept; retry when connectivity returns.
+   */
+  MARMOT_STATUS_STICKER_NETWORK = 113,
+  /**
+   * Signal sticker import was refused or failed. Import is refused before
+   * any network call while its fetch cannot be pinned.
+   */
+  MARMOT_STATUS_STICKER_IMPORT = 114,
+  /**
+   * Signal sticker import is not available for external-signing accounts.
+   */
+  MARMOT_STATUS_STICKER_IMPORT_UNSUPPORTED = 115,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -3573,6 +3598,15 @@ typedef struct MarmotMarkdownDocument {
 } MarmotMarkdownDocument;
 
 /**
+ * Exact kind-9 sticker reference: pack coordinate, shortcode, and plaintext hash.
+ */
+typedef struct MarmotStickerRef {
+  char *pack_coordinate;
+  char *shortcode;
+  char *plaintext_sha256;
+} MarmotStickerRef;
+
+/**
  * Preview of a chat row's last message.
  */
 typedef struct MarmotChatListMessagePreview {
@@ -3583,6 +3617,7 @@ typedef struct MarmotChatListMessagePreview {
   char *plaintext;
   struct MarmotMarkdownDocument content_tokens;
   uint64_t kind;
+  struct MarmotStickerRef *sticker;
   uint64_t timeline_at;
   bool has_retention_seconds;
   /**
@@ -3878,6 +3913,7 @@ typedef struct MarmotAppMessageRecord {
   uint64_t kind;
   struct MarmotMessageTag *tags;
   uintptr_t tags_len;
+  struct MarmotStickerRef *sticker;
   bool has_source_epoch;
   /**
    *Only meaningful when the matching `has_` flag is set.
@@ -4670,6 +4706,7 @@ typedef struct MarmotTimelineReplyPreview {
   char *plaintext;
   struct MarmotMarkdownDocument content_tokens;
   uint64_t kind;
+  struct MarmotStickerRef *sticker;
   char *media_json;
   /**
    * Ordered per-attachment outcomes for the previewed message:
@@ -4762,6 +4799,7 @@ typedef struct MarmotTimelineMessageRecord {
   char *plaintext;
   struct MarmotMarkdownDocument content_tokens;
   uint64_t kind;
+  struct MarmotStickerRef *sticker;
   struct MarmotMessageTag *tags;
   uintptr_t tags_len;
   /**
@@ -4848,6 +4886,7 @@ typedef struct MarmotNotificationUpdate {
   struct MarmotNotificationUser sender;
   struct MarmotNotificationUser receiver;
   char *preview_text;
+  struct MarmotStickerRef *sticker;
   char *reaction_emoji;
   char *reacted_to_preview;
   int64_t timestamp_ms;
@@ -5227,6 +5266,90 @@ typedef struct MarmotTimelineEditHistoryPage {
   bool has_more_before;
 } MarmotTimelineEditHistoryPage;
 
+/**
+ * One sticker in a pack projection.
+ */
+typedef struct MarmotSticker {
+  char *pack_coordinate;
+  char *shortcode;
+  char *url;
+  /**
+   * SHA-256 of the plaintext image bytes: the exact hash
+   * `marmot_fetch_sticker_asset` and `marmot_send_sticker` take.
+   */
+  char *plaintext_sha256;
+  char *mime;
+  bool has_width;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint32_t width;
+  bool has_height;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint32_t height;
+  char *alt;
+  char *emoji;
+} MarmotSticker;
+
+/**
+ * A validated sticker pack and its install state.
+ */
+typedef struct MarmotStickerPack {
+  char *coordinate;
+  char *author_pubkey_hex;
+  char *identifier;
+  char *event_id_hex;
+  uint64_t created_at;
+  char *title;
+  char *description;
+  struct MarmotSticker *cover;
+  struct MarmotSticker *stickers;
+  uintptr_t stickers_len;
+  char *license;
+  bool installed;
+} MarmotStickerPack;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotStickerPackList {
+  struct MarmotStickerPack *items;
+  uintptr_t len;
+} MarmotStickerPackList;
+
+/**
+ * Counts from one bounded sticker-pack sync.
+ */
+typedef struct MarmotStickerSyncResult {
+  uint32_t discovered;
+  uint32_t updated;
+  uint32_t installed;
+  uint32_t pending_operations;
+} MarmotStickerSyncResult;
+
+/**
+ * A Signal sticker import result.
+ */
+typedef struct MarmotStickerImportResult {
+  struct MarmotStickerPack pack;
+  /**
+   * Signal sticker ids the import skipped; `(NULL, 0)` when there are none.
+   */
+  uint32_t *skipped_signal_sticker_ids;
+  uintptr_t skipped_signal_sticker_ids_len;
+} MarmotStickerImportResult;
+
+/**
+ * Downloaded sticker bytes plus the validated reference metadata.
+ */
+typedef struct MarmotStickerAsset {
+  struct MarmotSticker sticker;
+  uint8_t *bytes;
+  uintptr_t bytes_len;
+} MarmotStickerAsset;
+
 typedef struct MarmotContentReport {
   char *report_id_hex;
   char *message_id_hex;
@@ -5368,6 +5491,7 @@ typedef struct MarmotReceivedMessage {
   uint64_t kind;
   struct MarmotMessageTag *tags;
   uintptr_t tags_len;
+  struct MarmotStickerRef *sticker;
   uint64_t source_epoch;
   /**
    * Unset means the engine could not recover the historical source
@@ -6349,6 +6473,14 @@ typedef struct MarmotConversationWindowSnapshot {
   bool has_more_before;
   bool has_more_after;
 } MarmotConversationWindowSnapshot;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotStickerList {
+  struct MarmotSticker *items;
+  uintptr_t len;
+} MarmotStickerList;
 
 typedef struct MarmotAttachmentDownloadPolicy {
   bool automatic;
@@ -10716,6 +10848,140 @@ MarmotStatus marmot_message_edit_history(const struct MarmotClient *client,
                                          struct MarmotTimelineEditHistoryPage **out);
 
 /**
+ * Read the encrypted sticker projection off the UI thread.
+ * `installed_only` is a uint8_t flag. `has_limit` 0 leaves the limit unset.
+ * Free with `marmot_sticker_pack_list_free`.
+ *
+ * # Safety
+ * `client` must be live, strings must be NUL-terminated, and `out` must be valid.
+ */
+MarmotStatus marmot_sticker_packs(const struct MarmotClient *client,
+                                  const char *account_ref,
+                                  uint8_t installed_only,
+                                  const char *search,
+                                  uint8_t has_limit,
+                                  uint32_t limit,
+                                  struct MarmotStickerPackList **out);
+
+/**
+ * Read one cached pack by coordinate or trusted pack link. NULL when absent.
+ * Free with `marmot_sticker_pack_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_sticker_pack(const struct MarmotClient *client,
+                                 const char *account_ref,
+                                 const char *input,
+                                 struct MarmotStickerPack **out);
+
+/**
+ * Refresh recent public packs and this account's installed list.
+ * Free with `marmot_sticker_sync_result_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_sync_sticker_packs(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       struct MarmotStickerSyncResult **out);
+
+/**
+ * Fetch one pack from its relay hints, then the account relays.
+ * Free with `marmot_sticker_pack_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_fetch_sticker_pack(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *input,
+                                       struct MarmotStickerPack **out);
+
+/**
+ * Record local install intent and publish the installed list.
+ * Free with `marmot_sticker_pack_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_install_sticker_pack(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *input,
+                                         struct MarmotStickerPack **out);
+
+/**
+ * Record local uninstall intent and publish the installed list.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_uninstall_sticker_pack(const struct MarmotClient *client,
+                                           const char *account_ref,
+                                           const char *input);
+
+/**
+ * Validate a canonical Signal pack link, then refuse before any network
+ * call. The pinned importer cannot be address-pinned, so this command
+ * does not download or upload. `blossom_server` may be NULL. Free with
+ * `marmot_sticker_import_result_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_import_signal_sticker_pack(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               const char *signal_link,
+                                               const char *blossom_server,
+                                               struct MarmotStickerImportResult **out);
+
+/**
+ * Download one exact sticker asset. The reference is borrowed and not freed.
+ * Free the result with `marmot_sticker_asset_free`.
+ *
+ * # Safety
+ * `client` must be live, strings must be NUL-terminated, and `out` must be valid.
+ */
+MarmotStatus marmot_fetch_sticker_asset(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *pack_coordinate,
+                                        const char *shortcode,
+                                        const char *plaintext_sha256,
+                                        struct MarmotStickerAsset **out);
+
+/**
+ * Send an exact sticker reference into a group.
+ *
+ * # Safety
+ * `client` must be live, strings must be NUL-terminated, and `out` must be valid.
+ */
+MarmotStatus marmot_send_sticker(const struct MarmotClient *client,
+                                 const char *account_ref,
+                                 const char *group_id_hex,
+                                 const char *pack_coordinate,
+                                 const char *shortcode,
+                                 const char *plaintext_sha256,
+                                 struct MarmotSendSummary **out);
+
+/**
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -13305,6 +13571,83 @@ void marmot_relay_endpoint_classification_list_free(struct MarmotRelayEndpointCl
  * library.
  */
 void marmot_unrecognized_sign_in_list_free(struct MarmotUnrecognizedSignInList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_sticker_ref_free(struct MarmotStickerRef *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_sticker_free(struct MarmotSticker *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_sticker_list_free(struct MarmotStickerList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_sticker_pack_free(struct MarmotStickerPack *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_sticker_pack_list_free(struct MarmotStickerPackList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_sticker_asset_free(struct MarmotStickerAsset *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_sticker_sync_result_free(struct MarmotStickerSyncResult *ptr);
+
+/**
+ * Free a sticker import result returned by this library.
+ *
+ * # Safety
+ * `value` must be NULL or a pointer returned by a Marmot sticker import call,
+ * and it must not have been freed already.
+ */
+void marmot_sticker_import_result_free(struct MarmotStickerImportResult *value);
 
 /**
  * Free a value of this type returned by this library. NULL

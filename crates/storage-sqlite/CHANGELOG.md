@@ -4,6 +4,16 @@
 
 ### Breaking changes
 
+- Migration 0135 advances account storage to schema 135 (mdk#2660 phase 4).
+  It replaces `account_recovery_units.fencing`, which nothing set, with
+  `account_recovery_unit_fences`: each capture range a unit fences, one row
+  each, never overlapping. `RecoveryUnit::fencing` goes, and
+  `set_recovery_unit_fencing` becomes `set_recovery_unit_fences`, which
+  replaces a unit's ranges. `recovery_unit_fences` lists every fenced range,
+  `staged_recovery_routes` the routes with staged events, and
+  `reclaim_staged_recovery_routes` drops the rows of routes the runner no
+  longer lists, owing their seconds again. The retention prune drops fenced
+  ranges below its floor.
 - Migration 0140 advances account storage to schema 140 (mdk#2628 item 3.4).
   It adds private KeyPackages, single-use KeyPackages a device hands to one
   sibling inside its device group: `cgka_private_key_packages` (one issuer
@@ -485,6 +495,10 @@ is unsupported. marmot-app also rekeys its databases once to raw SQLCipher keys
 
 ### Fixed
 
+- Sticker migrations run after the private KeyPackage schema, so upgrades
+  from schema `0140` create the pack and asset-history tables.
+- Winning sticker-pack replacements refresh asset URLs and metadata for an
+  unchanged exact hash. Older pack events cannot revert the replacement URL.
 - The timeline's modifier lookups (edits, reactions, deletions, reports), and
   the deleted-reaction and poll-vote queries, write their constant event kind
   into the SQL instead of binding it, so each kind keeps one cached statement.

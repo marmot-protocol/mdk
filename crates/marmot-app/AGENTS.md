@@ -186,6 +186,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   its first commit landed, it shows `Ended { LinkFailed }`. Each drive ends by comparing linking as hosts read it with
   `DevicePairing::last_view` and sets `device_link_changed` when it differs; the client opens with that flag set, and
   the same two seams as `linked_devices_changed` drain it into `DeviceLinkChanged`.
+- Keep outbound Welcomes on the engine's Welcome rows (mdk#2628 3.5a). The invite slot of
+  `drive_unpublished_welcome_delivery` holds only Welcome ids, published through the runtime's
+  `deliver_owed_welcomes_with_audit_context`; the founding slot keeps the create's `SessionEffects`, because a legacy
+  create's `GroupCreated` work rides them. Note a Welcome a publish could not deliver in one place,
+  `note_welcome_delivery_failures`, called from `remember_published_reports` (every seam that applies runtime
+  effects) and from the device-link send; never write a pending Welcome row or queue `WelcomeDeliveryPending` from a
+  drive. It announces each Welcome once per process (`announced_welcome_failures`) and leaves a failure without a
+  group (the startup retry's) to `reconcile_pending_welcome_delivery_index`. The worker's projection drain
+  (`publish_client_pending_projection_updates`) broadcasts the queued events, so every worker seam does.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.
@@ -331,23 +340,28 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the window. That time is only a hint: never use it to retire, un-cover or drop debt. It logs aggregate counts only.
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
-- Keep the recovery runner in `src/client/recovery_runner.rs` and its `select`, `quantum`, `compare`, `recheck`,
-  `policy` and `tails` modules (mdk#2660 phase 4). It is built but not started: nothing outside its tests constructs,
-  wakes or reads it until the switch-over replaces the comparison owner, so do not wire it from `account_worker.rs` or
-  a host surface in passing. Every ledger and retry-state write happens in a worker turn; the credit wait, caps read and sweep run
-  off the worker, and nothing read before the credit wait is planned on. Live tails are a query read fresh in each
-  turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
+- Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
+  `recheck`, `policy` and `tails` modules (mdk#2660 phase 4). It is built but not started: nothing outside its tests
+  constructs, wakes or reads it until the switch-over replaces the comparison owner, so do not wire it from
+  `account_worker.rs` or a host surface in passing. Every ledger and retry-state write happens in a worker turn; the
+  credit wait, caps read and sweep run off the worker, and nothing read before the credit wait is planned on. Live
+  tails are a query read fresh in each turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
   covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
   reached right after a `rate-limited:` reply settles `RateLimited`. Every event byte a required relay sends is
   charged to the account's rolling hour, cut and discarded replies included; best-effort relays are never charged.
   A quantum cut by its deadline, shutdown or the pass deadline interrupts its request in flight rather than dropping
   it, so the reply it was reading is charged too (`SweepRelay::interrupt`); an interrupted request is no answer and
-  never clears a rate limit. Logs carry aggregates only.
+  never clears a rate limit.
   A comparison or re-check quantum settles through the same table: its end maps to a sweep end (`compare::verdict`).
   A re-check settles the relay and the account budget but never its unit's retry state, records pass progress only
   under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it
   runs only when no debt unit is eligible, on required relays whose recorded caps show NIP-77. Storage makes a relay's
   re-checks due in the same write that ends a cooldown longer than an hour; do not split that into a second write.
+  Admission releases a group's staged events oldest first below its admission frontier, never past an event the
+  engine kept no trace of. Nothing is swept, compared or re-checked for a group admission cannot drain (held, or
+  admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences; the fence is a query
+  (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own
+  `LiveCount`, never the coverage recorder's facts. Logs carry aggregates only.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown

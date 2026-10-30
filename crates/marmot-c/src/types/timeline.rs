@@ -1,5 +1,6 @@
 //! C mirrors of the materialized timeline conversions.
 
+use super::sticker::MarmotStickerRef;
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
@@ -138,6 +139,7 @@ c_mirror! {
         str plaintext,
         rec content_tokens: MarmotMarkdownDocument,
         copy kind: u64,
+        opt_rec sticker: MarmotStickerRef,
         opt_str media_json,
         /// Ordered per-attachment outcomes for the previewed message:
         /// accepted references plus typed rejections at their positions.
@@ -235,6 +237,7 @@ c_mirror! {
         str plaintext,
         rec content_tokens: MarmotMarkdownDocument,
         copy kind: u64,
+        opt_rec sticker: MarmotStickerRef,
         vec tags/tags_len: MarmotMessageTag,
         /// Authenticated inner app-event time, or observation time for
         /// synthesized rows.

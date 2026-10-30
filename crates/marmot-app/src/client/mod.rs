@@ -178,8 +178,10 @@ pub(crate) enum UnpublishedWelcomeKind {
         effects: SessionEffects,
         welcome_intents: Vec<String>,
     },
+    /// The invite's Welcomes by id. The engine holds their bytes; the drive
+    /// asks the runtime to publish those still owed.
     Invite {
-        welcomes: Vec<cgka_traits::transport::TransportMessage>,
+        welcome_ids: Vec<MessageId>,
         welcome_intents: Vec<String>,
     },
 }
@@ -969,11 +971,14 @@ pub struct AppClient {
     /// Tests fail every write of an owed push announce.
     #[cfg(test)]
     pub(crate) test_fail_push_announce_owed_write: bool,
-    /// Welcomes queued for re-delivery during the most recent create/invite.
-    /// The runtime account worker drains this after the command and broadcasts a
-    /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
-    /// without polling (mdk#352).
+    /// Welcomes a publish could not deliver, from any path. The runtime
+    /// account worker drains this with the projection updates and broadcasts
+    /// a `WelcomeDeliveryPending` event so callers learn a member is
+    /// unjoinable without polling (mdk#352).
     pub(crate) pending_welcome_delivery_events: Vec<PendingWelcomeDelivery>,
+    /// Welcomes already announced as pending by this process, so a Welcome
+    /// that keeps failing on each maintenance pass is announced once.
+    pub(crate) announced_welcome_failures: HashSet<MessageId>,
     /// Durable failure level from the last successful maintenance summary read.
     pub(crate) maintenance_failed_backlog: u32,
     /// Superseded own commits awaiting a `GroupChangeSuperseded` runtime event
@@ -3207,7 +3212,7 @@ impl AppClient {
             group_id: group_id.clone(),
             audit_context: audit_context.clone(),
             kind: UnpublishedWelcomeKind::Invite {
-                welcomes,
+                welcome_ids: welcomes.into_iter().map(|welcome| welcome.id).collect(),
                 welcome_intents,
             },
         });
@@ -3276,7 +3281,6 @@ impl AppClient {
                     "injected invite local refresh failure".into(),
                 ));
             }
-            self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
             self.record_human_action_succeeded(group_id, &audit_context, &effects);
             self.remember_published_reports(&effects);
             self.refresh_group(group_id);
@@ -4605,9 +4609,9 @@ impl AppClient {
             AppMessageIntent::Report { .. } | AppMessageIntent::DismissReports { .. } => {
                 (Family::MessageAction, "custom")
             }
-            AppMessageIntent::Chat { .. } | AppMessageIntent::TaggedChat { .. } => {
-                (Family::MessageAction, "text")
-            }
+            AppMessageIntent::Chat { .. }
+            | AppMessageIntent::TaggedChat { .. }
+            | AppMessageIntent::Sticker { .. } => (Family::MessageAction, "text"),
             AppMessageIntent::Reply { .. } => (Family::MessageAction, "reply"),
             AppMessageIntent::Reaction { .. } => (Family::MessageAction, "reaction"),
             AppMessageIntent::Unreact { .. } | AppMessageIntent::DeleteReactions { .. } => {
@@ -4755,6 +4759,10 @@ impl AppClient {
         F: FnMut(crate::AppProjectionUpdate),
     {
         self.ensure_group_application_messages_allowed(group_id)?;
+        if let AppMessageIntent::Sticker { sticker_ref } = &intent {
+            self.app
+                .authorize_sticker_ref(&self.state.label, sticker_ref)?;
+        }
         // Capture the human-action descriptor before `Unreact` is rewritten to
         // `DeleteReactions` below, so the audit log records the user's actual
         // intent.
@@ -7253,6 +7261,7 @@ impl AppClient {
 
     fn remember_published_reports(&mut self, effects: &marmot_session::AccountDeviceEffects) {
         self.note_superseded_intent_reports(effects);
+        self.note_welcome_delivery_failures(effects);
         self.pending_convergence_groups
             .extend(effects.pending_convergence.iter().cloned());
         if effects.reports.is_empty() {
@@ -7273,40 +7282,60 @@ impl AppClient {
         self.pending_group_projection_updates.insert(group_id_hex);
     }
 
-    /// Durably record welcomes a confirmed create/invite could not deliver, so
-    /// the repair handle is not lost when the call returns (mdk#352). The commit
-    /// is already confirmed and externally visible, so the added member stays in
-    /// the roster but cannot join until the welcome is re-delivered.
-    fn record_welcome_delivery_failures(
+    /// Record each Welcome a publish could not deliver as a pending Welcome
+    /// delivery, and queue its `WelcomeDeliveryPending` event (mdk#352),
+    /// whichever path published it: a create or invite, a commit the runtime
+    /// released its Welcomes after, maintenance, or a device link. The added
+    /// member stays in the roster but cannot join until the Welcome is
+    /// re-delivered. Each Welcome is announced once per process; the engine
+    /// still owes it, so a failed write only leaves the row to the next
+    /// reconcile. A failure without a group (the startup retry's) is left to
+    /// that reconcile too.
+    pub(crate) fn note_welcome_delivery_failures(
         &mut self,
-        group_id_hex: &str,
         effects: &marmot_session::AccountDeviceEffects,
-    ) -> Result<(), AppError> {
-        if effects.welcome_failures.is_empty() {
-            return Ok(());
-        }
-        let storage = self.app.account_storage(&self.state.label)?;
+    ) {
         let recorded_at = unix_now_seconds();
         for failure in &effects.welcome_failures {
+            let Some(group_id) = &failure.group_id else {
+                continue;
+            };
+            if !self
+                .announced_welcome_failures
+                .insert(failure.message_id.clone())
+            {
+                continue;
+            }
             let message_id_hex = hex::encode(failure.message_id.as_slice());
+            let group_id_hex = hex::encode(group_id.as_slice());
             let recipient_hex = hex::encode(failure.recipient.as_slice());
-            storage.app_storage().record_pending_welcome_delivery(
-                &message_id_hex,
-                group_id_hex,
-                &recipient_hex,
-                recorded_at,
-            )?;
-            // Queue a runtime event so subscribers (UI/CLI/UniFFI) learn the
-            // member is unjoinable without polling the durable queue.
+            let recorded = self
+                .app
+                .account_storage(&self.state.label)
+                .and_then(|storage| {
+                    Ok(storage.app_storage().record_pending_welcome_delivery(
+                        &message_id_hex,
+                        &group_id_hex,
+                        &recipient_hex,
+                        recorded_at,
+                    )?)
+                });
+            if let Err(error) = recorded {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "note_welcome_delivery_failures",
+                    error_kind = error.privacy_safe_kind(),
+                    "pending Welcome delivery left to the next reconcile"
+                );
+            }
             self.pending_welcome_delivery_events
                 .push(PendingWelcomeDelivery {
-                    group_id_hex: group_id_hex.to_owned(),
+                    group_id_hex,
                     message_id_hex,
                     recipient_hex,
                     recorded_at,
                 });
         }
-        Ok(())
     }
 
     /// Derive the current-profile founding Welcome message ids needed by the
@@ -7574,27 +7603,20 @@ impl AppClient {
                     self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
                         .await,
                 );
-                recover_post_canonical_result(
-                    "record_founding_welcome_delivery_failures",
-                    self.record_welcome_delivery_failures(
-                        &hex::encode(work.group_id.as_slice()),
-                        &effects,
-                    ),
-                );
                 self.record_human_action_succeeded(&work.group_id, &work.audit_context, &effects);
                 self.remember_published_reports(&effects);
                 delivery
             }
             UnpublishedWelcomeKind::Invite {
-                welcomes,
+                welcome_ids,
                 welcome_intents,
             } => {
                 let welcome_publish_started_at = Instant::now();
                 let publish_result = self
                     .runtime
-                    .publish_welcome_messages_with_audit_context(
-                        welcomes,
-                        Some(work.group_id.clone()),
+                    .deliver_owed_welcomes_with_audit_context(
+                        &welcome_ids,
+                        work.group_id.clone(),
                         work.audit_context,
                     )
                     .await
@@ -7618,18 +7640,14 @@ impl AppClient {
                     }
                 };
                 let _ = self.clear_delivered_founding_welcome_intents(&welcome_intents, &effects);
-                let _ = self.record_welcome_delivery_failures(
-                    &hex::encode(work.group_id.as_slice()),
-                    &effects,
-                );
                 self.remember_published_reports(&effects);
                 WelcomeDelivery::of(true, &effects)
             }
         }
     }
 
-    /// Drain the welcomes queued for re-delivery during the last create/invite,
-    /// for the runtime worker to broadcast as `WelcomeDeliveryPending` events
+    /// Drain the Welcomes queued for re-delivery since the last drain, for the
+    /// runtime worker to broadcast as `WelcomeDeliveryPending` events
     /// (mdk#352).
     /// A device group's Welcomes stay out of these events; the startup retry
     /// still redelivers them.
