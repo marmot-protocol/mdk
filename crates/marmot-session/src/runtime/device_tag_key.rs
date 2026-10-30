@@ -6,14 +6,16 @@
 //! the founding roster. Every other device sets its own once it has joined,
 //! in a roster update whose own UpdatePath the engine already tags under that
 //! key. Maintenance and every host KeyPackage publication make that update
-//! first; the host names the group.
+//! first, through the roster write path ([`AccountDeviceRuntime::edit_device_roster_entry`]);
+//! the host names the group.
 //!
 //! No KeyPackage is staged while the key is due and not yet in the merged
 //! roster: it would be built untagged and published after the key was set.
 
-use cgka_traits::app_components::{DeviceEntryV1, DeviceRosterOperationV1, DeviceSlotId};
+use cgka_traits::app_components::DeviceSlotId;
 use cgka_traits::{GroupId, TransportAdapter};
 
+use super::device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked};
 use super::{AccountDeviceEffects, AccountDeviceRuntime, TRACE_TARGET};
 use crate::error::AccountResult;
 use crate::key_package::KeyPackagePublisher;
@@ -23,11 +25,8 @@ use crate::routing::TransportRoutingPolicy;
 enum TagKey {
     /// The entry carries it, or no device group is named.
     Set,
-    /// The entry lacks it.
-    Due {
-        slot: DeviceSlotId,
-        entry: Box<DeviceEntryV1>,
-    },
+    /// The entry of this device's slot lacks it.
+    Due(DeviceSlotId),
     /// It cannot be set now: the device group is unreadable, holds no entry
     /// for this device's slot, or another device's entry or a removed slot
     /// keeps the key. The engine tags only from this device's own entry, so a
@@ -67,10 +66,7 @@ where
         if self.key_package_slot_withdrawn {
             return Ok(true);
         }
-        Ok(!matches!(
-            self.device_tag_key(&group_id)?,
-            TagKey::Due { .. }
-        ))
+        Ok(!matches!(self.device_tag_key(&group_id)?, TagKey::Due(_)))
     }
 
     /// Maintenance's step before it stages or announces a KeyPackage:
@@ -102,10 +98,11 @@ where
     /// the merged roster carries the key.
     ///
     /// Does nothing when no device group is named, the slot is withdrawn, the
-    /// entry already carries the key, or the device group cannot take a
-    /// commit from this device now: it is in `held`, quarantined, or
-    /// settling, or an earlier change of this device's there is still queued
-    /// or unconfirmed. A later call retries.
+    /// entry already carries the key, or the roster write path sends nothing:
+    /// the device group cannot take a commit from this device now (it is in
+    /// `held`, quarantined, or settling, or an earlier change of this
+    /// device's there is still queued or unconfirmed), or the entry changed
+    /// under the send. A later call retries.
     pub async fn set_device_tag_key_holding(
         &mut self,
         held: &[GroupId],
@@ -116,9 +113,9 @@ where
         if self.key_package_slot_withdrawn {
             return Ok(AccountDeviceEffects::default());
         }
-        let (slot, mut entry) = match self.device_tag_key(&group_id)? {
+        let slot = match self.device_tag_key(&group_id)? {
             TagKey::Set => return Ok(AccountDeviceEffects::default()),
-            TagKey::Due { slot, entry } => (slot, *entry),
+            TagKey::Due(slot) => slot,
             TagKey::Blocked(reason) => {
                 tracing::debug!(
                     target: TRACE_TARGET,
@@ -129,22 +126,35 @@ where
                 return Ok(AccountDeviceEffects::default());
             }
         };
-        if !self.device_group_takes_commit(&group_id, held)? {
-            return Ok(AccountDeviceEffects::default());
+        let own_key = self.session.own_signature_key();
+        match self
+            .edit_device_roster_entry(&group_id, &slot, held, |entry| {
+                entry.tag_signature_key = Some(own_key);
+            })
+            .await?
+        {
+            DeviceRosterEdit::Committed(effects) => {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    method = "set_device_tag_key",
+                    "set this device's tag signature key in its device group"
+                );
+                Ok(*effects)
+            }
+            DeviceRosterEdit::Unchanged
+            | DeviceRosterEdit::Blocked(DeviceRosterEditBlocked::Busy) => {
+                Ok(AccountDeviceEffects::default())
+            }
+            DeviceRosterEdit::Blocked(blocked) => {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    method = "set_device_tag_key",
+                    reason = blocked.reason(),
+                    "cannot set this device's tag signature key yet"
+                );
+                Ok(AccountDeviceEffects::default())
+            }
         }
-        // The commit replaces the entry whole: every other field stays as
-        // the roster holds it.
-        entry.tag_signature_key = Some(self.session.own_signature_key());
-        tracing::debug!(
-            target: TRACE_TARGET,
-            method = "set_device_tag_key",
-            "setting this device's tag signature key in its device group"
-        );
-        self.send_device_roster_update(
-            group_id,
-            vec![DeviceRosterOperationV1::SetDevice(slot, entry)],
-        )
-        .await
     }
 
     fn device_tag_key(&mut self, group_id: &GroupId) -> AccountResult<TagKey> {
@@ -178,9 +188,6 @@ where
         {
             return Ok(TagKey::Blocked("key_held_by_removed_slot"));
         }
-        Ok(TagKey::Due {
-            slot,
-            entry: Box::new(entry),
-        })
+        Ok(TagKey::Due(slot))
     }
 }

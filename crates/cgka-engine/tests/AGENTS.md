@@ -199,8 +199,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     creation; a roster update is a diff every member applies to the parent's roster, and a committer that writes the
     update's bytes as the state is dropped; the roster's own invariants, one tag signature key per device included; every leaf is one
     account, at creation, on invite, on replay and at join; the roster is required from creation or never, for
-    Commits and standalone proposals; and outside a device group roster bytes are unknown data. The `Parts::app_data_state` override in
-    `account_devices.rs` lets a crafted Commit write resulting bytes of its own.
+    Commits and standalone proposals; and outside a device group roster bytes are unknown data. A device entry
+    replacement (`ReplaceDeviceEntry`) never lands on an entry that changed since it was read: not from its own
+    send's settlement, a rival branch at the same epoch, or the drain, and a lost one is re-issued only while its
+    entry is untouched (`DeviceEntryChanged`). The
+    `Parts::app_data_state` override in `account_devices.rs` lets a crafted Commit write resulting bytes of its own.
 
 - **File:** `account_devices/link_device.rs` (test-policy builds only)
   - **Owns:** The link Commit (mdk#2628 item 3.3b), `LinkDevice`: one privileged admin Commit that adds the linked

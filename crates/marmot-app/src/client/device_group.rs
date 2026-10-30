@@ -29,15 +29,21 @@
 //! - The host reads the roster only as [`LinkedDevice`]s, this account's own
 //!   devices, from the device group this device trusts. The group's own events
 //!   never reach the host; `LinkedDevicesChanged` stands in for them.
+//! - The host changes a device entry only by renaming a device (3.6, in
+//!   `device_renames.rs`), through the runtime's roster write path, the one
+//!   slot announcements use. Each announcement also writes this device's
+//!   client and platform from the app's config into its own entry. Rejected
+//!   sign-ins (3.2) are written as rejected slots, never device entries, by
+//!   `commit_device_roster_update`.
 //!
 //! A confirmed link comes from device pairing. Until pairing reaches the app,
 //! only the test-policy hook supplies one.
 
 use cgka_traits::app_components::{
-    AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
-    DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID,
-    decode_device_roster_v1, encode_device_roster_update_v1, encode_device_roster_v1,
-    encode_nostr_routing_v1,
+    AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
+    DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, DeviceStatusV1,
+    NOSTR_ROUTING_COMPONENT_ID, decode_device_roster_v1, encode_device_roster_update_v1,
+    encode_device_roster_v1, encode_nostr_routing_v1,
 };
 use cgka_traits::engine::{CreateGroupRequest, SendIntent};
 use cgka_traits::storage::{
@@ -45,6 +51,7 @@ use cgka_traits::storage::{
     MaintenanceStorage as _, StorageError,
 };
 use cgka_traits::{EpochId, Group, GroupId, KeyPackage, TransportGroupSubscription};
+use marmot_session::DeviceSelfReport;
 use rand::RngCore as _;
 use rand::rngs::OsRng;
 use storage_sqlite::{DeviceGroupRecord, DeviceGroupTrust};
@@ -636,7 +643,27 @@ impl AppClient {
     pub(crate) fn sync_key_package_announcement_group(&mut self) -> Result<(), AppError> {
         let group = self.rostered_device_group()?;
         self.runtime.set_key_package_announcement_group(group);
+        self.runtime
+            .set_device_self_report(self.device_self_report());
         Ok(())
+    }
+
+    /// What this device says about itself in its roster entry: its
+    /// KeyPackage client name and its platform, each trimmed, and left empty
+    /// when blank or over the roster's 64 bytes.
+    fn device_self_report(&self) -> DeviceSelfReport {
+        let fit = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| value.len() <= DEVICE_ROSTER_TEXT_MAX_LEN)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        DeviceSelfReport {
+            client: fit(&self.app.config.key_package_client_name),
+            platform: fit(&self.app.config.device_platform),
+        }
     }
 
     /// Tell the runtime which device group this device tags its KeyPackages
@@ -815,7 +842,9 @@ impl AppClient {
     }
 
     /// One roster commit in the trusted device group `group_id`, carrying
-    /// `operations` as one diff update: the one way to write the roster.
+    /// `operations` as one diff update: the way to write rejected slots.
+    /// Device entries go through the runtime's `edit_device_roster_entry`
+    /// instead, which replaces an entry only while it is the one it read.
     /// Callers read `group_id` from [`Self::trusted_device_roster`] and check
     /// the group is quiet first.
     pub(crate) async fn commit_device_roster_update(

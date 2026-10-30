@@ -135,6 +135,15 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::UpdateAppComponents { group_id, updates } => {
                 self.do_send_update_app_components(group_id, updates).await
             }
+            SendIntent::ReplaceDeviceEntry {
+                group_id,
+                slot,
+                expected,
+                entry,
+            } => {
+                self.do_send_replace_device_entry(group_id, slot, *expected, *entry)
+                    .await
+            }
             SendIntent::UpdateGroupData {
                 group_id,
                 name,

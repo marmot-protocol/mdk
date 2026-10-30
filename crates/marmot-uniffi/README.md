@@ -242,7 +242,7 @@ The reference's names, signatures and source-line links are checked against sour
 
 ## Runtime options and client label
 
-`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, `secretStore` and
+`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, `devicePlatform`, `secretStore` and
 `attachmentAcquisitionMode` with the required [`deployment`](#deployment) in `Marmot.newWithConfiguration`.
 Every other field is optional in generated Swift/Kotlin: omitted policies mean public-only endpoints and an advancing cursor;
 an omitted label stays untagged, omitted storage uses the platform keychain, and an omitted
@@ -990,11 +990,25 @@ the device group this device trusts, for a Devices screen:
 - This device comes first (`is_this_device`), then the rest by `linked_at`. Every entry is this account's own device.
 - `slot_id_hex` is the device's KeyPackage slot, the handle later device actions take. `label`, `client` and
   `platform` are empty until set; `linked_by_slot_id_hex` is `None` for the device that founded the group.
+- Each device writes its own `client` and `platform`: its `clientName` and `devicePlatform` options (a short name
+  such as `iOS`), trimmed, and empty when blank or over 64 bytes. It writes them with its next KeyPackage
+  announcement in the device group, so they appear after its next maintenance pass.
 - The list is empty until this device trusts a device group (a single-device account has none), and in every release
   build until the roster's spec lands.
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
   device or group identities. It also fires once each time the account's worker opens or reconnects, so it may fire
   with no visible change.
+
+`rename_linked_device(account_ref, slot_id_hex, label)` renames any of the account's devices, this one included, with
+one roster commit in the device group:
+
+- Only the label changes. It is at most 64 bytes of UTF-8; an empty label clears it.
+- It is refused with nothing sent (`DeviceGroupRefused`) in release builds, for a label that is too long, without a
+  device group, for a slot the roster doesn't list, and while the device group has an earlier change of this device's
+  in flight (`device_group_busy`). Retry that last one later; a commit then could build on a roster that is about to
+  change.
+- A rename whose commit loses a fork to one that also changes that device's entry is not made again, and the winning
+  label stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`, not the one the user typed.
 
 ### Overdue KeyPackage refresh
 

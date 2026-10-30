@@ -23,11 +23,11 @@ pub use key_package::{
 pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy};
 pub use runtime::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, AccountIngestPhase,
-    CompletedWelcomePublishTask, FailedApplicationMessage, MaintenanceActivity,
-    MaintenanceAttemptDuration, MaintenanceTiming, PendingResolution, PreparedSessionCommit,
-    PreparedSessionSend, PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage,
-    UndeliveredCommit, UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
-    WelcomeDeliveryFailure,
+    CompletedWelcomePublishTask, DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport,
+    FailedApplicationMessage, MaintenanceActivity, MaintenanceAttemptDuration, MaintenanceTiming,
+    PendingResolution, PreparedSessionCommit, PreparedSessionSend, PreparedWelcomePublishTask,
+    PublishFailure, PublishedApplicationMessage, UndeliveredCommit, UnresolvedApplicationMessage,
+    UnresolvedPublish, UnresolvedPublishReason, WelcomeDeliveryFailure,
 };
 pub use session::{
     CreateGroupEffects, GroupAuthorityView, HydrationProgress, PublishWork, QueuedIntentRef,

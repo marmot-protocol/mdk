@@ -84,6 +84,10 @@ impl<S: StorageProvider> Engine<S> {
                     OwnCommitBaseline::AppComponents { components },
                 ))
             }
+            // The intent carries its own baseline: the entry it replaces.
+            SendIntent::ReplaceDeviceEntry { .. } => {
+                Some((SupersededIntentKind::AppComponents, OwnCommitBaseline::None))
+            }
             SendIntent::AppMessage { .. }
             | SendIntent::Leave { .. }
             | SendIntent::SelfUpdate { .. }
@@ -157,7 +161,9 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::Invite { .. } => SupersededIntentKind::Invite,
             SendIntent::RemoveMembers { .. } => SupersededIntentKind::RemoveMembers,
             SendIntent::UpdateGroupData { .. } => SupersededIntentKind::GroupProfile,
-            SendIntent::UpdateAppComponents { .. } => SupersededIntentKind::AppComponents,
+            SendIntent::UpdateAppComponents { .. } | SendIntent::ReplaceDeviceEntry { .. } => {
+                SupersededIntentKind::AppComponents
+            }
             _ => return Ok(None),
         };
         let report = |outcome, reason| SupersededIntentReport {
@@ -291,6 +297,28 @@ impl<S: StorageProvider> Engine<S> {
                         report(
                             SupersededIntentOutcome::Conflict,
                             "the winning branch changed the same component; its value stands",
+                        ),
+                        None,
+                    )));
+                }
+                record.intent.clone()
+            }
+            // Compared again when the re-issued copy is prepared, since
+            // another commit can change the entry before the drain.
+            SendIntent::ReplaceDeviceEntry {
+                group_id,
+                slot,
+                expected,
+                ..
+            } => {
+                let mls_group = self.load_mls_group(group_id)?;
+                if crate::app_components::device_entry_of_group(&mls_group, slot).as_ref()
+                    != Some(&**expected)
+                {
+                    return Ok(Some((
+                        report(
+                            SupersededIntentOutcome::Conflict,
+                            "the winning branch changed the same device entry; its value stands",
                         ),
                         None,
                     )));

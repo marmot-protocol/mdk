@@ -17,7 +17,7 @@
 //! `Box<dyn CgkaEngine + Send + Sync>` today and can be dropped later without
 //! breaking the contract.
 
-use crate::app_components::{AppComponentData, AppComponentId};
+use crate::app_components::{AppComponentData, AppComponentId, DeviceEntryV1, DeviceSlotId};
 use crate::app_event::AppMessageRetentionDecision;
 use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
@@ -219,6 +219,23 @@ pub enum SendIntent {
     UpdateAppComponents {
         group_id: GroupId,
         updates: Vec<AppComponentData>,
+    },
+    /// Replace the entry of `slot` in the roster of a device group with
+    /// `entry`, in one `marmot.account.device-roster.v1` `SetDevice`, while
+    /// the roster still holds `expected` there (mdk#2628 3.6).
+    ///
+    /// `SetDevice` replaces an entry whole, so an entry computed from an
+    /// older read would put back every field changed since. The engine
+    /// compares the slot's entry with `expected` each time it prepares the
+    /// Commit: on a direct send once the send has settled the group's
+    /// convergence input, when a queued copy is drained, and when it re-issues
+    /// the intent after a lost fork. Any other entry, or none, refuses it with
+    /// [`EngineError::DeviceEntryChanged`] and nothing is staged.
+    ReplaceDeviceEntry {
+        group_id: GroupId,
+        slot: DeviceSlotId,
+        expected: Box<DeviceEntryV1>,
+        entry: Box<DeviceEntryV1>,
     },
     /// Update the group's `marmot.group.profile.v1` app component fields.
     UpdateGroupData {

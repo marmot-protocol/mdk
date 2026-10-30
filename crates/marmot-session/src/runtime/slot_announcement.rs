@@ -11,27 +11,13 @@
 //! an announcement that convergence dropped holds publication back until it
 //! is made again. With no device group, publication runs as before.
 
-use cgka_traits::app_components::{DeviceEntryV1, DeviceRosterOperationV1, DeviceSlotId};
 use cgka_traits::{GroupId, TransportAdapter};
 
+use super::device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked};
 use super::{AccountDeviceEffects, AccountDeviceRuntime, TRACE_TARGET};
 use crate::error::{AccountError, AccountResult};
 use crate::key_package::KeyPackagePublisher;
 use crate::routing::TransportRoutingPolicy;
-
-/// Where this device's roster entry stands for one KeyPackage.
-enum Announcement {
-    /// The entry names it, or no device group is set.
-    Announced,
-    /// The entry names another KeyPackage, or none.
-    Due {
-        slot: DeviceSlotId,
-        entry: Box<DeviceEntryV1>,
-    },
-    /// It cannot be announced now: the device group is unreadable, or holds
-    /// no entry for this device's slot.
-    Blocked(&'static str),
-}
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
 where
@@ -55,10 +41,17 @@ where
     /// Whether `key_package_ref` may reach this device's slot: no device
     /// group is set, or this device's roster entry there names it.
     pub(super) fn key_package_announced(&mut self, key_package_ref: &[u8]) -> AccountResult<bool> {
-        Ok(matches!(
-            self.key_package_announcement(key_package_ref)?,
-            Announcement::Announced
-        ))
+        let Some(group_id) = self.key_package_announcement_group.clone() else {
+            return Ok(true);
+        };
+        let Some(slot) = self.own_device_slot()? else {
+            return Ok(false);
+        };
+        // Every failure to read the roster holds publication back.
+        Ok(self
+            .merged_device_roster(&group_id)
+            .and_then(|mut roster| roster.devices.remove(&slot))
+            .is_some_and(|entry| entry.announced_key_package.as_deref() == Some(key_package_ref)))
     }
 
     /// Refuse to publish `key_package_ref` until it is announced.
@@ -120,9 +113,11 @@ where
 
     /// Announce, in this device's roster entry, the KeyPackage this device is
     /// about to publish, or has published: its pending replacement, otherwise
-    /// its current one. The returned effects carry the roster commit.
+    /// its current one, along with what this device says about itself
+    /// ([`Self::set_device_self_report`]). The returned effects carry the
+    /// roster commit.
     ///
-    /// Does nothing when no device group is set, the entry already names it,
+    /// Does nothing when no device group is set, the entry already reads so,
     /// or the device group cannot take a commit from this device now: it is
     /// in `held`, quarantined, or settling, or an earlier change of this
     /// device's there is still queued or unconfirmed. A later call retries.
@@ -144,35 +139,45 @@ where
         else {
             return Ok(AccountDeviceEffects::default());
         };
-        let (slot, mut entry) = match self.key_package_announcement(&key_package_ref)? {
-            Announcement::Announced => return Ok(AccountDeviceEffects::default()),
-            Announcement::Due { slot, entry } => (slot, *entry),
-            Announcement::Blocked(reason) => {
+        let Some(slot) = self.own_device_slot()? else {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                method = "announce_key_package",
+                reason = "slot_unavailable",
+                "cannot announce this device's key package yet; its publication waits"
+            );
+            return Ok(AccountDeviceEffects::default());
+        };
+        let report = self.device_self_report.clone();
+        match self
+            .edit_device_roster_entry(&group_id, &slot, held, |entry| {
+                entry.announced_key_package = Some(key_package_ref);
+                report.apply(entry);
+            })
+            .await?
+        {
+            DeviceRosterEdit::Committed(effects) => {
                 tracing::debug!(
                     target: TRACE_TARGET,
                     method = "announce_key_package",
-                    reason,
+                    "announced this device's key package and self-report in its device group"
+                );
+                Ok(*effects)
+            }
+            DeviceRosterEdit::Unchanged
+            | DeviceRosterEdit::Blocked(DeviceRosterEditBlocked::Busy) => {
+                Ok(AccountDeviceEffects::default())
+            }
+            DeviceRosterEdit::Blocked(blocked) => {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    method = "announce_key_package",
+                    reason = blocked.reason(),
                     "cannot announce this device's key package yet; its publication waits"
                 );
-                return Ok(AccountDeviceEffects::default());
+                Ok(AccountDeviceEffects::default())
             }
-        };
-        if !self.device_group_takes_commit(&group_id, held)? {
-            return Ok(AccountDeviceEffects::default());
         }
-        // The commit replaces the entry whole: every other field stays as
-        // the roster holds it.
-        entry.announced_key_package = Some(key_package_ref);
-        tracing::debug!(
-            target: TRACE_TARGET,
-            method = "announce_key_package",
-            "announcing this device's key package in its device group"
-        );
-        self.send_device_roster_update(
-            group_id,
-            vec![DeviceRosterOperationV1::SetDevice(slot, entry)],
-        )
-        .await
     }
 
     /// Whether [`Self::republish_key_package`] would publish a fresh
@@ -244,29 +249,5 @@ where
                 .saturating_add(super::KEY_PACKAGE_REFRESH_MAX_SECS)
                 <= now.0
         }))
-    }
-
-    fn key_package_announcement(&mut self, key_package_ref: &[u8]) -> AccountResult<Announcement> {
-        let Some(group_id) = self.key_package_announcement_group.clone() else {
-            return Ok(Announcement::Announced);
-        };
-        let Some(slot) = self.own_device_slot()? else {
-            return Ok(Announcement::Blocked("slot_unavailable"));
-        };
-        // Every failure to read the roster holds publication back.
-        let roster = self.merged_device_roster(&group_id);
-        let Some(mut roster) = roster else {
-            return Ok(Announcement::Blocked("device_group_unreadable"));
-        };
-        Ok(match roster.devices.remove(&slot) {
-            None => Announcement::Blocked("no_roster_entry"),
-            Some(entry) if entry.announced_key_package.as_deref() == Some(key_package_ref) => {
-                Announcement::Announced
-            }
-            Some(entry) => Announcement::Due {
-                slot,
-                entry: Box::new(entry),
-            },
-        })
     }
 }

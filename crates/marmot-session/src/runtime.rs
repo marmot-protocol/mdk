@@ -69,6 +69,7 @@ use crate::time::{
 };
 
 mod device_roster;
+pub use device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport};
 mod device_tag_key;
 mod removed_slot_expiry;
 mod slot_announcement;
@@ -512,6 +513,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// publishes them (mdk#2628 3.4). The host sets it; `None` publishes as
     /// a device with no device group does.
     key_package_announcement_group: Option<GroupId>,
+    /// What this device says about itself in its roster entry there (mdk#2628
+    /// 3.6); every announcement writes it too.
+    device_self_report: DeviceSelfReport,
     /// The device group this device tags its KeyPackages and leaves from
     /// (mdk#2628 3.1d), as the host last named it to the engine.
     device_tag_group: Option<GroupId>,
@@ -592,6 +596,7 @@ where
             maintenance_paused: false,
             key_package_slot_withdrawn: false,
             key_package_announcement_group: None,
+            device_self_report: DeviceSelfReport::default(),
             device_tag_group: None,
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
@@ -6930,6 +6935,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::RemoveOwnAccountDevices { .. }
             | SendIntent::SelfUpdate { .. }
             | SendIntent::UpdateAppComponents { .. }
+            | SendIntent::ReplaceDeviceEntry { .. }
             | SendIntent::UpdateGroupData { .. }
             | SendIntent::EnableDisbanding { .. }
             | SendIntent::EnableAccountDevices { .. }

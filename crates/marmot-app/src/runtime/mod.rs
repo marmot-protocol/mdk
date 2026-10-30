@@ -2495,6 +2495,27 @@ impl MarmotAppRuntime {
         self.accounts.key_package_refresh_overdue(account_ref).await
     }
 
+    /// Rename one of this account's devices, this one included, by its
+    /// `slot_id_hex` from `linked_devices`: one roster commit in the device
+    /// group. Any device may rename any device. The label is at most 64
+    /// bytes of UTF-8; empty clears it. Refused with
+    /// `DeviceGroupRefused`: `roster_unsupported` (release builds),
+    /// `label_too_long`, `no_device_group`, `unknown_device`,
+    /// `roster_unavailable`, or `device_group_busy` while the device group
+    /// has an earlier change in flight (retry later). A rename whose commit
+    /// loses a fork to one that also changes that device's entry is not made
+    /// again; refresh on `LinkedDevicesChanged`.
+    pub async fn rename_linked_device(
+        &self,
+        account_ref: &str,
+        slot_id_hex: String,
+        label: String,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .rename_linked_device(account_ref, slot_id_hex, label)
+            .await
+    }
+
     /// Record that the user accepts the risk of changing a group that is still
     /// catching up, after a group change failed with
     /// [`AppError::GroupCatchingUp`] (mdk#2258). The device may be behind its

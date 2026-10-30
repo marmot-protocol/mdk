@@ -166,8 +166,8 @@ impl<S: StorageProvider> Engine<S> {
     /// This device tags once that roster holds an entry whose
     /// `tag_signature_key` is its MLS signature key (`own_signature_key`;
     /// device-tag-v1.md, "Producing tags"). It sets that key itself in a
-    /// roster update through `SendIntent::UpdateAppComponents`, whose
-    /// UpdatePath then carries the first tag.
+    /// roster update (`SendIntent::ReplaceDeviceEntry`), whose UpdatePath
+    /// then carries the first tag.
     pub fn set_device_tag_group(&mut self, group_id: Option<GroupId>) -> Result<(), EngineError> {
         self.device_tag_group = group_id;
         match self.device_tag_group.clone() {

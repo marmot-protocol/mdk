@@ -40,6 +40,19 @@
 
 ### Added
 
+- `MarmotOptions.devicePlatform` names the platform this device runs on, such
+  as `iOS`. With `clientName`, each device writes it into its own roster
+  entry, so `linked_devices` shows every device's client and platform
+  (mdk#2628 item 3.6). Defaults to none; written only where device groups are.
+
+- `rename_linked_device(account_ref, slot_id_hex, label)` renames one of this
+  account's devices, this one included, with one roster commit in the device
+  group (mdk#2628 item 3.6). It is refused with nothing sent while the device
+  group has an earlier change in flight (`device_group_busy`; retry later),
+  and in release builds until the roster's spec lands. A rename whose commit
+  loses a fork to one that also changes that device's entry is not made
+  again.
+
 - `AppGroupMlsStateFfi.convergence_parked` (default `false`) reports a group
   whose convergence pass spent its failure budget (mdk#2684). Show it as stuck
   syncing; `retry_group_convergence` grants one more attempt. Regenerate
