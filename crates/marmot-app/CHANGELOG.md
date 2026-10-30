@@ -76,7 +76,9 @@
   3.2): a fresh, valid KeyPackage in a slot neither this device nor its device
   group's roster knows. `answer_sign_in` takes a `SignInResponse` (Not now,
   Reject or Dismiss), and `check_sign_ins` checks now instead of at the next
-  scheduled check. `UnrecognizedSignInsChanged` says to re-read the list. All
+  scheduled check. A KeyPackage the roster announced for a device's slot in
+  the last 30 days counts as that device's, even after a newer announcement
+  or a rewind. `UnrecognizedSignInsChanged` says to re-read the list. All
   are empty and silent in release builds until the roster's spec lands.
 - Device pairing links a new device of the account through the account runtime (mdk#2628 item 3.3b), behind the
   unreleased `unreleased-device-pairing` feature and `dev_device_groups`. The new device starts a link naming its

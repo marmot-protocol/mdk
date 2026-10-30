@@ -71,6 +71,13 @@
   (what this device still wants from each issuer). `SqliteAccountStorage` implements the new
   `PrivateKeyPackageStorage`; `SqliteAppStorage` gains the received-KeyPackage
   and need reads and writes. Nothing writes them unless device groups are on.
+- Migration 0144 advances account storage to schema 144 (mdk#2628 item 3.2).
+  It adds `cgka_announced_key_packages`: one row per KeyPackage a
+  device-group roster this device applied announced for a slot, with when it
+  last applied one that did. `SqliteAccountStorage` implements the new
+  `AnnouncedKeyPackageStorage`. Rows survive a branch-selection rewind, go
+  with their group, and are pruned after 30 days or past 16 per slot. Nothing
+  writes them unless device groups are on.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`
