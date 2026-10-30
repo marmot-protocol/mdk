@@ -7,8 +7,12 @@
 //! id and found a group under it, but cannot sign as the existing device's
 //! leaf.
 
-use super::device_roster::{create_under, expect_link_welcome, roster, roster_device};
+use super::device_roster::{
+    NO_WELCOME_DEADLINE, create_under, device_group_request, expect_link_welcome, roster,
+    roster_device,
+};
 use super::*;
+use cgka_engine::engine::OutboundWelcomeStatus;
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage as _};
 
 /// The id the existing device's confirmation named.
@@ -112,6 +116,7 @@ async fn a_chat_welcome_under_the_reserved_id_is_refused() {
                 initial_admins: vec![],
             },
             chosen(),
+            NO_WELCOME_DEADLINE,
             None,
         )
         .await
@@ -127,6 +132,47 @@ async fn a_chat_welcome_under_the_reserved_id_is_refused() {
 
     let real = found_under_chosen(&mut phone, key_package).await;
     assert_joins(&mut laptop, &real, &chosen(), &phone).await;
+}
+
+/// The founding Welcome of a device group created for a link keeps the
+/// link's delivery deadline, and the creator counts it as settled from then
+/// on: it is never published once the new device stopped waiting (D40).
+#[tokio::test]
+async fn a_founding_welcome_keeps_its_delivery_deadline() {
+    let mut phone = roster_device(b"alice");
+    let mut laptop = roster_device(b"alice");
+    let key_package = laptop.engine.fresh_key_package().await.unwrap();
+    let deadline = Timestamp(1_700_000_600);
+
+    let (_, created) = phone
+        .engine
+        .create_group_with_chosen_id_and_audit_context(
+            device_group_request(&roster(&[(1, "Phone"), (2, "Laptop")]), vec![key_package]),
+            chosen(),
+            deadline,
+            None,
+        )
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
+        panic!("current-profile founding group")
+    };
+    let id = &welcomes[0].id;
+    assert_eq!(
+        phone.engine.sent_welcome_deliver_until(id).unwrap(),
+        Some(deadline)
+    );
+    assert!(matches!(
+        phone
+            .engine
+            .outbound_welcome_status(id, Timestamp(deadline.0 - 1))
+            .unwrap(),
+        OutboundWelcomeStatus::Owed { .. }
+    ));
+    assert_eq!(
+        phone.engine.outbound_welcome_status(id, deadline).unwrap(),
+        OutboundWelcomeStatus::Settled
+    );
 }
 
 #[tokio::test]

@@ -47,6 +47,12 @@ impl StorageProvider for SqliteAccountStorage {
         Some(self)
     }
 
+    fn private_key_package_storage(
+        &self,
+    ) -> Option<&dyn cgka_traits::storage::PrivateKeyPackageStorage> {
+        Some(self)
+    }
+
     fn group_replay_state_fingerprint(
         &self,
         group_id: &cgka_traits::types::GroupId,

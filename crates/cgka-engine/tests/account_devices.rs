@@ -85,6 +85,9 @@ mod creation;
 #[path = "account_devices/activation.rs"]
 mod activation;
 
+#[path = "account_devices/private_key_packages.rs"]
+mod private_key_packages;
+
 // The device roster's wire format is unreleased, so only test-policy builds
 // may advertise it (mdk#2628 3.1).
 #[cfg(feature = "test-policy-overrides")]

@@ -33,7 +33,7 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
-use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
+use cgka_traits::transport::{EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
 use marmot_forensics::AuditEventKind;
@@ -279,6 +279,14 @@ impl<S: StorageProvider> Drop for NewGroupCleanupGuard<S> {
 /// The longest group id a host may choose.
 pub(crate) const MAX_CHOSEN_GROUP_ID_LEN: usize = 255;
 
+/// A creation under a group id the host chose, as a device link's
+/// (mdk#2628 item 3.3b). Its Welcomes are never published from
+/// `welcome_deliver_until` on, when the new device stops waiting (D40).
+pub(crate) struct ChosenGroup {
+    pub(crate) group_id: GroupId,
+    pub(crate) welcome_deliver_until: Timestamp,
+}
+
 impl<S: StorageProvider> Engine<S> {
     /// A chosen group id must name no group this device holds in any state.
     /// OpenMLS refuses an id with live state on its own, but a removed or
@@ -326,10 +334,17 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         req: CreateGroupRequest,
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
-        chosen_group_id: Option<GroupId>,
+        chosen: Option<ChosenGroup>,
     ) -> Result<(GroupId, SendResult), EngineError> {
-        if let Some(group_id) = &chosen_group_id {
-            self.ensure_chosen_group_id_is_free(group_id)?;
+        if let Some(chosen) = &chosen {
+            // A legacy create holds its Welcomes with its pending commit,
+            // which keeps no delivery deadline (D40).
+            if self.new_protocol_profile == ProtocolProfile::Legacy {
+                return Err(EngineError::Other(
+                    "only a current-profile group is created under a chosen id".into(),
+                ));
+            }
+            self.ensure_chosen_group_id_is_free(&chosen.group_id)?;
         }
         // 1. Validate invitees against required capabilities.
         let crate::key_package::CreationKeyPackageCapabilities {
@@ -542,8 +557,8 @@ impl<S: StorageProvider> Engine<S> {
         // crash or write fault cannot leave a partial, undiscoverable group.
         let mut mls_group = self.storage.with_transaction(|storage| {
             let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
-            let group = match &chosen_group_id {
-                Some(group_id) => MlsGroup::new_with_group_id(
+            let group = match &chosen {
+                Some(ChosenGroup { group_id, .. }) => MlsGroup::new_with_group_id(
                     &provider,
                     &self.identity.signer,
                     &group_config,
@@ -779,6 +794,7 @@ impl<S: StorageProvider> Engine<S> {
                                         .as_slice()
                                         .to_vec(),
                                 ),
+                                chosen.as_ref().map(|chosen| chosen.welcome_deliver_until),
                             )
                             .encode()
                             .map_err(|error| {
@@ -1303,6 +1319,12 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 decided => decided?,
             };
+            // A private KeyPackage joins only through a sibling Welcome from
+            // the device group (mdk#2628 3.5). Refusing it as not addressed
+            // here remembers only this wrapper, so that Welcome stays open.
+            if crate::private_key_packages::is_issued(storage, &consumed_key_package_ref)? {
+                return Err(EngineError::WelcomeNotAddressedToThisDevice);
+            }
             let processed = openmls::group::ProcessedWelcome::new_from_welcome(
                 &provider,
                 &join_config,

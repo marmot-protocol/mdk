@@ -4,14 +4,25 @@
 
 ### Breaking changes
 
+- Migration 0140 advances account storage to schema 140 (mdk#2628 item 3.4).
+  It adds private KeyPackages, single-use KeyPackages a device hands to one
+  sibling inside its device group: `cgka_private_key_packages` (one issuer
+  record per KeyPackage, its key in the OpenMLS bundle store),
+  `private_key_packages_received` (what siblings handed this device, by
+  issuer slot; one this device used keeps its ref until it expires, so it
+  is not kept again if handed over again) and `private_key_package_requests`
+  (what this device still wants from each issuer). `SqliteAccountStorage` implements the new
+  `PrivateKeyPackageStorage`; `SqliteAppStorage` gains the received-KeyPackage
+  and need reads and writes. Nothing writes them unless device groups are on.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`
   would, so the generation stays routed, and lowers the generation's floor to
   the lowest bound they list; `None` makes it account-wide, as every such
   observation did before.
-- Migration 0138 advances account storage to schema 138 (mdk#2628 item 4.1).
-  It adds `cgka_account_device_history_keys`: this device's HPKE history key
+- Migration 0138 (mdk#2628 item 4.1) runs on every account database that
+  lacks it, including one already at schema 140. It adds
+  `cgka_account_device_history_keys`: this device's HPKE history key
   pair, one per account-device identity, next to its MLS signer's binding.
   `SqliteAccountStorage` implements the new
   `cgka_traits::storage::AccountDeviceHistoryKeyStorage`, which
