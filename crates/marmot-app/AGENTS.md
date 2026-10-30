@@ -127,7 +127,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   withdraws a message by message id alone (an own send's transport id, a received message's content id), so a kind whose
   withdrawal a feature acts on is listed in `withdrawal_handled` and dispatched in `device_group_message_withdrawn`.
   Each such message is recorded with its kind in `device_group_messages` when sent (before the send; its message id is
-  filled in from whichever drain's effects publish it, in `retain_effect_projection`) and when read.
+  filled in from whichever drain's effects publish it, in `retain_effect_projection`) and when read. Records go after
+  a week or past 4,096, so a feature also acts on a withdrawn message with no record, which may be of any kind.
 - Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
   Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
   roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
@@ -193,7 +194,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   to fit 32,768 bytes, each page's items marked sent only after it went out (a duplicate is harmless, a loss is not),
   and a broadcast request when owed. Updates and requests are read from any member of the trusted device group, never
   through `ensure_sent_by`. A withdrawn update owes every held item again, whoever sent it, and a withdrawn broadcast
-  request owes a new one.
+  request owes a new one; a withdrawn message with no record in the trusted device group owes both. A winning pin for
+  an archived chat waits, unobserved, until the chat is unarchived.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

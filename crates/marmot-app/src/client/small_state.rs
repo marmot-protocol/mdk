@@ -283,6 +283,20 @@ impl AppClient {
         Ok(())
     }
 
+    /// A withdrawn message in the device group this device trusts that it
+    /// has no record of: it may have been an update or a request whose record
+    /// is gone, so every item and a request are owed again.
+    pub(crate) fn unrecorded_device_group_message_withdrawn(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        if self.ensure_small_state_group(group_id).is_err() {
+            return Ok(());
+        }
+        self.small_state_message_withdrawn(group_id, KIND_SMALL_STATE_UPDATE)?;
+        self.small_state_message_withdrawn(group_id, KIND_SMALL_STATE_BROADCAST_REQUEST)
+    }
+
     /// Refuse a small-state message from anywhere but the device group this
     /// device trusts.
     fn ensure_small_state_group(&self, group_id: &GroupId) -> Result<(), AppError> {

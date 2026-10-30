@@ -56,7 +56,8 @@
   passes the app-payload window since its last broadcast, and at most hourly
   when a sibling asks with a broadcast request (kind 476). An update or
   request that branch selection withdraws is sent again. Pin order stays per
-  device, and drafts are not synced. Release builds hold no device group and
+  device; an archived chat is never pinned, so a sibling's pin waits until the
+  chat is unarchived here. Drafts are not synced. Release builds hold no device group and
   sync nothing.
 - `MarmotAppRuntime::linked_devices` lists this account's own devices as
   `LinkedDevice`s, from the roster of the device group this device trusts,

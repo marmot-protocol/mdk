@@ -293,6 +293,20 @@ fn an_item_at_the_highest_version_cannot_be_changed() {
     assert_eq!(app.small_state_items().unwrap(), vec![fixed]);
     assert!(app.unsent_small_state_items().unwrap().is_empty());
     assert_eq!(sync(&store, &[], &rule), SmallStateSync::default());
+
+    // Archiving unpins, and the pin is put back once the chat is unarchived.
+    save_groups(&store, &[("11", true)]);
+    sync(&store, &[], &rule);
+    assert!(pins(&store).is_empty());
+    save_groups(&store, &[("11", false)]);
+    sync(&store, &[], &rule);
+    assert_eq!(pins(&store), vec!["11"]);
+    assert!(
+        app.unsent_small_state_items()
+            .unwrap()
+            .iter()
+            .all(|item| item.name() != SmallStateItemName::Pin)
+    );
 }
 
 #[test]
@@ -472,28 +486,29 @@ fn archive_winners_go_back_to_the_caller_and_settle_once_applied() {
 }
 
 #[test]
-fn a_pin_that_comes_with_an_unarchive_waits_for_it() {
-    let store = started_store(&[("11", true)]);
+fn a_pin_for_an_archived_chat_waits_until_it_is_unarchived() {
+    let store = started_store(&[("11", true), ("22", true)]);
     let rule = TestRule::new();
     sync(&store, &[], &rule);
-    let unarchive = versioned("11", SmallStateValue::Archive(false), 2, 9);
-    let pin = versioned("11", SmallStateValue::Pin(true), 1, 9);
-    let outcome = sync(&store, &[unarchive, pin], &rule);
+    let unarchive = |chat: &str| versioned(chat, SmallStateValue::Archive(false), 2, 9);
+    let pin = |chat: &str| versioned(chat, SmallStateValue::Pin(true), 1, 9);
+    // One chat's pin comes with its unarchive, the other's before it.
+    let outcome = sync(&store, &[unarchive("11"), pin("11"), pin("22")], &rule);
     assert_eq!(outcome.archive_to_apply, vec![("11".to_owned(), false)]);
     assert!(outcome.applied.is_empty());
-    assert!(pins(&store).is_empty());
+    let outcome = sync(&store, &[unarchive("22")], &rule);
     assert_eq!(
-        sync(&store, &[], &rule).archive_to_apply,
-        vec![("11".to_owned(), false)]
+        outcome.archive_to_apply,
+        vec![("11".to_owned(), false), ("22".to_owned(), false)]
     );
     assert!(pins(&store).is_empty());
 
-    // Once the caller unarchives, the pin goes on, as no change of this
+    // Once the caller unarchives, the pins go on, as no change of this
     // device's.
-    save_groups(&store, &[("11", false)]);
+    save_groups(&store, &[("11", false), ("22", false)]);
     let outcome = sync(&store, &[], &rule);
     assert!(outcome.archive_to_apply.is_empty());
-    assert_eq!(pins(&store), vec!["11".to_owned()]);
+    assert_eq!(pins(&store).len(), 2);
     assert_eq!(outcome.recorded, 0);
     assert_eq!(sync(&store, &[], &rule).recorded, 0);
 }

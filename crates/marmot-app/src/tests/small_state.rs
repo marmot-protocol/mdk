@@ -170,7 +170,7 @@ async fn an_unarchive_right_after_a_siblings_archive_is_this_devices_change() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_pin_that_comes_with_an_unarchive_is_applied_with_it() {
+async fn a_pin_for_an_archived_chat_is_applied_once_it_is_unarchived() {
     let mut devices = phone_and_laptop().await;
     let (_bob_dir, chat) =
         chat_with_bob(&devices.phone_app, &mut devices.phone, &devices.relay).await;
@@ -208,6 +208,32 @@ async fn a_pin_that_comes_with_an_unarchive_is_applied_with_it() {
         ChatListUpdateTrigger::ArchiveChanged
     );
     phone.sync_small_state(&[]).unwrap();
+    assert!(storage.unsent_small_state_items().unwrap().is_empty());
+
+    // Archived here again, a sibling's newer pin waits; once this device's
+    // user unarchives the chat, the next maintenance pass applies it.
+    phone.set_group_archived(&chat, true).unwrap();
+    phone.sync_small_state(&[]).unwrap();
+    let pin = SmallStateItem {
+        version: Some(SmallStateVersion {
+            version: 3,
+            change_id: [7; 16],
+        }),
+        ..sibling_value(&chat_hex, SmallStateValue::Pin(true))
+    };
+    phone.sync_small_state(std::slice::from_ref(&pin)).unwrap();
+    phone.take_pending_projection_updates();
+    phone.set_group_archived(&chat, false).unwrap();
+    phone.take_pending_projection_updates();
+    phone.drive_small_state().await;
+    let row = phone
+        .take_pending_projection_updates()
+        .into_iter()
+        .rev()
+        .find_map(|update| update.chat_list_row)
+        .unwrap();
+    assert!(!row.archived && row.pinned);
+    assert!(storage.small_state_items().unwrap().contains(&pin));
     assert!(storage.unsent_small_state_items().unwrap().is_empty());
 }
 
@@ -425,8 +451,7 @@ async fn siblings_exchange_small_state_through_the_device_group() {
     );
 
     // A withdrawn update owes every item again, on the device that sent it
-    // and on the one that merged it, each naming it by its own id; a message
-    // no one recorded owes nothing.
+    // and on the one that merged it, each naming it by its own id.
     let of_kind = |kind| {
         sent.iter()
             .find(|(_, (_, sent_kind))| *sent_kind == kind)
@@ -436,15 +461,6 @@ async fn siblings_exchange_small_state_through_the_device_group() {
     let (update, request) = (
         of_kind(KIND_SMALL_STATE_UPDATE),
         of_kind(KIND_SMALL_STATE_BROADCAST_REQUEST),
-    );
-    devices
-        .phone
-        .observe_device_group_event(&withdrawn(&group, &MessageId::new(vec![0x77; 32])));
-    assert!(
-        phone_storage()
-            .unsent_small_state_items()
-            .unwrap()
-            .is_empty()
     );
     devices
         .phone
@@ -477,6 +493,38 @@ async fn siblings_exchange_small_state_through_the_device_group() {
                 .request_owed
         );
     }
+
+    // Records go after a week. A withdrawal whose record is gone owes both,
+    // as does one of a message never recorded.
+    let phone = phone_storage();
+    let settle = || {
+        phone
+            .mark_small_state_sent(&phone.unsent_small_state_items().unwrap())
+            .unwrap();
+        phone.small_state_broadcast_request_sent().unwrap();
+    };
+    settle();
+    phone
+        .record_device_group_message(
+            &hex::encode(group.as_slice()),
+            "a week on",
+            Some(&"ee".repeat(32)),
+            KIND_SMALL_STATE_BROADCAST_REQUEST,
+            crate::unix_now_seconds() + 8 * 24 * 60 * 60,
+        )
+        .unwrap();
+    assert!(!recorded(&devices.phone, &group).contains_key(&request));
+    devices
+        .phone
+        .observe_device_group_event(&withdrawn(&group, &sent[&request].0));
+    assert_eq!(phone.unsent_small_state_items().unwrap().len(), 401);
+    assert!(phone.small_state_schedule().unwrap().unwrap().request_owed);
+    settle();
+    devices
+        .phone
+        .observe_device_group_event(&withdrawn(&group, &MessageId::new(vec![0x77; 32])));
+    assert_eq!(phone.unsent_small_state_items().unwrap().len(), 401);
+    assert!(phone.small_state_schedule().unwrap().unwrap().request_owed);
 }
 
 /// An update that reaches no relay leaves its items owed, and the next pass

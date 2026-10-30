@@ -19,7 +19,9 @@
 //!   only by its message id (an own send's transport id, a received
 //!   message's content id), so each message of a kind in
 //!   [`withdrawal_handled`] is recorded with its kind when this device sends
-//!   or reads it. A feature adds its kinds to both.
+//!   or reads it. A feature adds its kinds to both. Records go after a week
+//!   or past 4,096, so a feature also says what a withdrawn message of no
+//!   recorded kind owes it.
 
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
 use cgka_traits::app_event::MarmotAppEvent;
@@ -177,8 +179,9 @@ impl AppClient {
 
     /// Hand a device-group message that branch selection withdrew to the
     /// feature that owns its kind, when this device recorded sending or
-    /// reading it. A failure waits for that feature's own repair: small state
-    /// broadcasts again at least daily.
+    /// reading it. One with no record may be of any kind, its record gone, so
+    /// small state is owed as for both of its kinds. A failure waits for that
+    /// feature's own repair: small state broadcasts again at least daily.
     pub(crate) fn device_group_message_withdrawn(
         &mut self,
         group_id: &GroupId,
@@ -197,7 +200,8 @@ impl AppClient {
                 Some(kind @ (KIND_SMALL_STATE_UPDATE | KIND_SMALL_STATE_BROADCAST_REQUEST)) => {
                     self.small_state_message_withdrawn(group_id, kind)
                 }
-                _ => Ok(()),
+                Some(_) => Ok(()),
+                None => self.unrecorded_device_group_message_withdrawn(group_id),
             });
         if let Err(error) = result {
             tracing::warn!(
