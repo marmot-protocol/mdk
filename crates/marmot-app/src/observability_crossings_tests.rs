@@ -63,13 +63,15 @@ use syn::visit::{self, Visit};
 /// The code step 6 moves into `marmot-observability` (#2627, "The shape"): the modules that move
 /// whole, by module path. `audit_upload` is the audit upload half PR 3 split out of
 /// `audit_log.rs`; `export_config` is what PR 4 split out of `config.rs` (the exporters' resolved
-/// config and the endpoint parsers).
+/// config and the endpoint parsers); `observability_test_support` is the collector test support
+/// PR 5 gated for the move.
 const MOVING_SET: &[&str] = &[
     "app_telemetry",
     "audit_otlp_sender",
     "audit_upload",
     "collector_host_safety",
     "export_config",
+    "observability_test_support",
     "observer",
     "product_analytics",
     "relay_telemetry_export",

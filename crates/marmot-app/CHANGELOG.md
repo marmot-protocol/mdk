@@ -356,6 +356,10 @@
   `MarmotApp` the process builds (mdk#2627). Before one exists they build no
   HTTP client, so an `AuditOtlpSender::send` made that early returns
   `Unknown` without dialing. Every send through a runtime is unchanged.
+- The `test-support` feature also compiles the diagnostics collectors' test
+  fixtures and `_for_test` hooks, including methods on `ProductAnalytics`
+  (mdk#2627). Enable it only as a dev-dependency, as before. Builds without
+  it are unchanged.
 
 ### Fixed
 

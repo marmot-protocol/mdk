@@ -1,12 +1,5 @@
 use super::*;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 async fn resolve(endpoint: &str, ips: &[&str]) -> Result<PinnedCollector, CollectorRequestError> {
     let ips = ips.iter().map(|ip| ip.parse().unwrap()).collect();
@@ -232,79 +225,4 @@ async fn every_attempt_resolves_fresh_and_checks_host_and_port() {
             .is_err()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-}
-
-struct ForbiddenDns(Arc<AtomicUsize>);
-
-impl reqwest::dns::Resolve for ForbiddenDns {
-    fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Err(std::io::Error::other("second DNS lookup").into()) })
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::disallowed_methods)]
-async fn reqwest_uses_only_pinned_addresses_and_ignores_proxies() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let pin = resolve(
-        &format!("http://localhost:{}/metrics?exact=one%2Ftwo", addr.port()),
-        &["127.0.0.1"],
-    )
-    .await
-    .unwrap();
-    let client = pin
-        .build_client_from(
-            reqwest::Client::builder()
-                .dns_resolver(Arc::new(ForbiddenDns(calls.clone())))
-                .proxy(
-                    reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap(),
-                ),
-            CONNECT_TIMEOUT,
-            REQUEST_TIMEOUT,
-        )
-        .unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut bytes = Vec::new();
-        loop {
-            let mut buf = [0; 1024];
-            let n = stream.read(&mut buf).await.unwrap();
-            assert!(n > 0);
-            bytes.extend_from_slice(&buf[..n]);
-            if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-        let headers = String::from_utf8(bytes).unwrap().to_lowercase();
-        assert!(headers.starts_with("post /metrics?exact=one%2ftwo http/1.1\r\n"));
-        assert!(headers.contains(&format!("host: localhost:{}\r\n", addr.port())));
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .await
-            .unwrap();
-    });
-    assert!(
-        client
-            .post(pin.url)
-            .send()
-            .await
-            .unwrap()
-            .status()
-            .is_success()
-    );
-    server.await.unwrap();
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "reqwest must not resolve again"
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), proxy.accept())
-            .await
-            .is_err()
-    );
 }

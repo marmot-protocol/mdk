@@ -888,7 +888,8 @@ mod tests {
         #[cfg(feature = "product-analytics-export")]
         let app = {
             let mut configured = app;
-            configured.product_analytics = crate::product_analytics::test_product_collector();
+            configured.product_analytics =
+                crate::observability_test_support::test_product_collector();
             configured.set_usage_diagnostics_consent(true).unwrap();
             configured
         };

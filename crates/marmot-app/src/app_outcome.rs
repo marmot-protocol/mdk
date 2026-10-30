@@ -33,10 +33,11 @@ impl From<&AppError> for Option<StorageFailureKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::product_analytics::observed::success_or_failure;
+    use crate::observability_test_support::success_or_failure;
+    use crate::observer::PerformanceRecorder;
     use crate::{
-        AccountCatchUpFailure, AppPerformanceTelemetry, RuntimePerformanceOperation,
-        SyncErrorClass, SyncFailureClassification, SyncFailureStage,
+        AccountCatchUpFailure, RuntimePerformanceOperation, SyncErrorClass,
+        SyncFailureClassification, SyncFailureStage,
     };
     use cgka_traits::StorageError;
 
@@ -181,7 +182,7 @@ mod tests {
             );
 
             // Through a recorder, as the call sites record it.
-            let telemetry = AppPerformanceTelemetry::default();
+            let telemetry = PerformanceRecorder::default();
             let operation = RuntimePerformanceOperation::ConversationOpen;
             telemetry.observe(operation).finish_app(&result);
             let snapshot = telemetry

@@ -71,6 +71,8 @@ use crate::time::{
 mod device_roster;
 pub use device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport};
 mod device_tag_key;
+mod own_slot;
+pub use own_slot::{ForeignSlotOutcome, ForeignSlotPublication};
 mod private_key_packages;
 mod removed_slot_expiry;
 mod slot_announcement;
@@ -521,6 +523,10 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// publishes them (mdk#2628 3.4). The host sets it; `None` publishes as
     /// a device with no device group does.
     key_package_announcement_group: Option<GroupId>,
+    /// Every publication of this device's own at or before this time is to
+    /// be replaced: the slot served a newer one it did not make (mdk#2628
+    /// 3.4). See `runtime/own_slot.rs`.
+    slot_superseded_through: Option<Timestamp>,
     /// What this device says about itself in its roster entry there (mdk#2628
     /// 3.6); every announcement writes it too.
     device_self_report: DeviceSelfReport,
@@ -614,6 +620,7 @@ where
             maintenance_paused: false,
             key_package_slot_withdrawn: false,
             key_package_announcement_group: None,
+            slot_superseded_through: None,
             device_self_report: DeviceSelfReport::default(),
             device_tag_group: None,
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
@@ -1095,13 +1102,18 @@ where
         &self,
         lifecycle: &KeyPackageLifecycleState,
     ) -> Option<&'static str> {
-        current_key_package_republish_blocker(lifecycle, self.wall_clock.now()).or_else(|| {
-            lifecycle
-                .current_key_package
-                .as_ref()
-                .is_some_and(|current| !self.advertises_current_capabilities(current))
-                .then_some("advertised_capabilities_changed")
-        })
+        current_key_package_republish_blocker(lifecycle, self.wall_clock.now())
+            .or_else(|| {
+                lifecycle
+                    .current_key_package
+                    .as_ref()
+                    .is_some_and(|current| !self.advertises_current_capabilities(current))
+                    .then_some("advertised_capabilities_changed")
+            })
+            .or_else(|| {
+                self.current_publication_superseded(lifecycle)
+                    .then_some("slot_publication_superseded")
+            })
     }
 
     /// Re-send the exact current durable authored KeyPackage event to the
@@ -1352,8 +1364,10 @@ where
                 .as_ref()
                 .is_none_or(|pending| self.pending_replacement_obsolete(&lifecycle, pending))
         {
-            // Newer than every publication in the slot, and than its
-            // withdrawal: relays drop anything up to that.
+            // Newer than every publication in the slot, a foreign one
+            // included, and than its withdrawal: relays drop anything up to
+            // that.
+            let superseded_through = self.slot_superseded_through_signable(now);
             let created_at = Timestamp(
                 lifecycle
                     .authored_event_created_at
@@ -1365,6 +1379,7 @@ where
                             .map(|pending| pending.authored_created_at),
                     )
                     .chain(lifecycle.slot_withdrawn_at)
+                    .chain(superseded_through)
                     .max()
                     .map(|previous| previous.0.saturating_add(1))
                     .unwrap_or(now.0)
@@ -1611,6 +1626,7 @@ where
         if !withdrawn_with_slot(&lifecycle, artifact.created_at) {
             lifecycle.slot_withdrawn_at = None;
         }
+        self.note_slot_publication(artifact.created_at);
         lifecycle.authored_signed_event = Some(artifact);
         lifecycle.publication_targets = replacement.targets;
         lifecycle.refresh_at = Some(replacement.refresh_at);
@@ -1695,7 +1711,8 @@ where
     /// other than a Welcome consuming it: there is none, its weekly refresh
     /// is due, the generator policy changed, the capabilities this client
     /// supports changed (`foundation/key-packages.md`, "Refreshing a slot"),
-    /// or the slot was withdrawn at sign-out.
+    /// or the slot was withdrawn at sign-out or served a foreign publication
+    /// at least as new.
     fn current_key_package_replacement_due(
         &self,
         lifecycle: &KeyPackageLifecycleState,
@@ -1705,14 +1722,15 @@ where
             return true;
         };
         key_package_refresh_due(lifecycle, now)
-            || lifecycle.slot_withdrawn_at.is_some()
+            || self.current_publication_superseded(lifecycle)
             || !lifecycle.upgrade_rotation_recorded
             || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
             || !self.advertises_current_capabilities(current)
     }
 
     /// Whether `pending` must be replaced before it is published: built by an
-    /// older generator revision, staged before the slot was withdrawn, or
+    /// older generator revision, superseded in the slot (staged before its
+    /// withdrawal, or no newer than a foreign publication found there), or
     /// built without the capabilities this device now advertises, such as a
     /// device tag once this device tags (mdk#2628 3.1d).
     fn pending_replacement_obsolete(
@@ -1721,7 +1739,7 @@ where
         pending: &PendingKeyPackageReplacement,
     ) -> bool {
         pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
-            || withdrawn_with_slot(lifecycle, pending.authored_created_at)
+            || self.slot_publication_superseded(lifecycle, pending.authored_created_at)
             || !self.advertises_current_capabilities(&pending.key_package)
     }
 
@@ -1738,12 +1756,12 @@ where
         if self.key_package_slot_withdrawn {
             return Ok(false);
         }
-        // A withdrawn slot's publication is deleted; its replacement is due.
+        // A withdrawn or superseded publication is replaced, not resent.
         Ok(self
             .session
             .key_package_lifecycle()?
             .is_some_and(|lifecycle| {
-                lifecycle.slot_withdrawn_at.is_none()
+                !self.current_publication_superseded(&lifecycle)
                     && lifecycle.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
                     && lifecycle.authored_signed_event.is_some()
                     && lifecycle.publication_targets.iter().any(|target| {
@@ -1858,7 +1876,7 @@ where
             return Ok(());
         };
         if lifecycle.pending_replacement.is_some()
-            || lifecycle.slot_withdrawn_at.is_some()
+            || self.current_publication_superseded(&lifecycle)
             || self.key_package_slot_withdrawn
         {
             return Ok(());

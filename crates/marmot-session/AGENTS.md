@@ -31,6 +31,10 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   - `runtime/slot_announcement.rs` — the slot-announcement gate (mdk#2628 3.4): while the host names a device group,
     no KeyPackage reaches this device's slot until this device's own roster entry there names it. Maintenance
     announces first.
+  - `runtime/own_slot.rs` — the own-slot check's runtime half (mdk#2628 3.4): the host hands over publications in this
+    device's slot that it did not make. `slot_publication_superseded` is the one test of whether a publication of this
+    device's own still stands there; every step that stages, publishes, resends or republishes asks it. One dated past
+    the skew window is deleted by id (D63) and never outranked, so it never holds back a refresh.
   - `runtime/device_roster.rs` — this device's reads and writes of its device group's roster: its slot, the merged
     roster, the gate its roster commits wait behind (not stable, held, quarantined, settling, or a change of this
     device's still queued or unconfirmed), and the sends. The runtime's roster-writing steps use these rather than

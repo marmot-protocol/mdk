@@ -196,6 +196,28 @@ pub fn key_package_slot_deletion_event(
     )
 }
 
+/// The unsigned kind 5 request asking relays to stop serving one event in
+/// the author's own KeyPackage slot, by id (mdk#2628 item 3.4, D63): exactly
+/// one `e` tag naming it and one `k` tag. It covers that event whatever its
+/// `created_at`, which a slot deletion cannot when the event is dated past
+/// the request. Receivers selecting KeyPackages ignore `e` tags.
+pub fn key_package_event_deletion_event(
+    account_id: &MemberId,
+    event_id_hex: &str,
+    created_at: u64,
+) -> NostrTransportEvent {
+    NostrTransportEvent::new_unsigned_at(
+        hex::encode(account_id.as_slice()),
+        KIND_EVENT_DELETION,
+        vec![
+            vec!["e".to_owned(), event_id_hex.to_owned()],
+            vec!["k".to_owned(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+        ],
+        String::new(),
+        created_at,
+    )
+}
+
 const KIND_EVENT_DELETION: u64 = 5;
 
 #[derive(Clone)]
@@ -359,6 +381,24 @@ mod tests {
             event.tags,
             vec![
                 vec!["a".to_owned(), format!("30443:{}:slot-1", "ab".repeat(32))],
+                vec!["k".to_owned(), "30443".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn event_deletion_names_only_the_event_and_kind() {
+        let account_id = MemberId::new(vec![0xAB; 32]);
+        let event_id = "cd".repeat(32);
+        let event = key_package_event_deletion_event(&account_id, &event_id, 1_700_000_000);
+        assert_eq!(event.kind, 5);
+        assert_eq!(event.pubkey, "ab".repeat(32));
+        assert_eq!(event.created_at, 1_700_000_000);
+        assert_eq!(event.content, "");
+        assert_eq!(
+            event.tags,
+            vec![
+                vec!["e".to_owned(), event_id],
                 vec!["k".to_owned(), "30443".to_owned()],
             ]
         );

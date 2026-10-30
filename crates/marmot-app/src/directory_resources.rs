@@ -461,7 +461,7 @@ mod observer_tests {
     fn directory_observations_keep_their_events_and_drop_rule() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = MarmotApp::with_relays(dir.path(), vec![]);
-        app.product_analytics = crate::product_analytics::test_product_collector();
+        app.product_analytics = crate::observability_test_support::test_product_collector();
         app.set_usage_diagnostics_consent(true).unwrap();
 
         let counts = DirectoryObserver::begin(
