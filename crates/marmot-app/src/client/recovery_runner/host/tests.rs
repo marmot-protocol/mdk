@@ -560,3 +560,123 @@ async fn each_chokepoint_wakes_the_runner() {
     assert!(client.dismiss_history_notice(&notice.notice_id).unwrap());
     assert!(woken(&mut wake), "a dismissal");
 }
+
+/// A relay a group's own route replacement drops retires as route gone at
+/// the runner's next debt turn, once the turn confirms it: the group still
+/// has a route that no longer lists the relay. A group emptied for a while,
+/// or a drop restored before the turn, retires nothing. A relay that comes
+/// back owes the whole goal again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_dropped_from_its_route_retires_once_confirmed() {
+    use cgka_traits::TransportEndpoint;
+    use storage_sqlite::{RecoverySpanRetirement, RecoveryUnitState};
+    let (_dir, _relay, app, mut client) = direct_client(true).await;
+    let group = client.create_group("gone", &[]).await.unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    let installed = client
+        .routing
+        .snapshot()
+        .group_routes
+        .into_iter()
+        .filter(|route| route.group_id == group)
+        .collect::<Vec<_>>();
+    let runner_route = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
+        .unwrap();
+    let (route, relay) = (runner_route.route, runner_route.required[0].clone());
+    let now = unix_now_seconds();
+    storage
+        .widen_recovery_coverage_goals(std::slice::from_ref(&route), now - HOUR)
+        .unwrap();
+    let policy = RecoveryRunnerPolicy::default().unit;
+    for _ in 0..policy.break_after_no_progress {
+        storage
+            .begin_recovery_unit_attempt(&route, &relay, None, now)
+            .unwrap();
+        storage
+            .settle_recovery_unit(
+                &route,
+                &relay,
+                RecoveryUnitOutcome::NoProgress,
+                &policy,
+                now,
+            )
+            .unwrap();
+    }
+    let state = |storage: &SqliteAppStorage| {
+        storage
+            .recovery_unit(&route, &relay)
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    assert!(matches!(state(&storage), RecoveryUnitState::Broken(_)));
+    client.settle_recovery_route_changes(&storage, now);
+
+    // Emptied while it may be waiting to hydrate, then back.
+    client.routing.replace_group_routes(&group, Vec::new());
+    client.settle_recovery_route_changes(&storage, now);
+    client
+        .routing
+        .replace_group_routes(&group, installed.clone());
+    client.settle_recovery_route_changes(&storage, now);
+    assert!(matches!(state(&storage), RecoveryUnitState::Broken(_)));
+
+    // Dropped and restored within one command.
+    let mut moved = installed.clone();
+    moved[0].endpoints = vec![TransportEndpoint("wss://other.example".to_owned())];
+    client.routing.replace_group_routes(&group, moved.clone());
+    client
+        .routing
+        .replace_group_routes(&group, installed.clone());
+    client.settle_recovery_route_changes(&storage, now);
+    assert!(matches!(state(&storage), RecoveryUnitState::Broken(_)));
+    assert_eq!(storage.parked_recovery_routes().unwrap().len(), 1);
+
+    // Dropped for good: the group's route goes on without the relay.
+    client.routing.replace_group_routes(&group, moved);
+    client.settle_recovery_route_changes(&storage, now);
+    assert_eq!(state(&storage), RecoveryUnitState::Retired);
+    assert!(
+        storage
+            .recovery_unit_spans(&route, &relay)
+            .unwrap()
+            .iter()
+            .all(|span| span.retired == Some(RecoverySpanRetirement::RouteGone))
+    );
+    assert!(storage.parked_recovery_routes().unwrap().is_empty());
+    assert!(
+        storage
+            .recovery_unit_debt(&route, &relay, now)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Back on the route: it owes the whole goal again.
+    client.routing.replace_group_routes(&group, installed);
+    client.settle_recovery_route_changes(&storage, now);
+    assert_eq!(state(&storage), RecoveryUnitState::Active);
+    assert!(
+        storage
+            .recovery_unit_spans(&route, &relay)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !storage
+            .recovery_unit_debt(&route, &relay, now)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// With the gate off no runner tracks route changes, so nothing is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_route_changes_are_kept_with_the_gate_off() {
+    let (_dir, _relay, _app, mut client) = direct_client(false).await;
+    let group = client.create_group("untracked", &[]).await.unwrap();
+    client.routing.replace_group_routes(&group, Vec::new());
+    assert!(client.routing.take_route_changes().is_none());
+}

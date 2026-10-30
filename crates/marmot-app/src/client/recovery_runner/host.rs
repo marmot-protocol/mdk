@@ -166,6 +166,7 @@ impl RunnerHost for AccountRunnerHost {
             Box::pin(async move {
                 let app = runner_storage(client)?;
                 let now = unix_now();
+                client.settle_recovery_route_changes(&app, now);
                 let tails = client.recovery_runner_live_tails(&app, now).await;
                 let routes = client.recovery_runner_routes();
                 // The live counts and the fences they raise come with PR 5c.
@@ -337,6 +338,7 @@ impl AppClient {
     /// Build the account's runner over this client, woken by its routing's
     /// chokepoint bumps. Its turns wait until this client's owner serves them.
     async fn build_recovery_runner(&self) -> AccountRunner {
+        self.routing.track_route_changes();
         let (turns_tx, turns) = mpsc::channel(1);
         let account_id = self.adapter.account_id().clone();
         let host = AccountRunnerHost {

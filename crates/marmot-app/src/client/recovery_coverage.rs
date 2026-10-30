@@ -593,6 +593,63 @@ impl AppClient {
             .collect()
     }
 
+    /// Settle what routing replacements changed since the recovery runner's
+    /// last debt turn (mdk#2660 section 3). A (route, relay) a replacement
+    /// dropped is retired as gone once this turn confirms it: the routes still
+    /// do not carry it, and its group is terminal or still has a route
+    /// installed (the inbox: still has a relay). A group left with none may
+    /// only be waiting to hydrate, so its drop is forgotten. A relay the
+    /// routes carry again owes its whole goal. It runs at the start of a debt
+    /// turn,
+    /// between the owner's commands, so a command that drops a route and
+    /// restores it settles nothing. A failed write keeps the changes for the
+    /// next turn.
+    pub(crate) fn settle_recovery_route_changes(&self, app: &SqliteAppStorage, now: u64) {
+        let Some(changes) = self.routing.take_route_changes() else {
+            return;
+        };
+        if changes.dropped.is_empty() && !changes.changed {
+            return;
+        }
+        let routing = self.routing.snapshot();
+        let carried =
+            crate::ledger_route_pairs(&routing.group_routes, &routing.local_inbox_endpoints);
+        let mut gone: BTreeMap<&TransportReconciliationRoute, Vec<String>> = BTreeMap::new();
+        for (group, route, relay) in &changes.dropped {
+            if carried.contains(&(route.clone(), relay.clone())) {
+                continue;
+            }
+            let confirmed = match group {
+                Some(group) => {
+                    let group = cgka_traits::GroupId::new(group.clone());
+                    super::group_is_terminal(&self.runtime, &group)
+                        || routing
+                            .group_routes
+                            .iter()
+                            .any(|route| route.group_id == group)
+                }
+                None => !routing.local_inbox_endpoints.is_empty(),
+            };
+            if confirmed {
+                gone.entry(route).or_default().push(relay.clone());
+            }
+        }
+        let settled = (|| {
+            for (route, relays) in &gone {
+                let ended = !carried.iter().any(|(carried, _)| carried == *route);
+                app.retire_gone_recovery_units(route, (!ended).then_some(relays), now)?;
+            }
+            app.reopen_returned_recovery_units(|route, relay| {
+                carried.contains(&(route.clone(), relay.to_owned()))
+            })?;
+            Ok::<_, cgka_traits::storage::StorageError>(())
+        })();
+        if let Err(error) = settled {
+            log_failure("settle_recovery_route_changes", &AppError::from(error));
+            self.routing.restore_route_changes(changes);
+        }
+    }
+
     /// Whether the group's local copy is Unrecoverable, which suspends its
     /// recovery (mdk#2660 section 6). A group whose record cannot be read is
     /// not suspended.
