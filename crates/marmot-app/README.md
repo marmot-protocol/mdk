@@ -434,6 +434,19 @@ announced but failing at the relays doesn't count. The client recomputes the ans
 time the account's worker opens or reconnects. It is false, and the event silent, in every release build until the
 roster's spec lands.
 
+## Unrecognized sign-ins
+
+`MarmotAppRuntime::unrecognized_sign_ins(account_ref)` lists sign-ins of this account that this device does not
+recognize as `UnrecognizedSignIn`s (mdk#2628), the earliest to appear first. Each is a fresh, valid KeyPackage of the
+account in a slot that neither this device nor the roster of its device group knows. One that is
+`before_this_device` was found by this device's first check: ask whether the user still has it. Any other is new: ask
+whether it was them. The account checks its slots at open, every six hours, and soon after one of its KeyPackages
+arrives live; `check_sign_ins` checks now. `answer_sign_in` takes a `SignInResponse`: `NotNow` keeps one listed
+without a prompt, `Reject` records it as rejected in the device group's roster, and `Dismiss` ends a prompt another
+device answered first. Linking one is device pairing's. `MarmotAppEvent::UnrecognizedSignInsChanged` says to re-read,
+and also fires once each time the account's worker opens or reconnects. All of it is empty and silent in every release
+build until the roster's spec lands.
+
 ## Linking a new device
 
 Device linking (mdk#2628) runs through the account runtime, and only in builds with `unreleased-device-pairing` and

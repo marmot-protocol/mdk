@@ -1022,6 +1022,29 @@ does one that is announced but failing at the relays. Re-read on `MarmotEventFfi
 which carries no device or group identities and also fires once each time the account's worker opens or reconnects.
 It is false in every release build until the roster's spec lands.
 
+## Unrecognized sign-ins
+
+`unrecognized_sign_ins(account_ref)` returns sign-ins of this account that this device does not recognize as
+`UnrecognizedSignInFfi` records, for a "Was this you?" prompt:
+
+- Each is a fresh, valid KeyPackage of the account in a slot that neither this device nor its device group's roster
+  knows. The earliest to appear comes first.
+- `before_this_device` means this device's first check found it, so it was signed in before this device: ask whether
+  the user still has it, with `last_seen_at`. For any other, ask whether it was them, with `client` and
+  `appeared_at`. `client` is display only.
+- `state` is `Prompt`, `NotNow`, or `LinkedElsewhere`/`RejectedElsewhere` when another device answered while the
+  prompt waited here. `linked_by_slot_id_hex` names the linking device for `LinkedElsewhere`.
+- `answer_sign_in(account_ref, slot_id_hex, response)` takes `NotNow`, `Reject` or `Dismiss`. `Reject` drops the sign-in
+  from this device's list and records its slot as rejected in the device group's roster; with no device group yet, it
+  waits on this device. On another device, a new sign-in whose prompt still waits there turns `RejectedElsewhere` and
+  stays until `Dismiss`; one put off with `NotNow`, or found before that device, leaves its list. `Dismiss` only ends a
+  prompt another device answered. Linking one is device pairing's.
+- The account checks at open, every six hours, and soon after one of its KeyPackages arrives live.
+  `check_sign_ins(account_ref)` checks now and returns the list after the check.
+- Re-read on `MarmotEventFfi::UnrecognizedSignInsChanged`, which carries no slots. It also fires once each time the
+  account's worker opens or reconnects, so it may fire with no visible change.
+- The list is empty in every release build until the roster's spec lands.
+
 ## Linking a new device
 
 Linking a new device of the account shows the same seven emoji on both devices, and each user confirms. Every call

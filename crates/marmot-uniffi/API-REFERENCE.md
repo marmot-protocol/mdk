@@ -3498,6 +3498,47 @@ Deprecated consent control. Use `set_usage_diagnostics_consent` instead. Enable 
 </details>
 
 <details>
+<summary>commands/sign_in.rs</summary>
+
+### `Marmot::answer_sign_in`
+
+**Current.**
+
+```rust
+pub async fn answer_sign_in( &self, account_ref: String, slot_id_hex: String, response: SignInResponseFfi, ) -> Result<(), MarmotKitError>
+```
+
+Answer the unrecognized sign-in in `slot_id_hex`. `NotNow` keeps it listed without a prompt. `Reject` records that it was not the user: it leaves this device's list, and its slot goes into the device group's roster as rejected, in one commit once that group is quiet. Another device that still shows it as a new sign-in's waiting prompt lists it as `RejectedElsewhere` until `Dismiss`; one there that was put off with `NotNow`, or found before that device, leaves its list. With no device group yet, the rejection stays on this device and goes into the roster of the group it later creates or joins. `Dismiss` only ends a prompt another device already answered. A refusal is `MarmotKitError::Runtime` whose details read `device group refused: <reason>`, the reason being `sign_in_unknown` (not listed), `sign_in_answered`, `sign_in_answered_elsewhere` (only Dismiss applies), `sign_in_unanswered` (Dismiss before any device answered), or `roster_unsupported`; re-read the list after one. An answer raises `UnrecognizedSignInsChanged`. Runs on the account worker.
+
+[Source](src/commands/sign_in.rs#L31)
+
+### `Marmot::check_sign_ins`
+
+**Current.**
+
+```rust
+pub async fn check_sign_ins( &self, account_ref: String, ) -> Result<Vec<UnrecognizedSignInFfi>, MarmotKitError>
+```
+
+Check the account's KeyPackage slots for new sign-ins now, for a pull-to-refresh or a Check now action, and return the list after the check. The check reads every slot from each of the account's KeyPackage relays, and restarts the six-hour schedule. Only a complete read marks a sign-in as signed out. A read that reached no relay fails with `MarmotKitError::Runtime` (`device group refused: key_packages_unreachable`), and the list is unchanged. Runs on the account worker and waits on the network.
+
+[Source](src/commands/sign_in.rs#L45)
+
+### `Marmot::unrecognized_sign_ins`
+
+**Current.**
+
+```rust
+pub async fn unrecognized_sign_ins( &self, account_ref: String, ) -> Result<Vec<UnrecognizedSignInFfi>, MarmotKitError>
+```
+
+List the sign-ins of this account that this device does not recognize, the earliest to appear first. Each is a fresh, valid KeyPackage of this account in a slot that neither this device nor the roster of its device group knows: someone holding the account's key signed in there. An entry with `before_this_device` was found by this device's first check, so it was signed in before this device: ask whether the user still has it, with `last_seen_at`. Any other is new: ask whether it was them, with `client` and `appeared_at`. A `LinkedElsewhere` or `RejectedElsewhere` entry was answered on another device while its prompt waited here; offer Dismiss. A sign-in whose slot empties stays listed with `signed_in` false. Linking one is device pairing's, started from its `slot_id_hex`. Read from local state with no network I/O; the account checks its slots at open, every six hours, and soon after one of its KeyPackages arrives live. Always empty in release builds until the roster's spec lands. Refresh on `MarmotEventFfi::UnrecognizedSignInsChanged`, which may fire with no visible change. Runs on the account worker.
+
+[Source](src/commands/sign_in.rs#L15)
+
+</details>
+
+<details>
 <summary>commands/sticker.rs</summary>
 
 ### `Marmot::sticker_packs`

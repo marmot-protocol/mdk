@@ -5,9 +5,9 @@
 //! Device entries have one write path (3.4, 3.6, 3.1d):
 //! [`AccountDeviceRuntime::edit_device_roster_entry`], a commit that replaces
 //! one entry. Slot announcements, the tag signature key and the host's device
-//! edits all use it. Rejected-slot records (3.1d's expiry) go through
-//! [`AccountDeviceRuntime::send_device_roster_update`] and never touch a
-//! device entry.
+//! edits all use it. Rejected-slot records (3.1d's expiry and 3.2's sign-in
+//! rejections) go through [`AccountDeviceRuntime::send_device_roster_update`]
+//! and never touch a device entry.
 //!
 //! `SetDevice` replaces an entry whole, so a commit computed from an older
 //! read would put back whatever a sibling or an earlier commit of this device
@@ -30,6 +30,8 @@ use cgka_traits::app_components::{
 };
 use cgka_traits::engine::SendIntent;
 use cgka_traits::{EngineError, EpochState, FanoutMlsState, GroupId, TransportAdapter};
+
+use marmot_forensics::AuditEventContext;
 
 use super::{AccountDeviceEffects, AccountDeviceRuntime};
 use crate::error::{AccountError, AccountResult};
@@ -200,13 +202,15 @@ where
     }
 
     /// Commit rejected-slot `operations` to `group_id`'s roster as one
-    /// update. The returned effects carry the commit. A device entry is
-    /// never written here: [`Self::edit_device_roster_entry`] replaces one
-    /// only while it is still the entry it read.
+    /// update, audited with `context` when the host gives one. The returned
+    /// effects carry the commit. A device entry is never written here:
+    /// [`Self::edit_device_roster_entry`] replaces one only while it is still
+    /// the entry it read.
     pub(super) async fn send_device_roster_update(
         &mut self,
         group_id: GroupId,
         operations: Vec<DeviceRosterOperationV1>,
+        context: Option<AuditEventContext>,
     ) -> AccountResult<AccountDeviceEffects> {
         debug_assert!(operations.iter().all(|operation| matches!(
             operation,
@@ -216,13 +220,16 @@ where
         let update = DeviceRosterUpdateV1::new(operations)
             .and_then(|update| encode_device_roster_update_v1(&update))
             .map_err(|error| AccountError::Engine(cgka_traits::EngineError::Serialize(error)))?;
-        self.send(SendIntent::UpdateAppComponents {
+        let intent = SendIntent::UpdateAppComponents {
             group_id,
             updates: vec![AppComponentData {
                 component_id: DEVICE_ROSTER_COMPONENT_ID,
                 data: update,
             }],
-        })
-        .await
+        };
+        match context {
+            Some(context) => self.send_with_audit_context(intent, context).await,
+            None => self.send(intent).await,
+        }
     }
 }

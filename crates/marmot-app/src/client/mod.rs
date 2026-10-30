@@ -803,6 +803,11 @@ pub struct AppClient {
     /// When this device next checks its account's KeyPackages for new
     /// sign-ins (mdk#2628 3.2).
     pub(crate) sign_in_schedule: sign_ins::SignInSchedule,
+    /// The unrecognized sign-ins may have changed since hosts last heard: a
+    /// check that found something new, an answer, a roster change, or an
+    /// open. The same seams as `linked_devices_changed` drain it into one
+    /// `UnrecognizedSignInsChanged`.
+    pub(crate) unrecognized_sign_ins_changed: bool,
     /// Linking a new device may have changed as hosts would read it, or the
     /// client just opened, ending any link in progress. The same seams drain
     /// it into one `DeviceLinkChanged`.
@@ -7024,11 +7029,13 @@ impl AppClient {
         effects: &marmot_session::AccountDeviceEffects,
     ) {
         for report in &effects.superseded_intents {
-            // A roster update this device made may have carried a sign-in
-            // rejection (mdk#2628 3.2).
+            // A roster update this device made lost to another branch, whose
+            // roster the devices and sign-ins now read; the update may have
+            // carried a sign-in rejection (mdk#2628 3.2).
             if report.kind == cgka_traits::engine::SupersededIntentKind::AppComponents
                 && self.is_device_group(&report.group_id).unwrap_or(true)
             {
+                self.note_device_roster_changed();
                 self.recheck_sign_in_rejections();
             }
             if !self.host_may_see_group(&report.group_id) {
