@@ -3323,12 +3323,14 @@ where
     }
 
     /// Prepare creation of a group under a group id chosen before it exists,
-    /// as a device link needs. Publish the effects as for
+    /// as a device link needs; a device group's founding Add sets the linked
+    /// device's entry by `roster_update`. Publish the effects as for
     /// [`Self::prepare_create_group_with_audit_context`].
     pub async fn prepare_create_group_with_chosen_id_and_audit_context(
         &mut self,
         request: CreateGroupRequest,
         group_id: GroupId,
+        roster_update: Option<Vec<u8>>,
         welcome_deliver_until: Timestamp,
         context: AuditEventContext,
     ) -> AccountResult<CreateGroupEffects> {
@@ -3337,6 +3339,7 @@ where
             .create_group_with_chosen_id_and_audit_context(
                 request,
                 group_id,
+                roster_update,
                 welcome_deliver_until,
                 context,
             )

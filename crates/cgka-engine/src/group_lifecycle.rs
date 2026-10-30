@@ -38,6 +38,7 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
 use marmot_forensics::AuditEventKind;
 use openmls::group::{MlsGroup, MlsGroupCreateConfig};
+use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{
     BasicCredential, CreationFromExternalError, Extension, Extensions, KeyPackageBundle,
     MlsMessageBodyIn, MlsMessageIn, WelcomeError,
@@ -280,10 +281,13 @@ impl<S: StorageProvider> Drop for NewGroupCleanupGuard<S> {
 pub(crate) const MAX_CHOSEN_GROUP_ID_LEN: usize = 255;
 
 /// A creation under a group id the host chose, as a device link's
-/// (mdk#2628 item 3.3b). Its Welcomes are never published from
-/// `welcome_deliver_until` on, when the new device stops waiting (D40).
+/// (mdk#2628 item 3.3b). A device group's founding Add adds the linked
+/// device and sets its roster entry by `roster_update` (D41). Its Welcomes are
+/// never published from `welcome_deliver_until` on, when the new device stops
+/// waiting (D40).
 pub(crate) struct ChosenGroup {
     pub(crate) group_id: GroupId,
+    pub(crate) roster_update: Option<Vec<u8>>,
     pub(crate) welcome_deliver_until: Timestamp,
 }
 
@@ -467,6 +471,34 @@ impl<S: StorageProvider> Engine<S> {
                 .is_empty(),
             "engine-owned components must not be negotiated out of a created group"
         );
+        // A device group's founding Add is a link's, as every Add there is
+        // (device-group.md, "Creating the device group"): it adds exactly the
+        // confirmed KeyPackage and sets that device's roster entry, so the
+        // founding roster never lists it (D41).
+        let founding_add_links = required_caps
+            .app_components
+            .contains(DEVICE_ROSTER_COMPONENT_ID)
+            && !parsed_kps.is_empty();
+        let founding_roster_update = chosen
+            .as_ref()
+            .and_then(|chosen| chosen.roster_update.as_deref());
+        match (founding_add_links, founding_roster_update) {
+            (true, Some(update)) if parsed_kps.len() == 1 => {
+                crate::link_device::validate_link_roster_update(update)?;
+            }
+            (true, _) => {
+                return Err(EngineError::Other(
+                    "a device group's founding Add adds exactly one device and sets its roster entry"
+                        .into(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(EngineError::Other(
+                    "a founding roster update needs a device group's founding Add".into(),
+                ));
+            }
+            (false, None) => {}
+        }
         let required_caps_ext = extension_from_group_capabilities(&required_caps);
 
         // 2. Build the group config with leaf capabilities, MLS
@@ -614,9 +646,44 @@ impl<S: StorageProvider> Engine<S> {
         let welcome_bytes: Option<Vec<u8>> = if parsed_kps.is_empty() {
             None
         } else {
-            let (_commit_out, welcome_out, _group_info) = mls_group
-                .add_members(&provider, &self.identity.signer, &parsed_kps)
-                .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+            let welcome_out = match founding_roster_update {
+                // Built from the Add and the roster update only, as a link's
+                // Commit is, and authorized as every own device-group Commit.
+                Some(roster_update) => {
+                    let roster_proposal =
+                        Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
+                            DEVICE_ROSTER_COMPONENT_ID,
+                            roster_update.to_vec(),
+                        )));
+                    let (_commit_out, welcome_out) = self
+                        .stage_exact_commit_with_app_data_updates(
+                            &mut mls_group,
+                            &provider,
+                            Vec::new(),
+                            parsed_kps.clone(),
+                            vec![roster_proposal],
+                            "found_device_group",
+                        )?;
+                    let staged = mls_group.pending_commit().ok_or_else(|| {
+                        EngineError::Backend("founding add produced no pending commit".into())
+                    })?;
+                    crate::commit_class::authorize_own_staged_commit(
+                        &mls_group,
+                        &group_id,
+                        self.identity.self_id(),
+                        staged,
+                    )?;
+                    welcome_out.ok_or_else(|| {
+                        EngineError::Backend("founding add produced no Welcome".into())
+                    })?
+                }
+                None => {
+                    let (_commit_out, welcome_out, _group_info) = mls_group
+                        .add_members(&provider, &self.identity.signer, &parsed_kps)
+                        .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+                    welcome_out
+                }
+            };
             if self.new_protocol_profile == ProtocolProfile::Legacy {
                 pending_commit_guard = Some(PendingCommitCleanupGuard::arm(
                     &self.storage,
@@ -1535,15 +1602,17 @@ impl<S: StorageProvider> Engine<S> {
             // 5f. A Welcome into a group that requires the device roster, or
             // into a group id a confirmed device link reserved, joins only as
             // that link's Welcome: into a device group, from the leaf whose
-            // signature key the link named, before its wait ends (mdk#2628
-            // D28, D30). The group id alone is no proof: anyone holding the
-            // account key can read it and found a group under it. The join
-            // consumes the expectation in this transaction.
+            // signature key the link named, adding this device by the
+            // KeyPackage the link confirmed, before its wait ends (mdk#2628
+            // D28, D30, D41). The group id alone is no proof: anyone holding
+            // the account key can read it and found a group under it. The
+            // join consumes the expectation in this transaction.
             let roster_required = crate::app_components::group_requires_device_roster(&mls_group)?;
             match storage.device_group_welcome_expectation(&group_id)? {
                 Some(expected)
                     if roster_required
                         && expected.sender_signature_key == welcome_sender_key
+                        && expected.key_package_ref == consumed_key_package_ref
                         && joined_at.0 < expected.expires_at =>
                 {
                     storage.delete_device_group_welcome_expectation(&group_id)?;
@@ -1551,6 +1620,20 @@ impl<S: StorageProvider> Engine<S> {
                 Some(_) => return Err(EngineError::UnexpectedDeviceGroupWelcome),
                 None if roster_required => return Err(EngineError::UnexpectedDeviceGroupWelcome),
                 None => {}
+            }
+            // While a link waits, the KeyPackage it confirmed is reserved for
+            // it: no Welcome into another group, a chat included, consumes
+            // it (D41).
+            if storage
+                .device_group_welcome_expectations()?
+                .iter()
+                .any(|waiting| {
+                    waiting.group_id != group_id
+                        && waiting.key_package_ref == consumed_key_package_ref
+                        && joined_at.0 < waiting.expires_at
+                })
+            {
+                return Err(EngineError::UnexpectedDeviceGroupWelcome);
             }
 
             if let Some(local_state_token) = confirmation_token {

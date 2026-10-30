@@ -49,7 +49,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `refresh_group_routes` when the drained prefix carried zero deliveries and clean routes.
 - Keep app-defined custom events on the `AppMessageIntent::Custom` path in `src/messages/intents.rs`: kind, tags, and
   content pass through verbatim, and kinds MDK owns (`is_reserved_app_event_kind`: chat, reaction, edit, delete,
-  agent, group system, push token) are rejected with `AppError::InvalidAppMessagePayload` so apps cannot forge
+  agent, group system, push token, and the device-group kinds `is_device_group_kind` lists) are rejected with `AppError::InvalidAppMessagePayload` so apps cannot forge
   protocol-owned events. Custom kinds project as standalone timeline rows under
   `TimelineUpdateTrigger::CustomEvent` (never folding onto a target message like reactions/deletes) and are queryable
   by kind through `AppMessageQuery::kinds`.
@@ -64,18 +64,19 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   says `created` or `linked`. Never judge a joined Welcome: the engine decides which Welcome joins, before the join
   (mdk#2628 D28, D30). `record_confirmed_device_link` refuses a group this device already holds, writes the
   `awaiting_welcome` row, then records the engine's `DeviceGroupWelcomeExpectation` (group, the existing device's leaf
-  signature key, `WELCOME_WAIT_SECS`), deleting the row if that fails. Withdrawing a link and ending a wait
-  (`withdraw_confirmed_device_link`, `end_welcome_waits` on every record and reconcile) delete the expectation before
-  the row, so once either returns no Welcome under the link joins. A row a crash or failure leaves without its
-  expectation admits nothing, and `end_welcome_waits` drops it at once rather than at the wait's end. Decide
-  from the engine's durable group record (`stored_group`), never the live group a deferred open has not hydrated, and
-  settle trust in one place (`settle_held_device_group`: the live join and the restart reconcile). A held device group
-  with an `awaiting_welcome` row joined in time, whatever the row's age. A held device group with no row stays
-  `untrusted`, and a group under a row that does not require the roster drops the row; neither arises through the
-  engine. A routing rebuild skips a device group a deferred open has not hydrated; the post-hydration reconcile
-  installs its route. The founding Add takes the account's own device only through the confirmed `KeyPackageRef`.
-  Confirmed links come from device pairing; the `test-policy-overrides` hooks (`dev_create_device_group`,
-  `dev_record_confirmed_device_link`, `dev_withdraw_confirmed_device_link`) stay for tests.
+  signature key, the confirmed `KeyPackageRef`, `WELCOME_WAIT_SECS`), deleting the row if that fails. Withdrawing a
+  link and ending a wait (`withdraw_confirmed_device_link`, `end_welcome_waits` on every record and reconcile) delete
+  the expectation before the row, so once either returns no Welcome under the link joins. A row a crash or failure
+  leaves without its expectation admits nothing, and `end_welcome_waits` drops it at once rather than at the wait's
+  end. Decide from the engine's durable group record (`stored_group`), never the live group a deferred open has not
+  hydrated, and settle trust in one place (`settle_held_device_group`: the live join and the restart reconcile). A held
+  device group with an `awaiting_welcome` row joined in time, whatever the row's age. A held device group with no row
+  stays `untrusted`, and a group under a row that does not require the roster drops the row; neither arises through the
+  engine. A routing rebuild skips a device group a deferred open has not hydrated; the post-hydration reconcile installs
+  its route. The founding roster lists only this device and its sign-in rejections, never the linked slot's; the
+  founding Add takes the account's own device only through the confirmed `KeyPackageRef` and sets its entry, as a later
+  link does (D41). Confirmed links come from device pairing; the `test-policy-overrides` hooks
+  (`dev_create_device_group`, `dev_record_confirmed_device_link`, `dev_withdraw_confirmed_device_link`) stay for tests.
 - Read the device roster only through `trusted_device_roster` (the trusted group's decoded roster, or none). Hosts see
   it only as `linked_devices`, this account's own devices; its errors never name the group. The device group's events
   stay hidden, so every hidden device-group event and every change of trust sets `linked_devices_changed`, which the
@@ -129,12 +130,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
   `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in `observe_device_group_event`
   (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
-  D33). That read sees only the current tree, so a message from an earlier epoch has no readable sender. The engine
-  withdraws a message by message id alone (an own send's transport id, a received message's content id), so a kind whose
-  withdrawal a feature acts on is listed in `withdrawal_handled` and dispatched in `device_group_message_withdrawn`.
-  Each such message is recorded with its kind in `device_group_messages` when sent (before the send; its message id is
-  filled in from whichever drain's effects publish it, in `retain_effect_projection`) and when read. Records go after
-  a week or past 4,096, so a feature also acts on a withdrawn message with no record, which may be of any kind.
+  D33). That read sees only the current tree, so a message from an earlier epoch has no readable sender. List every kind
+  sent only in a device group in `is_device_group_kind` (457, 459, 460, 462), the one list: `observe_event`
+  drops one received in any other group before the host summary and the stored projection, the notification preview
+  refuses it, and the custom path rejects it as reserved. The engine withdraws a message by message id alone (an own
+  send's transport id, a received message's content id), so a kind whose withdrawal a feature acts on is listed in
+  `withdrawal_handled` and dispatched in `device_group_message_withdrawn`. Each such message is recorded with its kind
+  in `device_group_messages` when sent (before the send; its message id is filled in from whichever drain's effects
+  publish it, in `retain_effect_projection`) and when read. Records go after a week or past 4,096, so a feature also
+  acts on a withdrawn message with no record, which may be of any kind.
 - Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
   Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
   roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
@@ -211,6 +215,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   drive. It announces each Welcome once per process (`announced_welcome_failures`) and leaves a failure without a
   group (the startup retry's) to `reconcile_pending_welcome_delivery_index`. The worker's projection drain
   (`publish_client_pending_projection_updates`) broadcasts the queued events, so every worker seam does.
+  `note_welcome_delivery_failures` and that reconcile are the pending table's only writers; never write a row before a
+  commit is exposed, since the engine stages an invite's Welcomes with its commit.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.
@@ -337,7 +343,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`ReplayEndpointView::streaming`: the relay client still names the connection its serial started on); a count
   that is not streaming is recorded as ended. A tail can outlive its REQ by the time the adapter takes to process
   notifications already queued for that relay, an accepted limit: a forwarder that falls behind records loss, which
-  breaks it, and a tail never reaches the ledger. Read tails at every debt read; they lapse without an event. Debt that drives work reads the ledger only up to
+  breaks it, and a tail never reaches the ledger. Read tails at every debt read; they lapse without an event. A route whose group's live frames
+  the adapter's fence holds gets no live boundary until they are released, while its tail stands. Debt that drives work reads the ledger only up to
   `LiveTails::owed_until`, refreshed by `AppClient::live_tails`; without it an idle connected account owes its own
   live frames. Storage keeps a released receipt's second out of every live boundary, and a tail starts past the
   newest one on its route; only a fetch proof covers it, on its own relay. Live-boundary tests live in
@@ -377,7 +384,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   engine kept no trace of. Nothing is swept, compared or re-checked for a group admission cannot drain (held, or
   admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences; the fence is a query
   (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own
-  `LiveCount`, never the coverage recorder's facts. Logs carry aggregates only.
+  `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
+  with the adapter's fence ticket and held routes; `fence_live_frames` answers with that ticket. Nothing calls
+  them or `enable_live_fences` before the switch-over. Logs carry aggregates only.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown

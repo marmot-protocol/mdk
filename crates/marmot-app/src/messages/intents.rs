@@ -763,7 +763,8 @@ pub(crate) fn build_inner_event_with_media_reply(
 /// Inner app-event kinds MDK assigns protocol semantics to. The custom-event
 /// path rejects these so an app cannot forge, e.g., a kind-5 delete or a
 /// kind-447 push-token update that other members' clients would act on under
-/// MDK's interpretation.
+/// MDK's interpretation. Device-group kinds are reserved too, through
+/// `is_device_group_kind`, which owns their list.
 const RESERVED_APP_EVENT_KINDS: &[u64] = &[
     MARMOT_APP_EVENT_KIND_REPORT,
     MARMOT_APP_EVENT_KIND_REVIEW,
@@ -784,9 +785,10 @@ const RESERVED_APP_EVENT_KINDS: &[u64] = &[
 ];
 
 /// True when `kind` is one MDK owns (chat, reactions, edits, agent, group
-/// system, push token). Custom sends must use any other kind.
+/// system, push token, device group). Custom sends must use any other kind.
 pub fn is_reserved_app_event_kind(kind: u64) -> bool {
     RESERVED_APP_EVENT_KINDS.contains(&kind)
+        || crate::client::device_group::is_device_group_kind(kind)
 }
 
 // Application tags may decorate chat, but encrypted media references remain typed.

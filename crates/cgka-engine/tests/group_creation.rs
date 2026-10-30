@@ -2702,6 +2702,7 @@ async fn a_legacy_engine_refuses_a_chosen_group_id() {
                 initial_admins: vec![],
             },
             chosen.clone(),
+            None,
             Timestamp(u64::MAX),
             None,
         )
