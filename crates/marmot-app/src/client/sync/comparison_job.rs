@@ -5004,8 +5004,12 @@ mod tests {
     async fn a_comparison_only_pass_without_a_backend_is_unserved_not_quiet() {
         use crate::client::audit_recovery::recorded_v5_rows;
         let mut fixture = fixture_with_options(None, false, true).await;
-        // Settle the create-group history demand, as the epoch-gap fixture
-        // does, so the next grant owns only the comparison slot.
+        // Settle the live REQs' native replay before the first grant, or its
+        // SubscriptionReplay duty can join every grant (mdk#2693). Then settle
+        // the create-group history demand, as the epoch-gap fixture does, so
+        // the next grant owns only the comparison slot.
+        let plane = fixture.client.app.relay_plane.clone();
+        crate::tests::settle_live_replay(&plane, &fixture.relay, &mut fixture.client).await;
         let baseline = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
