@@ -3806,20 +3806,19 @@ where
                 // behind an unrelated transport backoff in the same group.
                 return Ok(None);
             }
+            if matches!(fanout.mls_state(), FanoutMlsState::Confirmed)
+                && !fanout.pending_post_confirmation_welcomes().is_empty()
+            {
+                let Some(delay) = self
+                    .welcome_retry_delay_ms(fanout.pending_post_confirmation_welcomes(), now_ms)?
+                else {
+                    return Ok(None);
+                };
+                welcome_delay = Some(welcome_delay.map_or(delay, |prior: u64| prior.min(delay)));
+            }
             if outcome.outstanding_targets == 0 {
                 if matches!(fanout.mls_state(), FanoutMlsState::Pending(_)) {
                     return Ok(None);
-                }
-                if !fanout.pending_post_confirmation_welcomes().is_empty() {
-                    let Some(delay) = self.welcome_retry_delay_ms(
-                        fanout.pending_post_confirmation_welcomes(),
-                        now_ms,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    welcome_delay =
-                        Some(welcome_delay.map_or(delay, |prior: u64| prior.min(delay)));
                 }
                 continue;
             }
@@ -3832,7 +3831,8 @@ where
             }
             // The first incomplete network fanout is the group-scoped ordering
             // barrier, so later NotAttempted records cannot pull this cutoff
-            // forward. Earlier Welcome-only continuations are not that barrier.
+            // forward. Its own retained Welcomes can retry earlier; preceding
+            // Welcome-only continuations are not that barrier.
             return Ok(match (earliest, welcome_delay) {
                 (Some(retry), Some(welcome)) => Some(retry.min(welcome)),
                 (retry, welcome) => retry.or(welcome),

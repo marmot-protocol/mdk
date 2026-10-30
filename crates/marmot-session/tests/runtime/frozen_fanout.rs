@@ -200,6 +200,251 @@ async fn retained_welcome_retry_cutoff() {
     assert_eq!(adapter.publishes().len(), 2);
 }
 
+#[tokio::test]
+async fn mixed_welcome_retry_cutoff() {
+    for welcome_first in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new("mixed Welcome scheduling key").unwrap();
+        let path = dir.path().join("alice.sqlite");
+        let mut alice = session(&path, &key, b"mixed-retry-alice");
+        let mut bob = session(dir.path().join("bob.sqlite"), &key, b"mixed-retry-bob");
+        let mut carol = session(dir.path().join("carol.sqlite"), &key, b"mixed-retry-carol");
+        let created = alice
+            .create_group(CreateGroupRequest {
+                name: "mixed Welcome retry".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let group = created.group_id;
+        let PublishWork::GroupCreated { pending, .. } = &created.effects.publish[0] else {
+            panic!("expected group creation");
+        };
+        alice.confirm_published(*pending).await.unwrap();
+        let effects = alice
+            .send(SendIntent::Invite {
+                group_id: group.clone(),
+                key_packages: vec![
+                    bob.fresh_key_package().await.unwrap(),
+                    carol.fresh_key_package().await.unwrap(),
+                ],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let PublishWork::GroupEvolution { msg, welcomes, .. } = &effects.publish[0] else {
+            panic!("expected invite");
+        };
+        let commit = msg.clone();
+        assert_eq!(welcomes.len(), 2);
+        let unfinished = welcomes[0].clone();
+        let rejected = welcomes[1].clone();
+        let primary = TransportEndpoint("wss://mixed-retry-primary.example".into());
+        let secondary = TransportEndpoint("wss://mixed-retry-secondary.example".into());
+        let inbox = TransportEndpoint("wss://mixed-retry-inbox.example".into());
+        let policy = StaticTransportRouting::new(vec![inbox.clone()])
+            .with_inbox_route(bob.self_id(), vec![inbox.clone()])
+            .with_inbox_route(carol.self_id(), vec![inbox.clone()])
+            .with_group_route(
+                group.clone(),
+                group.as_slice().to_vec(),
+                vec![primary.clone(), secondary.clone()],
+            );
+        let adapter = RecordingAdapter::default();
+        adapter.fail_endpoints_as(
+            vec![primary, secondary.clone()],
+            TransportEndpointFailureKind::PossiblyExposed,
+        );
+        let wall = Arc::new(TestWallClock::new(100));
+        let mut runtime = AccountDeviceRuntime::new(
+            alice,
+            adapter.clone(),
+            policy.clone(),
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        let first = runtime.publish_session_effects(effects).await.unwrap();
+        assert_eq!(first.unresolved_publishes.len(), 1);
+        assert_eq!(adapter.publishes().len(), 2);
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+            Some(30_000),
+            "unconfirmed Welcomes must not hide the Commit's durable cutoff"
+        );
+
+        // The second Commit attempt confirms MLS, but gives the secondary a
+        // 60-second backoff. A real Welcome completion failure retains both
+        // continuations; its sibling has a persisted 30-second retry cutoff.
+        wall.set(130);
+        adapter.fail_endpoints_as(
+            vec![secondary.clone(), inbox.clone()],
+            TransportEndpointFailureKind::PossiblyExposed,
+        );
+        runtime.arm_finish_stage_failure(unfinished.id.clone());
+        let error = runtime.resume_outbound_fanouts().await.unwrap_err();
+        assert!(matches!(
+            error.as_engine_error(),
+            Some(cgka_traits::EngineError::Storage(
+                cgka_traits::storage::StorageError::Busy(_)
+            ))
+        ));
+        let fanouts = runtime
+            .session()
+            .outbound_fanouts_for_group(&group)
+            .unwrap();
+        assert_eq!(fanouts.len(), 1);
+        assert!(matches!(fanouts[0].mls_state(), FanoutMlsState::Confirmed));
+        assert_eq!(fanouts[0].request().message, commit);
+        assert_eq!(fanouts[0].outcome().accepted_targets, 1);
+        assert_eq!(fanouts[0].outcome().outstanding_targets, 1);
+        assert_eq!(fanouts[0].pending_post_confirmation_welcomes().len(), 2);
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+            None,
+            "unfinished Welcome bookkeeping still needs the ordinary scheduler delay"
+        );
+        drop(runtime);
+
+        let adapter = RecordingAdapter::default();
+        let mut runtime = AccountDeviceRuntime::new(
+            session(&path, &key, b"mixed-retry-alice"),
+            adapter.clone(),
+            policy,
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        let delivered = runtime.redeliver_welcome(&unfinished.id).await.unwrap();
+        assert!(delivered.welcome_failures.is_empty());
+        assert_eq!(adapter.publishes()[0].message, unfinished);
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+            Some(30_000),
+            "the retained Welcome is due at 160, before the secondary at 190"
+        );
+        if !welcome_first {
+            wall.set(140);
+            adapter.fail_endpoints_as(vec![inbox], TransportEndpointFailureKind::PossiblyExposed);
+            let failed = runtime.redeliver_welcome(&rejected.id).await.unwrap();
+            assert_eq!(failed.welcome_failures.len(), 1);
+            assert_eq!(failed.welcome_failures[0].message_id, rejected.id);
+            adapter.fail_endpoints_as(vec![], TransportEndpointFailureKind::PossiblyExposed);
+            assert_eq!(
+                runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+                Some(50_000),
+                "the secondary at 190 precedes the Welcome's new cutoff at 200"
+            );
+        }
+
+        // Stage real newer work without publishing it. The mixed parent, unlike
+        // a Welcome-only continuation, remains the group's ordering barrier.
+        let staged = runtime
+            .session_mut()
+            .send(SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
+            .await
+            .unwrap();
+        let PublishWork::GroupEvolution { msg, pending, .. } = &staged.publish[0] else {
+            panic!("expected staged self-update");
+        };
+        let TransportEnvelope::GroupMessage { transport_group_id } = &msg.envelope else {
+            panic!("expected group Commit");
+        };
+        let newer = OutboundFanout::stage(
+            TransportPublishRequest {
+                account_id: runtime.session().self_id(),
+                message: msg.clone(),
+                target: TransportPublishTarget::Group {
+                    group_id: group.clone(),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: fanouts[0].request().target.endpoints().to_vec(),
+                },
+                required_acks: 1,
+            },
+            Some(*pending),
+            Some(group.clone()),
+            wall.now().0 * 1_000 + 1,
+        )
+        .unwrap();
+        runtime.session().put_outbound_fanout(&newer).unwrap();
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+            Some(if welcome_first { 30_000 } else { 50_000 }),
+            "a later NotAttempted fanout cannot accelerate the mixed parent"
+        );
+        let cutoff = if welcome_first { 160 } else { 190 };
+        wall.set(cutoff - 1);
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+            Some(1_000)
+        );
+        let prior = adapter.publishes().len();
+        wall.set(cutoff);
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+            Some(0)
+        );
+        let retried = runtime.resume_outbound_fanouts().await.unwrap();
+        assert!(retried.failures.is_empty());
+        if welcome_first {
+            let attempts = adapter.publishes();
+            assert_eq!(attempts.len(), prior + 1);
+            assert_eq!(attempts[prior].message, rejected);
+            assert!(retried.pending.is_empty(), "the newer Commit stays blocked");
+            assert_eq!(
+                runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+                Some(30_000)
+            );
+            wall.set(189);
+            assert_eq!(
+                runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+                Some(1_000)
+            );
+            runtime.resume_outbound_fanouts().await.unwrap();
+            assert_eq!(adapter.publishes().len(), prior + 1);
+            wall.set(190);
+            runtime.resume_outbound_fanouts().await.unwrap();
+        }
+        let attempts = adapter.publishes();
+        let target_index = prior + usize::from(welcome_first);
+        assert_eq!(attempts.len(), target_index + 3);
+        assert_eq!(attempts[target_index].message, commit);
+        assert_eq!(attempts[target_index].target.endpoints(), &[secondary]);
+        assert!(
+            attempts[target_index + 1..]
+                .iter()
+                .all(|attempt| attempt.message == *msg)
+        );
+        assert!(!runtime.has_pending_outbound_fanouts(&group).unwrap());
+        if !welcome_first {
+            assert!(
+                runtime
+                    .outstanding_welcome_deliveries()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, message)| message.id == rejected.id)
+            );
+            wall.set(200);
+            let delivered = runtime.redeliver_welcome(&rejected.id).await.unwrap();
+            assert!(delivered.welcome_failures.is_empty());
+            assert_eq!(adapter.publishes().last().unwrap().message, rejected);
+        }
+        assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
+    }
+}
+
 #[derive(Clone, Default)]
 struct CrashDuringFanoutPublishAdapter {
     publishes: Arc<Mutex<Vec<TransportPublishRequest>>>,
