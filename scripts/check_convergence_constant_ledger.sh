@@ -147,6 +147,7 @@ discover_constants \
     "crates/marmot-app/src/client/recovery_runner/policy.rs" \
     "RUNNER_[A-Z0-9_]+"
 discover_constants "crates/transport-nostr-adapter/src/compare/mod.rs" "COMPARE_[A-Z0-9_]+"
+discover_constants "crates/transport-nostr-adapter/src/sweep/mod.rs" "INTERRUPT_[A-Z0-9_]+"
 discover_constants \
     "crates/marmot-app/src/lib.rs" \
     "(APP_RUNTIME_RELAY_REBUILD_LOOKBACK|TRANSPORT_CURSOR_MAX_FUTURE_SKEW|HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE)"

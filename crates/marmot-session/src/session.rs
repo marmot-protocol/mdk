@@ -909,6 +909,17 @@ impl AccountDeviceSession {
         Ok(self.engine.withdraw_sent_welcome(id)?)
     }
 
+    /// See `Engine::sent_welcomes_for_key_package`.
+    pub fn sent_welcomes_for_key_package(
+        &self,
+        group_id: &GroupId,
+        key_package_ref: &[u8],
+    ) -> SessionResult<Vec<MessageId>> {
+        Ok(self
+            .engine
+            .sent_welcomes_for_key_package(group_id, key_package_ref)?)
+    }
+
     /// See `Engine::sent_welcome_withdrawn`.
     pub fn sent_welcome_withdrawn(&self, id: &MessageId) -> SessionResult<bool> {
         Ok(self.engine.sent_welcome_withdrawn(id)?)
@@ -1856,6 +1867,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
         SendIntent::LinkDevice { .. } => "link_device",
+        SendIntent::UnlinkDevice { .. } => "unlink_device",
         SendIntent::Disband { .. } => "disband",
     }
 }

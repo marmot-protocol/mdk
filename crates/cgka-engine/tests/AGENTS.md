@@ -212,7 +212,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     group, a KeyPackage without the group's required components, an update that doesn't set exactly one device entry,
     an entry not for a new slot or not announcing the KeyPackage, a roster the link would leave invalid. Also the sender
     rule refusing any own device-group Commit that takes an Add from the proposal store, and `LinkDeviceUnsettled`
-    instead of a queued link while convergence is unsettled or an own Commit is in flight.
+    instead of a queued link while convergence is unsettled or an own Commit is in flight. Its undo, `UnlinkDevice`
+    (D40): one privileged Commit removing the linked leaf and its entry, which the removed device sees as its removal;
+    refused for another leaf than one other leaf of the account, an update that doesn't remove exactly one listed
+    entry, or while an own Commit is in flight.
 
 - **File:** `account_devices/device_group_welcome.rs` (test-policy builds only)
   - **Owns:** Which Welcome a new device joins its device group through (mdk#2628 D28, D30): only the one a stored

@@ -96,6 +96,7 @@ impl<S: StorageProvider> Engine<S> {
             | SendIntent::EnableDisbanding { .. }
             | SendIntent::EnableAccountDevices { .. }
             | SendIntent::LinkDevice { .. }
+            | SendIntent::UnlinkDevice { .. }
             | SendIntent::Disband { .. } => None,
         })
     }

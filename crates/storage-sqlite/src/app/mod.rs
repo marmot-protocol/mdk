@@ -8,6 +8,7 @@ pub(crate) mod avatar_cache;
 pub(crate) mod chat_list;
 pub(crate) mod chat_presentation;
 pub(crate) mod device_groups;
+pub(crate) mod device_links;
 pub(crate) mod encrypted_media_secrets;
 pub(crate) mod group_system;
 pub(crate) mod handle;

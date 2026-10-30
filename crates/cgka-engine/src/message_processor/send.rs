@@ -166,6 +166,14 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_send_link_device(group_id, key_package, roster_update)
                     .await
             }
+            SendIntent::UnlinkDevice {
+                group_id,
+                leaf_signature_key,
+                roster_update,
+            } => {
+                self.do_send_unlink_device(group_id, leaf_signature_key, roster_update)
+                    .await
+            }
             SendIntent::Disband { group_id } => self.do_request_disband(group_id),
         };
         if let (
@@ -543,7 +551,15 @@ impl<S: StorageProvider> Engine<S> {
                 self.peeler.wrap_welcome(&payload, &recipient).await
             }
             .map_err(EngineError::Peeler)?;
-            self.record_staged_invite_welcome(&wrapped, commit_id, group_id, source_epoch)?;
+            self.record_staged_invite_welcome(
+                &wrapped,
+                commit_id,
+                crate::key_package::key_package_ref(parsed_kp)?
+                    .as_slice()
+                    .to_vec(),
+                group_id,
+                source_epoch,
+            )?;
             welcomes.push(wrapped);
         }
         Ok(welcomes)

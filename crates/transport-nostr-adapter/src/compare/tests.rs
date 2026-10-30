@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use nostr::prelude::{Keys, Kind, PublicKey, Signature, Tag, Timestamp};
@@ -82,6 +82,14 @@ struct ModelRelay {
     fetched: Mutex<Vec<EventId>>,
     /// The largest relay set a comparison reported.
     largest_set: AtomicUsize,
+    /// Every fetch by id reads `read_until_cut` bytes and waits to be
+    /// interrupted before it answers.
+    hold_fetches: bool,
+    read_until_cut: u64,
+    /// What [`CompareRelay::interrupt`] answers.
+    interruptible: bool,
+    interrupted: CancellationToken,
+    metered: AtomicU64,
 }
 
 impl ModelRelay {
@@ -161,6 +169,11 @@ impl CompareRelay for ModelRelay {
             return IdsReply::Closed(reason);
         }
         self.fetched.lock().unwrap().extend_from_slice(ids);
+        if self.hold_fetches {
+            self.interrupted.cancelled().await;
+            self.metered
+                .fetch_add(self.read_until_cut, Ordering::SeqCst);
+        }
         let asked = ids.iter().collect::<HashSet<_>>();
         IdsReply::Answered(
             self.in_window(window)
@@ -169,6 +182,15 @@ impl CompareRelay for ModelRelay {
                 .cloned()
                 .collect(),
         )
+    }
+
+    fn take_fetched_bytes(&self) -> u64 {
+        self.metered.swap(0, Ordering::SeqCst)
+    }
+
+    fn interrupt(&self) -> bool {
+        self.interrupted.cancel();
+        self.interruptible
     }
 }
 
@@ -495,4 +517,43 @@ async fn the_deadline_pauses_the_call() {
     .await;
     assert_eq!(report.end, CompareEnd::DeadlineReached);
     assert_eq!(report.stats.answers, 0);
+}
+
+/// A fetch the deadline cuts is interrupted and awaited, so the bytes it read
+/// reach the report; a relay that cannot interrupt has it dropped, unmetered.
+#[tokio::test(start_paused = true)]
+async fn a_cut_fetch_reports_what_it_read() {
+    for interruptible in [true, false] {
+        let mut factory = EventFactory::new();
+        let relay = ModelRelay {
+            hold_fetches: true,
+            read_until_cut: 4_096,
+            interruptible,
+            ..ModelRelay::holding(factory.spread(day(), 20))
+        };
+        let mut sink = RecordingSink::default();
+        let started = Instant::now();
+        let report = run_comparison(
+            CompareRequest {
+                route: route(),
+                range: day(),
+                local: &[],
+                deadline: Some(started + Duration::from_secs(2)),
+                policy: policy(2_048),
+            },
+            &relay,
+            &mut sink,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(report.end, CompareEnd::DeadlineReached);
+        assert!(report.certified.is_empty() && sink.batches.is_empty());
+        assert_eq!(relay.fetched().len(), 20, "the cut fetch went out");
+        let read = if interruptible { 4_096 } else { 0 };
+        assert_eq!(
+            report.unadmitted_bytes, read,
+            "interruptible: {interruptible}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+    }
 }

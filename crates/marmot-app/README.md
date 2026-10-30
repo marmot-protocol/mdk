@@ -433,6 +433,25 @@ announced but failing at the relays doesn't count. The client recomputes the ans
 time the account's worker opens or reconnects. It is false, and the event silent, in every release build until the
 roster's spec lands.
 
+## Linking a new device
+
+Device linking (mdk#2628) runs through the account runtime, and only in builds with `unreleased-device-pairing` and
+`dev_device_groups`; every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
+link (`new_device`) and the prompts for sign-ins this device can link (`prompts`).
+
+- On the new device, `start_device_link` asks a device already signed in to link this one. Its state goes from
+  `WaitingForAnswer` to `Comparing`, with seven emoji and their English descriptions for screen readers, then
+  `WaitingForOtherDevice` after `confirm_device_link_match`, `Joining`, and `Linked`. `cancel_device_link` ends it.
+- On a device already signed in, a prompt shows the same code once that device checked the new device's KeyPackage.
+  `link_device` takes the prompt id, the new device's label and its two settings, both on by default.
+  `decline_device_link` is Not now. The prompt stays `Linking` until the new device's first change in the device
+  group arrives, which the new device makes as soon as it joins; with none within an hour, this device removes it
+  again and both sides show `LinkFailed`. A prompt also says when the sign-in can't be linked, when the account has
+  20 devices, when several sign-ins compete, and who added the device on another device.
+- `device_link_snapshot` reads linking without changing it. `MarmotAppEvent::DeviceLinkChanged` says to re-read. It
+  also fires once each time the account's worker opens or reconnects, which ends any link in progress: pairing keeps
+  its secrets only in memory.
+
 ## History may be incomplete notices
 
 Recovery parks an obligation after its fixed budget of fruitless attempts instead of retrying forever.

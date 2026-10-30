@@ -771,14 +771,21 @@ impl<S: StorageProvider> Engine<S> {
                         storage.put_group(&canonical_record)?;
                         persist_new_group_maintenance(storage, &group_id, enrolled_at, None, None)?;
 
-                        for welcome in &welcomes {
-                            let payload = StoredMessagePayload::outbound_welcome(welcome.clone())
-                                .encode()
-                                .map_err(|error| {
-                                    EngineError::Serialize(format!(
-                                        "encode founding Welcome: {error:?}"
-                                    ))
-                                })?;
+                        for (welcome, parsed_kp) in welcomes.iter().zip(&parsed_kps) {
+                            let payload = StoredMessagePayload::outbound_welcome(
+                                welcome.clone(),
+                                Some(
+                                    crate::key_package::key_package_ref(parsed_kp)?
+                                        .as_slice()
+                                        .to_vec(),
+                                ),
+                            )
+                            .encode()
+                            .map_err(|error| {
+                                EngineError::Serialize(format!(
+                                    "encode founding Welcome: {error:?}"
+                                ))
+                            })?;
                             storage.put_message(&MessageRecord {
                                 id: welcome.id.clone(),
                                 group_id: group_id.clone(),

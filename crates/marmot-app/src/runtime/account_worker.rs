@@ -664,6 +664,11 @@ pub(crate) enum AccountWorkerCommand {
     PublishKeyPackage {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
+    /// Linking a new device of this account (mdk#2628 item 3.3b).
+    DeviceLink {
+        op: crate::DeviceLinkOp,
+        respond: oneshot::Sender<Result<crate::DeviceLinkSnapshot, AppError>>,
+    },
     /// Complete the exact KeyPackage publication authorized by the durable
     /// account-setup journal. This is deliberately distinct from the general
     /// publication command so no other mutation can enter the startup lane.
@@ -1473,7 +1478,9 @@ async fn run_app_runtime_account_worker(
                                         let delivery_started = Instant::now();
                                         let receive_observation = shared.observer.performance()
                                             .observe(RuntimeOp::WorkerReceive);
-                                        match client.ingest_received_delivery_with_partial(*delivery).await {
+                                        let ingested = client.ingest_received_delivery_with_partial(*delivery).await;
+                                        client.drive_device_pairing().await;
+                                        match ingested {
                                             Ok(summary) => {
                                                 receive_observation.finish(TelemetryOutcome::Success);
                                                 shared.observer.performance().record(
@@ -2616,7 +2623,11 @@ async fn run_app_runtime_account_worker(
                 let receive_observation = shared.observer.performance().observe(RuntimeOp::WorkerReceive);
                 let result = match received {
                     Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) => {
-                        client.ingest_received_delivery(*delivery).await
+                        let ingested = client.ingest_received_delivery(*delivery).await;
+                        // Pairing messages arrive among the account's gift
+                        // wraps; answer them while the other device waits.
+                        client.drive_device_pairing().await;
+                        ingested
                     }
                     // receive_next_delivery persisted the loss. The owned
                     // comparison job dispatched below recovers it off the
@@ -3031,6 +3042,8 @@ async fn run_app_runtime_account_worker(
                     &client,
                     &mut legacy_message_promotion,
                 );
+                // Pairing timers, KeyPackage retries and link settlement.
+                client.drive_device_pairing().await;
                 attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
                 attachments::spawn_legacy_migration(
                     &client,
@@ -5173,7 +5186,9 @@ fn account_worker_command_future<'a>(
                 Box::pin(serve_snapshot_reads_until(
                     read_snapshot,
                     async {
-                        client
+                        // An undelivered Welcome stays owed; the events below
+                        // report it.
+                        let _ = client
                             .drive_unpublished_welcome_delivery(Some(&telemetry))
                             .await;
                         publish_pending_welcome_delivery_events(
@@ -5631,7 +5646,9 @@ fn account_worker_command_future<'a>(
                 Box::pin(serve_snapshot_reads_until(
                     read_snapshot,
                     async {
-                        client
+                        // An undelivered Welcome stays owed; the events below
+                        // report it.
+                        let _ = client
                             .drive_unpublished_welcome_delivery(Some(&telemetry))
                             .await;
                         publish_pending_welcome_delivery_events(
@@ -6368,6 +6385,11 @@ fn account_worker_command_future<'a>(
             respond,
         } => Box::pin(async move {
             let result = client.redeliver_welcome(&message_id_hex).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::DeviceLink { op, respond } => Box::pin(async move {
+            let result = client.device_link(op).await;
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
@@ -7303,14 +7325,10 @@ fn schedule_pending_convergence_groups(
 fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
     // Normal builds always schedule against the pinned v1 quiescence window
     // (mdk#970); the override exists only in explicit test-policy builds.
-    let quiescence_ms = if cfg!(feature = "test-policy-overrides") {
-        app.config
-            .dev_settlement_quiescence_ms
-            .unwrap_or(marmot_session::V1_SETTLEMENT_QUIESCENCE_MS)
-    } else {
-        marmot_session::V1_SETTLEMENT_QUIESCENCE_MS
-    };
-    Duration::from_millis(quiescence_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS))
+    Duration::from_millis(
+        app.settlement_quiescence_ms()
+            .saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
+    )
 }
 
 fn startup_hydration_batch_test_delay(app: &MarmotApp) -> Duration {
@@ -7930,11 +7948,12 @@ fn publish_account_level_changes(
 }
 
 /// One `LinkedDevicesChanged` for a hidden device-group event or a change of
-/// device-group trust since the last call, and one
+/// device-group trust since the last call, one
 /// `KeyPackageRefreshOverdueChanged` for a maintenance pass that changed the
-/// overdue-refresh answer. Both the account-level seam and the
-/// applied-summary seam drain them, so startup, reconnect, maintenance and
-/// every command and delivery announce them.
+/// overdue-refresh answer, and one `DeviceLinkChanged` for a change in
+/// linking a new device. Both the account-level seam and the applied-summary
+/// seam drain them, so startup, reconnect, maintenance and every command and
+/// delivery announce them.
 fn publish_device_group_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -7949,6 +7968,12 @@ fn publish_device_group_changes(
     }
     if client.take_key_package_refresh_overdue_changed() {
         let _ = events.send(MarmotAppEvent::KeyPackageRefreshOverdueChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+    if client.take_device_link_changed() {
+        let _ = events.send(MarmotAppEvent::DeviceLinkChanged {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
         });

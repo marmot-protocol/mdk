@@ -165,12 +165,13 @@ pub enum EngineError {
     AppMessageEpochUnsettled { expected: EpochId },
 
     /// A [`SendIntent::LinkDevice`](crate::engine::SendIntent::LinkDevice)
+    /// or [`SendIntent::UnlinkDevice`](crate::engine::SendIntent::UnlinkDevice)
     /// refused instead of queued, because the device group has a Commit in
     /// flight or convergence input still unsettled. Nothing was persisted.
     /// A link never waits in the outbound queue: the new device stops waiting
     /// for its Welcome, and a link sent after that would add a device that
     /// never joins. Retry once the group settles, while the new device still
-    /// waits.
+    /// waits. An unlink is retried the same way, until it lands.
     #[error("linking a device refused while the device group is unsettled")]
     LinkDeviceUnsettled { group_id: GroupId },
 
