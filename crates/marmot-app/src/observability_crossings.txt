@@ -3,18 +3,3 @@
 # edit by hand. Regenerate with:
 #   MARMOT_APP_REGENERATE_CROSSINGS=1 cargo nextest run -p marmot-app --lib -E 'test(observability_crossings)'
 # <production|test> <file under src/> <crossing>
-test app_telemetry.rs crate::AccountCatchUpFailure
-test app_telemetry.rs crate::AppError
-test app_telemetry.rs crate::ClassifiedSyncFailure
-test app_telemetry.rs crate::SyncSummary
-test app_telemetry.rs crate::sqlcipher::sqlcipher_migration_probe_counters
-test app_telemetry.rs marmot_session::AccountError
-test app_telemetry/runtime.rs crate::AppError
-test audit_otlp_sender/tests.rs crate::retired_relay_hosts
-test collector_host_safety.rs crate::network_proxy::http_builder
-test collector_host_safety/proxy_tests.rs crate::network_proxy::nostr_builder
-test product_analytics/tests.rs crate::AccountCatchUpFailure
-test product_analytics/tests.rs crate::AppError
-test product_analytics/tests.rs crate::MarmotApp
-test product_analytics/tests.rs rusqlite::Connection
-test relay_telemetry_export.rs crate::MarmotRelayPlane

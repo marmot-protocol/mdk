@@ -22,9 +22,9 @@ use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, O
 use super::resources::DirectoryResources;
 use crate::ids::parse_account_id_hex;
 use crate::published_records::{
-    AccountKeyPackageSlots, account_key_package_slots_from_records, fresh_or_cached_key_package,
-    fresh_relay_list_status_from_records, key_package_queries, merge_relay_list_status,
-    relay_list_queries, select_key_packages_from_records,
+    AccountKeyPackageSlots, KEY_PACKAGE_READ_PAGE, account_key_package_slots_from_records,
+    fresh_or_cached_key_package, fresh_relay_list_status_from_records, key_package_queries,
+    merge_relay_list_status, relay_list_queries, select_key_packages_from_records,
 };
 use crate::records::{
     CachedIdentityProjection, CurrentFollowList, FetchedFollowList, MAX_CACHED_IDENTITY_PAGE_SIZE,
@@ -853,20 +853,32 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     /// Read every KeyPackage slot of `account_id_hex` from `source_relays`
     /// (the directory relays when empty) in one inviter's read: one page of
     /// KeyPackages and one of their deletion requests, each relay to its end
-    /// of stored events. See [`AccountKeyPackageSlots`].
+    /// of stored events. With `own_slot`, the same read also asks each relay
+    /// for that slot alone (mdk#2628 item 3.4). See [`AccountKeyPackageSlots`].
     pub async fn read_account_key_package_slots(
         &self,
         account_id_hex: &str,
         source_relays: &[TransportEndpoint],
+        own_slot: Option<&str>,
     ) -> Result<AccountKeyPackageSlots, DirectoryError> {
         let account = PublicKey::parse(account_id_hex)
             .map_err(|_| DirectoryError::InvalidPublicKey)?
             .to_hex();
+        let mut queries = key_package_queries(vec![account.clone()]);
+        if let Some(slot) = own_slot {
+            // A page as large as the account's, so the slot's own page
+            // never cuts the account's read short sooner.
+            queries.push(DirectoryEventQuery::key_package_slot(
+                &account,
+                slot.to_owned(),
+                KEY_PACKAGE_READ_PAGE,
+            ));
+        }
         let outcome = self
             .relay_plane
             .fetch_directory_events_with_completion(
                 self.directory_source_relays(source_relays),
-                key_package_queries(vec![account.clone()]),
+                queries,
             )
             .await
             .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key packages: {e}")))?;
@@ -875,6 +887,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             &outcome.records,
             outcome.complete,
             self.directory_freshness(),
+            own_slot,
         ))
     }
 

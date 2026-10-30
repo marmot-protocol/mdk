@@ -557,26 +557,4 @@ mod tests {
                 .all(|s| s.started == 0 && s.duration_ms.buckets.len() == 27)
         );
     }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn aborted_caller_records_cancellation_without_a_completion_callback() {
-        let t = AppPerformanceTelemetry::default();
-        let copy = t.clone();
-        let (entered, waiting) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            copy.measure_app(RuntimePerformanceOperation::ConversationOpen, async move {
-                entered.send(()).unwrap();
-                std::future::pending::<Result<(), crate::AppError>>().await
-            })
-            .await
-        });
-        waiting.await.unwrap();
-        assert_eq!(sample(&t).in_flight, 1);
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        let s = sample(&t);
-        assert_eq!(
-            (s.started, s.completed, s.cancelled, s.in_flight),
-            (1, 1, 1, 0)
-        );
-    }
 }

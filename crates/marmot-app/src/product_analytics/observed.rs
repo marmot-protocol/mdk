@@ -60,7 +60,7 @@ impl ObservedOperation {
 }
 
 /// `success` or `failure`: the rule most operations use.
-pub(crate) fn success_or_failure<T, E>(result: &Result<T, E>) -> &'static str {
+pub fn success_or_failure<T, E>(result: &Result<T, E>) -> &'static str {
     if result.is_ok() { "success" } else { "failure" }
 }
 
@@ -89,7 +89,7 @@ pub(crate) fn send_outcome<T, E>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::configured;
+    use super::super::fixtures::configured;
     use super::*;
     use cgka_traits::SendAcceptDisposition::Published;
 

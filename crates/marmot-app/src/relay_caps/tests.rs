@@ -93,6 +93,9 @@ impl DocumentServer {
 }
 
 fn fetch_with(resolve: impl Fn(String) -> Vec<IpAddr> + Send + Sync + 'static) -> Nip11Fetch {
+    // These fetches run without a `MarmotApp`, so hand in its proxy policy as its constructors
+    // do; the collector helper builds no client before one is handed in.
+    crate::collector_host_safety::hand_in_http_builder(crate::network_proxy::http_builder);
     let resolve = Arc::new(resolve);
     Nip11Fetch {
         resolver: Arc::new(move |host, _port| {

@@ -458,7 +458,7 @@ async fn missing_diagnostics_executor_keeps_exporters_stopped() {
             }),
             ..RelayTelemetryExportConfig::enabled("https://collector.example/v1/metrics")
         };
-        assert!(config.export_allowed());
+        assert!(transport_nostr::RelayExportGate::export_allowed(&config));
         runtime.shared.configure_relay_telemetry_exporter(config);
         assert!(
             runtime

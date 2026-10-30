@@ -1161,7 +1161,7 @@ async fn maintenance_counts_one_recovery_transition() {
         .create_account("alice")
         .unwrap();
     let mut app = app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
-    app.product_analytics = crate::product_analytics::test_product_collector();
+    app.product_analytics = crate::observability_test_support::test_product_collector();
     let runtime = app.runtime();
     runtime.set_usage_diagnostics_consent(true).unwrap();
     let mut client = app.client("alice").await.unwrap();
@@ -1772,4 +1772,111 @@ async fn assert_managed_worker_retains_activity(late_checkpoint: bool) {
     .expect("quiet worker retry must deliver the one-shot activity");
     assert_eq!(timeline.take_snapshot().messages.len(), baseline + 2);
     runtime.shutdown().await;
+}
+
+/// mdk#2628 3.5a: a Welcome the runtime publishes outside the invite call
+/// reaches the host like one the call sent. Convergence commits an invite that
+/// a settlement window held back, the Welcome it then publishes fails, and the
+/// failure leaves a pending record and one host event. The same Welcome
+/// failing again, as a later pass may report it, is not announced twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn welcome_failed_after_convergence_reaches_the_host_once() {
+    use super::push_token_reshare::Device;
+    const QUIESCENCE_MS: u64 = 2_000;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(QUIESCENCE_MS)
+            .with_dev_scheduled_convergence_delay_ms(0),
+    )
+    .with_test_relay_client(relay.clone());
+    let mut alice = Device::create(&home, &app, "alice").await;
+    let mut bob = Device::create(&home, &app, "bob").await;
+    let carol = Device::create(&home, &app, "carol").await;
+    let group = alice
+        .client
+        .create_group("released welcome", &[&bob.account_id_hex])
+        .await
+        .unwrap();
+    bob.join(&relay, &group).await;
+    // Bob's Commit opens a settlement window on Alice, which holds her invite
+    // back for convergence to commit.
+    bob.client
+        .runtime
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    alice.receive(&relay).await;
+    alice
+        .client
+        .invite_members(&group, &[carol.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert!(
+        alice
+            .client
+            .runtime
+            .has_queued_outbound_intents(&group)
+            .unwrap()
+    );
+
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_NIP59_GIFT_WRAP);
+    tokio::time::sleep(Duration::from_millis(QUIESCENCE_MS + 200)).await;
+    alice.client.retry_group_convergence(&group).await.unwrap();
+    assert!(
+        !alice
+            .client
+            .runtime
+            .has_queued_outbound_intents(&group)
+            .unwrap(),
+        "convergence committed the invite"
+    );
+    let events = alice.client.take_pending_welcome_delivery_events();
+    let [pending] = events.as_slice() else {
+        panic!("one host event for the failed Welcome, got {events:?}");
+    };
+    assert_eq!(pending.group_id_hex, hex::encode(group.as_slice()));
+    assert_eq!(pending.recipient_hex, carol.account_id_hex);
+    let recorded = app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .list_pending_welcome_deliveries()
+        .unwrap();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|record| record.message_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        [pending.message_id_hex.as_str()],
+        "the failure is recorded before any reconcile"
+    );
+
+    let again = marmot_session::AccountDeviceEffects {
+        welcome_failures: vec![marmot_session::WelcomeDeliveryFailure {
+            message_id: cgka_traits::MessageId::new(hex::decode(&pending.message_id_hex).unwrap()),
+            recipient: MemberId::new(hex::decode(&carol.account_id_hex).unwrap()),
+            group_id: Some(group.clone()),
+            reason: "relay refused".to_owned(),
+        }],
+        ..Default::default()
+    };
+    alice
+        .client
+        .finish_maintenance_effects(&again)
+        .await
+        .unwrap();
+    assert!(
+        alice
+            .client
+            .take_pending_welcome_delivery_events()
+            .is_empty(),
+        "a repeated failure is not announced again"
+    );
 }

@@ -31,6 +31,10 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   - `runtime/slot_announcement.rs` — the slot-announcement gate (mdk#2628 3.4): while the host names a device group,
     no KeyPackage reaches this device's slot until this device's own roster entry there names it. Maintenance
     announces first.
+  - `runtime/own_slot.rs` — the own-slot check's runtime half (mdk#2628 3.4): the host hands over publications in this
+    device's slot that it did not make. `slot_publication_superseded` is the one test of whether a publication of this
+    device's own still stands there; every step that stages, publishes, resends or republishes asks it. One dated past
+    the skew window is deleted by id (D63) and never outranked, so it never holds back a refresh.
   - `runtime/device_roster.rs` — this device's reads and writes of its device group's roster: its slot, the merged
     roster, the gate its roster commits wait behind (not stable, held, quarantined, settling, or a change of this
     device's still queued or unconfirmed), and the sends. The runtime's roster-writing steps use these rather than
@@ -61,7 +65,8 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     that no attempt record (stored fanout or detached startup retry) holds, so one whose publish stored nothing (no
     route) or whose fanout expired goes out again on the next pass, as the startup pass would send it.
     Whichever attempt meets a Welcome's acknowledgement policy marks it delivered, maintenance's retry of its stored
-    fanout included.
+    fanout included. A host that names Welcomes by id (the app's invite drive) publishes them through
+    `deliver_owed_welcomes_with_audit_context`, which sends only those the engine says are owed now.
   - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b). The request
     and hand-off checks read device tags through `member_device_tag_claim`.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
