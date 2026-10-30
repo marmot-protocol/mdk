@@ -36,7 +36,6 @@ use storage_sqlite::{PreparedGroupImageUploadRecord, PreparedGroupImageUploadSta
 use transport_nostr_peeler::MarmotNostrSigner;
 use zeroize::Zeroizing;
 
-use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{
     GroupConfirmationProjection, accept_disposition_from_effects, add_group,
     fail_if_publish_failed, publish_failure_error, send_summary_from_effects,
@@ -63,8 +62,10 @@ use crate::{
     AppTransportRouting, CanonicalCreatedGroup, GroupInviteDeclineResult, MarmotApp,
     MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
-    SelfMembership, SendSummary, observer::PerformanceRecorder, unix_now_seconds,
+    SelfMembership, SendSummary, unix_now_seconds,
 };
+use marmot_observability::app_telemetry::AppPerformanceOperation;
+use marmot_observability::observer::PerformanceRecorder;
 
 mod audit;
 mod audit_recovery;
@@ -180,10 +181,7 @@ pub(crate) enum UnpublishedWelcomeKind {
     },
     /// The invite's Welcomes by id. The engine holds their bytes; the drive
     /// asks the runtime to publish those still owed.
-    Invite {
-        welcome_ids: Vec<MessageId>,
-        welcome_intents: Vec<String>,
-    },
+    Invite { welcome_ids: Vec<MessageId> },
 }
 
 pub(crate) struct UnpublishedWelcomeDelivery {
@@ -805,6 +803,11 @@ pub struct AppClient {
     /// When this device next checks its account's KeyPackages for new
     /// sign-ins (mdk#2628 3.2).
     pub(crate) sign_in_schedule: sign_ins::SignInSchedule,
+    /// The unrecognized sign-ins may have changed since hosts last heard: a
+    /// check that found something new, an answer, a roster change, or an
+    /// open. The same seams as `linked_devices_changed` drain it into one
+    /// `UnrecognizedSignInsChanged`.
+    pub(crate) unrecognized_sign_ins_changed: bool,
     /// Linking a new device may have changed as hosts would read it, or the
     /// client just opened, ending any link in progress. The same seams drain
     /// it into one `DeviceLinkChanged`.
@@ -1335,32 +1338,28 @@ impl AppClient {
     }
 
     pub async fn publish_key_package(&mut self) -> Result<KeyPackage, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::KeyPackage,
             "publish",
             crate::ProductUnit::Action,
         );
-        let product_result = Box::pin(self.publish_key_package_unobserved()).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
-
-    async fn publish_key_package_unobserved(&mut self) -> Result<KeyPackage, AppError> {
-        self.app
-            .ensure_local_account_relay_lists(&self.state.label)
-            .await?;
-        self.refresh_routing()?;
-        // Floored at the rebuild cursor like every other activation, and reused
-        // when it matches the live one. An unfloored activation would replay
-        // every held event on every route and leave a lag's loss unbounded.
-        self.prepare_transport().await?;
-        self.publish_key_package_from_lifecycle().await
+        let work = async move {
+            self.app
+                .ensure_local_account_relay_lists(&self.state.label)
+                .await?;
+            self.refresh_routing()?;
+            // Floored at the rebuild cursor like every other activation, and reused
+            // when it matches the live one. An unfloored activation would replay
+            // every held event on every route and leave a lag's loss unbounded.
+            self.prepare_transport().await?;
+            self.publish_key_package_from_lifecycle().await
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
+            .await
     }
 
     /// Publish the exact lifecycle-owned KeyPackage authorized by the durable
@@ -1454,7 +1453,7 @@ impl AppClient {
         if !self
             .maintenance_observation_generation
             .as_ref()
-            .is_some_and(crate::observer::permit_valid)
+            .is_some_and(marmot_observability::observer::permit_valid)
         {
             previous = Default::default();
         }
@@ -1467,7 +1466,7 @@ impl AppClient {
                 "self_update",
                 crate::ProductUnit::Attempt,
             )
-            .map(crate::observer::ProductOperation::counts_only);
+            .map(marmot_observability::observer::ProductOperation::counts_only);
         let key_package_observation = self
             .app
             .product_analytics
@@ -1476,13 +1475,14 @@ impl AppClient {
                 "key_package",
                 crate::ProductUnit::Attempt,
             )
-            .map(crate::observer::ProductOperation::counts_only);
+            .map(marmot_observability::observer::ProductOperation::counts_only);
         let sweep = self.app.product_analytics.begin(
             crate::ProductFamily::Maintenance,
             "sweep",
             crate::ProductUnit::Attempt,
         );
         self.drive_sign_ins().await;
+        self.device_rename_upkeep().await;
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;
@@ -1571,13 +1571,13 @@ impl AppClient {
                 "retire",
                 crate::ProductUnit::Transition,
             )
-            .map(crate::observer::ProductOperation::counts_only)
+            .map(marmot_observability::observer::ProductOperation::counts_only)
         {
             // Use the sweep's generation, not a grant made while it was awaiting I/O.
             if self
                 .maintenance_observation_generation
                 .as_ref()
-                .is_some_and(crate::observer::permit_valid)
+                .is_some_and(marmot_observability::observer::permit_valid)
             {
                 observation.count(
                     "success",
@@ -1915,33 +1915,29 @@ impl AppClient {
     }
 
     pub async fn rotate_key_package(&mut self) -> Result<KeyPackage, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::KeyPackage,
             "rotate",
             crate::ProductUnit::Action,
         );
-        let product_result = Box::pin(self.rotate_key_package_unobserved()).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
-
-    async fn rotate_key_package_unobserved(&mut self) -> Result<KeyPackage, AppError> {
-        self.app
-            .ensure_local_account_relay_lists(&self.state.label)
-            .await?;
-        self.refresh_routing()?;
-        // Floored like publish_key_package's activation; never a full replay.
-        self.prepare_transport().await?;
-        // SQLCipher lifecycle state is authoritative. On first rollout the
-        // publisher imports only the legacy JSON `d` slot, then performs the
-        // recorded upgrade replacement under that same slot.
-        self.publish_fresh_key_package_announced().await
+        let work = async move {
+            self.app
+                .ensure_local_account_relay_lists(&self.state.label)
+                .await?;
+            self.refresh_routing()?;
+            // Floored like publish_key_package's activation; never a full replay.
+            self.prepare_transport().await?;
+            // SQLCipher lifecycle state is authoritative. On first rollout the
+            // publisher imports only the legacy JSON `d` slot, then performs the
+            // recorded upgrade replacement under that same slot.
+            self.publish_fresh_key_package_announced().await
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
+            .await
     }
 
     /// Ask the relays to stop serving this device's KeyPackage slot before it
@@ -2822,7 +2818,7 @@ impl AppClient {
     /// `AccountGroupReadSnapshot`, mdk#1161).
     pub(crate) fn group_read_snapshot_with_stage_telemetry(
         &self,
-        telemetry: &crate::observer::PerformanceRecorder,
+        telemetry: &marmot_observability::observer::PerformanceRecorder,
     ) -> Result<GroupReadSnapshot, AppError> {
         self.group_read_snapshot_inner(Some(telemetry))
     }
@@ -2833,7 +2829,7 @@ impl AppClient {
 
     fn group_read_snapshot_inner(
         &self,
-        telemetry: Option<&crate::observer::PerformanceRecorder>,
+        telemetry: Option<&marmot_observability::observer::PerformanceRecorder>,
     ) -> Result<GroupReadSnapshot, AppError> {
         if cfg!(feature = "test-policy-overrides")
             && self.app.config.dev_force_group_read_snapshot_failure
@@ -2850,7 +2846,7 @@ impl AppClient {
         let profiles = self.app.profiles_by_id();
         if let Some(telemetry) = telemetry {
             telemetry.record(
-                crate::app_telemetry::AppPerformanceOperation::AccountProfileLoad,
+                marmot_observability::app_telemetry::AppPerformanceOperation::AccountProfileLoad,
                 profile_load_started.elapsed(),
                 profiles.is_ok(),
             );
@@ -2908,27 +2904,15 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<bool, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Recovery,
             "hydration",
             crate::ProductUnit::Action,
         );
-        let product_result = self.retry_hydrate_quarantined_group_unobserved(group_id);
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
-
-    fn retry_hydrate_quarantined_group_unobserved(
-        &mut self,
-        group_id: &GroupId,
-    ) -> Result<bool, AppError> {
-        Ok(self.runtime.retry_hydrate_quarantined_group(group_id)?)
+        let work = || -> Result<bool, AppError> {
+            Ok(self.runtime.retry_hydrate_quarantined_group(group_id)?)
+        };
+        observed.run(work, marmot_observability::observer::success_or_failure)
     }
 
     pub fn safe_export_secret(
@@ -3157,58 +3141,14 @@ impl AppClient {
             }
             _ => None,
         };
-        // The invite is staged locally but not canonical yet. Record every
-        // Welcome destination atomically before exposing the commit; if that
-        // persistence fails, roll back the staged MLS change and return the
-        // original error so a retry cannot create phantom local membership.
-        let welcome_intent_result = if cfg!(feature = "test-policy-overrides")
-            && self.app.config.dev_fail_invite_welcome_intent
-        {
-            Err(AppError::Publish(
-                "injected invite welcome intent failure".into(),
-            ))
-        } else {
-            self.record_welcome_delivery_intents(group_id, prepared.welcomes())
-        };
-        let welcome_intents = match welcome_intent_result {
-            Ok(welcome_intents) => welcome_intents,
-            Err(error) => {
-                if let Some(snapshot) = push_snapshot {
-                    self.restore_push_snapshot_owed(snapshot);
-                }
-                let rollback = self
-                    .runtime
-                    .rollback_prepared_session_commit(prepared)
-                    .await
-                    .map_err(AppError::from);
-                record_app_performance(
-                    telemetry,
-                    AppPerformanceOperation::GroupInviteEnginePublish,
-                    engine_publish_started_at.elapsed(),
-                    false,
-                );
-                rollback?;
-                self.refresh_group(group_id);
-                if let Err(refresh_error) =
-                    self.save_state_with_pending_local_group_deletion_frontier_clears()
-                {
-                    tracing::warn!(
-                        target: "marmot_app::client",
-                        method = "invite_members_intent_failure_rollback",
-                        error_kind = refresh_error.privacy_safe_kind(),
-                        "rolled back staged invite but could not persist the refreshed app projection"
-                    );
-                }
-                return Err(error);
-            }
-        };
+        // The engine staged each Welcome with the commit, so its destination
+        // is durable before the commit is exposed; the app keeps only ids.
         let (session_effects, welcomes) = prepared.into_effects_and_welcomes();
         self.unpublished_welcome_delivery = Some(UnpublishedWelcomeDelivery {
             group_id: group_id.clone(),
             audit_context: audit_context.clone(),
             kind: UnpublishedWelcomeKind::Invite {
                 welcome_ids: welcomes.into_iter().map(|welcome| welcome.id).collect(),
-                welcome_intents,
             },
         });
 
@@ -3314,100 +3254,86 @@ impl AppClient {
         group_id: &GroupId,
         member_refs: &[&str],
     ) -> Result<SendSummary, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             "remove_members",
             crate::ProductUnit::Action,
         );
-        let product_result = Box::pin(self.remove_members_unobserved(group_id, member_refs)).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
+        let work = async move {
+            self.ensure_group(group_id)?;
+            self.ensure_group_change_admitted(group_id)?;
+            let mut members = Vec::with_capacity(member_refs.len());
+            for member in member_refs {
+                members.push(self.app.member_id(member)?);
+            }
+            let audit_context = Self::local_human_action_context(
+                "remove_members",
+                vec!["members"],
+                Vec::new(),
+                Some(member_refs.len() as u64),
+            );
+            let target_hexes = members
+                .iter()
+                .map(|member| hex::encode(member.as_slice()))
+                .collect::<Vec<_>>();
 
-    async fn remove_members_unobserved(
-        &mut self,
-        group_id: &GroupId,
-        member_refs: &[&str],
-    ) -> Result<SendSummary, AppError> {
-        self.ensure_group(group_id)?;
-        self.ensure_group_change_admitted(group_id)?;
-        let mut members = Vec::with_capacity(member_refs.len());
-        for member in member_refs {
-            members.push(self.app.member_id(member)?);
-        }
-        let audit_context = Self::local_human_action_context(
-            "remove_members",
-            vec!["members"],
-            Vec::new(),
-            Some(member_refs.len() as u64),
-        );
-        let target_hexes = members
-            .iter()
-            .map(|member| hex::encode(member.as_slice()))
-            .collect::<Vec<_>>();
-
-        self.sync_runtime_groups_for_send("remove_members").await?;
-        let wake_snapshot = self.snapshot_group_push_tokens_for_members(group_id, &target_hexes);
-        let effects = self
-            .runtime
-            .send_with_audit_context(
-                SendIntent::RemoveMembers {
-                    group_id: group_id.clone(),
-                    members,
-                },
-                audit_context.clone(),
+            self.sync_runtime_groups_for_send("remove_members").await?;
+            let wake_snapshot =
+                self.snapshot_group_push_tokens_for_members(group_id, &target_hexes);
+            let effects = self
+                .runtime
+                .send_with_audit_context(
+                    SendIntent::RemoveMembers {
+                        group_id: group_id.clone(),
+                        members,
+                    },
+                    audit_context.clone(),
+                )
+                .await?;
+            self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                .await?;
+            self.record_human_action_succeeded(group_id, &audit_context, &effects);
+            self.remember_published_reports(&effects);
+            self.refresh_group(group_id);
+            self.cleanup_stale_push_tokens_best_effort(group_id);
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+            self.publish_targeted_group_state_wake_best_effort(
+                group_id,
+                wake_snapshot,
+                &effects.events,
             )
-            .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
-            .await?;
-        self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
-        self.refresh_group(group_id);
-        self.cleanup_stale_push_tokens_best_effort(group_id);
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.publish_targeted_group_state_wake_best_effort(
-            group_id,
-            wake_snapshot,
-            &effects.events,
-        )
-        .await;
-        Ok(send_summary_from_effects(&effects))
+            .await;
+            Ok(send_summary_from_effects(&effects))
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
+            .await
     }
 
     pub async fn leave_group(&mut self, group_id: &GroupId) -> Result<SendSummary, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             "leave",
             crate::ProductUnit::Action,
         );
-        let product_result = Box::pin(self.leave_group_unobserved(group_id)).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
-
-    async fn leave_group_unobserved(
-        &mut self,
-        group_id: &GroupId,
-    ) -> Result<SendSummary, AppError> {
-        let audit_context = Self::local_human_action_context(
-            "leave_group",
-            vec!["membership"],
-            Vec::new(),
-            Some(1),
-        );
-        self.leave_group_with_audit_context(group_id, audit_context)
+        let work = async move {
+            let audit_context = Self::local_human_action_context(
+                "leave_group",
+                vec!["membership"],
+                Vec::new(),
+                Some(1),
+            );
+            self.leave_group_with_audit_context(group_id, audit_context)
+                .await
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -3510,68 +3436,61 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<AppDisbandRequest, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             "disband",
             crate::ProductUnit::Action,
         );
-        let product_result = Box::pin(self.disband_group_unobserved(group_id)).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
-
-    async fn disband_group_unobserved(
-        &mut self,
-        group_id: &GroupId,
-    ) -> Result<AppDisbandRequest, AppError> {
-        self.ensure_group(group_id)?;
-        self.ensure_group_change_admitted(group_id)?;
-        let audit_context = Self::local_human_action_context(
-            "disband_group",
-            vec!["lifecycle", "membership", "admins"],
-            vec![
-                cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID,
-                cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID,
-            ],
-            None,
-        );
-        self.sync_runtime_groups_for_send("disband_group").await?;
-        let effects = self
-            .runtime
-            .send_with_audit_context(
-                SendIntent::Disband {
-                    group_id: group_id.clone(),
-                },
-                audit_context,
-            )
-            .await?;
-        self.remember_published_reports(&effects);
-        if let Err(error) = self
-            .app
-            .delete_message_draft(&self.state.label, &hex::encode(group_id.as_slice()))
-        {
-            // The irreversible engine request is already durable. Treat draft
-            // cleanup like the other repairable post-canonical projections:
-            // report success for the request and reconcile local UI state on
-            // the next account mutation/open rather than inviting a retry.
-            tracing::warn!(
-                target: "marmot_app::client",
-                method = "disband_group",
-                error_kind = error.privacy_safe_kind(),
-                "durable disband request outpaced composer draft cleanup"
+        let work = async move {
+            self.ensure_group(group_id)?;
+            self.ensure_group_change_admitted(group_id)?;
+            let audit_context = Self::local_human_action_context(
+                "disband_group",
+                vec!["lifecycle", "membership", "admins"],
+                vec![
+                    cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID,
+                    cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID,
+                ],
+                None,
             );
-        }
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.runtime
-            .disband_request(group_id)?
-            .map(Into::into)
-            .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
+            self.sync_runtime_groups_for_send("disband_group").await?;
+            let effects = self
+                .runtime
+                .send_with_audit_context(
+                    SendIntent::Disband {
+                        group_id: group_id.clone(),
+                    },
+                    audit_context,
+                )
+                .await?;
+            self.remember_published_reports(&effects);
+            if let Err(error) = self
+                .app
+                .delete_message_draft(&self.state.label, &hex::encode(group_id.as_slice()))
+            {
+                // The irreversible engine request is already durable. Treat draft
+                // cleanup like the other repairable post-canonical projections:
+                // report success for the request and reconcile local UI state on
+                // the next account mutation/open rather than inviting a retry.
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "disband_group",
+                    error_kind = error.privacy_safe_kind(),
+                    "durable disband request outpaced composer draft cleanup"
+                );
+            }
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+            self.runtime
+                .disband_request(group_id)?
+                .map(Into::into)
+                .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
+            .await
     }
 
     pub fn acknowledge_disband_failure(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
@@ -3665,97 +3584,93 @@ impl AppClient {
     /// restored without restoring the projection. The durable deletion frontier
     /// filters historical replay until a strictly newer app message arrives.
     pub async fn delete_group_local(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             "delete",
             crate::ProductUnit::Action,
         );
-        let product_result = Box::pin(self.delete_group_local_unobserved(group_id)).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
-
-    async fn delete_group_local_unobserved(
-        &mut self,
-        group_id: &GroupId,
-    ) -> Result<bool, AppError> {
-        if self.runtime.disbanding_in_progress(group_id)? {
-            return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
-        }
-        // A local wipe removes this group's transport route. Any already-durable
-        // removal must publish first; retaining it after the route disappears
-        // would preserve bytes on disk without preserving liveness.
-        self.drain_existing_push_registration_removals_for_group(group_id)
-            .await?;
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let original_groups = self.state.groups.clone();
-        let original_routing = self.routing.snapshot();
-        let was_live = original_groups
-            .iter()
-            .any(|group| group.group_id_hex == group_id_hex);
-
-        if was_live {
-            self.state
-                .groups
-                .retain(|group| group.group_id_hex != group_id_hex);
-            if let Err(error) = self.refresh_routing() {
-                self.restore_local_group_after_failed_delete(
-                    original_groups,
-                    original_routing.clone(),
-                    false,
-                )
-                .await;
-                return Err(error);
+        let work = async move {
+            if self.runtime.disbanding_in_progress(group_id)? {
+                return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
             }
-            if let Err(error) = self.sync_runtime_groups().await {
-                self.restore_local_group_after_failed_delete(
-                    original_groups,
-                    original_routing.clone(),
-                    true,
-                )
-                .await;
-                return Err(error);
-            }
-        }
+            // A local wipe removes this group's transport route. Any already-durable
+            // removal must publish first; retaining it after the route disappears
+            // would preserve bytes on disk without preserving liveness.
+            self.drain_existing_push_registration_removals_for_group(group_id)
+                .await?;
+            let group_id_hex = hex::encode(group_id.as_slice());
+            let original_groups = self.state.groups.clone();
+            let original_routing = self.routing.snapshot();
+            let was_live = original_groups
+                .iter()
+                .any(|group| group.group_id_hex == group_id_hex);
 
-        let result = match self
-            .app
-            .delete_group_local_data(&self.state.label, &group_id_hex)
-        {
-            Ok(result) => result,
-            Err(error) => {
-                if was_live {
+            if was_live {
+                self.state
+                    .groups
+                    .retain(|group| group.group_id_hex != group_id_hex);
+                if let Err(error) = self.refresh_routing() {
                     self.restore_local_group_after_failed_delete(
                         original_groups,
-                        original_routing,
+                        original_routing.clone(),
+                        false,
+                    )
+                    .await;
+                    return Err(error);
+                }
+                if let Err(error) = self.sync_runtime_groups().await {
+                    self.restore_local_group_after_failed_delete(
+                        original_groups,
+                        original_routing.clone(),
                         true,
                     )
                     .await;
+                    return Err(error);
                 }
-                return Err(error);
             }
-        };
-        // A committed deletion supersedes every previously admitted projection
-        // for this group, including a cached decision to cross an older frontier.
-        self.forget_pending_effect_projections(group_id);
-        self.pending_group_projection_updates.remove(&group_id_hex);
-        self.pending_local_group_deletion_frontier_clears
-            .remove(&group_id_hex);
-        self.pending_projection_updates
-            .retain(|update| update.group_id_hex != group_id_hex);
-        if was_live {
-            // The wipe has committed. Route restoration is a best-effort
-            // post-success step: a transient adapter failure must not report
-            // the durable delete as failed. Startup reconciliation retries it.
-            match self.ensure_local_deleted_group_route(group_id) {
-                Ok(true) => {
-                    if let Err(error) = self.sync_runtime_groups().await {
+
+            let result = match self
+                .app
+                .delete_group_local_data(&self.state.label, &group_id_hex)
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    if was_live {
+                        self.restore_local_group_after_failed_delete(
+                            original_groups,
+                            original_routing,
+                            true,
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            };
+            // A committed deletion supersedes every previously admitted projection
+            // for this group, including a cached decision to cross an older frontier.
+            self.forget_pending_effect_projections(group_id);
+            self.pending_group_projection_updates.remove(&group_id_hex);
+            self.pending_local_group_deletion_frontier_clears
+                .remove(&group_id_hex);
+            self.pending_projection_updates
+                .retain(|update| update.group_id_hex != group_id_hex);
+            if was_live {
+                // The wipe has committed. Route restoration is a best-effort
+                // post-success step: a transient adapter failure must not report
+                // the durable delete as failed. Startup reconciliation retries it.
+                match self.ensure_local_deleted_group_route(group_id) {
+                    Ok(true) => {
+                        if let Err(error) = self.sync_runtime_groups().await {
+                            tracing::warn!(
+                                target: "marmot_app::client",
+                                method = "delete_group_local",
+                                error_kind = error.privacy_safe_kind(),
+                                "local-delete route restoration remains pending",
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
                         tracing::warn!(
                             target: "marmot_app::client",
                             method = "delete_group_local",
@@ -3764,18 +3679,15 @@ impl AppClient {
                         );
                     }
                 }
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        target: "marmot_app::client",
-                        method = "delete_group_local",
-                        error_kind = error.privacy_safe_kind(),
-                        "local-delete route restoration remains pending",
-                    );
-                }
             }
-        }
-        Ok(was_live || result)
+            Ok(was_live || result)
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
+            .await
     }
 
     async fn restore_local_group_after_failed_delete(
@@ -4076,37 +3988,30 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<GroupInviteDeclineResult, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             "decline_invite",
             crate::ProductUnit::Action,
         );
-        let product_result = Box::pin(self.decline_group_invite_unobserved(group_id)).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
-
-    async fn decline_group_invite_unobserved(
-        &mut self,
-        group_id: &GroupId,
-    ) -> Result<GroupInviteDeclineResult, AppError> {
-        let audit_context = Self::local_human_action_context(
-            "decline_group_invite",
-            vec!["membership"],
-            Vec::new(),
-            Some(1),
-        );
-        let summary = self
-            .leave_group_with_audit_context(group_id, audit_context)
-            .await?;
-        let group = self.set_group_invite_confirmation(group_id, false, true)?;
-        Ok(GroupInviteDeclineResult { group, summary })
+        let work = async move {
+            let audit_context = Self::local_human_action_context(
+                "decline_group_invite",
+                vec!["membership"],
+                Vec::new(),
+                Some(1),
+            );
+            let summary = self
+                .leave_group_with_audit_context(group_id, audit_context)
+                .await?;
+            let group = self.set_group_invite_confirmation(group_id, false, true)?;
+            Ok(GroupInviteDeclineResult { group, summary })
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
+            .await
     }
 
     pub async fn promote_admin(
@@ -4114,39 +4019,31 @@ impl AppClient {
         group_id: &GroupId,
         member_ref: &str,
     ) -> Result<SendSummary, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             "promote_admin",
             crate::ProductUnit::Action,
         );
-        let product_result = Box::pin(self.promote_admin_unobserved(group_id, member_ref)).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
-
-    async fn promote_admin_unobserved(
-        &mut self,
-        group_id: &GroupId,
-        member_ref: &str,
-    ) -> Result<SendSummary, AppError> {
-        self.ensure_group(group_id)?;
-        let member_id = self.app.member_id(member_ref)?;
-        let mut admins = self.runtime.admin_pubkeys(group_id)?;
-        admins.push(admin_pubkey_from_member_id(&member_id)?);
-        let audit_context = Self::local_human_action_context(
-            "promote_admin",
-            vec!["admins"],
-            vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
-            Some(1),
-        );
-        let target_hex = hex::encode(member_id.as_slice());
-        self.update_admin_policy(group_id, admins, audit_context, &[target_hex])
+        let work = async move {
+            self.ensure_group(group_id)?;
+            let member_id = self.app.member_id(member_ref)?;
+            let mut admins = self.runtime.admin_pubkeys(group_id)?;
+            admins.push(admin_pubkey_from_member_id(&member_id)?);
+            let audit_context = Self::local_human_action_context(
+                "promote_admin",
+                vec!["admins"],
+                vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
+                Some(1),
+            );
+            let target_hex = hex::encode(member_id.as_slice());
+            self.update_admin_policy(group_id, admins, audit_context, &[target_hex])
+                .await
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -4155,82 +4052,67 @@ impl AppClient {
         group_id: &GroupId,
         member_ref: &str,
     ) -> Result<SendSummary, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             "demote_admin",
             crate::ProductUnit::Action,
         );
-        let product_result = Box::pin(self.demote_admin_unobserved(group_id, member_ref)).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
-
-    async fn demote_admin_unobserved(
-        &mut self,
-        group_id: &GroupId,
-        member_ref: &str,
-    ) -> Result<SendSummary, AppError> {
-        self.ensure_group(group_id)?;
-        let member_id = self.app.member_id(member_ref)?;
-        let target = admin_pubkey_from_member_id(&member_id)?;
-        let mut admins = self.runtime.admin_pubkeys(group_id)?;
-        admins.retain(|admin| admin != &target);
-        let audit_context = Self::local_human_action_context(
-            "demote_admin",
-            vec!["admins"],
-            vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
-            Some(1),
-        );
-        let target_hex = hex::encode(member_id.as_slice());
-        self.update_admin_policy(group_id, admins, audit_context, &[target_hex])
+        let work = async move {
+            self.ensure_group(group_id)?;
+            let member_id = self.app.member_id(member_ref)?;
+            let target = admin_pubkey_from_member_id(&member_id)?;
+            let mut admins = self.runtime.admin_pubkeys(group_id)?;
+            admins.retain(|admin| admin != &target);
+            let audit_context = Self::local_human_action_context(
+                "demote_admin",
+                vec!["admins"],
+                vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
+                Some(1),
+            );
+            let target_hex = hex::encode(member_id.as_slice());
+            self.update_admin_policy(group_id, admins, audit_context, &[target_hex])
+                .await
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
     pub async fn self_demote_admin(&mut self, group_id: &GroupId) -> Result<SendSummary, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             "demote_admin",
             crate::ProductUnit::Action,
         );
-        let product_result = Box::pin(self.self_demote_admin_unobserved(group_id)).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
-
-    async fn self_demote_admin_unobserved(
-        &mut self,
-        group_id: &GroupId,
-    ) -> Result<SendSummary, AppError> {
-        self.ensure_group(group_id)?;
-        let account = self.app.account_home().account(&self.state.label)?;
-        let local = admin_pubkey_from_account_id_hex(&account.account_id_hex)?;
-        let mut admins = self.runtime.admin_pubkeys(group_id)?;
-        admins.retain(|admin| admin != &local);
-        let audit_context = Self::local_human_action_context(
-            "self_demote_admin",
-            vec!["admins"],
-            vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
-            Some(1),
-        );
-        self.update_admin_policy(
-            group_id,
-            admins,
-            audit_context,
-            std::slice::from_ref(&account.account_id_hex),
-        )
-        .await
+        let work = async move {
+            self.ensure_group(group_id)?;
+            let account = self.app.account_home().account(&self.state.label)?;
+            let local = admin_pubkey_from_account_id_hex(&account.account_id_hex)?;
+            let mut admins = self.runtime.admin_pubkeys(group_id)?;
+            admins.retain(|admin| admin != &local);
+            let audit_context = Self::local_human_action_context(
+                "self_demote_admin",
+                vec!["admins"],
+                vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
+                Some(1),
+            );
+            self.update_admin_policy(
+                group_id,
+                admins,
+                audit_context,
+                std::slice::from_ref(&account.account_id_hex),
+            )
+            .await
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
+            .await
     }
 
     async fn update_admin_policy(
@@ -4341,60 +4223,50 @@ impl AppClient {
         group_id: &GroupId,
         disappearing_message_secs: u64,
     ) -> Result<SendSummary, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             "retention",
             crate::ProductUnit::Action,
         );
-        let product_result =
-            Box::pin(self.update_message_retention_unobserved(group_id, disappearing_message_secs))
-                .await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
+        let work = async move {
+            self.ensure_group(group_id)?;
+            self.ensure_group_change_admitted(group_id)?;
+            let component = AppGroupMessageRetentionComponent::new(disappearing_message_secs)
+                .to_app_component_data()?;
+            let audit_context = Self::local_human_action_context(
+                "update_message_retention",
+                vec!["message_retention"],
+                vec![GROUP_MESSAGE_RETENTION_COMPONENT_ID],
+                None,
+            );
 
-    async fn update_message_retention_unobserved(
-        &mut self,
-        group_id: &GroupId,
-        disappearing_message_secs: u64,
-    ) -> Result<SendSummary, AppError> {
-        self.ensure_group(group_id)?;
-        self.ensure_group_change_admitted(group_id)?;
-        let component = AppGroupMessageRetentionComponent::new(disappearing_message_secs)
-            .to_app_component_data()?;
-        let audit_context = Self::local_human_action_context(
-            "update_message_retention",
-            vec!["message_retention"],
-            vec![GROUP_MESSAGE_RETENTION_COMPONENT_ID],
-            None,
-        );
-
-        self.sync_runtime_groups_for_send("update_message_retention")
-            .await?;
-        let effects = self
-            .runtime
-            .send_with_audit_context(
-                SendIntent::UpdateAppComponents {
-                    group_id: group_id.clone(),
-                    updates: vec![component],
-                },
-                audit_context.clone(),
+            self.sync_runtime_groups_for_send("update_message_retention")
+                .await?;
+            let effects = self
+                .runtime
+                .send_with_audit_context(
+                    SendIntent::UpdateAppComponents {
+                        group_id: group_id.clone(),
+                        updates: vec![component],
+                    },
+                    audit_context.clone(),
+                )
+                .await?;
+            self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                .await?;
+            self.record_human_action_succeeded(group_id, &audit_context, &effects);
+            self.remember_published_reports(&effects);
+            self.refresh_group(group_id);
+            self.prune_plaintext_retention_for_group(group_id)?;
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+            Ok(send_summary_from_effects(&effects))
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
             )
-            .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
-            .await?;
-        self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
-        self.refresh_group(group_id);
-        self.prune_plaintext_retention_for_group(group_id)?;
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        Ok(send_summary_from_effects(&effects))
+            .await
     }
 
     pub async fn replace_encrypted_media_blob_endpoints(
@@ -4588,73 +4460,6 @@ impl AppClient {
             .await
     }
 
-    async fn send_app_event_with_context<F>(
-        &mut self,
-        group_id: &GroupId,
-        intent: AppMessageIntent,
-        on_local_projection: F,
-        draft: Option<(crate::MessageDraftRevision, Option<String>)>,
-        prepared: Option<(MarmotInnerEvent, Vec<u8>)>,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
-    where
-        F: FnMut(crate::AppProjectionUpdate),
-    {
-        use crate::{ProductFamily as Family, ProductUnit};
-        let (family, operation) = match &intent {
-            AppMessageIntent::Report { .. } | AppMessageIntent::DismissReports { .. } => {
-                (Family::MessageAction, "custom")
-            }
-            AppMessageIntent::Chat { .. }
-            | AppMessageIntent::TaggedChat { .. }
-            | AppMessageIntent::Sticker { .. } => (Family::MessageAction, "text"),
-            AppMessageIntent::Reply { .. } => (Family::MessageAction, "reply"),
-            AppMessageIntent::Reaction { .. } => (Family::MessageAction, "reaction"),
-            AppMessageIntent::Unreact { .. } | AppMessageIntent::DeleteReactions { .. } => {
-                (Family::MessageAction, "unreact")
-            }
-            AppMessageIntent::Edit { .. } => (Family::MessageAction, "edit"),
-            AppMessageIntent::Poll { .. } => (Family::MessageAction, "poll"),
-            AppMessageIntent::PollResponse { .. } => (Family::MessageAction, "poll_response"),
-            AppMessageIntent::Delete { .. } | AppMessageIntent::RemoveMessage { .. } => {
-                (Family::MessageAction, "delete")
-            }
-            AppMessageIntent::Media { .. } => (Family::MessageAction, "media"),
-            AppMessageIntent::PushTokenUpdate { .. } | AppMessageIntent::PushTokenList { .. } => {
-                (Family::Notification, "update")
-            }
-            AppMessageIntent::PushTokenRemoval { .. } => (Family::Notification, "remove"),
-            AppMessageIntent::StreamStart { .. } => (Family::Stream, "start"),
-            AppMessageIntent::StreamFinal { .. } => (Family::Stream, "finalize"),
-            AppMessageIntent::AgentActivity { .. }
-            | AppMessageIntent::AgentOperation { .. }
-            | AppMessageIntent::GroupSystem { .. }
-            | AppMessageIntent::Custom { .. } => (Family::MessageAction, "custom"),
-        };
-        let observation = self
-            .app
-            .product_analytics
-            .begin(family, operation, ProductUnit::Action);
-        let result = Box::pin(self.send_app_event_with_local_projection_unobserved(
-            group_id,
-            intent,
-            on_local_projection,
-            draft,
-            prepared,
-        ))
-        .await;
-        if let Some(observation) = observation {
-            observation.finish(match &result {
-                Ok((_, summary)) => match summary.accept_disposition {
-                    cgka_traits::SendAcceptDisposition::Published => "confirmed",
-                    cgka_traits::SendAcceptDisposition::AcceptedPending => "pending",
-                    cgka_traits::SendAcceptDisposition::CompletionUnknown => "unknown",
-                },
-                Err(_) => "rejected",
-            });
-        }
-        result
-    }
-
     pub(crate) async fn publish_local_submission<F>(
         &mut self,
         submission: &storage_sqlite::LocalSubmission,
@@ -4742,7 +4547,7 @@ impl AppClient {
         validate_stamped_poll_response(&poll_event, response_created_at, option_ids)
     }
 
-    async fn send_app_event_with_local_projection_unobserved<F>(
+    async fn send_app_event_with_context<F>(
         &mut self,
         group_id: &GroupId,
         intent: AppMessageIntent,
@@ -4753,391 +4558,439 @@ impl AppClient {
     where
         F: FnMut(crate::AppProjectionUpdate),
     {
-        self.ensure_group_application_messages_allowed(group_id)?;
-        if let AppMessageIntent::Sticker { sticker_ref } = &intent {
-            self.app
-                .authorize_sticker_ref(&self.state.label, sticker_ref)?;
-        }
-        // Capture the human-action descriptor before `Unreact` is rewritten to
-        // `DeleteReactions` below, so the audit log records the user's actual
-        // intent.
-        let mut audit_context = Self::message_human_action_context(&intent);
-        let sender = self
+        use crate::{ProductFamily as Family, ProductUnit};
+        let (family, operation) = match &intent {
+            AppMessageIntent::Report { .. } | AppMessageIntent::DismissReports { .. } => {
+                (Family::MessageAction, "custom")
+            }
+            AppMessageIntent::Chat { .. }
+            | AppMessageIntent::TaggedChat { .. }
+            | AppMessageIntent::Sticker { .. } => (Family::MessageAction, "text"),
+            AppMessageIntent::Reply { .. } => (Family::MessageAction, "reply"),
+            AppMessageIntent::Reaction { .. } => (Family::MessageAction, "reaction"),
+            AppMessageIntent::Unreact { .. } | AppMessageIntent::DeleteReactions { .. } => {
+                (Family::MessageAction, "unreact")
+            }
+            AppMessageIntent::Edit { .. } => (Family::MessageAction, "edit"),
+            AppMessageIntent::Poll { .. } => (Family::MessageAction, "poll"),
+            AppMessageIntent::PollResponse { .. } => (Family::MessageAction, "poll_response"),
+            AppMessageIntent::Delete { .. } | AppMessageIntent::RemoveMessage { .. } => {
+                (Family::MessageAction, "delete")
+            }
+            AppMessageIntent::Media { .. } => (Family::MessageAction, "media"),
+            AppMessageIntent::PushTokenUpdate { .. } | AppMessageIntent::PushTokenList { .. } => {
+                (Family::Notification, "update")
+            }
+            AppMessageIntent::PushTokenRemoval { .. } => (Family::Notification, "remove"),
+            AppMessageIntent::StreamStart { .. } => (Family::Stream, "start"),
+            AppMessageIntent::StreamFinal { .. } => (Family::Stream, "finalize"),
+            AppMessageIntent::AgentActivity { .. }
+            | AppMessageIntent::AgentOperation { .. }
+            | AppMessageIntent::GroupSystem { .. }
+            | AppMessageIntent::Custom { .. } => (Family::MessageAction, "custom"),
+        };
+        let observed = self
             .app
-            .account_home()
-            .account(&self.state.label)?
-            .account_id_hex;
-        // NIP-25 has no native un-react: kind-7 reactions are retracted with a
-        // kind-5 delete. Resolve every matching active own reaction from the
-        // projection and place all ids in one tombstone so remove-all is atomic.
-        let intent = match intent {
-            AppMessageIntent::Report {
-                target_message_id,
-                reason,
-                explanation,
-                ..
-            } => {
-                let storage = self.app.account_storage(&self.state.label)?;
-                let group_hex = hex::encode(group_id.as_slice());
-                let author = storage
-                    .app_storage()
-                    .report_target_author(&group_hex, &target_message_id)?
-                    .ok_or_else(|| {
-                        AppError::InvalidAppMessagePayload("report target is unavailable".into())
-                    })?;
+            .product_analytics
+            .observed(family, operation, ProductUnit::Action);
+        let work = async move {
+            self.ensure_group_application_messages_allowed(group_id)?;
+            if let AppMessageIntent::Sticker { sticker_ref } = &intent {
+                self.app
+                    .authorize_sticker_ref(&self.state.label, sticker_ref)?;
+            }
+            // Capture the human-action descriptor before `Unreact` is rewritten to
+            // `DeleteReactions` below, so the audit log records the user's actual
+            // intent.
+            let mut audit_context = Self::message_human_action_context(&intent);
+            let sender = self
+                .app
+                .account_home()
+                .account(&self.state.label)?
+                .account_id_hex;
+            // NIP-25 has no native un-react: kind-7 reactions are retracted with a
+            // kind-5 delete. Resolve every matching active own reaction from the
+            // projection and place all ids in one tombstone so remove-all is atomic.
+            let intent = match intent {
                 AppMessageIntent::Report {
                     target_message_id,
                     reason,
                     explanation,
-                    target_author: Some(author),
-                }
-            }
-            AppMessageIntent::DismissReports { ref report_ids, .. } => {
-                if !self.delete_moderation_grant(group_id, &sender) {
-                    return Err(AppError::InvalidAppMessagePayload(
-                        "group admin authority required".into(),
-                    ));
-                }
-                let storage = self.app.account_storage(&self.state.label)?;
-                for id in report_ids {
-                    if !storage
+                    ..
+                } => {
+                    let storage = self.app.account_storage(&self.state.label)?;
+                    let group_hex = hex::encode(group_id.as_slice());
+                    let author = storage
                         .app_storage()
-                        .report_is_reviewable(&hex::encode(group_id.as_slice()), id)?
-                    {
-                        return Err(AppError::InvalidAppMessagePayload(
-                            "report is unavailable in this group".into(),
-                        ));
+                        .report_target_author(&group_hex, &target_message_id)?
+                        .ok_or_else(|| {
+                            AppError::InvalidAppMessagePayload(
+                                "report target is unavailable".into(),
+                            )
+                        })?;
+                    AppMessageIntent::Report {
+                        target_message_id,
+                        reason,
+                        explanation,
+                        target_author: Some(author),
                     }
                 }
-                intent
-            }
-            // Fail fast on edits recipients would ignore: the target must be an
-            // available chat message by the same author in this device's view
-            // now. Recipients stay authoritative; a delete or convergence change
-            // landing after this check yields a harmlessly ignored edit, so it is
-            // not re-checked later. Retained edits were checked at admission and
-            // keep their stamped identity; re-rejecting them here would erase
-            // their text. `local_publish_failed` is a local delivery state that
-            // recipients never see, and the row can still be published.
-            AppMessageIntent::Edit {
-                ref target_message_id,
-                ..
-            } if prepared.is_none() => {
-                self.app
-                    .account_storage(&self.state.label)?
-                    .app_storage()
-                    .timeline_message(&hex::encode(group_id.as_slice()), target_message_id)?
-                    .filter(|target| {
+                AppMessageIntent::DismissReports { ref report_ids, .. } => {
+                    if !self.delete_moderation_grant(group_id, &sender) {
+                        return Err(AppError::InvalidAppMessagePayload(
+                            "group admin authority required".into(),
+                        ));
+                    }
+                    let storage = self.app.account_storage(&self.state.label)?;
+                    for id in report_ids {
+                        if !storage
+                            .app_storage()
+                            .report_is_reviewable(&hex::encode(group_id.as_slice()), id)?
+                        {
+                            return Err(AppError::InvalidAppMessagePayload(
+                                "report is unavailable in this group".into(),
+                            ));
+                        }
+                    }
+                    intent
+                }
+                // Fail fast on edits recipients would ignore: the target must be an
+                // available chat message by the same author in this device's view
+                // now. Recipients stay authoritative; a delete or convergence change
+                // landing after this check yields a harmlessly ignored edit, so it is
+                // not re-checked later. Retained edits were checked at admission and
+                // keep their stamped identity; re-rejecting them here would erase
+                // their text. `local_publish_failed` is a local delivery state that
+                // recipients never see, and the row can still be published.
+                AppMessageIntent::Edit {
+                    ref target_message_id,
+                    ..
+                } if prepared.is_none() => {
+                    self.app
+                        .account_storage(&self.state.label)?
+                        .app_storage()
+                        .timeline_message(&hex::encode(group_id.as_slice()), target_message_id)?
+                        .filter(|target| {
+                            target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+                                && target.sender == sender
+                                && !target.deleted
+                                // A failed local publish is retried; recipients
+                                // resolve the edit once the original arrives.
+                                && target.invalidation_status.as_deref().is_none_or(|status| {
+                                    status == crate::LOCAL_PUBLISH_FAILED_REASON
+                                })
+                        })
+                        .ok_or(AppError::InvalidEditTarget)?;
+                    intent
+                }
+                AppMessageIntent::Delete { target_message_id } => {
+                    let storage = self.app.account_storage(&self.state.label)?.app_storage();
+                    let target = storage
+                        .app_message(&hex::encode(group_id.as_slice()), &target_message_id)?;
+                    if target.as_ref().is_some_and(|target| {
                         target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
-                            && target.sender == sender
-                            && !target.deleted
-                            // A failed local publish is retried; recipients
-                            // resolve the edit once the original arrives.
-                            && target.invalidation_status.as_deref().is_none_or(|status| {
-                                status == crate::LOCAL_PUBLISH_FAILED_REASON
-                            })
-                    })
-                    .ok_or(AppError::InvalidEditTarget)?;
-                intent
-            }
-            AppMessageIntent::Delete { target_message_id } => {
-                let storage = self.app.account_storage(&self.state.label)?.app_storage();
-                let target =
-                    storage.app_message(&hex::encode(group_id.as_slice()), &target_message_id)?;
-                if target.as_ref().is_some_and(|target| {
-                    target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
-                }) && self.delete_moderation_grant(group_id, &sender)
-                    && storage
-                        .report_target_author(
-                            &hex::encode(group_id.as_slice()),
-                            &target_message_id,
-                        )?
-                        .is_some()
-                {
-                    AppMessageIntent::RemoveMessage { target_message_id }
-                } else {
-                    if target.is_some_and(|target| target.sender != sender) {
-                        return Err(AppError::InvalidAppMessagePayload(
-                            "an available chat message and group admin authority are required to remove another account's content".into(),
-                        ));
+                    }) && self.delete_moderation_grant(group_id, &sender)
+                        && storage
+                            .report_target_author(
+                                &hex::encode(group_id.as_slice()),
+                                &target_message_id,
+                            )?
+                            .is_some()
+                    {
+                        AppMessageIntent::RemoveMessage { target_message_id }
+                    } else {
+                        if target.is_some_and(|target| target.sender != sender) {
+                            return Err(AppError::InvalidAppMessagePayload(
+                                "an available chat message and group admin authority are required to remove another account's content".into(),
+                            ));
+                        }
+                        // An unavailable moderation target does not take away the
+                        // author's ordinary retraction path after invalidation or pruning.
+                        AppMessageIntent::Delete { target_message_id }
                     }
-                    // An unavailable moderation target does not take away the
-                    // author's ordinary retraction path after invalidation or pruning.
-                    AppMessageIntent::Delete { target_message_id }
                 }
-            }
-            AppMessageIntent::Unreact {
-                target_message_id,
-                emoji,
-            } => {
-                if let Some(emoji) = emoji.as_deref() {
-                    crate::messages::validate_reaction_content(emoji)?;
+                AppMessageIntent::Unreact {
+                    target_message_id,
+                    emoji,
+                } => {
+                    if let Some(emoji) = emoji.as_deref() {
+                        crate::messages::validate_reaction_content(emoji)?;
+                    }
+                    let reaction_message_ids = self.own_reaction_event_ids(
+                        group_id,
+                        &sender,
+                        &target_message_id,
+                        emoji.as_deref(),
+                    )?;
+                    AppMessageIntent::DeleteReactions {
+                        reaction_message_ids,
+                    }
                 }
-                let reaction_message_ids = self.own_reaction_event_ids(
-                    group_id,
-                    &sender,
-                    &target_message_id,
-                    emoji.as_deref(),
-                )?;
-                AppMessageIntent::DeleteReactions {
-                    reaction_message_ids,
-                }
-            }
-            other => other,
-        };
-        // An encrypted-media reference is bound to the epoch that produced its
-        // ciphertext: the wire `imeta` tag carries no epoch, so every recipient
-        // derives the media key from the epoch of the message that delivers
-        // the tag. Pin the send to that epoch. The engine then refuses to
-        // retain the message while the group's epoch is unsettled and refuses
-        // to encrypt it if convergence moves the epoch during the send, instead
-        // of publishing an attachment nobody can decrypt. Callers have already
-        // checked that every attachment shares one epoch.
-        let expected_epoch = match &intent {
-            AppMessageIntent::Media { attachments, .. } => attachments
-                .first()
-                .map(|attachment| cgka_traits::types::EpochId(attachment.source_epoch)),
-            _ => None,
-        };
-        let (event, payload) = if let Some((event, payload)) = prepared {
-            event.validate_sender(&sender).map_err(|_| {
-                AppError::InvalidAppMessagePayload("invalid local submission author".into())
-            })?;
-            (event, payload)
-        } else {
-            let event = match draft.as_ref().and_then(|(_, reply)| reply.as_deref()) {
-                Some(reply) => build_inner_event_with_media_reply(
-                    &intent,
-                    &sender,
-                    unix_now_seconds(),
-                    Some(reply),
-                )?,
-                None => build_inner_event(&intent, &sender, unix_now_seconds())?,
+                other => other,
             };
-            let payload = encode_inner_event(&event)?;
-            (event, payload)
-        };
-        if let AppMessageIntent::PollResponse {
-            poll_event_id,
-            option_ids,
-        } = &intent
-        {
-            self.ensure_poll_response_valid_at(
-                group_id,
+            // An encrypted-media reference is bound to the epoch that produced its
+            // ciphertext: the wire `imeta` tag carries no epoch, so every recipient
+            // derives the media key from the epoch of the message that delivers
+            // the tag. Pin the send to that epoch. The engine then refuses to
+            // retain the message while the group's epoch is unsettled and refuses
+            // to encrypt it if convergence moves the epoch during the send, instead
+            // of publishing an attachment nobody can decrypt. Callers have already
+            // checked that every attachment shares one epoch.
+            let expected_epoch = match &intent {
+                AppMessageIntent::Media { attachments, .. } => attachments
+                    .first()
+                    .map(|attachment| cgka_traits::types::EpochId(attachment.source_epoch)),
+                _ => None,
+            };
+            let (event, payload) = if let Some((event, payload)) = prepared {
+                event.validate_sender(&sender).map_err(|_| {
+                    AppError::InvalidAppMessagePayload("invalid local submission author".into())
+                })?;
+                (event, payload)
+            } else {
+                let event = match draft.as_ref().and_then(|(_, reply)| reply.as_deref()) {
+                    Some(reply) => build_inner_event_with_media_reply(
+                        &intent,
+                        &sender,
+                        unix_now_seconds(),
+                        Some(reply),
+                    )?,
+                    None => build_inner_event(&intent, &sender, unix_now_seconds())?,
+                };
+                let payload = encode_inner_event(&event)?;
+                (event, payload)
+            };
+            if let AppMessageIntent::PollResponse {
                 poll_event_id,
                 option_ids,
-                event.created_at,
-            )?;
-        }
-        let _draft_guard = if let Some((revision, _)) = draft {
-            let storage = self.app.draft_storage(&self.state.label)?;
-            self.engine_storage.set_message_draft_commit_observer(
-                self.app.draft_commit_observer(&self.state.label),
-            );
-            storage
-                .app_storage()
-                .stage_message_draft_submission(&revision, &event.id, &payload)
-                .map_err(|error| crate::drafts::revision_error(error, revision.group_id_hex()))?;
-            Some(crate::drafts::DraftSubmissionGuard {
-                storage,
-                revision,
-                app_event_id: event.id.clone(),
-            })
-        } else {
-            None
-        };
+            } = &intent
+            {
+                self.ensure_poll_response_valid_at(
+                    group_id,
+                    poll_event_id,
+                    option_ids,
+                    event.created_at,
+                )?;
+            }
+            let _draft_guard = if let Some((revision, _)) = draft {
+                let storage = self.app.draft_storage(&self.state.label)?;
+                self.engine_storage.set_message_draft_commit_observer(
+                    self.app.draft_commit_observer(&self.state.label),
+                );
+                storage
+                    .app_storage()
+                    .stage_message_draft_submission(&revision, &event.id, &payload)
+                    .map_err(|error| {
+                        crate::drafts::revision_error(error, revision.group_id_hex())
+                    })?;
+                Some(crate::drafts::DraftSubmissionGuard {
+                    storage,
+                    revision,
+                    app_event_id: event.id.clone(),
+                })
+            } else {
+                None
+            };
 
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let app_event_id = event.id.clone();
-        audit_context
-            .get_or_insert_with(Default::default)
-            .operation_id = Some(marmot_forensics::application_send_operation_id(
-            group_id.as_slice(),
-            &app_event_id,
-        ));
+            let group_id_hex = hex::encode(group_id.as_slice());
+            let app_event_id = event.id.clone();
+            audit_context
+                .get_or_insert_with(Default::default)
+                .operation_id = Some(marmot_forensics::application_send_operation_id(
+                group_id.as_slice(),
+                &app_event_id,
+            ));
 
-        let should_project_locally = !notifications::is_push_gossip_kind(event.kind);
-        if should_project_locally {
-            let update = self.record_send_intent_projection(group_id, &sender, &event)?;
-            on_local_projection(update);
-            self.publish_conversation_captures(group_id);
-        }
+            let should_project_locally = !notifications::is_push_gossip_kind(event.kind);
+            if should_project_locally {
+                let update = self.record_send_intent_projection(group_id, &sender, &event)?;
+                on_local_projection(update);
+                self.publish_conversation_captures(group_id);
+            }
 
-        let send_result = match self
-            .sync_runtime_groups_for_send("send_app_event_with_local_projection")
-            .await
-        {
-            Ok(()) => {
-                let send_intent = SendIntent::AppMessage {
-                    group_id: group_id.clone(),
-                    payload,
-                    expected_epoch,
-                };
-                // Thread the human-action context through the engine so the
-                // send's audit rows carry `human_action`, matching
-                // create_group/invite/etc.
-                match &audit_context {
-                    Some(context) => {
-                        self.runtime
-                            .send_with_audit_context(send_intent, context.clone())
-                            .await
+            let send_result = match self
+                .sync_runtime_groups_for_send("send_app_event_with_local_projection")
+                .await
+            {
+                Ok(()) => {
+                    let send_intent = SendIntent::AppMessage {
+                        group_id: group_id.clone(),
+                        payload,
+                        expected_epoch,
+                    };
+                    // Thread the human-action context through the engine so the
+                    // send's audit rows carry `human_action`, matching
+                    // create_group/invite/etc.
+                    match &audit_context {
+                        Some(context) => {
+                            self.runtime
+                                .send_with_audit_context(send_intent, context.clone())
+                                .await
+                        }
+                        None => self.runtime.send(send_intent).await,
                     }
-                    None => self.runtime.send(send_intent).await,
-                }
-                .map_err(AppError::from)
-            }
-            // The inactive-account queue carries no epoch pin, so an
-            // epoch-bound payload cannot take it: it would drain under
-            // whatever epoch the group has by then.
-            Err(error) if error.is_account_not_active() && expected_epoch.is_none() => {
-                let context = audit_context.clone().unwrap_or_default();
-                self.runtime
-                    .queue_app_message_with_audit_context(group_id.clone(), payload, context)
-                    .await
                     .map_err(AppError::from)
+                }
+                // The inactive-account queue carries no epoch pin, so an
+                // epoch-bound payload cannot take it: it would drain under
+                // whatever epoch the group has by then.
+                Err(error) if error.is_account_not_active() && expected_epoch.is_none() => {
+                    let context = audit_context.clone().unwrap_or_default();
+                    self.runtime
+                        .queue_app_message_with_audit_context(group_id.clone(), payload, context)
+                        .await
+                        .map_err(AppError::from)
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        }
-        .map_err(|error| pinned_media_send_error(expected_epoch, error));
-        // The publish-status gate is applied separately from obtaining the
-        // effects: even when the outbound publish hard-fails, the engine may
-        // already have folded retained peer commits into this send, and those
-        // applied `GroupStateChanged` / `EpochChanged` events must still be
-        // observed and broadcast — only the local message is retracted.
-        let effects = match send_result {
-            Ok(effects) => effects,
-            Err(err) => {
+            .map_err(|error| pinned_media_send_error(expected_epoch, error));
+            // The publish-status gate is applied separately from obtaining the
+            // effects: even when the outbound publish hard-fails, the engine may
+            // already have folded retained peer commits into this send, and those
+            // applied `GroupStateChanged` / `EpochChanged` events must still be
+            // observed and broadcast — only the local message is retracted.
+            let effects = match send_result {
+                Ok(effects) => effects,
+                Err(err) => {
+                    self.retract_failed_local_projection(
+                        should_project_locally,
+                        &group_id_hex,
+                        &app_event_id,
+                        &mut on_local_projection,
+                    );
+                    return Err(err);
+                }
+            };
+            if should_project_locally {
+                if let Some(duration) = effects.local_accept_duration {
+                    record_app_performance(
+                        self.send_telemetry.as_ref(),
+                        AppPerformanceOperation::OutboundMessageLocalAccept,
+                        duration,
+                        true,
+                    );
+                }
+                if let Some(duration) = effects.publish_duration {
+                    let published = effects.published_app_messages.iter().any(|message| {
+                        message.group_id == *group_id && message.app_event_id == app_event_id
+                    });
+                    record_app_performance(
+                        self.send_telemetry.as_ref(),
+                        AppPerformanceOperation::OutboundMessagePublish,
+                        duration,
+                        published,
+                    );
+                }
+            }
+            if let Err(publish_err) = self
+                .observe_recovery_evidence_then_gate_send_publish(&effects, group_id, &app_event_id)
+                .await
+            {
                 self.retract_failed_local_projection(
                     should_project_locally,
                     &group_id_hex,
                     &app_event_id,
                     &mut on_local_projection,
                 );
-                return Err(err);
+                return Err(publish_err);
             }
-        };
-        if should_project_locally {
-            if let Some(duration) = effects.local_accept_duration {
-                record_app_performance(
-                    self.send_telemetry.as_ref(),
-                    AppPerformanceOperation::OutboundMessageLocalAccept,
-                    duration,
-                    true,
-                );
+            if let Some(context) = &audit_context {
+                self.record_human_action_succeeded(group_id, context, &effects);
             }
-            if let Some(duration) = effects.publish_duration {
-                let published = effects.published_app_messages.iter().any(|message| {
-                    message.group_id == *group_id && message.app_event_id == app_event_id
-                });
-                record_app_performance(
-                    self.send_telemetry.as_ref(),
-                    AppPerformanceOperation::OutboundMessagePublish,
-                    duration,
-                    published,
-                );
-            }
-        }
-        if let Err(publish_err) = self
-            .observe_recovery_evidence_then_gate_send_publish(&effects, group_id, &app_event_id)
-            .await
-        {
-            self.retract_failed_local_projection(
-                should_project_locally,
-                &group_id_hex,
-                &app_event_id,
-                &mut on_local_projection,
-            );
-            return Err(publish_err);
-        }
-        if let Some(context) = &audit_context {
-            self.record_human_action_succeeded(group_id, context, &effects);
-        }
-        self.remember_published_reports(&effects);
-        let published = effects.published_app_messages.iter().find(|published| {
-            published.group_id == *group_id && published.app_event_id == app_event_id
-        });
-        let completion_unknown = effects.unresolved_app_messages.iter().any(|unresolved| {
-            unresolved.group_id == *group_id && unresolved.app_event_id == app_event_id
-        });
-        let source_message_id_hex =
-            published.map(|published| hex::encode(published.message_id.as_slice()));
-        let source_state = published.map(|published| {
-            (
-                published.source_epoch.0,
-                published.retention,
-                published.authority,
-            )
-        });
-        if should_project_locally {
-            let projection = (|| {
-                let update = self.record_local_app_event_projection(
-                    group_id,
-                    &sender,
-                    &event,
-                    source_message_id_hex,
-                    source_state,
-                    published.is_some(),
-                )?;
-                on_local_projection(update);
-                self.prune_plaintext_retention_for_group(group_id)
-            })();
-            if let Err(error) = projection {
-                self.pending_convergence_groups.insert(group_id.clone());
-                tracing::warn!(
-                    target: "marmot_app::messages",
-                    method = "send_app_event_with_local_projection",
-                    error_kind = error.privacy_safe_kind(),
-                    "accepted application-message projection deferred",
-                );
-            }
-        }
-        // Finalization skips an already-completed local projection, repairs
-        // failed source writes, and forwards sibling updates before retiring
-        // the accepted fanouts.
-        self.retry_send_applied_effects_best_effort().await;
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
-            // A checkpoint is needed only when another transport wait follows;
-            // otherwise the worker can service the already-invalidated window.
+            self.remember_published_reports(&effects);
+            let published = effects.published_app_messages.iter().find(|published| {
+                published.group_id == *group_id && published.app_event_id == app_event_id
+            });
+            let completion_unknown = effects.unresolved_app_messages.iter().any(|unresolved| {
+                unresolved.group_id == *group_id && unresolved.app_event_id == app_event_id
+            });
+            let source_message_id_hex =
+                published.map(|published| hex::encode(published.message_id.as_slice()));
+            let source_state = published.map(|published| {
+                (
+                    published.source_epoch.0,
+                    published.retention,
+                    published.authority,
+                )
+            });
             if should_project_locally {
-                self.publish_conversation_captures(group_id);
+                let projection = (|| {
+                    let update = self.record_local_app_event_projection(
+                        group_id,
+                        &sender,
+                        &event,
+                        source_message_id_hex,
+                        source_state,
+                        published.is_some(),
+                    )?;
+                    on_local_projection(update);
+                    self.prune_plaintext_retention_for_group(group_id)
+                })();
+                if let Err(error) = projection {
+                    self.pending_convergence_groups.insert(group_id.clone());
+                    tracing::warn!(
+                        target: "marmot_app::messages",
+                        method = "send_app_event_with_local_projection",
+                        error_kind = error.privacy_safe_kind(),
+                        "accepted application-message projection deferred",
+                    );
+                }
             }
-            self.publish_notification_trigger_best_effort(
-                group_id,
-                notifications::NotificationTrigger::NewMessage,
-            )
-            .await;
-            self.remember_message_notification_sent(group_id, &app_event_id);
-        }
-        if should_project_locally {
-            self.note_push_announce_after_send(group_id);
-        }
-        #[cfg(test)]
-        if !should_project_locally {
-            self.test_sent_push_gossip
-                .push((group_id.clone(), event.clone()));
-        }
-        Ok((
-            event,
-            SendSummary {
-                published: usize::from(published.is_some()),
-                message_ids: vec![app_event_id],
-                // Per-message, not per-pass: `published` above matched this
-                // exact `app_event_id` in `effects.published_app_messages`. A
-                // send that folded peer commits can publish other work in the
-                // same pass, so counting `effects.reports` or the group-wide
-                // queue would misreport this row. Absent means the engine
-                // accepted and retained it (mdk#1177).
-                accept_disposition: if published.is_some() {
-                    cgka_traits::SendAcceptDisposition::Published
-                } else if completion_unknown {
-                    cgka_traits::SendAcceptDisposition::CompletionUnknown
-                } else {
-                    cgka_traits::SendAcceptDisposition::AcceptedPending
+            // Finalization skips an already-completed local projection, repairs
+            // failed source writes, and forwards sibling updates before retiring
+            // the accepted fanouts.
+            self.retry_send_applied_effects_best_effort().await;
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+            if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
+                // A checkpoint is needed only when another transport wait follows;
+                // otherwise the worker can service the already-invalidated window.
+                if should_project_locally {
+                    self.publish_conversation_captures(group_id);
+                }
+                self.publish_notification_trigger_best_effort(
+                    group_id,
+                    notifications::NotificationTrigger::NewMessage,
+                )
+                .await;
+                self.remember_message_notification_sent(group_id, &app_event_id);
+            }
+            if should_project_locally {
+                self.note_push_announce_after_send(group_id);
+            }
+            #[cfg(test)]
+            if !should_project_locally {
+                self.test_sent_push_gossip
+                    .push((group_id.clone(), event.clone()));
+            }
+            Ok((
+                event,
+                SendSummary {
+                    published: usize::from(published.is_some()),
+                    message_ids: vec![app_event_id],
+                    // Per-message, not per-pass: `published` above matched this
+                    // exact `app_event_id` in `effects.published_app_messages`. A
+                    // send that folded peer commits can publish other work in the
+                    // same pass, so counting `effects.reports` or the group-wide
+                    // queue would misreport this row. Absent means the engine
+                    // accepted and retained it (mdk#1177).
+                    accept_disposition: if published.is_some() {
+                        cgka_traits::SendAcceptDisposition::Published
+                    } else if completion_unknown {
+                        cgka_traits::SendAcceptDisposition::CompletionUnknown
+                    } else {
+                        cgka_traits::SendAcceptDisposition::AcceptedPending
+                    },
+                    maintenance_disposition: effects.maintenance_disposition,
                 },
-                maintenance_disposition: effects.maintenance_disposition,
-            },
-        ))
+            ))
+        };
+        observed
+            .run_async(Box::pin(work), |result| {
+                marmot_observability::observer::send_outcome(result, |(_, summary)| {
+                    summary.accept_disposition
+                })
+            })
+            .await
     }
 
     /// Apply the publish gate to one completed application send's effects —
@@ -5969,73 +5822,63 @@ impl AppClient {
         plaintext: Vec<u8>,
         media_type: &str,
     ) -> Result<SendSummary, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             "image_update",
             crate::ProductUnit::Action,
         );
-        let product_result =
-            Box::pin(self.update_group_image_unobserved(group_id, plaintext, media_type)).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
+        let work = async move {
+            self.ensure_group_application_messages_allowed(group_id)?;
+            self.ensure_group_change_admitted(group_id)?;
+            let audit_context = Self::local_human_action_context(
+                "update_group_image",
+                vec!["image"],
+                vec![GROUP_BLOSSOM_IMAGE_COMPONENT_ID],
+                None,
+            );
+            self.sync_runtime_groups_for_send("update_group_image")
+                .await?;
+            let input = if plaintext.is_empty() {
+                AppGroupImageInput::default()
             } else {
-                "failure"
-            });
-        }
-        product_result
-    }
-
-    async fn update_group_image_unobserved(
-        &mut self,
-        group_id: &GroupId,
-        plaintext: Vec<u8>,
-        media_type: &str,
-    ) -> Result<SendSummary, AppError> {
-        self.ensure_group_application_messages_allowed(group_id)?;
-        self.ensure_group_change_admitted(group_id)?;
-        let audit_context = Self::local_human_action_context(
-            "update_group_image",
-            vec!["image"],
-            vec![GROUP_BLOSSOM_IMAGE_COMPONENT_ID],
-            None,
-        );
-        self.sync_runtime_groups_for_send("update_group_image")
-            .await?;
-        let input = if plaintext.is_empty() {
-            AppGroupImageInput::default()
-        } else {
-            let upload = upload_group_image(
-                &plaintext,
-                media_type,
-                &self.app.deployment().group_image_endpoint_for(None)?,
-                &self.blossom_http_transport,
-            )
-            .await?;
-            AppGroupImageInput::from(upload)
+                let upload = upload_group_image(
+                    &plaintext,
+                    media_type,
+                    &self.app.deployment().group_image_endpoint_for(None)?,
+                    &self.blossom_http_transport,
+                )
+                .await?;
+                AppGroupImageInput::from(upload)
+            };
+            let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
+            let effects = self
+                .runtime
+                .send_with_audit_context(
+                    SendIntent::UpdateAppComponents {
+                        group_id: group_id.clone(),
+                        updates: vec![AppComponentData {
+                            component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+                            data,
+                        }],
+                    },
+                    audit_context.clone(),
+                )
+                .await?;
+            self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                .await?;
+            self.record_human_action_succeeded(group_id, &audit_context, &effects);
+            self.remember_published_reports(&effects);
+            let summary = send_summary_from_effects(&effects);
+            self.refresh_group(group_id);
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+            Ok(summary)
         };
-        let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
-        let effects = self
-            .runtime
-            .send_with_audit_context(
-                SendIntent::UpdateAppComponents {
-                    group_id: group_id.clone(),
-                    updates: vec![AppComponentData {
-                        component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-                        data,
-                    }],
-                },
-                audit_context.clone(),
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
             )
-            .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
-            .await?;
-        self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
-        let summary = send_summary_from_effects(&effects);
-        self.refresh_group(group_id);
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        Ok(summary)
+            .await
     }
 
     /// Fetch + decrypt the group's avatar. Errors when the group has no image set.
@@ -6235,8 +6078,8 @@ impl AppClient {
 
     /// Send an app-defined event with an arbitrary non-reserved kind. `tags`
     /// and `content` pass through verbatim; kinds MDK owns (chat, reaction,
-    /// edit, delete, agent, group system, push token) are rejected so an app
-    /// cannot forge protocol events.
+    /// edit, delete, agent, group system, push token, device group) are
+    /// rejected so an app cannot forge protocol events.
     pub async fn send_custom_event(
         &mut self,
         group_id: &GroupId,
@@ -6261,48 +6104,41 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<SendSummary, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Recovery,
             "convergence",
             crate::ProductUnit::Action,
         );
-        let product_result = Box::pin(self.retry_group_convergence_unobserved(group_id)).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
+        let work = async move {
+            self.ensure_group(group_id)?;
 
-    async fn retry_group_convergence_unobserved(
-        &mut self,
-        group_id: &GroupId,
-    ) -> Result<SendSummary, AppError> {
-        self.ensure_group(group_id)?;
-
-        // Unlike a send, a convergence retry needs live subscriptions, and its
-        // pass re-syncs routes before checkpointing. Refuse it up front rather
-        // than publish and then fail that checkpoint.
-        self.sync_runtime_groups().await?;
-        // An explicit retry is the user's evidence: a parked or backing-off
-        // pass makes its next attempt now (mdk#2684). The worker's next
-        // schedule read re-arms the group whatever the attempt returns: an
-        // advance that errors before it re-parks the pass would otherwise
-        // leave it due with no wake.
-        if self.runtime.retry_failed_convergence_pass(group_id)? {
-            self.pending_convergence_groups.insert(group_id.clone());
-        }
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_convergence_retry_advance) {
-            return Err(AppError::Storage(cgka_traits::storage::StorageError::Busy(
-                "injected convergence retry advance failure".to_owned(),
-            )));
-        }
-        let effects = self.runtime.advance_convergence(group_id).await?;
-        self.observe_convergence_retry_effects(group_id, &effects)
+            // Unlike a send, a convergence retry needs live subscriptions, and its
+            // pass re-syncs routes before checkpointing. Refuse it up front rather
+            // than publish and then fail that checkpoint.
+            self.sync_runtime_groups().await?;
+            // An explicit retry is the user's evidence: a parked or backing-off
+            // pass makes its next attempt now (mdk#2684). The worker's next
+            // schedule read re-arms the group whatever the attempt returns: an
+            // advance that errors before it re-parks the pass would otherwise
+            // leave it due with no wake.
+            if self.runtime.retry_failed_convergence_pass(group_id)? {
+                self.pending_convergence_groups.insert(group_id.clone());
+            }
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_convergence_retry_advance) {
+                return Err(AppError::Storage(cgka_traits::storage::StorageError::Busy(
+                    "injected convergence retry advance failure".to_owned(),
+                )));
+            }
+            let effects = self.runtime.advance_convergence(group_id).await?;
+            self.observe_convergence_retry_effects(group_id, &effects)
+                .await
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -6332,79 +6168,69 @@ impl AppClient {
         name: Option<&str>,
         description: Option<&str>,
     ) -> Result<SendSummary, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             "profile_update",
             crate::ProductUnit::Action,
         );
-        let product_result =
-            Box::pin(self.update_group_profile_unobserved(group_id, name, description)).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
+        let work = async move {
+            if name.is_none() && description.is_none() {
+                return Err(AppError::InvalidGroupProfile(
+                    "name or description is required".into(),
+                ));
+            }
+            validate_group_profile(name.unwrap_or(""), description.unwrap_or(""))?;
+            self.ensure_group(group_id)?;
+            self.ensure_group_change_admitted(group_id)?;
+            let mut fields = Vec::new();
+            if name.is_some() {
+                fields.push("name");
+            }
+            if description.is_some() {
+                fields.push("description");
+            }
+            let audit_context = Self::local_human_action_context(
+                "update_group_profile",
+                fields,
+                vec![GROUP_PROFILE_COMPONENT_ID],
+                None,
+            );
 
-    async fn update_group_profile_unobserved(
-        &mut self,
-        group_id: &GroupId,
-        name: Option<&str>,
-        description: Option<&str>,
-    ) -> Result<SendSummary, AppError> {
-        if name.is_none() && description.is_none() {
-            return Err(AppError::InvalidGroupProfile(
-                "name or description is required".into(),
-            ));
-        }
-        validate_group_profile(name.unwrap_or(""), description.unwrap_or(""))?;
-        self.ensure_group(group_id)?;
-        self.ensure_group_change_admitted(group_id)?;
-        let mut fields = Vec::new();
-        if name.is_some() {
-            fields.push("name");
-        }
-        if description.is_some() {
-            fields.push("description");
-        }
-        let audit_context = Self::local_human_action_context(
-            "update_group_profile",
-            fields,
-            vec![GROUP_PROFILE_COMPONENT_ID],
-            None,
-        );
-
-        self.sync_runtime_groups_for_send("update_group_profile")
-            .await?;
-        let effects = self
-            .runtime
-            .send_with_audit_context(
-                SendIntent::UpdateGroupData {
-                    group_id: group_id.clone(),
-                    name: name.map(ToOwned::to_owned),
-                    description: description.map(ToOwned::to_owned),
-                },
-                audit_context.clone(),
+            self.sync_runtime_groups_for_send("update_group_profile")
+                .await?;
+            let effects = self
+                .runtime
+                .send_with_audit_context(
+                    SendIntent::UpdateGroupData {
+                        group_id: group_id.clone(),
+                        name: name.map(ToOwned::to_owned),
+                        description: description.map(ToOwned::to_owned),
+                    },
+                    audit_context.clone(),
+                )
+                .await?;
+            self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                .await?;
+            self.record_human_action_succeeded(group_id, &audit_context, &effects);
+            self.remember_published_reports(&effects);
+            let group_metadata = self.runtime.group_record(group_id).ok();
+            let projection = self.event_group_projection(group_id, group_metadata.as_ref())?;
+            add_group(
+                &mut self.state,
+                group_id,
+                &projection,
+                GroupConfirmationProjection::Preserve,
+            );
+            self.mark_group_projection_dirty(group_id);
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+            Ok(send_summary_from_effects(&effects))
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
             )
-            .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
-            .await?;
-        self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
-        let group_metadata = self.runtime.group_record(group_id).ok();
-        let projection = self.event_group_projection(group_id, group_metadata.as_ref())?;
-        add_group(
-            &mut self.state,
-            group_id,
-            &projection,
-            GroupConfirmationProjection::Preserve,
-        );
-        self.mark_group_projection_dirty(group_id);
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        Ok(send_summary_from_effects(&effects))
+            .await
     }
 
     fn ensure_group(&self, group_id: &GroupId) -> Result<(), AppError> {
@@ -6665,50 +6491,41 @@ impl AppClient {
         group_id: &GroupId,
         archived: bool,
     ) -> Result<AppGroupRecord, AppError> {
-        let observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             if archived { "archive" } else { "unarchive" },
             crate::ProductUnit::Action,
         );
-        let result = self.set_group_archived_unobserved(group_id, archived);
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    fn set_group_archived_unobserved(
-        &mut self,
-        group_id: &GroupId,
-        archived: bool,
-    ) -> Result<AppGroupRecord, AppError> {
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let group = self
-            .state
-            .groups
-            .iter_mut()
-            .find(|group| group.group_id_hex == group_id_hex)
-            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
-        let previous = group.archived;
-        group.archived = archived;
-        let group = group.clone();
-        self.mark_group_projection_dirty_hex(group_id_hex.clone());
-        // Roll the in-memory flag back if persistence fails so the worker's
-        // authoritative snapshot stays consistent with what is on disk; a later
-        // unrelated `save_state` must not silently re-apply a toggle the caller
-        // was told had failed.
-        if let Err(err) = self.save_state_with_pending_local_group_deletion_frontier_clears() {
-            if let Some(group) = self
+        let work = || -> Result<AppGroupRecord, AppError> {
+            let group_id_hex = hex::encode(group_id.as_slice());
+            let group = self
                 .state
                 .groups
                 .iter_mut()
                 .find(|group| group.group_id_hex == group_id_hex)
-            {
-                group.archived = previous;
+                .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+            let previous = group.archived;
+            group.archived = archived;
+            let group = group.clone();
+            self.mark_group_projection_dirty_hex(group_id_hex.clone());
+            // Roll the in-memory flag back if persistence fails so the worker's
+            // authoritative snapshot stays consistent with what is on disk; a later
+            // unrelated `save_state` must not silently re-apply a toggle the caller
+            // was told had failed.
+            if let Err(err) = self.save_state_with_pending_local_group_deletion_frontier_clears() {
+                if let Some(group) = self
+                    .state
+                    .groups
+                    .iter_mut()
+                    .find(|group| group.group_id_hex == group_id_hex)
+                {
+                    group.archived = previous;
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
-        Ok(group)
+            Ok(group)
+        };
+        observed.run(work, marmot_observability::observer::success_or_failure)
     }
 
     fn set_group_invite_confirmation(
@@ -7212,11 +7029,13 @@ impl AppClient {
         effects: &marmot_session::AccountDeviceEffects,
     ) {
         for report in &effects.superseded_intents {
-            // A roster update this device made may have carried a sign-in
-            // rejection (mdk#2628 3.2).
+            // A roster update this device made lost to another branch, whose
+            // roster the devices and sign-ins now read; the update may have
+            // carried a sign-in rejection (mdk#2628 3.2).
             if report.kind == cgka_traits::engine::SupersededIntentKind::AppComponents
                 && self.is_device_group(&report.group_id).unwrap_or(true)
             {
+                self.note_device_roster_changed();
                 self.recheck_sign_in_rejections();
             }
             if !self.host_may_see_group(&report.group_id) {
@@ -7355,38 +7174,6 @@ impl AppClient {
         Ok(message_ids)
     }
 
-    fn record_welcome_delivery_intents(
-        &mut self,
-        group_id: &GroupId,
-        welcomes: &[cgka_traits::transport::TransportMessage],
-    ) -> Result<Vec<String>, AppError> {
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let recorded_at = unix_now_seconds();
-        let storage = self.app.account_storage(&self.state.label)?;
-        let mut records = Vec::with_capacity(welcomes.len());
-        for welcome in welcomes {
-            let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
-                return Err(AppError::Publish(
-                    "delivery artifact was not a Welcome".into(),
-                ));
-            };
-            let message_id_hex = hex::encode(welcome.id.as_slice());
-            records.push(storage_sqlite::PendingWelcomeDeliveryRecord {
-                message_id_hex,
-                group_id_hex: group_id_hex.clone(),
-                recipient_hex: hex::encode(recipient.as_slice()),
-                recorded_at,
-            });
-        }
-        storage
-            .app_storage()
-            .record_pending_welcome_deliveries(&records)?;
-        Ok(records
-            .into_iter()
-            .map(|record| record.message_id_hex)
-            .collect())
-    }
-
     fn clear_confirmed_welcome_intent(
         &self,
         storage: &storage_sqlite::SqliteAppStorage,
@@ -7400,7 +7187,7 @@ impl AppClient {
                 "publish",
                 crate::ProductUnit::Transition,
             )
-            .map(crate::observer::ProductOperation::counts_only);
+            .map(marmot_observability::observer::ProductOperation::counts_only);
         if storage.take_pending_welcome_delivery(message_id_hex)?
             && let Some(observation) = observation
         {
@@ -7409,9 +7196,11 @@ impl AppClient {
         Ok(())
     }
 
-    /// Clear only intent rows whose exact Welcome met its acknowledgement
-    /// policy. Failed or unattempted rows stay durable for re-delivery.
-    fn clear_delivered_founding_welcome_intents(
+    /// Clear only the pending rows whose exact Welcome met its
+    /// acknowledgement policy, counting each row removed as a confirmed
+    /// publish. A Welcome has a row only once a publish failed or a reconcile
+    /// wrote it; failed or unattempted rows stay durable for re-delivery.
+    fn clear_delivered_welcome_rows(
         &mut self,
         message_ids: &[String],
         effects: &marmot_session::AccountDeviceEffects,
@@ -7585,8 +7374,8 @@ impl AppClient {
                 );
                 let delivery = WelcomeDelivery::of(published, &effects);
                 recover_post_canonical_result(
-                    "clear_delivered_founding_welcome_intents",
-                    self.clear_delivered_founding_welcome_intents(&welcome_intents, &effects),
+                    "clear_delivered_welcome_rows",
+                    self.clear_delivered_welcome_rows(&welcome_intents, &effects),
                 );
                 // Non-fatal here: this classification only logs, so no
                 // refusal is lost to an early return. It still arms through the
@@ -7600,10 +7389,7 @@ impl AppClient {
                 self.remember_published_reports(&effects);
                 delivery
             }
-            UnpublishedWelcomeKind::Invite {
-                welcome_ids,
-                welcome_intents,
-            } => {
+            UnpublishedWelcomeKind::Invite { welcome_ids } => {
                 let welcome_publish_started_at = Instant::now();
                 let publish_result = self
                     .runtime
@@ -7632,7 +7418,11 @@ impl AppClient {
                         return WelcomeDelivery::Undelivered;
                     }
                 };
-                let _ = self.clear_delivered_founding_welcome_intents(&welcome_intents, &effects);
+                let welcome_ids = welcome_ids
+                    .iter()
+                    .map(|id| hex::encode(id.as_slice()))
+                    .collect::<Vec<_>>();
+                let _ = self.clear_delivered_welcome_rows(&welcome_ids, &effects);
                 self.remember_published_reports(&effects);
                 WelcomeDelivery::of(true, &effects)
             }
@@ -7720,8 +7510,7 @@ impl AppClient {
                         },
                     );
                 }
-                let _ =
-                    self.clear_delivered_founding_welcome_intents(&completed.welcome_ids, &effects);
+                let _ = self.clear_delivered_welcome_rows(&completed.welcome_ids, &effects);
                 self.remember_published_reports(&effects);
             }
             Err(error) => {
@@ -7773,50 +7562,43 @@ impl AppClient {
         &mut self,
         message_id_hex: &str,
     ) -> Result<SendSummary, AppError> {
-        let product_observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Welcome,
             "retry",
             crate::ProductUnit::Attempt,
         );
-        let product_result = Box::pin(self.redeliver_welcome_unobserved(message_id_hex)).await;
-        if let Some(observation) = product_observation {
-            observation.finish(if product_result.is_ok() {
-                "confirmed"
-            } else {
-                "failure"
-            });
-        }
-        product_result
-    }
-
-    async fn redeliver_welcome_unobserved(
-        &mut self,
-        message_id_hex: &str,
-    ) -> Result<SendSummary, AppError> {
-        let message_id = cgka_traits::MessageId::new(hex::decode(message_id_hex)?);
-        let effects = self.runtime.redeliver_welcome(&message_id).await?;
-        // Only clear the durable pending record once every "still undelivered"
-        // signal agrees the welcome landed: no PublishFailure, no structured
-        // WelcomeDeliveryFailure, and a report that met its ack threshold.
-        // These are kept in lockstep by `publish_one` today, but asserting all
-        // three means a future refactor cannot drift one signal and clear the
-        // queue while the welcome is still unreachable (the #375 class of bug).
-        let delivered = effects.failures.is_empty()
-            && effects.welcome_failures.is_empty()
-            && effects
-                .reports
-                .last()
-                .is_some_and(|report| report.met_required_acks());
-        if !delivered {
-            return Err(if effects.failures.is_empty() {
-                AppError::Publish("welcome re-delivery did not reach the recipient".into())
-            } else {
-                publish_failure_error(&effects.failures)
-            });
-        }
-        let storage = self.app.account_storage(&self.state.label)?;
-        self.clear_confirmed_welcome_intent(&storage.app_storage(), message_id_hex)?;
-        Ok(send_summary_from_effects(&effects))
+        let work = async move {
+            let message_id = cgka_traits::MessageId::new(hex::decode(message_id_hex)?);
+            let effects = self.runtime.redeliver_welcome(&message_id).await?;
+            // Only clear the durable pending record once every "still undelivered"
+            // signal agrees the welcome landed: no PublishFailure, no structured
+            // WelcomeDeliveryFailure, and a report that met its ack threshold.
+            // These are kept in lockstep by `publish_one` today, but asserting all
+            // three means a future refactor cannot drift one signal and clear the
+            // queue while the welcome is still unreachable (the #375 class of bug).
+            let delivered = effects.failures.is_empty()
+                && effects.welcome_failures.is_empty()
+                && effects
+                    .reports
+                    .last()
+                    .is_some_and(|report| report.met_required_acks());
+            if !delivered {
+                return Err(if effects.failures.is_empty() {
+                    AppError::Publish("welcome re-delivery did not reach the recipient".into())
+                } else {
+                    publish_failure_error(&effects.failures)
+                });
+            }
+            let storage = self.app.account_storage(&self.state.label)?;
+            self.clear_confirmed_welcome_intent(&storage.app_storage(), message_id_hex)?;
+            Ok(send_summary_from_effects(&effects))
+        };
+        observed
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::confirmed_or_failure,
+            )
+            .await
     }
 }
 

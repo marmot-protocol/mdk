@@ -21,14 +21,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::audit_upload::{
+use crate::conversions::{audit_log_settings_from_storage, audit_log_settings_to_storage};
+use crate::error::AppError;
+use crate::{MarmotApp, config};
+use marmot_observability::audit_upload::{
     AuditSnapshotPost, AuditUploadCheckpoint, AuditUploadSnapshot, ListedAuditFile,
     invalid_audit_upload, post_audit_upload_snapshot, system_time_ms,
     validate_audit_upload_endpoint,
 };
-use crate::conversions::{audit_log_settings_from_storage, audit_log_settings_to_storage};
-use crate::error::AppError;
-use crate::{MarmotApp, config};
 
 mod legacy_cleanup;
 pub(crate) use legacy_cleanup::cleanup_legacy_audit_logs;
@@ -812,8 +812,8 @@ mod tests {
 
     use marmot_account::AccountHome;
 
-    use crate::audit_upload::AuditUploadOutcome;
     use crate::{AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp};
+    use marmot_observability::audit_upload::AuditUploadOutcome;
 
     #[test]
     fn audit_engine_id_is_stable_hash_not_raw_account_prefix() {

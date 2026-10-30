@@ -1,0 +1,31 @@
+# Every collector client must follow the process SOCKS5 policy and the
+# collector dial discipline: build it through `collector_host_safety`, which
+# wraps a fresh reqwest builder with the `http_builder` marmot-app hands in.
+#
+# The crate also creates and opens no files: marmot-app keeps every audit,
+# checkpoint and id file on fs-private and hands the uploader a file it has
+# already opened. Only a test that writes a temporary file allows this lint.
+disallowed-methods = [
+    { path = "reqwest::Client::builder", reason = "build collector clients through collector_host_safety" },
+    { path = "reqwest::Client::new", reason = "build collector clients through collector_host_safety" },
+    { path = "reqwest::ClientBuilder::new", reason = "build collector clients through collector_host_safety" },
+    { path = "reqwest::get", reason = "build collector clients through collector_host_safety" },
+    { path = "std::fs::File::create", reason = "marmot-app creates files through fs-private" },
+    { path = "std::fs::File::create_new", reason = "marmot-app creates files through fs-private" },
+    { path = "std::fs::File::open", reason = "marmot-app opens files and hands them in" },
+    { path = "std::fs::File::options", reason = "marmot-app opens files and hands them in" },
+    { path = "std::fs::OpenOptions::open", reason = "marmot-app opens files and hands them in" },
+    { path = "std::fs::copy", reason = "marmot-app creates files through fs-private" },
+    { path = "std::fs::create_dir", reason = "marmot-app creates directories through fs-private" },
+    { path = "std::fs::create_dir_all", reason = "marmot-app creates directories through fs-private" },
+    { path = "std::fs::write", reason = "marmot-app creates files through fs-private" },
+    { path = "tokio::fs::File::create", reason = "marmot-app creates files through fs-private" },
+    { path = "tokio::fs::File::create_new", reason = "marmot-app creates files through fs-private" },
+    { path = "tokio::fs::File::open", reason = "marmot-app opens files and hands them in" },
+    { path = "tokio::fs::File::options", reason = "marmot-app opens files and hands them in" },
+    { path = "tokio::fs::OpenOptions::open", reason = "marmot-app opens files and hands them in" },
+    { path = "tokio::fs::copy", reason = "marmot-app creates files through fs-private" },
+    { path = "tokio::fs::create_dir", reason = "marmot-app creates directories through fs-private" },
+    { path = "tokio::fs::create_dir_all", reason = "marmot-app creates directories through fs-private" },
+    { path = "tokio::fs::write", reason = "marmot-app creates files through fs-private" },
+]

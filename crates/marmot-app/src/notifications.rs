@@ -1821,6 +1821,7 @@ pub(crate) fn notification_update_from_event_cached(
         | MarmotAppEvent::HistoryNoticesChanged { .. }
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }
         | MarmotAppEvent::AccountError(_) => Ok(None),
     }
@@ -2311,11 +2312,13 @@ pub(crate) fn message_text_mentions_account(
 }
 
 /// Shared preview rule for an inner app event's kind/plaintext. Push-gossip
-/// kinds and blank text never produce a preview. Structured agent kinds expose
-/// only approved text/status fields; group-system rows expose supported parsed
-/// text only, so their JSON envelope never reaches a notification payload.
+/// kinds, device-group kinds and blank text never produce a preview.
+/// Structured agent kinds expose only approved text/status fields;
+/// group-system rows expose supported parsed text only, so their JSON envelope
+/// never reaches a notification payload.
 fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
     if is_push_gossip_kind(kind)
+        || crate::client::device_group::is_device_group_kind(kind)
         || kind == MARMOT_APP_EVENT_KIND_POLL
         || plaintext.trim().is_empty()
     {

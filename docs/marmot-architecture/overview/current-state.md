@@ -251,8 +251,10 @@ outside its scope, and browser execution still requires downstream acceptance co
 Hosts can also send app-defined custom events: any non-reserved application event kind with verbatim tags and content,
 through `marmot-app`, the MarmotKit bindings, or `wn messages send-event`. Stored events are queryable by kind on
 every message surface, and custom kinds materialize as standalone timeline rows under a dedicated `CustomEvent`
-update trigger. Kinds MDK owns (chat, reactions, edits, deletes, agent, group system, push token) are rejected on
-the custom send path, so apps cannot forge protocol events.
+update trigger. Kinds MDK owns (chat, reactions, edits, deletes, agent, group system, push token, and the
+device-group kinds 457, 459, 460 and 462) are rejected on the custom send path, so apps cannot forge protocol events.
+A device-group kind received in any group other than the account's device group is ignored: no row, message or
+notification.
 
 The Claude Code, Codex, OpenCode, and Pi terminal harnesses share typed `inherit`,
 `autonomous`, and `unrestricted` execution intent while retaining

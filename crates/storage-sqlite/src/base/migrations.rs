@@ -284,12 +284,18 @@ mod migration_0133_device_links;
 mod migration_0134_recovery_recheck_revision;
 #[path = "migrations/0135_recovery_unit_fences.rs"]
 mod migration_0135_recovery_unit_fences;
+#[path = "migrations/0136_recovery_conversion.rs"]
+mod migration_0136_recovery_conversion;
+#[path = "migrations/0137_device_renames.rs"]
+mod migration_0137_device_renames;
 #[path = "migrations/0140_private_key_packages.rs"]
 mod migration_0140_private_key_packages;
 #[path = "migrations/0141_sonar_stickers.rs"]
 mod migration_0141_sonar_stickers;
 #[path = "migrations/0142_sticker_asset_history.rs"]
 mod migration_0142_sticker_asset_history;
+#[path = "migrations/0144_announced_key_packages.rs"]
+mod migration_0144_announced_key_packages;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1122,6 +1128,18 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0135_recovery_unit_fences::apply,
     },
     Migration {
+        version: 136,
+        name: "0136_recovery_conversion",
+        suspend_foreign_keys: &[],
+        apply: migration_0136_recovery_conversion::apply,
+    },
+    Migration {
+        version: 137,
+        name: "0137_device_renames",
+        suspend_foreign_keys: &[],
+        apply: migration_0137_device_renames::apply,
+    },
+    Migration {
         version: 140,
         name: "0140_private_key_packages",
         suspend_foreign_keys: &[],
@@ -1138,6 +1156,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0142_sticker_asset_history",
         suspend_foreign_keys: &[],
         apply: migration_0142_sticker_asset_history::apply,
+    },
+    Migration {
+        version: 144,
+        name: "0144_announced_key_packages",
+        suspend_foreign_keys: &[],
+        apply: migration_0144_announced_key_packages::apply,
     },
 ];
 
@@ -1157,6 +1181,16 @@ pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<usize> {
 #[cfg(test)]
 pub(crate) fn run(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<()> {
     run_with_summary(connection, migrations).map(|_| ())
+}
+
+/// Leave the schema as a build whose last migration was `version` did.
+#[cfg(test)]
+pub(crate) fn run_through(connection: &mut Connection, version: i64) -> StorageResult<()> {
+    let applied = MIGRATIONS
+        .iter()
+        .take_while(|migration| migration.version <= version)
+        .count();
+    run(connection, &MIGRATIONS[..applied])
 }
 
 /// Run a registry with the same validation and transaction rules but no progress callback.

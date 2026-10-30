@@ -3,7 +3,7 @@ use std::time::Duration;
 use marmot_session::MaintenanceTiming;
 
 use crate::deployment::{MarmotDeployment, OpenRankingProvider};
-use crate::export_config::{
+use marmot_observability::export_config::{
     AuditLogUploadSource, DEFAULT_EXPORT_INTERVAL, RelayTelemetryExportConfig,
     RelayTelemetryRuntimeConfig, endpoint_transport_allowed, trim_optional,
 };
@@ -176,10 +176,6 @@ pub struct MarmotAppConfig {
     /// Honored only with `test-policy-overrides`; this exercises the account
     /// worker's degraded catch-up path without corrupting a real database.
     pub dev_force_group_read_snapshot_failure: bool,
-    /// Dev/test-only override that fails invite Welcome-intent recording.
-    /// Honored only with `test-policy-overrides`; this proves a canonical
-    /// invite still returns success and attempts Welcome fanout.
-    pub dev_fail_invite_welcome_intent: bool,
     /// Dev/test-only override that fails the app projection transaction after
     /// a founding group is already canonical. Honored only with
     /// `test-policy-overrides`; restart tests use it to exercise the sole
@@ -291,7 +287,6 @@ impl Default for MarmotAppConfig {
             dev_maintenance_timing: None,
             dev_startup_hydration_batch_delay_ms: None,
             dev_force_group_read_snapshot_failure: false,
-            dev_fail_invite_welcome_intent: false,
             dev_fail_create_local_projection: false,
             dev_device_groups: false,
             dev_fail_invite_local_refresh: false,
@@ -456,13 +451,6 @@ impl MarmotAppConfig {
     /// Normal builds ignore this field.
     pub fn with_dev_force_group_read_snapshot_failure(mut self, enabled: bool) -> Self {
         self.dev_force_group_read_snapshot_failure = enabled;
-        self
-    }
-
-    /// Fail invite Welcome-intent recording in test-policy builds.
-    /// Normal builds ignore this field.
-    pub fn with_dev_fail_invite_welcome_intent(mut self, enabled: bool) -> Self {
-        self.dev_fail_invite_welcome_intent = enabled;
         self
     }
 
@@ -685,7 +673,7 @@ impl RelayTelemetrySettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::export_config::RelayTelemetryResource;
+    use marmot_observability::export_config::RelayTelemetryResource;
 
     #[test]
     fn cursor_persistence_defaults_to_advance_and_is_opt_in() {

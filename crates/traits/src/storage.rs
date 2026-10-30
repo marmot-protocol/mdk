@@ -849,17 +849,23 @@ pub trait AccountDeviceSignerStorage {
 // ── DeviceGroupWelcomeStorage ──────────────────────────────────────────────
 
 /// The Welcome a new device waits for after a confirmed device link
-/// (mdk#2628 D28, D30): into `group_id`, a group that requires the device
-/// roster, sent by the leaf whose MLS signature key is
-/// `sender_signature_key`, before `expires_at` (Unix seconds).
+/// (mdk#2628 D28, D30, D41): into `group_id`, a group that requires the
+/// device roster, sent by the leaf whose MLS signature key is
+/// `sender_signature_key`, adding this device by the KeyPackage whose
+/// `KeyPackageRef` is `key_package_ref`, before `expires_at` (Unix seconds).
 ///
-/// While it is stored, it reserves `group_id`: the engine joins no other
-/// Welcome into that group. The join that matches it consumes it in the
-/// join's own transaction.
+/// While it is stored and unexpired, it reserves both: the engine joins no
+/// other Welcome into `group_id`, and no Welcome into another group that
+/// adds this device by `key_package_ref`. The join that matches it consumes
+/// it in the join's own transaction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceGroupWelcomeExpectation {
     pub group_id: GroupId,
     pub sender_signature_key: Vec<u8>,
+    /// A record stored before the link named its KeyPackage reads as empty,
+    /// which matches no Welcome.
+    #[serde(default)]
+    pub key_package_ref: Vec<u8>,
     pub expires_at: u64,
 }
 
@@ -873,6 +879,11 @@ pub trait DeviceGroupWelcomeStorage {
         &self,
         group_id: &GroupId,
     ) -> StorageResult<Option<DeviceGroupWelcomeExpectation>>;
+    /// Every stored expectation, expired ones included. One stands for each
+    /// link this device waits on, so there are few.
+    fn device_group_welcome_expectations(
+        &self,
+    ) -> StorageResult<Vec<DeviceGroupWelcomeExpectation>>;
     /// Whether an expectation for `group_id` was there to delete.
     fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool>;
 }
@@ -963,6 +974,50 @@ pub trait PrivateKeyPackageStorage {
     /// Every issued record, oldest first.
     fn list_issued_private_key_packages(&self) -> StorageResult<Vec<IssuedPrivateKeyPackage>>;
     fn delete_issued_private_key_package(&self, key_package_ref: &[u8]) -> StorageResult<()>;
+}
+
+// ── AnnouncedKeyPackageStorage ─────────────────────────────────────────────
+
+/// A KeyPackage a device-group roster announced for one of its device slots
+/// (mdk#2628 D31 item 7).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AnnouncedKeyPackage {
+    /// The device's KeyPackage slot, the Nostr `d` its roster entry is keyed
+    /// by.
+    pub slot: [u8; 32],
+    pub key_package_ref: Vec<u8>,
+}
+
+/// How long an announcement is kept after the last roster state this device
+/// applied that announced it: as long as a KeyPackage publication stays
+/// fresh, so a relay still serving it after a newer announcement is covered.
+/// A slot whose roster entry still announces it needs no record.
+pub const ANNOUNCED_KEY_PACKAGE_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// How many announcements each slot of a group keeps, newest first.
+pub const ANNOUNCED_KEY_PACKAGES_PER_SLOT: usize = 16;
+
+/// Every KeyPackage a device-group roster this device held announced, by
+/// group and slot (mdk#2628 D31 item 7). The engine records each roster
+/// state it applies; nothing in the engine reads them back.
+pub trait AnnouncedKeyPackageStorage {
+    /// Record `announced` as seen in `group_id`'s roster at `seen_at`. A pair
+    /// already recorded keeps the later of the two times.
+    fn record_announced_key_packages(
+        &self,
+        group_id: &GroupId,
+        announced: &[AnnouncedKeyPackage],
+        seen_at: u64,
+    ) -> StorageResult<()>;
+    /// Drop every record last seen before `before`, and each group slot's
+    /// records beyond its `per_slot` most recently seen.
+    fn prune_announced_key_packages(&self, before: u64, per_slot: usize) -> StorageResult<()>;
+    /// What `group_id`'s rosters announced, last seen at or after `since`.
+    fn announced_key_packages(
+        &self,
+        group_id: &GroupId,
+        since: u64,
+    ) -> StorageResult<Vec<AnnouncedKeyPackage>>;
 }
 
 // ── MaintenanceStorage ─────────────────────────────────────────────────────
@@ -1156,6 +1211,12 @@ pub trait StorageProvider:
     /// Optional store of the private KeyPackages this device issued to its
     /// siblings (mdk#2628 item 3.4b). A backend without one issues none.
     fn private_key_package_storage(&self) -> Option<&dyn PrivateKeyPackageStorage> {
+        None
+    }
+
+    /// Optional store of the KeyPackages device-group rosters announced
+    /// (mdk#2628 D31 item 7). A backend without one records none.
+    fn announced_key_package_storage(&self) -> Option<&dyn AnnouncedKeyPackageStorage> {
         None
     }
 

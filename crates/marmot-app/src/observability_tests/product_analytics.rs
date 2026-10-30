@@ -9,12 +9,6 @@ use std::sync::atomic::Ordering;
 #[cfg(feature = "product-analytics-export")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::observability_test_support::configured;
-#[cfg(feature = "product-analytics-export")]
-use crate::observability_test_support::grant;
-use crate::observer::permit_valid;
-#[cfg(feature = "product-analytics-export")]
-use crate::wiring;
 #[cfg(feature = "product-analytics-export")]
 use crate::{
     AppError, ProductAnalyticsActivity, ProductEvent, ProductEventMode, ProductEventSchema,
@@ -24,6 +18,12 @@ use crate::{
     DiagnosticsExporterStatus, MarmotApp, ProductAnalyticsRuntimeConfig, ProductFamily,
     ProductUnit, UsageDiagnosticsDecision,
 };
+use marmot_observability::observability_test_support::configured;
+#[cfg(feature = "product-analytics-export")]
+use marmot_observability::observability_test_support::grant;
+use marmot_observability::observer::permit_valid;
+#[cfg(feature = "product-analytics-export")]
+use marmot_observability::wiring;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "product-analytics-export")]

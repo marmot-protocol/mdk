@@ -3,7 +3,7 @@
 use super::account_worker::AccountWorkerCommand;
 use super::event_routing::{chat_list_event_route, projection_update_from_event};
 use super::{AccountManager, MarmotAppRuntime, blocking_app_task, wait_for_runtime_shutdown};
-use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
+use crate::RuntimePerformanceOperation as RuntimeOp;
 use crate::chat_presentation::signals::PresentationInvalidation;
 use crate::conversation_presentation::{
     ConversationAuthority, ConversationHeaderState, ConversationPresentationError,
@@ -11,8 +11,9 @@ use crate::conversation_presentation::{
 };
 use crate::drafts::MessageDraftInvalidation;
 use crate::{AppClient, AppError, MarmotApp, MarmotAppEvent, SelectedMessageDraft};
-use crate::{RuntimePerformanceOperation as RuntimeOp, observer::PerformanceRecorder};
 use cgka_traits::{GroupId, StorageError};
+use marmot_observability::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
+use marmot_observability::observer::PerformanceRecorder;
 use marmot_session::GroupAuthoritySnapshot;
 use std::{
     sync::{Arc, Mutex, Weak},

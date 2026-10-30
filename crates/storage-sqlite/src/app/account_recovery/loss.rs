@@ -218,7 +218,7 @@ impl RecoveryLossReach {
 
 /// Which generations a reach read counts.
 #[derive(Clone, Copy)]
-enum ReachOf {
+pub(super) enum ReachOf {
     /// One cause's generations that still carry debt.
     Cause(RecoveryLossCause),
     /// Every generation an import charged after this loss revision, retired
@@ -226,7 +226,11 @@ enum ReachOf {
     ImportedAfter(i64),
 }
 
-fn reach(conn: &Connection, label: &str, of: ReachOf) -> StorageResult<RecoveryLossReach> {
+pub(super) fn reach(
+    conn: &Connection,
+    label: &str,
+    of: ReachOf,
+) -> StorageResult<RecoveryLossReach> {
     let (filter, value) = match of {
         ReachOf::Cause(cause) => (
             "cause = ?2

@@ -4,6 +4,32 @@
 
 ### Breaking changes
 
+- Migration 0137 advances account storage to schema 137 (mdk#2628 item 3.6).
+  It adds `device_renames`, one row per device this device renamed in its
+  device group's roster: the label its latest rename sets, the rename ids
+  that rename wrote, and the rename ids the device's entry held where this
+  device's renames of it were built. `SqliteAppStorage` gains
+  `device_renames`, `device_rename`, `put_device_rename` and
+  `drop_device_rename`, with `DeviceRenameRecord`.
+- Migration 0136 advances account storage to schema 136 (mdk#2660 phase 4).
+  It adds `account_recovery_conversion`, the marker of the one-time upgrade
+  conversion (its next step, whether the changed "history may be incomplete"
+  notices still need announcing, whether a report is pending, and the shadow
+  rows and units the conversion counted), `account_recovery_conversion_counts`
+  (converted obligations by cause and disposition) and
+  `account_recovery_conversion_loss` (the loss watermarks of each account and
+  cause whose live loss it un-covered). Every database starts with the
+  conversion pending.
+  `SqliteAppStorage` gains `convert_recovery_obligations`, which takes a
+  `RecoveryConversionInput` of `RecoveryConversionRoute`s,
+  `recovery_conversion_pending`, `recovery_conversion_report` (a
+  `RecoveryConversionReport` of `RecoveryConvertedObligations` by cause),
+  `acknowledge_recovery_conversion_report`, `converted_recovery_loss` (each
+  account and cause's converted `RecoveryConvertedLoss` watermarks, until
+  reclaimed), `reclaim_converted_recovery_loss` (deletes each converted
+  generation still at its converted count), `recovery_conversion_notices_changed`
+  and `acknowledge_recovery_conversion_notices`. Nothing calls the conversion
+  yet.
 - Migration 0135 advances account storage to schema 135 (mdk#2660 phase 4).
   It replaces `account_recovery_units.fencing`, which nothing set, with
   `account_recovery_unit_fences`: each capture range a unit fences, one row
@@ -24,6 +50,13 @@
   (what this device still wants from each issuer). `SqliteAccountStorage` implements the new
   `PrivateKeyPackageStorage`; `SqliteAppStorage` gains the received-KeyPackage
   and need reads and writes. Nothing writes them unless device groups are on.
+- Migration 0144 advances account storage to schema 144 (mdk#2628 item 3.2).
+  It adds `cgka_announced_key_packages`: one row per KeyPackage a
+  device-group roster this device applied announced for a slot, with when it
+  last applied one that did. `SqliteAccountStorage` implements the new
+  `AnnouncedKeyPackageStorage`. Rows survive a branch-selection rewind, go
+  with their group, and are pruned after 30 days or past 16 per slot. Nothing
+  writes them unless device groups are on.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`
@@ -177,6 +210,12 @@
   goal the cap parked.
 - `apply_group_push_token_tombstone` takes an `AccountGroupPushTokenTombstone`
   instead of eight arguments, and stores its optional removal proof.
+- `SqliteAccountStorage` implements the new
+  `DeviceGroupWelcomeStorage::device_group_welcome_expectations`, which lists
+  every stored expectation, expired ones included (mdk#2628 item 3.3b, D41).
+  An expectation's record gains `key_package_ref`, the confirmed KeyPackage's
+  `KeyPackageRef`; a record stored before it reads with an empty ref. No
+  migration: the field lives in the stored record.
 
 ### Added
 
@@ -218,6 +257,12 @@
   `record_group_push_gossip_announce` now also takes the owed value the
   published announce was built under, and settles the debt only while it
   still holds that value; a new Welcome drops it.
+
+### Fixed
+
+- `delete_group` joins a caller's `with_transaction` instead of beginning its
+  own, which failed inside one, so the engine's cleanup of a failed group
+  creation now removes the group's MLS state.
 
 ## 0.14.0 - 2026-10-23
 

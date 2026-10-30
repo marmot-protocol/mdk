@@ -1,7 +1,7 @@
 //! The runtime-operation recorder's cancellation test, which measures an `AppError` result.
 
-use crate::observer::PerformanceRecorder;
 use crate::{AppPerformanceTelemetry, RuntimePerformanceOperation, RuntimePerformanceSnapshot};
+use marmot_observability::observer::PerformanceRecorder;
 
 /// The live conversation-open series, read from the public snapshot.
 fn sample(t: &AppPerformanceTelemetry) -> RuntimePerformanceSnapshot {

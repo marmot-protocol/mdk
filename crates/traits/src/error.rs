@@ -183,11 +183,14 @@ pub enum EngineError {
     DeviceEntryChanged { group_id: GroupId },
 
     /// A Welcome refused because it is not the device-group Welcome a
-    /// confirmed device link expects (mdk#2628 D28, D30): it joins a group
-    /// that requires the device roster with no link expecting it, it comes
-    /// from a leaf other than the one the link named, it arrives after the
-    /// link's wait, or it joins a group id a link reserved without being that
-    /// link's Welcome. Nothing was joined; an expectation it failed stays.
+    /// confirmed device link expects (mdk#2628 D28, D30, D41): it joins a
+    /// group that requires the device roster with no link expecting it, it
+    /// comes from a leaf other than the one the link named, it adds this
+    /// device by a KeyPackage other than the one the link confirmed, it
+    /// arrives after the link's wait, it joins a group id a link reserved
+    /// without being that link's Welcome, or it adds this device to another
+    /// group by the KeyPackage a waiting link reserved. Nothing was joined;
+    /// an expectation it failed stays.
     #[error("Welcome refused: not the device-group Welcome a confirmed link expects")]
     UnexpectedDeviceGroupWelcome,
 

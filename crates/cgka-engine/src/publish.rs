@@ -195,6 +195,12 @@ impl<S: StorageProvider> Engine<S> {
                         .merge_pending_commit(&tx_provider)
                         .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
                     crate::app_components::validate_current_profile_group_invariants(&mls_group)?;
+                    crate::announced_key_packages::record_roster_announcements(
+                        storage,
+                        &group_id,
+                        &mls_group,
+                        self.wall_clock.now(),
+                    )?;
                     if let Some(stamp) = own_commit_stamp.as_mut() {
                         stamp.resulting_epoch_authenticator = Some(
                             crate::openmls_projection::own_commit_post_merge_epoch_authenticator(

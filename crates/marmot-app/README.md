@@ -89,7 +89,8 @@ database and releases file locks; `shutdown` alone does not. See
 reaches live subscriptions only after the write behind it has committed, so an update a host received that way is
 still stored after `shutdown_and_close`.
 
-For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on; the user directory is the [`nostr-directory`](../nostr-directory) crate) see
+For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on; the user directory is the [`nostr-directory`](../nostr-directory) crate
+and the diagnostics exporters are the [`marmot-observability`](../marmot-observability) crate) see
 [`AGENTS.md`](AGENTS.md).
 
 ## SOCKS5 routing
@@ -415,11 +416,11 @@ writes them with its next KeyPackage announcement in the device group.
 
 `MarmotAppRuntime::rename_linked_device(account_ref, slot_id_hex, label)` renames any of the account's devices, this one
 included: one roster commit in the device group, through the same roster write path as slot announcements, that changes
-only that entry's label. The label is at most 64 bytes of UTF-8; empty clears it. While the device group has an earlier
-change of this device's in flight, the rename is refused as `DeviceGroupRefused("device_group_busy")` with nothing
-sent, since a commit then could build on a roster that is about to change; retry later. A rename whose commit loses a
-fork to one that also changes that device's entry is not made again, and the winning label stands. Show the label the
-next list returns after `LinkedDevicesChanged`, not the one the user typed.
+only that entry's label and rename id. The label is at most 64 bytes of UTF-8; empty clears it. While the device group
+has an earlier change of this device's in flight, the rename is refused as `DeviceGroupRefused("device_group_busy")`
+with nothing sent, since a commit then could build on a roster that is about to change; retry later. A rename whose
+commit loses a fork is made again on a later maintenance pass, unless another rename of that device won; that one
+stands. Show the label the next list returns after `LinkedDevicesChanged`, not the one the user typed.
 
 ### Overdue KeyPackage refresh
 
@@ -432,6 +433,19 @@ announced but failing at the relays doesn't count. The client recomputes the ans
 `MarmotAppEvent::KeyPackageRefreshOverdueChanged` says to re-read. Like `LinkedDevicesChanged`, it also fires once each
 time the account's worker opens or reconnects. It is false, and the event silent, in every release build until the
 roster's spec lands.
+
+## Unrecognized sign-ins
+
+`MarmotAppRuntime::unrecognized_sign_ins(account_ref)` lists sign-ins of this account that this device does not
+recognize as `UnrecognizedSignIn`s (mdk#2628), the earliest to appear first. Each is a fresh, valid KeyPackage of the
+account in a slot that neither this device nor the roster of its device group knows. One that is
+`before_this_device` was found by this device's first check: ask whether the user still has it. Any other is new: ask
+whether it was them. The account checks its slots at open, every six hours, and soon after one of its KeyPackages
+arrives live; `check_sign_ins` checks now. `answer_sign_in` takes a `SignInResponse`: `NotNow` keeps one listed
+without a prompt, `Reject` records it as rejected in the device group's roster, and `Dismiss` ends a prompt another
+device answered first. Linking one is device pairing's. `MarmotAppEvent::UnrecognizedSignInsChanged` says to re-read,
+and also fires once each time the account's worker opens or reconnects. All of it is empty and silent in every release
+build until the roster's spec lands.
 
 ## Linking a new device
 

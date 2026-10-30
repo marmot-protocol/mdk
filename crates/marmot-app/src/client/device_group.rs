@@ -37,13 +37,16 @@
 //!   `device_renames.rs`), through the runtime's roster write path, the one
 //!   slot announcements use. Each announcement also writes this device's
 //!   client and platform from the app's config into its own entry. Rejected
-//!   sign-ins (3.2) are written as rejected slots, never device entries, by
-//!   `commit_device_roster_update`.
+//!   sign-ins (3.2) are written as rejected slots, never device entries,
+//!   through the runtime's rejected-slot write (`reject_device_slots`). The
+//!   app keeps no roster write of its own.
 //!
 //! A confirmed link comes from device pairing (`device_pairing`). The
 //! test-policy hooks still supply one directly, for tests.
 
 mod messages;
+
+pub(crate) use messages::is_device_group_kind;
 
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
@@ -51,7 +54,7 @@ use cgka_traits::app_components::{
     DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID, decode_device_roster_v1,
     encode_device_roster_update_v1, encode_device_roster_v1, encode_nostr_routing_v1,
 };
-use cgka_traits::engine::{CreateGroupRequest, SendIntent};
+use cgka_traits::engine::CreateGroupRequest;
 use cgka_traits::storage::{
     DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage as _, GroupStorage as _,
     MaintenanceStorage as _, StorageError,
@@ -304,13 +307,16 @@ impl AppClient {
         let now = unix_now_seconds();
         let mut roster = DeviceRosterV1::default();
         OsRng.fill_bytes(&mut roster.leaf_tag_key);
-        // Each founding entry announces the KeyPackage in that device's slot
-        // (3.4), so neither device owes a roster commit before it publishes.
-        // This device's entry also carries its tag signature key, so the
-        // engine tags its founding leaf (3.1d); the new device sets its own
-        // once it joins. Nobody chose settings for the founder, so it takes the
-        // defaults a new device starts with: siblings add it to chats it is
-        // missing, with their history.
+        // The founding roster lists only this device and its rejections; the
+        // founding Add sets the new device's entry, as every later Add does,
+        // so no entry ever names a device without its leaf (D41). Each entry
+        // announces the KeyPackage in that device's slot (3.4), so neither
+        // device owes a roster commit before it publishes. This device's
+        // entry also carries its tag signature key, so the engine tags its
+        // founding leaf (3.1d); the new device sets its own once it joins.
+        // Nobody chose settings for the founder, so it takes the defaults a
+        // new device starts with: siblings add it to chats it is missing, with
+        // their history.
         roster.devices.insert(
             own_slot,
             DeviceEntryV1 {
@@ -325,25 +331,28 @@ impl AppClient {
                 ..DeviceEntryV1::default()
             },
         );
-        roster.devices.insert(
-            sibling_slot,
-            DeviceEntryV1 {
-                label: choices.label.clone(),
-                linked_at: now,
-                linked_by: Some(own_slot),
-                settings: DeviceSettingsV1 {
-                    add_to_all_chats: choices.add_to_all_chats,
-                    bring_history: choices.bring_history,
-                    keep_while_inactive: false,
-                },
-                announced_key_package: Some(hex::decode(&link.key_package_ref_hex)?),
-                ..DeviceEntryV1::default()
+        let sibling_entry = DeviceEntryV1 {
+            label: choices.label.clone(),
+            linked_at: now,
+            linked_by: Some(own_slot),
+            settings: DeviceSettingsV1 {
+                add_to_all_chats: choices.add_to_all_chats,
+                bring_history: choices.bring_history,
+                keep_while_inactive: false,
             },
-        );
+            announced_key_package: Some(hex::decode(&link.key_package_ref_hex)?),
+            ..DeviceEntryV1::default()
+        };
         // Rejections this device made before it had a device group (3.2).
-        self.founding_sign_in_rejections(&mut roster)?;
+        self.founding_sign_in_rejections(&mut roster, &sibling_slot)?;
         let roster = encode_device_roster_v1(&roster)
             .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
+        let roster_update = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
+            sibling_slot,
+            sibling_entry,
+        )])
+        .and_then(|update| encode_device_roster_update_v1(&update).map_err(|e| e.to_string()))
+        .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
         let routing = encode_nostr_routing_v1(&self.app.new_nostr_routing(None)?)
             .map_err(AppError::InvalidNostrRouting)?;
         let request = CreateGroupRequest {
@@ -388,6 +397,7 @@ impl AppClient {
             .prepare_create_group_with_chosen_id_and_audit_context(
                 request,
                 link.device_group_id.clone(),
+                Some(roster_update),
                 Timestamp(wait_ends),
                 audit_context.clone(),
             )
@@ -432,16 +442,18 @@ impl AppClient {
             self.ensure_device_group_route(&group_id).map(drop),
         );
         super::recover_post_canonical_result("name_device_tag_group", self.sync_device_tag_group());
-        self.linked_devices_changed = true;
+        self.note_device_roster_changed();
         Ok(group_id)
     }
 
     /// The new device's side of a confirmed link, before it sends its own
     /// confirmation: wait [`WELCOME_WAIT_SECS`] for the Welcome into the
-    /// device group the link names, from the leaf it names. The engine joins
-    /// that group only through that Welcome, and refuses every other Welcome
-    /// into its id meanwhile, so a group someone else founded under the id
-    /// never joins and never takes it.
+    /// device group the link names, from the leaf it names, adding this
+    /// device by the KeyPackage it confirmed. The engine joins that group only
+    /// through that Welcome, and refuses every other Welcome into its id
+    /// meanwhile, so a group someone else founded under the id never joins
+    /// and never takes it. Nor does any other Welcome that adds this device
+    /// by that KeyPackage, into any group (D41).
     ///
     /// The group must be new to this device. Its waiting row is written
     /// first and removed again if the engine cannot record the expectation.
@@ -460,6 +472,7 @@ impl AppClient {
         if self.stored_group(&link.device_group_id)?.is_some() {
             return Err(AppError::DeviceGroupRefused("device_group_exists"));
         }
+        let key_package_ref = hex::decode(&link.key_package_ref_hex)?;
         let group_id_hex = hex::encode(link.device_group_id.as_slice());
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         if !storage.insert_device_group(&DeviceGroupRecord {
@@ -475,6 +488,7 @@ impl AppClient {
             .expect_device_group_welcome(&DeviceGroupWelcomeExpectation {
                 group_id: link.device_group_id.clone(),
                 sender_signature_key: link.welcome_sender_key.clone(),
+                key_package_ref,
                 expires_at: now.saturating_add(WELCOME_WAIT_SECS),
             });
         if let Err(error) = expected {
@@ -585,7 +599,7 @@ impl AppClient {
             None,
             now,
         )? {
-            self.linked_devices_changed = true;
+            self.note_device_roster_changed();
             self.sync_device_tag_group()?;
             return Ok(true);
         }
@@ -631,7 +645,7 @@ impl AppClient {
                     None,
                     record.recorded_at,
                 )?;
-                self.linked_devices_changed = true;
+                self.note_device_roster_changed();
             } else {
                 storage.delete_device_group(&record.group_id_hex, DeviceGroupTrust::Creating)?;
             }
@@ -889,44 +903,6 @@ impl AppClient {
         Ok(Some((group_id, roster)))
     }
 
-    /// One roster commit in the trusted device group `group_id`, carrying
-    /// `operations` as one diff update: the way to write rejected slots.
-    /// Device entries go through the runtime's `edit_device_roster_entry`
-    /// instead, which replaces an entry only while it is the one it read.
-    /// Callers read `group_id` from [`Self::trusted_device_roster`] and check
-    /// the group is quiet first.
-    pub(crate) async fn commit_device_roster_update(
-        &mut self,
-        group_id: GroupId,
-        operations: Vec<DeviceRosterOperationV1>,
-        action: &'static str,
-    ) -> Result<(), AppError> {
-        let update = DeviceRosterUpdateV1::new(operations)
-            .and_then(|update| encode_device_roster_update_v1(&update))
-            .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
-        let audit_context = Self::local_human_action_context(
-            action,
-            vec!["app_component"],
-            vec![DEVICE_ROSTER_COMPONENT_ID],
-            None,
-        );
-        let effects = self
-            .runtime
-            .send_with_audit_context(
-                SendIntent::UpdateAppComponents {
-                    group_id,
-                    updates: vec![AppComponentData {
-                        component_id: DEVICE_ROSTER_COMPONENT_ID,
-                        data: update,
-                    }],
-                },
-                audit_context,
-            )
-            .await?;
-        self.observe_drained_session_events(&effects).await?;
-        Ok(())
-    }
-
     /// This account's devices from the trusted device group's roster: this
     /// device first, then by when each was linked, then by slot. Empty when
     /// [`Self::trusted_device_roster`] has no roster.
@@ -948,6 +924,14 @@ impl AppClient {
         // Stable, so equal keys keep the roster's slot order.
         devices.sort_by_key(|device| (!device.is_this_device, device.linked_at));
         Ok(devices)
+    }
+
+    /// A hidden device-group event or a change of trust: the roster this
+    /// device reads may differ, and with it the linked devices and how each
+    /// unrecognized sign-in is listed.
+    pub(crate) fn note_device_roster_changed(&mut self) {
+        self.linked_devices_changed = true;
+        self.unrecognized_sign_ins_changed = true;
     }
 
     /// Whether the linked devices may have changed since the last call. Set

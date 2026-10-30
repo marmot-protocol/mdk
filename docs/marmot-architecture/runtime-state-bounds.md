@@ -58,7 +58,7 @@ Each peer's scan receives at most 16,384 raw events and 4 MiB of validated event
 pages and at most three seconds within the shared pass deadline. Held-only traversal is not recovery progress;
 the existing durable unserved-pass count and backoff survive client reconstruction unchanged.
 
-### `marmot-app` runtime performance observations (`src/app_telemetry/runtime.rs`)
+### `marmot-observability` runtime performance observations (`src/app_telemetry/runtime.rs`)
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
@@ -86,6 +86,12 @@ only telemetry, a closed operation and timing metadata, never a client or storag
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | `cgka_device_group_welcome_expectations` | One row per device group a confirmed link waits to join: a group id, the expected sender's signature key and a deadline. The app records one only alongside its `awaiting_welcome` row, and an account holds at most one such row, so at most one in practice. | The join it admits deletes it in the same transaction. The app deletes it before the row when the link is withdrawn or its 10-minute wait ends (`end_welcome_waits`, on every new link and every reconcile), which also drops a waiting row left without its expectation. |
+
+### `cgka-engine` announced KeyPackages (`src/announced_key_packages.rs`, `storage-sqlite` `src/protocol/storage/announced_key_packages.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `cgka_announced_key_packages` | One row per (group, slot, KeyPackageRef) a device-group roster this device applied announced, so it grows only with commits that change an announcement; at most 16 per group slot (`ANNOUNCED_KEY_PACKAGES_PER_SLOT`). | A repeat sighting renews a row. Every write prunes rows last seen more than 30 days ago (`ANNOUNCED_KEY_PACKAGE_RETENTION_SECS`) and each slot's rows past its 16 most recently seen. Deleting the group cascades. A branch-selection rewind keeps them: they sit outside snapshots on purpose. |
 
 ### `storage-sqlite` durable moderation (`src/timeline/reports.rs`, `src/timeline.rs`)
 
@@ -161,6 +167,7 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 | `AppClient.device_link_changed` | One flag | Set at open and when a pairing drive changes linking as hosts read it; cleared at the same seams, which announce `DeviceLinkChanged`; dropped with the client, whose replacement opens with it set. |
 | `AppClient.linked_devices_changed` | One flag | Set at open and by a hidden device-group event or a change of device-group trust; cleared at the next account-level or applied-summary publication seam, which announces `LinkedDevicesChanged`; dropped with the client, whose replacement opens with it set. |
 | `AppClient.key_package_refresh_overdue` and `key_package_refresh_overdue_changed` | One `Option<bool>` and one flag | The answer is replaced after each maintenance pass; a change sets the flag, which the next account-level or applied-summary publication seam clears by announcing `KeyPackageRefreshOverdueChanged`. Both are dropped with the client, whose replacement opens with the flag set. |
+| `AppClient.unrecognized_sign_ins_changed` | One flag | Set at open, by a sign-in check or answer that changed what hosts see, and with every roster change that sets `linked_devices_changed`; cleared at the same seams, which announce `UnrecognizedSignInsChanged`; dropped with the client, whose replacement opens with it set. |
 | `AppClient.history_notice_baseline` | One entry (16-byte obligation id, revision, optional group id) per parked recovery obligation; input-relative to the parked demand keys, not to history | Replaced wholesale from one indexed read at each publication seam; dropped with the client. Losing it costs at most one extra `HistoryNoticesChanged`. |
 | `AppClient.encrypted_media_not_required_epochs` | One `u64` per live projected group (mdk#1380) | Pruned to the live group set at the start of every warm pass; stale entries are evicted when the group epoch advances and an authoritative re-check finds the component required; the whole map is dropped with the client. Entries are only ever inserted after a successful authoritative negative, so map loss or eviction costs at most one `MlsGroup::load` re-check, never a wrong skip. |
 | Avatar acquisition | At most 2,048 jobs, each descriptor at most 16 KiB; at most four HTTP/results across foreground media and avatar work, with one permit kept free by background admission | Job rows cascade with asset eviction/removal. Selected source changes replace demand atomically. Interrupted work resumes after worker reconstruction; retry deadlines persist and 16 consecutive transient failures slow to one daily probe. Worker exit cancels active I/O. |
