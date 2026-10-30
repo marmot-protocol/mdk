@@ -17,6 +17,17 @@ fn nostr_peeler(account: &[u8]) -> transport_nostr_peeler::NostrMlsPeeler {
         .with_welcome_signer(deterministic_nostr_keys(account))
 }
 
+async fn recovery_control(
+    account: &[u8],
+    carrier: &TransportMessage,
+) -> cgka_traits::AuthenticatedGroupRecovery {
+    let peeled = nostr_peeler(account).peel_welcome(carrier).await.unwrap();
+    let PeeledContent::GroupRecovery { recovery } = peeled.content else {
+        panic!("expected authenticated recovery control");
+    };
+    *recovery
+}
+
 fn nostr_device_session_with_peeler(
     path: impl Into<std::path::PathBuf>,
     key: &SqlCipherKey,
@@ -153,7 +164,10 @@ impl Device {
     }
 
     fn lifecycle(&self) -> cgka_traits::KeyPackageLifecycleState {
-        self.runtime.key_package_maintenance_status().unwrap().unwrap()
+        self.runtime
+            .key_package_maintenance_status()
+            .unwrap()
+            .unwrap()
     }
 
     async fn ingest(&mut self, welcome: &TransportMessage) -> marmot_session::IngestEffects {
@@ -273,7 +287,11 @@ async fn rumors_for(
     account: &[u8],
     key_packages: &[&cgka_traits::engine::KeyPackage],
 ) -> Vec<TransportMessage> {
-    assert_eq!(welcomes.len(), key_packages.len(), "one rumor per KeyPackage");
+    assert_eq!(
+        welcomes.len(),
+        key_packages.len(),
+        "one rumor per KeyPackage"
+    );
     let account_id = MemberId::new(pad32(account));
     let mut named = Vec::new();
     for welcome in welcomes {
@@ -332,9 +350,11 @@ async fn create_group(
 
 async fn evolve(inviter: &mut AccountDeviceSession, intent: SendIntent) -> Vec<TransportMessage> {
     let effects = inviter.send(intent).await.unwrap();
-    let [PublishWork::GroupEvolution {
-        welcomes, pending, ..
-    }] = &effects.publish[..]
+    let [
+        PublishWork::GroupEvolution {
+            welcomes, pending, ..
+        },
+    ] = &effects.publish[..]
     else {
         panic!("expected one group evolution");
     };
@@ -453,9 +473,18 @@ async fn each_device_joins_only_through_its_own_rumor_in_either_order() {
         ..
     } = alice_with_two_devices("multi-device welcome order").await;
     let (phone_before, laptop_before) = (phone.lifecycle(), laptop.lifecycle());
-    let (group_id, welcomes) = create_group(&mut bob, &[&phone.key_package, &laptop.key_package], "both at once").await;
-    let [to_phone, to_laptop] = &rumors_for(&welcomes, b"alice", &[&phone.key_package, &laptop.key_package]).await[..]
-    else {
+    let (group_id, welcomes) = create_group(
+        &mut bob,
+        &[&phone.key_package, &laptop.key_package],
+        "both at once",
+    )
+    .await;
+    let [to_phone, to_laptop] = &rumors_for(
+        &welcomes,
+        b"alice",
+        &[&phone.key_package, &laptop.key_package],
+    )
+    .await[..] else {
         unreachable!()
     };
 
@@ -472,7 +501,10 @@ async fn each_device_joins_only_through_its_own_rumor_in_either_order() {
             duplicate(),
         ]
     );
-    assert_eq!(joins(&results), vec![(group_id.clone(), to_phone.id.clone())]);
+    assert_eq!(
+        joins(&results),
+        vec![(group_id.clone(), to_phone.id.clone())]
+    );
 
     // The laptop receives its own rumor first, then both again.
     let results = laptop
@@ -487,7 +519,10 @@ async fn each_device_joins_only_through_its_own_rumor_in_either_order() {
             duplicate(),
         ]
     );
-    assert_eq!(joins(&results), vec![(group_id.clone(), to_laptop.id.clone())]);
+    assert_eq!(
+        joins(&results),
+        vec![(group_id.clone(), to_laptop.id.clone())]
+    );
 
     // Neither device holds an offer, and each consumed only its own
     // KeyPackage.
@@ -620,8 +655,12 @@ async fn a_siblings_rumor_never_becomes_a_rejoin_offer() {
         },
     )
     .await;
-    let [to_phone, to_laptop] = &rumors_for(&welcomes, b"alice", &[&phone.key_package, &laptop.key_package]).await[..]
-    else {
+    let [to_phone, to_laptop] = &rumors_for(
+        &welcomes,
+        b"alice",
+        &[&phone.key_package, &laptop.key_package],
+    )
+    .await[..] else {
         unreachable!()
     };
 
@@ -702,7 +741,10 @@ async fn a_welcome_naming_a_superseded_key_package_still_joins() {
     let results = phone.ingest_all(&[to_phone]).await;
     assert_eq!(joins(&results), vec![(group_id, to_phone.id.clone())]);
     let after = phone.lifecycle();
-    assert_eq!(after.current_key_package_ref, before.current_key_package_ref);
+    assert_eq!(
+        after.current_key_package_ref,
+        before.current_key_package_ref
+    );
     assert!(
         after
             .retained_private_material
@@ -719,12 +761,7 @@ async fn a_welcome_naming_a_superseded_key_package_still_joins() {
 async fn rejoin_before_the_upgrade(
     dir: &tempfile::TempDir,
     key: &SqlCipherKey,
-) -> (
-    Device,
-    GroupId,
-    TransportMessage,
-    TransportMessage,
-) {
+) -> (Device, GroupId, TransportMessage, TransportMessage) {
     let path = dir.path().join("alice-phone.sqlite");
     let mut phone = Device::with_session(
         nostr_device_session_with_peeler(
@@ -769,8 +806,7 @@ async fn rejoin_before_the_upgrade(
         b"alice",
         &[&phone.key_package, &laptop.key_package],
     )
-    .await[..]
-    else {
+    .await[..] else {
         unreachable!()
     };
     (phone, group_id, to_phone.clone(), to_laptop.clone())
@@ -874,8 +910,12 @@ mod same_account_welcome {
         name: &str,
         account: &[u8],
     ) -> (Device, SqliteAccountStorage) {
-        let (session, storage) =
-            device_session(dir.path().join(format!("{name}.sqlite")), key, account, true);
+        let (session, storage) = device_session(
+            dir.path().join(format!("{name}.sqlite")),
+            key,
+            account,
+            true,
+        );
         let mut device =
             Device::with_session(session, cgka_traits::engine::KeyPackage::new(Vec::new()));
         device.publish().await;
@@ -948,7 +988,8 @@ mod same_account_welcome {
     ) -> (Device, SqliteAccountStorage, Device, GroupId) {
         let key = SqlCipherKey::new("same-account welcome").unwrap();
         let (mut bob, _) = device_session(dir.path().join("bob.sqlite"), &key, b"bob", require);
-        let (mut phone, phone_storage) = advertising_device(dir, &key, "alice-phone", b"alice").await;
+        let (mut phone, phone_storage) =
+            advertising_device(dir, &key, "alice-phone", b"alice").await;
         let (laptop, _) = advertising_device(dir, &key, "alice-laptop", b"alice").await;
         let created = bob
             .create_group(CreateGroupRequest {
@@ -1043,7 +1084,10 @@ mod same_account_welcome {
         assert_eq!(phone.lifecycle(), phone_before);
 
         let results = laptop.ingest_all(&[to_laptop]).await;
-        assert_eq!(joins(&results), vec![(group_id.clone(), to_laptop.id.clone())]);
+        assert_eq!(
+            joins(&results),
+            vec![(group_id.clone(), to_laptop.id.clone())]
+        );
         let welcomers: Vec<_> = results
             .iter()
             .flat_map(|effects| &effects.effects.events)

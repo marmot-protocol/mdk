@@ -1,6 +1,9 @@
 //! Account-device runtime: drives session effects through transport publish,
 //! confirmation, and rollback, and the effect aggregates it produces.
 
+mod group_recovery;
+pub use group_recovery::GroupRejoinStatus;
+
 /// Closed timing boundaries; callbacks receive no delivery or identity data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccountIngestPhase {
@@ -560,6 +563,7 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// error. Never set by production code.
     finish_stage_failure: Option<cgka_traits::MessageId>,
     publication_progress: PublicationProgressSlot,
+    recovery_turn: Vec<storage_sqlite::GroupRecoveryRecord>,
 }
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
@@ -627,6 +631,7 @@ where
             unread_welcome_groups: Vec::new(),
             finish_stage_failure: None,
             publication_progress: Arc::new(std::sync::Mutex::new(None)),
+            recovery_turn: Vec::new(),
         }
     }
 
@@ -2280,24 +2285,34 @@ where
     /// Only call this for authenticated, valid MLS commits or proposals.
     pub fn note_valid_state_bearing_input(&mut self, group_id: &GroupId) -> AccountResult<()> {
         let now = self.wall_clock.now();
-        for mut obligation in self.session.maintenance_obligations_for_group(group_id)? {
-            if matches!(
-                obligation.phase,
-                MaintenancePhase::CatchUp
-                    | MaintenancePhase::EoseTimeout
-                    | MaintenancePhase::Grace
-                    | MaintenancePhase::Quiet
-                    | MaintenancePhase::Jitter
-                    | MaintenancePhase::Overdue
-            ) {
-                obligation.phase = MaintenancePhase::Quiet;
-                obligation.quiet_since = Some(now);
-                obligation.not_before = None;
-                self.persist_maintenance_obligation(&obligation)?;
-                self.maintenance_quiet_monotonic
-                    .insert(obligation.id, self.monotonic_clock.elapsed());
-            }
+        for obligation in self.session.maintenance_obligations_for_group(group_id)? {
+            self.reset_obligation_quiet(obligation, now)?;
         }
+        Ok(())
+    }
+
+    fn reset_obligation_quiet(
+        &mut self,
+        mut obligation: MaintenanceObligation,
+        now: Timestamp,
+    ) -> AccountResult<()> {
+        if !matches!(
+            obligation.phase,
+            MaintenancePhase::CatchUp
+                | MaintenancePhase::EoseTimeout
+                | MaintenancePhase::Grace
+                | MaintenancePhase::Quiet
+                | MaintenancePhase::Jitter
+                | MaintenancePhase::Overdue
+        ) {
+            return Ok(());
+        }
+        obligation.phase = MaintenancePhase::Quiet;
+        obligation.quiet_since = Some(now);
+        obligation.not_before = None;
+        self.persist_maintenance_obligation(&obligation)?;
+        self.maintenance_quiet_monotonic
+            .insert(obligation.id, self.monotonic_clock.elapsed());
         Ok(())
     }
 
@@ -3915,6 +3930,8 @@ where
 
     /// Ingest a borrowed delivery through the ordinary engine and publication path.
     /// Its transport owner retains the frame until the operation is acknowledged.
+    /// Recovery controls also drain independently authorized native work restored
+    /// by hydration, even when the control itself is ignored.
     pub async fn ingest_delivery(
         &mut self,
         delivery: &TransportDelivery,
@@ -3935,7 +3952,44 @@ where
             return Err(AccountError::WrongAccountDelivery);
         }
         let started = Instant::now();
-        let ingested = self.session.ingest_delivery(delivery).await;
+        let ingested = match self.session.ingest_delivery(delivery).await {
+            Ok(IngestEffects {
+                outcome: IngestOutcome::GroupRecovery { recovery },
+                ..
+            }) => {
+                let ingested = self
+                    .ingest_group_recovery(&delivery.message, &recovery)
+                    .await;
+                observe(
+                    AccountIngestPhase::Engine,
+                    started.elapsed(),
+                    ingested.is_ok(),
+                );
+                let accepted = ingested?;
+                let mut ingested = AccountIngestEffects {
+                    // Preserve the authenticated classification for consumers;
+                    // accepting a recovery control is not accepting a Welcome.
+                    outcome: IngestOutcome::GroupRecovery { recovery },
+                    left_object_unpersisted: !accepted,
+                    effects: AccountDeviceEffects::default(),
+                };
+                let restored = self.session.drain();
+                if !restored.is_empty() {
+                    let started = Instant::now();
+                    let published = self.publish_session_effects(restored).await;
+                    observe(
+                        AccountIngestPhase::EffectPublication,
+                        started.elapsed(),
+                        published.is_ok(),
+                    );
+                    // The control contributes no native effects. Move the
+                    // restored batch whole, including its fanout summaries.
+                    ingested.effects = published?;
+                }
+                return Ok(ingested);
+            }
+            ingested => ingested,
+        };
         observe(
             AccountIngestPhase::Engine,
             started.elapsed(),
@@ -3955,20 +4009,11 @@ where
             published.is_ok(),
         );
         let effects = published?;
-        let mut state_bearing_groups = effects
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                GroupEvent::EpochChanged { group_id, .. } => Some(group_id.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        state_bearing_groups.extend(valid_proposal_groups);
-        let mut unique_state_bearing_groups = Vec::new();
-        for group_id in state_bearing_groups {
-            if !unique_state_bearing_groups.contains(&group_id) {
-                self.note_valid_state_bearing_input(&group_id)?;
-                unique_state_bearing_groups.push(group_id);
+        // Publication reconciles epoch changes, including its deferred retries.
+        let mut noted = HashSet::new();
+        for group_id in &valid_proposal_groups {
+            if noted.insert(group_id) {
+                self.note_valid_state_bearing_input(group_id)?;
             }
         }
         Ok(AccountIngestEffects {
@@ -4312,6 +4357,8 @@ where
                 .is_some_and(|baseline| baseline.as_slice() != current.as_slice())
             {
                 self.complete_maintenance_obligation(&mut obligation, now)?;
+            } else {
+                self.reset_obligation_quiet(obligation, now)?;
             }
         }
         Ok(())

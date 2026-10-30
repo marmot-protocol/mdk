@@ -3980,6 +3980,19 @@ impl<S: StorageProvider> Engine<S> {
         Ok(admins)
     }
 
+    /// Share the authenticated transport boundary with account-level control
+    /// workflows without moving their parsing or policy into the MLS engine.
+    pub fn transport_peeler(&self) -> Arc<dyn TransportPeeler> {
+        Arc::clone(&self.peeler)
+    }
+
+    /// Durable-seeded, in-memory recovery candidates. This performs no storage
+    /// scans or hydration; callers must still exclude departed copies using
+    /// the per-group lifecycle gates before initiating account recovery.
+    pub fn unrecoverable_group_ids(&self) -> Vec<GroupId> {
+        self.epoch_manager.unrecoverable_group_ids()
+    }
+
     /// Hash this copy's authenticated MLS device signing key, which remains
     /// stable across ordinary HPKE leaf refreshes and across source branches.
     pub fn own_recovery_key_hash(&self, group_id: &GroupId) -> Result<[u8; 32], EngineError> {
@@ -4022,12 +4035,6 @@ impl<S: StorageProvider> Engine<S> {
         device_key_hash: &[u8; 32],
     ) -> Result<cgka_traits::group_recovery::GroupRecoverySource, EngineError> {
         self.do_group_recovery_source(group_id, member, device_key_hash)
-    }
-
-    /// Share the authenticated transport boundary with account-level control
-    /// workflows without moving their parsing or policy into the MLS engine.
-    pub fn transport_peeler(&self) -> Arc<dyn TransportPeeler> {
-        Arc::clone(&self.peeler)
     }
 
     pub fn safe_export_secret_with_epoch(

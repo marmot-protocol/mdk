@@ -1207,6 +1207,163 @@ impl Scenario {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_inbox_audit_metrics() {
+    use cgka_traits::{GroupRecoveryBody, GroupRecoveryMessage};
+    use sha2::{Digest, Sha256};
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        for capture in [true, false] {
+            let mut scenario = Scenario::new().await;
+            let group = scenario.create().await;
+            scenario.bob.sync().await.unwrap();
+            #[cfg(feature = "product-analytics-export")]
+            {
+                scenario.alice.app.product_analytics =
+                    crate::product_analytics::test_product_collector();
+                scenario
+                    .alice
+                    .app
+                    .set_usage_diagnostics_consent(true)
+                    .unwrap();
+            }
+            if !capture {
+                scenario
+                    .alice
+                    .app
+                    .set_audit_log_settings(AuditLogSettings { enabled: false })
+                    .unwrap();
+                scenario.alice.audit_v5_probe = None;
+            }
+            let before = scenario
+                .alice
+                .audit_v5_probe
+                .as_ref()
+                .map(|probe| probe.rows.len());
+            let bob = scenario.bob.app.account_home().account("bob").unwrap();
+            let signer = scenario.bob.app.account_signer_for_summary(&bob).unwrap();
+            let peeler = NostrMlsPeeler::new().with_welcome_signer_arc(signer.as_nostr_signer());
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let request = GroupRecoveryMessage {
+                group_id: group,
+                request_id: [0x97; 32],
+                expires_at: now + 60,
+                body: GroupRecoveryBody::Request {
+                    device_key_hash: Sha256::digest(scenario.bob.runtime.own_signature_key())
+                        .into(),
+                },
+            };
+            let path = scenario.alice.app.account_storage_path("alice");
+            let keys = scenario
+                .alice
+                .app
+                .account_home()
+                .load_signing_keys("alice")
+                .unwrap();
+            let key = scenario
+                .alice
+                .app
+                .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+                .unwrap();
+            let connection = rusqlite::Connection::open(path).unwrap();
+            storage_sqlite::open_hardened_sqlcipher(
+                &connection,
+                &key,
+                storage_sqlite::SqlCipherHardening::cipher_only(),
+            )
+            .unwrap();
+            for mode in 0..3 {
+                // The third delivery authenticates successfully, then fails in
+                // the recovery journal lookup, not in invitation/MLS processing.
+                if mode == 2 {
+                    connection
+                        .execute("UPDATE cgka_group_rejoin SET record = x'00'", [])
+                        .unwrap();
+                }
+                let control = GroupRecoveryMessage {
+                    expires_at: if mode == 1 {
+                        now - 1
+                    } else {
+                        request.expires_at
+                    },
+                    ..request.clone()
+                };
+                let message = peeler
+                    .wrap_group_recovery(&control, &scenario.alice.runtime.self_id())
+                    .await
+                    .unwrap();
+                let result = scenario
+                    .alice
+                    .ingest_received_delivery(cgka_traits::TransportDelivery {
+                        account_id: scenario.alice.runtime.self_id(),
+                        group_id_hint: None,
+                        message,
+                        received_at: cgka_traits::transport::Timestamp(now),
+                        source: cgka_traits::TransportDeliverySource {
+                            transport: cgka_traits::transport::TransportSource("nostr".into()),
+                            plane: cgka_traits::TransportDeliveryPlane::AccountInbox,
+                            endpoint: None,
+                            subscription_id: None,
+                            wire: None,
+                        },
+                    })
+                    .await;
+                if mode == 2 {
+                    assert!(
+                        result.is_err(),
+                        "known control must retain real processing failure"
+                    );
+                } else {
+                    let summary = result.unwrap();
+                    assert!(summary.joined_groups.is_empty());
+                    assert_eq!(
+                        scenario
+                            .alice
+                            .runtime
+                            .group_rejoin_status(&request.group_id)
+                            .unwrap(),
+                        marmot_session::GroupRejoinStatus::Inactive,
+                    );
+                    if mode == 0 {
+                        let jobs = scenario
+                            .alice
+                            .engine_storage
+                            .list_group_recoveries()
+                            .unwrap();
+                        assert!(
+                            jobs.iter().any(|job| job.request_id == request.request_id),
+                            "the first control was accepted and persisted, not merely discarded"
+                        );
+                    }
+                }
+                if let Some(before) = before {
+                    assert_eq!(
+                        scenario.alice.audit_v5_probe.as_ref().unwrap().rows.len(),
+                        before,
+                        "controls must emit neither WelcomeObserved nor WelcomeUnwrapped"
+                    );
+                }
+                #[cfg(feature = "product-analytics-export")]
+                assert!(
+                    scenario
+                        .alice
+                        .app
+                        .product_analytics
+                        .test_payloads()
+                        .iter()
+                        .all(|event| event["eventName"] != "mdk_welcome_summary"),
+                    "accepted, refused and failed controls are not invitation metrics"
+                );
+            }
+        }
+    })
+    .await
+    .expect("bounded control audit and analytics scenario");
+}
+
 #[cfg(feature = "unreleased-device-pairing")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pairing_inbox_audit_metrics() {

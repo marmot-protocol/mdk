@@ -35,11 +35,18 @@ the default.
 - Publishes fresh KeyPackages through an injected boundary, and drives KeyPackage generator upgrades.
 - Turns `SessionEffects.publish` work into `TransportPublishRequest`s, then confirms or rolls back pending session state
   from the adapter's publish reports.
+- Reconciles epoch changes and local copy restoration with maintenance quiet windows. Failed bookkeeping stays owned
+  for retry without withholding confirmed effects, including when recovery-control ingest resumes publication.
 - Keeps a confirmed fanout scheduler-visible while linked Welcomes still await publication bookkeeping. Its retry
   cutoff follows the Welcomes' durable endpoint backoff; work without a stored cutoff uses the ordinary retry delay.
   Welcome backoff does not postpone earlier-ready group work; an incomplete group publication still orders later ones.
 - Keeps transport routing policy generic, so the first implementation can be Nostr without baking Nostr into the
   session or engine crates.
+- Reserves authenticated Unrecoverable rejoin work through `prepare_group_recovery`; the host resolves only the
+  returned members' safe inbox routes, then calls `advance_group_recovery` on the same runtime with held group IDs
+  and a caller-owned effects buffer. Apply appended effects even when advancement returns an error. Retry reservations
+  and publication continuation are durable. The host drives this loop; see the
+  [rejoin contract](../../docs/marmot-architecture/invitation-recovery.md#automatic-rejoin-of-an-unrecoverable-copy).
 
 ## What the session does
 

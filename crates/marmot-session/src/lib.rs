@@ -24,10 +24,11 @@ pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutin
 pub use runtime::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, AccountIngestPhase,
     CompletedWelcomePublishTask, DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport,
-    FailedApplicationMessage, MaintenanceActivity, MaintenanceAttemptDuration, MaintenanceTiming,
-    PendingResolution, PreparedSessionCommit, PreparedSessionSend, PreparedWelcomePublishTask,
-    PublishFailure, PublishedApplicationMessage, UndeliveredCommit, UnresolvedApplicationMessage,
-    UnresolvedPublish, UnresolvedPublishReason, WelcomeDeliveryFailure,
+    FailedApplicationMessage, GroupRejoinStatus, MaintenanceActivity, MaintenanceAttemptDuration,
+    MaintenanceTiming, PendingResolution, PreparedSessionCommit, PreparedSessionSend,
+    PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage, UndeliveredCommit,
+    UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
+    WelcomeDeliveryFailure,
 };
 pub use session::{
     CreateGroupEffects, GroupAuthorityView, HydrationProgress, PublishWork, QueuedIntentRef,

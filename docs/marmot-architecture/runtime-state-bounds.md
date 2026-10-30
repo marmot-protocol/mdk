@@ -30,6 +30,15 @@ Tracking issue: marmot-protocol/mdk#381.
 | --- | --- | --- |
 | Epoch-bound Manual maintenance markers | One per restored own-checkpoint epoch/authenticator; retained across the same horizon as exact checkpoints | Prune only after checkpoint pruning, strictly below its retained epoch floor. Completed or failed phases never release the restored epoch's send gate. A different authenticated epoch releases that gate; ordinary Manual maintenance may still perform one rotation. Group deletion and terminal teardown remove its records. |
 
+### Automatic Unrecoverable rejoin (`marmot-session/src/runtime/group_recovery.rs`)
+
+These bounds belong to convergence ledger policy A21, separate from A18's history-recovery parking budgets.
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `cgka_group_rejoin` journal | Runtime admits 64 recipient jobs/account, one/group; storage admits 256 coordinator jobs/account and 16/group. Each job retains at most one bounded control and its exact authored carrier. | Lost eligibility removes the recipient job. Each budget permits 32 reservations and remote evidence may refill once: at most 64 before native/admin evidence or explicit retry. Expiry and reopen preserve cost and the spent remote permission; exhaustion parks after the current request expires. Retry clears remote epoch claims but preserves a live grant's authorization. Coordinator rows survive both request expiry and their 600-second per-member Commit cooldown; owned publications survive until resolved. Group deletion cascades rows. Capacity refusal never evicts active authorization. |
+| Reserved runtime turn | One control or at most 16 compatible grants; an engine recovery Commit admits at most 32 grants | Advancement takes the turn; preparation clears it. Cancellation loses the memory permit but retains durable backoff and episode cost. Runtime drop releases the vector. |
+| Control admission | 128 KiB JSON body, 1 KiB MLS group id, 16 KiB KeyPackage and 512 KiB authenticated recovery carrier | Recovery classification and carrier checks follow one authenticated unwrap; ordinary Welcome size acceptance is unchanged. Oversized controls are refused before durable admission. These are not total wire/RSS limits and grant no replacement authority. |
 ### `marmot-app` audit export admission (`src/audit_export_lifecycle.rs`)
 
 | Structure | Bound | Reclamation |

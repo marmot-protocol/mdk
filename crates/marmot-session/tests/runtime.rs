@@ -35,8 +35,8 @@ use cgka_traits::{
     TransportPublishTarget,
 };
 use marmot_session::{
-    AccountDeviceRuntime, AccountDeviceSession, AccountError, KeyPackagePublication,
-    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
+    AccountDeviceEffects, AccountDeviceRuntime, AccountDeviceSession, AccountError,
+    KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
     KeyPackageSlotWithdrawal, MaintenanceRandom, MaintenanceTiming, MonotonicClock,
     NoopKeyPackagePublisher, PendingResolution, PublishWork, PublishedApplicationMessage,
     SessionConfig, SessionError, StaticTransportRouting, TransportRoutingError,
@@ -737,11 +737,14 @@ impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
 
 include!("runtime/frozen_fanout.rs");
 include!("runtime/hydrated_welcome.rs");
+include!("support/recovery_challenge.rs");
 include!("runtime/key_package_generation_upgrade.rs");
 include!("runtime/component_migration.rs");
 include!("runtime/multi_device_welcome.rs");
 include!("runtime/key_package_slot.rs");
 include!("runtime/key_package_slot_withdrawal.rs");
+include!("runtime/recovery_eligibility.rs");
+include!("runtime/rejoin_budget.rs");
 include!("runtime/account_devices_advertising.rs");
 include!("runtime/welcome_withdrawal.rs");
 include!("runtime/staged_invite_welcome.rs");
