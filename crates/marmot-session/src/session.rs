@@ -15,6 +15,7 @@ pub use cgka_engine::account_identity_proof::{
 };
 pub use cgka_engine::application_message_len;
 pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
+pub(crate) use cgka_engine::engine::{OutboundWelcomeStatus, OutboundWelcomeWork};
 pub use cgka_engine::engine::{WelcomeDeliveryIndex, WelcomeWithdrawal};
 pub use cgka_engine::feature_registry::FeatureRegistry;
 pub use cgka_engine::group_authority::{CanonicalGroupMembership, GroupAuthoritySnapshot};
@@ -810,6 +811,27 @@ impl AccountDeviceSession {
     /// message store, so it survives a crash before app projection writes.
     pub fn outstanding_sent_welcomes(&self) -> SessionResult<Vec<(GroupId, TransportMessage)>> {
         Ok(self.engine.outstanding_sent_welcomes()?)
+    }
+
+    /// See `Engine::outbound_welcome_work`.
+    pub(crate) fn outbound_welcome_work(&self) -> SessionResult<OutboundWelcomeWork> {
+        Ok(self.engine.outbound_welcome_work()?)
+    }
+
+    /// See `Engine::outbound_welcome_work_in`.
+    pub(crate) fn outbound_welcome_work_in(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Option<OutboundWelcomeWork>> {
+        Ok(self.engine.outbound_welcome_work_in(group_id)?)
+    }
+
+    /// See `Engine::outbound_welcome_status`.
+    pub(crate) fn outbound_welcome_status(
+        &self,
+        id: &MessageId,
+    ) -> SessionResult<OutboundWelcomeStatus> {
+        Ok(self.engine.outbound_welcome_status(id)?)
     }
 
     /// See `Engine::sent_welcome_awaits_commit`.

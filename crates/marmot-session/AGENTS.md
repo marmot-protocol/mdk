@@ -50,13 +50,22 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     counts toward `key_package_refresh_overdue` like one held back by its announcement.
   - `runtime/removed_slot_expiry.rs` — maintenance drops `removed` slot records 30 days after their `rejected_at`, by
     this device's clock (device-roster-v1.md), in one roster update after the KeyPackage steps. `not_me` records stay.
+  - `runtime/welcome_delivery.rs` — outbound Welcome delivery (mdk#2628 3.5a). The engine's Welcome row is the
+    obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again and a staged
+    one waits for its commit. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
+    maintenance pass) finds staged or owed; a group skipped because it was not live is read again on each pass until it
+    is. A Welcome stays watched until its row is settled. Maintenance publishes each watched Welcome that is owed and
+    that no attempt record (stored fanout or detached startup retry) holds, so one whose publish stored nothing (no
+    route) or whose fanout expired goes out again on the next pass, as the startup pass would send it.
+    Whichever attempt meets a Welcome's acknowledgement policy marks it delivered, maintenance's retry of its stored
+    fanout included.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.
 
 Tests: `tests/runtime.rs` plus `tests/runtime/` (frozen fanout, KeyPackage generator upgrade, component migration,
-multi-device Welcome delivery), and the session's `tests/session_lifecycle.rs`, `tests/nostr_stack.rs` and
-`tests/nostr_stack_chaos.rs`.
+multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome delivery), and the session's
+`tests/session_lifecycle.rs`, `tests/nostr_stack.rs` and `tests/nostr_stack_chaos.rs`.
 
 ## Rules
 
