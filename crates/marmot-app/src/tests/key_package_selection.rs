@@ -217,6 +217,7 @@ async fn the_account_slot_read_keeps_every_valid_slot() {
         &records,
         true,
         app.directory().directory_freshness_for_test(),
+        None,
     );
     assert!(slots.complete && slots.reached);
     // Every slot the read returned, the stale one included, though only fresh
@@ -236,6 +237,77 @@ async fn the_account_slot_read_keeps_every_valid_slot() {
     let mut every = ids(&events.iter().collect::<Vec<_>>());
     every.sort();
     assert_eq!(read, every);
+}
+
+/// The own-slot check (mdk#2628 3.4) reads what each relay serves as its
+/// slot's current publication: the newest there, the lowest id on a tie,
+/// whatever it holds and whenever it is dated, each publication once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_own_slot_read_takes_each_relays_current_publication() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    let own = "own-slot";
+    let published = |slot: &str, at: u64| {
+        candidate(account, device_package(&app, account, true), slot, None, at)
+    };
+    let older = published(own, now - 10);
+    let newer = published(own, now);
+    let other_slot = published("other", now + 50);
+    // Not a KeyPackage, and dated far ahead: it still occupies the slot.
+    let future = NostrTransportEvent::new_unsigned_at(
+        account.account_id_hex.clone(),
+        older.kind,
+        vec![vec!["d".into(), own.into()]],
+        "not a key package".into(),
+        now + 100_000,
+    );
+    let mut tied = [published(own, now - 5), published(own, now - 5)];
+    tied.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut someone_else = published(own, now + 60);
+    someone_else.pubkey = "ff".repeat(32);
+    let served = |event: &NostrTransportEvent, relay: &str| RelayEventRecord {
+        event: event.clone(),
+        endpoints: vec![TransportEndpoint(relay.into())],
+    };
+    let records = [
+        served(&older, "wss://a"),
+        served(&newer, "wss://a"),
+        served(&other_slot, "wss://a"),
+        served(&older, "wss://b"),
+        served(&future, "wss://c"),
+        served(&older, "wss://c"),
+        served(&tied[1], "wss://d"),
+        served(&tied[0], "wss://d"),
+        served(&newer, "wss://e"),
+        served(&someone_else, "wss://e"),
+    ];
+    let read = |complete| {
+        nostr_directory::account_key_package_slots_from_records(
+            &account.account_id_hex,
+            &records,
+            complete,
+            app.directory().directory_freshness_for_test(),
+            Some(own),
+        )
+        .own_slot
+        .unwrap()
+    };
+    let own_slot = read(true);
+    assert!(own_slot.complete);
+    let mut current = own_slot
+        .current
+        .iter()
+        .map(|publication| (publication.event_id.clone(), publication.created_at))
+        .collect::<Vec<_>>();
+    current.sort();
+    let mut expected = [&newer, &older, &future, &tied[0]]
+        .into_iter()
+        .map(|event| (event.id.clone(), event.created_at))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(current, expected);
+    assert!(!read(false).complete);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

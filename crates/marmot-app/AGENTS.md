@@ -120,6 +120,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   one the roster cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a
   rejected KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's
   included, into a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7).
+- The own-slot check (mdk#2628 3.4, `src/client/sign_ins.rs`) rides 3.2's read: `read_account_key_package_slots` also
+  reads this device's slot by `d` from every relay (`OwnSlotRead`), keeping each relay's current publication there by
+  NIP-01's rule, valid or not. One whose event id is none of this device's current, pending or retained events is
+  foreign (`OwnSlotForeign`); an older event of its own is a lagging relay, which fanout retry owns. `check_sign_ins`
+  hands foreign ones to `replace_foreign_slot_publications`, which publishes a newer KeyPackage or, for one dated past
+  the skew window, asks the relays to delete it by id (D63). An incomplete own-slot read is retried within the hour.
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
   `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in
   `observe_device_group_event` (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending
