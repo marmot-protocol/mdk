@@ -52,14 +52,19 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   - `runtime/removed_slot_expiry.rs` — maintenance drops `removed` slot records 30 days after their `rejected_at`, by
     this device's clock (device-roster-v1.md), in one roster update after the KeyPackage steps. `not_me` records stay.
   - `runtime/welcome_delivery.rs` — outbound Welcome delivery (mdk#2628 3.5a). The engine's Welcome row is the
-    obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again and a staged
-    one waits for its commit. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
+    obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again, a staged
+    one waits for its commit, and a device link's Welcome never goes out from its `deliver_until` on, by this
+    runtime's wall clock (mdk#2628 D40). A batch checks that deadline again before it starts each relay attempt, so a
+    detached startup retry prepared earlier does not send it late. An expired Welcome is settled for its watch, and
+    maintenance drops its retry record. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
     maintenance pass) finds staged or owed; a group skipped because it was not live is read again on each pass until it
     is. A Welcome stays watched until its row is settled. Maintenance publishes each watched Welcome that is owed and
     that no attempt record (stored fanout or detached startup retry) holds, so one whose publish stored nothing (no
     route) or whose fanout expired goes out again on the next pass, as the startup pass would send it.
     Whichever attempt meets a Welcome's acknowledgement policy marks it delivered, maintenance's retry of its stored
     fanout included.
+  - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b). The request
+    and hand-off checks read device tags through `member_device_tag_claim`.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.

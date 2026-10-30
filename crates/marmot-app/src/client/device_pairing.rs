@@ -229,13 +229,6 @@ impl AppClient {
         self.drive_device_pairing_live().await;
     }
 
-    /// Withdraw the Welcomes of failed and expired links before anything can
-    /// publish them. Every open calls it, before it returns the client.
-    pub(crate) fn withdraw_expired_link_welcomes(&mut self) {
-        #[cfg(feature = "unreleased-device-pairing")]
-        self.withdraw_expired_link_welcomes_at(crate::unix_now_seconds());
-    }
-
     /// Whether to announce `DeviceLinkChanged`, clearing the flag. Never
     /// without pairing, or while device groups are off.
     pub(crate) fn take_device_link_changed(&mut self) -> bool {

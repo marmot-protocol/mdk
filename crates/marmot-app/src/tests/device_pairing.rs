@@ -7,7 +7,7 @@
 
 use super::canonical_membership::{deliver_new, published_key_package};
 use super::*;
-use crate::client::device_group::LINK_DEADLINE_SECS;
+use crate::client::device_group::{LINK_DEADLINE_SECS, WELCOME_WAIT_SECS};
 use crate::{
     DeviceLinkChoices, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPromptState,
     DeviceLinkSnapshot, NewDeviceLinkState,
@@ -1016,15 +1016,38 @@ async fn a_link_that_crashed_after_its_commit_still_withdraws_its_welcome() {
     );
 }
 
+/// Move a stored link Welcome's delivery deadline to `deliver_until`, as if
+/// the new device's wait for it ended then.
+fn set_welcome_deadline(device: &Device, welcome: &cgka_traits::MessageId, deliver_until: u64) {
+    use cgka_traits::storage::MessageStorage as _;
+    let storage = device.app.account_storage("alice").unwrap();
+    let mut record = storage.get_message(welcome).unwrap();
+    let mut payload = cgka_traits::message::StoredMessagePayload::decode(&record.payload).unwrap();
+    let cgka_traits::message::StoredMessagePayload::OutboundWelcome {
+        deliver_until: deadline,
+        ..
+    } = &mut payload
+    else {
+        panic!("an owed Welcome")
+    };
+    assert!(
+        deadline.is_some(),
+        "a link's Welcome has a delivery deadline"
+    );
+    *deadline = Some(cgka_traits::Timestamp(deliver_until));
+    record.payload = payload.encode().unwrap();
+    storage.put_message(&record).unwrap();
+}
+
 /// The account worker publishes owed Welcomes at startup before the link gate
 /// runs: in its recovery pass, and in any maintenance pass a host queued
-/// while initial sync ran, which replays first. A failed link whose Welcome
-/// a crash left unwithdrawn, and a pending link past its deadline, have their
-/// Welcome withdrawn before either, so it never reaches a relay, even when
-/// the next launch turns device groups off.
+/// while initial sync ran, which replays first. A link's Welcome whose new
+/// device stopped waiting still never reaches a relay, even when the next
+/// launch turns device groups off: the Welcome's own deadline holds it on
+/// every publish path, whatever ran first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn startup_never_publishes_a_failed_or_expired_links_welcome() {
-    for (failed, groups_on) in [(true, true), (false, true), (true, false)] {
+async fn startup_never_publishes_an_expired_links_welcome() {
+    for groups_on in [true, false] {
         let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
         let (group, slot) = create_device_group_unpublished(&relay, &mut phone, &mut laptop).await;
         let owed = phone
@@ -1036,35 +1059,15 @@ async fn startup_never_publishes_a_failed_or_expired_links_welcome() {
             panic!("the first link owes one Welcome")
         };
         let welcome_id = hex::encode(welcome.id.as_slice());
-        let link = link_record(&phone, &group, &slot);
-        let storage = phone.app.account_storage("alice").unwrap().app_storage();
-        if failed {
-            // The gate recorded the failure; the crash came before the
-            // withdrawal.
-            assert!(
-                storage
-                    .decide_device_link(
-                        &link.group_id_hex,
-                        &link.slot_hex,
-                        DeviceLinkOutcome::Failed,
-                        link.linked_at,
-                    )
-                    .unwrap()
-            );
-        } else {
-            // The restart comes after the deadline of a link still pending.
-            storage
-                .record_device_link(
-                    &link.group_id_hex,
-                    &link.slot_hex,
-                    &link.key_package_ref_hex,
-                    &link.leaf_signature_key_hex,
-                    link.linked_at.saturating_sub(LINK_DEADLINE_SECS + 1),
-                )
-                .unwrap();
-        }
+        // The restart comes after the new device stopped waiting, with the
+        // link still pending.
+        set_welcome_deadline(&phone, &welcome.id, crate::unix_now_seconds() - 1);
+        assert_eq!(
+            link_record(&phone, &group, &slot).outcome,
+            DeviceLinkOutcome::Pending
+        );
         // The device stayed off longer than the Welcome's fanout is kept, so
-        // no attempt record holds it and maintenance publishes it as owed.
+        // no attempt record holds it and maintenance would publish it as owed.
         phone
             .client
             .runtime
@@ -1113,12 +1116,8 @@ async fn startup_never_publishes_a_failed_or_expired_links_welcome() {
         runtime.shutdown().await;
         assert!(
             !relay.published_event_ids().contains(&welcome_id),
-            "startup published the Welcome of a link that failed: {failed}, device groups on: \
-             {groups_on}"
+            "startup published an expired link's Welcome, device groups on: {groups_on}"
         );
-        if failed {
-            assert!(link_record_of(&app, &group, &slot).welcome_withdrawn);
-        }
     }
 }
 
@@ -1593,6 +1592,40 @@ async fn an_approval_whose_device_group_never_existed_fails() {
             .outcome,
         DeviceLinkOutcome::Failed
     );
+}
+
+/// A failing link whose Welcome cannot be withdrawn stays pending while that
+/// Welcome's deadline may be ahead, so no failed link has a Welcome still
+/// publishable. Once the new device's wait from `linked_at` is over, the
+/// runtime refuses the Welcome anyway and the failure is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_link_waits_for_its_welcomes_withdrawal_until_its_deadline() {
+    let (_relay, [mut phone]) = alice_devices::<1>().await;
+    let (group_hex, slot_hex) = ("ab".repeat(16), "cd".repeat(32));
+    let linked_at = crate::unix_now_seconds();
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    // A KeyPackage ref that cannot be read, so every withdrawal fails.
+    storage
+        .record_device_link(&group_hex, &slot_hex, "zz", &"12".repeat(32), linked_at)
+        .unwrap();
+    let outcome = || {
+        storage
+            .device_link(&group_hex, &slot_hex)
+            .unwrap()
+            .unwrap()
+            .outcome
+    };
+
+    phone
+        .client
+        .drive_device_pairing_at(linked_at + WELCOME_WAIT_SECS - 1)
+        .await;
+    assert_eq!(outcome(), DeviceLinkOutcome::Pending);
+    phone
+        .client
+        .drive_device_pairing_at(linked_at + WELCOME_WAIT_SECS)
+        .await;
+    assert_eq!(outcome(), DeviceLinkOutcome::Failed);
 }
 
 /// Without device groups, linking is refused and nothing runs.

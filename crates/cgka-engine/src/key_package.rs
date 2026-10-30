@@ -77,6 +77,8 @@ pub struct KeyPackageRetirementReport {
 }
 
 /// Enumerate KeyPackages whose private OpenMLS bundles are durably usable.
+/// Private KeyPackages issued to a sibling are left out: they are never
+/// published, so they are no part of the host's inventory.
 ///
 /// This is deliberately a storage-only query so callers can establish device
 /// ownership while an account is signed out and no signing runtime is active.
@@ -84,6 +86,7 @@ pub fn durably_owned_key_packages<S: StorageProvider>(
     storage: &S,
     protocol_profile: ProtocolProfile,
 ) -> Result<Vec<KeyPackage>, EngineError> {
+    let private = crate::private_key_packages::issued_references(storage)?;
     let mut owned = Vec::new();
     let mut seen_references = std::collections::BTreeSet::new();
     let mut skipped = 0_usize;
@@ -96,6 +99,9 @@ pub fn durably_owned_key_packages<S: StorageProvider>(
             skipped += 1;
             continue;
         };
+        if private.contains(reference.as_slice()) {
+            continue;
+        }
         let Ok(Some(persisted_bundle)) = OpenMlsStorageProvider::key_package::<_, KeyPackageBundle>(
             storage.mls_storage(),
             &reference,
@@ -434,6 +440,18 @@ impl<S: StorageProvider> Engine<S> {
     /// device tag, whether it is published or handed to a sibling
     /// (device-tag-v1.md, "Producing tags").
     pub(crate) fn build_fresh_key_package(&self, storage: &S) -> Result<KeyPackage, EngineError> {
+        Ok(self.build_key_package(storage, true)?.0)
+    }
+
+    /// Build + persist a KeyPackage with this device's current lifetime and
+    /// capabilities, returning its wire bytes and the validated KeyPackage.
+    /// A single-use one (`last_resort` false) is deleted by OpenMLS when a
+    /// Welcome consumes it.
+    pub(crate) fn build_key_package(
+        &self,
+        storage: &S,
+        last_resort: bool,
+    ) -> Result<(KeyPackage, MlsKeyPackage), EngineError> {
         let caps = leaf_capabilities(&self.registry, self.ciphersuite, self.new_protocol_profile);
         let device_tag = self
             .own_device_tag(storage)
@@ -446,11 +464,14 @@ impl<S: StorageProvider> Engine<S> {
             .leaf_extensions(&self.supported_app_components, device_tag)?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
 
-        let bundle = MlsKeyPackage::builder()
+        let mut builder = MlsKeyPackage::builder()
             .key_package_lifetime(Lifetime::new(KEY_PACKAGE_LIFETIME_SECS))
             .leaf_node_capabilities(caps)
-            .leaf_node_extensions(leaf_extensions)
-            .mark_as_last_resort()
+            .leaf_node_extensions(leaf_extensions);
+        if last_resort {
+            builder = builder.mark_as_last_resort();
+        }
+        let bundle = builder
             .build(
                 self.ciphersuite,
                 &provider,
@@ -463,7 +484,10 @@ impl<S: StorageProvider> Engine<S> {
         let bytes = mls_msg
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-        Ok(KeyPackage::new(bytes).with_protocol_profile(self.new_protocol_profile))
+        Ok((
+            KeyPackage::new(bytes).with_protocol_profile(self.new_protocol_profile),
+            bundle.key_package().clone(),
+        ))
     }
 
     /// Delete a previously generated (and persisted) KeyPackage bundle from
@@ -513,6 +537,20 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) fn parse_key_package(&self, kp: &KeyPackage) -> Result<MlsKeyPackage, EngineError> {
         parse_invitation_key_package(kp)
     }
+}
+
+/// Which roster slot `kp`'s leaf belongs to, as its device tag says
+/// ([`crate::device_tag::device_tag_claim`]). Tags are read only on the
+/// reader's own account's leaves; the caller checks that first.
+pub(crate) fn key_package_device_tag_claim(
+    kp: &KeyPackage,
+    roster: &cgka_traits::app_components::DeviceRosterV1,
+) -> Result<cgka_traits::app_components::DeviceTagClaim, EngineError> {
+    let key_package = parse_invitation_key_package(kp)?;
+    Ok(crate::device_tag::device_tag_claim(
+        key_package.leaf_node(),
+        roster,
+    ))
 }
 
 fn parse_invitation_key_package(kp: &KeyPackage) -> Result<MlsKeyPackage, EngineError> {

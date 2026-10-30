@@ -85,6 +85,11 @@ pub struct OwnApplicationConvergenceStamp {
 ///   can still find the Welcome (mdk#2628 item 3.3b). Promotion from staged to
 ///   outbound carries it across. A Welcome stored before the ref was kept has
 ///   none.
+///
+///   A device link's Welcome also keeps `deliver_until`: the time, in Unix
+///   seconds, at which the new device stops waiting for it. It is never
+///   published from then on (D40). Promotion carries it across too, and any
+///   other Welcome has none.
 /// - `OpenMlsWire`: transport metadata plus payload replaced with peeled MLS
 ///   wire bytes. This variant, `SignedOpenMlsWire`, and `OwnCommitWire` are
 ///   eligible for OpenMLS projection and convergence replay.
@@ -107,12 +112,16 @@ pub enum StoredMessagePayload {
         message: TransportMessage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key_package_ref: Option<Vec<u8>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deliver_until: Option<Timestamp>,
     },
     StagedInviteWelcome {
         message: TransportMessage,
         origin_commit_id: MessageId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key_package_ref: Option<Vec<u8>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deliver_until: Option<Timestamp>,
     },
     OpenMlsWire(TransportMessage),
     SignedOpenMlsWire {
@@ -134,10 +143,15 @@ impl StoredMessagePayload {
         Self::RawTransport(message)
     }
 
-    pub fn outbound_welcome(message: TransportMessage, key_package_ref: Option<Vec<u8>>) -> Self {
+    pub fn outbound_welcome(
+        message: TransportMessage,
+        key_package_ref: Option<Vec<u8>>,
+        deliver_until: Option<Timestamp>,
+    ) -> Self {
         Self::OutboundWelcome {
             message,
             key_package_ref,
+            deliver_until,
         }
     }
 
@@ -145,11 +159,13 @@ impl StoredMessagePayload {
         message: TransportMessage,
         origin_commit_id: MessageId,
         key_package_ref: Option<Vec<u8>>,
+        deliver_until: Option<Timestamp>,
     ) -> Self {
         Self::StagedInviteWelcome {
             message,
             origin_commit_id,
             key_package_ref,
+            deliver_until,
         }
     }
 
@@ -264,6 +280,20 @@ impl StoredMessagePayload {
         }
     }
 
+    /// When a retained outbound Welcome, staged or not, stops being
+    /// deliverable, if it has a delivery deadline: a device link's Welcome
+    /// does.
+    pub fn welcome_deliver_until(&self) -> Option<Timestamp> {
+        match self {
+            Self::OutboundWelcome { deliver_until, .. }
+            | Self::StagedInviteWelcome { deliver_until, .. } => *deliver_until,
+            Self::RawTransport(_)
+            | Self::OpenMlsWire(_)
+            | Self::SignedOpenMlsWire { .. }
+            | Self::OwnCommitWire { .. } => None,
+        }
+    }
+
     pub fn as_openmls_wire(&self) -> Option<&TransportMessage> {
         match self {
             Self::RawTransport(_)
@@ -365,33 +395,40 @@ fn encode_stored_message_payload_v2(
             out.push(0);
             encode_transport_message(message, &mut out)?;
         }
-        // A Welcome with no KeyPackageRef keeps its original variant, byte
-        // for byte; one with a ref takes the variant that adds it.
+        // A Welcome with no KeyPackageRef and no delivery deadline keeps its
+        // original variant, byte for byte; one with a ref takes the variant
+        // that adds it, and one with a deadline the variant that adds both.
         StoredMessagePayload::OutboundWelcome {
             message,
             key_package_ref,
+            deliver_until,
         } => {
-            out.push(if key_package_ref.is_some() { 6 } else { 1 });
+            out.push(match (key_package_ref, deliver_until) {
+                (_, Some(_)) => 8,
+                (Some(_), None) => 6,
+                (None, None) => 1,
+            });
             encode_transport_message(message, &mut out)?;
-            if let Some(key_package_ref) = key_package_ref {
-                encode_var_bytes(key_package_ref, &mut out, "Welcome KeyPackageRef")?;
-            }
+            encode_welcome_tail(key_package_ref.as_ref(), *deliver_until, &mut out)?;
         }
         StoredMessagePayload::StagedInviteWelcome {
             message,
             origin_commit_id,
             key_package_ref,
+            deliver_until,
         } => {
-            out.push(if key_package_ref.is_some() { 7 } else { 5 });
+            out.push(match (key_package_ref, deliver_until) {
+                (_, Some(_)) => 9,
+                (Some(_), None) => 7,
+                (None, None) => 5,
+            });
             encode_transport_message(message, &mut out)?;
             encode_var_bytes(
                 origin_commit_id.as_slice(),
                 &mut out,
                 "staged Welcome origin commit id",
             )?;
-            if let Some(key_package_ref) = key_package_ref {
-                encode_var_bytes(key_package_ref, &mut out, "Welcome KeyPackageRef")?;
-            }
+            encode_welcome_tail(key_package_ref.as_ref(), *deliver_until, &mut out)?;
         }
         StoredMessagePayload::OpenMlsWire(message) => {
             out.push(2);
@@ -438,6 +475,7 @@ fn decode_stored_message_payload_v2(
         1 => StoredMessagePayload::OutboundWelcome {
             message: decoder.transport_message()?,
             key_package_ref: None,
+            deliver_until: None,
         },
         2 => StoredMessagePayload::OpenMlsWire(decoder.transport_message()?),
         3 => StoredMessagePayload::SignedOpenMlsWire {
@@ -456,15 +494,31 @@ fn decode_stored_message_payload_v2(
             message: decoder.transport_message()?,
             origin_commit_id: MessageId::new(decoder.var_bytes("staged Welcome origin commit id")?),
             key_package_ref: None,
+            deliver_until: None,
         },
         6 => StoredMessagePayload::OutboundWelcome {
             message: decoder.transport_message()?,
             key_package_ref: Some(decoder.var_bytes("Welcome KeyPackageRef")?),
+            deliver_until: None,
         },
         7 => StoredMessagePayload::StagedInviteWelcome {
             message: decoder.transport_message()?,
             origin_commit_id: MessageId::new(decoder.var_bytes("staged Welcome origin commit id")?),
             key_package_ref: Some(decoder.var_bytes("Welcome KeyPackageRef")?),
+            deliver_until: None,
+        },
+        8 => StoredMessagePayload::OutboundWelcome {
+            message: decoder.transport_message()?,
+            key_package_ref: decoder
+                .option(|decoder| decoder.var_bytes("Welcome KeyPackageRef"))?,
+            deliver_until: Some(Timestamp(decoder.u64("Welcome delivery deadline")?)),
+        },
+        9 => StoredMessagePayload::StagedInviteWelcome {
+            message: decoder.transport_message()?,
+            origin_commit_id: MessageId::new(decoder.var_bytes("staged Welcome origin commit id")?),
+            key_package_ref: decoder
+                .option(|decoder| decoder.var_bytes("Welcome KeyPackageRef"))?,
+            deliver_until: Some(Timestamp(decoder.u64("Welcome delivery deadline")?)),
         },
         variant => {
             return Err(invalid(format!(
@@ -496,6 +550,28 @@ fn encode_transport_message(
             out.push(1);
             encode_var_bytes(recipient.as_slice(), out, "welcome recipient")?;
         }
+    }
+    Ok(())
+}
+
+/// The fields after a Welcome's message (and a staged one's origin): the
+/// KeyPackageRef bare in variants 6 and 7, and, in variants 8 and 9, an
+/// optional KeyPackageRef followed by the delivery deadline.
+fn encode_welcome_tail(
+    key_package_ref: Option<&Vec<u8>>,
+    deliver_until: Option<Timestamp>,
+    out: &mut Vec<u8>,
+) -> Result<(), StoredMessagePayloadCodecError> {
+    let encode_ref = |key_package_ref: &Vec<u8>, out: &mut Vec<u8>| {
+        encode_var_bytes(key_package_ref, out, "Welcome KeyPackageRef")
+    };
+    match (key_package_ref, deliver_until) {
+        (key_package_ref, Some(deliver_until)) => {
+            encode_option(key_package_ref, out, encode_ref)?;
+            out.extend_from_slice(&deliver_until.0.to_be_bytes());
+        }
+        (Some(key_package_ref), None) => encode_ref(key_package_ref, out)?,
+        (None, None) => {}
     }
     Ok(())
 }
@@ -906,17 +982,37 @@ mod stored_payload_codec_tests {
         };
         let values = [
             StoredMessagePayload::RawTransport(group_message.clone()),
-            StoredMessagePayload::outbound_welcome(welcome.clone(), None),
-            StoredMessagePayload::outbound_welcome(welcome.clone(), Some(vec![0x57; 32])),
+            StoredMessagePayload::outbound_welcome(welcome.clone(), None, None),
+            StoredMessagePayload::outbound_welcome(welcome.clone(), Some(vec![0x57; 32]), None),
+            StoredMessagePayload::outbound_welcome(
+                welcome.clone(),
+                Some(vec![0x57; 32]),
+                Some(Timestamp(1_700_000_600)),
+            ),
+            StoredMessagePayload::outbound_welcome(welcome.clone(), None, Some(Timestamp(9))),
             StoredMessagePayload::staged_invite_welcome(
                 welcome.clone(),
                 MessageId::new([0x55, 0x56]),
                 None,
+                None,
+            ),
+            StoredMessagePayload::staged_invite_welcome(
+                welcome.clone(),
+                MessageId::new([0x55, 0x56]),
+                Some(vec![0x58; 32]),
+                None,
+            ),
+            StoredMessagePayload::staged_invite_welcome(
+                welcome.clone(),
+                MessageId::new([0x55, 0x56]),
+                Some(vec![0x58; 32]),
+                Some(Timestamp(1_700_000_600)),
             ),
             StoredMessagePayload::staged_invite_welcome(
                 welcome,
                 MessageId::new([0x55, 0x56]),
-                Some(vec![0x58; 32]),
+                None,
+                Some(Timestamp(9)),
             ),
             StoredMessagePayload::OpenMlsWire(group_message.clone()),
             StoredMessagePayload::SignedOpenMlsWire {
@@ -983,15 +1079,16 @@ mod stored_payload_codec_tests {
         let legacy = serde_json::json!({ "kind": "outbound_welcome", "message": &welcome });
         assert_eq!(
             StoredMessagePayload::decode(&serde_json::to_vec(&legacy).unwrap()).unwrap(),
-            StoredMessagePayload::outbound_welcome(welcome.clone(), None)
+            StoredMessagePayload::outbound_welcome(welcome.clone(), None, None)
         );
         let key_package_ref = Some(vec![0x44; 32]);
         for value in [
-            StoredMessagePayload::outbound_welcome(welcome.clone(), key_package_ref.clone()),
+            StoredMessagePayload::outbound_welcome(welcome.clone(), key_package_ref.clone(), None),
             StoredMessagePayload::staged_invite_welcome(
                 welcome.clone(),
                 MessageId::new([0x55]),
                 key_package_ref.clone(),
+                None,
             ),
         ] {
             assert_eq!(
@@ -1000,10 +1097,81 @@ mod stored_payload_codec_tests {
             );
             assert_eq!(value.welcome_key_package_ref(), key_package_ref.as_deref());
         }
-        let without = StoredMessagePayload::outbound_welcome(welcome.clone(), None);
+        let without = StoredMessagePayload::outbound_welcome(welcome.clone(), None, None);
         assert_eq!(without.encode().unwrap()[7], 1);
-        let with = StoredMessagePayload::outbound_welcome(welcome, key_package_ref);
+        let with = StoredMessagePayload::outbound_welcome(welcome, key_package_ref, None);
         assert_eq!(with.encode().unwrap()[7], 6);
+    }
+
+    /// A link's Welcome keeps its delivery deadline through every encoding
+    /// and through promotion's re-encoding, and only a Welcome with one
+    /// takes the variants that add it: every other Welcome's bytes are
+    /// unchanged.
+    #[test]
+    fn a_welcome_keeps_its_delivery_deadline_and_only_it_changes_variant() {
+        let welcome = transport(TransportEnvelope::Welcome {
+            recipient: MemberId::new([0x22; 32]),
+        });
+        let key_package_ref = Some(vec![0x44; 32]);
+        let deadline = Some(Timestamp(1_700_000_600));
+        let outbound = StoredMessagePayload::outbound_welcome(
+            welcome.clone(),
+            key_package_ref.clone(),
+            deadline,
+        );
+        let staged = StoredMessagePayload::staged_invite_welcome(
+            welcome.clone(),
+            MessageId::new([0x55]),
+            key_package_ref.clone(),
+            deadline,
+        );
+        for (value, variant) in [(&outbound, 8), (&staged, 9)] {
+            let encoded = value.encode().unwrap();
+            assert_eq!(encoded[7], variant);
+            assert!(encoded.ends_with(&1_700_000_600_u64.to_be_bytes()));
+            assert_eq!(&StoredMessagePayload::decode(&encoded).unwrap(), value);
+            assert_eq!(
+                &StoredMessagePayload::decode(&serde_json::to_vec(value).unwrap()).unwrap(),
+                value
+            );
+            assert_eq!(value.welcome_deliver_until(), deadline);
+            assert_eq!(value.welcome_key_package_ref(), key_package_ref.as_deref());
+        }
+        for (with, without) in [
+            (
+                outbound,
+                StoredMessagePayload::outbound_welcome(
+                    welcome.clone(),
+                    key_package_ref.clone(),
+                    None,
+                ),
+            ),
+            (
+                staged,
+                StoredMessagePayload::staged_invite_welcome(
+                    welcome.clone(),
+                    MessageId::new([0x55]),
+                    key_package_ref.clone(),
+                    None,
+                ),
+            ),
+        ] {
+            let mut stripped = with.clone();
+            match &mut stripped {
+                StoredMessagePayload::OutboundWelcome { deliver_until, .. }
+                | StoredMessagePayload::StagedInviteWelcome { deliver_until, .. } => {
+                    *deliver_until = None;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(stripped.encode().unwrap(), without.encode().unwrap());
+            assert_eq!(without.welcome_deliver_until(), None);
+        }
+        assert!(
+            !serde_json::to_string(&StoredMessagePayload::outbound_welcome(welcome, None, None))
+                .unwrap()
+                .contains("deliver_until")
+        );
     }
 
     #[test]

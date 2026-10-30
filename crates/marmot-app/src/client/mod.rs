@@ -77,6 +77,7 @@ mod device_renames;
 pub(crate) mod epoch_stall;
 pub(crate) mod history_notices;
 mod invite_recovery;
+mod private_key_packages;
 mod projection;
 mod push;
 mod receipts;
@@ -1436,6 +1437,7 @@ impl AppClient {
     pub async fn run_due_maintenance(&mut self) -> Result<crate::MaintenanceRunSummary, AppError> {
         if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
             self.runtime.sweep_expired_key_package_private_material()?;
+            self.discard_expired_sibling_key_packages();
             let summary = self
                 .runtime
                 .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
@@ -1480,6 +1482,7 @@ impl AppClient {
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;
+        self.sibling_key_package_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
         self.note_key_package_refresh_overdue();
         let mut activity = self.runtime.take_maintenance_activity();

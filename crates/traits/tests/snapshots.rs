@@ -249,7 +249,8 @@ fn stored_message_payload_distinguishes_raw_outbound_welcome_and_openmls_wire() 
     };
 
     let raw_payload = StoredMessagePayload::raw_transport(raw);
-    let outbound_welcome_payload = StoredMessagePayload::outbound_welcome(outbound_welcome, None);
+    let outbound_welcome_payload =
+        StoredMessagePayload::outbound_welcome(outbound_welcome, None, None);
     let openmls_payload = StoredMessagePayload::openmls_wire(openmls);
 
     insta::assert_json_snapshot!("stored_payload_raw_transport", raw_payload);
@@ -588,6 +589,7 @@ fn snapshot_send_intents() {
             group_id: gid(),
             key_package: KeyPackage::new(vec![0xEF; 4]),
             roster_update: vec![0x5C; 4],
+            deliver_until: Timestamp(1_700_000_600),
         }
     );
     insta::assert_json_snapshot!("intent_leave", SendIntent::Leave { group_id: gid() });

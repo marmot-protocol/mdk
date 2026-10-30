@@ -15,6 +15,7 @@ mod maintenance;
 mod member_validation_cache;
 pub(crate) mod messages;
 mod outbound;
+mod private_key_packages;
 pub(crate) mod snapshots;
 mod transport_routes;
 mod welcomes;

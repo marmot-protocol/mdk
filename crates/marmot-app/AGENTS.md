@@ -122,6 +122,20 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   one the roster cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a
   rejected KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's
   included, into a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7).
+- Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
+  `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in
+  `observe_device_group_event` (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending
+  leaf's device tag (mdk#2628 D33). That read sees only the current tree, so a message from an earlier epoch has no
+  readable sender.
+- Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
+  Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
+  roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
+  this account's, single-use, unexpired and tagged as that slot's (mdk#2628 D33, through 3.1d's tag reader; never a
+  second one). Never publish one, and never fall back to a public KeyPackage when none is held. A KeyPackage this
+  device has used is never kept again if a sibling hands it over again (mdk#2628 D42).
+  Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
+  ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
+  be untagged.
 - Keep device pairing (mdk#2628 item 3.3b) in `src/client/device_pairing.rs` (host DTOs) and
   `src/client/device_pairing/live.rs` (behind `unreleased-device-pairing`, and inert unless
   `MarmotAppConfig::dev_device_groups` is set). The Welcome peeler opens each gift wrap to the account once and hands
@@ -139,12 +153,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   override only test-policy builds read), or when that commit is still absent `LINK_DEADLINE_SECS` after the entry's
   `linked_at`. A decided link never changes, and a link whose approval still waits to be retried is not decided. A
   failed link ends its prompt as `LinkFailed` with a `CannotLink` cancel. Its Welcome, found by the `KeyPackageRef`
-  recorded before the commit (`welcomes_for_key_package`), is withdrawn before the failure is recorded, then again on
-  each drive until that succeeds and marks it withdrawn; never rely on a Welcome id written after the commit, which a
-  crash can lose. Welcome publishers (startup recovery, a maintenance pass, a fanout retry) run before the gate, so
-  every client open, before it returns the client and whether or not device groups are on, withdraws the Welcome of
-  every failed link not marked withdrawn and every pending link past its deadline (`withdraw_expired_link_welcomes`);
-  a new publisher must not run before open returns. While the roster
+  recorded before the commit (`welcomes_for_key_package`), is withdrawn before the failure is recorded. While the
+  Welcome's deadline may be ahead (before `linked_at` plus `WELCOME_WAIT_SECS`), a failure is recorded only once that
+  withdrawal succeeds: until then the link stays pending and the next drive decides it again. From then on the runtime
+  refuses the Welcome, so the failure is recorded and the removal does not wait for the withdrawal. Never rely on a Welcome id written after the commit, which a crash can lose. Welcome publishers (startup
+  recovery, a maintenance pass, a fanout retry) run before the gate and whether or not device groups are on, so the
+  gate never guards delivery: both link paths pass the new device's wait end (`Approval::wait_ends`) to the engine as
+  the Welcome's `deliver_until`, and the runtime's publish check refuses it from then on. While the roster
   lists the device as this device's link, it also removes its entry, and its leaf if the engine's tree still has one, in
   one `SendIntent::UnlinkDevice` commit; never decide the leaf from the stored member list, which a staged removal has
   already changed. A withdrawal that fails never holds the removal back. A link refused as

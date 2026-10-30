@@ -173,7 +173,7 @@ pub(super) async fn found_device_group(
 
 /// The founding request of a device group holding `initial` and adding
 /// `key_packages`.
-fn device_group_request(
+pub(super) fn device_group_request(
     initial: &DeviceRosterV1,
     key_packages: Vec<KeyPackage>,
 ) -> CreateGroupRequest {
@@ -186,6 +186,9 @@ fn device_group_request(
         initial_admins: vec![],
     }
 }
+
+/// A device link Welcome's delivery deadline that no test reaches.
+pub(super) const NO_WELCOME_DEADLINE: Timestamp = Timestamp(u64::MAX);
 
 /// `creator` founds a device group under `chosen`, the id a device link
 /// chose before the group existed.
@@ -200,6 +203,7 @@ pub(super) async fn create_under(
         .create_group_with_chosen_id_and_audit_context(
             device_group_request(initial, key_packages),
             chosen.clone(),
+            NO_WELCOME_DEADLINE,
             None,
         )
         .await

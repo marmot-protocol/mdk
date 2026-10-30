@@ -63,6 +63,7 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 | `src/app/device_renames.rs` | Renames this device made in its device group's roster (mdk#2628 item 3.6, D37), one row per device renamed: the label, the rename ids the rename wrote, and the ids the entry held where this device's renames of it were built. |
 | `src/app/sign_ins.rs` | The account's sign-ins this device does not recognize (mdk#2628 item 3.2): one transaction per check, the first taking the baseline of every slot its read returned; this device's answers and rejections the roster does not record yet. |
 | `src/app/device_links.rs` | The devices this device added to the account's device group and how each link ended, and the device groups it joined through a link whose first commit has not landed yet (mdk#2628 item 3.3b). |
+| `src/app/private_key_packages.rs` | Private KeyPackages siblings handed to this device, keyed by issuer slot, and what this device still wants from each (mdk#2628 item 3.4b). A used one keeps its ref until it expires and is never kept again (D42). |
 | `src/app/local_submissions.rs` | Device-local submission identity and durable admission before engine work. |
 | `src/app/transport/agent_stream_sequences.rs` | Durable, fail-closed publisher sequence reservations for QUIC previews. |
 | `src/app/account_projection.rs` | Account-level event projection. |

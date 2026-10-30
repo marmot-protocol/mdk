@@ -105,6 +105,7 @@ pub use app::message_drafts::{
     StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary, StoredMessageDraftSummary,
 };
 pub use app::pending_welcome_delivery::PendingWelcomeDeliveryRecord;
+pub use app::private_key_packages::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage};
 pub use app::recovery_coverage::{
     RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageProved, RecoveryCoverageRange,
     RecoveryCoverageSlice,

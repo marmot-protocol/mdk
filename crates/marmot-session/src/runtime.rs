@@ -71,6 +71,7 @@ use crate::time::{
 mod device_roster;
 pub use device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport};
 mod device_tag_key;
+mod private_key_packages;
 mod removed_slot_expiry;
 mod slot_announcement;
 mod welcome_delivery;
@@ -255,6 +256,9 @@ struct PreparedLegacyPublishAttempt {
     relay_urls: Vec<String>,
     target_group_id: Option<GroupId>,
     defers_remaining_fanout_until_confirmation: bool,
+    /// A device link's Welcome's delivery deadline: a batch does not start
+    /// the attempt from then on.
+    deliver_until: Option<Timestamp>,
     request: TransportPublishRequest,
 }
 
@@ -287,6 +291,7 @@ struct CompletedWelcomePublish {
 #[must_use = "a prepared Welcome publish task must be run and reconciled"]
 pub struct PreparedWelcomePublishTask {
     adapter: Arc<dyn TransportAdapter>,
+    wall_clock: Arc<dyn WallClock>,
     prepared: PreparedWelcomePublish,
     message_ids: Vec<cgka_traits::MessageId>,
     withdrawals: DetachedWelcomeWithdrawals,
@@ -313,7 +318,11 @@ impl PreparedWelcomePublishTask {
         CompletedWelcomePublishTask {
             completed: self
                 .prepared
-                .publish(self.adapter.as_ref(), Some(&self.withdrawals))
+                .publish(
+                    self.adapter.as_ref(),
+                    self.wall_clock.as_ref(),
+                    Some(&self.withdrawals),
+                )
                 .await,
             message_ids: self.message_ids,
         }
@@ -329,19 +338,26 @@ impl PreparedWelcomePublish {
     }
 
     /// `withdrawals` names Welcomes withdrawn after preparation; one whose
-    /// relay attempt has not started is skipped and reported withdrawn.
+    /// relay attempt has not started is skipped and reported withdrawn, and
+    /// so is one whose delivery deadline passed while it waited for a slot.
     async fn publish(
         mut self,
         adapter: &dyn TransportAdapter,
+        wall_clock: &dyn WallClock,
         withdrawals: Option<&Mutex<HashSet<cgka_traits::MessageId>>>,
     ) -> CompletedWelcomePublish {
         let publish = |index, attempt: Box<PreparedLegacyPublishAttempt>| async move {
-            if withdrawals.is_some_and(|withdrawals| {
-                withdrawals
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .contains(&attempt.message_id)
-            }) {
+            let expired = attempt
+                .deliver_until
+                .is_some_and(|deliver_until| wall_clock.now() >= deliver_until);
+            if expired
+                || withdrawals.is_some_and(|withdrawals| {
+                    withdrawals
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .contains(&attempt.message_id)
+                })
+            {
                 return (index, attempt, None);
             }
             let result = adapter.publish(attempt.request.clone()).await;
@@ -3295,11 +3311,17 @@ where
         &mut self,
         request: CreateGroupRequest,
         group_id: GroupId,
+        welcome_deliver_until: Timestamp,
         context: AuditEventContext,
     ) -> AccountResult<CreateGroupEffects> {
         Ok(self
             .session
-            .create_group_with_chosen_id_and_audit_context(request, group_id, context)
+            .create_group_with_chosen_id_and_audit_context(
+                request,
+                group_id,
+                welcome_deliver_until,
+                context,
+            )
             .await?)
     }
 
@@ -4848,8 +4870,8 @@ where
             return Ok(());
         };
         match self.welcome_hold(message_id, &fanout.exact_message.envelope)? {
-            // A withdrawn Welcome's remaining retries go with it.
-            Some(WelcomeHold::Withdrawn) => {
+            // A withdrawn or expired Welcome's remaining retries go with it.
+            Some(WelcomeHold::Withdrawn | WelcomeHold::Expired) => {
                 self.session.delete_transport_fanout(message_id)?;
                 return Ok(());
             }
@@ -5561,7 +5583,7 @@ where
         // Every Welcome publish passes here, whichever path still holds the
         // Welcome, or through maintenance's retry of its fanout.
         match self.welcome_hold(&message_id, &message.envelope)? {
-            Some(WelcomeHold::Withdrawn) => {
+            Some(WelcomeHold::Withdrawn | WelcomeHold::Expired) => {
                 return Ok(PreparedLegacyPublish::Complete(PublishStatus {
                     withdrawn: true,
                     ..PublishStatus::default()
@@ -5575,6 +5597,12 @@ where
             }
             None => {}
         }
+        let deliver_until = match &message.envelope {
+            TransportEnvelope::Welcome { .. } => {
+                self.session.sent_welcome_deliver_until(&message_id)?
+            }
+            TransportEnvelope::GroupMessage { .. } => None,
+        };
         let msg_id_hex = hex::encode(message_id.as_slice());
         // Capture the outbound wire envelope before `message` is moved into the
         // publish request. The post-wrap relay event id / ephemeral pubkey are
@@ -5843,6 +5871,7 @@ where
                 relay_urls,
                 target_group_id,
                 defers_remaining_fanout_until_confirmation,
+                deliver_until,
                 request: TransportPublishRequest {
                     account_id: self.session.self_id(),
                     message,
@@ -5874,6 +5903,7 @@ where
             relay_urls,
             target_group_id,
             defers_remaining_fanout_until_confirmation,
+            deliver_until: _,
             request: _,
         } = attempt;
         // Test-only fault injection (`arm_finish_stage_failure`): behaves like
