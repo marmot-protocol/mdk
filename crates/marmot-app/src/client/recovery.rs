@@ -1,6 +1,7 @@
 //! Account recovery authorization. Network work remains on the account worker;
 //! this module only decides whether one immutable grant may spend retry cost.
 use cgka_traits::MaintenanceStorage;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use storage_sqlite::SqliteAppStorage;
@@ -531,12 +532,26 @@ impl AccountRecoveryOwner {
             })
     }
 
+    #[cfg(test)]
     pub(crate) fn select_authorized_attempt(
         &mut self,
         storage: &SqliteAccountStorage,
         readiness: RecoveryReadiness,
         now: Instant,
         explicit: Option<&mut ExplicitRecoveryPermit>,
+    ) -> StorageResult<Option<AttemptGrant>> {
+        self.select_authorized_attempt_except(storage, readiness, now, explicit, &BTreeSet::new())
+    }
+
+    /// Select the next attempt, leaving out `suspended` obligations: they are
+    /// not reserved, charged, parked or fetched, and stay pending.
+    pub(crate) fn select_authorized_attempt_except(
+        &mut self,
+        storage: &SqliteAccountStorage,
+        readiness: RecoveryReadiness,
+        now: Instant,
+        explicit: Option<&mut ExplicitRecoveryPermit>,
+        suspended: &BTreeSet<[u8; 16]>,
     ) -> StorageResult<Option<AttemptGrant>> {
         if self.active.upgrade().is_some() {
             return Ok(None);
@@ -556,6 +571,7 @@ impl AccountRecoveryOwner {
         let mut fence = storage
             .app_storage()
             .recovery_eligible_revision_fence(immediate)?;
+        fence.obligations.retain(|(id, _)| !suspended.contains(id));
         let comparison = storage.app_storage().recovery_comparison()?;
         // Queued native bodies need ordinary MDK admission, not another
         // acquisition reservation. Only hide a duty backed by acquired sources
@@ -1809,6 +1825,31 @@ impl AppClient {
         Ok(())
     }
 
+    /// The epoch-gap obligations of Unrecoverable groups, which recovery
+    /// suspends (mdk#2660 section 6), as the recovery runner suspends their
+    /// routes: a fetch would only fill the group's deferred input with
+    /// ciphertext its copy cannot open. None until the runner owns debt.
+    fn suspended_epoch_gaps(
+        &self,
+        storage: &SqliteAppStorage,
+    ) -> StorageResult<BTreeSet<[u8; 16]>> {
+        if !self.app.recovery_runner_owns_debt() {
+            return Ok(BTreeSet::new());
+        }
+        Ok(storage
+            .pending_recovery_demands()?
+            .into_iter()
+            .filter(|demand| {
+                demand.cause == storage_sqlite::RecoveryCause::EpochGap
+                    && demand
+                        .group_id
+                        .as_deref()
+                        .is_some_and(|group_id| self.group_unrecoverable(group_id))
+            })
+            .map(|demand| demand.ticket.id)
+            .collect())
+    }
+
     /// Whether recovery may contact any relay of the account's routes. With
     /// none, no grant can be selected, so no caller should wait for a credit.
     pub(crate) fn recovery_endpoints_admitted(&self) -> bool {
@@ -1874,11 +1915,13 @@ impl AppClient {
         } else {
             RecoveryReadiness::Waiting
         };
-        let selected = self.recovery_owner.select_authorized_attempt(
+        let suspended = self.suspended_epoch_gaps(&storage.app_storage())?;
+        let selected = self.recovery_owner.select_authorized_attempt_except(
             &storage,
             readiness,
             Instant::now(),
             explicit.as_deref_mut(),
+            &suspended,
         )?;
         self.record_unavailable_epoch_observation(&storage.app_storage())?;
         let Some(mut grant) = selected else {
@@ -5749,6 +5792,93 @@ mod tests {
             eligibility_after_comparison(O::Unknown, true),
             E::WaitingCapacity
         );
+    }
+
+    /// Once the recovery runner owns debt, an Unrecoverable group's epoch gap
+    /// is suspended as its route is: no grant selects it, so it is never
+    /// fetched, charged or parked, and it stays pending. With the gate off the
+    /// old owner still selects it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unrecoverable_groups_epoch_gap_is_suspended_once_the_runner_owns_debt() {
+        use crate::tests::{
+            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+            scripted_eose_pump,
+        };
+        use cgka_traits::storage::GroupStorage;
+        use storage_sqlite::{RecoveryCause, RecoveryEligibility};
+        for owns_debt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            crate::AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let mut app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+                .with_test_relay_client(relay.clone());
+            if owns_debt {
+                app = app.with_recovery_runner_owning_debt();
+            }
+            let _pump =
+                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+            let mut client = client_on_app_relay_plane(&app, "alice").await;
+            let group = client.create_group("suspended", &[]).await.unwrap();
+            let storage = app.account_storage("alice").unwrap();
+            let mut record = storage.get_group(&group).unwrap();
+            record.unrecoverable = true;
+            storage.put_group(&record).unwrap();
+            let app = storage.app_storage();
+            app.arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(group.as_slice()),
+                stalled_epoch: record.epoch.0,
+            }])
+            .unwrap();
+            // Every compared relay answers and certifies nothing, so a
+            // selected gap would park after the budget.
+            client.test_comparison_results =
+                Some(crate::client::sync::ScriptedComparisons::by_route(|_| {
+                    Ok(Some((
+                        transport_nostr_adapter::NostrReconciliationSummary {
+                            relays_succeeded: 1,
+                            ..Default::default()
+                        },
+                        Vec::new(),
+                    )))
+                }));
+            let mut selected = false;
+            for _ in 0..=RECOVERY_PARK_AFTER_ATTEMPTS {
+                client
+                    .recovery_owner
+                    .test_advance_clock(Duration::from_secs(300));
+                let Some(grant) = client
+                    .authorize_account_recovery(
+                        None,
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                    )
+                    .await
+                    .unwrap()
+                else {
+                    break;
+                };
+                selected |= grant
+                    .plan()
+                    .unwrap()
+                    .iter()
+                    .any(|obligation| obligation.cause == RecoveryCause::EpochGap);
+                client.run_recovery_grant_for_test(grant).await.unwrap();
+            }
+            assert_eq!(selected, !owns_debt, "owns_debt: {owns_debt}");
+            if owns_debt {
+                assert_eq!(
+                    app.pending_recovery_demands()
+                        .unwrap()
+                        .into_iter()
+                        .find(|demand| demand.cause == RecoveryCause::EpochGap)
+                        .expect("the gap stays pending")
+                        .eligibility,
+                    RecoveryEligibility::Ready,
+                    "never attempted, so never charged or parked"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

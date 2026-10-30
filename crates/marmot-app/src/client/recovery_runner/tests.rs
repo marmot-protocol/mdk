@@ -82,6 +82,7 @@ fn required(route: &Route, relays: &[&str]) -> RunnerRoute {
         group_id: None,
         required: relays.iter().map(|relay| (*relay).to_owned()).collect(),
         best_effort: Vec::new(),
+        unrecoverable: false,
     }
 }
 
@@ -3780,4 +3781,67 @@ async fn recovery_runner_fetches_nothing_while_admission_waits_after_a_local_fai
     let resumed = ran(runner.step().await);
     assert_eq!((&resumed.key.route, resumed.recheck), (&other, false));
     assert_eq!(account.admitted_events(), failing_events.len() as u64);
+}
+
+/// An Unrecoverable group's route is suspended: no sweep, re-check or
+/// comparison runs for it, nothing is charged, broken or parked, and its debt
+/// stays owed. Once the copy is repaired the route is served again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_suspends_an_unrecoverable_groups_route() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(every([1; 32], floor, t0, 60))
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![RunnerRoute {
+            unrecoverable: true,
+            ..required(&route, &[RELAY])
+        }],
+        &[&relay],
+    );
+    // No re-check has run, so one would be due at once.
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+    let owed = account.debt(&route, RELAY, t0 - 1);
+    assert!(!owed.is_empty());
+
+    assert_eq!(
+        idle(runner.step().await),
+        None,
+        "a suspended route waits for its repair, not for time"
+    );
+    clock.advance(DAY);
+    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(
+        runner.run_pass(Duration::from_secs(30)).await,
+        PassReport::default()
+    );
+    // A unit picked before its group froze does not begin.
+    let key = unit_key(&route, RELAY);
+    let policy = test_policy();
+    assert!(
+        host.debt_turn(move |turn| {
+            select::begin(turn, &key, false, Some(caps(500, true)), true, &policy).unwrap()
+        })
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(relay.requests(), 0);
+    assert!(relay.comparisons().is_empty());
+    assert!(
+        account.app.recovery_unit(&route, RELAY).unwrap().is_none(),
+        "never charged, broken or parked"
+    );
+    assert_eq!(account.debt(&route, RELAY, t0 - 1), owed);
+
+    host.routes.lock().unwrap()[0].unrecoverable = false;
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
 }

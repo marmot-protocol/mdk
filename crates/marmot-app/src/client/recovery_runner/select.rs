@@ -209,10 +209,9 @@ pub(super) fn sweepable(routes: &[RunnerRoute]) -> impl Iterator<Item = &RunnerR
         .filter(|route| matches!(route.route, TransportReconciliationRoute::Group(_)))
 }
 
-/// Whether the route's group is suspended (Unrecoverable). PR 5 fills this
-/// from the group's lifecycle; until then every group is eligible.
-pub(super) fn suspended(_route: &RunnerRoute) -> bool {
-    false
+/// Whether the route's group is suspended: its copy is Unrecoverable.
+pub(super) fn suspended(route: &RunnerRoute) -> bool {
+    route.unrecoverable
 }
 
 /// When the relay's cooldown ends, if one is running at `now`.
@@ -485,6 +484,7 @@ pub(super) fn begin(
     };
     let current = sweepable(turn.routes).any(|route| {
         route.route == key.route
+            && !suspended(route)
             && route
                 .relays()
                 .any(|(relay, effort)| relay == key.relay && effort == best_effort)

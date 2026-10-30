@@ -574,12 +574,25 @@ impl AppClient {
         self.current_coverage_routes()
             .into_iter()
             .map(|current| super::recovery_runner::RunnerRoute {
+                unrecoverable: current
+                    .group_id
+                    .as_deref()
+                    .is_some_and(|group_id| self.group_unrecoverable(group_id)),
                 route: current.route,
                 group_id: current.group_id,
                 required: current.required,
                 best_effort: current.best_effort,
             })
             .collect()
+    }
+
+    /// Whether the group's local copy is Unrecoverable, which suspends its
+    /// recovery (mdk#2660 section 6). A group whose record cannot be read is
+    /// not suspended.
+    pub(crate) fn group_unrecoverable(&self, group_id: &[u8]) -> bool {
+        self.runtime
+            .group_record(&cgka_traits::GroupId::new(group_id.to_vec()))
+            .is_ok_and(|group| group.unrecoverable)
     }
 
     fn coverage_storage(&self) -> Result<storage_sqlite::SqliteAccountStorage, AppError> {

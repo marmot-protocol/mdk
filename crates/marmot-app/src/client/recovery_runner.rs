@@ -104,6 +104,12 @@ pub(crate) struct RunnerRoute {
     /// Its other relays: one attempt per new debt, never charged, broken or
     /// noticed.
     pub(crate) best_effort: Vec<String>,
+    /// Its group's local copy is Unrecoverable (the engine froze it). The
+    /// route is suspended: its units and re-checks are not scheduled,
+    /// charged, broken or noticed while its debt keeps accruing, since a
+    /// fetch would only fill the group's deferred input with ciphertext the
+    /// copy cannot open.
+    pub(crate) unrecoverable: bool,
 }
 
 impl RunnerRoute {
