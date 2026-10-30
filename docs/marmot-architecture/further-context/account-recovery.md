@@ -843,7 +843,8 @@ deadline (30 s); then its frames go in as late input, the range stays owed, and 
 group no more until a new count arms it. Held frames count neither in the account's pending
 admission nor against other groups' placement, so other groups' boundaries, tails and ingest go
 on. The recorder writes no live boundary on a held route until its frames are released; its
-tail still stands. Held frames stay under the replay buffer bounds, so overflow is loss.
+tail still stands. Held frames stay under the replay buffer bounds, so overflow is loss, and the
+relay plane's cursor seal stops at the oldest one, since no queue holds it yet.
 
 ## What gets deleted
 

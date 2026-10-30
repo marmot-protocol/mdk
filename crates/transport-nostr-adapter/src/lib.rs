@@ -1584,7 +1584,7 @@ impl NostrTransportAdapter {
             .account_replay_coverage
             .values()
             .find(|coverage| coverage.subscriptions.contains_key(subscription_id))
-            .map(|coverage| coverage.request_groups_placed(subscription_id))
+            .map(|coverage| coverage.request_groups_placed(subscription_id, false))
     }
 
     /// Session-bound EOSE for one caller-supplied endpoint. Unknown or retired
@@ -2820,11 +2820,7 @@ impl ReplaySupervisor {
                 // an older arrival. Rejoin the still-owned suffix before any
                 // unstarted handoff; the next range is sorted after all peers
                 // settle. The permit send and this check share the state lock.
-                if delivery.group_id_hint.as_ref().is_some_and(|id| {
-                    coverage.groups.get(id).is_some_and(|group| {
-                        !coverage.group_ready(group) || !group.events.is_empty()
-                    })
-                }) {
+                if coverage.draining_rejoins(&delivery) {
                     deliveries.push_front(delivery);
                     coverage.restore_draining(deliveries);
                     break;
@@ -3789,6 +3785,8 @@ struct AccountReplayCoverage {
     fencing: bool,
     /// The last ticket at which a count that armed a fence became a fact.
     fence_ticket: u64,
+    /// The ticket of the last owner plan applied: an older plan is stale.
+    fence_plan_ticket: u64,
     /// When each fence gives up, as `deadlines` does for peers.
     fence_deadlines: std::collections::BTreeMap<tokio::time::Instant, Vec<GroupId>>,
 }
@@ -5162,6 +5160,21 @@ impl AccountReplayCoverage {
         deliveries
     }
 
+    /// Whether an unstarted hand-off must rejoin its group's buffer: the group
+    /// is no longer ready, an arrival there must be sorted in first, or a
+    /// fence now holds it. Frames a fence already holds stay where they are.
+    fn draining_rejoins(&self, delivery: &TransportDelivery) -> bool {
+        delivery.group_id_hint.as_ref().is_some_and(|id| {
+            self.groups.get(id).is_some_and(|group| {
+                !self.group_ready(group)
+                    || group.events.values().any(|event| !group.holds(event))
+                    || group
+                        .held_from()
+                        .is_some_and(|from| delivery.message.timestamp.0 >= from)
+            })
+        })
+    }
+
     fn restore_draining(&mut self, deliveries: VecDeque<TransportDelivery>) {
         for delivery in deliveries {
             let bytes = delivery.message.payload.len();
@@ -6163,11 +6176,13 @@ impl AccountReplayCoverage {
                 .routes
                 .get(&paging.subscription_id)
                 .is_some_and(|owned| owned.iter().any(|route| routes.contains(route)))
-                && (!group.ready_history.is_empty()
+                // A fence holds its frames for order; the next route's
+                // history may page meanwhile, within the buffer bounds.
+                && (group.ready_history.iter().any(|id| !group.holds_id(id))
                     || group
                         .streams
                         .values()
-                        .any(|stream| !stream.claims.is_empty()))
+                        .any(|stream| stream.claims.iter().any(|id| !group.holds_id(id))))
         })
     }
 

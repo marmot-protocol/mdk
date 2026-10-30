@@ -386,7 +386,7 @@ fn observe_live_counts(
         } else {
             routes
         };
-        let placed = source.placed();
+        let placed = source.placed_apart_from_fences();
         let held = source
             .fenced_routes()
             .map(|id| TransportReconciliationRoute::Group(*id))

@@ -201,13 +201,24 @@ impl ReplayRequestView<'_> {
                         .iter()
                         .any(|delivery| delivery.group_id_hint.is_none())
             }
-            ReplayScope::Groups(_) => self.coverage.request_groups_placed(self.id),
+            ReplayScope::Groups(_) => self.coverage.request_groups_placed(self.id, false),
+        }
+    }
+
+    /// [`Self::placed`], except that a group whose only buffered frames a
+    /// fence holds counts as placed: a fence holds one group, never the
+    /// request. Those groups' routes are [`Self::fenced_routes`], and nothing
+    /// on them is placed above the hold.
+    pub fn placed_apart_from_fences(&self) -> bool {
+        match &self.window.scope {
+            ReplayScope::Inbox => self.placed(),
+            ReplayScope::Groups(_) => self.coverage.request_groups_placed(self.id, true),
         }
     }
 
     /// The routes this request carries whose group's live frames a fence
     /// holds: their input is not placed while it does, even when
-    /// [`Self::placed`] holds for the rest of the request.
+    /// [`Self::placed_apart_from_fences`] holds for the rest of the request.
     pub fn fenced_routes(&self) -> impl Iterator<Item = &[u8; 32]> {
         self.coverage
             .request_groups
@@ -238,16 +249,18 @@ impl ReplayRequestView<'_> {
 impl AccountReplayCoverage {
     /// Every MLS group request `id` routes has reached durable placement and
     /// ordinary native admission: nothing for those groups is buffered, queued
-    /// natively, pinned or waiting in the outbox, except frames a fence holds.
-    /// A fence holds one group, never the request: its held frames are owed
-    /// on its own routes ([`ReplayRequestView::fenced_routes`]).
-    pub(super) fn request_groups_placed(&self, id: &str) -> bool {
+    /// natively, pinned or waiting in the outbox, except, when `held_placed`,
+    /// frames a fence holds.
+    pub(super) fn request_groups_placed(&self, id: &str, held_placed: bool) -> bool {
         self.request_groups.get(id).is_some_and(|groups| {
             !groups.is_empty()
                 && groups.iter().all(|group_id| {
                     self.groups.get(group_id).is_some_and(|group| {
                         self.group_ready(group)
-                            && group.events.values().all(|event| group.holds(event))
+                            && group
+                                .events
+                                .values()
+                                .all(|event| held_placed && group.holds(event))
                             && group.placements == 0
                             && !self.native_group_pending(group_id)
                             && !self
@@ -362,6 +375,15 @@ impl ReplayAdmissionStatus<'_> {
                 .get(self.account_id)
                 .map_or(0, |coverage| coverage.fence_ticket),
         )
+    }
+
+    /// The oldest frame a fence holds for this account. A cursor commit stops
+    /// there, so a restart fetches it again.
+    pub fn fence_held_since(&self) -> Option<u64> {
+        self._guard
+            .account_replay_coverage
+            .get(self.account_id)
+            .and_then(|coverage| coverage.fence_held_since())
     }
 
     /// The routes of every group whose live frames a fence holds now, a route

@@ -4256,6 +4256,107 @@ async fn replay_handoff_fences_cursor() {
     plane.shutdown().await;
 }
 
+/// A frame the adapter's fence holds is in no queue, yet a restart past it
+/// would never fetch it again: it caps the commit like a queued delivery,
+/// and stops capping once the owner's plan releases it.
+#[tokio::test]
+async fn fence_held_frame_caps_cursor() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = plane.account_adapter(account.clone(), relay.clone());
+    adapter.open_transport_cursor(Some(OPENED_CURSOR));
+    adapter.enable_replay_fencing().await;
+    let endpoint = TransportEndpoint("wss://relay.example/".into());
+    let transport_group_id = vec![0xD3; 32];
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 16]),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+                retained_since: None,
+            }],
+            since: Some(Timestamp(OPENED_CURSOR - 1_000)),
+        })
+        .await
+        .unwrap();
+    let group = issued_id(&relay, |subscription| {
+        matches!(subscription, NostrSubscription::GroupBatch { .. })
+    });
+    let created_at = OPENED_CURSOR + 500;
+    let mut event = group_event("fence-held-history", &transport_group_id);
+    event.created_at = created_at;
+    sign_group_event(&mut event);
+    // The relay's stored copy counts before its EOSE, as the notification
+    // consumer reports it.
+    plane
+        .inner
+        .transport
+        .adapter
+        .observe_relay_event(
+            &hex::decode(&event.id).unwrap(),
+            &endpoint,
+            Some(&group),
+            created_at,
+        )
+        .await;
+    plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(group),
+            event,
+        })
+        .await
+        .unwrap();
+    let issued = relay.subscriptions.lock().unwrap().clone();
+    for subscription in issued {
+        plane
+            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+            .await;
+    }
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(adapter.try_receive_account_delivery().is_none(), "held");
+    let ticket = {
+        let status = adapter.replay_admission().await;
+        assert!(!status.pending, "a held frame is not pending admission");
+        assert_eq!(status.fence_held_since(), Some(created_at));
+        status.fence_ticket()
+    };
+    let candidate = Some(OPENED_CURSOR + 2_000);
+    assert_eq!(
+        adapter.seal_transport_cursor(candidate, |_| true),
+        Some(created_at + CURSOR_LOOKBACK),
+        "the held frame caps the commit"
+    );
+
+    adapter
+        .fence_replay(&ReplayFencePlan {
+            ticket,
+            fences: Vec::new(),
+        })
+        .await;
+    let Some(AccountDeliveryReceive::Delivery(delivery)) =
+        timeout(Duration::from_secs(1), adapter.receive_account_delivery())
+            .await
+            .expect("the plan releases the held frame")
+            .unwrap()
+    else {
+        panic!("the held frame arrives once");
+    };
+    assert_eq!(delivery.message.timestamp.0, created_at);
+    adapter.release_account_delivery(&delivery.message.id);
+    assert_eq!(
+        adapter.seal_transport_cursor(candidate, |_| true),
+        candidate
+    );
+    plane.shutdown().await;
+}
+
 /// Replacing an activation can discard ciphertext before its EOSE. The next
 /// activation's complete coverage does not discharge that earlier loss, even
 /// when the router has not yet consumed the coalesced loss notification.
