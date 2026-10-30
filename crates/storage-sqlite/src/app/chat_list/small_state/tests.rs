@@ -589,6 +589,16 @@ fn a_read_marker_on_a_row_no_position_names_gives_the_message_before_it() {
         app.unsent_small_state_items().unwrap(),
         vec![read("11", 8, 150, 8)]
     );
+
+    // A delivered message whose time is out of range is not named either.
+    app.mark_small_state_sent(&app.unsent_small_state_items().unwrap())
+        .unwrap();
+    app.record_app_event(&delivered_chat("11", 11, 9, MAX_SMALL_STATE_NUMBER + 1))
+        .unwrap();
+    app.mark_timeline_message_read(LOCAL, "11", &message(11), &no_mentions)
+        .unwrap();
+    assert_eq!(sync(&store, &[], &rule).recorded, 0);
+    assert!(app.unsent_small_state_items().unwrap().is_empty());
 }
 
 #[test]
