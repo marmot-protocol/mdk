@@ -56,6 +56,26 @@
   3.4), so hosts can tell the user before inviters stop treating the device as
   fresh at 30 days. `KeyPackageRefreshOverdueChanged` says to re-read it. Both
   are false and silent in release builds until the roster's spec lands.
+- Account workers automatically rejoin durably and natively `Unrecoverable`
+  group copies through an authenticated account-inbox handshake. A healthy
+  current admin device replaces only the authorized device leaf and sends a fresh
+  Welcome after Commit confirmation. Retry state survives interruption;
+  stored history remains. Each grant binds one coordinating device, even on
+  a shared account inbox. Usable forks still require explicit consent, and
+  removed members cannot use this path to reenter.
+  Explicit Repair rearms eligible parked episodes through the runtime's
+  authorization and budget checks.
+  Linked-device recovery sets the device's tag signature key and announces
+  the replacement KeyPackage before publishing it. Host-held device groups
+  defer those writes. Roster and replacement-Commit effects reach the app even
+  if a later recovery control publication or journal write fails.
+  Confirmed Commits retain independent Welcome retry deadlines while secondary
+  relay targets retry, without letting later outbound work overtake them.
+  Recovery Welcomes stay scheduled in a live runtime after an expired transport
+  attempt, rather than waiting for reopen.
+  Authenticated recovery and pairing controls retain their private classification through runtime ingest.
+  Completed processing and runtime errors produce neither invitation metrics
+  nor Welcome audit observations for those controls.
 - Device pairing links a new device of the account through the account runtime (mdk#2628 item 3.3b), behind the
   unreleased `unreleased-device-pairing` feature and `dev_device_groups`. The new device starts a link naming its
   published KeyPackage (`MarmotAppRuntime::start_device_link`), both devices show the same seven emoji with their

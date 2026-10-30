@@ -3985,17 +3985,18 @@ impl AppClient {
                 }
             })
             .await;
-        let recovery_control = if let Some(slot) = &client.audit_v5_peel_slot {
-            let (recovery, completion) = slot.lock().unwrap().take();
+        let private_control = if let Some(slot) = &client.audit_v5_peel_slot {
+            let (private_control, completion) = slot.lock().unwrap().take();
             if let (Some(probe), Some(completion)) = (&mut client.audit_v5_probe, completion) {
                 probe.unwrapped(completion);
             }
-            recovery
+            private_control
         } else {
             false
         };
         if let (Some(probe), Some(receive), Ok(effects)) =
             (&mut client.audit_v5_probe, probe_receive, &ingest)
+            && !private_control
             && matches!(effects.outcome, IngestOutcome::Processed)
         {
             // The event is journaled in the join transaction. Only this
@@ -4040,6 +4041,7 @@ impl AppClient {
         }
         if let Some(observation) = observation {
             let outcome = match &ingest {
+                _ if private_control => None,
                 Ok(effects) => match &effects.outcome {
                     IngestOutcome::Processed => Some("success"),
                     // Authenticated control is neither an invitation metric nor
@@ -4061,7 +4063,6 @@ impl AppClient {
                     | IngestOutcome::Stale { .. }
                     | IngestOutcome::Rejected { .. } => Some("rejected"),
                 },
-                Err(_) if recovery_control => None,
                 Err(_) => Some("failure"),
             };
             if let Some(outcome) = outcome {
@@ -5880,6 +5881,10 @@ impl AppClient {
                 self.delivery_loss_blocks_cursor(),
             ));
         }
+        // Explicit host Repair is user authorization for one new finite
+        // replacement-Welcome episode; the runtime alone mutates its journal.
+        self.retry_parked_rejoins()
+            .map_err(|error| state_persist(SyncSummary::default(), error))?;
         if self
             .refresh_sync_routes()
             .map_err(|error| state_persist(SyncSummary::default(), error))?

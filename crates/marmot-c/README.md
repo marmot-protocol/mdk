@@ -493,6 +493,10 @@ immediately (free with `marmot_group_commit_delivery_free`), and
 [shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices) for when the
 status is returned.
 
+Automatic Unrecoverable rejoin runs inside the account workers; C hosts keep their existing group-state
+subscriptions. See the [shared automatic rejoin contract](../../docs/marmot-architecture/invitation-recovery.md#automatic-rejoin-of-an-unrecoverable-copy)
+for authorization, history retention and availability requirements.
+
 ## Group reporting
 
 The C ABI mirrors the [shared reporting operations](../marmot-uniffi/README.md#group-reporting). Pages are capped at

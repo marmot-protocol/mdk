@@ -14665,6 +14665,43 @@ fn app_transport_routing_recovers_from_poisoned_lock() {
 }
 
 #[test]
+fn recovery_selected_inbox_only() {
+    let recipient = MemberId::new(vec![0xa1; 32]);
+    let other = MemberId::new(vec![0xa2; 32]);
+    let endpoint = TransportEndpoint("wss://member-inbox.example".into());
+    let routing = AppTransportRouting::new(AppRoutingState {
+        local_inbox_endpoints: vec![TransportEndpoint("wss://own-inbox.example".into())],
+        key_package_endpoints: Vec::new(),
+        inbox_routes: HashMap::new(),
+        group_routes: Vec::new(),
+        required_acks: 1,
+    });
+    let message = TransportMessage {
+        id: MessageId::new(vec![0xa3; 32]),
+        payload: vec![1],
+        timestamp: Timestamp(1),
+        causal_deps: Vec::new(),
+        source: cgka_traits::transport::TransportSource("nostr".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: recipient.clone(),
+        },
+    };
+    routing.replace_inbox_route(other, Some(vec![endpoint.clone()]));
+    assert!(matches!(
+        routing.publish_target(&message),
+        Err(TransportRoutingError::MissingInboxRoute)
+    ));
+    routing.replace_inbox_route(recipient.clone(), Some(vec![endpoint.clone()]));
+    assert_eq!(
+        routing.publish_target(&message).unwrap(),
+        TransportPublishTarget::Inbox {
+            recipient,
+            endpoints: vec![endpoint],
+        }
+    );
+}
+
+#[test]
 fn relay_plane_rebuild_uses_persisted_cursor_with_bounded_overlap() {
     let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
 
