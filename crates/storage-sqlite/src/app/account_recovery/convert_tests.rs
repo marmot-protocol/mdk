@@ -691,8 +691,8 @@ fn a_nightly_database_quarantines_the_shadow_ledger_and_converts_every_row_kind(
     assert_eq!(scope_count(&store), 0);
     assert_eq!(orphan_scopes(&store), 0);
 
-    // Live boundaries are dropped; the comparison range is un-covered by the
-    // loss above the window floor; the sweep keeps what lies below it.
+    // Live boundaries are dropped; the unknown bound un-covers the comparison
+    // range and the sweep, below the window floor too.
     let ledger = |route: &TransportReconciliationRoute, relay: &str| {
         app.recovery_coverage_ranges(route, relay)
             .unwrap()
@@ -703,13 +703,7 @@ fn a_nightly_database_quarantines_the_shadow_ledger_and_converts_every_row_kind(
     assert!(ledger(&group(A), R1).is_empty());
     assert!(ledger(&group(C), R1).is_empty());
     assert!(ledger(&TransportReconciliationRoute::Inbox, R1).is_empty());
-    assert_eq!(
-        ledger(&group(B), R2),
-        vec![(
-            range(W - 500, W - 1),
-            crate::RecoveryCoverageProof::SweepSlice
-        )]
-    );
+    assert!(ledger(&group(B), R2).is_empty());
 
     // The shadow strip below the window was settled, not parked; every
     // current route owes from the window floor, a route the account left
@@ -720,8 +714,8 @@ fn a_nightly_database_quarantines_the_shadow_ledger_and_converts_every_row_kind(
     assert_eq!(goal(&store, &group(C)), Some(W));
 
     // The unknown bound parks everything below the window on each current
-    // route, as far as a required relay still owes it: group B's relay holds
-    // the sweep's part. Shadow remainders are gone.
+    // route, whatever the sweep proved there before the loss. Shadow
+    // remainders are gone.
     let remainders = app
         .recovery_coverage_remainders()
         .unwrap()
@@ -740,11 +734,11 @@ fn a_nightly_database_quarantines_the_shadow_ledger_and_converts_every_row_kind(
         vec![
             (TransportReconciliationRoute::Inbox, range(0, W - 1), 3, NOW),
             (group(A), range(0, W - 1), 4, NOW),
-            (group(B), range(0, W - 501), 5, NOW),
+            (group(B), range(0, W - 1), 5, NOW),
         ]
     );
 
-    // The un-cover is logged once, for every route.
+    // The un-cover is logged once, for every route, from the unknown bound.
     {
         let conn = store.lock().unwrap();
         let logged = rows(
@@ -757,7 +751,7 @@ fn a_nightly_database_quarantines_the_shadow_ledger_and_converts_every_row_kind(
             &vec![
                 Value::Integer(4),
                 Value::Null,
-                Value::Integer(W as i64),
+                Value::Integer(0),
                 Value::Null
             ]
         );
@@ -1180,4 +1174,45 @@ fn converted_loss_is_reclaimed_only_at_its_exact_watermarks() {
         "queue evidence, with the new generation, stays"
     );
     assert!(!app.reclaim_converted_recovery_loss(&notification).unwrap());
+}
+
+/// Loss bounded below the window parks the whole strip from its bound up to
+/// the window floor, as a live import and the next prune would: coverage that
+/// proved part of it before the loss does not shrink the remainder.
+#[test]
+fn loss_below_the_window_parks_what_old_coverage_proved() {
+    let rows = format!(
+        "{}UPDATE account_delivery_loss_evidence SET bound_state = 1, bound_seconds = {bound}
+             WHERE cause = 1 AND marker_token = 21;
+         INSERT INTO account_recovery_coverage (route_kind, route_id, relay, proof,
+             since_seconds, until_seconds, recorded_at_seconds)
+         VALUES (0, x'', '{R1}', 3, {bound}, {below}, 6), (0, x'', '{R2}', 2, {bound}, {below}, 6);",
+        nightly_rows(),
+        bound = W - 1000,
+        below = W - 1,
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let store = fixture(&directory, i64::MAX, &rows);
+    let app = store.app_storage();
+    convert(&store).unwrap();
+    for relay in [R1, R2] {
+        assert!(
+            app.recovery_coverage_ranges(&TransportReconciliationRoute::Inbox, relay)
+                .unwrap()
+                .is_empty(),
+            "{relay}"
+        );
+    }
+    let remainders = app
+        .recovery_coverage_remainders()
+        .unwrap()
+        .into_iter()
+        .map(|remainder| (remainder.route, remainder.range))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        remainders,
+        [TransportReconciliationRoute::Inbox, group(A), group(B)]
+            .map(|route| (route, range(W - 1000, W - 1)))
+            .to_vec()
+    );
 }

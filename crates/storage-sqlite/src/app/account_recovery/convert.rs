@@ -498,10 +498,10 @@ fn dismissed_tx(
     delete_converted_tx(conn, "state = 2", Disposition::Dismissed).map(|_| ())
 }
 
-/// Every live loss generation un-covers every route once, from its bound: the
-/// part inside the window is owed again, and what lies below the window,
-/// where the bound is unknown or older, parks in each current route's
-/// remainder. The generations then count as imported, so a later import does
+/// Every live loss generation un-covers every route once, from its bound, as
+/// a live import does: the part inside the window is owed again, and what
+/// lies below the window, where the bound is unknown or older, parks in each
+/// current route's remainder, whatever coverage proved it before the loss. The generations then count as imported, so a later import does
 /// not un-cover them again; their rows stay as the watermark that keeps a
 /// delayed duplicate observation from counting as new loss. The report lists
 /// each account and cause with live loss, with every generation of it, so the
@@ -511,17 +511,13 @@ fn loss_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> StorageRes
         return Ok(());
     };
     let (floor, now) = (input.retention_floor_seconds, input.now_seconds);
-    let from = lowest.max(floor);
-    uncover_loss_tx(conn, from, now)?;
+    uncover_loss_tx(conn, lowest, now)?;
     // The un-cover widened the goals the ledger holds; a current route
-    // without one owes from the same floor.
+    // without one owes from the same bound.
     for current in input.routes {
-        reopen_goal(conn, &current.route, from)?;
+        reopen_goal(conn, &current.route, lowest)?;
     }
     if lowest < floor {
-        for current in input.routes {
-            reopen_goal(conn, &current.route, lowest)?;
-        }
         let certifying = input
             .routes
             .iter()
