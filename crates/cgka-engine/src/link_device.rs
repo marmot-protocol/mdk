@@ -32,7 +32,9 @@
 //! Commit in the device group by the link's deadline, the device that
 //! approved the link removes its leaf and its roster entry in one admin
 //! Commit, under the same rules: never queued, built from those two
-//! proposals only, and checked as every own device-group Commit is.
+//! proposals only, and checked as every own device-group Commit is. The
+//! engine reads its own tree for the leaf: the Commit removes it only if the
+//! tree still has it, and removes the roster entry either way.
 
 use crate::engine::Engine;
 use crate::message_processor::route_wrapped_group_message;
@@ -233,11 +235,21 @@ impl<S: StorageProvider> Engine<S> {
         crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
         let existing = self.storage.get_group(&group_id)?;
         let account = crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
-        let removed = crate::own_account_devices::own_account_leaves(
-            &mls_group,
-            std::slice::from_ref(&leaf_signature_key),
-            &account,
-        )?;
+        // The leaf may already be gone, removed by another Commit or by its
+        // device leaving; the roster entry goes either way, so a failed link
+        // never leaves an entry behind for a device that is not there.
+        let removed = if mls_group
+            .members()
+            .any(|member| member.signature_key == leaf_signature_key)
+        {
+            crate::own_account_devices::own_account_leaves(
+                &mls_group,
+                std::slice::from_ref(&leaf_signature_key),
+                &account,
+            )?
+        } else {
+            Vec::new()
+        };
         validate_unlink_roster_update(&mls_group, &roster_update)?;
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());

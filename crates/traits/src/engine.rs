@@ -209,10 +209,11 @@ pub enum SendIntent {
     ///
     /// `leaf_signature_key` names the leaf the link added, as
     /// [`Member::credential`](crate::group::Member) reports it: another leaf
-    /// of this device's account. `roster_update` is a
-    /// `marmot.account.device-roster.v1` update with exactly one operation,
-    /// removing the device entry of a slot the roster lists. Like a link, it
-    /// is never queued.
+    /// of this device's account. The Commit removes that leaf only if the
+    /// group's tree still has it, so an entry whose leaf is already gone is
+    /// still removed. `roster_update` is a `marmot.account.device-roster.v1`
+    /// update with exactly one operation, removing the device entry of a slot
+    /// the roster lists. Like a link, it is never queued.
     UnlinkDevice {
         group_id: GroupId,
         leaf_signature_key: Vec<u8>,

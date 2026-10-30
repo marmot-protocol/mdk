@@ -601,6 +601,45 @@ async fn an_unlink_removes_the_device_and_its_entry_in_one_commit() {
     }
 }
 
+/// The engine reads its own tree for the leaf: when the linked device's leaf
+/// is already gone (here an earlier Commit removed only the leaf), the
+/// unlink still removes its roster entry, in a Commit that removes no leaf.
+#[tokio::test]
+async fn an_unlink_whose_leaf_is_gone_removes_only_the_entry() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let tablet = link_tablet(&mut phone, &mut laptop, &gid).await;
+    let tablet_key = signature_key(&tablet, &gid);
+    let leaf_only = send_commit(
+        &mut phone,
+        SendIntent::RemoveOwnAccountDevices {
+            group_id: gid.clone(),
+            leaf_signature_keys: vec![tablet_key.clone()],
+        },
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut laptop, &leaf_only, &gid).await;
+    assert_eq!(load_group(&phone, &gid).members().count(), 2);
+    assert!(roster_of(&phone, &gid).devices.contains_key(&slot(3)));
+
+    let commit = send_commit(
+        &mut phone,
+        unlink(
+            &gid,
+            tablet_key,
+            vec![DeviceRosterOperationV1::RemoveDevice(slot(3))],
+        ),
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut laptop, &commit, &gid).await;
+    let expected = roster(&[(1, "Phone"), (2, "Laptop")]);
+    for device in [&phone, &laptop] {
+        assert_eq!(roster_of(device, &gid), expected);
+        assert_eq!(load_group(device, &gid).members().count(), 2);
+    }
+}
+
 /// An unlink names one other leaf of the account and removes exactly one
 /// listed device entry; anything else is refused with nothing staged.
 #[tokio::test]
@@ -624,10 +663,6 @@ async fn a_refused_unlink_leaves_the_group_as_it_was() {
         (
             unlink(&gid, tablet_key.clone(), vec![remove(4)]),
             "the roster lists no such device",
-        ),
-        (
-            unlink(&gid, vec![7; 32], vec![remove(3)]),
-            "no current leaf has a device's signature key",
         ),
         (
             unlink(&gid, signature_key(&phone, &gid), vec![remove(1)]),

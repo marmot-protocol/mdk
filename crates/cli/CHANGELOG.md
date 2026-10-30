@@ -110,7 +110,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 - `SendIntent::UnlinkDevice` removes a device whose link failed, with its roster entry, in one admin Commit
   (mdk#2628 item 3.3b): the new device made no commit in the device group by the link's deadline. It takes the
   device's leaf signature key and a roster update that removes exactly one listed slot, adds no member and makes no
-  Welcome. Like a link, it is never queued: while the device group is settling it is refused with
+  Welcome. It removes the leaf only if the group's tree still has it, and the roster entry either way. Like a link, it is never queued: while the device group is settling it is refused with
   `EngineError::LinkDeviceUnsettled`, and the caller retries. It is reachable only in test-policy builds.
 - The engine can create a group under a group id the host chose before the group exists
   (`create_group_with_chosen_id_and_audit_context`), as a device link needs (mdk#2628). The id has 1 to 255 bytes.
