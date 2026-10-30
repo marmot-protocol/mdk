@@ -27,8 +27,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   one included, by its `slot_id_hex`, with one roster commit in the device
   group (mdk#2628 item 3.6). It fails with nothing sent while the device group
   has an earlier change in flight, and in release builds until the roster's
-  spec lands. A rename whose commit loses a fork to one that also changes that
-  device's entry is not made again. Use matching regenerated headers and
+  spec lands. A rename whose commit loses a fork is made again later, unless
+  another rename of that device won. Use matching regenerated headers and
   libraries.
 - `MarmotAppGroupMlsState` gains a trailing `convergence_parked` field for a
   group whose convergence pass spent its failure budget (mdk#2684). Show it as
@@ -54,6 +54,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   fresh at 30 days. The new `MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED`
   event says to re-read it. It is false in release builds until the roster's
   spec lands. Use matching regenerated headers and libraries.
+- `marmot_unrecognized_sign_ins` and `marmot_check_sign_ins` write sign-ins of
+  this account that this device does not recognize as a
+  `MarmotUnrecognizedSignInList` (free with
+  `marmot_unrecognized_sign_in_list_free`) (mdk#2628 item 3.2).
+  `marmot_answer_sign_in` answers one with a `MarmotSignInResponse`
+  discriminant. The new `MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED` event says
+  to re-read the list. It is empty in release builds until the roster's spec
+  lands. Use matching regenerated headers and libraries.
 - `marmot_account_devices_activation` and `marmot_enable_account_devices` let
   an admin turn on account-devices in an existing group, only when the user
   asks (mdk#2628). The first writes a `MarmotAccountDevicesActivation` that

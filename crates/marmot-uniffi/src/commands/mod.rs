@@ -26,6 +26,7 @@ mod notification;
 mod onboarding;
 mod push;
 mod relay;
+mod sign_in;
 mod sticker;
 mod subscription;
 mod telemetry;

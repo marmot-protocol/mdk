@@ -458,6 +458,17 @@ device's device group has held its KeyPackage refresh back for a week. Re-read i
 `MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED`. See the
 [shared contract](../marmot-uniffi/README.md#overdue-keypackage-refresh).
 
+## Unrecognized sign-ins
+
+`marmot_unrecognized_sign_ins` blocks on the account worker, reads local state only, and writes an owned
+`MarmotUnrecognizedSignInList`; free it with `marmot_unrecognized_sign_in_list_free`. `marmot_check_sign_ins` checks
+the account's slots now, over the network, and writes the list after the check. Each `MarmotUnrecognizedSignIn` has
+its `slot_id_hex` handle, `client` (empty when none), `appeared_at`, `last_seen_at`, `before_this_device`,
+`signed_in`, a `MarmotUnrecognizedSignInState`, and a `linked_by_slot_id_hex` set only for `LinkedElsewhere`.
+`marmot_answer_sign_in` takes a `MarmotSignInResponse` discriminant as `uint32_t`; an out-of-range value is
+`MARMOT_STATUS_INVALID_ARGUMENT`. The list is empty in every release build until the roster's spec lands. Re-read it on
+`MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED`. See the [shared contract](../marmot-uniffi/README.md#unrecognized-sign-ins).
+
 ## Linking a new device
 
 `marmot_start_device_link`, `marmot_confirm_device_link_match` and `marmot_cancel_device_link` (on the new device),

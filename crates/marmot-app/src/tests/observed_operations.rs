@@ -10,7 +10,8 @@ use super::*;
 fn observed_app(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
     let mut app =
         MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
-    app.product_analytics = crate::observability_test_support::test_product_collector();
+    app.product_analytics =
+        marmot_observability::observability_test_support::test_product_collector();
     app.set_usage_diagnostics_consent(true).unwrap();
     app
 }

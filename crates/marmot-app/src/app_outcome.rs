@@ -4,8 +4,8 @@
 //! error themselves.
 
 use crate::AppError;
-use crate::app_telemetry::runtime::Outcome;
-use crate::observer::StorageFailureKind;
+use marmot_observability::app_telemetry::runtime::Outcome;
+use marmot_observability::observer::StorageFailureKind;
 
 /// The performance outcome of a failed operation: a worker that did not answer in time is a
 /// timeout, a busy worker is not ready, and any other error is a failure.
@@ -33,13 +33,13 @@ impl From<&AppError> for Option<StorageFailureKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observability_test_support::success_or_failure;
-    use crate::observer::PerformanceRecorder;
     use crate::{
         AccountCatchUpFailure, RuntimePerformanceOperation, SyncErrorClass,
         SyncFailureClassification, SyncFailureStage,
     };
     use cgka_traits::StorageError;
+    use marmot_observability::observability_test_support::success_or_failure;
+    use marmot_observability::observer::PerformanceRecorder;
 
     /// The performance recorder's `finish_app` before #2627 PR 1, verbatim but for its receiver.
     fn finish_app_before<T>(result: &Result<T, AppError>) -> Outcome {

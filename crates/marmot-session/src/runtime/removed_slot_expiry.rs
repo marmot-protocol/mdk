@@ -87,6 +87,7 @@ where
             record_count = expired.len(),
             "dropping expired removed-device records from the device group"
         );
-        self.send_device_roster_update(group_id, expired).await
+        self.send_device_roster_update(group_id, expired, None)
+            .await
     }
 }

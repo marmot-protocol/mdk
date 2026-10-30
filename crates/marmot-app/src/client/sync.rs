@@ -1,5 +1,5 @@
 use crate::RuntimePerformanceOperation as RuntimeOp;
-use crate::app_telemetry::runtime::Outcome as TelemetryOutcome;
+use marmot_observability::app_telemetry::runtime::Outcome as TelemetryOutcome;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,6 @@ use storage_sqlite::{
 use tokio::time::timeout;
 use transport_nostr_adapter::NostrReconciliationItem as AdapterReconciliationItem;
 
-use crate::app_telemetry::{AppPerformanceOperation, SyncFailureStage};
 use crate::groups::{
     EventGroupProjection, decode_received_event, event_group_id, fail_if_publish_failed,
     observe_event,
@@ -24,12 +23,14 @@ use crate::notifications;
 use crate::{
     AccountState, AppError, AppMessageProjection, ClassifiedSyncFailure, SDK_DRAIN_WAIT,
     SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
-    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, observer::PerformanceRecorder, unix_now_seconds,
+    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
 };
 use marmot_forensics::{
     AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillExecutionSeam,
     EpochStallBackfillTrigger, ForensicRecorder as _,
 };
+use marmot_observability::app_telemetry::{AppPerformanceOperation, SyncFailureStage};
+use marmot_observability::observer::PerformanceRecorder;
 
 #[cfg(test)]
 use marmot_forensics::EpochBackfillCompletionKind;
@@ -7763,9 +7764,10 @@ mod runtime_group_subscription_refresh_tests {
     use std::sync::Arc;
 
     use super::{SyncCheckpointError, SyncSummary};
+    use crate::MarmotApp;
     use crate::tests::ScriptedPushRelayClient;
-    use crate::{MarmotApp, observer::PerformanceRecorder};
     use marmot_account::AccountHome;
+    use marmot_observability::observer::PerformanceRecorder;
 
     /// A send can release a peer's route update without changing membership.
     /// Its retained observer must install that route and retry a failed rebuild.

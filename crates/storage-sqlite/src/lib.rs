@@ -12,6 +12,7 @@ mod cross;
 pub mod media_store_bench;
 mod protocol;
 
+pub use app::device_renames::DeviceRenameRecord;
 pub use app::group_system::{
     GroupSystemEventProjection, GroupSystemEventProvenance, group_system_event_from_message,
 };

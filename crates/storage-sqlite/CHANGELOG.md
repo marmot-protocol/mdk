@@ -25,6 +25,13 @@
   `mark_small_state_sent` and `owe_all_small_state_items`, with
   `SmallStateItem`, `SmallStateRule`, `SmallStateSchedule`,
   `SmallStateBroadcast` and their value types.
+- Migration 0137 advances account storage to schema 137 (mdk#2628 item 3.6).
+  It adds `device_renames`, one row per device this device renamed in its
+  device group's roster: the label its latest rename sets, the rename ids
+  that rename wrote, and the rename ids the device's entry held where this
+  device's renames of it were built. `SqliteAppStorage` gains
+  `device_renames`, `device_rename`, `put_device_rename` and
+  `drop_device_rename`, with `DeviceRenameRecord`.
 - Migration 0136 advances account storage to schema 136 (mdk#2660 phase 4).
   It adds `account_recovery_conversion`, the marker of the one-time upgrade
   conversion (its next step, whether the changed "history may be incomplete"

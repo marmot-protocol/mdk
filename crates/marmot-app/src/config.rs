@@ -3,7 +3,7 @@ use std::time::Duration;
 use marmot_session::MaintenanceTiming;
 
 use crate::deployment::{MarmotDeployment, OpenRankingProvider};
-use crate::export_config::{
+use marmot_observability::export_config::{
     AuditLogUploadSource, DEFAULT_EXPORT_INTERVAL, RelayTelemetryExportConfig,
     RelayTelemetryRuntimeConfig, endpoint_transport_allowed, trim_optional,
 };
@@ -673,7 +673,7 @@ impl RelayTelemetrySettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::export_config::RelayTelemetryResource;
+    use marmot_observability::export_config::RelayTelemetryResource;
 
     #[test]
     fn cursor_persistence_defaults_to_advance_and_is_opt_in() {

@@ -1166,7 +1166,8 @@ async fn maintenance_counts_one_recovery_transition() {
         .create_account("alice")
         .unwrap();
     let mut app = app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
-    app.product_analytics = crate::observability_test_support::test_product_collector();
+    app.product_analytics =
+        marmot_observability::observability_test_support::test_product_collector();
     let runtime = app.runtime();
     runtime.set_usage_diagnostics_consent(true).unwrap();
     let mut client = app.client("alice").await.unwrap();

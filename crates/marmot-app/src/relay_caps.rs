@@ -29,7 +29,7 @@ use transport_nostr::{RelayEndpointPolicy, RelaySafetyPolicy};
 use transport_nostr_adapter::sweep::RelayCaps;
 use url::Url;
 
-use crate::collector_host_safety;
+use marmot_observability::collector_host_safety;
 
 /// Relay connects use 5 s (`dial-safety.md`); the document fetch matches.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
