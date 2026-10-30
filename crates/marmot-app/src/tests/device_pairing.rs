@@ -698,6 +698,11 @@ async fn a_first_link_whose_welcome_never_lands_fails_at_the_deadline() {
             .is_empty(),
         "the link's Welcome is withdrawn"
     );
+    assert_eq!(
+        link_record(&phone, &group, &slot).welcome_id_hex,
+        None,
+        "a withdrawn Welcome is not withdrawn again"
+    );
     assert!(!phone.roster(&group).devices.contains_key(&laptop_slot));
     let leaf = hex::decode(link_record(&phone, &group, &slot).leaf_signature_key_hex).unwrap();
     assert!(
@@ -738,6 +743,17 @@ async fn a_device_with_no_first_commit_by_the_deadline_is_removed_and_told() {
     );
     let group = phone.client.trusted_device_group().unwrap().unwrap();
     let laptop_slot: [u8; 32] = hex::decode(&slot).unwrap().try_into().unwrap();
+    // A Welcome id that cannot be withdrawn does not hold the removal back.
+    let unreadable = "zz";
+    assert!(
+        phone
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .record_device_link_welcome(&hex::encode(group.as_slice()), &slot, unreadable)
+            .unwrap()
+    );
 
     phone
         .client
@@ -755,6 +771,11 @@ async fn a_device_with_no_first_commit_by_the_deadline_is_removed_and_told() {
         DeviceLinkOutcome::Failed
     );
     assert!(!phone.roster(&group).devices.contains_key(&laptop_slot));
+    assert_eq!(
+        link_record(&phone, &group, &slot).welcome_id_hex.as_deref(),
+        Some(unreadable),
+        "a Welcome not yet withdrawn is kept to withdraw on a later drive"
+    );
 
     let removed = laptop.step(&relay).await; // the Welcome, then its removal
     assert_eq!(
@@ -1071,6 +1092,34 @@ async fn not_now_is_refused_while_an_approval_waits() {
             .state,
         DeviceLinkPromptState::Linking
     );
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Pending,
+        "a waiting approval is not decided"
+    );
+
+    // The phone's own commit lands; the approval then commits the link, and
+    // the tablet joins.
+    relay.allow_publishes();
+    make_retained_publish_due(&phone.client, &group);
+    let retried = phone
+        .client
+        .runtime
+        .advance_convergence(&group)
+        .await
+        .unwrap();
+    phone
+        .client
+        .observe_drained_session_events(&retried)
+        .await
+        .unwrap();
+    let committed = phone.step(&relay).await;
+    assert_eq!(
+        committed.prompt_for_slot(&slot).unwrap().state,
+        DeviceLinkPromptState::Linking
+    );
+    join_then_linked(&relay, &mut phone, &mut tablet).await;
+    assert_eq!(tablet.trust(&group), Some(DeviceGroupTrust::Linked));
 }
 
 /// A retained link commit whose retry the relay refuses rolls back: the link

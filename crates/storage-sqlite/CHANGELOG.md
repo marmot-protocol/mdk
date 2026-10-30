@@ -21,8 +21,9 @@
   its outcome: `pending`, `linked` or `failed`. It also adds
   `device_group_joins`, the device groups this device joined through a link
   whose first commit there has not landed yet. `SqliteAppStorage` gains
-  `record_device_link`, `record_device_link_welcome`, `device_link`,
-  `device_links`, `decide_device_link`, `record_device_group_join`,
+  `record_device_link`, `record_device_link_welcome`,
+  `clear_failed_device_link_welcome`, `device_link`, `device_links`,
+  `decide_device_link`, `record_device_group_join`,
   `device_group_joins` and `delete_device_group_join`. A local forget removes
   the group's rows. No rows are seeded.
 - Migration 0132 advances account storage to schema 132 (mdk#2660 phase 4).

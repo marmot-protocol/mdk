@@ -113,6 +113,27 @@ impl SqliteAppStorage {
         Ok(changed != 0)
     }
 
+    /// Forget a failed link's Welcome once it is withdrawn, so nothing
+    /// withdraws it again. Returns whether the link failed with that
+    /// Welcome recorded.
+    pub fn clear_failed_device_link_welcome(
+        &self,
+        group_id_hex: &str,
+        slot_hex: &str,
+        welcome_id_hex: &str,
+    ) -> StorageResult<bool> {
+        let changed = self
+            .lock()?
+            .execute_cached(
+                "UPDATE device_links SET welcome_id_hex = NULL
+                 WHERE group_id_hex = ?1 AND slot_hex = ?2 AND outcome = 'failed'
+                     AND welcome_id_hex = ?3",
+                params![group_id_hex, slot_hex, welcome_id_hex],
+            )
+            .storage()?;
+        Ok(changed != 0)
+    }
+
     pub fn device_link(
         &self,
         group_id_hex: &str,
@@ -294,6 +315,12 @@ mod tests {
         assert!(!store.decide_device_link("aa", "01", Failed, 8).unwrap());
         assert!(!store.record_device_link_welcome("aa", "01", "w2").unwrap());
         assert!(store.decide_device_link("aa", "01", Pending, 8).is_err());
+        // Only a failed link's Welcome is forgotten.
+        assert!(
+            !store
+                .clear_failed_device_link_welcome("aa", "01", "w1")
+                .unwrap()
+        );
         assert_eq!(
             store.device_link("aa", "01").unwrap().unwrap(),
             DeviceLinkRecord {
@@ -322,6 +349,27 @@ mod tests {
         assert_eq!(links[1].leaf_signature_key_hex, "22");
         assert_eq!(links[1].welcome_id_hex, None);
         assert!(store.device_link("bb", "01").unwrap().is_none());
+
+        assert!(store.record_device_link_welcome("aa", "02", "w3").unwrap());
+        assert!(store.decide_device_link("aa", "02", Failed, 10).unwrap());
+        assert!(
+            !store
+                .clear_failed_device_link_welcome("aa", "02", "w4")
+                .unwrap()
+        );
+        assert!(
+            store
+                .clear_failed_device_link_welcome("aa", "02", "w3")
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .device_link("aa", "02")
+                .unwrap()
+                .unwrap()
+                .welcome_id_hex,
+            None
+        );
     }
 
     #[test]
