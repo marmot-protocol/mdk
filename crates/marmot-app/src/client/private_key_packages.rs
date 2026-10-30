@@ -38,15 +38,18 @@
 //!   admitted one is stashed (migration 0160) and each maintenance pass joins
 //!   from the stash, before upkeep tops the sender's stock up again, while
 //!   its carrier is still delivered. A refused one is dropped like a refused
-//!   hand-off, and so is one whose carrier a branch switch withdrew; one
-//!   admitted but not stashed fails the event's projection, which is retried,
-//!   so a failed write never loses it.
+//!   hand-off, and so is one whose carrier a branch switch withdrew. One into
+//!   a chat this device still holds, such as one ahead of the removal it
+//!   follows, becomes the engine's rejoin offer, retried once the removal
+//!   lands. One admitted but not stashed fails the event's projection, which
+//!   is retried, so a failed write never loses it.
 
 use base64::Engine as _;
 use cgka_traits::app_components::{
     DeviceRosterV1, DeviceSlotId, DeviceTagClaim, NOSTR_ROUTING_MAX_RELAYS,
     validate_nostr_relay_url,
 };
+use cgka_traits::ingest::LocalIngestState;
 use cgka_traits::storage::{IssuedPrivateKeyPackage, MaintenanceStorage as _, MessageStorage as _};
 use cgka_traits::{
     EpochId, GroupId, IngestOutcome, KeyPackage, MemberId, MessageId, MessageState, StorageError,
@@ -304,9 +307,9 @@ impl AppClient {
 
     /// Join a chat from every stashed sibling Welcome, oldest first, and
     /// project the joins. A Welcome leaves the stash once its join settles,
-    /// whether it joined or was refused, and unjoined once its carrier is no
-    /// longer delivered; one whose join failed stays for the next pass. A
-    /// failure waits for the next pass.
+    /// whether it joined, was refused or left a rejoin offer, and unjoined
+    /// once its carrier is no longer delivered; one whose join failed stays
+    /// for the next pass. A failure waits for the next pass.
     pub(crate) async fn join_stashed_sibling_welcomes(&mut self) {
         if !self.app.device_groups_enabled() || self.runtime.maintenance_is_paused() {
             return;
@@ -332,7 +335,8 @@ impl AppClient {
         // their projection have settled.
         let policy_lock = self.app.block_update_lock(&self.state.label).await;
         let _policy_guard = policy_lock.lock().await;
-        let (mut joined, mut refused, mut withdrawn, mut failed) = (0usize, 0usize, 0usize, 0usize);
+        let (mut joined, mut offered, mut refused, mut withdrawn, mut failed) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
         for record in stashed {
             let (Ok(welcome), Ok(message_id)) = (
                 SiblingWelcome::decode(&record.content),
@@ -365,10 +369,16 @@ impl AppClient {
             {
                 Ok(outcome) => {
                     storage.delete_stashed_sibling_welcome(&record.message_id_hex)?;
-                    if matches!(outcome, IngestOutcome::Processed) {
-                        joined += 1;
-                    } else {
-                        refused += 1;
+                    match outcome {
+                        IngestOutcome::Processed => joined += 1,
+                        // Into a chat this device still holds, such as one
+                        // whose removal has not reached it yet: the engine
+                        // keeps it as a rejoin offer, which maintenance
+                        // retries once the removal lands.
+                        IngestOutcome::LocalState {
+                            state: LocalIngestState::RejoinConfirmationRequired,
+                        } => offered += 1,
+                        _ => refused += 1,
                     }
                 }
                 Err(_) => failed += 1,
@@ -378,6 +388,7 @@ impl AppClient {
             target: TRACE_TARGET,
             method = "join_stashed_sibling_welcomes",
             joined,
+            offered,
             refused,
             withdrawn,
             failed,

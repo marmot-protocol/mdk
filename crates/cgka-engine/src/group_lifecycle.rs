@@ -21,7 +21,7 @@ use crate::wire_format::{
 use cgka_traits::TransportEndpoint;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet,
-    DEVICE_ROSTER_COMPONENT_ID, DeviceSlotId, decode_device_roster_v1, default_group_components,
+    DEVICE_ROSTER_COMPONENT_ID, decode_device_roster_v1, default_group_components,
 };
 use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
@@ -35,7 +35,7 @@ use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
+use cgka_traits::welcome::{PendingWelcome, RejoinWelcome, SiblingWelcomeRoute};
 use marmot_forensics::AuditEventKind;
 use openmls::group::{MlsGroup, MlsGroupCreateConfig};
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
@@ -171,11 +171,8 @@ pub(crate) enum WelcomeRoute {
     Delivery,
     /// A sibling Welcome the app admitted from the trusted device group. It
     /// consumes only the private KeyPackage it names, and only one this
-    /// device issued to `from`'s slot.
-    Sibling {
-        from: DeviceSlotId,
-        key_package_ref: Vec<u8>,
-    },
+    /// device issued to `from`'s slot. An offer it leaves keeps the route.
+    Sibling(SiblingWelcomeRoute),
 }
 
 pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
@@ -1103,10 +1100,27 @@ impl<S: StorageProvider> Engine<S> {
                     method = "retry_rejoins_after_trusted_removal", "skipping a group awaiting hydration repair");
                 continue;
             }
-            match self
-                .do_join_welcome(welcome, None, WelcomeRoute::Delivery)
-                .await
+            // A sibling Welcome's offer joins by its own route, and only
+            // while its carrier is still delivered.
+            let (prepeeled, route) = match candidate
+                .rejoin
+                .as_ref()
+                .and_then(|rejoin| rejoin.sibling.clone())
             {
+                Some(sibling) => {
+                    if !self.sibling_carrier_delivered(&sibling.carrier)? {
+                        self.storage.take_welcome(&candidate.message_id)?;
+                        tracing::debug!(target: "cgka_engine::group_lifecycle",
+                            method = "retry_rejoins_after_trusted_removal", "retired a withdrawn sibling offer");
+                        continue;
+                    }
+                    let prepeeled =
+                        self.peeled_sibling_welcome(&welcome, Some(welcome.timestamp))?;
+                    (Some(prepeeled), WelcomeRoute::Sibling(sibling))
+                }
+                None => (None, WelcomeRoute::Delivery),
+            };
+            match self.do_join_welcome(welcome, prepeeled, route).await {
                 Ok(_) => joined = true,
                 Err(error) if terminal_welcome_error(&error) => {
                     self.storage.take_welcome(&candidate.message_id)?;
@@ -1135,10 +1149,12 @@ impl<S: StorageProvider> Engine<S> {
             .into_iter()
             .find(|candidate| &candidate.message_id == welcome_id)
             .ok_or(EngineError::InvalidWelcome)?;
-        candidate
+        let sibling = candidate
             .rejoin
             .as_ref()
-            .ok_or(EngineError::InvalidWelcome)?;
+            .ok_or(EngineError::InvalidWelcome)?
+            .sibling
+            .clone();
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let group = MlsGroup::load(
             provider.storage(),
@@ -1153,18 +1169,33 @@ impl<S: StorageProvider> Engine<S> {
         // Recheck the live token inside the replacement transaction below.
         let welcome: TransportMessage = serde_json::from_slice(&candidate.welcome_bytes)
             .map_err(|error| EngineError::Serialize(error.to_string()))?;
-        let peeled = self
-            .peeler
-            .peel_welcome(&welcome)
-            .await
-            .map_err(EngineError::Peeler)?;
-        let content_id = welcome_content_dedup_id(&peeled)?;
+        let (peeled, content_id, route) = match sibling {
+            // A withdrawn sibling Welcome is gone, like a declined offer.
+            Some(sibling) if !self.sibling_carrier_delivered(&sibling.carrier)? => {
+                self.storage.take_welcome(welcome_id)?;
+                return Err(EngineError::InvalidWelcome);
+            }
+            Some(sibling) => {
+                let (peeled, content_id) =
+                    self.peeled_sibling_welcome(&welcome, Some(welcome.timestamp))?;
+                (peeled, content_id, WelcomeRoute::Sibling(sibling))
+            }
+            None => {
+                let peeled = self
+                    .peeler
+                    .peel_welcome(&welcome)
+                    .await
+                    .map_err(EngineError::Peeler)?;
+                let content_id = welcome_content_dedup_id(&peeled)?;
+                (peeled, content_id, WelcomeRoute::Delivery)
+            }
+        };
         self.join_peeled_welcome_with_consent(
             welcome,
             peeled,
             content_id,
             Some((&candidate.group_id, local_state_token)),
-            WelcomeRoute::Delivery,
+            route,
         )
         .await
     }
@@ -1419,14 +1450,9 @@ impl<S: StorageProvider> Engine<S> {
                 crate::private_key_packages::issued_record(storage, &consumed_key_package_ref)?;
             let sibling_record = match (&route, issued) {
                 (WelcomeRoute::Delivery, None) => None,
-                (
-                    WelcomeRoute::Sibling {
-                        from,
-                        key_package_ref,
-                    },
-                    Some(record),
-                ) if &record.recipient_slot == from
-                    && key_package_ref == &consumed_key_package_ref =>
+                (WelcomeRoute::Sibling(sibling), Some(record))
+                    if record.recipient_slot == sibling.from
+                        && sibling.key_package_ref == consumed_key_package_ref =>
                 {
                     Some(record)
                 }
@@ -1677,13 +1703,9 @@ impl<S: StorageProvider> Engine<S> {
             }
 
             if let Some(local_state_token) = confirmation_token {
-                // A sibling Welcome adds a device missing from the chat, and
-                // this one holds an active copy. An offer would also be
-                // confirmed by the delivery route, which refuses a private
-                // KeyPackage.
-                if sibling_record.is_some() {
-                    return Err(EngineError::InvalidWelcome);
-                }
+                // A sibling Welcome's offer keeps its route, since the
+                // delivery route refuses a private KeyPackage. It too may
+                // arrive before the removal it follows.
                 pending_rejoin = Some(PendingWelcome {
                     message_id: welcome_id.clone(),
                     group_id: group_id.clone(),
@@ -1694,6 +1716,10 @@ impl<S: StorageProvider> Engine<S> {
                         epoch: EpochId(mls_group.epoch().as_u64()),
                         welcomer: welcome_sender_id.clone(),
                         local_state_token,
+                        sibling: match &route {
+                            WelcomeRoute::Delivery => None,
+                            WelcomeRoute::Sibling(sibling) => Some(sibling.clone()),
+                        },
                     }),
                 });
                 // Roll back ALL tentative state including KeyPackage consumption.

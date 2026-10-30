@@ -144,8 +144,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Stash a sibling Welcome (461, mdk#2628 3.5b) only after a hand-off's checks, a relay list of one to 16 relay URLs
   distinct once parsed, and a KeyPackage this device issued to its sender; join from the stash (migration 0160) in
   the maintenance pass, never in the synchronous dispatch, only while its carrier is still `Processed`, and drain the
-  joins' events as a confirmed rejoin does. A refused or withdrawn 461 is dropped; one admitted but not stashed fails
-  the event's projection, which is retried.
+  joins' events as a confirmed rejoin does. A refused or withdrawn 461 is dropped; one into a chat still held active
+  is the engine's rejoin offer, which the invite-recovery seam retries once the removal lands; one admitted but not
+  stashed fails the event's projection, which is retried.
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.

@@ -26,10 +26,13 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
+use cgka_traits::message::MessageState;
+use cgka_traits::storage::StorageError;
 use cgka_traits::storage::{
     IssuedPrivateKeyPackage, PrivateKeyPackageStorage, StorageProvider, private_key_package_halfway,
 };
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
+use cgka_traits::welcome::SiblingWelcomeRoute;
 use cgka_traits::{MemberId, MessageId};
 use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
@@ -524,30 +527,57 @@ impl<S: StorageProvider> Engine<S> {
                 recipient: self.identity.self_id().clone(),
             },
         };
+        let (peeled, content_id) = self.peeled_sibling_welcome(&msg, created_at)?;
+        let joined = self
+            .do_join_welcome(
+                msg.clone(),
+                Some((peeled, content_id.clone())),
+                crate::group_lifecycle::WelcomeRoute::Sibling(SiblingWelcomeRoute {
+                    carrier: message_id.clone(),
+                    from: welcome.from,
+                    key_package_ref: welcome.key_package_ref.clone(),
+                }),
+            )
+            .await;
+        self.welcome_join_outcome(&msg, Some(content_id), joined)
+    }
+
+    /// A sibling Welcome's transport message as a join reads it, already
+    /// peeled, and its content id.
+    pub(crate) fn peeled_sibling_welcome(
+        &self,
+        msg: &TransportMessage,
+        created_at: Option<Timestamp>,
+    ) -> Result<(PeeledMessage, MessageId), EngineError> {
         let peeled = PeeledMessage {
             id: msg.id.clone(),
             group_id: None,
             // Every device of the account is a sibling's sender.
             sender: Some(self.identity.self_id().clone()),
             content: PeeledContent::Welcome {
-                bytes: welcome.welcome.clone(),
+                bytes: msg.payload.clone(),
                 created_at,
                 key_package_event_id: None,
             },
             origin: msg.clone(),
         };
         let content_id = crate::group_lifecycle::welcome_content_dedup_id(&peeled)?;
-        let joined = self
-            .do_join_welcome(
-                msg.clone(),
-                Some((peeled, content_id.clone())),
-                crate::group_lifecycle::WelcomeRoute::Sibling {
-                    from: welcome.from,
-                    key_package_ref: welcome.key_package_ref.clone(),
-                },
-            )
-            .await;
-        self.welcome_join_outcome(&msg, Some(content_id), joined)
+        Ok((peeled, content_id))
+    }
+
+    /// Whether the device-group message that carried a sibling Welcome is
+    /// still delivered. A branch switch that withdrew it, or a rollback that
+    /// dropped it, withdraws the Welcome too, so a rejoin offer it left joins
+    /// only while it is.
+    pub(crate) fn sibling_carrier_delivered(
+        &self,
+        carrier: &MessageId,
+    ) -> Result<bool, EngineError> {
+        match self.storage.get_message(carrier) {
+            Ok(record) => Ok(record.state == MessageState::Processed),
+            Err(StorageError::NotFound) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Every private KeyPackage this device issued, oldest first.
