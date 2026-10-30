@@ -14,9 +14,10 @@ use storage_sqlite::{
 };
 use tokio::sync::watch;
 
+use super::super::RecoveryRunner;
 use super::super::open_attempts::AttemptKind;
 use super::super::{RecoveryRunnerPolicy, RunnerHost, UnitKey};
-use super::{AccountRunner, RunnerSeat, SpawnedRunner};
+use super::{AccountRunner, AccountRunnerHost, RunnerSeat, SpawnedRunner};
 use crate::client::AppClient;
 use crate::client::history_notices::park_recovery_for_test;
 use crate::client::recovery_coverage::scenario_tests::{Fixture, fixture};
@@ -236,25 +237,65 @@ async fn a_stopped_runner_settles_the_quantum_it_preempted() {
     hold.release.notify_waiters();
 }
 
-/// A stop whose wait ends before the preempted quantum's settle comes, as
-/// when its relay is slow to honour the cancel, refunds the attempt as
-/// unanswered instead.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stop_that_outwaits_the_settle_refunds_the_attempt() {
-    let hold = HeldSweeps::default();
-    let (_dir, _relay, mut client, storage) = held_client(&hold).await;
-    let before = charged(&storage);
-    let mut runner = client.spawn_recovery_runner().await.unwrap();
-    serve_until_held(&mut runner, &mut client, &hold).await;
-    assert_eq!(charged(&storage), before + 1, "the quantum began");
-
-    runner.stop_within(&mut client, Duration::ZERO).await;
-    assert_eq!(charged(&storage), before, "the stop refunded the attempt");
-    hold.release.notify_waiters();
+/// The account's runner, never spawned, with one attempt on `key` begun as
+/// its begin turn begins one, owned as the worker owns a runner whose task
+/// still waits on its relay. Returns it with the runner, which holds the
+/// host its turns go through.
+async fn begun_runner(
+    client: &AppClient,
+    storage: &SqliteAppStorage,
+    key: &UnitKey,
+) -> (SpawnedRunner, RecoveryRunner<AccountRunnerHost>) {
+    let AccountRunner {
+        runner,
+        handle,
+        turns,
+        refund,
+    } = client.build_recovery_runner().await;
+    storage
+        .begin_recovery_unit_attempt(&key.route, &key.relay, None, unix_now_seconds())
+        .unwrap();
+    runner.open_attempts().begun(key, AttemptKind::Debt);
+    let spawned = SpawnedRunner {
+        handle,
+        task: tokio::spawn(std::future::pending()),
+        turns,
+        _refund: refund,
+    };
+    (spawned, runner)
 }
 
-/// A settle the runner sent by the stop's deadline is still served: its
-/// verdict, not a refund, decides the charge.
+/// A deadline the stop has already passed.
+fn passed() -> tokio::time::Instant {
+    tokio::time::Instant::now() - Duration::from_secs(1)
+}
+
+/// A stop whose wait ends before the preempted quantum's settle comes, as
+/// when its relay is slow to honour the cancel and the quantum still waits
+/// out its grace, refunds the attempt as unanswered: the charge goes back and
+/// the relay gets no verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_whose_settle_never_comes_refunds_the_attempt() {
+    const RELAY: &str = "wss://slow.example";
+    let (_dir, _relay, app, mut client) = direct_client(true).await;
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    let route = TransportReconciliationRoute::Group([9; 32]);
+    let key = UnitKey {
+        route: route.clone(),
+        relay: RELAY.to_owned(),
+    };
+    let before = charged(&storage);
+    let (spawned, _runner) = begun_runner(&client, &storage, &key).await;
+    assert_eq!(charged(&storage), before + 1, "the quantum began");
+
+    spawned.stop(&mut client).await;
+    assert_eq!(charged(&storage), before, "the stop refunded the attempt");
+    let health = storage.recovery_relay_health(RELAY).unwrap().unwrap();
+    assert_eq!((health.unreachable_streak, health.cooldown), (0, None));
+}
+
+/// A settle the runner sent by the stop's deadline is still served after the
+/// deadline: its verdict, not a refund, decides the charge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_settle_sent_by_the_stops_deadline_beats_the_refund() {
     const RELAY: &str = "wss://settled.example";
@@ -265,22 +306,12 @@ async fn a_settle_sent_by_the_stops_deadline_beats_the_refund() {
         route: route.clone(),
         relay: RELAY.to_owned(),
     };
-    let AccountRunner {
-        runner,
-        handle,
-        turns,
-        refund,
-    } = client.build_recovery_runner().await;
-
-    // An attempt begun as the runner's begin turn begins one.
-    let open = runner.open_attempts();
-    storage
-        .begin_recovery_unit_attempt(&route, RELAY, None, unix_now_seconds())
-        .unwrap();
-    open.begun(&key, AttemptKind::Debt);
+    let (spawned, runner) = begun_runner(&client, &storage, &key).await;
     let before = charged(&storage);
+
     // Its settle, sent and waiting: an answer without progress keeps the
     // charge and backs the unit off.
+    let open = runner.open_attempts();
     let host = runner.host.clone();
     let settle = tokio::spawn(async move {
         host.turn(move |turn| {
@@ -296,20 +327,14 @@ async fn a_settle_sent_by_the_stops_deadline_beats_the_refund() {
         .await
     });
     tokio::time::timeout(Duration::from_secs(10), async {
-        while turns.is_empty() {
+        while spawned.turns.is_empty() {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("the settle is sent");
 
-    let stopping = SpawnedRunner {
-        handle,
-        task: tokio::spawn(std::future::pending()),
-        turns,
-        _refund: refund,
-    };
-    stopping.stop_within(&mut client, Duration::ZERO).await;
+    spawned.stop_by(&mut client, passed()).await;
     assert!(
         matches!(settle.await.unwrap(), Some(Ok(_))),
         "the settle was served"
@@ -317,7 +342,6 @@ async fn a_settle_sent_by_the_stops_deadline_beats_the_refund() {
     assert_eq!(charged(&storage), before, "its verdict kept the charge");
     let unit = storage.recovery_unit(&route, RELAY).unwrap().unwrap();
     assert_eq!(unit.backoff_step, 1, "and backed the unit off");
-    drop(runner);
 }
 
 /// A directly owned client's pass dropped mid-quantum refunds the attempt it

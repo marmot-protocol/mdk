@@ -288,9 +288,9 @@ async fn shutdown_and_close_stops_the_runner_mid_quantum() {
 }
 
 /// A reconnect stops the worker's runner mid-quantum while storage is open:
-/// the preempted quantum's attempt is given back before the next runner
-/// begins its own on the same debt, so the account is charged once for the
-/// two.
+/// the preempted quantum, which had made no progress, gives its attempt back
+/// before the next runner begins its own on the same debt, so the account is
+/// charged once for the two.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reconnect_mid_quantum_gives_the_preempted_attempt_back() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
@@ -302,6 +302,12 @@ async fn a_reconnect_mid_quantum_gives_the_preempted_attempt_back() {
     let started = crate::unix_now_seconds();
     let worker = GatedWorker::start(&url, true).await;
     worker.served_after(started).await;
+    // A pass waits for the step in flight, so what the account owed at start
+    // is served first.
+    timeout(SETTLE, worker.pass().await)
+        .await
+        .expect("the pass ends within its budget")
+        .unwrap();
     let storage = worker
         .app
         .account_storage(&worker.label)
@@ -326,10 +332,11 @@ async fn a_reconnect_mid_quantum_gives_the_preempted_attempt_back() {
         }
     };
 
-    // Owe an earlier day, and ask for the pass that sweeps it into the hold.
+    // Lose the last day, as a loss import would, and ask for the pass that
+    // sweeps it into the hold: its first request waits there.
     hold.arm(&worker.route_hex);
     storage
-        .widen_recovery_coverage_goals(
+        .uncover_recovery_coverage(
             std::slice::from_ref(&worker.route),
             crate::unix_now_seconds() - 24 * HOUR,
         )

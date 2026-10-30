@@ -536,12 +536,12 @@ impl SpawnedRunner {
     /// Once storage is closed (`shutdown_and_close`) nothing settles or is
     /// refunded: the attempt stays charged until it ages out of the hour.
     pub(crate) async fn stop(self, client: &mut AppClient) {
-        self.stop_within(client, STOP_WAIT).await;
+        self.stop_by(client, tokio::time::Instant::now() + STOP_WAIT)
+            .await;
     }
 
-    async fn stop_within(mut self, client: &mut AppClient, wait: Duration) {
+    async fn stop_by(mut self, client: &mut AppClient, deadline: tokio::time::Instant) {
         self.handle.shutdown();
-        let deadline = tokio::time::Instant::now() + wait;
         loop {
             tokio::select! {
                 biased;
