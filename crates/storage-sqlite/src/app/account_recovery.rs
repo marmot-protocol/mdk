@@ -2,6 +2,13 @@
 //! the narrow loss writer may only append monotonically increasing evidence.
 mod comparison;
 pub use comparison::{RecoveryComparison, RecoveryComparisonOutcome, RecoveryComparisonPlan};
+mod convert;
+#[cfg(test)]
+mod convert_tests;
+pub use convert::{
+    RecoveryConversionInput, RecoveryConversionReport, RecoveryConversionRoute,
+    RecoveryConvertedLoss, RecoveryConvertedObligations,
+};
 mod demand;
 pub use demand::{
     RecoveryCause, RecoveryDemand, RecoveryDemandTicket, RecoveryPredicate, RecoveryRequest,
@@ -480,10 +487,10 @@ impl ChargedLoss {
     /// Un-cover what was lost, in the import's transaction. Returns whether
     /// every route lost coverage.
     fn uncover(self, conn: &Connection) -> StorageResult<bool> {
-        if let Some(floor) = self.every_route {
-            crate::app::recovery_coverage::uncover_loss_tx(conn, floor)?;
-        }
         let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64())?;
+        if let Some(floor) = self.every_route {
+            crate::app::recovery_coverage::uncover_loss_tx(conn, floor, now)?;
+        }
         for (route, bound) in self.routes {
             match self.every_route {
                 Some(floor) if bound >= floor => {

@@ -65,7 +65,7 @@ fn snapshot(
     })
 }
 
-fn watermarks(
+pub(super) fn watermarks(
     conn: &Connection,
     label: &str,
     cause: RecoveryLossCause,
@@ -632,24 +632,35 @@ impl SqliteAppStorage {
             if !matches(&conn, &label, cause)? {
                 return Ok(false);
             }
-            // The rows say where this loss reached; keep how recent it was.
-            conn.execute_cached(
-                "UPDATE account_recovery_state SET acknowledged_import_revision =
-                    MAX(acknowledged_import_revision, COALESCE(
-                        (SELECT MAX(import_revision) FROM account_delivery_loss_evidence
-                         WHERE account_label=?1 AND cause=?2), 0))
-                 WHERE singleton=1",
-                params![label, cause as i64],
-            )
-            .storage()?;
-            conn.execute_cached(
-                "DELETE FROM account_delivery_loss_evidence WHERE account_label=?1 AND cause=?2",
-                params![label, cause as i64],
-            )
-            .storage()?;
+            reclaim_evidence_tx(&conn, &label, cause)?;
             Ok(true)
         })
     }
+}
+
+/// Delete one cause's loss evidence once its exact watermarks were
+/// acknowledged, keeping how recent the deleted loss was.
+pub(super) fn reclaim_evidence_tx(
+    conn: &Connection,
+    label: &str,
+    cause: RecoveryLossCause,
+) -> StorageResult<()> {
+    // The rows say where this loss reached; keep how recent it was.
+    conn.execute_cached(
+        "UPDATE account_recovery_state SET acknowledged_import_revision =
+            MAX(acknowledged_import_revision, COALESCE(
+                (SELECT MAX(import_revision) FROM account_delivery_loss_evidence
+                 WHERE account_label=?1 AND cause=?2), 0))
+         WHERE singleton=1",
+        params![label, cause as i64],
+    )
+    .storage()?;
+    conn.execute_cached(
+        "DELETE FROM account_delivery_loss_evidence WHERE account_label=?1 AND cause=?2",
+        params![label, cause as i64],
+    )
+    .storage()?;
+    Ok(())
 }
 
 #[cfg(test)]
