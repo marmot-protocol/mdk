@@ -163,8 +163,6 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("secure_delete_checkpoint_intents", Side::App),
     ("seen_events", Side::App),
     ("small_state_items", Side::App),
-    ("small_state_snapshot_parts", Side::App),
-    ("small_state_snapshot_requests", Side::App),
     ("small_state_sync", Side::App),
     ("transport_reconciliation_items", Side::App),
     ("transport_reconciliation_route_state", Side::App),

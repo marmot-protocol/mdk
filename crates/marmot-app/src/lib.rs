@@ -4,7 +4,7 @@
 //! early app surfaces: encrypted session storage, Nostr MLS peeling, Nostr
 //! transport publishing, and relay-backed app projections.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2067,7 +2067,6 @@ impl MarmotApp {
             history_notice_baseline: None,
             // A fresh client cannot know what hosts last read.
             linked_devices_changed: true,
-            small_state_snapshot_answers_owed: BTreeSet::new(),
             key_package_refresh_overdue: None,
             key_package_refresh_overdue_changed: true,
             sign_in_schedule: Default::default(),

@@ -1,5 +1,5 @@
 use cgka_traits::MaintenanceStorage;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -791,9 +791,6 @@ pub struct AppClient {
     /// what hosts last read. The worker's account-level and applied-summary
     /// seams drain it into one `LinkedDevicesChanged`.
     pub(crate) linked_devices_changed: bool,
-    /// Snapshot requests to this device it has not answered yet, by request
-    /// id (mdk#2628 item 4.3).
-    pub(crate) small_state_snapshot_answers_owed: BTreeSet<[u8; 16]>,
     /// The last overdue-refresh answer a maintenance pass computed, and
     /// whether hosts owe a `KeyPackageRefreshOverdueChanged`. The flag starts
     /// set, since a fresh client cannot know what hosts last read.

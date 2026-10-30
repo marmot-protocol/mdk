@@ -3,14 +3,14 @@
 //! its siblings sent, once that device trusts its account's device group.
 
 use super::canonical_membership::{app_at, deliver_new, published_key_package};
-use super::device_group::{Devices, phone_and_laptop, stable_slot};
+use super::device_group::{Devices, phone_and_laptop};
 use super::*;
 use crate::small_state::{
-    KIND_SMALL_STATE_SNAPSHOT, KIND_SMALL_STATE_SNAPSHOT_REQUEST, KIND_SMALL_STATE_UPDATE,
-    encode_small_state_snapshot, encode_snapshot_request,
+    BROADCAST_REQUEST, KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE,
 };
-use std::collections::BTreeSet;
-use storage_sqlite::{MuteSetting, SmallStateItem, SmallStateValue, SmallStateVersion};
+use storage_sqlite::{
+    MuteSetting, SmallStateBroadcast, SmallStateItem, SmallStateValue, SmallStateVersion,
+};
 
 /// Bob, with a published KeyPackage on `relay`, and a chat the phone starts
 /// with him.
@@ -87,12 +87,18 @@ async fn a_pass_records_this_devices_changes_and_applies_its_siblings() {
     assert!(!storage().small_state_started().unwrap());
 
     // Its first pass after that starts small state: the pin is owed to the
-    // laptop at version 1, and so is a snapshot request.
+    // laptop at version 1, and so is a broadcast request.
     link(&mut devices).await;
     let phone = &mut devices.phone;
     phone.take_pending_projection_updates();
     phone.sync_small_state(&[]).unwrap();
-    assert!(storage().small_state_snapshot_owed().unwrap());
+    assert!(
+        storage()
+            .small_state_schedule()
+            .unwrap()
+            .unwrap()
+            .request_owed
+    );
     let owed = storage().unsent_small_state_items().unwrap();
     assert_eq!(owed.len(), 1);
     assert_eq!(owed[0].value, SmallStateValue::Pin(true));
@@ -133,70 +139,14 @@ async fn a_pass_records_this_devices_changes_and_applies_its_siblings() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_snapshot_request_is_answered_only_by_the_device_it_names() {
+async fn broadcasts_follow_their_schedule_and_withdrawals_owe_again() {
+    const HOUR: u64 = 60 * 60;
     let mut devices = phone_and_laptop().await;
     link(&mut devices).await;
-    let phone_slot: [u8; 32] = hex::decode(stable_slot(&devices.phone_app))
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let laptop_slot: [u8; 32] = hex::decode(stable_slot(&devices.laptop_app))
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let phone = &mut devices.phone;
-
-    let (group, roster) = phone.trusted_device_roster().unwrap().unwrap();
-    assert_eq!(
-        phone.small_state_snapshot_targets(&roster).unwrap(),
-        vec![laptop_slot]
-    );
-
-    phone
-        .receive_small_state_snapshot_request(
-            &group,
-            &encode_snapshot_request(&laptop_slot, &[1; 16]),
-        )
-        .unwrap();
-    assert!(phone.small_state_snapshot_answers_owed.is_empty());
-    assert!(
-        phone
-            .receive_small_state_snapshot_request(&group, "{\"v\":1}")
-            .is_err()
-    );
-    // Only the trusted device group carries small state.
-    let elsewhere = GroupId::new(vec![0x11; 16]);
-    let asks_phone = encode_snapshot_request(&phone_slot, &[2; 16]);
-    assert!(
-        phone
-            .receive_small_state_snapshot_request(&elsewhere, &asks_phone)
-            .is_err()
-    );
-    assert!(phone.small_state_snapshot_answers_owed.is_empty());
-    phone
-        .receive_small_state_snapshot_request(&group, &asks_phone)
-        .unwrap();
-    assert_eq!(
-        phone.small_state_snapshot_answers_owed,
-        BTreeSet::from([[2; 16]])
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshots_and_withdrawals_settle_this_devices_requests() {
-    let mut devices = phone_and_laptop().await;
-    link(&mut devices).await;
-    let laptop_slot: [u8; 32] = hex::decode(stable_slot(&devices.laptop_app))
-        .unwrap()
-        .try_into()
-        .unwrap();
     let phone_app = devices.phone_app.clone();
     let storage = || phone_app.account_storage("alice").unwrap().app_storage();
     let phone = &mut devices.phone;
     let (group, _) = phone.trusted_device_roster().unwrap().unwrap();
-    phone.sync_small_state(&[]).unwrap();
-    // A round begun at the device group's tip is not due again until the tip
-    // moves past the app-payload window.
     let tip = phone_app
         .account_storage("alice")
         .unwrap()
@@ -204,52 +154,70 @@ async fn snapshots_and_withdrawals_settle_this_devices_requests() {
         .unwrap()
         .epoch
         .0;
-    storage()
-        .begin_small_state_snapshots(&[laptop_slot], tip)
-        .unwrap();
-    phone.owe_small_state_round_when_due().unwrap();
-    assert!(!storage().small_state_snapshot_owed().unwrap());
-    storage()
-        .record_small_state_snapshot_asked(&laptop_slot, &[3; 16], 100)
-        .unwrap();
+    let schedule = || storage().small_state_schedule().unwrap().unwrap();
 
-    // Withdrawing this device's request asks again at once.
-    let request = encode_snapshot_request(&laptop_slot, &[3; 16]);
-    phone
-        .small_state_message_withdrawn(&group, KIND_SMALL_STATE_SNAPSHOT_REQUEST, &request)
-        .unwrap();
+    // The first pass starts small state, and the first broadcast is due at
+    // once, at the device group's tip.
+    phone.sync_small_state(&[]).unwrap();
+    let now = 1_000_000;
+    phone.begin_small_state_broadcast_when_due(now).unwrap();
     assert_eq!(
-        storage().small_state_snapshot_requests().unwrap()[0].asked_at,
-        None
+        schedule().last_broadcast,
+        Some(SmallStateBroadcast { at: now, tip })
     );
+    phone.begin_small_state_broadcast_when_due(now + 1).unwrap();
+    assert_eq!(schedule().last_broadcast.unwrap().at, now);
 
-    // The laptop's whole answer, an empty one, settles it, and its items are
-    // merged whoever asked.
-    let chat_hex = "0a".repeat(16);
-    let pin = sibling_value(&chat_hex, SmallStateValue::Pin(true));
-    let answer = encode_small_state_snapshot(&[3; 16], std::slice::from_ref(&pin));
-    assert_eq!(answer.len(), 1);
-    phone
-        .receive_small_state_snapshot(&group, &answer[0])
-        .unwrap();
-    assert!(
-        storage()
-            .small_state_snapshot_requests()
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(storage().small_state_items().unwrap(), vec![pin.clone()]);
-
-    // A withdrawn update or snapshot owes every item held again.
-    assert!(storage().unsent_small_state_items().unwrap().is_empty());
-    phone
-        .small_state_message_withdrawn(&group, KIND_SMALL_STATE_SNAPSHOT, &answer[0])
-        .unwrap();
-    assert_eq!(storage().unsent_small_state_items().unwrap(), vec![pin]);
+    // A sibling's request is answered once an hour has passed since the
+    // last broadcast. Only the trusted device group carries one.
     let elsewhere = GroupId::new(vec![0x11; 16]);
     assert!(
         phone
-            .small_state_message_withdrawn(&elsewhere, KIND_SMALL_STATE_UPDATE, &answer[0])
+            .receive_small_state_broadcast_request(&elsewhere, BROADCAST_REQUEST)
+            .is_err()
+    );
+    assert!(
+        phone
+            .receive_small_state_broadcast_request(&group, "{\"v\":1,\"to\":\"5a\"}")
+            .is_err()
+    );
+    assert!(!schedule().answer_owed);
+    phone
+        .receive_small_state_broadcast_request(&group, BROADCAST_REQUEST)
+        .unwrap();
+    assert!(schedule().answer_owed);
+    phone
+        .begin_small_state_broadcast_when_due(now + HOUR - 1)
+        .unwrap();
+    assert_eq!(schedule().last_broadcast.unwrap().at, now);
+    phone
+        .begin_small_state_broadcast_when_due(now + HOUR)
+        .unwrap();
+    assert_eq!(schedule().last_broadcast.unwrap().at, now + HOUR);
+    assert!(!schedule().answer_owed);
+
+    // A withdrawn request owes a new one.
+    storage().small_state_broadcast_request_sent().unwrap();
+    phone
+        .small_state_message_withdrawn(&group, KIND_SMALL_STATE_BROADCAST_REQUEST)
+        .unwrap();
+    assert!(schedule().request_owed);
+
+    // A withdrawn update owes every item held again, whoever sent it.
+    let chat_hex = "0a".repeat(16);
+    let pin = sibling_value(&chat_hex, SmallStateValue::Pin(true));
+    phone.sync_small_state(std::slice::from_ref(&pin)).unwrap();
+    storage()
+        .mark_small_state_sent(&storage().unsent_small_state_items().unwrap())
+        .unwrap();
+    assert!(storage().unsent_small_state_items().unwrap().is_empty());
+    phone
+        .small_state_message_withdrawn(&group, KIND_SMALL_STATE_UPDATE)
+        .unwrap();
+    assert_eq!(storage().unsent_small_state_items().unwrap(), vec![pin]);
+    assert!(
+        phone
+            .small_state_message_withdrawn(&elsewhere, KIND_SMALL_STATE_UPDATE)
             .is_err()
     );
 }

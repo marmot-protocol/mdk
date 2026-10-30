@@ -7,19 +7,17 @@
 - Migration 0132 advances account storage to schema 132 (mdk#2628 item 4.3).
   It adds `small_state_items`, one row per chat and item (`read`, `pin`,
   `mute`, `archive`) holding the value the account's devices agree on, what
-  this device last observed of it and whether its siblings are still owed it;
-  `small_state_sync`, which records that this device started and whether it
-  owes snapshot requests; and `small_state_snapshot_requests` and
-  `small_state_snapshot_parts`, each sibling whose whole snapshot this device
-  still needs with the parts of its answer merged so far. `SqliteAppStorage`
-  gains `start_small_state`, `small_state_started`, `sync_small_state`,
-  `small_state_items`, `unsent_small_state_items`, `mark_small_state_sent`,
-  `owe_all_small_state_items`, `small_state_snapshot_owed`,
-  `owe_small_state_snapshots`, `begin_small_state_snapshots`,
-  `small_state_snapshot_requests`, `record_small_state_snapshot_asked`,
-  `drop_small_state_snapshot_request`, `withdraw_small_state_snapshot_request`
-  and `record_small_state_snapshot_part`, with `SmallStateItem`,
-  `SmallStateRule`, `SmallStateSnapshotRequest` and their value types.
+  this device last observed of it and whether its siblings are still owed it,
+  and `small_state_sync`, which records that this device started, when and at
+  which device-group tip it last broadcast every item, and whether it owes a
+  broadcast request or an answer to one. Only chats whose MLS group id is at
+  most 256 bytes hold items. `SqliteAppStorage` gains `start_small_state`,
+  `small_state_started`, `small_state_schedule`, `begin_small_state_broadcast`,
+  `owe_small_state_broadcast_request`, `small_state_broadcast_request_sent`,
+  `owe_small_state_broadcast_answer`, `sync_small_state`, `small_state_items`,
+  `unsent_small_state_items`, `mark_small_state_sent` and
+  `owe_all_small_state_items`, with `SmallStateItem`, `SmallStateRule`,
+  `SmallStateSchedule`, `SmallStateBroadcast` and their value types.
 - Migration 0131 advances account storage to schema 131 (mdk#2628 item 3.2).
   It adds `account_sign_ins`, one row per KeyPackage slot of the account that
   this device found and does not recognize: whether this device's first check

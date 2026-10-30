@@ -86,9 +86,9 @@ pub use app::chat_list::{
     ChatListRow, ChatListSelectionError, ChatListSelectionSnapshot, ChatListView,
     ChatListWindowQuery, ChatListWindowRead, ChatPinError, ChatPinState,
     ExistingDirectConversation, MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition,
-    RetentionExpiryScan, SmallStateItem, SmallStateItemName, SmallStateRule,
-    SmallStateSnapshotRequest, SmallStateSync, SmallStateValue, SmallStateVersion,
-    conversation_kind, select_reusable_direct_conversation,
+    RetentionExpiryScan, SmallStateBroadcast, SmallStateItem, SmallStateItemName, SmallStateRule,
+    SmallStateSchedule, SmallStateSync, SmallStateValue, SmallStateVersion, conversation_kind,
+    select_reusable_direct_conversation,
 };
 pub use app::chat_presentation::{
     CHAT_LIST_DRAFT_PREVIEW_CHARS, CHAT_PRESENTATION_BATCH_LIMIT, ChatListDraftPreview,

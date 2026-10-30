@@ -1,6 +1,7 @@
 //! Small state between this account's devices (mdk#2628 item 4.3): the wire
-//! form of updates, snapshot requests and snapshots, and the rule that picks
-//! a winner between two values of one item.
+//! form of updates and broadcast requests, the rule that picks a winner
+//! between two values of one item, and when this device broadcasts every item
+//! it holds.
 //!
 //! Storage keeps the items and applies winners (`storage_sqlite`'s small-state
 //! module); `client::small_state` drives a pass and talks to the siblings.
@@ -8,28 +9,34 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use cgka_traits::app_components::DeviceSlotId;
 use rand::{RngCore, rngs::OsRng};
 use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 use storage_sqlite::{
     MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition, SmallStateItem, SmallStateItemName,
-    SmallStateRule, SmallStateValue, SmallStateVersion,
+    SmallStateRule, SmallStateSchedule, SmallStateValue, SmallStateVersion,
 };
 
 use crate::AppError;
 
-/// An update: items whose value this device's user changed.
+/// An update: items whose value this device's user changed, or part of a
+/// broadcast of every item it holds.
 pub(crate) const KIND_SMALL_STATE_UPDATE: u64 = 475;
-/// A snapshot request, naming the sibling asked.
-pub(crate) const KIND_SMALL_STATE_SNAPSHOT_REQUEST: u64 = 476;
-/// A snapshot: part of every item the sender holds.
-pub(crate) const KIND_SMALL_STATE_SNAPSHOT: u64 = 477;
-/// The longest content any of them carries, in bytes.
+/// A broadcast request: asks every sibling to broadcast.
+pub(crate) const KIND_SMALL_STATE_BROADCAST_REQUEST: u64 = 476;
+/// The longest content either carries, in bytes.
 pub(crate) const MAX_SMALL_STATE_CONTENT_BYTES: usize = 32_768;
+/// A broadcast request's content.
+pub(crate) const BROADCAST_REQUEST: &str = "{\"v\":1}";
+
+/// The longest a device goes between broadcasts, in seconds.
+const BROADCAST_PERIOD_SECS: u64 = 24 * 60 * 60;
+/// The shortest a device waits after a broadcast before answering a request,
+/// in seconds.
+const ANSWER_INTERVAL_SECS: u64 = 60 * 60;
 
 const UPDATE_START: &str = "{\"v\":1,\"items\":[";
-const PAGE_END: &str = "]}";
+const UPDATE_END: &str = "]}";
 
 /// The rule every device applies, so every device picks the same winner.
 pub(crate) struct SmallStateMergeRule;
@@ -77,8 +84,7 @@ fn new_pin_index(_pinned: &[String]) -> usize {
     0
 }
 
-/// 16 bytes from the operating system's secure random source: a change id or
-/// a snapshot request id.
+/// 16 bytes from the operating system's secure random source: a change id.
 pub(crate) fn random_id() -> [u8; 16] {
     let mut id = [0; 16];
     OsRng.fill_bytes(&mut id);
@@ -91,46 +97,7 @@ pub(crate) fn random_id() -> [u8; 16] {
 pub(crate) fn encode_small_state_update(
     items: &[SmallStateItem],
 ) -> Vec<(String, Vec<SmallStateItem>)> {
-    let room = MAX_SMALL_STATE_CONTENT_BYTES - UPDATE_START.len() - PAGE_END.len();
-    item_pages(items, room)
-        .into_iter()
-        .map(|(body, carried)| (format!("{UPDATE_START}{body}{PAGE_END}"), carried))
-        .collect()
-}
-
-/// `items` as the snapshots answering `request`: every part numbered, and one
-/// empty part when there is no item.
-pub(crate) fn encode_small_state_snapshot(
-    request: &[u8; 16],
-    items: &[SmallStateItem],
-) -> Vec<String> {
-    let longest_start = snapshot_start(request, MAX_SMALL_STATE_NUMBER, MAX_SMALL_STATE_NUMBER);
-    let room = MAX_SMALL_STATE_CONTENT_BYTES - longest_start.len() - PAGE_END.len();
-    let mut bodies = item_pages(items, room)
-        .into_iter()
-        .map(|(body, _)| body)
-        .collect::<Vec<_>>();
-    if bodies.is_empty() {
-        bodies.push(String::new());
-    }
-    let parts = bodies.len() as u64;
-    bodies
-        .into_iter()
-        .zip(1..)
-        .map(|(body, part)| format!("{}{body}{PAGE_END}", snapshot_start(request, part, parts)))
-        .collect()
-}
-
-fn snapshot_start(request: &[u8; 16], part: u64, parts: u64) -> String {
-    format!(
-        "{{\"v\":1,\"request\":\"{}\",\"part\":{part},\"parts\":{parts},\"items\":[",
-        hex::encode(request)
-    )
-}
-
-/// Valid items as comma-separated bodies of at most `room` bytes each, with
-/// each body's items.
-fn item_pages(items: &[SmallStateItem], room: usize) -> Vec<(String, Vec<SmallStateItem>)> {
+    let room = MAX_SMALL_STATE_CONTENT_BYTES - UPDATE_START.len() - UPDATE_END.len();
     let mut pages = Vec::new();
     let mut body = String::new();
     let mut carried = Vec::new();
@@ -153,6 +120,9 @@ fn item_pages(items: &[SmallStateItem], room: usize) -> Vec<(String, Vec<SmallSt
         pages.push((body, carried));
     }
     pages
+        .into_iter()
+        .map(|(body, carried)| (format!("{UPDATE_START}{body}{UPDATE_END}"), carried))
+        .collect()
 }
 
 /// One item, members in the order the wire form gives them.
@@ -196,38 +166,6 @@ pub(crate) fn decode_small_state_update(content: &str) -> Result<Vec<SmallStateI
         return Err(malformed());
     }
     Ok(items.iter().filter_map(decode_item).collect())
-}
-
-/// One snapshot of an answer.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SmallStateSnapshot {
-    pub(crate) request: [u8; 16],
-    pub(crate) part: u64,
-    pub(crate) parts: u64,
-    pub(crate) items: Vec<SmallStateItem>,
-}
-
-/// A snapshot's request, part and items, under the same rules as an update;
-/// its items may be empty.
-pub(crate) fn decode_small_state_snapshot(content: &str) -> Result<SmallStateSnapshot, AppError> {
-    let object = small_state_object(content, &["v", "request", "part", "parts", "items"])?;
-    let request = object
-        .get("request")
-        .and_then(Value::as_str)
-        .and_then(sixteen_bytes)
-        .ok_or_else(malformed)?;
-    let part = object.get("part").and_then(number).ok_or_else(malformed)?;
-    let parts = object.get("parts").and_then(number).ok_or_else(malformed)?;
-    if part == 0 || part > parts {
-        return Err(malformed());
-    }
-    let items = decode_items(&object)?;
-    Ok(SmallStateSnapshot {
-        request,
-        part,
-        parts,
-        items: items.iter().filter_map(decode_item).collect(),
-    })
 }
 
 /// The raw items, refusing two with the same chat and item.
@@ -310,31 +248,32 @@ fn sixteen_bytes(text: &str) -> Option<[u8; 16]> {
     hex::decode(text).ok()?.try_into().ok()
 }
 
-/// A snapshot request's content, asking `to` with the id `request`.
-pub(crate) fn encode_snapshot_request(to: &DeviceSlotId, request: &[u8; 16]) -> String {
-    format!(
-        "{{\"v\":1,\"to\":\"{}\",\"request\":\"{}\"}}",
-        hex::encode(to),
-        hex::encode(request)
-    )
+/// Refuse content that is not a broadcast request.
+pub(crate) fn decode_broadcast_request(content: &str) -> Result<(), AppError> {
+    small_state_object(content, &["v"]).map(drop)
 }
 
-/// The slot a snapshot request asks, and its id.
-pub(crate) fn decode_snapshot_request(content: &str) -> Result<(DeviceSlotId, [u8; 16]), AppError> {
-    let object = small_state_object(content, &["v", "to", "request"])?;
-    let to = object
-        .get("to")
-        .and_then(Value::as_str)
-        .filter(|to| !to.bytes().any(|byte| byte.is_ascii_uppercase()))
-        .and_then(|to| hex::decode(to).ok())
-        .and_then(|to| DeviceSlotId::try_from(to).ok())
-        .ok_or_else(malformed)?;
-    let request = object
-        .get("request")
-        .and_then(Value::as_str)
-        .and_then(sixteen_bytes)
-        .ok_or_else(malformed)?;
-    Ok((to, request))
+/// Whether this device owes a broadcast at `now`, by its own clock, with the
+/// device group's tip epoch at `tip`: none has been made yet, a day has
+/// passed since the last, the tip has moved more than `window` epochs past
+/// the last one's, or a sibling asked and an hour has passed. A clock that
+/// went back before the last broadcast owes one too, so a wrong clock never
+/// holds broadcasts back. The only place that schedule is decided.
+pub(crate) fn broadcast_due(
+    schedule: &SmallStateSchedule,
+    now: u64,
+    tip: u64,
+    window: u64,
+) -> bool {
+    let Some(last) = schedule.last_broadcast else {
+        return true;
+    };
+    let Some(elapsed) = now.checked_sub(last.at) else {
+        return true;
+    };
+    elapsed >= BROADCAST_PERIOD_SECS
+        || tip > last.tip.saturating_add(window)
+        || (schedule.answer_owed && elapsed >= ANSWER_INTERVAL_SECS)
 }
 
 /// The content's object, when it is one with exactly `members`, no object in
