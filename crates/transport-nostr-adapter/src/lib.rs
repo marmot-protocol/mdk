@@ -3908,6 +3908,9 @@ struct ReplayEndpoint {
     /// What this serial's physical EOSE counted, until the serial ends or the
     /// relay closes the REQ.
     live_count: Option<ReplayLiveCount>,
+    /// Moves whenever a live count is installed or ends, so a fence arming
+    /// knows whether the count that made it is still this endpoint's.
+    count_id: u64,
     /// The relay closed the REQ or its connection dropped in this serial: an
     /// EOSE still in flight is not live, so it installs no count.
     stopped: bool,
@@ -3971,7 +3974,13 @@ impl ReplayEndpoint {
         }
     }
 
+    fn install_live_count(&mut self, count: ReplayLiveCount) {
+        self.count_id += 1;
+        self.live_count = Some(count);
+    }
+
     fn take_live_count(&mut self) {
+        self.count_id += 1;
         if let Some(count) = self.live_count.take()
             && self.boundary_admitted
         {
@@ -3987,6 +3996,7 @@ impl ReplayEndpoint {
     /// whose disconnect the transport reported has already ended the count;
     /// one it did not report keeps none.
     fn drop_boundary(&mut self) {
+        self.count_id += 1;
         self.live_count = None;
         self.boundary_admitted = false;
     }
@@ -4000,6 +4010,7 @@ impl AccountReplayCoverage {
                 endpoint.end_live_count();
             }
         }
+        self.prune_fence_armings();
     }
 }
 
@@ -4292,8 +4303,8 @@ impl AccountReplayCoverage {
                     && self.request_admitted(id, Some(*relay))
                 {
                     endpoint.boundary_admitted = true;
-                    if self.fencing {
-                        admitted.push((id.clone(), *relay, endpoint.serial));
+                    if self.fencing && endpoint.live_count.is_some() {
+                        admitted.push((id.clone(), *relay, endpoint.serial, endpoint.count_id));
                     }
                 }
             }
@@ -4652,6 +4663,7 @@ impl AccountReplayCoverage {
                             loss_debt: None,
                             requested_at,
                             live_count: None,
+                            count_id: 0,
                             stopped: false,
                             recount: None,
                             sent_again: false,
@@ -5689,7 +5701,7 @@ impl AccountReplayCoverage {
                 .and_then(|relays| relays.get_mut(&relay))
                 && let Some(recount) = endpoint.recount.take()
             {
-                endpoint.live_count = Some(endpoint.eose_count(recount));
+                endpoint.install_live_count(endpoint.eose_count(recount));
                 self.arm_fence(id, relay);
             }
             return None;
@@ -5700,7 +5712,7 @@ impl AccountReplayCoverage {
             .and_then(|relays| relays.get_mut(&relay))
             .filter(|endpoint| !endpoint.stopped)
         {
-            endpoint.live_count = Some(endpoint.eose_count(stored));
+            endpoint.install_live_count(endpoint.eose_count(stored));
             self.arm_fence(id, relay);
         }
         let replay = self.replay_mut(id, relay)?;
@@ -5885,6 +5897,7 @@ impl AccountReplayCoverage {
                 endpoint.end_live_count();
             }
         }
+        self.prune_fence_armings();
         // The restored reply counts alone: what the closed one sent says
         // nothing of the time it was closed.
         if disposition == SubscriptionRefusalDisposition::Pending

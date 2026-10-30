@@ -13,8 +13,11 @@
 //!   on, from its EOSE. A count only becomes a fact the owner can see once its
 //!   boundary is admitted, and a boundary is admitted only once its group's
 //!   range left the native hold, so without this the frames would be gone
-//!   before the owner could fence them. A count whose generation ends before
-//!   its boundary is admitted fences nothing, and its arming is dropped.
+//!   before the owner could fence them. An arming belongs to its own count
+//!   (the endpoint's count id moves whenever a count is installed or ends): a
+//!   count that ends, or that a newer count replaces, before its boundary is
+//!   admitted fences nothing, and its arming is dropped. An admission after
+//!   the count ended makes it no fact.
 //! - **The owner's answer.** A [`ReplayFencePlan`] answers the armings its
 //!   ticket covers, that is the counts its observation saw as facts, and sets
 //!   each group's release point. Frames sent before it go out oldest first;
@@ -61,6 +64,10 @@ struct FenceArming {
     request: Arc<str>,
     relay: RelayIndex,
     serial: u64,
+    /// The endpoint's count id when it armed: once that moves, this count is
+    /// no longer the endpoint's, and unless it became a fact it fences
+    /// nothing.
+    count: u64,
     /// Its REQ's `since`: nothing older lies in the range it left unproven.
     since: u64,
     /// The ticket from which an owner's observation sees this count as a
@@ -213,7 +220,8 @@ impl AccountReplayCoverage {
 
     /// `relay`'s EOSE for `id` just installed a live count: unless it is
     /// empty or clamped, it holds every group the REQ routes until the owner
-    /// answers it, or one replay deadline.
+    /// answers it, or one replay deadline. One that does not fence retires
+    /// the endpoint's earlier counts that are no fact.
     pub(super) fn arm_fence(&mut self, id: &str, relay: RelayIndex) {
         if !self.fencing || self.maintenance.contains(id) {
             return;
@@ -229,9 +237,11 @@ impl AccountReplayCoverage {
             .live_count
             .is_some_and(|count| count.events > 0 && !count.clamped())
         {
+            self.retire_fence_armings(id, relay);
             return;
         }
         let serial = endpoint.serial;
+        let count = endpoint.count_id;
         let answerable = endpoint.boundary_admitted.then(|| self.next_fence_ticket());
         let since = self.windows.get(id).map_or(0, |window| window.since);
         let request: Arc<str> = Arc::from(id);
@@ -251,6 +261,7 @@ impl AccountReplayCoverage {
                 request: request.clone(),
                 relay,
                 serial,
+                count,
                 since,
                 answerable,
             };
@@ -280,6 +291,31 @@ impl AccountReplayCoverage {
         self.wake_replay();
     }
 
+    /// Drop the armings `relay`'s earlier counts for `id` left that never
+    /// became facts: a newer count replaced them.
+    fn retire_fence_armings(&mut self, id: &str, relay: RelayIndex) {
+        let mut released = false;
+        for group_id in self.request_groups.get(id).into_iter().flatten() {
+            let Some(group) = self.groups.get_mut(group_id) else {
+                continue;
+            };
+            let Some(fence) = group.fence.as_mut().filter(|fence| !fence.spent) else {
+                continue;
+            };
+            let held = fence.armed.len();
+            fence.armed.retain(|arming| {
+                arming.answerable.is_some()
+                    || arming.relay != relay
+                    || arming.request.as_ref() != id
+            });
+            released |= fence.armed.len() != held;
+            end_idle(group);
+        }
+        if released {
+            self.wake_replay();
+        }
+    }
+
     /// The oldest buffered frame a fence holds at or after `floor`. A cursor
     /// that passed it would leave it to no restart, so the cursor seal stops
     /// there; a held frame below the floor is already the restart's.
@@ -300,15 +336,16 @@ impl AccountReplayCoverage {
             .min()
     }
 
-    /// The boundaries of `admitted` (request, relay, serial) were just
-    /// admitted: the counts that armed fences there become facts an owner's
-    /// next observation sees.
-    pub(super) fn admit_fence_armings(&mut self, admitted: &[(String, RelayIndex, u64)]) {
+    /// The boundaries of `admitted` (request, relay, serial, count id) were
+    /// just admitted with their counts still current: the counts that armed
+    /// fences there become facts an owner's next observation sees. An arming
+    /// whose count already ended is not among them.
+    pub(super) fn admit_fence_armings(&mut self, admitted: &[(String, RelayIndex, u64, u64)]) {
         if admitted.is_empty() {
             return;
         }
         let ticket = self.next_fence_ticket();
-        for (id, relay, serial) in admitted {
+        for (id, relay, serial, count) in admitted {
             for group_id in self.request_groups.get(id.as_str()).into_iter().flatten() {
                 let Some(fence) = self
                     .groups
@@ -321,6 +358,7 @@ impl AccountReplayCoverage {
                     if arming.answerable.is_none()
                         && arming.relay == *relay
                         && arming.serial == *serial
+                        && arming.count == *count
                         && arming.request.as_ref() == id.as_str()
                     {
                         arming.answerable = Some(ticket);
@@ -330,8 +368,8 @@ impl AccountReplayCoverage {
         }
     }
 
-    /// Drop armings whose count ended before its boundary was admitted: such
-    /// a count is no fact and fences nothing.
+    /// Drop armings whose count ended, or was replaced, before its boundary
+    /// was admitted: such a count is no fact and fences nothing.
     pub(super) fn prune_fence_armings(&mut self) {
         if self.fence_deadlines.is_empty() {
             return;
@@ -349,7 +387,7 @@ impl AccountReplayCoverage {
                         .get(arming.request.as_ref())
                         .and_then(|relays| relays.get(&arming.relay))
                         .is_some_and(|endpoint| {
-                            endpoint.serial == arming.serial && endpoint.live_count.is_some()
+                            endpoint.serial == arming.serial && endpoint.count_id == arming.count
                         })
             });
             released |= fence.armed.len() != held;
@@ -746,6 +784,159 @@ mod tests {
         );
         coverage.prune_fence_armings();
         assert_eq!(held_from(&coverage, 0), None);
+    }
+
+    /// A count the relay closes and the SDK sends again ends unadmitted: the
+    /// restored reply's empty recount fences nothing, and nothing of the
+    /// closed count still holds.
+    #[tokio::test]
+    async fn an_empty_recount_after_a_kept_close_holds_nothing() {
+        let (mut coverage, id, _) = fenced_coverage(true);
+        let (tx, _rx) = mpsc::channel(8);
+        // Relay 2 is still replaying, so relay 1's boundary waits for it.
+        coverage.record_stored_event(&id, RelayIndex(2), 140);
+        coverage.record_stored_event(&id, RelayIndex(1), 150);
+        coverage
+            .stage_delivery(
+                delivery(0, 150, 1, &id, 1),
+                Some(RelayIndex(1)),
+                ReplayInput::History,
+                &tx,
+            )
+            .unwrap();
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        assert_eq!(held_from(&coverage, 0), Some(SINCE));
+        assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
+        coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
+        assert_eq!(held_from(&coverage, 0), None, "the count ended unadmitted");
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        assert!(
+            coverage.endpoint_deadlines[&id][&RelayIndex(1)]
+                .live_count
+                .is_some_and(|count| count.events == 0),
+            "the restored reply counted nothing"
+        );
+        assert_eq!(held_from(&coverage, 0), None);
+        coverage.prune_fence_armings();
+        assert_eq!(held_from(&coverage, 0), None);
+    }
+
+    /// A count that ends before its boundary is admitted is no fact, even when
+    /// its boundary is admitted after it ended: an acknowledgement that frees
+    /// the boundary then makes no ended count answerable.
+    #[tokio::test]
+    async fn a_count_that_ended_is_not_admitted_by_a_later_acknowledgement() {
+        let (mut coverage, id, _) = fenced_coverage(true);
+        let (tx, _rx) = mpsc::channel(8);
+        replay(&mut coverage, &id, &[(0, 150)], &tx);
+        coverage.apply_fence_plan(&plan(&coverage, &[]));
+        assert_eq!(released(&mut coverage), vec![(0, 150)]);
+        // 150's pin keeps relay 1's next boundary from being admitted.
+        coverage.restart_relay(
+            RelayIndex(1),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+            None,
+            None,
+        );
+        coverage.record_stored_event(&id, RelayIndex(1), 160);
+        coverage
+            .stage_delivery(
+                delivery(0, 160, 2, &id, 1),
+                Some(RelayIndex(1)),
+                ReplayInput::History,
+                &tx,
+            )
+            .unwrap();
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        assert_eq!(held_from(&coverage, 0), Some(SINCE));
+        assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
+
+        coverage.end_relay_live_counts(RelayIndex(1));
+        coverage.ack_placement(&delivery(0, 150, 1, &id, 1).message.id);
+        coverage.prune_fence_armings();
+        assert_eq!(held_from(&coverage, 0), None, "no fact holds 160");
+        assert_eq!(released(&mut coverage), vec![(0, 160)]);
+    }
+
+    /// A newer count that does not fence retires the endpoint's earlier
+    /// counts that never became facts, however its earlier count ended.
+    #[tokio::test]
+    async fn a_newer_empty_count_retires_an_unadmitted_arming() {
+        let (mut coverage, id, _) = fenced_coverage(true);
+        let (tx, _rx) = mpsc::channel(8);
+        coverage.record_stored_event(&id, RelayIndex(2), 140);
+        coverage.record_stored_event(&id, RelayIndex(1), 150);
+        coverage
+            .stage_delivery(
+                delivery(0, 150, 1, &id, 1),
+                Some(RelayIndex(1)),
+                ReplayInput::History,
+                &tx,
+            )
+            .unwrap();
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        assert_eq!(held_from(&coverage, 0), Some(SINCE));
+        // The count ends with nothing pruning at once.
+        coverage
+            .endpoint_deadlines
+            .get_mut(&id)
+            .unwrap()
+            .get_mut(&RelayIndex(1))
+            .unwrap()
+            .hold_live_count(true);
+        assert_eq!(held_from(&coverage, 0), Some(SINCE), "not yet pruned");
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        assert_eq!(held_from(&coverage, 0), None);
+    }
+
+    /// An acknowledgement that admits a boundary after its count ended makes
+    /// no arming of that count a fact, so the next prune drops it.
+    #[tokio::test]
+    async fn an_ended_count_admitted_later_is_no_fact() {
+        let (mut coverage, id, _) = fenced_coverage(true);
+        let (tx, _rx) = mpsc::channel(8);
+        replay(&mut coverage, &id, &[(0, 150)], &tx);
+        coverage.apply_fence_plan(&plan(&coverage, &[]));
+        assert_eq!(released(&mut coverage), vec![(0, 150)]);
+        coverage.restart_relay(
+            RelayIndex(1),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+            None,
+            None,
+        );
+        coverage.record_stored_event(&id, RelayIndex(1), 160);
+        coverage
+            .stage_delivery(
+                delivery(0, 160, 2, &id, 1),
+                Some(RelayIndex(1)),
+                ReplayInput::History,
+                &tx,
+            )
+            .unwrap();
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        assert_eq!(held_from(&coverage, 0), Some(SINCE));
+        // The count ends with nothing pruning at once.
+        coverage
+            .endpoint_deadlines
+            .get_mut(&id)
+            .unwrap()
+            .get_mut(&RelayIndex(1))
+            .unwrap()
+            .end_live_count();
+        coverage.ack_placement(&delivery(0, 150, 1, &id, 1).message.id);
+        assert!(coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
+        assert!(
+            coverage.groups[&group_id(0)]
+                .fence
+                .as_ref()
+                .is_some_and(|fence| fence.armed.iter().all(|arming| arming.answerable.is_none())),
+            "the ended count is no fact"
+        );
+        coverage.prune_fence_armings();
+        assert_eq!(held_from(&coverage, 0), None);
+        assert_eq!(released(&mut coverage), vec![(0, 160)]);
     }
 
     /// A clamped reply is paged backwards natively, so it fences nothing.
