@@ -229,9 +229,8 @@ impl AppClient {
         self.drive_device_pairing_live().await;
     }
 
-    /// Withdraw the Welcomes of failed and expired links before startup
-    /// recovery can publish them. The worker calls it at startup, before it
-    /// prepares that recovery.
+    /// Withdraw the Welcomes of failed and expired links before anything can
+    /// publish them. Every open calls it, before it returns the client.
     pub(crate) fn withdraw_expired_link_welcomes(&mut self) {
         #[cfg(feature = "unreleased-device-pairing")]
         self.withdraw_expired_link_welcomes_at(crate::unix_now_seconds());

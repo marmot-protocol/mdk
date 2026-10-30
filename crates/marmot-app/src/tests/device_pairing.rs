@@ -1016,12 +1016,13 @@ async fn a_link_that_crashed_after_its_commit_still_withdraws_its_welcome() {
     );
 }
 
-/// The account worker's startup recovery publishes owed Welcomes before the
-/// link gate runs. A failed link whose Welcome a crash left unwithdrawn, and
-/// a pending link past its deadline, have their Welcome withdrawn first, so
-/// it never reaches a relay.
+/// The account worker publishes owed Welcomes at startup before the link gate
+/// runs: in its recovery pass, and in any maintenance pass a host queued
+/// while initial sync ran, which replays first. A failed link whose Welcome
+/// a crash left unwithdrawn, and a pending link past its deadline, have their
+/// Welcome withdrawn before either, so it never reaches a relay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn startup_recovery_never_publishes_a_failed_or_expired_links_welcome() {
+async fn startup_never_publishes_a_failed_or_expired_links_welcome() {
     for failed in [true, false] {
         let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
         let (group, slot) = create_device_group_unpublished(&relay, &mut phone, &mut laptop).await;
@@ -1061,6 +1062,14 @@ async fn startup_recovery_never_publishes_a_failed_or_expired_links_welcome() {
                 )
                 .unwrap();
         }
+        // The device stayed off longer than the Welcome's fanout is kept, so
+        // no attempt record holds it and maintenance publishes it as owed.
+        phone
+            .client
+            .runtime
+            .session()
+            .delete_transport_fanout(&welcome.id)
+            .unwrap();
         let Device {
             _dir, app, client, ..
         } = phone;
@@ -1068,12 +1077,32 @@ async fn startup_recovery_never_publishes_a_failed_or_expired_links_welcome() {
 
         relay.allow_publishes();
         let runtime = crate::MarmotAppRuntime::new(app.clone());
+        let startup = Arc::new(tokio::sync::Barrier::new(2));
+        runtime
+            .shared_services()
+            .set_next_startup_sync_barrier(startup.clone());
         runtime.reconcile_accounts().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), startup.wait())
+            .await
+            .expect("the worker reaches initial sync");
+        let maintenance = runtime.run_due_maintenance("alice");
+        tokio::pin!(maintenance);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut maintenance)
+                .await
+                .is_err(),
+            "a maintenance pass waits for initial sync"
+        );
+        // Answered during startup, behind the queued pass, so that pass is
+        // deferred before initial sync is released.
+        runtime.quarantined_groups("alice").await.unwrap();
+        startup.wait().await;
+        maintenance.await.unwrap();
         runtime.drain_in_flight_work().await.unwrap();
         runtime.shutdown().await;
         assert!(
             !relay.published_event_ids().contains(&welcome_id),
-            "startup recovery published the Welcome of a link that failed: {failed}"
+            "startup published the Welcome of a link that failed: {failed}"
         );
         if failed {
             assert!(link_record_of(&app, &group, &slot).welcome_withdrawn);

@@ -1889,9 +1889,6 @@ async fn run_app_runtime_account_worker(
     let mut avatar_resumed = false;
     let mut avatar_identities = super::avatar::IdentityAvatarMaintenance::default();
 
-    // A failed or expired device link's Welcome is withdrawn before startup
-    // recovery could publish it (mdk#2628 D40).
-    client.withdraw_expired_link_welcomes();
     // Prepare exact Welcome attempts under the serialized owner, then let only
     // relay I/O run independently. The worker stays available for inbound
     // delivery, maintenance, media completions, timers, and commands while a
