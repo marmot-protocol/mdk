@@ -1880,3 +1880,51 @@ async fn welcome_failed_after_convergence_reaches_the_host_once() {
         "a repeated failure is not announced again"
     );
 }
+
+/// mdk#2628 3.5a: the engine stages an invite's Welcomes with its commit, so
+/// the invite writes no pending Welcome delivery before exposing the commit.
+/// It goes through while that table refuses writes, the invitee joins, and a
+/// delivered Welcome leaves no pending row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_needs_no_pending_welcome_row() {
+    use super::push_token_reshare::Device;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut alice = Device::create(&home, &app, "alice").await;
+    let mut bob = Device::create(&home, &app, "bob").await;
+    let mut carol = Device::create(&home, &app, "carol").await;
+    let group = alice
+        .client
+        .create_group("no pending row", &[&bob.account_id_hex])
+        .await
+        .unwrap();
+    bob.join(&relay, &group).await;
+
+    let connection = alice.raw_connection();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER no_pending_welcome BEFORE INSERT ON app_pending_welcome_delivery
+             BEGIN SELECT RAISE(FAIL, 'injected pending Welcome write'); END;",
+        )
+        .unwrap();
+    alice
+        .client
+        .invite_members(&group, &[carol.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    connection
+        .execute_batch("DROP TRIGGER no_pending_welcome")
+        .unwrap();
+
+    carol.join(&relay, &group).await;
+    assert!(
+        alice
+            .client
+            .pending_welcome_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}
