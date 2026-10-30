@@ -625,18 +625,19 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   helper so forensic audit uploads share it; do not feature-gate the module or introduce a second uploader. Relay
   NIP-11 fetches (`relay_caps.rs`) pin through its `pin_with` too, after the relay gate (`RelaySafetyPolicy`). See
   `docs/marmot-architecture/relay-observability.md`, `audit-logging.md`, and `overview/dial-safety.md`.
-- The diagnostics exporters live in [`marmot-observability`](../marmot-observability/AGENTS.md) (mdk#2627). This crate
-  records through `Observer`'s views (`marmot_observability::observer`: `ProductRecorder`, `PerformanceRecorder`,
-  `ProductOperation`), runs the collectors through `marmot_observability::wiring`, and re-exports what hosts name at
-  their `marmot_app::` paths: the `product_analytics` and `audit_otlp_sender` modules, and the other types by name
-  from the crate root. Hosts can name `ProductAnalytics`, `AppPerformanceTelemetry`, `ProductObservation`,
-  `DiagnosticsPermit` and `AuditOtlpSender`, so do not give them new `pub` methods; add the method to a view or to
-  `wiring`. An operation recorded as one product outcome runs its body through `ProductRecorder::observed` and an
-  outcome rule (`success_or_failure`, `confirmed_or_failure`, `send_outcome` or its own); do not write an
-  `_unobserved` twin beside it.
+- The diagnostics exporters live in [`marmot-observability`](../marmot-observability/AGENTS.md) (mdk#2627). Its
+  surface is its crate root; its other modules are private. This crate records through `Observer`'s views
+  (`ProductRecorder`, `PerformanceRecorder`, `ProductOperation`), runs the collectors through
+  `marmot_observability::wiring`, names everything else at the crate root, and re-exports what hosts name at their
+  `marmot_app::` paths: the `product_analytics` and `audit_otlp_sender` modules, and the other types by name from the
+  crate root. Hosts can name `ProductAnalytics`, `AppPerformanceTelemetry`, `ProductObservation`, `DiagnosticsPermit`
+  and `AuditOtlpSender`, so do not give them new `pub` methods; add the method to a view or to `wiring`. An operation
+  recorded as one product outcome runs its body through `ProductRecorder::observed` and an outcome rule
+  (`success_or_failure`, `confirmed_or_failure`, `send_outcome` or its own); do not write an `_unobserved` twin beside
+  it.
 - Diagnostics tests that need a `MarmotApp`, its runtime or the network-proxy policy live in `src/observability_tests/`,
-  one module per crate file. They reach the crate as the rest of this crate does, plus its `observability_test_support`
-  fixtures and `_for_test` hooks, which `marmot-observability`'s `test-support` feature (enabled here as a
+  one module per crate file. They reach the crate as the rest of this crate does, plus the fixtures its root
+  re-exports and its `_for_test` hooks, which `marmot-observability`'s `test-support` feature (enabled here as a
   dev-dependency only) builds.
 
 ## Code map (modules not covered above)

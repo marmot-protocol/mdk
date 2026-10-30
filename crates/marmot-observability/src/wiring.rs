@@ -2,8 +2,8 @@
 //!
 //! Applying consent receipts, silencing, the telemetry origin, the collector's runtime
 //! configuration, the product delivery worker, the exporters' runtime config and the audit sender's
-//! destination. Only `marmot-app` calls it; recording goes through [`crate::observer`]. Hosts never
-//! see it, so the collector and the exporter types they can name gain no method.
+//! destination. Only `marmot-app` calls it; recording goes through [`crate::Observer`]'s views. Hosts
+//! never see it, so the collector and the exporter types they can name gain no method.
 
 use std::future::Future;
 
@@ -14,7 +14,7 @@ use crate::{
     UsageDiagnosticsSettings,
 };
 
-pub use crate::product_analytics::consent::{ConsentChange, ReceiptRevisions};
+pub use crate::product_analytics::consent::{ConsentChange, ReceiptRevisions, ReceiptStamp};
 
 /// Silence the collector (a deployment without diagnostics) or lift it.
 pub fn silence(collector: &ProductAnalytics, silent: bool) {
