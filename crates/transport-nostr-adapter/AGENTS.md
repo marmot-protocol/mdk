@@ -29,6 +29,7 @@ for reconnect/backoff and relay status mechanics.
 | `src/relay_list.rs` | NIP-65 kind `10002` and Marmot inbox kind `10050` relay-list event building. |
 | `src/sweep/` | Time-sliced resumable history sweep (#2660 phase 3): engine over `SweepRelay`, caller-owned sink and cursor store; `sdk.rs` is the SDK-backed relay, `hint_tap.rs` reads NIP-67 `more` off the wire for it. Not yet scheduled by anything. |
 | `src/compare/` | NIP-77 comparison of one (route, relay, range) against the caller's held ids (#2660 phase 4): windows under the relay's set limit, differences fetched by id oldest first, each window certified once every id the relay holds there is fetched or held. `SdkSweepRelay` implements its `CompareRelay`. Not yet scheduled by anything. |
+| `src/replay_fence.rs` | Fences on a group's live frames (#2660 phase 4): arming at a counted EOSE, the owner's `ReplayFencePlan` answers, partial release, the one-deadline expiry. Nothing enables it before the switch-over (PR 5g). |
 | `src/sdk_client.rs` | Optional `nostr-sdk` relay client implementation and SDK planning tests. |
 | `src/telemetry.rs` | Relay delivery telemetry: cross-relay arrival spread (phase 1) and subscription sync timing / initial-sync gate (phase 2); local-time, aggregate, privacy-safe. |
 | `tests/inbound_routing.rs` | Public behavior tests for group delivery, welcome delivery, group sync, and publish. |
@@ -167,6 +168,14 @@ for reconnect/backoff and relay status mechanics.
   cursor seal; import its loss before another await, then drop it. Notify only wakes the router; it never
   consumes evidence. `ack_replay_delivery` follows actual pinned queue/spill placement or recorded loss, never
   merely adapter enqueue.
+- A fence (`src/replay_fence.rs`) holds one group's live frames from its point on, never the account: held frames
+  count neither in `admission_pending` nor against request placement or stream admission, and every release path
+  (`GroupReplay::release`, native ingress, both `stage_delivery` fast paths) lets out only what lies below the point.
+  Nothing arms until `enable_replay_fencing`. Then a live EOSE whose count is non-empty and not clamped holds the
+  REQ's groups from its `since` until a `fence_replay` plan whose ticket saw that count as admitted answers it; a count
+  that ends unadmitted drops its arming. A fence holds at most one `REPLAY_PAGE_LIMITS.max_duration`; then its frames
+  go out as late input and plans are ignored until a new count arms the group. Held frames stay under the replay
+  buffer bounds, so overflow is loss. With fencing off, every changed predicate reduces to its old form.
 - Record each REQ's filter `since` and the routes it selects (`NostrSubscription::delivery_routes`) in its SDK
   account context before the REQ goes out, find it by subscription id when the REQ closes, and keep a closed
   REQ's floors for the rest of the context's life: routing is content-keyed, and a closed REQ's buffered or

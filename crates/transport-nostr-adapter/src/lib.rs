@@ -79,6 +79,7 @@ pub mod pairing;
 mod publish_accounting;
 mod relay_list;
 mod replay_admission;
+mod replay_fence;
 mod replay_ingress;
 #[cfg(feature = "sdk")]
 mod sdk_client;
@@ -120,7 +121,8 @@ const DELIVERY_BUFFER: usize = 1024;
 
 pub use replay_admission::{
     RelayConnection, ReplayCaptureOutcome, ReplayCapturePlan, ReplayCaptureToken, ReplayEndedCount,
-    ReplayEndpointView, ReplayLiveCount, ReplayRequestView, ReplaySourceGeneration,
+    ReplayEndpointView, ReplayFence, ReplayFencePlan, ReplayFenceTicket, ReplayLiveCount,
+    ReplayRequestView, ReplaySourceGeneration,
 };
 pub use replay_ingress::{ReplayBatch, ReplayBatchTake, ReplayIngress};
 
@@ -1991,6 +1993,34 @@ impl NostrTransportAdapter {
         }
     }
 
+    /// Fence the account's groups' live frames from now on (mdk#2660): a live
+    /// count that leaves part of its REQ's range unproven holds the groups its
+    /// REQ routes until the owner's [`Self::fence_replay`] answers it, or one
+    /// replay deadline passes. Call it before activating the account, so its
+    /// first counts are held too. It lasts the adapter's life.
+    pub async fn enable_replay_fencing(&self, account_id: &MemberId) {
+        let mut state = self.state.write().await;
+        state.replay_fencing.insert(account_id.clone());
+        if let Some(coverage) = state.account_replay_coverage.get_mut(account_id) {
+            coverage.fencing = true;
+        }
+    }
+
+    /// Apply the account owner's fences: each group `plan` names releases its
+    /// held live frames sent before the plan's point and keeps the rest, the
+    /// counts its ticket covers are answered, and a group neither fences nor
+    /// an unanswered count holds goes free. A fence holds at most one replay
+    /// deadline, however often a plan names its group; then its frames go out
+    /// as late input. Enables fencing ([`Self::enable_replay_fencing`]).
+    pub async fn fence_replay(&self, account_id: &MemberId, plan: &ReplayFencePlan) {
+        let mut state = self.state.write().await;
+        state.replay_fencing.insert(account_id.clone());
+        if let Some(coverage) = state.account_replay_coverage.get_mut(account_id) {
+            coverage.expire_replay(tokio::time::Instant::now());
+            coverage.apply_fence_plan(plan);
+        }
+    }
+
     /// Install the temporary, full-history subscription used by the post-join
     /// maintenance gate. The caller owns its eventual removal.
     pub async fn install_group_maintenance_subscription(
@@ -2681,7 +2711,11 @@ impl ReplaySupervisor {
                 coverage.publish_native_progress();
                 coverage.expire_replay(tokio::time::Instant::now());
                 coverage.refresh_boundaries();
+                coverage.prune_fence_armings();
                 let mut deadline = coverage.deadlines.first_key_value().map(|(at, _)| *at);
+                if let Some(next) = coverage.next_fence_deadline() {
+                    deadline = Some(deadline.map_or(next, |at| at.min(next)));
+                }
                 for endpoint in coverage
                     .endpoint_deadlines
                     .values_mut()
@@ -3750,6 +3784,13 @@ struct AccountReplayCoverage {
     flushing: bool,
     cancellation: NostrAcquisitionCancellation,
     loss: Option<(MemberId, Arc<ReplayLosses>)>,
+    /// The account owner fences groups' live frames (see `replay_fence`);
+    /// until it does, no count arms a fence.
+    fencing: bool,
+    /// The last ticket at which a count that armed a fence became a fact.
+    fence_ticket: u64,
+    /// When each fence gives up, as `deadlines` does for peers.
+    fence_deadlines: std::collections::BTreeMap<tokio::time::Instant, Vec<GroupId>>,
 }
 
 impl Drop for AccountReplayCoverage {
@@ -3821,6 +3862,9 @@ struct GroupReplay {
     live: HashSet<[u8; 32]>,
     ready_history: HashSet<[u8; 32]>,
     placements: usize,
+    /// The fence on its live frames, from the count or plan that began it
+    /// until it is spent (see `replay_fence`).
+    fence: Option<replay_fence::GroupFence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -4235,6 +4279,7 @@ impl AccountReplayCoverage {
         // Readiness consults request/group bodies, not the endpoint leases.
         // Temporarily split those fields rather than allocate on every ACK.
         let mut endpoints = std::mem::take(&mut self.endpoint_deadlines);
+        let mut admitted = Vec::new();
         for (id, relays) in &mut endpoints {
             for (relay, endpoint) in relays {
                 if !endpoint.boundary_admitted
@@ -4246,10 +4291,14 @@ impl AccountReplayCoverage {
                     && self.request_admitted(id, Some(*relay))
                 {
                     endpoint.boundary_admitted = true;
+                    if self.fencing {
+                        admitted.push((id.clone(), *relay, endpoint.serial));
+                    }
                 }
             }
         }
         self.endpoint_deadlines = endpoints;
+        self.admit_fence_armings(&admitted);
     }
 
     fn capture_outcome(&self, attempt: &ReplayAttempt) -> Option<ReplayCaptureOutcome> {
@@ -4366,7 +4415,7 @@ impl AccountReplayCoverage {
 
     fn admission_pending(&self) -> bool {
         self.flushing
-            || self.buffered_items != 0
+            || self.buffered_items != self.fence_held_items()
             || self.native_held().0 != 0
             || !self.unplaced.is_empty()
             || self.groups.values().any(|group| {
@@ -4414,7 +4463,9 @@ impl AccountReplayCoverage {
                     routes += 1;
                     complete = false;
                 }
-                if !stream.claims.is_empty() {
+                // A fence holds its frames back for order, not because the
+                // relay's range is incomplete.
+                if stream.claims.iter().any(|claim| !group.holds_id(claim)) {
                     return false;
                 }
                 complete |= relay.is_none_or(|relay| relay == owner.relay)
@@ -4880,9 +4931,14 @@ impl AccountReplayCoverage {
             self.record_loss(self.retained_since.unwrap_or(0));
             return Ok(());
         };
+        // A fence holds what it does not release, however it arrives.
+        let fenced = group
+            .held_from()
+            .is_some_and(|from| delivery.message.timestamp.0 >= from);
         if input == ReplayInput::Untracked
             && self.ingress.is_none()
             && group.events.is_empty()
+            && !fenced
             && self.group_ready(group)
             && !self.native_group_pending(group_id)
         {
@@ -4960,6 +5016,7 @@ impl AccountReplayCoverage {
             && self.ingress.is_none()
             && self.group_ready(group)
             && group.events.is_empty()
+            && !fenced
             && (!historical
                 || owner
                     .as_ref()
@@ -5053,7 +5110,9 @@ impl AccountReplayCoverage {
             .groups
             .iter()
             .filter(|(_, group)| {
-                self.ingress.is_none() && !group.events.is_empty() && self.group_ready(group)
+                self.ingress.is_none()
+                    && group.events.values().any(|event| !group.holds(event))
+                    && self.group_ready(group)
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
@@ -5066,12 +5125,7 @@ impl AccountReplayCoverage {
             .sum::<usize>();
         for group_id in ready {
             let group = self.groups.get_mut(&group_id).expect("ready group exists");
-            for stream in group.streams.values_mut() {
-                stream.claims.clear();
-            }
-            group.live.clear();
-            group.ready_history.clear();
-            for (_, event) in group.events.drain() {
+            for (_, event) in group.release() {
                 self.buffered_items -= 1;
                 self.buffered_bytes -= event.delivery.message.payload.len();
                 deliveries.push(event.delivery);
@@ -5619,6 +5673,7 @@ impl AccountReplayCoverage {
                 && let Some(recount) = endpoint.recount.take()
             {
                 endpoint.live_count = Some(endpoint.eose_count(recount));
+                self.arm_fence(id, relay);
             }
             return None;
         }
@@ -5629,6 +5684,7 @@ impl AccountReplayCoverage {
             .filter(|endpoint| !endpoint.stopped)
         {
             endpoint.live_count = Some(endpoint.eose_count(stored));
+            self.arm_fence(id, relay);
         }
         let replay = self.replay_mut(id, relay)?;
         if stored.events >= RELAY_REPLAY_PAGE_LIMIT
@@ -6166,6 +6222,7 @@ impl AccountReplayCoverage {
                 endpoint.deadline = None;
             }
         }
+        self.expire_fences(now);
     }
 }
 
@@ -6289,6 +6346,9 @@ struct AdapterState {
     maintenance_attempt_high_water: HashMap<(MemberId, GroupId), u64>,
     /// Consumed owner operation serials survive account replacement.
     capture_attempts: HashMap<MemberId, u64>,
+    /// Accounts whose owner fences their groups' live frames. Survives
+    /// account replacement, so an activation's first counts arm fences.
+    replay_fencing: HashSet<MemberId>,
     source_clock: Arc<std::sync::atomic::AtomicU64>,
     /// Derived accelerator for `routes_for` group delivery (#698/#752): maps a
     /// `transport_group_id` to its candidate routes, so an inbound group event is
@@ -6745,6 +6805,7 @@ impl AdapterState {
         if let Some(ingress) = self.replay_ingresses.get(account_id) {
             coverage.attach_ingress(ingress.clone());
         }
+        coverage.fencing = self.replay_fencing.contains(account_id);
         self.account_replay_coverage
             .insert(account_id.clone(), coverage);
         self.stage_replay_batches(account_id, subscriptions);

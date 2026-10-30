@@ -630,8 +630,12 @@ impl NostrTransportAdapter {
 impl AccountReplayCoverage {
     pub(super) fn owner_flushable(&self, id: &GroupId, group: &GroupReplay) -> bool {
         let Some(ingress) = &self.ingress else {
-            return !group.events.is_empty() && self.group_ready(group);
+            return group.events.values().any(|event| !group.holds(event))
+                && self.group_ready(group);
         };
+        if group.held_from().is_some() {
+            return self.fenced_flushable(id, group, ingress);
+        }
         let history = group
             .streams
             .values()
@@ -654,6 +658,36 @@ impl AccountReplayCoverage {
                 .iter()
                 .any(|event| self.native_owned(id, event))
         })
+    }
+
+    /// [`Self::owner_flushable`] for a group a fence holds: only what the
+    /// fence lets go may move, by the same rules, and claims on what native
+    /// ingress already owns are still dropped.
+    fn fenced_flushable(
+        &self,
+        id: &GroupId,
+        group: &GroupReplay,
+        ingress: &ReplayIngressState,
+    ) -> bool {
+        if !self.group_ready(group) {
+            return false;
+        }
+        let native = || {
+            group.streams.values().any(|stream| {
+                stream
+                    .claims
+                    .iter()
+                    .any(|event| self.native_owned(id, event))
+            })
+        };
+        let (released, history) = fenced_release(group);
+        if !released {
+            return native();
+        }
+        if !ingress.group_pending(id) || (ingress.queued(id) && history) {
+            return true;
+        }
+        native()
     }
 
     pub(super) fn native_owned(&self, group: &GroupId, id: &[u8; 32]) -> bool {
@@ -743,12 +777,19 @@ impl AccountReplayCoverage {
                             .is_some_and(|groups| groups.contains(&group_id)))
                 });
             }
-            let history = group.events.values().any(|event| event.retained)
-                || group
-                    .streams
-                    .values()
-                    .any(|stream| !stream.claims.is_empty());
-            if group.events.is_empty()
+            let (released, history) = if group.held_from().is_some() {
+                fenced_release(group)
+            } else {
+                (
+                    !group.events.is_empty(),
+                    group.events.values().any(|event| event.retained)
+                        || group
+                            .streams
+                            .values()
+                            .any(|stream| !stream.claims.is_empty()),
+                )
+            };
+            if !released
                 || (ingress.group_pending(&group_id) && (!ingress.queued(&group_id) || !history))
             {
                 self.refresh_boundaries();
@@ -757,12 +798,7 @@ impl AccountReplayCoverage {
             }
             let mut deliveries = Vec::with_capacity(group.events.len());
             let mut bytes = 0;
-            for stream in group.streams.values_mut() {
-                stream.claims.clear();
-            }
-            group.live.clear();
-            group.ready_history.clear();
-            for (_, event) in group.events.drain() {
+            for (_, event) in group.release() {
                 self.buffered_items -= 1;
                 self.buffered_bytes -= event.delivery.message.payload.len();
                 bytes += event.delivery.message.payload.len();
@@ -844,6 +880,25 @@ impl AccountReplayCoverage {
             self.changes.tx.send_replace(self.wire_generation);
         }
     }
+}
+
+/// Whether a fence on `group` lets any buffered event go, and whether what it
+/// lets go holds history: a retained frame, or one a source claims.
+fn fenced_release(group: &GroupReplay) -> (bool, bool) {
+    let mut released = false;
+    let mut history = false;
+    for (id, event) in &group.events {
+        if group.holds(event) {
+            continue;
+        }
+        released = true;
+        history |= event.retained
+            || group
+                .streams
+                .values()
+                .any(|stream| stream.claims.contains(id));
+    }
+    (released, history)
 }
 
 #[cfg(test)]
@@ -1693,5 +1748,90 @@ mod tests {
                 .get(&account),
             Some(&NostrNotificationLossFloor::Unbounded)
         );
+    }
+
+    /// A fence lets native ingress take a group's frames only up to its
+    /// release point, oldest first; the rest wait with their claims, and the
+    /// group is not offered again until the fence moves.
+    #[tokio::test]
+    async fn a_fence_releases_native_input_up_to_its_point() {
+        let mut state = AdapterState::default();
+        let shared = Arc::new(ReplayIngressState::default());
+        shared.queue.lock().unwrap().consumer = Some(1);
+        let (mut coverage, id) = coverage(&state, shared.clone());
+        coverage.fencing = true;
+        let (tx, _rx) = mpsc::channel(1);
+        for at in [30, 40] {
+            coverage.record_stored_event(&id, RelayIndex(0), u64::from(at));
+            coverage
+                .stage_delivery(
+                    delivery(at, &id),
+                    Some(RelayIndex(0)),
+                    ReplayInput::History,
+                    &tx,
+                )
+                .unwrap();
+        }
+        coverage.record_eose(&id, RelayIndex(0), 0);
+        let group = GroupId::new(vec![0; 16]);
+        assert!(!coverage.owner_flushable(&group, &coverage.groups[&group]));
+        let account = MemberId::new(vec![0xA1; 32]);
+        state
+            .account_replay_coverage
+            .insert(account.clone(), coverage);
+        state
+            .replay_ingresses
+            .insert(account.clone(), shared.clone());
+        let state = Arc::new(RwLock::new(state));
+        let mut ingress = ReplayIngress {
+            consumer: Arc::new(ReplayConsumer {
+                shared: Arc::downgrade(&shared),
+                serial: 1,
+            }),
+            shared,
+            state: Arc::downgrade(&state),
+            account: account.clone(),
+        };
+        let fence = |release_before: Option<u64>| {
+            let state = state.clone();
+            let account = account.clone();
+            async move {
+                let mut state = state.write().await;
+                let coverage = state.account_replay_coverage.get_mut(&account).unwrap();
+                let plan = ReplayFencePlan {
+                    ticket: ReplayFenceTicket(coverage.fence_ticket),
+                    fences: release_before
+                        .map(|release_before| ReplayFence {
+                            route: [0; 32],
+                            release_before,
+                        })
+                        .into_iter()
+                        .collect(),
+                };
+                coverage.apply_fence_plan(&plan);
+            }
+        };
+        assert!(matches!(
+            ingress.take_batch(None).await,
+            ReplayBatchTake::Empty
+        ));
+        fence(Some(35)).await;
+        let mut batch = ready(&mut ingress).await;
+        assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(30));
+        batch.acknowledge().await;
+        assert!(batch.delivery().is_none());
+        drop(batch);
+        assert!(matches!(
+            ingress.take_batch(None).await,
+            ReplayBatchTake::Empty
+        ));
+        fence(None).await;
+        let mut batch = ready(&mut ingress).await;
+        assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(40));
+        batch.acknowledge().await;
+        drop(batch);
+        let state = state.read().await;
+        assert!(!state.account_replay_coverage[&account].admission_pending());
+        assert!(state.replay_losses.pending.lock().unwrap().is_empty());
     }
 }

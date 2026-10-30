@@ -10,7 +10,7 @@
 //! aggregate counts. Nothing here schedules, retries or fences recovery, and
 //! every write is best effort: a failure is logged and the recovery step it
 //! follows goes on. No route, relay, group or obligation identity is logged.
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use storage_sqlite::{
     RecoveryCause, RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageSlice,
@@ -19,10 +19,14 @@ use storage_sqlite::{
     TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationRoute,
 };
 use transport_nostr::MarmotRelayPlaneAccountAdapter;
-use transport_nostr_adapter::{ReplayAdmissionStatus, ReplayLiveCount, ReplaySourceGeneration};
+use transport_nostr_adapter::{
+    ReplayAdmissionStatus, ReplayFence, ReplayFencePlan, ReplayFenceTicket, ReplayLiveCount,
+    ReplaySourceGeneration,
+};
 
 use super::AppClient;
 use super::recovery::AttemptGrant;
+use super::recovery_runner::{LiveCount, LiveFence};
 use super::sync::RouteComparison;
 use crate::AppError;
 use crate::notifications::unix_now_seconds;
@@ -119,9 +123,9 @@ pub(crate) struct LiveCoverage {
     /// Generations loss may have reached, while the adapter still reports
     /// them.
     broken: HashSet<GenerationKey>,
-    /// Generations whose count is settled: written, or unable to prove
-    /// anything. A count is written once.
-    settled: HashSet<GenerationKey>,
+    /// The routes on which each generation's count is settled: written, or
+    /// unable to prove anything. A count is written once on each route.
+    settled: HashMap<GenerationKey, BTreeSet<TransportReconciliationRoute>>,
     tails: LiveTails,
 }
 
@@ -137,7 +141,7 @@ impl LiveCoverage {
         Self {
             mark,
             broken: inherited.into_keys().collect(),
-            settled: HashSet::new(),
+            settled: HashMap::new(),
             tails: LiveTails::default(),
         }
     }
@@ -147,7 +151,7 @@ impl LiveCoverage {
         Self {
             mark,
             broken: HashSet::new(),
-            settled: HashSet::new(),
+            settled: HashMap::new(),
             tails: LiveTails::default(),
         }
     }
@@ -167,24 +171,34 @@ impl LiveCoverage {
         }
     }
 
-    /// The counts `facts` settle now, each with the range it proves on every
-    /// route its filter carries, if any: from [`live_boundary_since`]
-    /// through the second before its `requested_at`. Generations loss may
-    /// have reached prove nothing.
-    fn durable<'a>(
-        &self,
-        facts: &'a [LiveCountFact],
-    ) -> Vec<(&'a LiveCountFact, Option<(u64, u64)>)> {
+    /// The counts `facts` settle now, each with the range it proves, if any,
+    /// and the routes its filter carries that it settles on: from
+    /// [`live_boundary_since`] through the second before its `requested_at`.
+    /// Generations loss may have reached prove nothing, and a route whose
+    /// group's live frames a fence holds waits until they are released.
+    fn durable<'a>(&self, facts: &'a [LiveCountFact]) -> Vec<Settling<'a>> {
         facts
             .iter()
-            .filter(|fact| {
-                fact.placed && !self.settled.contains(&fact.key) && !self.broken.contains(&fact.key)
-            })
-            .map(|fact| {
+            .filter(|fact| fact.placed && !self.broken.contains(&fact.key))
+            .filter_map(|fact| {
+                let routes = fact
+                    .routes
+                    .iter()
+                    .filter(|route| {
+                        !fact.held.contains(route)
+                            && !self
+                                .settled
+                                .get(&fact.key)
+                                .is_some_and(|settled| settled.contains(route))
+                    })
+                    .collect::<Vec<_>>();
+                if routes.is_empty() {
+                    return None;
+                }
                 let range = live_boundary_since(fact.since, &fact.count)
                     .map(|since| (since, fact.count.requested_at.saturating_sub(1)))
                     .filter(|(since, until)| since <= until);
-                (fact, range)
+                Some((fact, range, routes))
             })
             .collect()
     }
@@ -222,6 +236,14 @@ impl LiveCoverage {
     }
 }
 
+/// A count [`LiveCoverage::durable`] settles now: the range it proves, if
+/// any, and the routes it settles on.
+type Settling<'a> = (
+    &'a LiveCountFact,
+    Option<(u64, u64)>,
+    Vec<&'a TransportReconciliationRoute>,
+);
+
 /// One generation's count, copied out of the adapter's guard.
 struct LiveCountFact {
     key: GenerationKey,
@@ -231,8 +253,100 @@ struct LiveCountFact {
     /// The relay closed the REQ or its connection dropped, or the relay
     /// client no longer reports the connection its serial started on.
     ended: bool,
-    /// The request's input reached durable placement.
+    /// The request's input reached durable placement, apart from live
+    /// frames a fence holds.
     placed: bool,
+    /// The routes whose group's live frames a fence holds: nothing on them
+    /// is placed above the hold yet.
+    held: Vec<TransportReconciliationRoute>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl LiveCountFact {
+    /// The count as the runner's fence reads it. Only a non-empty count
+    /// leaves capture debt below its oldest event; one its relay cut at the
+    /// page limit fences nothing, since the adapter pages the rest itself.
+    fn live_count(&self) -> LiveCount {
+        LiveCount {
+            routes: self.routes.clone(),
+            relay: self.key.1.clone(),
+            since: self.since,
+            oldest_seen: self
+                .count
+                .oldest
+                .filter(|_| self.count.events > 0 && !self.count.clamped()),
+        }
+    }
+}
+
+/// What the runner's fence reads from one look at the adapter (mdk#2660
+/// phase 4). Not `Debug`: it carries routes and relays.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct LiveCountRead {
+    /// The look's place in the adapter's fence order: a plan built from these
+    /// counts carries it, so it answers only the counts this look saw.
+    pub(crate) ticket: ReplayFenceTicket,
+    /// Each admitted count, current or ended.
+    pub(crate) counts: Vec<LiveCount>,
+    /// The routes whose group's live frames the adapter holds now, waiting
+    /// for the runner's answer or behind its fence: served first.
+    pub(crate) held: BTreeSet<TransportReconciliationRoute>,
+}
+
+/// The adapter's plan for `fences`, as of `ticket`. A fence holds only group
+/// frames, so inbox routes are left out.
+#[cfg_attr(not(test), allow(dead_code))]
+fn fence_plan(ticket: ReplayFenceTicket, fences: &[LiveFence]) -> ReplayFencePlan {
+    ReplayFencePlan {
+        ticket,
+        fences: fences
+            .iter()
+            .flat_map(|fence| {
+                fence.routes.iter().filter_map(|route| match route {
+                    TransportReconciliationRoute::Group(route) => Some(ReplayFence {
+                        route: *route,
+                        release_before: fence.release_before,
+                    }),
+                    TransportReconciliationRoute::Inbox => None,
+                })
+            })
+            .collect(),
+    }
+}
+
+/// The runner's fence seam. Nothing calls it until the switch-over (5g).
+#[cfg_attr(not(test), allow(dead_code))]
+impl AppClient {
+    /// The adapter's admitted live counts for the runner's fence, read now
+    /// with the fence ticket and the held routes from the same look. The
+    /// runner's host reads this with each debt turn's tails (from 5g).
+    pub(crate) async fn recovery_runner_live_counts(&self) -> LiveCountRead {
+        let observation = self.adapter.replay_admission().await;
+        let (_, facts, _) = observe_live_counts(&observation);
+        LiveCountRead {
+            ticket: observation.fence_ticket(),
+            counts: facts.iter().map(LiveCountFact::live_count).collect(),
+            held: observation
+                .fenced_routes()
+                .map(|route| TransportReconciliationRoute::Group(*route))
+                .collect(),
+        }
+    }
+
+    /// Have the adapter hold each counted group's live frames until the
+    /// runner answers with [`Self::fence_live_frames`], for at most one
+    /// replay deadline. Nothing calls this until the switch-over (5g), so
+    /// owner capture keeps every behavior; no call undoes it.
+    pub(crate) async fn enable_live_fences(&self) {
+        self.adapter.enable_replay_fencing().await;
+    }
+
+    /// Release each fenced group's held live frames below its fence, and the
+    /// rest of every group the counts read at `ticket` held that `fences`
+    /// leaves out.
+    pub(crate) async fn fence_live_frames(&self, ticket: ReplayFenceTicket, fences: &[LiveFence]) {
+        self.adapter.fence_replay(&fence_plan(ticket, fences)).await;
+    }
 }
 
 /// The first second a live REQ's count proves on one relay: the second after
@@ -273,6 +387,10 @@ fn observe_live_counts(
             routes
         };
         let placed = source.placed();
+        let held = source
+            .fenced_routes()
+            .map(|id| TransportReconciliationRoute::Group(*id))
+            .collect::<Vec<_>>();
         for endpoint in source.endpoints() {
             let relay = transport_nostr::canonical_relay(endpoint.endpoint().as_str());
             let mut fact = |generation, count, ended| {
@@ -286,6 +404,7 @@ fn observe_live_counts(
                         count,
                         ended,
                         placed,
+                        held: held.clone(),
                     });
                 }
             };
@@ -578,7 +697,7 @@ impl AppClient {
             observe_live_counts(&observation)
         };
         live.broken.retain(|key| present.contains_key(key));
-        live.settled.retain(|key| present.contains_key(key));
+        live.settled.retain(|key, _| present.contains_key(key));
         live.break_reached(&present, lost.as_deref());
         live.mark = Some(mark);
         if !input_placed || self.delivery_loss_blocks_cursor() {
@@ -587,9 +706,9 @@ impl AppClient {
         let durable = live.durable(&facts);
         let slices = durable
             .iter()
-            .filter_map(|(fact, range)| range.map(|range| (fact, range)))
-            .flat_map(|(fact, (since, until))| {
-                fact.routes.iter().map(move |route| RecoveryCoverageSlice {
+            .filter_map(|(fact, range, routes)| range.map(|range| (fact, range, routes)))
+            .flat_map(|(fact, (since, until), routes)| {
+                routes.iter().map(move |route| RecoveryCoverageSlice {
                     route,
                     relay: &fact.key.1,
                     since_seconds: since,
@@ -600,11 +719,12 @@ impl AppClient {
             .collect::<Vec<_>>();
         match app.record_recovery_coverage_since(&slices, now, mark) {
             Ok(true) => {
-                let settled = durable
-                    .iter()
-                    .map(|(fact, _)| fact.key.clone())
-                    .collect::<Vec<_>>();
-                live.settled.extend(settled);
+                for (fact, _, routes) in &durable {
+                    live.settled
+                        .entry(fact.key.clone())
+                        .or_default()
+                        .extend(routes.iter().map(|route| (*route).clone()));
+                }
             }
             Ok(false) => {
                 return tracing::debug!(target: TARGET, method = "record_native_coverage",

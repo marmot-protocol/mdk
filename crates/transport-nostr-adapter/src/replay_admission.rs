@@ -88,6 +88,40 @@ pub struct ReplayLiveCount {
     pub live_from: u64,
 }
 
+impl ReplayLiveCount {
+    /// The relay sent a full replay page or more before EOSE, so it may have
+    /// clamped the reply. Native paging fetches such a window backwards; its
+    /// count never fences.
+    pub fn clamped(&self) -> bool {
+        self.events >= RELAY_REPLAY_PAGE_LIMIT
+    }
+}
+
+/// Which live counts an owner's observation could see as facts: read from the
+/// [`ReplayAdmissionStatus`] its fences were computed from. A fence plan
+/// answers only the counts its ticket covers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplayFenceTicket(pub(super) u64);
+
+/// One group's fence on its live frames, by any of the group's routes. Not
+/// `Debug`: it carries the route.
+#[derive(Clone, Copy)]
+pub struct ReplayFence {
+    /// A routing id of the group.
+    pub route: [u8; 32],
+    /// Frames sent before this second may be released; the rest stay held.
+    pub release_before: u64,
+}
+
+/// The account owner's fences on its groups' live frames (mdk#2660), as of
+/// the observation `ticket` came from. A group the plan does not name is not
+/// fenced by the owner. Not `Debug`: it carries routes.
+#[derive(Clone)]
+pub struct ReplayFencePlan {
+    pub ticket: ReplayFenceTicket,
+    pub fences: Vec<ReplayFence>,
+}
+
 /// A generation's count that ended while its boundary was admitted: the relay
 /// closed the REQ, or the connection dropped.
 #[derive(Clone, Copy)]
@@ -171,6 +205,21 @@ impl ReplayRequestView<'_> {
         }
     }
 
+    /// The routes this request carries whose group's live frames a fence
+    /// holds: their input is not placed while it does, even when
+    /// [`Self::placed`] holds for the rest of the request.
+    pub fn fenced_routes(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.coverage
+            .request_groups
+            .get(self.id)
+            .into_iter()
+            .flatten()
+            .filter_map(|group_id| self.coverage.groups.get(group_id))
+            .filter(|group| group.held_from().is_some())
+            .filter_map(|group| group.routes.get(self.id))
+            .flatten()
+    }
+
     /// Every issued peer terminally refused this live request. Such a source
     /// remains observable debt, but supplies no private-capture capability.
     pub fn terminally_refused(&self) -> bool {
@@ -189,14 +238,16 @@ impl ReplayRequestView<'_> {
 impl AccountReplayCoverage {
     /// Every MLS group request `id` routes has reached durable placement and
     /// ordinary native admission: nothing for those groups is buffered, queued
-    /// natively, pinned or waiting in the outbox.
+    /// natively, pinned or waiting in the outbox, except frames a fence holds.
+    /// A fence holds one group, never the request: its held frames are owed
+    /// on its own routes ([`ReplayRequestView::fenced_routes`]).
     pub(super) fn request_groups_placed(&self, id: &str) -> bool {
         self.request_groups.get(id).is_some_and(|groups| {
             !groups.is_empty()
                 && groups.iter().all(|group_id| {
                     self.groups.get(group_id).is_some_and(|group| {
                         self.group_ready(group)
-                            && group.events.is_empty()
+                            && group.events.values().all(|event| group.holds(event))
                             && group.placements == 0
                             && !self.native_group_pending(group_id)
                             && !self
@@ -300,6 +351,29 @@ impl ReplayAdmissionStatus<'_> {
             .account_replay_coverage
             .get(self.account_id)
             .map_or(0, |coverage| coverage.wire_generation)
+    }
+
+    /// Which of this account's live counts this status shows as facts: hand
+    /// it back with the fences computed from them.
+    pub fn fence_ticket(&self) -> ReplayFenceTicket {
+        ReplayFenceTicket(
+            self._guard
+                .account_replay_coverage
+                .get(self.account_id)
+                .map_or(0, |coverage| coverage.fence_ticket),
+        )
+    }
+
+    /// The routes of every group whose live frames a fence holds now, a route
+    /// once per request that carries it. Allocates nothing.
+    pub fn fenced_routes(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self._guard
+            .account_replay_coverage
+            .get(self.account_id)
+            .into_iter()
+            .flat_map(|coverage| coverage.groups.values())
+            .filter(|group| group.held_from().is_some())
+            .flat_map(|group| group.routes.values().flatten())
     }
 
     /// This iterator and its endpoint views allocate nothing.

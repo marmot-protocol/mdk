@@ -36,7 +36,7 @@ use transport_nostr_adapter::{
 
 pub use transport_nostr_adapter::{
     DeliveryRoute, MAX_DELIVERY_LOSS_ROUTES, ReplayAdmissionStatus, ReplayCaptureOutcome,
-    ReplayCapturePlan,
+    ReplayCapturePlan, ReplayFence, ReplayFencePlan, ReplayFenceTicket,
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -3747,6 +3747,31 @@ impl MarmotRelayPlaneAccountAdapter {
             .adapter
             .capture_replay(&self.account_id, plan, cancellation)
             .await
+    }
+
+    /// Hold this account's groups' live frames behind the owner's fences from
+    /// now on (mdk#2660). Call it before activation, so the first counts are
+    /// held too.
+    #[doc(hidden)]
+    pub async fn enable_replay_fencing(&self) {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .enable_replay_fencing(&self.account_id)
+            .await;
+    }
+
+    /// Apply the owner's fences on this account's groups' live frames, as of
+    /// the status `plan`'s ticket came from. Schedules no IO.
+    #[doc(hidden)]
+    pub async fn fence_replay(&self, plan: &ReplayFencePlan) {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .fence_replay(&self.account_id, plan)
+            .await;
     }
 
     /// Register ordered native input before activation. Retained group spill
