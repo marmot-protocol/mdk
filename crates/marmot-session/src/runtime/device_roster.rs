@@ -21,7 +21,8 @@
 //! caller retries or reports it.
 //!
 //! A device keeps its own entry's `client` and `platform` current itself
-//! ([`DeviceSelfReport`]); each announcement of its KeyPackage writes them.
+//! ([`DeviceSelfReport`]), and its `history_key` (4.1, generated on first
+//! use); each announcement of its KeyPackage writes them.
 
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
@@ -33,7 +34,7 @@ use cgka_traits::{EngineError, EpochState, FanoutMlsState, GroupId, TransportAda
 
 use marmot_forensics::AuditEventContext;
 
-use super::{AccountDeviceEffects, AccountDeviceRuntime};
+use super::{AccountDeviceEffects, AccountDeviceRuntime, TRACE_TARGET};
 use crate::error::{AccountError, AccountResult};
 use crate::key_package::KeyPackagePublisher;
 use crate::routing::TransportRoutingPolicy;
@@ -147,6 +148,24 @@ where
         Ok(DeviceRosterEdit::Committed(Box::new(
             self.publish_session_effects(staged).await?,
         )))
+    }
+
+    /// The public half of this device's history key, for its own roster
+    /// entry, or `None` when it cannot be read or stored now. A history key
+    /// never holds back the roster edit it rides on; a later edit of this
+    /// device's own entry writes it.
+    pub(super) fn own_history_key(&self, method: &'static str) -> Option<Vec<u8>> {
+        self.session
+            .history_public_key()
+            .inspect_err(|_| {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = method,
+                    error_kind = "history_key",
+                    "could not read this device's history key; a later roster edit writes it"
+                );
+            })
+            .ok()
     }
 
     /// Whether this device may commit in the device group `group_id` now:

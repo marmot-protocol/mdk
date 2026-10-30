@@ -82,6 +82,14 @@
   would, so the generation stays routed, and lowers the generation's floor to
   the lowest bound they list; `None` makes it account-wide, as every such
   observation did before.
+- Migration 0138 (mdk#2628 item 4.1) runs on every account database that
+  lacks it, including one already at schema 140. It adds
+  `cgka_account_device_history_keys`: this device's HPKE history key
+  pair, one per account-device identity, next to its MLS signer's binding.
+  `SqliteAccountStorage` implements the new
+  `cgka_traits::storage::AccountDeviceHistoryKeyStorage`, which
+  `StorageProvider` now requires; `put_account_device_history_key_if_absent`
+  never replaces a stored key.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it

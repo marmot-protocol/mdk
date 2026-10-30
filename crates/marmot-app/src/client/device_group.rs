@@ -331,12 +331,13 @@ impl AppClient {
         // announces the KeyPackage in that device's slot (3.4), so neither
         // device owes a roster commit before it publishes. This device's
         // entry also carries its tag signature key, so the engine tags its
-        // founding leaf (3.1d); the new device sets its own once it joins.
-        // Nobody chose settings for the founder, so it takes the defaults a
-        // new device starts with: siblings add it to chats it is missing, with
-        // their history. Each entry is created with a fresh rename id (3.6a),
-        // so a later rename of either never reads as one made before it
-        // existed.
+        // founding leaf (3.1d), and its history key (4.1), which a later
+        // announcement writes if it cannot be read now; the new device sets
+        // both of its own once it joins. Nobody chose settings for the
+        // founder, so it takes the defaults a new device starts with:
+        // siblings add it to chats it is missing, with their history. Each
+        // entry is created with a fresh rename id (3.6a), so a later rename
+        // of either never reads as one made before it existed.
         roster.devices.insert(
             own_slot,
             DeviceEntryV1 {
@@ -349,6 +350,7 @@ impl AppClient {
                 },
                 announced_key_package: own_lifecycle.current_key_package_ref,
                 tag_signature_key: Some(self.runtime.own_signature_key()),
+                history_key: self.runtime.history_public_key().ok(),
                 ..DeviceEntryV1::default()
             },
         );

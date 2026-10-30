@@ -915,6 +915,32 @@ where
         Ok(self.session.expect_device_group_welcome(expectation)?)
     }
 
+    /// The public half of this device's history key (mdk#2628 4.1),
+    /// generated and stored on first use. This device's own roster entry
+    /// carries it; see [`cgka_engine::engine::Engine::history_public_key`].
+    pub fn history_public_key(&self) -> SessionResult<Vec<u8>> {
+        self.session.history_public_key()
+    }
+
+    /// `plaintext` sealed to a sibling's history key, as its roster entry
+    /// holds it, for `context`; `None` when that key is not one this device
+    /// can seal to. See [`cgka_engine::history_key`].
+    pub fn seal_history(
+        &self,
+        recipient_public_key: &[u8],
+        context: &[u8],
+        plaintext: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.session
+            .seal_history(recipient_public_key, context, plaintext)
+    }
+
+    /// `sealed` opened with this device's history key for `context`;
+    /// `None` when it does not open or this device has no history key yet.
+    pub fn open_history(&self, context: &[u8], sealed: &[u8]) -> SessionResult<Option<Vec<u8>>> {
+        self.session.open_history(context, sealed)
+    }
+
     /// See `CgkaEngine::withdraw_device_group_welcome`.
     pub fn withdraw_device_group_welcome(&mut self, group_id: &GroupId) -> SessionResult<bool> {
         Ok(self.session.withdraw_device_group_welcome(group_id)?)
