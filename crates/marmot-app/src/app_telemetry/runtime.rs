@@ -239,7 +239,7 @@ impl CompletedState {
         bucket.fetch_add(1, Ordering::Relaxed);
         let _ = self
             .sum_ms
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sum| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |sum| {
                 Some(sum.saturating_add(duration_ms))
             });
         let index = match outcome {

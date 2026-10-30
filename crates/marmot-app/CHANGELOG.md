@@ -910,6 +910,8 @@
 
 ### Maintenance
 
+- Use `AtomicU64::try_update` for runtime telemetry duration totals to remove
+  the `fetch_update` deprecation warning; saturation and memory ordering are unchanged.
 - Removed the 41 Delete/wiring tests identified in #2413 across the Rust crates
   and Hermes/OpenClaw integrations. Runtime behavior and public contracts are unchanged.
 
