@@ -1523,6 +1523,11 @@ impl DeviceGroupWelcomeStorage for FaultStorage {
     ) -> StorageResult<Option<DeviceGroupWelcomeExpectation>> {
         self.inner.device_group_welcome_expectation(group_id)
     }
+    fn device_group_welcome_expectations(
+        &self,
+    ) -> StorageResult<Vec<DeviceGroupWelcomeExpectation>> {
+        self.inner.device_group_welcome_expectations()
+    }
     fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool> {
         self.inner.delete_device_group_welcome_expectation(group_id)
     }

@@ -1272,14 +1272,16 @@ pub trait CgkaEngine: Send + Sync {
 
     /// Expect the Welcome into the account's device group that a confirmed
     /// device link names; the new device records it before it sends its own
-    /// confirmation (mdk#2628 D28, D30). Until `expires_at` the engine joins
-    /// `group_id` only through a Welcome into a group that requires the device
-    /// roster, sent by the leaf whose signature key is
-    /// `sender_signature_key`, and that join consumes the expectation. It
-    /// refuses every other Welcome into that group id, and every Welcome into a
-    /// group that requires the device roster that no expectation names, with
-    /// [`EngineError::UnexpectedDeviceGroupWelcome`]. Replaces an earlier
-    /// expectation for the same group.
+    /// confirmation (mdk#2628 D28, D30, D41). Until `expires_at` the engine
+    /// joins `group_id` only through a Welcome into a group that requires the
+    /// device roster, sent by the leaf whose signature key is
+    /// `sender_signature_key`, that adds this device by the KeyPackage whose
+    /// `KeyPackageRef` is `key_package_ref`, and that join consumes the
+    /// expectation. It refuses every other Welcome into that group id, every
+    /// Welcome into another group that adds this device by that KeyPackage,
+    /// and every Welcome into a group that requires the device roster that no
+    /// expectation names, with [`EngineError::UnexpectedDeviceGroupWelcome`].
+    /// Replaces an earlier expectation for the same group.
     fn expect_device_group_welcome(
         &mut self,
         expectation: &crate::storage::DeviceGroupWelcomeExpectation,

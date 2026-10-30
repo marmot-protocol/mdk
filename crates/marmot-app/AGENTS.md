@@ -64,18 +64,19 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   says `created` or `linked`. Never judge a joined Welcome: the engine decides which Welcome joins, before the join
   (mdk#2628 D28, D30). `record_confirmed_device_link` refuses a group this device already holds, writes the
   `awaiting_welcome` row, then records the engine's `DeviceGroupWelcomeExpectation` (group, the existing device's leaf
-  signature key, `WELCOME_WAIT_SECS`), deleting the row if that fails. Withdrawing a link and ending a wait
-  (`withdraw_confirmed_device_link`, `end_welcome_waits` on every record and reconcile) delete the expectation before
-  the row, so once either returns no Welcome under the link joins. A row a crash or failure leaves without its
-  expectation admits nothing, and `end_welcome_waits` drops it at once rather than at the wait's end. Decide
-  from the engine's durable group record (`stored_group`), never the live group a deferred open has not hydrated, and
-  settle trust in one place (`settle_held_device_group`: the live join and the restart reconcile). A held device group
-  with an `awaiting_welcome` row joined in time, whatever the row's age. A held device group with no row stays
-  `untrusted`, and a group under a row that does not require the roster drops the row; neither arises through the
-  engine. A routing rebuild skips a device group a deferred open has not hydrated; the post-hydration reconcile
-  installs its route. The founding Add takes the account's own device only through the confirmed `KeyPackageRef`.
-  Confirmed links come from device pairing; the `test-policy-overrides` hooks (`dev_create_device_group`,
-  `dev_record_confirmed_device_link`, `dev_withdraw_confirmed_device_link`) stay for tests.
+  signature key, the confirmed `KeyPackageRef`, `WELCOME_WAIT_SECS`), deleting the row if that fails. Withdrawing a
+  link and ending a wait (`withdraw_confirmed_device_link`, `end_welcome_waits` on every record and reconcile) delete
+  the expectation before the row, so once either returns no Welcome under the link joins. A row a crash or failure
+  leaves without its expectation admits nothing, and `end_welcome_waits` drops it at once rather than at the wait's
+  end. Decide from the engine's durable group record (`stored_group`), never the live group a deferred open has not
+  hydrated, and settle trust in one place (`settle_held_device_group`: the live join and the restart reconcile). A held
+  device group with an `awaiting_welcome` row joined in time, whatever the row's age. A held device group with no row
+  stays `untrusted`, and a group under a row that does not require the roster drops the row; neither arises through the
+  engine. A routing rebuild skips a device group a deferred open has not hydrated; the post-hydration reconcile installs
+  its route. The founding roster lists only this device and its sign-in rejections, never the linked slot's; the
+  founding Add takes the account's own device only through the confirmed `KeyPackageRef` and sets its entry, as a later
+  link does (D41). Confirmed links come from device pairing; the `test-policy-overrides` hooks
+  (`dev_create_device_group`, `dev_record_confirmed_device_link`, `dev_withdraw_confirmed_device_link`) stay for tests.
 - Read the device roster only through `trusted_device_roster` (the trusted group's decoded roster, or none). Hosts see
   it only as `linked_devices`, this account's own devices; its errors never name the group. The device group's events
   stay hidden, so every hidden device-group event and every change of trust sets `linked_devices_changed`, which the
@@ -192,6 +193,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   drive. It announces each Welcome once per process (`announced_welcome_failures`) and leaves a failure without a
   group (the startup retry's) to `reconcile_pending_welcome_delivery_index`. The worker's projection drain
   (`publish_client_pending_projection_updates`) broadcasts the queued events, so every worker seam does.
+  `note_welcome_delivery_failures` and that reconcile are the pending table's only writers; never write a row before a
+  commit is exposed, since the engine stages an invite's Welcomes with its commit.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

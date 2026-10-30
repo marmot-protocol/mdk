@@ -286,9 +286,8 @@ async fn device_that_holds_nothing_sends_no_snapshot() {
     assert_eq!(owed(&fx.alice, &group_hex), None);
 }
 
-/// The owed snapshot is recorded before the Commit is staged, and undone when
-/// the Welcome intents then fail to record and the Commit rolls back. Either
-/// failure leaves the earlier owed snapshot as it was.
+/// The owed snapshot is recorded before the Commit is staged, so a failure to
+/// record it stages nothing and leaves the earlier owed snapshot as it was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_invite_persistence_leaves_the_owed_snapshot_as_it_was() {
     let mut fx = Fixture::new().await;
@@ -305,30 +304,28 @@ async fn failed_invite_persistence_leaves_the_owed_snapshot_as_it_was() {
     );
     let connection = fx.alice.raw_connection();
 
-    for trigger in [
-        "CREATE TRIGGER fail_invite BEFORE INSERT ON app_pending_welcome_delivery
-         BEGIN SELECT RAISE(FAIL, 'injected welcome intent failure'); END;",
-        "CREATE TRIGGER fail_invite BEFORE UPDATE ON group_push_gossip_state
-         BEGIN SELECT RAISE(FAIL, 'injected snapshot failure'); END;",
-    ] {
-        connection.execute_batch(trigger).unwrap();
-        assert!(
-            fx.alice
-                .client
-                .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
-                .await
-                .is_err()
-        );
-        connection
-            .execute_batch("DROP TRIGGER fail_invite")
-            .unwrap();
-        assert_eq!(owed(&fx.alice, &group_hex), Some(0));
-        assert_eq!(
-            current_epoch(&fx.alice, &group),
-            epoch,
-            "the Commit rolled back"
-        );
-    }
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_invite BEFORE UPDATE ON group_push_gossip_state
+             BEGIN SELECT RAISE(FAIL, 'injected snapshot failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        fx.alice
+            .client
+            .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
+            .await
+            .is_err()
+    );
+    connection
+        .execute_batch("DROP TRIGGER fail_invite")
+        .unwrap();
+    assert_eq!(owed(&fx.alice, &group_hex), Some(0));
+    assert_eq!(
+        current_epoch(&fx.alice, &group),
+        epoch,
+        "no Commit was staged"
+    );
 }
 
 /// A Commit the relay rejects never merges, so it owes no snapshot.
