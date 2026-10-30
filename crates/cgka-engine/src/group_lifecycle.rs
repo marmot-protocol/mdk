@@ -162,6 +162,24 @@ pub(crate) fn welcome_key_package_of_this_device(
     }
 }
 
+/// Whether a delivery of a Welcome this device already joined names a
+/// KeyPackage publication this device never held. One Welcome reaches every
+/// device it adds, each in its own delivery of the same content, so once this
+/// device joined through its own, a sibling's lands on the content dedup
+/// marker. It is still not addressed to this device (mdk#2628 3.2). Without
+/// a claim or a lifecycle record, it stays a duplicate.
+pub(crate) fn joined_welcome_names_another_key_package(
+    lifecycle: Option<&KeyPackageLifecycleState>,
+    claimed: Option<&MessageId>,
+) -> bool {
+    match (lifecycle, claimed) {
+        (Some(lifecycle), Some(claimed)) => !lifecycle
+            .held_publications()
+            .any(|(held, _)| held == claimed),
+        _ => false,
+    }
+}
+
 pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
     matches!(
         error,
@@ -2452,6 +2470,34 @@ mod tests {
         assert!(matches!(
             decide(None, None),
             Err(EngineError::MissingWelcomeKeyPackage)
+        ));
+    }
+
+    #[test]
+    fn a_joined_welcome_delivered_for_another_key_package_is_not_a_duplicate() {
+        let id = |byte| MessageId::new(vec![byte; 32]);
+        let mut lifecycle = KeyPackageLifecycleState::slot_only("slot".into());
+        lifecycle.current_key_package_ref = Some(vec![1]);
+        lifecycle.authored_event_id = Some(id(1));
+
+        // A sibling's or unknown delivery names a publication never held.
+        assert!(joined_welcome_names_another_key_package(
+            Some(&lifecycle),
+            Some(&id(2))
+        ));
+        // This device's own delivery again is a duplicate.
+        assert!(!joined_welcome_names_another_key_package(
+            Some(&lifecycle),
+            Some(&id(1))
+        ));
+        // So is any delivery it cannot tell apart.
+        assert!(!joined_welcome_names_another_key_package(
+            Some(&lifecycle),
+            None
+        ));
+        assert!(!joined_welcome_names_another_key_package(
+            None,
+            Some(&id(2))
         ));
     }
 }

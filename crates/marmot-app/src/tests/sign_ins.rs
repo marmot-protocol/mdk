@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use super::canonical_membership::{deliver_new, published_key_package};
+use super::canonical_membership::{deliver_events, deliver_new, published_key_package};
 use super::*;
 use crate::client::sign_ins::{Announcement, SlotOutcome};
 use crate::{ConfirmedDeviceLink, SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
@@ -1138,17 +1138,58 @@ async fn a_live_key_package_brings_the_check_forward() {
     assert_eq!(phone.unrecognized_sign_ins().unwrap().len(), 1);
 }
 
+/// The deliveries published after `cursor`, with the Welcome rumors that name
+/// `own` first or last and the order otherwise kept. Advances `cursor`.
+async fn welcomes_ordered(
+    account: &Account,
+    cursor: &mut usize,
+    own: &MessageId,
+    own_first: bool,
+) -> Vec<NostrTransportEvent> {
+    let events = account.relay.published_events.lock().unwrap()[*cursor..].to_vec();
+    *cursor += events.len();
+    let peeler =
+        transport_nostr_peeler::NostrMlsPeeler::new().with_welcome_signer(account.keys.clone());
+    let (mut named, mut own_rumors, mut other_rumors) = (Vec::new(), 0, 0);
+    for event in events {
+        let names_own = match peeler
+            .peel_welcome_with_provenance(&event.to_transport_message().unwrap())
+            .await
+        {
+            Ok((_, provenance)) => {
+                let names_own = provenance.key_package_event_id.as_slice() == own.as_slice();
+                if names_own {
+                    own_rumors += 1;
+                } else {
+                    other_rumors += 1;
+                }
+                names_own
+            }
+            Err(_) => false,
+        };
+        named.push((names_own != own_first, event));
+    }
+    assert!(own_rumors > 0 && other_rumors > 0, "both devices' rumors");
+    named.sort_by_key(|(later, _)| *later);
+    named.into_iter().map(|(_, event)| event).collect()
+}
+
 /// A Welcome that names another KeyPackage of the account brings the check
 /// forward too (mdk#2628 3.2). Bob invites Alice, so the phone also receives
 /// the delivery made for the laptop's KeyPackage, which is not addressed to
-/// it, and checks within the minute. Anyone can send such a Welcome: a burst
-/// right after a check waits its minute, then makes one check.
+/// it, and checks within the minute, whichever delivery comes first. Anyone
+/// can send such a Welcome: a burst right after a check waits its minute,
+/// then makes one check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_welcome_naming_another_key_package_brings_the_check_forward() {
     let account = Account::new(2, true);
     let relay = &account.relay;
     let mut phone = account.open(0).await;
-    published_key_package(&mut phone, relay).await;
+    let phones = published_key_package(&mut phone, relay)
+        .await
+        .source
+        .unwrap()
+        .event_id;
     phone.drive_sign_ins().await;
     let mut laptop = account.open(1).await;
     published_key_package(&mut laptop, relay).await;
@@ -1169,11 +1210,15 @@ async fn a_welcome_naming_another_key_package_brings_the_check_forward() {
     let bob_app = sign_in_app_at(&bob_dir, relay.clone(), false);
     remember_test_member_inbox(&bob_app, &account.alice_id, "wss://relay.example");
     let mut bob = bob_app.client("bob").await.unwrap();
-    let mut cursor = 0;
+    let mut cursor = relay.published_events.lock().unwrap().len();
+    // The phone's own deliveries first: it joins each group before the
+    // laptop's delivery of the same Welcome arrives.
     for name in ["one", "two", "three"] {
         bob.create_group(name, &[&account.alice_id]).await.unwrap();
     }
-    deliver_new(&mut phone, relay, &mut cursor).await;
+    let burst = welcomes_ordered(&account, &mut cursor, &phones, true).await;
+    let delivered = deliver_events(&mut phone, &burst).await;
+    assert_eq!(delivered.joined_groups.len(), 3);
     assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
     assert!(checks_a_minute_on(&mut phone).await);
     assert_eq!(
@@ -1181,12 +1226,14 @@ async fn a_welcome_naming_another_key_package_brings_the_check_forward() {
         [(own_slot(&laptop), false, UnrecognizedSignInState::Prompt)]
     );
 
-    // A burst right after a check waits its minute, then makes one check and
-    // leaves none pending.
+    // A burst right after a check, the laptop's deliveries first, waits its
+    // minute, then makes one check and leaves none pending.
     for name in ["four", "five", "six"] {
         bob.create_group(name, &[&account.alice_id]).await.unwrap();
     }
-    deliver_new(&mut phone, relay, &mut cursor).await;
+    let burst = welcomes_ordered(&account, &mut cursor, &phones, false).await;
+    let delivered = deliver_events(&mut phone, &burst).await;
+    assert_eq!(delivered.joined_groups.len(), 3);
     let checked = phone.sign_in_schedule.last;
     phone.drive_sign_ins().await;
     assert_eq!(
