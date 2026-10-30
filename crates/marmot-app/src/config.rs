@@ -95,6 +95,11 @@ pub struct MarmotAppConfig {
     /// or longer than 64 bytes once trimmed, leaves publications untagged; signed
     /// retries retain their original tags.
     pub key_package_client_name: Option<String>,
+    /// Optional short name of the platform this device runs on, such as
+    /// `iOS`, which it writes with `key_package_client_name` into its own
+    /// entry in its device group's roster (mdk#2628 3.6). None, or a name
+    /// blank or longer than 64 bytes once trimmed, writes none.
+    pub device_platform: Option<String>,
     /// Automatic acquisition defaults on with bounded resource limits.
     /// None disables automatic acquisition; frozen runtimes always disable it.
     /// Per-account native policy overrides are durable.
@@ -269,6 +274,7 @@ impl Default for MarmotAppConfig {
     fn default() -> Self {
         Self {
             key_package_client_name: None,
+            device_platform: None,
             attachment_acquisition: Some(AttachmentAcquisitionPolicy::default()),
             attachment_acquisition_mode: AttachmentAcquisitionMode::default(),
             moderation_report_config: None,
@@ -320,6 +326,11 @@ impl MarmotAppConfig {
 
     pub fn with_key_package_client_name(mut self, name: Option<String>) -> Self {
         self.key_package_client_name = name;
+        self
+    }
+
+    pub fn with_device_platform(mut self, platform: Option<String>) -> Self {
+        self.device_platform = platform;
         self
     }
 

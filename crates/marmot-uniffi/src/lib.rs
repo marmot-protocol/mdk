@@ -211,6 +211,11 @@ pub struct MarmotOptions {
     pub cursor_persistence: Option<CursorPersistenceFfi>,
     #[uniffi(default = None)]
     pub client_name: Option<String>,
+    /// Short name of the platform this device runs on, such as `iOS`. With
+    /// `client_name`, it fills this device's entry on the account's Devices
+    /// screen (mdk#2628 3.6). Blank, or over 64 bytes once trimmed, is left out.
+    #[uniffi(default = None)]
+    pub device_platform: Option<String>,
     #[uniffi(default = None)]
     pub secret_store: Option<Arc<dyn SecretStore>>,
     #[uniffi(default = None)]
@@ -235,6 +240,7 @@ impl MarmotOptions {
             relay_policy: None,
             cursor_persistence: None,
             client_name: None,
+            device_platform: None,
             secret_store: None,
             attachment_acquisition_mode: None,
             moderation_report_config: None,
@@ -262,6 +268,7 @@ impl MarmotOptions {
                     .into(),
             )
             .with_key_package_client_name(self.client_name.clone())
+            .with_device_platform(self.device_platform.clone())
             .with_moderation_report_config(self.moderation_report_config.clone().map(Into::into))
             .with_deployment(self.deployment.clone().into())
     }
@@ -570,6 +577,7 @@ mod tests {
             marmot_app::CursorPersistence::Advance
         );
         assert_eq!(defaults.key_package_client_name, None);
+        assert_eq!(defaults.device_platform, None);
         assert_eq!(
             defaults.attachment_acquisition_mode,
             marmot_app::AttachmentAcquisitionMode::NativeAutomatic
@@ -592,6 +600,7 @@ mod tests {
                 relay_policy: Some(policy),
                 cursor_persistence: Some(CursorPersistenceFfi::Frozen),
                 client_name: Some(" whitenoise ".into()),
+                device_platform: Some("iOS".into()),
                 ..MarmotOptions::for_deployment(marmot_deployment_neutral())
             }
             .app_config();
@@ -605,6 +614,7 @@ mod tests {
                 config.key_package_client_name.as_deref(),
                 Some(" whitenoise ")
             );
+            assert_eq!(config.device_platform.as_deref(), Some("iOS"));
         }
     }
 

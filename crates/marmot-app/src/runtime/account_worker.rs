@@ -500,6 +500,11 @@ pub(crate) enum AccountWorkerCommand {
     CheckSignIns {
         respond: oneshot::Sender<Result<Vec<crate::UnrecognizedSignIn>, AppError>>,
     },
+    RenameLinkedDevice {
+        slot_id_hex: String,
+        label: String,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     DismissHistoryNotice {
         notice_id: String,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -5794,6 +5799,15 @@ fn account_worker_command_future<'a>(
         AccountWorkerCommand::CheckSignIns { respond } => Box::pin(async move {
             let result = client.check_sign_ins_now().await;
             publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::RenameLinkedDevice {
+            slot_id_hex,
+            label,
+            respond,
+        } => Box::pin(async move {
+            let result = client.rename_linked_device(&slot_id_hex, &label).await;
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),

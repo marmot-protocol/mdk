@@ -765,6 +765,38 @@ hint change, a relay reconnect or its earliest retry time. An explicit pass runs
 once in place within a budget, as a directly owned client's `sync()` will after the switch-over.
 Its starting values are convergence-ledger decision A19.
 
+A unit compares instead of sweeping when its relay's recorded caps show NIP-77 and the device
+already holds events in the owed range: its retained inventory and anything staged. With
+nothing held a sweep is cheaper, since every id the relay names would be fetched anyway. The
+comparison fetches the difference by id, oldest first, in windows that keep the relay's set
+under its 16,384-item limit, and certifies a window once every id the relay holds there is
+fetched or held. A quantum cut short certifies the prefix below its oldest unfetched
+difference and stages the rest uncovered, so the next quantum holds it and resumes: a large
+difference finishes over several quanta and nothing is fetched twice. A relay that turns out
+not to support NIP-77, or refuses a comparison, is swept until it reconnects. Progress is still
+newly covered seconds: a single second whose difference is larger than one quantum may fetch is
+taken in parts that certify nothing until the last, so a second holding more than six quanta of
+missing events (about 12,000 typical group messages) breaks its unit and parks behind the
+notice, as a sweep's saturated second does. What those parts fetched stays staged.
+
+Re-checks look for late input on history already covered or retired. Each group (route,
+relay) on a required relay with NIP-77 has one resumable pass over its covered and retired
+ranges inside the route's complete reconciliation inventory: the retention window, raised past
+whatever the inventory compacted beyond its 16,384 ids. That is the window inside which
+automatic late-publication repair is guaranteed; below it the held set is incomplete, so
+nothing is re-checked there, and an epoch gap's bound below it is raised to it. Best-effort relays get none, and a relay that can only
+prove by count is never re-checked. A pass falls due 6 h after the last full pass, and at once
+after an epoch gap (that group, from the gap's bound), explicit repair, or a cooldown of its
+relay longer than an hour. Storage makes them due in the write that ends the cooldown, and each
+such request bumps the pass's revision; a quantum records its pass's progress only under the
+revision it began on, so a request that arrives while one runs is never swallowed. Re-checks run
+only while no debt unit is eligible. A window that
+finds nothing records a re-check proof; what one finds inside a covered range is staged as
+late input and counted, and a retired span it proves becomes coverage. A failed or truncated
+pass un-covers nothing and resumes from its position after the unit backoff's doubling. A
+re-check charges the account budget and the relay's streak like any quantum, never the unit's
+own retry state. These values are decision A20.
+
 ## What gets deleted
 
 Deleted in step 2:

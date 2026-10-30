@@ -174,6 +174,13 @@ pub enum EngineError {
     #[error("linking a device refused while the device group is unsettled")]
     LinkDeviceUnsettled { group_id: GroupId },
 
+    /// A [`SendIntent::ReplaceDeviceEntry`](crate::engine::SendIntent::ReplaceDeviceEntry)
+    /// refused because the slot no longer holds the entry the replacement
+    /// was computed from: a commit applied since changed or removed it.
+    /// Nothing was staged. Read the roster again to retry.
+    #[error("a device entry replacement refused: the entry changed since it was read")]
+    DeviceEntryChanged { group_id: GroupId },
+
     /// A Welcome refused because it is not the device-group Welcome a
     /// confirmed device link expects (mdk#2628 D28, D30): it joins a group
     /// that requires the device roster with no link expecting it, it comes
@@ -319,6 +326,7 @@ impl EngineError {
             EngineError::AppMessageEpochMismatch { .. } => "app_message_epoch_mismatch",
             EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
             EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
+            EngineError::DeviceEntryChanged { .. } => "device_entry_changed",
             EngineError::UnexpectedDeviceGroupWelcome => "unexpected_device_group_welcome",
             EngineError::ForkedEpoch { .. } => "forked_epoch",
             EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",

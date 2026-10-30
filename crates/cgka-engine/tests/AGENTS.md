@@ -199,8 +199,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     creation; a roster update is a diff every member applies to the parent's roster, and a committer that writes the
     update's bytes as the state is dropped; the roster's own invariants, one tag signature key per device included; every leaf is one
     account, at creation, on invite, on replay and at join; the roster is required from creation or never, for
-    Commits and standalone proposals; and outside a device group roster bytes are unknown data. The `Parts::app_data_state` override in
-    `account_devices.rs` lets a crafted Commit write resulting bytes of its own.
+    Commits and standalone proposals; and outside a device group roster bytes are unknown data. A device entry
+    replacement (`ReplaceDeviceEntry`) never lands on an entry that changed since it was read: not from its own
+    send's settlement, a rival branch at the same epoch, or the drain, and a lost one is re-issued only while its
+    entry is untouched (`DeviceEntryChanged`). The
+    `Parts::app_data_state` override in `account_devices.rs` lets a crafted Commit write resulting bytes of its own.
 
 - **File:** `account_devices/link_device.rs` (test-policy builds only)
   - **Owns:** The link Commit (mdk#2628 item 3.3b), `LinkDevice`: one privileged admin Commit that adds the linked
@@ -222,15 +225,16 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `account_devices/device_tag.rs` (test-policy builds only)
   - **Owns:** `marmot.member.device-tag.v1` (0x800f, mdk#2628 item 3.1d) through the engine: a member leaf whose tag
-    verifies under a roster device's key reads as that device, against the current tree only; a tag that doesn't
-    open never invalidates a Commit; another account's leaf is unclaimed; a Commit, standalone proposal or Welcome
-    that requires 0x800f is rejected; a GroupContext entry under it is unknown data the engine never writes. Producing
-    them: a device that sets its own key in a roster update tags that Commit's UpdatePath; every KeyPackage it then
-    builds carries a fresh tag, and an untagged or no longer matching one is stale; a founder tags its founding leaf
-    from the roster it founds; each kind of own Commit tags a leaf that needs a tag, and the members accept it; a leaf
-    whose tag reads as its own keeps it; without a named device group nothing is tagged; naming a seeded group hydrates
-    it, and a quarantined one tags nothing while a tagged KeyPackage stays current. The tag crypto and the spec vector
-    are unit-tested in `src/device_tag.rs`.
+    verifies under a roster device's key reads as that device, against the current tree only; a tag that doesn't open
+    never invalidates a Commit; another account's leaf is unclaimed; a Commit, standalone proposal or Welcome that
+    requires 0x800f is rejected; a GroupContext entry under it is unknown data the engine never writes. Producing them:
+    a device that sets its own key in a roster update tags that Commit's UpdatePath; every KeyPackage it then builds
+    carries a fresh tag, and an untagged or no longer matching one is stale; only the entry at its own slot tags, so
+    another entry carrying its key tags nothing and an entry moved off its slot stops it tagging; a founder tags its
+    founding leaf from the roster it founds, from its own entry only; each kind of own Commit tags a leaf that needs a
+    tag, and the members accept it; a leaf whose tag reads as its own keeps it; without a named device group nothing is
+    tagged; naming a seeded group hydrates it, and a quarantined one tags nothing while a tagged KeyPackage stays
+    current. The tag crypto and the spec vector are unit-tested in `src/device_tag.rs`.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and

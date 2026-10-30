@@ -140,6 +140,7 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
         SendIntent::Leave { .. } => "leave",
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
+        SendIntent::ReplaceDeviceEntry { .. } => "replace_device_entry",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
@@ -163,6 +164,7 @@ pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId 
         | SendIntent::Leave { group_id }
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
+        | SendIntent::ReplaceDeviceEntry { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. }
         | SendIntent::EnableDisbanding { group_id }
         | SendIntent::EnableAccountDevices { group_id }

@@ -812,6 +812,11 @@ impl AccountDeviceSession {
         Ok(self.engine.outstanding_sent_welcomes()?)
     }
 
+    /// See `Engine::sent_welcome_awaits_commit`.
+    pub fn sent_welcome_awaits_commit(&self, id: &MessageId) -> SessionResult<bool> {
+        Ok(self.engine.sent_welcome_awaits_commit(id)?)
+    }
+
     /// IDs of delivery-aware outbound Welcomes, including completed ones.
     pub fn tracked_outbound_welcome_ids(&self) -> SessionResult<Vec<MessageId>> {
         Ok(self.engine.tracked_outbound_welcome_ids()?)
@@ -1775,6 +1780,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::Leave { .. } => "leave",
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
+        SendIntent::ReplaceDeviceEntry { .. } => "replace_device_entry",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",

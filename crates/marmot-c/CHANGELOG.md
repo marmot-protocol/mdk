@@ -19,6 +19,17 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotClientOptions` gains a trailing `device_platform`: the platform this
+  device runs on, such as "iOS", which each device writes with its client
+  label into its own roster entry (mdk#2628 item 3.6). NULL leaves it out.
+  The struct layout changed: use matching regenerated headers and libraries.
+- `marmot_rename_linked_device` renames one of this account's devices, this
+  one included, by its `slot_id_hex`, with one roster commit in the device
+  group (mdk#2628 item 3.6). It fails with nothing sent while the device group
+  has an earlier change in flight, and in release builds until the roster's
+  spec lands. A rename whose commit loses a fork to one that also changes that
+  device's entry is not made again. Use matching regenerated headers and
+  libraries.
 - `MarmotAppGroupMlsState` gains a trailing `convergence_parked` field for a
   group whose convergence pass spent its failure budget (mdk#2684). Show it as
   stuck syncing; `marmot_retry_group_convergence` grants one more attempt.

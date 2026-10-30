@@ -2293,7 +2293,7 @@ pub async fn linked_devices( &self, account_ref: String, ) -> Result<Vec<LinkedD
 
 List this account's own devices for a Devices screen, from the roster of the device group this device trusts: this device first (`is_this_device`), then by `linked_at`. Every entry is this account's own device, never another account's, and it is read from local group state with no network I/O, so it is cheap to re-read. `slot_id_hex` is the device's KeyPackage slot and the handle later device actions take; `label`, `client` and `platform` are empty until set, and `linked_by_slot_id_hex` is `None` for the device that founded the group. The list is empty until this device trusts a device group (a single-device account has none), once that group is terminal, and always in release builds until the roster's spec lands. The device group's own events never reach hosts: refresh on `MarmotEventFfi::LinkedDevicesChanged`, which may fire with no visible change. A roster that cannot be read is `DeviceGroupRefused` with reason `roster_unavailable`. Runs on the account worker.
 
-[Source](src/commands/linked_device.rs#L15)
+[Source](src/commands/linked_device.rs#L16)
 
 ### `Marmot::key_package_refresh_overdue`
 
@@ -2305,7 +2305,19 @@ pub async fn key_package_refresh_overdue( &self, account_ref: String, ) -> Resul
 
 Whether this device's device group has held its KeyPackage refresh back for a week, so the app warns the user. While this device trusts a device group, each KeyPackage it publishes is first announced in its own roster entry; if the device group can't take that Commit, the old KeyPackage stays in the slot, and at 30 days inviters stop treating the device as fresh. True once the KeyPackage this device would publish is still unannounced and its slot's newest publication is a week old, or there is none. A routine refresh never shows, and neither does one that is announced but failing at the relays. Always false until this device trusts a device group, and in release builds until the roster's spec lands. Re-read on `MarmotEventFfi::KeyPackageRefreshOverdueChanged`, which carries no device or group identities and may fire with no visible change. Reads local state with no network I/O; runs on the account worker.
 
-[Source](src/commands/linked_device.rs#L34)
+[Source](src/commands/linked_device.rs#L35)
+
+### `Marmot::rename_linked_device`
+
+**Current.**
+
+```rust
+pub async fn rename_linked_device( &self, account_ref: String, slot_id_hex: String, label: String, ) -> Result<(), MarmotKitError>
+```
+
+Rename one of this account's devices, this one included, by its `slot_id_hex` from `linked_devices`: one roster commit in the device group that sets only that device's label. The label is at most 64 bytes of UTF-8, and an empty label clears it. It is refused with `DeviceGroupRefused` and nothing sent in release builds until the roster's spec lands (`roster_unsupported`), for a label that is too long (`label_too_long`), without a device group (`no_device_group`), for a slot the roster doesn't list (`unknown_device`), and while the device group has an earlier change of this device's in flight (`device_group_busy`, retry later). A rename whose commit loses a fork to one that also changes that device's entry is not made again, and the winning label stands: show the label `linked_devices` returns after `LinkedDevicesChanged`. Runs on the account worker.
+
+[Source](src/commands/linked_device.rs#L55)
 
 </details>
 
@@ -3872,7 +3884,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L283)
+[Source](src/lib.rs#L290)
 
 ### `Marmot::new_with_options`
 
@@ -3884,7 +3896,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L299)
+[Source](src/lib.rs#L306)
 
 ### `Marmot::new`
 
@@ -3896,7 +3908,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L328)
+[Source](src/lib.rs#L335)
 
 ### `Marmot::new_with_secret_store`
 
@@ -3908,7 +3920,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L354)
+[Source](src/lib.rs#L361)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -3920,7 +3932,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L385)
+[Source](src/lib.rs#L392)
 
 ### `Marmot::new_with_client_name`
 
@@ -3932,7 +3944,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L406)
+[Source](src/lib.rs#L413)
 
 ### `Marmot::start`
 
@@ -3944,7 +3956,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L444)
+[Source](src/lib.rs#L451)
 
 ### `Marmot::shutdown`
 
@@ -3956,7 +3968,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L456)
+[Source](src/lib.rs#L463)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3968,7 +3980,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L492)
+[Source](src/lib.rs#L499)
 
 ### `Marmot::storage_is_closed`
 
@@ -3980,7 +3992,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L500)
+[Source](src/lib.rs#L507)
 
 ### `Marmot::is_stopping`
 
@@ -3992,7 +4004,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L507)
+[Source](src/lib.rs#L514)
 
 </details>
 
@@ -4856,4 +4868,3 @@ White Noise's deployment: its recovery relays, discovery indexers, media and ima
 [Source](src/deployment.rs#L90)
 
 </details>
-

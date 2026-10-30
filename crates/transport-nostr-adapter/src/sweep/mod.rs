@@ -90,7 +90,7 @@ impl SweepRoute {
     }
 
     /// Whether an event a relay returned belongs to this route.
-    fn matches(&self, event: &Event) -> bool {
+    pub(crate) fn matches(&self, event: &Event) -> bool {
         match self {
             Self::Group { nostr_group_id } => {
                 event.kind == Kind::from(GROUP_MESSAGE_KIND)
@@ -172,7 +172,7 @@ pub enum UnreachableKind {
 }
 
 impl UnreachableKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::TimedOut => "timed_out",
             Self::Disconnected => "disconnected",
@@ -204,7 +204,7 @@ impl ClosedReason {
         }))
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         self.0
             .map_or("unclassified", TransportEndpointRejectionCategory::as_str)
     }

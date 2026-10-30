@@ -95,6 +95,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the roster. The client recomputes it after each maintenance pass; a change sets
   `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
   `KeyPackageRefreshOverdueChanged`. It opens set, for the same reason as `linked_devices_changed`.
+- Write a device entry of the roster only through the runtime's `edit_device_roster_entry` (renaming, announcements).
+  It refuses while the device group has anything of this device's in flight; surface that as `device_group_busy`.
+  The engine stages a `ReplaceDeviceEntry` only while the entry is still the one the edit read, so a whole-entry
+  replacement never undoes a change that lands in between. A rename (`client/device_renames.rs`) whose commit loses a
+  fork to one that also changes that device's entry is not made again; the engine re-issues it only when the winner
+  left that entry alone. Rejected slots (3.2's sign-in rejections, below) are written by the runtime's
+  `reject_device_slots` instead, never as device entries.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription only brings a check forward (`SignInNudges`). The
   first check's baseline, every slot id its read returned whether or not it counted, never a publication time, separates
@@ -262,16 +269,21 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the window. That time is only a hint: never use it to retire, un-cover or drop debt. It logs aggregate counts only.
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
-- Keep the recovery runner in `src/client/recovery_runner.rs` and its `select`, `quantum`, `policy` and `tails`
-  modules (mdk#2660 phase 4). It is built but not started: nothing outside its tests constructs, wakes or reads it
-  until the switch-over replaces the comparison owner, so do not wire it from `account_worker.rs` or a host surface
-  in passing. Every ledger and retry-state write happens in a worker turn; the credit wait, caps read and sweep run
+- Keep the recovery runner in `src/client/recovery_runner.rs` and its `select`, `quantum`, `compare`, `recheck`,
+  `policy` and `tails` modules (mdk#2660 phase 4). It is built but not started: nothing outside its tests constructs,
+  wakes or reads it until the switch-over replaces the comparison owner, so do not wire it from `account_worker.rs` or
+  a host surface in passing. Every ledger and retry-state write happens in a worker turn; the credit wait, caps read and sweep run
   off the worker, and nothing read before the credit wait is planned on. Live tails are a query read fresh in each
   turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
   covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
   reached right after a `rate-limited:` reply settles `RateLimited`. Every event byte a required relay sends is
   charged to the account's rolling hour, cut and discarded replies included; best-effort relays are never charged.
   The one uncharged reply is the one in flight when a quantum is cut (mdk#2719). Logs carry aggregates only.
+  A comparison or re-check quantum settles through the same table: its end maps to a sweep end (`compare::verdict`).
+  A re-check settles the relay and the account budget but never its unit's retry state, records pass progress only
+  under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it
+  runs only when no debt unit is eligible, on required relays whose recorded caps show NIP-77. Storage makes a relay's
+  re-checks due in the same write that ends a cooldown longer than an hour; do not split that into a second write.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown

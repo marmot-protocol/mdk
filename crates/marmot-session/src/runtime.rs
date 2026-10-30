@@ -69,6 +69,7 @@ use crate::time::{
 };
 
 mod device_roster;
+pub use device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport};
 mod device_tag_key;
 mod removed_slot_expiry;
 mod sign_in_rejection;
@@ -207,6 +208,20 @@ struct PublishStatus {
     /// The Welcome was withdrawn or retired, so nothing was published and
     /// nothing is owed.
     withdrawn: bool,
+    /// The Welcome is staged with its unconfirmed commit, so nothing was
+    /// published and nothing is recorded or owed yet.
+    awaits_commit: bool,
+}
+
+/// Why a Welcome is not published (see `welcome_hold`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WelcomeHold {
+    /// Withdrawn, or retired with its rolled-back commit: never published
+    /// again, and nothing is owed.
+    Withdrawn,
+    /// Staged with its unconfirmed invite commit: held until the commit
+    /// confirms and promotes it (mdk#2726).
+    AwaitsCommit,
 }
 
 struct PendingFanoutContinuation {
@@ -499,6 +514,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// publishes them (mdk#2628 3.4). The host sets it; `None` publishes as
     /// a device with no device group does.
     key_package_announcement_group: Option<GroupId>,
+    /// What this device says about itself in its roster entry there (mdk#2628
+    /// 3.6); every announcement writes it too.
+    device_self_report: DeviceSelfReport,
     /// The device group this device tags its KeyPackages and leaves from
     /// (mdk#2628 3.1d), as the host last named it to the engine.
     device_tag_group: Option<GroupId>,
@@ -579,6 +597,7 @@ where
             maintenance_paused: false,
             key_package_slot_withdrawn: false,
             key_package_announcement_group: None,
+            device_self_report: DeviceSelfReport::default(),
             device_tag_group: None,
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
@@ -4870,6 +4889,7 @@ where
             };
             if let Some(status) = status
                 && !status.withdrawn
+                && !status.awaits_commit
             {
                 if status.met_required_acks {
                     self.mark_welcome_delivered_best_effort(&welcome_id);
@@ -5008,6 +5028,26 @@ where
         Ok(())
     }
 
+    /// Why a Welcome must not reach a relay now, checked by both places that
+    /// publish one: the publish preparation step and maintenance's retry of a
+    /// stored fanout.
+    fn welcome_hold(
+        &self,
+        message_id: &cgka_traits::MessageId,
+        envelope: &TransportEnvelope,
+    ) -> AccountResult<Option<WelcomeHold>> {
+        if !matches!(envelope, TransportEnvelope::Welcome { .. }) {
+            return Ok(None);
+        }
+        if self.session.sent_welcome_withdrawn(message_id)? {
+            return Ok(Some(WelcomeHold::Withdrawn));
+        }
+        if self.session.sent_welcome_awaits_commit(message_id)? {
+            return Ok(Some(WelcomeHold::AwaitsCommit));
+        }
+        Ok(None)
+    }
+
     /// Complete the endpoint snapshot for an already-persisted exact event.
     ///
     /// Group evolutions call this only after the first accepted acknowledgement
@@ -5024,13 +5064,15 @@ where
         let Some(mut fanout) = self.session.transport_fanout(message_id)? else {
             return Ok(());
         };
-        if matches!(
-            fanout.exact_message.envelope,
-            TransportEnvelope::Welcome { .. }
-        ) && self.session.sent_welcome_withdrawn(message_id)?
-        {
-            self.session.delete_transport_fanout(message_id)?;
-            return Ok(());
+        match self.welcome_hold(message_id, &fanout.exact_message.envelope)? {
+            // A withdrawn Welcome's remaining retries go with it.
+            Some(WelcomeHold::Withdrawn) => {
+                self.session.delete_transport_fanout(message_id)?;
+                return Ok(());
+            }
+            // A staged one keeps them for when its commit confirms.
+            Some(WelcomeHold::AwaitsCommit) => return Ok(()),
+            None => {}
         }
         let remaining = fanout
             .targets
@@ -5696,6 +5738,7 @@ where
             terminal_failure: report.accepted_count() == 0
                 && fanout_outcome.outstanding_targets == 0,
             withdrawn: false,
+            awaits_commit: false,
         };
         let publish_failure_reason =
             if fanout_outcome.outstanding_targets > 0 && !status.met_required_acks {
@@ -5864,14 +5907,21 @@ where
             }));
         }
         // Every Welcome publish passes here, whichever path still holds the
-        // Welcome, so a withdrawn or retired one is never published again.
-        if matches!(message.envelope, TransportEnvelope::Welcome { .. })
-            && self.session.sent_welcome_withdrawn(&message_id)?
-        {
-            return Ok(PreparedLegacyPublish::Complete(PublishStatus {
-                withdrawn: true,
-                ..PublishStatus::default()
-            }));
+        // Welcome, or through maintenance's retry of its fanout.
+        match self.welcome_hold(&message_id, &message.envelope)? {
+            Some(WelcomeHold::Withdrawn) => {
+                return Ok(PreparedLegacyPublish::Complete(PublishStatus {
+                    withdrawn: true,
+                    ..PublishStatus::default()
+                }));
+            }
+            Some(WelcomeHold::AwaitsCommit) => {
+                return Ok(PreparedLegacyPublish::Complete(PublishStatus {
+                    awaits_commit: true,
+                    ..PublishStatus::default()
+                }));
+            }
+            None => {}
         }
         let msg_id_hex = hex::encode(message_id.as_slice());
         // Capture the outbound wire envelope before `message` is moved into the
@@ -6070,6 +6120,7 @@ where
                 retry_deferred,
                 terminal_failure: false,
                 withdrawn: false,
+                awaits_commit: false,
             }));
         }
         let attempt_target = publish_target_with_endpoints(&target, retry_endpoints.clone());
@@ -6281,6 +6332,7 @@ where
                     retry_deferred: false,
                     terminal_failure: false,
                     withdrawn: false,
+                    awaits_commit: false,
                 });
             }
         };
@@ -6368,6 +6420,7 @@ where
             retry_deferred: false,
             terminal_failure: !published && !accepted_by_any_endpoint && !fanout.possible_exposure,
             withdrawn: false,
+            awaits_commit: false,
         })
     }
 
@@ -6883,6 +6936,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::RemoveOwnAccountDevices { .. }
             | SendIntent::SelfUpdate { .. }
             | SendIntent::UpdateAppComponents { .. }
+            | SendIntent::ReplaceDeviceEntry { .. }
             | SendIntent::UpdateGroupData { .. }
             | SendIntent::EnableDisbanding { .. }
             | SendIntent::EnableAccountDevices { .. }

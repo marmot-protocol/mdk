@@ -784,6 +784,15 @@ c_cmd! {
     /// and in release builds until the device group's spec lands. Re-read on
     /// the `KeyPackageRefreshOverdueChanged` event.
     async fn marmot_key_package_refresh_overdue(account_ref: str) -> scalar(bool) = key_package_refresh_overdue;
+    /// Rename one of this account's devices, this one included, by its
+    /// `slot_id_hex` from `marmot_linked_devices`: one roster commit in the
+    /// device group. The label is at most 64 bytes of UTF-8; an empty
+    /// string clears it. Fails while device groups are off, for an unknown
+    /// device, or while the device group has an earlier change in flight
+    /// (retry later). A rename whose commit loses a fork to one that also
+    /// changes that device's entry is not made again. Re-read on the
+    /// `LinkedDevicesChanged` event.
+    async fn marmot_rename_linked_device(account_ref: str, slot_id_hex: str, label: str) -> unit = rename_linked_device;
 
     /// List the sign-ins of this account that this device does not
     /// recognize, the earliest to appear first. Always empty in release

@@ -393,6 +393,16 @@ outcome for the caller's backoff. `SdkSweepRelay` (`sdk` feature) runs it over a
 the wire for the sweep's own REQs, and `more` splits a slice. No hint proves one: `finish` is ignored, since a misread
 `finish` would skip history. Nothing schedules the sweep yet; the recovery runner will (#2660).
 
+## NIP-77 comparison
+
+`compare::run_comparison` compares one route's range on one relay with the ids the caller already holds there, a
+window at a time from the oldest end, and fetches each window's difference by id (at most 500 ids per REQ, fewer
+under the relay's cap). A window whose relay set reaches the 16,384-item limit may hide more, so it halves. A window
+is certified once every id the relay named is fetched; a call cut by its deadline, its event or byte budget, a
+withheld id or a refusal hands over what it fetched uncertified, so its caller holds those events and the next call
+resumes without fetching them again. `SdkSweepRelay` implements the relay side. The recovery runner (#2660) uses it
+for owed ranges where the account already holds events, and for its periodic re-checks of covered history.
+
 ## Run tests
 
 ```sh

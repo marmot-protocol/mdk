@@ -1,5 +1,6 @@
-//! This account's own devices, from its device group's roster, and whether
-//! this device's KeyPackage refresh is held back by its device group.
+//! This account's own devices, from its device group's roster, renaming
+//! them, and whether this device's KeyPackage refresh is held back by its
+//! device group.
 
 use crate::Marmot;
 use crate::conversions::LinkedDeviceFfi;
@@ -38,6 +39,28 @@ impl Marmot {
         Ok(self
             .runtime
             .key_package_refresh_overdue(&account_ref)
+            .await?)
+    }
+
+    /// Rename one of this account's devices, this one included, by its
+    /// `slot_id_hex` from `linked_devices`: one roster commit in the device
+    /// group. Any device may rename any device. The label is at most 64
+    /// bytes of UTF-8; empty clears it. Refused with `DeviceGroupRefused`:
+    /// `roster_unsupported` (release builds), `label_too_long`,
+    /// `no_device_group`, `unknown_device`, `roster_unavailable`, or
+    /// `device_group_busy` while the device group has an earlier change in
+    /// flight (retry later). A rename whose commit loses a fork to one that
+    /// also changes that device's entry is not made again; refresh on
+    /// `LinkedDevicesChanged`.
+    pub async fn rename_linked_device(
+        &self,
+        account_ref: String,
+        slot_id_hex: String,
+        label: String,
+    ) -> Result<(), MarmotKitError> {
+        Ok(self
+            .runtime
+            .rename_linked_device(&account_ref, slot_id_hex, label)
             .await?)
     }
 }
