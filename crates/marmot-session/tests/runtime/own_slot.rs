@@ -88,7 +88,7 @@ async fn a_foreign_slot_publication_is_replaced_by_a_newer_one() {
     let wall = Arc::new(TestWallClock::new(now));
     let publisher = DeletingKeyPackages::default();
     let mut runtime = slot_runtime(
-        current_session(&dir.path().join("alice.sqlite"), &key, b"alice"),
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
         publisher.clone(),
         &wall,
         0,
@@ -137,17 +137,22 @@ async fn a_foreign_publication_too_far_ahead_is_deleted_by_id_and_never_blocks_r
     let now = unix_now();
     let wall = Arc::new(TestWallClock::new(now));
     let publisher = DeletingKeyPackages::default();
-    let mut runtime = slot_runtime(
-        current_session(&dir.path().join("alice.sqlite"), &key, b"alice"),
-        publisher.clone(),
-        &wall,
-        0,
-        &[KEY_ENDPOINT],
-    );
+    let open = || {
+        slot_runtime(
+            current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+            publisher.clone(),
+            &wall,
+            0,
+            &[KEY_ENDPOINT],
+        )
+    };
+    let mut runtime = open();
     runtime.publish_fresh_key_package().await.unwrap();
     let published = slot_lifecycle(&runtime).authored_event_created_at.unwrap();
+    let weekly = slot_lifecycle(&runtime).refresh_at;
 
-    // A relay that accepts nothing leaves the slot as it was.
+    // A relay that accepts nothing leaves the slot as it was, and the
+    // weekly refresh where it was.
     publisher.refuse.store(true, Ordering::Relaxed);
     let far = foreign(9, now + 10 * DAY);
     let outcome = runtime
@@ -158,6 +163,7 @@ async fn a_foreign_publication_too_far_ahead_is_deleted_by_id_and_never_blocks_r
     assert_eq!(outcome.deleted, 0);
     assert!(!outcome.replacing);
     assert!(!runtime.key_package_network_maintenance_due().unwrap());
+    assert_eq!(slot_lifecycle(&runtime).refresh_at, weekly);
 
     // One request naming that event alone, at the current time.
     publisher.refuse.store(false, Ordering::Relaxed);
@@ -177,8 +183,11 @@ async fn a_foreign_publication_too_far_ahead_is_deleted_by_id_and_never_blocks_r
         vec![TransportEndpoint(KEY_ENDPOINT.into())]
     );
 
-    // The slot is filled again, just after this device's own publication:
-    // the far one never sets the next publication's time.
+    // The slot is filled again, even across a restart, just after this
+    // device's own publication: the far one never sets the next
+    // publication's time.
+    drop(runtime);
+    let mut runtime = open();
     assert!(runtime.key_package_network_maintenance_due().unwrap());
     runtime.run_due_maintenance().await.unwrap();
     let publications = publisher.publications.publications();
@@ -208,7 +217,7 @@ async fn a_foreign_publication_this_device_can_no_longer_outrank_is_dropped() {
     let wall = Arc::new(TestWallClock::new(now));
     let publisher = DeletingKeyPackages::default();
     let mut runtime = slot_runtime(
-        current_session(&dir.path().join("alice.sqlite"), &key, b"alice"),
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
         publisher.clone(),
         &wall,
         0,
@@ -242,7 +251,7 @@ async fn paused_or_withdrawn_slots_ignore_foreign_publications() {
     let wall = Arc::new(TestWallClock::new(now));
     let publisher = DeletingKeyPackages::default();
     let mut runtime = slot_runtime(
-        current_session(&dir.path().join("alice.sqlite"), &key, b"alice"),
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
         publisher.clone(),
         &wall,
         0,

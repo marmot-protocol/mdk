@@ -16,9 +16,11 @@
 //! - **Out of reach.** A foreign publication whose time is past what this
 //!   device would sign cannot be outranked. It never feeds the rule, so it
 //!   never holds back this device's refreshes. This device asks the relays
-//!   to delete that event by id (D63), and once one accepts, publishes again
-//!   to fill the slot.
-//! - The finding lives in memory only: the host reads the slot again at open.
+//!   to delete that event by id (D63). A relay that accepts is left with an
+//!   empty slot, so the refresh that refills it is made due, durably, before
+//!   the request goes out, and put back if no relay accepts.
+//! - Otherwise the finding lives in memory only: the host reads the slot
+//!   again at open, and finds any foreign publication still there.
 
 use cgka_traits::{MessageId, Timestamp, TransportAdapter};
 
@@ -85,7 +87,7 @@ where
                 count = outrankable.len(),
                 "this device's key package slot serves a publication it did not make; replacing it"
             );
-            outcome.replacing = self.supersede_slot_publications_through(Some(newest))?;
+            outcome.replacing = self.supersede_slot_publications_through(newest)?;
         }
         outcome.beyond_skew = beyond.len();
         for publication in beyond {
@@ -96,13 +98,8 @@ where
             );
             if self.delete_slot_publication(&publication.event_id).await? {
                 outcome.deleted += 1;
+                outcome.replacing = true;
             }
-        }
-        if outcome.deleted > 0 {
-            // Relays that dropped this device's publication for the deleted
-            // one serve nothing now: fill the slot again.
-            outcome.replacing =
-                self.supersede_slot_publications_through(None)? || outcome.replacing;
         }
         Ok(outcome)
     }
@@ -164,17 +161,12 @@ where
 
     /// Supersede every publication of this device's own up to `foreign`
     /// and its current one. Returns whether there was one to supersede.
-    fn supersede_slot_publications_through(
-        &mut self,
-        foreign: Option<Timestamp>,
-    ) -> AccountResult<bool> {
+    fn supersede_slot_publications_through(&mut self, foreign: Timestamp) -> AccountResult<bool> {
         let current = self
             .session
             .key_package_lifecycle()?
             .and_then(|lifecycle| lifecycle.authored_event_created_at);
-        let Some(through) = foreign.into_iter().chain(current).max() else {
-            return Ok(false);
-        };
+        let through = current.map_or(foreign, |current| current.max(foreign));
         self.slot_superseded_through = Some(
             self.slot_superseded_through
                 .map_or(through, |earlier| earlier.max(through)),
@@ -183,7 +175,9 @@ where
     }
 
     /// Ask every KeyPackage relay to delete `event_id`. Returns whether one
-    /// accepted.
+    /// accepted, and with it that this device's KeyPackage is to be
+    /// replaced: a relay that dropped this device's publication for the
+    /// deleted one serves nothing in the slot now.
     async fn delete_slot_publication(&mut self, event_id: &MessageId) -> AccountResult<bool> {
         let mut endpoints = self.routing.key_package_endpoints().to_vec();
         if let Some(lifecycle) = self.session.key_package_lifecycle()? {
@@ -196,10 +190,14 @@ where
         if endpoints.is_empty() {
             return Ok(false);
         }
+        let now = self.wall_clock.now();
+        let Some(refresh_at) = self.make_refresh_due(now)? else {
+            return Ok(false);
+        };
         let deletion = KeyPackageEventDeletion {
             account_id: self.session.self_id().clone(),
             event_id: event_id.clone(),
-            created_at: self.wall_clock.now(),
+            created_at: now,
             endpoints,
         };
         let accepted = match self.key_packages.delete_key_package_event(&deletion).await {
@@ -222,6 +220,39 @@ where
             accepted_count = accepted,
             "asked the relays to delete a foreign key package publication"
         );
+        if accepted == 0 {
+            // The slot holds what it held: no refill is owed.
+            self.restore_refresh(now, refresh_at)?;
+        }
         Ok(accepted > 0)
+    }
+
+    /// Make this device's KeyPackage refresh due at `now`, durably, so a
+    /// restart still refills the slot. Returns the refresh time it replaced,
+    /// or `None` when this device has no KeyPackage lifecycle.
+    fn make_refresh_due(&mut self, now: Timestamp) -> AccountResult<Option<Option<Timestamp>>> {
+        let Some(mut lifecycle) = self.session.key_package_lifecycle()? else {
+            return Ok(None);
+        };
+        let replaced = lifecycle.refresh_at.replace(now);
+        self.session.put_key_package_lifecycle(&lifecycle)?;
+        Ok(Some(replaced))
+    }
+
+    /// Put back the refresh time [`Self::make_refresh_due`] replaced, unless
+    /// something rescheduled the refresh since.
+    fn restore_refresh(
+        &mut self,
+        due_at: Timestamp,
+        replaced: Option<Timestamp>,
+    ) -> AccountResult<()> {
+        let Some(mut lifecycle) = self.session.key_package_lifecycle()? else {
+            return Ok(());
+        };
+        if lifecycle.refresh_at == Some(due_at) {
+            lifecycle.refresh_at = replaced;
+            self.session.put_key_package_lifecycle(&lifecycle)?;
+        }
+        Ok(())
     }
 }
