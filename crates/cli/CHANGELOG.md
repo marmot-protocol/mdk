@@ -175,8 +175,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
-- `messages send-event` refuses the device-group kinds 457, 459, 460 and 462 with `reserved_app_event_kind`, and one
-  received in a chat makes no timeline row or message (mdk#2628). They are read only in the account's device group.
+- `messages send-event` refuses the device-group kinds 457, 459, 460, 462, 475 and 476 with `reserved_app_event_kind`,
+  and one received in a chat makes no timeline row or message (mdk#2628). They are read only in the account's device
+  group.
 - Creating a group now refuses an initial entry for `marmot.group.account-devices.v1` (0x800d), or any other protocol
   component that carries no data, with `EngineError::NoDataAppComponent` before anything is created or published
   (mdk#2628). Hosts could pass one among the optional initial components and create a GroupContext entry the spec

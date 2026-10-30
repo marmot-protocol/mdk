@@ -131,7 +131,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in `observe_device_group_event`
   (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
   D33). That read sees only the current tree, so a message from an earlier epoch has no readable sender. List every kind
-  sent only in a device group in `is_device_group_kind` (457, 459, 460, 462), the one list: `observe_event`
+  sent only in a device group in `is_device_group_kind` (457, 459, 460, 462, 475, 476), the one list: `observe_event`
   drops one received in any other group before the host summary and the stored projection, the notification preview
   refuses it, and the custom path rejects it as reserved. The engine withdraws a message by message id alone (an own
   send's transport id, a received message's content id), so a kind whose withdrawal a feature acts on is listed in

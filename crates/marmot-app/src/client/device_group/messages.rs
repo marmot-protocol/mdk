@@ -45,9 +45,10 @@ pub(crate) const KIND_DEVICE_HEARTBEAT: u64 = 457;
 pub(crate) const KIND_ANOMALY_ALERT: u64 = 462;
 
 /// True for a kind sent only in a device group: a heartbeat, a private
-/// KeyPackage request or hand-off, or an anomaly alert. A device reads these
-/// only in the device group it trusts and ignores them in any other group.
-/// Whatever kind a device-group feature adds goes here too.
+/// KeyPackage request or hand-off, an anomaly alert, or a small-state update
+/// or broadcast request. A device reads these only in the device group it
+/// trusts and ignores them in any other group. Whatever kind a device-group
+/// feature adds goes here too.
 pub(crate) fn is_device_group_kind(kind: u64) -> bool {
     matches!(
         kind,
@@ -55,6 +56,8 @@ pub(crate) fn is_device_group_kind(kind: u64) -> bool {
             | KIND_PRIVATE_KEY_PACKAGE_REQUEST
             | KIND_PRIVATE_KEY_PACKAGE_HAND_OFF
             | KIND_ANOMALY_ALERT
+            | KIND_SMALL_STATE_UPDATE
+            | KIND_SMALL_STATE_BROADCAST_REQUEST
     )
 }
 
