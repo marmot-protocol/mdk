@@ -62,6 +62,8 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     route) or whose fanout expired goes out again on the next pass, as the startup pass would send it.
     Whichever attempt meets a Welcome's acknowledgement policy marks it delivered, maintenance's retry of its stored
     fanout included.
+  - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b). The request
+    and hand-off checks read device tags through `member_device_tag_claim`.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.

@@ -923,6 +923,54 @@ pub trait KeyPackageBundleStorage {
     fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()>;
 }
 
+// ── PrivateKeyPackageStorage ───────────────────────────────────────────────
+
+/// A single-use KeyPackage this device issued to one sibling in its device
+/// group, handed over inside the device group and never published (mdk#2628
+/// item 3.4b). Its private bundle sits in OpenMLS storage under
+/// `key_package_ref`; the engine writes and deletes the two together.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuedPrivateKeyPackage {
+    pub key_package_ref: Vec<u8>,
+    /// The sibling's KeyPackage slot, the Nostr `d` its roster entry is keyed
+    /// by.
+    pub recipient_slot: [u8; 32],
+    pub not_before: u64,
+    pub not_after: u64,
+    /// The KeyPackage as an `mls_key_package` MLSMessage, for its hand-off.
+    pub key_package: Vec<u8>,
+    pub issued_at: u64,
+    /// Whether its hand-off has been queued to the device group. One that was
+    /// not is sent again.
+    pub hand_off_queued: bool,
+    /// Whether it counts toward the sibling's stock. A request from the
+    /// sibling stops every earlier record counting, since their hand-offs may
+    /// be lost; their private keys stay until used or expired.
+    pub counted: bool,
+    /// The request this record answers, so a request is answered once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<MessageId>,
+}
+
+/// When a private KeyPackage stops counting as usable stock: halfway through
+/// its lifetime, about 15 days in. It stays valid until `not_after`.
+pub fn private_key_package_halfway(not_before: u64, not_after: u64) -> u64 {
+    not_before + not_after.saturating_sub(not_before) / 2
+}
+
+/// The private KeyPackages this device issued to its siblings.
+pub trait PrivateKeyPackageStorage {
+    fn put_issued_private_key_package(&self, record: &IssuedPrivateKeyPackage)
+    -> StorageResult<()>;
+    fn issued_private_key_package(
+        &self,
+        key_package_ref: &[u8],
+    ) -> StorageResult<Option<IssuedPrivateKeyPackage>>;
+    /// Every issued record, oldest first.
+    fn list_issued_private_key_packages(&self) -> StorageResult<Vec<IssuedPrivateKeyPackage>>;
+    fn delete_issued_private_key_package(&self, key_package_ref: &[u8]) -> StorageResult<()>;
+}
+
 // ── MaintenanceStorage ─────────────────────────────────────────────────────
 
 /// Account-device-local maintenance and immutable publication recovery.
@@ -1108,6 +1156,12 @@ pub trait StorageProvider:
     /// remain valid `StorageProvider`s, while production SQLCipher storage
     /// exposes the durable maintenance capability.
     fn maintenance_storage(&self) -> Option<&dyn MaintenanceStorage> {
+        None
+    }
+
+    /// Optional store of the private KeyPackages this device issued to its
+    /// siblings (mdk#2628 item 3.4b). A backend without one issues none.
+    fn private_key_package_storage(&self) -> Option<&dyn PrivateKeyPackageStorage> {
         None
     }
 
