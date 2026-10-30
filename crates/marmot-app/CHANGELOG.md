@@ -24,6 +24,13 @@
 
 ### Added
 
+- Each device keeps an HPKE history key, generated on first use and stored in
+  its encrypted account storage, and writes its public half into its own
+  device-group roster entry (`history_key`) so siblings can seal chat history
+  to it (mdk#2628 item 4.1). The founder writes it into its founding entry, a
+  new device in the commit that sets its tag signature key, and a device
+  whose entry lacks it with its next KeyPackage announcement. Only behind
+  `dev_device_groups`. Nothing sends history yet.
 - `MarmotAppConfig::device_platform` (`with_device_platform`) names the
   platform this device runs on. Each device writes it and
   `key_package_client_name` into its own roster entry with its next KeyPackage

@@ -1748,6 +1748,27 @@ impl AccountDeviceSession {
         self.engine.expect_device_group_welcome(expectation)
     }
 
+    /// See [`cgka_engine::engine::Engine::history_public_key`].
+    pub fn history_public_key(&self) -> SessionResult<Vec<u8>> {
+        Ok(self.engine.history_public_key()?)
+    }
+
+    /// See [`cgka_engine::engine::Engine::seal_history`].
+    pub fn seal_history(
+        &self,
+        recipient_public_key: &[u8],
+        context: &[u8],
+        plaintext: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.engine
+            .seal_history(recipient_public_key, context, plaintext)
+    }
+
+    /// See [`cgka_engine::engine::Engine::open_history`].
+    pub fn open_history(&self, context: &[u8], sealed: &[u8]) -> SessionResult<Option<Vec<u8>>> {
+        Ok(self.engine.open_history(context, sealed)?)
+    }
+
     /// See `CgkaEngine::withdraw_device_group_welcome`.
     pub fn withdraw_device_group_welcome(
         &mut self,

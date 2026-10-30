@@ -17,9 +17,9 @@
   `started_fresh`, and `trust_device_group`, which makes a device group
   trusted and takes its roster as this device's first in one transaction.
   `insert_device_group` and `set_device_group_trust` now refuse a trusted
-  state. The numbers below 148 that are not yet used (138, 139, 143, 145
-  and 147) belong to other work, which lands later; the runner applies them
-  in order.
+  state. The numbers below 148 that are not yet used (139, 143, 145 and
+  147) belong to other work, which lands later; the runner applies them in
+  order.
 - Migration 0137 advances account storage to schema 137 (mdk#2628 item 3.6).
   It adds `device_renames`, one row per device this device renamed in its
   device group's roster: the label its latest rename sets, the rename ids
@@ -88,6 +88,14 @@
   would, so the generation stays routed, and lowers the generation's floor to
   the lowest bound they list; `None` makes it account-wide, as every such
   observation did before.
+- Migration 0138 (mdk#2628 item 4.1) runs on every account database that
+  lacks it, including one already at schema 140. It adds
+  `cgka_account_device_history_keys`: this device's HPKE history key
+  pair, one per account-device identity, next to its MLS signer's binding.
+  `SqliteAccountStorage` implements the new
+  `cgka_traits::storage::AccountDeviceHistoryKeyStorage`, which
+  `StorageProvider` now requires; `put_account_device_history_key_if_absent`
+  never replaces a stored key.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it
