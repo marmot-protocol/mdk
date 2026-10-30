@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::maintenance::SignedPublicationArtifact;
-use cgka_traits::{MemberId, Timestamp, TransportEndpoint};
+use cgka_traits::{MemberId, MessageId, Timestamp, TransportEndpoint};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyPackagePublication {
@@ -24,6 +24,19 @@ pub struct KeyPackageSlotWithdrawal {
     /// This device's slot, the only one the request may name.
     pub slot_id: String,
     /// Every publication in the slot up to this time is withdrawn.
+    pub created_at: Timestamp,
+    pub endpoints: Vec<TransportEndpoint>,
+}
+
+/// A request to stop serving one publication in this device's slot that
+/// this device did not make and cannot outrank: its time is past what this
+/// device would sign (mdk#2628 item 3.4, D63). It names that event alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPackageEventDeletion {
+    pub account_id: MemberId,
+    /// The publication's transport event id.
+    pub event_id: MessageId,
+    /// The current time: the request covers that event whatever its time.
     pub created_at: Timestamp,
     pub endpoints: Vec<TransportEndpoint>,
 }
@@ -123,6 +136,18 @@ pub trait KeyPackagePublisher: Send + Sync {
             "this publisher cannot withdraw a KeyPackage slot",
         ))
     }
+
+    /// Ask the transport to stop serving `deletion.event_id`, a publication
+    /// in this device's slot, and nothing else. The receipt lists the
+    /// endpoints that accepted the request.
+    async fn delete_key_package_event(
+        &self,
+        _deletion: &KeyPackageEventDeletion,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        Err(KeyPackagePublishError::unexposed(
+            "this publisher cannot delete a KeyPackage event",
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -163,6 +188,16 @@ impl KeyPackagePublisher for NoopKeyPackagePublisher {
     ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
         Ok(KeyPackagePublishReceipt {
             accepted: withdrawal.endpoints.clone(),
+            failed: Vec::new(),
+        })
+    }
+
+    async fn delete_key_package_event(
+        &self,
+        deletion: &KeyPackageEventDeletion,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        Ok(KeyPackagePublishReceipt {
+            accepted: deletion.endpoints.clone(),
             failed: Vec::new(),
         })
     }

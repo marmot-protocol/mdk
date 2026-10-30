@@ -515,7 +515,7 @@ async fn a_read_of_relays_the_account_does_not_list_is_never_complete() {
     let account = Account::new(1, true);
     let app = &account.apps[0];
     assert!(
-        !app.read_account_key_package_slots("alice")
+        !app.read_account_key_package_slots("alice", None)
             .await
             .unwrap()
             .complete
@@ -528,7 +528,7 @@ async fn a_read_of_relays_the_account_does_not_list_is_never_complete() {
         .remember_directory_relay_lists(&account.alice_id, &relay_lists)
         .unwrap();
     assert!(
-        app.read_account_key_package_slots("alice")
+        app.read_account_key_package_slots("alice", None)
             .await
             .unwrap()
             .complete
@@ -980,6 +980,118 @@ async fn a_live_key_package_brings_the_check_forward() {
     );
     phone.drive_sign_ins().await;
     assert_eq!(phone.unrecognized_sign_ins().unwrap().len(), 1);
+}
+
+/// Sign a publication into `slot` with the account's key at `created_at`,
+/// holding `content`, as if whoever holds the key published it there.
+fn publish_into_slot(account: &Account, slot: &str, content: &str, created_at: u64) -> String {
+    let event = EventBuilder::new(Kind::Custom(30443), content)
+        .tags([Tag::parse(["d", slot]).unwrap()])
+        .custom_created_at(Timestamp::from_secs(created_at))
+        .finalize(&account.keys)
+        .unwrap();
+    let event = NostrTransportEvent::from_nostr_event(&event).unwrap();
+    let id = event.id.clone();
+    account.relay.published_events.lock().unwrap().push(event);
+    id
+}
+
+fn published_at(client: &AppClient) -> u64 {
+    client
+        .runtime
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap()
+        .authored_event_created_at
+        .unwrap()
+        .0
+}
+
+/// A publication in this device's own slot that it did not make, valid or
+/// not, is replaced by a newer KeyPackage of its own, even with no device
+/// group: `foundation/key-packages.md`, "A publication the device did not
+/// make" (mdk#2628 3.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_publication_in_its_own_slot_is_replaced() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let forged_at = published_at(&phone) + 2;
+    publish_into_slot(&account, &slot, "not a key package", forged_at);
+
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!(report.slots[&slot], SlotOutcome::OwnSlotForeign);
+    assert!(report.foreign.replacing);
+    assert!(report.own_slot_complete);
+    assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > forged_at);
+
+    // Its own publication, now the slot's newest, is never mistaken for a
+    // foreign one.
+    let before = account.relay.published_events.lock().unwrap().len();
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!(report.slots[&slot], SlotOutcome::OwnSlot);
+    assert!(!report.foreign.replacing);
+    phone.run_due_maintenance().await.unwrap();
+    assert_eq!(account.relay.published_events.lock().unwrap().len(), before);
+}
+
+/// A foreign publication dated further ahead than this device would sign
+/// cannot be outranked. The device asks the relays to delete that event by
+/// id (D63), publishes again to fill the slot, and its refreshes go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_publication_dated_far_ahead_is_deleted_by_id() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let published = published_at(&phone);
+    let far = publish_into_slot(
+        &account,
+        &slot,
+        "not a key package",
+        unix_now_seconds() + 864_000,
+    );
+
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!(report.slots[&slot], SlotOutcome::OwnSlotForeign);
+    assert_eq!(report.foreign.beyond_skew, 1);
+    assert_eq!(report.foreign.deleted, 1);
+    let deletions = account
+        .relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == 5)
+        .cloned()
+        .collect::<Vec<_>>();
+    let [deletion] = deletions.as_slice() else {
+        panic!("{deletions:?}");
+    };
+    assert_eq!(deletion.pubkey, account.alice_id);
+    assert_eq!(
+        deletion.tags,
+        vec![
+            vec!["e".to_owned(), far],
+            vec!["k".to_owned(), "30443".to_owned()],
+        ]
+    );
+
+    phone.run_due_maintenance().await.unwrap();
+    let lifecycle = phone
+        .runtime
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap();
+    assert!(lifecycle.authored_event_created_at.unwrap().0 > published);
+    assert!(lifecycle.authored_event_created_at.unwrap().0 <= unix_now_seconds() + 300);
+    assert_ne!(
+        lifecycle.phase,
+        cgka_traits::MaintenancePhase::ClockSkewBlocked
+    );
 }
 
 /// With device groups off, nothing is checked, listed or answered.
