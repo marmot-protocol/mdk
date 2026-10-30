@@ -485,6 +485,8 @@ is unsupported. marmot-app also rekeys its databases once to raw SQLCipher keys
 
 ### Fixed
 
+- Sticker migrations run after the private KeyPackage schema, so upgrades
+  from schema `0140` create the pack and asset-history tables.
 - Winning sticker-pack replacements refresh asset URLs and metadata for an
   unchanged exact hash. Older pack events cannot revert the replacement URL.
 - The timeline's modifier lookups (edits, reactions, deletions, reports), and

@@ -1455,7 +1455,7 @@ fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
     )? {
         return Ok(false);
     }
-    // Migration 0135 added `last_message_tags_json` as nullable. Existing
+    // Migration 0141 added `last_message_tags_json` as nullable. Existing
     // rows with a last message have NULL tags until rebuilt, so detect them
     // here and force a rebuild.
     if projection_has_rows_tx(

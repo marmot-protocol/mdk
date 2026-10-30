@@ -1049,8 +1049,8 @@ mod tests {
     #[test]
     fn pack_can_reuse_one_image_across_multiple_shortcodes() {
         // A pack where two different shortcodes reference the same sha256
-        // (same image) must be ingestible. Migration 0135 originally had a
-        // UNIQUE constraint on (pack_coordinate, sha256) that rejected this.
+        // (same image) must be ingestible. A UNIQUE constraint on
+        // (pack_coordinate, sha256) would reject this.
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let shared_hash = "ab".repeat(32);
         let mut pack = pack(&"cc".repeat(32), 10, &shared_hash);
