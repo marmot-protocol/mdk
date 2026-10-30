@@ -169,7 +169,8 @@ async fn a_rename_is_refused_with_nothing_sent() {
 }
 
 /// A rename whose publish reaches no relay yet is kept by the runtime for a
-/// retry, and keeps its record: when the retry lands, the roster holds the
+/// retry, and keeps its record: saving the label the roster still shows is
+/// refused as busy meanwhile, and when the retry lands, the roster holds the
 /// id that record wrote, so a later fork is still judged by it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rename_kept_for_a_retry_keeps_its_record() {
@@ -194,6 +195,19 @@ async fn a_rename_kept_for_a_retry_keeps_its_record() {
     let kept = renames(&phone);
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].label, "Laptop");
+
+    // Saving the label the roster shows meanwhile waits for the rename in
+    // flight rather than forgetting it.
+    assert_eq!(
+        refusal(
+            phone
+                .rename_linked_device(&laptop_slot, "")
+                .await
+                .unwrap_err()
+        ),
+        "device_group_busy"
+    );
+    assert_eq!(renames(&phone), kept);
 
     // The runtime retries the kept publish after its backoff.
     relay.allow_publishes();

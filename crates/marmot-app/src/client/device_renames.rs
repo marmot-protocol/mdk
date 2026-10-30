@@ -26,7 +26,8 @@
 //!
 //! Saving the label the roster already shows sends nothing. It keeps a rename
 //! that applied, so a fork that rewinds it later still has it made again, and
-//! forgets a lost one, which would now undo the user's choice.
+//! forgets a lost one, which would now undo the user's choice. While a rename
+//! of that device is still in flight, it is refused as busy instead.
 
 use cgka_traits::GroupId;
 use cgka_traits::app_components::{DEVICE_ROSTER_TEXT_MAX_LEN, DeviceRenameId, DeviceSlotId};
@@ -151,6 +152,14 @@ impl AppClient {
             // The user chose the label the roster shows. A lost rename of
             // this device would undo that choice; one that applied stays.
             if kept_standing.is_some_and(|kept| kept != Standing::Applied) {
+                // Judge it only once its commit has an outcome: one still in
+                // flight is not on the roster yet, and may land.
+                let held = self.epoch_gap_held_groups()?;
+                if !self.runtime.device_group_takes_commit(&group_id, &held)? {
+                    return Err(AppError::DeviceGroupRefused(
+                        DeviceRosterEditBlocked::Busy.reason(),
+                    ));
+                }
                 storage.drop_device_rename(&slot_id_hex)?;
             }
             return Ok(());
