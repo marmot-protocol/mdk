@@ -1138,6 +1138,65 @@ async fn a_live_key_package_brings_the_check_forward() {
     assert_eq!(phone.unrecognized_sign_ins().unwrap().len(), 1);
 }
 
+/// A Welcome that names another KeyPackage of the account brings the check
+/// forward too (mdk#2628 3.2). Bob invites Alice, so the phone also receives
+/// the delivery made for the laptop's KeyPackage, which is not addressed to
+/// it, and checks within the minute. Anyone can send such a Welcome: a burst
+/// right after a check waits its minute, then makes one check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_welcome_naming_another_key_package_brings_the_check_forward() {
+    let account = Account::new(2, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+    phone.drive_sign_ins().await;
+    let mut laptop = account.open(1).await;
+    published_key_package(&mut laptop, relay).await;
+    let a_minute = std::time::Duration::from_secs(61);
+    // Whether a pass a minute on from the last check runs one.
+    let checks_a_minute_on = async |phone: &mut AppClient| {
+        phone.sign_in_schedule.rewind(a_minute);
+        let before = phone.sign_in_schedule.last;
+        phone.drive_sign_ins().await;
+        phone.sign_in_schedule.last != before
+    };
+    assert!(!checks_a_minute_on(&mut phone).await, "nothing nudged it");
+
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = sign_in_app_at(&bob_dir, relay.clone(), false);
+    remember_test_member_inbox(&bob_app, &account.alice_id, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let mut cursor = 0;
+    for name in ["one", "two", "three"] {
+        bob.create_group(name, &[&account.alice_id]).await.unwrap();
+    }
+    deliver_new(&mut phone, relay, &mut cursor).await;
+    assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
+    assert!(checks_a_minute_on(&mut phone).await);
+    assert_eq!(
+        listed(&mut phone),
+        [(own_slot(&laptop), false, UnrecognizedSignInState::Prompt)]
+    );
+
+    // A burst right after a check waits its minute, then makes one check and
+    // leaves none pending.
+    for name in ["four", "five", "six"] {
+        bob.create_group(name, &[&account.alice_id]).await.unwrap();
+    }
+    deliver_new(&mut phone, relay, &mut cursor).await;
+    let checked = phone.sign_in_schedule.last;
+    phone.drive_sign_ins().await;
+    assert_eq!(
+        phone.sign_in_schedule.last, checked,
+        "not within the minute"
+    );
+    assert!(checks_a_minute_on(&mut phone).await);
+    assert!(!checks_a_minute_on(&mut phone).await, "one check per burst");
+}
+
 /// Sign a publication into `slot` with the account's key at `created_at`,
 /// holding `content`, as if whoever holds the key published it there.
 fn publish_into_slot(account: &Account, slot: &str, content: &str, created_at: u64) -> String {
