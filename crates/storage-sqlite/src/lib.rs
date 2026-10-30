@@ -147,13 +147,13 @@ pub use app::transport::transport_reconciliation::{
     TRANSPORT_RECONCILIATION_MAX_ITEMS_PER_ROUTE, TRANSPORT_RECONCILIATION_RETENTION_SECS,
     TransportReconciliationInventory, TransportReconciliationItem, TransportReconciliationRoute,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use base::connection::relax_storage_for_test_process;
 pub use base::connection::{
     CloseableConnection, ConnectionGuard, DatabaseCloser, SqlCipherHardening, SqlCipherKey,
     SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, SqliteTimingObserver,
     SqliteTimingOperation, open_hardened_sqlcipher,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use base::connection::relax_storage_for_test_process;
 pub use cross::outbound::MessageDraftCommitObserver;
 pub use protocol::handle::SqliteAccountStorage;
 #[allow(deprecated)]

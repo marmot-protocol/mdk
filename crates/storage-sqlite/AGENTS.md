@@ -99,7 +99,10 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 ## Invariants
 
 - Accept raw SQLCipher keys only. Key derivation and recovery live above this crate.
-- Apply privacy/durability defaults unless callers opt out with `SqliteStorageOptions`.
+- Apply privacy/durability defaults unless callers opt out with `SqliteStorageOptions`. The only exceptions are test
+  builds: `in_memory()` and processes that call `relax_storage_for_test_process()` (see README). Never call it from
+  non-test code, and keep the tests that pin the production settings (`encrypted_connection_applies_operational_defaults`,
+  the `pins_cipher_pragmas_before_keying` tests) away from it.
 - Keep invalidated message records. Applications decide whether to show them.
 - Prepare every database file with `fs_private::ensure_private_db_files` before `Connection::open`, and never open,
   read or copy a database or `-wal`/`-shm`/`-journal` sidecar through `std::fs` while this process may hold a

@@ -67,6 +67,15 @@ Default connection settings are privacy/durability oriented:
 Override with `open_encrypted_with_options` or `in_memory_with_options`. There is no first-class key rotation: create a
 new encrypted database, migrate data, and replace the old file.
 
+Test builds (this crate's own tests, or the `test-support` feature) keep the same defaults with two exceptions, because
+memory security turns every SQLite allocation into system calls and a full fsync per commit adds disk waits. Together
+they made up most of the workspace test lane's run time:
+
+- `in_memory()` leaves out `cipher_memory_security`. Only tests open in-memory stores.
+- After a test process calls `relax_storage_for_test_process()`, every database it opens skips
+  `cipher_memory_security` and uses `synchronous=NORMAL`. `marmot-app`'s constructors call it in its unit tests. The
+  tests that pin the production settings never call it.
+
 Long-lived connections are closeable so a host can release file locks before suspending; closing is terminal and
 surviving clones return `StorageError::Closed`.
 
