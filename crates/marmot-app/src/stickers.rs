@@ -25,7 +25,6 @@ use storage_sqlite::{
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::external_signer::AccountSigner;
 use crate::media::fetch_blossom_blob_limited;
 use crate::{AppError, MarmotApp, ReceivedMessage, unix_now_seconds};
 use cgka_traits::MemberId;
@@ -426,8 +425,7 @@ impl MarmotApp {
         let context = self.sticker_context(account_ref)?;
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
-        refresh_installed_base(self, &context).await?;
-        tolerate_offline(flush_sticker_outbox(self, &context).await)?;
+        let rebased = rebase_and_flush_sticker_outbox_best_effort(self, &context).await?;
 
         let filter = Filter::new()
             .kind(Kind::Custom(STICKER_PACK_KIND))
@@ -448,9 +446,14 @@ impl MarmotApp {
 
         let desired = context.storage.desired_installed_sticker_packs()?;
         for coordinate in desired.iter().take(MAX_INSTALLED_PACKS) {
-            let _ = fetch_pack_into_storage(self, &context, coordinate, &[]).await;
+            match fetch_pack_into_storage(self, &context, coordinate, &[]).await {
+                Ok(_) | Err(AppError::StickerRelay(_) | AppError::StickerNotFound) => {}
+                Err(error) => return Err(error),
+            }
         }
-        publish_pending_installed_list(self, &context).await?;
+        if rebased {
+            publish_pending_installed_list(self, &context).await?;
+        }
         let installed = context.storage.desired_installed_sticker_packs()?.len();
         let pending_operations = context.storage.sticker_install_operations()?.len();
         Ok(AppStickerSyncResult {
@@ -500,12 +503,23 @@ impl MarmotApp {
                     .map(|_| ()),
             )?;
         }
-        let desired = context.storage.desired_installed_sticker_packs()?;
+        let mut desired = context.storage.desired_installed_sticker_packs()?;
         validate_install_capacity(&desired, coordinate)?;
+        desired.retain(|pack| pack != coordinate);
+        desired.push(coordinate.clone());
+        // Refusal must leave the existing operation journal untouched. Once
+        // authorized, persist intent before any relay-visible publication.
+        let event = if rebased {
+            Some(sign_installed_list(self, &context, &desired).await?)
+        } else {
+            None
+        };
         context
             .storage
             .enqueue_sticker_install_operation(coordinate, true, unix_now_seconds())?;
-        publish_installed_list_if_rebased(self, &context, rebased).await?;
+        if let Some(event) = event {
+            tolerate_offline(publish_outboxed_event(self, &context, &event).await)?;
+        }
         app_pack_for_context(&context, coordinate)
     }
 
@@ -519,12 +533,22 @@ impl MarmotApp {
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
         let rebased = rebase_and_flush_sticker_outbox_best_effort(self, &context).await?;
+        let event = if rebased {
+            let mut desired = context.storage.desired_installed_sticker_packs()?;
+            desired.retain(|pack| pack != &coordinate);
+            Some(sign_installed_list(self, &context, &desired).await?)
+        } else {
+            None
+        };
         context.storage.enqueue_sticker_install_operation(
             &coordinate,
             false,
             unix_now_seconds(),
         )?;
-        publish_installed_list_if_rebased(self, &context, rebased).await
+        if let Some(event) = event {
+            tolerate_offline(publish_outboxed_event(self, &context, &event).await)?;
+        }
+        Ok(())
     }
 
     /// Signal import is refused before any network call.
@@ -576,13 +600,11 @@ impl MarmotApp {
                 "no account relays configured".into(),
             ));
         }
-        let signer = self.account_signer_for_summary(&account)?;
         Ok(StickerAccountContext {
             label: account.label.clone(),
             account_id_hex: account.account_id_hex,
             storage: self.account_storage(&account.label)?.app_storage(),
             endpoints,
-            signer,
         })
     }
 }
@@ -707,22 +729,6 @@ async fn rebase_and_flush_sticker_outbox_best_effort(
     }
 }
 
-/// Publish the rebased installed list only when this call refreshed the remote
-/// base first. Otherwise the local operation stays persisted and
-/// [`MarmotApp::sync_sticker_packs`] (or the next successful rebase) publishes
-/// it over the current remote winner. A publish that would succeed while the
-/// read failed is exactly the case that erases another device's changes.
-async fn publish_installed_list_if_rebased(
-    app: &MarmotApp,
-    context: &StickerAccountContext,
-    rebased: bool,
-) -> Result<(), AppError> {
-    if !rebased {
-        return Ok(());
-    }
-    tolerate_offline(publish_pending_installed_list(app, context).await)
-}
-
 fn validate_install_capacity(desired: &[String], coordinate: &str) -> Result<(), AppError> {
     if desired.len() >= MAX_INSTALLED_PACKS && !desired.iter().any(|pack| pack == coordinate) {
         return Err(invalid_sticker("too many installed sticker packs"));
@@ -752,7 +758,7 @@ async fn refresh_installed_base(
         .fetch_public_events(
             context.endpoints.clone(),
             vec![filter],
-            MAX_REPLACEABLE_VERSIONS_PER_FETCH,
+            MAX_REPLACEABLE_VERSIONS_PER_FETCH.saturating_mul(context.endpoints.len()),
         )
         .await
         .map_err(AppError::StickerRelay)?;
@@ -813,6 +819,15 @@ async fn publish_pending_installed_list(
         return Ok(());
     }
     let desired = context.storage.desired_installed_sticker_packs()?;
+    let event = sign_installed_list(app, context, &desired).await?;
+    publish_outboxed_event(app, context, &event).await
+}
+
+async fn sign_installed_list(
+    app: &MarmotApp,
+    context: &StickerAccountContext,
+    desired: &[String],
+) -> Result<Event, AppError> {
     if desired.len() > MAX_INSTALLED_PACKS {
         return Err(invalid_sticker("too many installed sticker packs"));
     }
@@ -823,14 +838,14 @@ async fn publish_pending_installed_list(
                 .map_err(|_| invalid_sticker("installed sticker address is invalid"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let event = sign_public_event(
+    sign_public_event(
+        app,
         context,
         USER_STICKER_PACKS_KIND,
         build_installed_packs_tags(&InstalledPackList::new(addresses)),
         next_installed_list_publication_timestamp(&context.storage)?,
     )
-    .await?;
-    publish_outboxed_event(app, context, &event).await
+    .await
 }
 
 fn next_installed_list_publication_timestamp(storage: &SqliteAppStorage) -> Result<u64, AppError> {
@@ -872,12 +887,14 @@ fn next_monotonic_publication_timestamp(
 }
 
 async fn sign_public_event(
+    app: &MarmotApp,
     context: &StickerAccountContext,
     kind: u16,
     tags: Vec<nostr044::Tag>,
     created_at: u64,
 ) -> Result<Event, AppError> {
-    let signer = context.signer.as_nostr_signer();
+    let account = app.account_home().account(&context.label)?;
+    let signer = app.account_signer_for_summary(&account)?.as_nostr_signer();
     let public_key = signer
         .get_public_key()
         .await
@@ -889,10 +906,11 @@ async fn sign_public_event(
         .into_iter()
         .map(sonar_tag_to_app)
         .collect::<Result<Vec<_>, _>>()?;
-    let unsigned = EventBuilder::new(Kind::Custom(kind), "")
+    let mut unsigned = EventBuilder::new(Kind::Custom(kind), "")
         .tags(tags)
         .custom_created_at(NostrTimestamp::from_secs(created_at))
         .finalize_unsigned(public_key);
+    unsigned.ensure_id();
     signer
         .sign_event(unsigned)
         .await
@@ -951,8 +969,10 @@ async fn publish_account_event(
         hex::decode(&context.account_id_hex)
             .map_err(|_| invalid_sticker("invalid account identity"))?,
     );
+    let account = app.account_home().account(&context.label)?;
+    let signer = app.account_signer_for_summary(&account)?;
     let outcome = app
-        .relay_client_for_account_id(&context.account_id_hex, context.signer.as_nostr_signer())
+        .relay_client_for_account_id(&context.account_id_hex, signer.as_nostr_signer())
         .publish_event_for_account(&account_id, &context.endpoints, &transport_event, 1)
         .await
         .map_err(|_| AppError::StickerRelay("sticker publication failed".into()))?;
@@ -1067,7 +1087,6 @@ struct StickerAccountContext {
     account_id_hex: String,
     storage: SqliteAppStorage,
     endpoints: Vec<TransportEndpoint>,
-    signer: AccountSigner,
 }
 
 fn app_pack_from_stored(
@@ -1617,6 +1636,290 @@ fn le_u16(bytes: &[u8], offset: usize) -> Result<u16, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::prelude::{Keys, UnsignedEvent};
+    use transport_nostr_peeler::{MarmotNostrSigner, MarmotSignerError, SignerFuture};
+
+    #[derive(Debug)]
+    struct RejectStickerSigner {
+        keys: Keys,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl MarmotNostrSigner for RejectStickerSigner {
+        fn get_public_key(&self) -> SignerFuture<'_, Result<PublicKey, MarmotSignerError>> {
+            MarmotNostrSigner::get_public_key(&self.keys)
+        }
+
+        fn sign_event(
+            &self,
+            _unsigned: UnsignedEvent,
+        ) -> SignerFuture<'_, Result<Event, MarmotSignerError>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Err(MarmotSignerError::from(
+                    crate::external_signer::EXTERNAL_SIGNER_REJECTED,
+                ))
+            })
+        }
+
+        fn nip04_encrypt<'a>(
+            &'a self,
+            public_key: &'a PublicKey,
+            content: &'a str,
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            MarmotNostrSigner::nip04_encrypt(&self.keys, public_key, content)
+        }
+
+        fn nip04_decrypt<'a>(
+            &'a self,
+            public_key: &'a PublicKey,
+            payload: &'a str,
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            MarmotNostrSigner::nip04_decrypt(&self.keys, public_key, payload)
+        }
+
+        fn nip44_encrypt<'a>(
+            &'a self,
+            public_key: &'a PublicKey,
+            content: &'a str,
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            MarmotNostrSigner::nip44_encrypt(&self.keys, public_key, content)
+        }
+
+        fn nip44_decrypt<'a>(
+            &'a self,
+            public_key: &'a PublicKey,
+            payload: &'a str,
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            MarmotNostrSigner::nip44_decrypt(&self.keys, public_key, payload)
+        }
+    }
+
+    impl marmot_session::AccountIdentityProofSigner for RejectStickerSigner {
+        fn sign_account_identity_proof(
+            &self,
+            _request: &marmot_session::AccountIdentityProofRequest,
+        ) -> Result<[u8; 64], String> {
+            Err(crate::external_signer::EXTERNAL_SIGNER_REJECTED.to_owned())
+        }
+    }
+
+    async fn external_sticker_fixture() -> (
+        tempfile::TempDir,
+        MarmotApp,
+        Keys,
+        String,
+        String,
+        nostr_relay_builder::LocalRelay,
+    ) {
+        use nostr_relay_builder::prelude::{
+            MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, RelayBuilder,
+        };
+
+        let keys = Keys::generate();
+        let pack = StickerPack::new(
+            PackAddress::new(keys.public_key().to_hex(), "cats".to_owned()).unwrap(),
+            "Cats".to_owned(),
+            None,
+            None,
+            vec![
+                Sticker::new(
+                    "wave".to_owned(),
+                    format!("https://cdn.example/{}.png", "11".repeat(32)),
+                    "11".repeat(32),
+                    "image/png".to_owned(),
+                    Some(32),
+                    Some(32),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+        let event = EventBuilder::new(Kind::Custom(STICKER_PACK_KIND), "")
+            .tags(
+                build_pack_tags(&pack)
+                    .into_iter()
+                    .map(|tag| sonar_tag_to_app(tag).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .finalize(&keys)
+            .unwrap();
+        let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+            events: true,
+            max_events: Some(8),
+        });
+        database
+            .save_event(&serde_json::from_str(&event.as_json()).unwrap())
+            .await
+            .unwrap();
+        let relay =
+            nostr_relay_builder::LocalRelay::new(RelayBuilder::default().database(database));
+        relay.run().await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let home = crate::AccountHome::open(directory.path());
+        let account = home
+            .add_external_signer_account(&keys.public_key().to_hex())
+            .unwrap();
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            directory.path(),
+            vec![relay.url().await.to_string()],
+            home,
+            crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        );
+        let coordinate = format!("30031:{}:cats", keys.public_key().to_hex());
+        (
+            directory,
+            app,
+            keys,
+            account.account_id_hex,
+            coordinate,
+            relay,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsigned_external_pack_fetch() {
+        let (_directory, app, _keys, account_id, coordinate, _relay) =
+            external_sticker_fixture().await;
+        assert!(!app.has_external_signer(&account_id));
+        let context = app.sticker_context(&account_id).unwrap();
+        assert!(context.storage.sticker_pack(&coordinate).unwrap().is_none());
+
+        let pack = app
+            .fetch_sticker_pack(&account_id, &coordinate)
+            .await
+            .unwrap();
+
+        assert_eq!(pack.coordinate, coordinate);
+        assert_eq!(pack.title, "Cats");
+        assert!(!pack.installed);
+        assert!(context.storage.sticker_pack(&coordinate).unwrap().is_some());
+        assert!(!app.has_external_signer(&account_id));
+    }
+
+    enum StickerAction {
+        Install,
+        Uninstall,
+    }
+
+    async fn reject_keeps_intent(action: StickerAction) {
+        let install = matches!(action, StickerAction::Install);
+        for prior_intent in [false, true] {
+            let (_directory, app, keys, account_id, coordinate, _relay) =
+                external_sticker_fixture().await;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            app.register_external_signer(
+                &account_id,
+                RejectStickerSigner {
+                    keys,
+                    calls: calls.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            let context = app.sticker_context(&account_id).unwrap();
+            if prior_intent {
+                // The rejected mutation would replace this row, not merely
+                // append a new operation, and must preserve unrelated intent.
+                context
+                    .storage
+                    .enqueue_sticker_install_operation(&coordinate, !install, 1)
+                    .unwrap();
+                context
+                    .storage
+                    .enqueue_sticker_install_operation(&self::coordinate(), true, 2)
+                    .unwrap();
+            }
+            let before = context.storage.sticker_install_operations().unwrap();
+            let desired = context.storage.desired_installed_sticker_packs().unwrap();
+
+            let result = if install {
+                app.install_sticker_pack(&account_id, &coordinate)
+                    .await
+                    .map(|_| ())
+            } else {
+                app.uninstall_sticker_pack(&account_id, &coordinate).await
+            };
+
+            assert!(
+                matches!(result, Err(AppError::ExternalSignerRejected)),
+                "prior_intent={prior_intent}: {result:?}"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                context.storage.sticker_install_operations().unwrap(),
+                before
+            );
+            assert_eq!(
+                context.storage.desired_installed_sticker_packs().unwrap(),
+                desired
+            );
+            assert!(context.storage.sticker_outbox_events().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_reject_keeps_intent() {
+        reject_keeps_intent(StickerAction::Install).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uninstall_reject_keeps_intent() {
+        reject_keeps_intent(StickerAction::Uninstall).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn future_list_keeps_intent() {
+        for install in [false, true] {
+            let (_directory, app, keys, account_id, coordinate, _relay) =
+                external_sticker_fixture().await;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            app.register_external_signer(
+                &account_id,
+                RejectStickerSigner {
+                    keys,
+                    calls: calls.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            let context = app.sticker_context(&account_id).unwrap();
+            context
+                .storage
+                .replace_installed_sticker_packs_if_newer(
+                    &StoredStickerPackVersion {
+                        event_id_hex: "ef".repeat(32),
+                        created_at: unix_now_seconds() + MAX_FUTURE_EVENT_SKEW_SECONDS + 60,
+                    },
+                    &[],
+                )
+                .unwrap();
+            context
+                .storage
+                .enqueue_sticker_install_operation(&coordinate, !install, 1)
+                .unwrap();
+            let before = context.storage.sticker_install_operations().unwrap();
+
+            let result = if install {
+                app.install_sticker_pack(&account_id, &coordinate)
+                    .await
+                    .map(|_| ())
+            } else {
+                app.uninstall_sticker_pack(&account_id, &coordinate).await
+            };
+
+            assert!(matches!(result, Err(AppError::InvalidSticker(_))));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                context.storage.sticker_install_operations().unwrap(),
+                before
+            );
+            assert!(context.storage.sticker_outbox_events().unwrap().is_empty());
+        }
+    }
 
     fn coordinate() -> String {
         format!("30031:{}:cats", "ab".repeat(32))
@@ -1865,21 +2168,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn signal_import_source_does_not_call_the_unpinned_importer() {
-        let source = include_str!("stickers.rs");
-        let start = source
-            .find("pub async fn import_signal_sticker_pack")
-            .expect("import command");
-        let body = &source[start..];
-        let end = body.find("\n    fn ").expect("following method");
-        let body = &body[..end];
-        assert!(
-            !body.contains("import_signal_pack"),
-            "Signal import must not call the unpinned sonar-stickers fetcher"
-        );
-        assert!(body.contains("validate_signal_sticker_link"));
-        assert!(body.contains("StickerImport"));
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_import_is_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relays(directory.path(), Vec::new());
+        let result = app.import_signal_sticker_pack(
+            "not-an-account",
+            "https://signal.art/addstickers/#pack_id=0123456789abcdef0123456789abcdef&pack_key=def".to_owned(),
+            None,
+        ).await;
+        assert!(matches!(result, Err(AppError::StickerImport(_))));
     }
 
     #[test]

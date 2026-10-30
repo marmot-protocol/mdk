@@ -210,6 +210,20 @@ async fn failed_installed_list_refresh_blocks_stale_publication_until_rebase() {
         policy.stalled.load(Ordering::SeqCst) >= 1,
         "the installed-list refresh must have been attempted and timed out"
     );
+    let stalled_before_sync = policy.stalled.load(Ordering::SeqCst);
+    let synced = app
+        .sync_sticker_packs(&account_id)
+        .await
+        .expect("sync may refresh public packs without a complete installed-list read");
+    assert!(
+        policy.stalled.load(Ordering::SeqCst) > stalled_before_sync,
+        "sync must attempt its own installed-list refresh"
+    );
+    assert_eq!(synced.installed, 0, "the pending uninstall stays visible");
+    assert_eq!(
+        synced.pending_operations, 1,
+        "sync must not publish pending intent over an incomplete installed-list read"
+    );
     // Reads recover. Nothing below the app has run yet, so the relay still
     // shows exactly what the failed-refresh path left behind.
     policy.armed.store(false, Ordering::SeqCst);
@@ -389,7 +403,8 @@ async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sync_refreshes_installed_packs() {
     install_mock_keyring();
-    let relay = LocalRelay::new(RelayBuilder::default());
+    let policy = StallInstalledListReadsWhileArmed::default();
+    let relay = LocalRelay::new(RelayBuilder::default().query_policy(policy.clone()));
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
     let keys = Keys::generate();
@@ -465,15 +480,26 @@ async fn sync_refreshes_installed_packs() {
         .await;
     }
 
+    policy.armed.store(true, Ordering::SeqCst);
     let synced = app.sync_sticker_packs(&account_id).await.unwrap();
+    assert!(
+        policy.stalled.load(Ordering::SeqCst) >= 1,
+        "the final sync must refresh packs despite an incomplete installed-list read"
+    );
     assert_eq!(synced.discovered, 100);
     assert_eq!(synced.installed, 1);
+    assert_eq!(synced.pending_operations, 0);
     let refreshed = app.sticker_pack(&account_id, &coordinate).unwrap().unwrap();
     assert!(refreshed.installed);
     assert_eq!(refreshed.created_at, now - 200);
     assert_eq!(refreshed.title, "Replacement");
     assert_eq!(refreshed.stickers.len(), 1);
     assert_eq!(refreshed.stickers[0].shortcode, "dance");
+
+    policy.armed.store(false, Ordering::SeqCst);
+    let (created_at, packs) = remote_installed_list(&url, keys.public_key()).await;
+    assert_eq!(created_at, now - 300);
+    assert_eq!(packs, vec![coordinate]);
 
     runtime.shutdown().await;
 }

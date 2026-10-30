@@ -352,6 +352,13 @@
 
 ### Fixed
 
+- External-signer sticker installs and uninstalls prepare event IDs and
+  finish signing before changing local intent. Refused signatures leave
+  existing pending changes untouched.
+- Public sticker-pack fetches no longer require a registered signer.
+- Sticker sync continues public pack refreshes when the installed-list read
+  is incomplete. Publishing that list still requires a complete read from
+  every account relay.
 - Sticker downloads check nested WebP bitstream dimensions against each
   animation frame before returning bytes to the host decoder.
 - Sticker sync refreshes cached installed packs even when their replacements
