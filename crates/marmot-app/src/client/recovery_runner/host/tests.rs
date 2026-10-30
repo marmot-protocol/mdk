@@ -2,6 +2,7 @@
 //! pass, and the chokepoints that wake the account's runner.
 
 use cgka_traits::engine::GroupEvent;
+use cgka_traits::storage::MessageStorage;
 use nostr_relay_builder::MockRelay;
 use storage_sqlite::{
     RecoveryCause, SqliteAppStorage, StoredEpochBackfillIntent, TransportReconciliationRoute,
@@ -128,6 +129,20 @@ async fn a_direct_clients_pass_serves_each_due_unit_once() {
     assert_eq!(passes(&client), 2);
 }
 
+/// With the gate on, a directly owned client's `next_event()` runs one pass
+/// in place when it meets delivery loss, after the recovery it already runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_clients_next_event_runs_a_pass_on_delivery_loss() {
+    let (_dir, _relay, _app, mut client) = direct_client(true).await;
+    client.sync().await.unwrap();
+    assert_eq!(passes(&client), 1);
+    client.discard_spilled_deliveries(&[]).unwrap();
+    // Nothing surfaces, so `next_event()` keeps waiting after the pass.
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(5), client.next_event()).await;
+    assert!(waited.is_err(), "the loss surfaces no event");
+    assert_eq!(passes(&client), 2, "the loss runs one pass");
+}
+
 /// An idle connected account's in-place passes charge nothing: the live
 /// boundaries prove its history and its live tails are not owed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -158,8 +173,9 @@ async fn a_direct_clients_pass_never_charges_an_idle_connected_account() {
 }
 
 /// Each chokepoint that can change the account's debt or what the runner may
-/// serve wakes it: loss import, goal widening, a route change, a dismissal
-/// and a group lifecycle change. Reinstalling the same routes does not.
+/// serve wakes it: loss import, goal widening, a route change, a released
+/// receipt, a dismissal and a group lifecycle change. Reinstalling the same
+/// routes does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_chokepoint_wakes_the_runner() {
     let Fixture {
@@ -195,6 +211,32 @@ async fn each_chokepoint_wakes_the_runner() {
     assert!(woken(&mut wake), "a route removed");
     client.routing.replace_group_routes(&group, routes);
     assert!(woken(&mut wake), "a route added");
+
+    let record = cgka_traits::MessageRecord {
+        id: cgka_traits::MessageId::new(vec![0xfb; 32]),
+        group_id: group.clone(),
+        epoch: cgka_traits::EpochId(0),
+        state: cgka_traits::MessageState::PeelDeferred,
+        payload: Vec::new(),
+        deferred_peel: None,
+    };
+    storage.put_message(&record).unwrap();
+    storage.release_message_for_replay(&record).unwrap();
+    assert_eq!(
+        client
+            .reconcile_released_transport_receipts()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(woken(&mut wake), "a released receipt");
+    assert!(
+        client
+            .reconcile_released_transport_receipts()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!woken(&mut wake), "no release, no wake");
 
     client.observe_recovery_evidence(&marmot_session::AccountDeviceEffects {
         events: vec![GroupEvent::GroupUnrecoverable {

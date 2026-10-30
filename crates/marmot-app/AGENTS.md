@@ -356,9 +356,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
-  `recheck`, `policy` and `tails` modules (mdk#2660 phase 4). It is built but not started: nothing outside its tests
-  constructs, wakes or reads it until the switch-over replaces the comparison owner, so do not wire it from
-  `account_worker.rs` or a host surface in passing. Every ledger and retry-state write happens in a worker turn; the
+  `recheck`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
+  `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, off; proofs turn it on with the hidden
+  `MarmotApp::with_recovery_runner_owning_debt`), never a host setting or cargo feature, until the switch-over flips it.
+  With the gate off nothing constructs it and the comparison owner keeps every behavior. `host` is its only seat:
+  the account worker spawns it with the worker, serves its turns in one select arm and stops it in every exit
+  (`SpawnedRunner::stop`), and a directly owned client from `MarmotApp::client()` runs one pass in place from
+  `sync()` and from `next_event()`'s loss branch. The worker never awaits a pass, the network or a credit. Wake it
+  through `AppTransportRouting`'s sender at the chokepoint that changes debt or routes (loss import, goal widening,
+  route replacement, a released receipt, a dismissal, a group lifecycle effect), never per call site; it re-reads
+  the ledger on every wake. Every ledger and retry-state write happens in a worker turn; the
   credit wait, caps read and sweep run off the worker, and nothing read before the credit wait is planned on. Live
   tails are a query read fresh in each turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
   covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
@@ -672,7 +679,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (runtime-only network approval; never restore it from disk).
 - `src/client/`: `recovery.rs` (recovery grant authorization), `recovery_coverage.rs` (the shadow coverage-ledger
   recorder and its comparison with pending obligations, mdk#2660), `recovery_runner.rs` (the per-account recovery
-  runner, not started yet, mdk#2660), `invite_recovery.rs` (durable invitation recovery),
+  runner behind the internal `runner_owns_debt` gate, mdk#2660; `recovery_runner/host.rs` seats it on the worker or
+  a direct client), `invite_recovery.rs` (durable invitation recovery),
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
   job).

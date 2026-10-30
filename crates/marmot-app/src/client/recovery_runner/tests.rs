@@ -2549,6 +2549,55 @@ async fn recovery_runner_task_wakes_on_a_bump_and_at_its_retry_time() {
     task.await.unwrap();
 }
 
+// The account's own wake sender (the routing's) wakes a runner built on it,
+// and the spawned task answers a pass until it stops. Paused as above.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_task_wakes_on_its_accounts_sender_and_answers_passes() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let relay = stalling_relay([1; 32], floor).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, floor);
+    let wake = tokio::sync::watch::channel(0).0;
+    let (runner, handle) = RecoveryRunner::waking_on(
+        host.clone(),
+        test_policy(),
+        recovery_credits::private_recovery_credit_pool_for_test(),
+        wake.clone(),
+    );
+    let task = runner.spawn();
+
+    tokio::time::sleep(Duration::from_secs(HOUR)).await;
+    assert_eq!(relay.requests(), 0, "nothing is owed, so the task sleeps");
+    host.tails.lapse(&route, RELAY);
+    wake.send_modify(|bumps| *bumps += 1);
+    wait_until("the woken quantum", WAIT, || {
+        account
+            .app
+            .recovery_unit(&route, RELAY)
+            .unwrap()
+            .is_some_and(|unit| unit.last_served_at_seconds.is_some())
+    })
+    .await;
+
+    assert!(handle.run_pass(WAIT).await.is_some());
+    handle.shutdown();
+    task.await.unwrap();
+    assert!(
+        handle.run_pass(WAIT).await.is_none(),
+        "a stopped runner runs no pass"
+    );
+}
+
 #[test]
 fn recovery_runner_classifies_every_sweep_end() {
     use SweepEnd as End;

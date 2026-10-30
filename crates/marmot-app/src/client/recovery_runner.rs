@@ -2,10 +2,12 @@
 //! history recovery scheduling over the coverage ledger and its durable retry
 //! state.
 //!
-//! It is built but not started. No production path constructs, wakes or reads
-//! it until the switch-over (PR 5), so the comparison owner in `recovery.rs`
-//! keeps every behavior and the ledger stays in shadow mode. Tests construct
-//! and drive it.
+//! It runs only behind the internal `runner_owns_debt` gate, off until the
+//! switch-over turns it on (PR 5g). With the gate on, the account worker
+//! spawns it and stops it with the worker, and a directly owned client runs it
+//! in place for one pass from `sync()` and `next_event()` ([`host`]). With the
+//! gate off nothing constructs it, so the comparison owner in `recovery.rs`
+//! keeps every behavior and the ledger stays in shadow mode.
 //!
 //! One step:
 //!
@@ -152,9 +154,10 @@ pub(crate) struct DebtTurn<'a> {
     pub(crate) live_counts: &'a [LiveCount],
 }
 
-/// What one account gives its runner. Turns run on the account worker (PR 5
-/// sends each as a worker command) and must stay short: storage reads and
-/// writes, no awaiting. Everything else runs off the worker.
+/// What one account gives its runner. Turns run on whoever owns the account's
+/// client, the account worker or a directly owned client's pass ([`host`]),
+/// and must stay short: storage reads and writes, no awaiting. Everything else
+/// runs off the worker.
 #[async_trait]
 pub(crate) trait RunnerHost: Send + Sync + 'static {
     /// Run `turn` on the worker. `None` once the worker is gone.
