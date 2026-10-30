@@ -48,8 +48,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again and a staged
     one waits for its commit. The runtime watches the Welcomes it stages, and those the startup pass (or else the first
     maintenance pass) finds staged or owed; a group skipped because it was not live is read again on each pass until it
-    is. Maintenance publishes each watched Welcome that is owed and that no attempt record holds, and keeps watching it
-    until its row is settled or a record holds it, so a publish that stored nothing (no route) is tried again next pass.
+    is. A Welcome stays watched until its row is settled. Maintenance publishes each watched Welcome that is owed and
+    that no attempt record (stored fanout or detached startup retry) holds, so one whose publish stored nothing (no
+    route) or whose fanout expired goes out again on the next pass, as the startup pass would send it.
     Whichever attempt meets a Welcome's acknowledgement policy marks it delivered, maintenance's retry of its stored
     fanout included.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,

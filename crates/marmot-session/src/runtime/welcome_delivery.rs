@@ -423,8 +423,8 @@ where
         Ok(Some((ids, task)))
     }
 
-    /// Watch Welcomes until each is settled or an attempt record holds it.
-    /// The runtime watches those it stages with a commit: the caller
+    /// Watch Welcomes until each is settled. The runtime watches those it
+    /// stages with a commit: the caller
     /// publishes them only if the commit was published, and a commit left
     /// for retry confirms later.
     pub(super) fn watch_welcomes(&mut self, ids: impl IntoIterator<Item = cgka_traits::MessageId>) {
@@ -467,10 +467,10 @@ where
     }
 
     /// Publish each watched Welcome that is owed and that no attempt record
-    /// holds. A Welcome stays watched until its row is settled or an attempt
-    /// record holds it, which maintenance then retries; one whose publish
-    /// stored no record, as when its route is unknown, is published again on
-    /// the next pass.
+    /// holds. A Welcome stays watched until its row is settled. While a stored
+    /// fanout or the detached startup retry holds it, that record retries it;
+    /// once none does, as after a publish that found no route or a fanout that
+    /// expired, the next pass publishes it again, as the startup pass would.
     pub(super) async fn deliver_watched_welcomes(
         &mut self,
         output: &mut AccountDeviceEffects,
@@ -489,9 +489,8 @@ where
                     Ok((status, held))
                 });
             match status {
-                Ok((OutboundWelcomeStatus::Waiting, _)) => watching.push(id),
-                // Settled, or an attempt record holds it.
-                Ok((OutboundWelcomeStatus::Settled, _) | (_, true)) => {}
+                Ok((OutboundWelcomeStatus::Settled, _)) => {}
+                Ok((OutboundWelcomeStatus::Waiting, _) | (_, true)) => watching.push(id),
                 Ok((OutboundWelcomeStatus::Owed { group_id, message }, false)) => {
                     watching.push(id);
                     match due.iter_mut().find(|(group, _)| *group == group_id) {

@@ -520,3 +520,46 @@ async fn staged_invite_welcome_goes_out_after_a_send_that_found_no_route() {
             .is_empty()
     );
 }
+
+/// A Welcome stays watched while its stored fanout retries it, so if that
+/// fanout expires with the Welcome still owed, the next pass sends it again,
+/// as the startup pass would at the next open.
+#[tokio::test]
+async fn staged_invite_welcome_goes_out_again_after_its_fanout_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut invite = retained_invite(dir.path()).await;
+    let welcome_id = invite.welcome.id.clone();
+    invite.confirm_commit().await;
+    invite
+        .adapter
+        .error_for_endpoints(vec![invite.carol_inbox.clone()]);
+
+    invite.runtime.run_due_maintenance().await.unwrap();
+    let fanout = invite
+        .runtime
+        .session()
+        .transport_fanout(&welcome_id)
+        .unwrap()
+        .expect("the failed send stored its retry record");
+    invite.wall.set(300_200);
+    invite.runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        staged_welcome_publishes(&invite.adapter).len(),
+        2,
+        "the stored fanout retried it"
+    );
+
+    invite.adapter.error_for_endpoints(Vec::new());
+    invite.wall.set(fanout.bounded_until.unwrap().0);
+    invite.runtime.run_due_maintenance().await.unwrap();
+    let sent = staged_welcome_publishes(&invite.adapter);
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[2].id, welcome_id);
+    assert!(
+        invite
+            .runtime
+            .outstanding_welcome_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}
