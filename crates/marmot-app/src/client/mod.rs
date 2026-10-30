@@ -6188,8 +6188,8 @@ impl AppClient {
 
     /// Send an app-defined event with an arbitrary non-reserved kind. `tags`
     /// and `content` pass through verbatim; kinds MDK owns (chat, reaction,
-    /// edit, delete, agent, group system, push token) are rejected so an app
-    /// cannot forge protocol events.
+    /// edit, delete, agent, group system, push token, device group) are
+    /// rejected so an app cannot forge protocol events.
     pub async fn send_custom_event(
         &mut self,
         group_id: &GroupId,

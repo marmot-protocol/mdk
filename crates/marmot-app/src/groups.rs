@@ -2351,6 +2351,20 @@ pub(crate) fn observe_event(
                 return None;
             };
             message.authority = *authority;
+            // A device-group kind is read only in the device group this
+            // account trusts, whose events never reach a chat's projection.
+            // Anywhere else it is no message: no host summary, no stored row,
+            // no notification.
+            if crate::client::device_group::is_device_group_kind(message.kind) {
+                tracing::debug!(
+                    target: "marmot_app::groups",
+                    method = "observe_event",
+                    kind = message.kind,
+                    "ignoring a device-group kind outside the device group",
+                );
+                summary.events.push(host_group_event(event));
+                return None;
+            }
             // Gossip remains available to native ingestion, but must never enter
             // the host message summary, including a partially applied batch.
             if !crate::notifications::is_push_gossip_kind(message.kind) {

@@ -49,7 +49,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `refresh_group_routes` when the drained prefix carried zero deliveries and clean routes.
 - Keep app-defined custom events on the `AppMessageIntent::Custom` path in `src/messages/intents.rs`: kind, tags, and
   content pass through verbatim, and kinds MDK owns (`is_reserved_app_event_kind`: chat, reaction, edit, delete,
-  agent, group system, push token) are rejected with `AppError::InvalidAppMessagePayload` so apps cannot forge
+  agent, group system, push token, and the device-group kinds `is_device_group_kind` lists) are rejected with `AppError::InvalidAppMessagePayload` so apps cannot forge
   protocol-owned events. Custom kinds project as standalone timeline rows under
   `TimelineUpdateTrigger::CustomEvent` (never folding onto a target message like reactions/deletes) and are queryable
   by kind through `AppMessageQuery::kinds`.
@@ -131,7 +131,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in
   `observe_device_group_event` (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending
   leaf's device tag (mdk#2628 D33). That read sees only the current tree, so a message from an earlier epoch has no
-  readable sender.
+  readable sender. List every kind sent only in a device group in `is_device_group_kind` (457, 459, 460, 462), the
+  one list: `observe_event` drops one received in any other group before the host summary and the stored
+  projection, the notification preview refuses it, and the custom path rejects it as reserved.
 - Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
   Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
   roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
