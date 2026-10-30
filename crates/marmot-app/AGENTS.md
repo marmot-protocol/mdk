@@ -616,7 +616,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `wiring.rs`. Hosts can name `ProductAnalytics`, `AppPerformanceTelemetry`, `ProductObservation`, `DiagnosticsPermit`
   and `AuditOtlpSender`, so do not make their crate-private methods `pub` and do not call them from outside the
   moving set; add the method to a view or to `wiring.rs`. Items the rest of the crate names from a private module
-  in the set are `pub` there.
+  in the set are `pub` there. An operation recorded as one product outcome runs its body through
+  `ProductRecorder::observed` and an outcome rule (`success_or_failure`, `confirmed_or_failure`, `send_outcome` or
+  its own); do not write an `_unobserved` twin beside it.
 - Tests in the moving set need nothing else from this crate. Tests that need a `MarmotApp`, its runtime or the
   network-proxy policy live in `src/observability_tests/`, one module per set file, and reach the set as the rest of
   the crate does, plus the fixtures in `observability_test_support.rs` and the `_for_test` hooks. Those are gated
