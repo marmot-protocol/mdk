@@ -170,6 +170,12 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 | Avatar upgrade ledger | At most one key per chat present at migration 0078 | Consumed in transactions of at most 64 rows; never recreated on restart. |
 | `app_prepared_group_image_upload` SQLCipher rows | 16 active staged/uploaded/failed artifacts and 128 consumed idempotency markers per account | Active artifacts expire after 7 days and consumed markers after 30 days; staging prunes expired rows, consumption evicts the oldest marker at the cap, and consumed rows erase their retained ciphertext/upload-secret copies. The founding MLS component remains authoritative after consumption. |
 
+### `marmot-session` own-slot check (`src/runtime/own_slot.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `AccountDeviceRuntime.slot_superseded_through` | One `Option<Timestamp>` | Raised by the own-slot check to the newest foreign publication found in this device's slot and its current publication's time. Cleared when a publication of its own newer than it becomes current, or when the clock went back so far that no publication could outrank it. Dropped with the runtime; the host reads the slot again at open. |
+
 ### `marmot-app` device pairing (`src/client/device_pairing/live.rs`)
 
 Built only with `unreleased-device-pairing`, and empty unless `dev_device_groups` is on. Pairing keeps its secrets

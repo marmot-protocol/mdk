@@ -485,7 +485,7 @@ jobs:
           shared-key: rust-test
 
       - name: Verify workspace shard coverage
-        run: bash scripts/check_ci_partitions.sh 7 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings --profile ci -E "$WORKSPACE_FILTER"
+        run: bash scripts/check_ci_partitions.sh slice:14 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings --profile ci -E "$WORKSPACE_FILTER"
 
       - name: Upload workspace compiler timings
         if: always()
@@ -510,15 +510,19 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # Seven shards keep the slowest one near 20 minutes. Each shard's tests run
-  # about four at a time, so its time tracks its total test time, and a slow
-  # runner adds up to a quarter to that; the slowest test run took 25 minutes.
+  # Fourteen shards keep the slowest one near 15 minutes. Each shard's tests run
+  # four at a time, so its time tracks its total test time, and the slowest
+  # runners add up to a fifth to that. That total grows fast (it doubled in the
+  # second half of October 2026, #2738), so add shards before the slowest one
+  # passes 20 minutes. `slice:` deals the whole test list out in turn, which
+  # stays balanced as tests are added; `count:` restarts the deal for every test
+  # binary, so each binary's first test lands on shard 1.
   # The 2 GB test archive downloads in under a minute on East US runners but
   # has taken up to 20 minutes on central and western ones (#2568), so the
   # download and the tests get separate budgets and a slow download cannot cut
   # the test run short.
   rust-test:
-    name: Rust tests (${{ matrix.partition }}/7)
+    name: Rust tests (${{ matrix.partition }}/14)
     needs: [changes, rust-test-build]
     if: needs.changes.outputs.ci_mode == 'full'
     runs-on: ubuntu-latest
@@ -526,7 +530,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2, 3, 4, 5, 6, 7]
+        partition: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
 
     steps:
       - name: Check out repository
@@ -559,7 +563,7 @@ jobs:
         # The subprocess-heavy `wn-cli::cli` suite runs in its own
         # `cli-e2e` job so its fan-out never starves these fast unit tests
         # (issue #103). `relay_runtime` keeps its own serial job.
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --partition count:${{ matrix.partition }}/7 --no-tests=pass --profile ci -E "$WORKSPACE_FILTER"
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --partition slice:${{ matrix.partition }}/14 --no-tests=pass --profile ci -E "$WORKSPACE_FILTER"
 
   rust-test-extras:
     name: Doctests and diagnostic exporters
@@ -635,7 +639,7 @@ jobs:
           shared-key: cli-e2e
 
       - name: Verify CLI shard coverage
-        run: bash scripts/check_ci_partitions.sh 2 -p wn-cli --test cli --features test-policy-overrides --locked --profile ci -E 'all()'
+        run: bash scripts/check_ci_partitions.sh count:2 -p wn-cli --test cli --features test-policy-overrides --locked --profile ci -E 'all()'
 
       - name: Archive CLI tests
         run: cargo nextest archive -p wn-cli --test cli --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
@@ -728,7 +732,7 @@ jobs:
           shared-key: relay-runtime
 
       - name: Verify relay runtime shard coverage
-        run: bash scripts/check_ci_partitions.sh 2 -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile ci -E 'binary(relay_runtime)'
+        run: bash scripts/check_ci_partitions.sh count:2 -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile ci -E 'binary(relay_runtime)'
 
       - name: Archive relay runtime tests
         run: cargo nextest archive -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
@@ -885,7 +889,7 @@ jobs:
           shared-key: simulator-tests
 
       - name: Verify simulator smoke shard coverage
-        run: bash scripts/check_ci_partitions.sh 2 -p cgka-conformance-simulator --locked --profile ci -E "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)"
+        run: bash scripts/check_ci_partitions.sh count:2 -p cgka-conformance-simulator --locked --profile ci -E "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)"
 
       - name: Archive default-feature simulator tests
         run: cargo nextest archive -p cgka-conformance-simulator --locked --profile ci --archive-file simulator.tar.zst
