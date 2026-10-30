@@ -1,13 +1,6 @@
 //! The observed-operation combinator (#2627): begin a product observation, run the work, then
 //! finish with the outcome a rule picks from its result. It is what replaces a public method's
 //! `_unobserved` twin.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "#2627 PR 8 converts the `_unobserved` operation pairs to this combinator"
-    )
-)]
 
 use super::{ProductAnalytics, ProductFamily, ProductObservation, ProductUnit};
 use cgka_traits::SendAcceptDisposition;
@@ -16,7 +9,7 @@ use cgka_traits::SendAcceptDisposition;
 /// `cancelled`. With diagnostics off it holds no observation: its work still runs and nothing is
 /// recorded.
 #[must_use = "an observed operation runs nothing until it is given its work"]
-pub(crate) struct ObservedOperation(Option<ProductObservation>);
+pub struct ObservedOperation(Option<ProductObservation>);
 
 impl ProductAnalytics {
     pub(crate) fn observed(
@@ -31,18 +24,14 @@ impl ProductAnalytics {
 
 impl ObservedOperation {
     /// Run `work`, then finish with the outcome `rule` picks from its result.
-    pub(crate) fn run<T>(
-        self,
-        work: impl FnOnce() -> T,
-        rule: impl FnOnce(&T) -> &'static str,
-    ) -> T {
+    pub fn run<T>(self, work: impl FnOnce() -> T, rule: impl FnOnce(&T) -> &'static str) -> T {
         let output = work();
         self.finish(&output, rule);
         output
     }
 
     /// Await `work`, then finish with the outcome `rule` picks from its result.
-    pub(crate) async fn run_async<T>(
+    pub async fn run_async<T>(
         self,
         work: impl Future<Output = T>,
         rule: impl FnOnce(&T) -> &'static str,
@@ -65,7 +54,7 @@ pub fn success_or_failure<T, E>(result: &Result<T, E>) -> &'static str {
 }
 
 /// `confirmed` or `failure`: Welcome redelivery.
-pub(crate) fn confirmed_or_failure<T, E>(result: &Result<T, E>) -> &'static str {
+pub fn confirmed_or_failure<T, E>(result: &Result<T, E>) -> &'static str {
     if result.is_ok() {
         "confirmed"
     } else {
@@ -75,7 +64,7 @@ pub(crate) fn confirmed_or_failure<T, E>(result: &Result<T, E>) -> &'static str 
 
 /// A send's outcome: `confirmed`, `pending` or `unknown` by how the engine accepted it, or
 /// `rejected`.
-pub(crate) fn send_outcome<T, E>(
+pub fn send_outcome<T, E>(
     result: &Result<T, E>,
     accepted: impl FnOnce(&T) -> SendAcceptDisposition,
 ) -> &'static str {
