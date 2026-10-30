@@ -177,11 +177,12 @@ for reconnect/backoff and relay status mechanics.
   go out as late input and plans are ignored until a new count arms the group; a plan older than the last applied is
   ignored, and a fence nothing holds ends at once. A fence holds only what is still in the replay buffer: never
   call back a frame already handed off (a queued or borrowed native batch, a draining hand-off); it goes on as late
-  input, as at expiry, and the range stays owed. A hand-off that rejoins the buffer for an arrival drops its
-  placement pin. Held frames stay under the replay buffer bounds, so overflow is loss, and wait on no paging.
-  `placed()` stays strict; only the recorder's `placed_apart_from_fences` passes held frames, and `fence_held_since`
-  caps the plane's cursor seal at the oldest held frame its restart floor does not cover. With fencing off, every
-  changed predicate reduces to its old form.
+  input, as at expiry, and the range stays owed. A hand-off that rejoins the buffer keeps its placement pin until its
+  next hand-off; while a fence holds it there, that pin is exempt (`held_pins`), but a pin on a copy still out never
+  is. Held frames stay under the replay buffer bounds, so overflow is loss, and wait on no paging. `placed()` stays
+  strict; only the recorder's `placed_apart_from_fences` passes held frames, and `fence_held_since` caps the plane's
+  cursor seal at the oldest held frame its restart floor does not cover. With fencing off, every changed predicate
+  reduces to its old form.
 - Record each REQ's filter `since` and the routes it selects (`NostrSubscription::delivery_routes`) in its SDK
   account context before the REQ goes out, find it by subscription id when the REQ closes, and keep a closed
   REQ's floors for the rest of the context's life: routing is content-keyed, and a closed REQ's buffered or

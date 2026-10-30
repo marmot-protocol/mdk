@@ -261,7 +261,12 @@ impl AccountReplayCoverage {
                                 .events
                                 .values()
                                 .all(|event| held_placed && group.holds(event))
-                            && group.placements == 0
+                            && group.placements
+                                == if held_placed {
+                                    self.held_pins(group_id, group)
+                                } else {
+                                    0
+                                }
                             && !self.native_group_pending(group_id)
                             && !self
                                 .outbox

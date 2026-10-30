@@ -3863,6 +3863,9 @@ struct GroupReplay {
     /// The fence on its live frames, from the count or plan that began it
     /// until it is spent (see `replay_fence`).
     fence: Option<replay_fence::GroupFence>,
+    /// Hand-offs that rejoined the buffer, each keeping its placement pin
+    /// until its next hand-off: a fence that holds one there exempts its pin.
+    restored: HashSet<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -4415,7 +4418,7 @@ impl AccountReplayCoverage {
         self.flushing
             || self.buffered_items != self.fence_held_items()
             || self.native_held().0 != 0
-            || !self.unplaced.is_empty()
+            || self.unplaced_pending()
             || self.groups.values().any(|group| {
                 group.streams.values().any(|stream| {
                     matches!(
@@ -4442,7 +4445,9 @@ impl AccountReplayCoverage {
                 return false;
             };
             grouped = true;
-            if (self.ingress.is_none() && group.placements != 0) || !self.request_ready(group, id) {
+            if (self.ingress.is_none() && group.placements != self.held_pins(group_id, group))
+                || !self.request_ready(group, id)
+            {
                 return false;
             }
             let mut route = None;
@@ -5189,19 +5194,8 @@ impl AccountReplayCoverage {
                 .as_slice()
                 .try_into()
                 .expect("validated draining event id");
-            // Buffered again, it is no placement: the next hand-off pins it
-            // anew, and a fence that holds it meanwhile leaves it unpending.
-            if let Some(groups) = self.unplaced.get_mut(&id)
-                && groups.remove(group_id)
-            {
-                if groups.is_empty() {
-                    self.unplaced.remove(&id);
-                }
-                if let Some(group) = self.groups.get_mut(group_id) {
-                    group.placements -= 1;
-                }
-            }
             let group = self.groups.entry(group_id.clone()).or_default();
+            group.restored.insert(id);
             if group.ready_history.insert(id) {
                 match group.events.entry(id) {
                     std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -5430,6 +5424,7 @@ impl AccountReplayCoverage {
             group.events.clear();
             group.live.clear();
             group.ready_history.clear();
+            group.restored.clear();
             group.placements = placements.get(id).copied().unwrap_or(0);
         }
         self.outbox.clear();

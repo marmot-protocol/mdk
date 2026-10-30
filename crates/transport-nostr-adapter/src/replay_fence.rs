@@ -32,8 +32,10 @@
 //!   as at the fence's deadline, and the range stays owed.
 //! - **One group.** A fence holds its own group's frames only. They count
 //!   neither in the account's pending admission nor against other groups'
-//!   placement, so other groups' live boundaries, tails and ingest go on.
-//!   Held frames stay in the replay buffer under its bounds: overflow is loss.
+//!   placement, so other groups' live boundaries, tails and ingest go on. A
+//!   hand-off that rejoined the buffer keeps its placement pin, which a fence
+//!   that holds it there exempts in the same way. Held frames stay in the
+//!   replay buffer under its bounds: overflow is loss.
 //!
 //! Nothing enables fencing before the switch-over (mdk#2660 PR 5g), so until
 //! then no group is ever fenced and every path below behaves as before.
@@ -107,6 +109,7 @@ impl GroupReplay {
             }
             self.live.clear();
             self.ready_history.clear();
+            self.restored.clear();
             return self.events.drain().collect();
         };
         let released = self
@@ -115,7 +118,7 @@ impl GroupReplay {
             .filter(|(_, event)| event.delivery.message.timestamp.0 < from)
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        released
+        let released = released
             .into_iter()
             .map(|id| {
                 for stream in self.streams.values_mut() {
@@ -128,7 +131,10 @@ impl GroupReplay {
                     self.events.remove(&id).expect("released event is buffered"),
                 )
             })
-            .collect()
+            .collect();
+        let events = &self.events;
+        self.restored.retain(|id| events.contains_key(id));
+        released
     }
 }
 
@@ -148,6 +154,45 @@ impl AccountReplayCoverage {
                     .count()
             })
             .sum()
+    }
+
+    /// Placement pins a fence exempts in `group`: those of hand-offs that
+    /// rejoined its buffer and that it holds there. Such a frame is held, not
+    /// placed; a pin on a copy still out is never exempt.
+    pub(super) fn held_pins(&self, group_id: &GroupId, group: &GroupReplay) -> usize {
+        if group.held_from().is_none() {
+            return 0;
+        }
+        group
+            .restored
+            .iter()
+            .filter(|id| self.held_pin(group_id, group, id))
+            .count()
+    }
+
+    fn held_pin(&self, group_id: &GroupId, group: &GroupReplay, id: &[u8; 32]) -> bool {
+        group.restored.contains(id)
+            && group.holds_id(id)
+            && self
+                .unplaced
+                .get(id)
+                .is_some_and(|groups| groups.contains(group_id))
+    }
+
+    /// Whether a placement pin is pending: one a fence exempts is not.
+    pub(super) fn unplaced_pending(&self) -> bool {
+        if !self.fencing {
+            return !self.unplaced.is_empty();
+        }
+        self.unplaced.iter().any(|(id, groups)| {
+            groups.is_empty()
+                || groups.iter().any(|group_id| {
+                    !self
+                        .groups
+                        .get(group_id)
+                        .is_some_and(|group| self.held_pin(group_id, group, id))
+                })
+        })
     }
 
     /// When the next fence gives up.
@@ -885,8 +930,10 @@ mod tests {
         );
     }
 
-    /// A hand-off that rejoins the buffer is no longer a placement: once a
-    /// lower plan holds it there, the account's admission is not pending.
+    /// A hand-off that rejoins the buffer keeps its pin until its next
+    /// hand-off, but once a lower plan holds it there it is held, not placed:
+    /// the account's admission is not pending, and its request's boundaries
+    /// are admitted.
     #[tokio::test]
     async fn a_restored_hand_off_a_fence_covers_is_not_pending() {
         let (mut coverage, id, _) = fenced_coverage(true);
@@ -908,14 +955,62 @@ mod tests {
         assert!(coverage.draining_rejoins(&outgoing));
         coverage.restore_draining(VecDeque::from([outgoing]));
         coverage.flushing = false;
-        assert_eq!(coverage.groups[&group_id(0)].placements, 0);
+        assert!(
+            !coverage.request_groups_placed(&id, true),
+            "pinned and unheld"
+        );
 
         coverage.apply_fence_plan(&plan(&coverage, &[(0, 120)]));
         assert_eq!(coverage.fence_held_items(), 3);
         assert!(!coverage.admission_pending(), "held frames, not placements");
+        assert!(coverage.request_groups_placed(&id, true));
+        assert!(!coverage.request_groups_placed(&id, false));
+        // A new count's boundary is admitted past the held pin.
+        coverage.restart_relay(
+            RelayIndex(2),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+            None,
+            None,
+        );
+        coverage.record_eose(&id, RelayIndex(2), 0);
+        assert!(coverage.endpoint_deadlines[&id][&RelayIndex(2)].boundary_admitted);
         coverage.apply_fence_plan(&plan(&coverage, &[]));
         assert_eq!(released(&mut coverage), vec![(0, 150), (0, 160), (0, 300)]);
         assert_eq!(coverage.groups[&group_id(0)].placements, 3);
+    }
+
+    /// Only a hand-off that rejoined the buffer has its pin exempted: a held
+    /// history copy of a frame whose first copy is still out leaves that
+    /// copy's pin pending.
+    #[tokio::test]
+    async fn a_held_copy_leaves_a_pin_still_out_pending() {
+        let (mut coverage, id, _) = fenced_coverage(true);
+        let (tx, _rx) = mpsc::channel(8);
+        replay(&mut coverage, &id, &[(0, 150)], &tx);
+        coverage.apply_fence_plan(&plan(&coverage, &[]));
+        assert_eq!(released(&mut coverage), vec![(0, 150)]);
+        coverage.restart_relay(
+            RelayIndex(2),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+            None,
+            None,
+        );
+        coverage.record_stored_event(&id, RelayIndex(2), 150);
+        coverage
+            .stage_delivery(
+                delivery(0, 150, 1, &id, 1),
+                Some(RelayIndex(2)),
+                ReplayInput::History,
+                &tx,
+            )
+            .unwrap();
+        coverage.record_eose(&id, RelayIndex(2), 0);
+        assert_eq!(held_from(&coverage, 0), Some(SINCE));
+        assert_eq!(coverage.fence_held_items(), 1);
+        assert!(coverage.admission_pending(), "the first copy is still out");
+        assert!(!coverage.request_groups_placed(&id, true));
     }
 
     /// A fence holds its frames for order, not for completeness: a clamped
