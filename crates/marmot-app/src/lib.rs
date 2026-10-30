@@ -153,6 +153,7 @@ mod startup_diagnostics;
 pub use startup_diagnostics::{
     NativeStartupObservation, NativeStartupOutcome, NativeStartupSnapshot, NativeStartupStage,
 };
+mod stickers;
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
 mod wiring;
@@ -205,6 +206,11 @@ pub use runtime::{
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
+pub use stickers::{
+    AppSticker, AppStickerAsset, AppStickerImportResult, AppStickerPack, AppStickerRef,
+    AppStickerSyncResult, parse_sticker_pack_input, sticker_ref_from_message,
+    sticker_ref_from_tags,
+};
 pub use storage_sqlite::{
     CHAT_LIST_DRAFT_PREVIEW_CHARS, ChatListDraftPreview, ChatListRowActions, ChatPinState,
     ChatPresentationVersion, ConversationOpenError, ConversationPresentation,
@@ -621,6 +627,10 @@ pub struct MarmotApp {
     /// In-memory view of the persisted per-kind authoring floors; see
     /// `sign_replaceable_identity_event`.
     replaceable_identity_created_at: Arc<Mutex<HashMap<(String, u64), u64>>>,
+    /// Per-account serialization for public sticker-pack/install mutations.
+    /// The mutex values are lifecycle-only; protocol truth and pending intent
+    /// remain in the account SQLCipher database.
+    sticker_mutation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1696,6 +1706,7 @@ impl MarmotApp {
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
+            sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1798,6 +1809,7 @@ impl MarmotApp {
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
+            sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

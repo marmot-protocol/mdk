@@ -1,5 +1,5 @@
 //! Small state shared with this account's other devices (mdk#2628 item 4.3):
-//! each chat's read position, pin, mute and archive state. See migration 0142
+//! each chat's read position, pin, mute and archive state. See migration 0161
 //! for the columns.
 //!
 //! Items hold the account's winning value; this device's own chat state stays

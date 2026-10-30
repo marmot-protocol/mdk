@@ -4,7 +4,7 @@
 
 ### Breaking changes
 
-- Migration 0142 advances account storage to schema 142 (mdk#2628 item 4.3).
+- Migration 0161 advances account storage to schema 161 (mdk#2628 item 4.3).
   It adds `small_state_items`, one row per chat and item (`read`, `pin`,
   `mute`, `archive`) holding the value the account's devices agree on, what
   this device last observed of it and whether its siblings are still owed it,
@@ -516,6 +516,10 @@ is unsupported. marmot-app also rekeys its databases once to raw SQLCipher keys
 
 ### Fixed
 
+- Sticker migrations run after the private KeyPackage schema, so upgrades
+  from schema `0140` create the pack and asset-history tables.
+- Winning sticker-pack replacements refresh asset URLs and metadata for an
+  unchanged exact hash. Older pack events cannot revert the replacement URL.
 - The timeline's modifier lookups (edits, reactions, deletions, reports), and
   the deleted-reaction and poll-vote queries, write their constant event kind
   into the SQL instead of binding it, so each kind keeps one cached statement.

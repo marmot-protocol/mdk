@@ -2,7 +2,7 @@
 //! withdrawal a feature acts on (mdk#2628). The engine withdraws a message by
 //! its message id alone (an own send's transport id, a received message's
 //! content id), so this is how the app tells which feature's message it was.
-//! See migration 0142 for the columns.
+//! See migration 0161 for the columns.
 
 use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};

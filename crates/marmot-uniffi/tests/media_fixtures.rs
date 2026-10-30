@@ -78,6 +78,7 @@ fn projected_outcome(tag: &[String], source_epoch: u64) -> MediaAttachmentOutcom
         message_id_hex: "aa".repeat(32),
         sender: "bb".repeat(32),
         plaintext: "caption".to_owned(),
+        tags: Vec::new(),
         kind: 9,
         source_epoch: Some(source_epoch),
         media: Some(serde_json::json!({ "imeta": [tag] })),

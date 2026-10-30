@@ -1,4 +1,4 @@
-//! Migration 0142: small state shared with this account's other devices
+//! Migration 0161: small state shared with this account's other devices
 //! (mdk#2628 item 4.3).
 //!
 //! - `small_state_items`: one row per chat and item (`read`, `pin`, `mute`,

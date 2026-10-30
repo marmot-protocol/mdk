@@ -175,6 +175,21 @@ pub enum MarmotStatus {
     /// aggregate reason `marmot_account_devices_activation` reports. It never
     /// names which members or devices hold the group back.
     AccountDevicesActivationRefused = 110,
+    /// Sticker data failed validation: pack metadata, a reference, a link,
+    /// or downloaded bytes that do not match the exact hash, MIME type, or
+    /// dimensions. Retrying the same input cannot succeed.
+    InvalidSticker = 111,
+    /// The sticker pack, or the exact `(pack, shortcode, plaintext hash)`
+    /// asset, is not known locally and could not be resolved.
+    StickerNotFound = 112,
+    /// A sticker relay or Blossom operation did not complete. Local intent is
+    /// kept; retry when connectivity returns.
+    StickerNetwork = 113,
+    /// Signal sticker import was refused or failed. Import is refused before
+    /// any network call while its fetch cannot be pinned.
+    StickerImport = 114,
+    /// Signal sticker import is not available for external-signing accounts.
+    StickerImportUnsupported = 115,
 }
 
 thread_local! {
@@ -268,6 +283,11 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::EmptyPassphrase => MarmotStatus::EmptyPassphrase,
         MarmotKitError::EncryptionFailed { .. } => MarmotStatus::EncryptionFailed,
         MarmotKitError::Io { .. } => MarmotStatus::Io,
+        MarmotKitError::InvalidSticker { .. } => MarmotStatus::InvalidSticker,
+        MarmotKitError::StickerNotFound => MarmotStatus::StickerNotFound,
+        MarmotKitError::StickerNetwork { .. } => MarmotStatus::StickerNetwork,
+        MarmotKitError::StickerImport { .. } => MarmotStatus::StickerImport,
+        MarmotKitError::StickerImportUnsupported => MarmotStatus::StickerImportUnsupported,
         MarmotKitError::Runtime { .. } => MarmotStatus::Runtime,
         MarmotKitError::ExternalSignerUnavailable { .. } => MarmotStatus::ExternalSignerUnavailable,
         MarmotKitError::ExternalSignerMismatch => MarmotStatus::ExternalSignerMismatch,
@@ -573,6 +593,17 @@ mod tests {
             MarmotKitError::GroupUnrecoverableRepairRequired {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::InvalidSticker {
+                details: "d".into(),
+            },
+            MarmotKitError::StickerNotFound,
+            MarmotKitError::StickerNetwork {
+                details: "d".into(),
+            },
+            MarmotKitError::StickerImport {
+                details: "d".into(),
+            },
+            MarmotKitError::StickerImportUnsupported,
             MarmotKitError::Runtime {
                 details: "d".into(),
             },
@@ -581,7 +612,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            101,
+            106,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -637,6 +668,10 @@ mod tests {
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
             79
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::StickerImportUnsupported) as i32,
+            115
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockPublicationUncertain) as i32,
