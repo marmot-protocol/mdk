@@ -67,6 +67,37 @@ pub struct WelcomeDeliveryIndex {
     pub tracked_ids: Vec<MessageId>,
 }
 
+/// Owed Welcomes and staged Welcome ids from one pass over the message store.
+#[derive(Debug, Default)]
+pub struct OutboundWelcomeWork {
+    /// Delivery-aware Welcomes still awaiting acknowledgement, as
+    /// [`Engine::outstanding_sent_welcomes`] lists them.
+    pub owed: Vec<(GroupId, TransportMessage)>,
+    /// Welcomes staged with an unconfirmed commit. Each becomes owed if its
+    /// commit confirms, or is retired if it rolls back.
+    pub staged: Vec<MessageId>,
+    /// Groups the pass did not read because they are not live (unhydrated
+    /// or quarantined). [`Engine::outbound_welcome_work_in`] reads one once
+    /// it is.
+    pub unread_groups: Vec<GroupId>,
+}
+
+/// Where one retained outbound Welcome stands for delivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutboundWelcomeStatus {
+    /// Not deliverable yet: staged with its unconfirmed commit, or in a
+    /// group that is not live (unhydrated or quarantined).
+    Waiting,
+    /// Owed and deliverable now.
+    Owed {
+        group_id: GroupId,
+        message: TransportMessage,
+    },
+    /// Nothing is left to send: delivered, withdrawn, retired with its
+    /// commit, or not a delivery-aware Welcome.
+    Settled,
+}
+
 /// What [`Engine::withdraw_sent_welcome`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WelcomeWithdrawal {
@@ -3386,15 +3417,90 @@ impl<S: StorageProvider> Engine<S> {
     pub fn outstanding_sent_welcomes(
         &self,
     ) -> Result<Vec<(GroupId, TransportMessage)>, EngineError> {
-        let mut welcomes = Vec::new();
-        self.visit_welcome_records(&[MessageState::Sent], |group_id, _, _, payload| {
-            if let StoredMessagePayload::OutboundWelcome(message) = payload
-                && matches!(message.envelope, TransportEnvelope::Welcome { .. })
-            {
-                welcomes.push((group_id.clone(), message));
+        Ok(self.outbound_welcome_work()?.owed)
+    }
+
+    /// [`Self::outstanding_sent_welcomes`], plus the ids of Welcomes still
+    /// staged with their commits, from the same pass. A restart uses it to
+    /// deliver what is owed and to watch what may become owed.
+    pub fn outbound_welcome_work(&self) -> Result<OutboundWelcomeWork, EngineError> {
+        let mut work = OutboundWelcomeWork::default();
+        for group_id in self.storage.list_groups()? {
+            if self.ensure_group_live(&group_id).is_err() {
+                work.unread_groups.push(group_id);
+                continue;
             }
-        })?;
-        Ok(welcomes)
+            self.read_outbound_welcome_work(&group_id, &mut work)?;
+        }
+        Ok(work)
+    }
+
+    /// [`Self::outbound_welcome_work`] for one group, or `None` while the
+    /// group is not live.
+    pub fn outbound_welcome_work_in(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<OutboundWelcomeWork>, EngineError> {
+        if self.ensure_group_live(group_id).is_err() {
+            return Ok(None);
+        }
+        let mut work = OutboundWelcomeWork::default();
+        self.read_outbound_welcome_work(group_id, &mut work)?;
+        Ok(Some(work))
+    }
+
+    fn read_outbound_welcome_work(
+        &self,
+        group_id: &GroupId,
+        work: &mut OutboundWelcomeWork,
+    ) -> Result<(), EngineError> {
+        self.visit_group_welcome_records(group_id, &[MessageState::Sent], |id, _, payload| {
+            match payload {
+                StoredMessagePayload::OutboundWelcome(message)
+                    if matches!(message.envelope, TransportEnvelope::Welcome { .. }) =>
+                {
+                    work.owed.push((group_id.clone(), message));
+                }
+                StoredMessagePayload::StagedInviteWelcome { .. } => work.staged.push(id),
+                _ => {}
+            }
+        })
+    }
+
+    /// Where the retained outbound Welcome `id` stands for delivery. A
+    /// missing row is settled: there is nothing this engine owes under it.
+    pub fn outbound_welcome_status(
+        &self,
+        id: &MessageId,
+    ) -> Result<OutboundWelcomeStatus, EngineError> {
+        let record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(OutboundWelcomeStatus::Settled),
+            Err(error) => return Err(EngineError::Storage(error)),
+        };
+        if record.state != MessageState::Sent {
+            return Ok(OutboundWelcomeStatus::Settled);
+        }
+        // A quarantined group may recover, and an unhydrated one hydrates.
+        if self.ensure_group_live(&record.group_id).is_err() {
+            return Ok(OutboundWelcomeStatus::Waiting);
+        }
+        // A `Sent` row that cannot be read may still be staged: wait.
+        let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+            return Ok(OutboundWelcomeStatus::Waiting);
+        };
+        Ok(match payload {
+            StoredMessagePayload::StagedInviteWelcome { .. } => OutboundWelcomeStatus::Waiting,
+            StoredMessagePayload::OutboundWelcome(message)
+                if matches!(message.envelope, TransportEnvelope::Welcome { .. }) =>
+            {
+                OutboundWelcomeStatus::Owed {
+                    group_id: record.group_id,
+                    message,
+                }
+            }
+            _ => OutboundWelcomeStatus::Settled,
+        })
     }
 
     /// IDs of every delivery-aware or explicitly staged outbound Welcome
@@ -3448,15 +3554,27 @@ impl<S: StorageProvider> Engine<S> {
             if self.ensure_group_live(&group_id).is_err() {
                 continue;
             }
-            for record in self
-                .storage
-                .list_messages_in_states(&group_id, states, EpochId(0))?
-            {
-                let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
-                    continue;
-                };
-                visit(&group_id, record.id, record.state, payload);
-            }
+            self.visit_group_welcome_records(&group_id, states, |id, state, payload| {
+                visit(&group_id, id, state, payload)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn visit_group_welcome_records(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        mut visit: impl FnMut(MessageId, MessageState, StoredMessagePayload),
+    ) -> Result<(), EngineError> {
+        for record in self
+            .storage
+            .list_messages_in_states(group_id, states, EpochId(0))?
+        {
+            let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+                continue;
+            };
+            visit(record.id, record.state, payload);
         }
         Ok(())
     }
