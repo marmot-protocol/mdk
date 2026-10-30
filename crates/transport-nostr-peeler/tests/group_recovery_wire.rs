@@ -212,6 +212,23 @@ async fn recovery_unmarked_dispatch() {
             message: request()
         }
     );
+    let opened = NostrMlsPeeler::new()
+        .with_welcome_signer(receiver)
+        .peel_account_gift_wrap(&message)
+        .await
+        .unwrap();
+    assert!(matches!(
+        &opened,
+        transport_nostr_peeler::AccountGiftWrap::GroupRecovery(_)
+    ));
+    let (peeled, provenance) = opened.into_welcome().unwrap();
+    assert!(provenance.is_none());
+    assert!(peeled.sender.is_none());
+    assert!(peeled.group_id.is_none());
+    assert!(matches!(
+        peeled.content,
+        cgka_traits::PeeledContent::GroupRecovery { .. }
+    ));
 }
 
 #[tokio::test]

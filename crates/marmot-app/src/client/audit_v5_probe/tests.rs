@@ -133,6 +133,8 @@ async fn blocked_inbox_demux() {
         }),
         slot: Arc::new(Mutex::new(PeelSlot::default())),
         storage: storage.clone(),
+        #[cfg(feature = "unreleased-device-pairing")]
+        pairing: None,
     };
     let welcome = from
         .wrap_welcome_with_metadata(
@@ -1203,6 +1205,120 @@ impl Scenario {
             }
         }
     }
+}
+
+#[cfg(feature = "unreleased-device-pairing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pairing_inbox_audit_metrics() {
+    use marmot_pairing::{CancelReason, PairingCancel, PairingMessage, SessionId};
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        for capture in [true, false] {
+            let mut scenario = Scenario::new().await;
+            #[cfg(feature = "product-analytics-export")]
+            {
+                scenario.alice.app.product_analytics =
+                    crate::product_analytics::test_product_collector();
+                scenario
+                    .alice
+                    .app
+                    .set_usage_diagnostics_consent(true)
+                    .unwrap();
+            }
+            if !capture {
+                scenario
+                    .alice
+                    .app
+                    .set_audit_log_settings(AuditLogSettings { enabled: false })
+                    .unwrap();
+                scenario.alice.audit_v5_probe = None;
+            }
+            let before = scenario
+                .alice
+                .audit_v5_probe
+                .as_ref()
+                .map(|probe| probe.rows.len());
+            let account = scenario.alice.app.account_home().account("alice").unwrap();
+            let signer = scenario
+                .alice
+                .app
+                .account_signer_for_summary(&account)
+                .unwrap();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let message = transport_nostr_adapter::pairing::wrap_pairing_message(
+                signer.as_nostr_signer(),
+                &PairingMessage::Cancel(PairingCancel {
+                    session_id: SessionId::new([0x53; 32]),
+                    reason: CancelReason::Timeout,
+                }),
+                now,
+            )
+            .await
+            .unwrap()
+            .to_transport_message()
+            .unwrap();
+
+            // The engine still refuses the pairing rumor. Its private kind
+            // survives that error before any app outcome is available, even
+            // without an armed audit capture or an enabled pairing inbox.
+            let slot = Arc::new(Mutex::new(PeelSlot::default()));
+            let peeler = ProbePeeler {
+                inner: NostrMlsPeeler::new().with_welcome_signer_arc(signer.as_nostr_signer()),
+                slot: slot.clone(),
+                storage: scenario
+                    .alice
+                    .app
+                    .account_storage("alice")
+                    .unwrap()
+                    .app_storage(),
+                pairing: None,
+            };
+            assert!(peeler.peel_welcome(&message).await.is_err());
+            let (private_control, completion) = slot.lock().unwrap().take();
+            assert!(private_control);
+            assert!(completion.is_none());
+
+            let summary = scenario
+                .alice
+                .ingest_received_delivery(cgka_traits::TransportDelivery {
+                    account_id: scenario.alice.runtime.self_id(),
+                    group_id_hint: None,
+                    message,
+                    received_at: cgka_traits::transport::Timestamp(now),
+                    source: cgka_traits::TransportDeliverySource {
+                        transport: cgka_traits::transport::TransportSource("nostr".into()),
+                        plane: cgka_traits::TransportDeliveryPlane::AccountInbox,
+                        endpoint: None,
+                        subscription_id: None,
+                        wire: None,
+                    },
+                })
+                .await
+                .unwrap();
+            assert!(summary.joined_groups.is_empty());
+            if let Some(before) = before {
+                assert_eq!(
+                    scenario.alice.audit_v5_probe.as_ref().unwrap().rows.len(),
+                    before
+                );
+            }
+            #[cfg(feature = "product-analytics-export")]
+            assert!(
+                scenario
+                    .alice
+                    .app
+                    .product_analytics
+                    .test_payloads()
+                    .iter()
+                    .all(|event| event["eventName"] != "mdk_welcome_summary")
+            );
+        }
+    })
+    .await
+    .expect("bounded pairing control audit and analytics scenario");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
