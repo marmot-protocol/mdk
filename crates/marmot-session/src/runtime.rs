@@ -3960,20 +3960,21 @@ where
                 // behind an unrelated transport backoff in the same group.
                 return Ok(None);
             }
+            if matches!(fanout.mls_state(), FanoutMlsState::Confirmed)
+                && !fanout.pending_post_confirmation_welcomes().is_empty()
+            {
+                let Some(delay) = self
+                    .welcome_retry_delay_ms(fanout.pending_post_confirmation_welcomes(), now_ms)?
+                else {
+                    return Ok(None);
+                };
+                earliest = Some(earliest.map_or(delay, |prior: u64| prior.min(delay)));
+            }
             if outcome.outstanding_targets == 0 {
                 if matches!(fanout.mls_state(), FanoutMlsState::Pending(_)) {
                     return Ok(None);
                 }
-                if !fanout.pending_post_confirmation_welcomes().is_empty() {
-                    let Some(delay) = self.welcome_retry_delay_ms(
-                        fanout.pending_post_confirmation_welcomes(),
-                        now_ms,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    earliest = Some(earliest.map_or(delay, |prior: u64| prior.min(delay)));
-                }
+
                 continue;
             }
             for index in fanout.outstanding_target_indexes() {
