@@ -196,8 +196,10 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
     ) -> Option<Box<dyn CompareRelay>>;
 
     /// Route one fetched event to this account (the adapter's
-    /// `reconciled_deliveries`); nothing when it routes nowhere or is invalid.
-    async fn deliveries(&self, relay: &str, event: Event) -> Vec<TransportDelivery>;
+    /// `reconciled_deliveries`). An invalid event routes nowhere and is
+    /// dropped. `None` when a valid event routes to nothing yet: the account's
+    /// installed subscriptions lag its routes, so its slice stays owed.
+    async fn deliveries(&self, relay: &str, event: Event) -> Option<Vec<TransportDelivery>>;
 
     /// Hand one staged delivery to the account's recovered-ingest path, as
     /// one worker command. `None` once the worker is gone; an error is its

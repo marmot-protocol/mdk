@@ -16,7 +16,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -39,20 +39,26 @@ use crate::client::sync::{RecoveredDelivery, TRANSPORT_RECONCILIATION_QUANTUM};
 use crate::client::{AppClient, InventoryWrite};
 use crate::relay_caps::RelayCapsCache;
 
-/// How long a stopping worker waits for its runner to wind down before it
-/// aborts the task. The runner holds no storage, so an abort loses nothing.
+/// How long a stopping worker serves its runner's last turns, the preempted
+/// quantum's settlement among them, before it aborts the task. The runner
+/// holds no storage, so an abort loses nothing durable: an unsettled quantum
+/// leaves its attempt charged and its unstaged bytes uncharged.
 const STOP_WAIT: Duration = Duration::from_secs(1);
 
 type ClientFuture<'c, T> = Pin<Box<dyn Future<Output = T> + Send + 'c>>;
 type ClientTurn = Box<dyn for<'c> FnOnce(&'c mut AppClient) -> ClientFuture<'c, ()> + Send>;
 
 /// One runner turn, waiting for the account's client. Not `Debug`.
-pub(crate) struct RunnerTurn(ClientTurn);
+pub(crate) struct RunnerTurn {
+    run: ClientTurn,
+    /// It ingests a staged delivery, so it may leave effects to publish.
+    ingests: bool,
+}
 
 impl RunnerTurn {
     /// Run the turn on `client`, the account's own.
     pub(crate) async fn serve(self, client: &mut AppClient) {
-        (self.0)(client).await;
+        (self.run)(client).await;
     }
 }
 
@@ -63,28 +69,53 @@ pub(crate) struct AccountRunnerHost {
     allow_loopback: bool,
     relay_plane: MarmotRelayPlane,
     account_id: MemberId,
-    /// The account's relay pool, read when the runner is built.
-    relay_client: Option<NostrSdkRelayClient>,
+    /// The account's relay pool. An account whose transport has not
+    /// registered yet has none, so each debt turn looks again until it does.
+    relay_client: Mutex<Option<NostrSdkRelayClient>>,
 }
 
 impl AccountRunnerHost {
     /// Send `run` to the client's owner and wait for its answer. `None` once
     /// nobody serves the account's turns, or when `run` answers nothing.
-    async fn on_client<T, F>(&self, run: F) -> Option<T>
+    async fn on_client<T, F>(&self, ingests: bool, run: F) -> Option<T>
     where
         T: Send + 'static,
         F: for<'c> FnOnce(&'c mut AppClient) -> ClientFuture<'c, Option<T>> + Send + 'static,
     {
         let (reply, answer) = oneshot::channel();
-        let turn = RunnerTurn(Box::new(move |client| {
-            Box::pin(async move {
-                if let Some(value) = run(client).await {
-                    let _ = reply.send(value);
-                }
-            })
-        }));
+        let turn = RunnerTurn {
+            run: Box::new(move |client| {
+                Box::pin(async move {
+                    if let Some(value) = run(client).await {
+                        let _ = reply.send(value);
+                    }
+                })
+            }),
+            ingests,
+        };
         self.turns.send(turn).await.ok()?;
         answer.await.ok()
+    }
+
+    fn relay_client(&self) -> std::sync::MutexGuard<'_, Option<NostrSdkRelayClient>> {
+        self.relay_client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Look for the account's relay pool if the runner has none yet. It
+    /// reads the plane's account contexts and dials nothing.
+    async fn find_relay_client(&self) {
+        if self.relay_client().is_some() {
+            return;
+        }
+        let found = self
+            .relay_plane
+            .account_history_relay_client(&self.account_id)
+            .await;
+        if found.is_some() {
+            *self.relay_client() = found;
+        }
     }
 
     fn sdk_relay(
@@ -95,7 +126,7 @@ impl AccountRunnerHost {
     ) -> Option<SdkSweepRelay> {
         let endpoint = RelayUrl::parse(relay).ok()?;
         Some(SdkSweepRelay::new(
-            self.relay_client.as_ref()?,
+            self.relay_client().as_ref()?,
             endpoint,
             caps,
             request_timeout,
@@ -110,7 +141,7 @@ impl RunnerHost for AccountRunnerHost {
         F: FnOnce(&WorkerTurn<'_>) -> T + Send + 'static,
         T: Send + 'static,
     {
-        self.on_client(move |client| {
+        self.on_client(false, move |client| {
             Box::pin(async move {
                 let app = runner_storage(client)?;
                 Some(turn(&WorkerTurn {
@@ -127,7 +158,10 @@ impl RunnerHost for AccountRunnerHost {
         F: FnOnce(&DebtTurn<'_>) -> T + Send + 'static,
         T: Send + 'static,
     {
-        self.on_client(move |client| {
+        // Every quantum begins in a debt turn, so its sweep finds the pool
+        // once the account's transport has registered one.
+        self.find_relay_client().await;
+        self.on_client(false, move |client| {
             Box::pin(async move {
                 let app = runner_storage(client)?;
                 let now = unix_now();
@@ -172,34 +206,52 @@ impl RunnerHost for AccountRunnerHost {
         Some(Box::new(self.sdk_relay(relay, caps, request_timeout)?))
     }
 
-    async fn deliveries(&self, relay: &str, event: Event) -> Vec<TransportDelivery> {
+    async fn deliveries(&self, relay: &str, event: Event) -> Option<Vec<TransportDelivery>> {
         let Ok(event) = NostrTransportEvent::from_nostr_event(&event) else {
-            return Vec::new();
+            return Some(Vec::new());
         };
         let fetched = NostrRelayEvent {
             endpoint: TransportEndpoint(relay.to_owned()),
             subscription_id: None,
             event,
         };
-        self.relay_plane
+        // The adapter routes by the subscriptions it has installed, which
+        // trail the routes a debt turn read: a valid event from a relay the
+        // account was just given routes nowhere until they catch up.
+        match self
+            .relay_plane
             .recovered_deliveries_for_account(&self.account_id, fetched)
             .await
-            .unwrap_or_else(|_| {
+        {
+            Ok(deliveries) if deliveries.is_empty() => {
                 tracing::debug!(
                     target: TARGET,
                     method = "deliveries",
-                    "recovery runner could not route a fetched event"
+                    "recovery runner fetched an event no installed subscription routes yet"
                 );
-                Vec::new()
-            })
+                None
+            }
+            Ok(deliveries) => Some(deliveries),
+            // Only an invalid event fails to route.
+            Err(_) => {
+                tracing::debug!(
+                    target: TARGET,
+                    method = "deliveries",
+                    "recovery runner dropped an invalid fetched event"
+                );
+                Some(Vec::new())
+            }
+        }
     }
 
     async fn admit_staged(
         &self,
         delivery: TransportDelivery,
     ) -> Option<Result<Admitted, &'static str>> {
-        self.on_client(move |client| Box::pin(async move { Some(admit(client, &delivery).await) }))
-            .await
+        self.on_client(true, move |client| {
+            Box::pin(async move { Some(admit(client, &delivery).await) })
+        })
+        .await
     }
 
     fn now_seconds(&self) -> u64 {
@@ -269,10 +321,11 @@ impl AppClient {
             turns: turns_tx,
             relay_caps: self.app.relay_caps.clone(),
             allow_loopback: self.app.config.allow_loopback_relay_endpoints,
-            relay_client: self
-                .relay_plane
-                .account_history_relay_client(&account_id)
-                .await,
+            relay_client: Mutex::new(
+                self.relay_plane
+                    .account_history_relay_client(&account_id)
+                    .await,
+            ),
             relay_plane: self.relay_plane.clone(),
             account_id,
         };
@@ -419,19 +472,40 @@ impl SpawnedRunner {
         }
     }
 
+    /// A turn the runner has already sent, if any.
+    pub(crate) fn ready_turn(&mut self) -> Option<RunnerTurn> {
+        self.turns.try_recv().ok()
+    }
+
     /// Wake it, steer it, or wait for one pass of it, off the worker.
     pub(crate) fn handle(&self) -> &RecoveryRunnerHandle {
         &self.handle
     }
 
-    /// Stop the runner: a quantum in flight is preempted, a turn it waits on
-    /// answers `None`, and the task gets a moment to end before it is
-    /// aborted.
-    pub(crate) async fn stop(mut self) {
+    /// Stop the runner while `client`, the account's own, is still open. A
+    /// quantum in flight is preempted and settles on it: its storage turns
+    /// are served until the task ends or [`STOP_WAIT`] passes, then a turn
+    /// still waiting answers `None` and the task is aborted. An admission is
+    /// refused, so nothing is ingested after the worker's last publication;
+    /// its event stays staged for the next runner. Once storage is closed
+    /// (`shutdown_and_close`) nothing settles: the attempt stays charged.
+    pub(crate) async fn stop(mut self, client: &mut AppClient) {
         self.handle.shutdown();
+        let deadline = tokio::time::Instant::now() + STOP_WAIT;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut self.task => break,
+                () = tokio::time::sleep_until(deadline) => break,
+                Some(turn) = self.turns.recv() => {
+                    if !turn.ingests {
+                        turn.serve(client).await;
+                    }
+                }
+            }
+        }
         self.turns.close();
         while self.turns.try_recv().is_ok() {}
-        let _ = tokio::time::timeout(STOP_WAIT, &mut self.task).await;
     }
 }
 

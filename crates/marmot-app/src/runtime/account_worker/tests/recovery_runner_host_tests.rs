@@ -1,8 +1,8 @@
 //! The account worker runs its recovery runner only with the internal
 //! `runner_owns_debt` gate on: the runner spawns with the worker, serves the
-//! account's debt over its own relay pool, answers a pass, and stops with
-//! `shutdown_and_close` even while a quantum waits on its relay. With the gate
-//! off nothing spawns.
+//! account's debt over its own relay pool, answers a pass even while commands
+//! keep the worker busy, and stops with `shutdown_and_close` even while a
+//! quantum waits on its relay. With the gate off nothing spawns.
 
 use super::*;
 use crate::runtime::account_worker::recovery_credits::{MAX_CONCURRENT_JOBS, available_credits};
@@ -231,6 +231,54 @@ async fn the_workers_runner_serves_debt_and_answers_a_pass() {
     assert!(report.is_some(), "the worker's runner answers a pass");
     worker.runtime.shutdown_and_close().await.unwrap();
     assert_eq!(available_credits(&worker.credits), MAX_CONCURRENT_JOBS);
+}
+
+/// Commands that never stop arriving do not starve the runner: the worker
+/// serves one of its turns each pass of its loop, so a pass still ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_worker_still_serves_its_runner() {
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let started = crate::unix_now_seconds();
+    let worker = GatedWorker::start(&url, true).await;
+    worker.served_after(started).await;
+
+    let commands = worker
+        .runtime
+        .accounts()
+        .worker_commands(&worker.label)
+        .await
+        .unwrap();
+    let flood = tokio::spawn(async move {
+        loop {
+            let (respond, _) = oneshot::channel();
+            let command = AccountWorkerCommand::UnhydratedGroupCount { respond };
+            if commands.send(command).await.is_err() {
+                break;
+            }
+        }
+    });
+    // Owe an earlier day, so the pass has quanta to run under the flood.
+    worker
+        .app
+        .account_storage(&worker.label)
+        .unwrap()
+        .app_storage()
+        .widen_recovery_coverage_goals(
+            std::slice::from_ref(&worker.route),
+            crate::unix_now_seconds() - 24 * HOUR,
+        )
+        .unwrap();
+    let report = timeout(SETTLE, worker.pass().await)
+        .await
+        .expect("the pass ends while commands keep arriving")
+        .unwrap()
+        .expect("the worker's runner answers");
+    assert!(report.quanta > 0, "the pass ran the newly owed day");
+    flood.abort();
+    worker.runtime.shutdown_and_close().await.unwrap();
 }
 
 /// `shutdown_and_close` stops the runner while its quantum waits on a relay

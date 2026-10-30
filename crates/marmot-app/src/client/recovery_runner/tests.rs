@@ -872,6 +872,8 @@ struct TestHost {
     admitted: AdmittedLog,
     /// Events the engine keeps no trace of.
     no_trace: Mutex<BTreeSet<Vec<u8>>>,
+    /// Events no installed subscription routes yet.
+    unrouted: Mutex<BTreeSet<Vec<u8>>>,
     /// Events whose ingest fails locally.
     failing_ingests: Mutex<BTreeSet<Vec<u8>>>,
     /// How many seconds of the host's clock each ingest and each debt turn
@@ -944,6 +946,7 @@ impl TestHost {
             counts: Mutex::default(),
             admitted: admitted.clone(),
             no_trace: Mutex::default(),
+            unrouted: Mutex::default(),
             failing_ingests: Mutex::default(),
             ingest_seconds: AtomicU64::new(0),
             debt_turn_seconds: AtomicU64::new(0),
@@ -1087,8 +1090,13 @@ impl RunnerHost for TestHost {
         }))
     }
 
-    async fn deliveries(&self, _relay: &str, event: Event) -> Vec<TransportDelivery> {
-        vec![delivery(&event)]
+    async fn deliveries(&self, _relay: &str, event: Event) -> Option<Vec<TransportDelivery>> {
+        let unrouted = self
+            .unrouted
+            .lock()
+            .unwrap()
+            .contains(event.id.as_bytes().as_slice());
+        (!unrouted).then(|| vec![delivery(&event)])
     }
 
     async fn admit_staged(
@@ -2384,6 +2392,54 @@ async fn recovery_runner_charges_returned_bytes_to_required_units_alone() {
     assert_eq!(usage().attempts, 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_leaves_a_slice_owed_while_its_events_route_nowhere() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let events = every([1; 32], floor, t0, 10 * 60);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(events.clone())
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    // The account was just given the relay: its installed subscriptions do
+    // not route the group there yet.
+    host.unrouted
+        .lock()
+        .unwrap()
+        .extend(events.iter().map(|event| event.id.to_bytes().to_vec()));
+    let (mut runner, _handle) = runner(&host, test_policy());
+    let usage = || account.app.recovery_account_usage(clock.now()).unwrap();
+
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Unanswered);
+    assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+    assert!(
+        !account.debt(&route, RELAY, t0 - 1).is_empty(),
+        "nothing it fetched covers the hour"
+    );
+    assert!(usage().event_bytes > 0, "its bytes are charged");
+
+    // Once the subscriptions catch up, the retry stages and covers it.
+    host.unrouted.lock().unwrap().clear();
+    let due = idle(runner.step().await).expect("the unit is retried");
+    clock.advance_to(due);
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
+    assert_eq!(
+        account.app.staged_recovery_total().unwrap().events,
+        events.len() as u64
+    );
+    assert!(account.debt(&route, RELAY, t0 - 1).is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn recovery_runner_charges_what_a_dropped_request_already_read() {
     const READ: u64 = 4096;
@@ -2607,6 +2663,7 @@ fn recovery_runner_classifies_every_sweep_end() {
     let local = Some(SinkStop::Local);
     let stale = Some(SinkStop::StaleMark);
     let gone = Some(SinkStop::WorkerGone);
+    let unrouted = Some(SinkStop::Unrouted);
     // (end, answered, last reply rate limited, newly covered, sink stop, still
     // owed)
     let cases = [
@@ -2712,6 +2769,14 @@ fn recovery_runner_classifies_every_sweep_end() {
         (
             (End::SinkFailed, true, false, 0, gone, true),
             Outcome::Unanswered,
+        ),
+        (
+            (End::SinkFailed, true, false, 0, unrouted, true),
+            Outcome::Unanswered,
+        ),
+        (
+            (End::SinkFailed, true, false, 9, unrouted, true),
+            Outcome::Advanced,
         ),
         (
             (End::StoreFailed, true, false, 0, None, true),

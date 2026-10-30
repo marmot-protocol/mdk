@@ -34,7 +34,7 @@ use super::{
     runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
 use crate::client::recovery::AttemptGrant;
-use crate::client::recovery_runner::host::next_runner_turn;
+use crate::client::recovery_runner::host::{SpawnedRunner, next_runner_turn};
 use crate::client::{
     CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
     CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
@@ -1038,6 +1038,15 @@ pub(crate) fn spawn_app_runtime_account_worker(
         startup_progress,
         shutdown,
     ))
+}
+
+/// Stop the worker's recovery runner, if it runs one, while `client` is
+/// still the account's: a quantum in flight settles on it
+/// ([`SpawnedRunner::stop`]).
+async fn stop_recovery_runner(runner: &mut Option<SpawnedRunner>, client: &mut AppClient) {
+    if let Some(runner) = runner.take() {
+        runner.stop(client).await;
+    }
 }
 
 async fn run_app_runtime_account_worker(
@@ -2108,6 +2117,15 @@ async fn run_app_runtime_account_worker(
                 continue 'worker;
             }
         }
+        // One recovery runner turn per pass of the loop, as comparison
+        // admission gets one above, so ready commands and live input never
+        // starve the runner (or a credit its quantum holds). What it admits
+        // publishes below.
+        if !client.has_pending_effect_projections()
+            && let Some(turn) = recovery_runner.as_mut().and_then(SpawnedRunner::ready_turn)
+        {
+            turn.serve(&mut client).await;
+        }
         // Unified admission may have advanced native frames as well as the
         // comparison prefix. Publish their committed effects before live input.
         let admitted = client.take_pending_applied_sync_summary();
@@ -2196,12 +2214,14 @@ async fn run_app_runtime_account_worker(
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
                 client.finish_audit_recording();
+                stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
             }
             stop = &mut shutdown => {
                 if stop.is_ok() {
                     client.finish_audit_recording();
                 }
+                stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
             }
             completed = async {
@@ -2293,7 +2313,10 @@ async fn run_app_runtime_account_worker(
                             &mut client,
                         );
                     }
-                    None => break 'worker,
+                    None => {
+                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                        break 'worker;
+                    }
                 }
             }
             // Alternate a command and a ready recovery quantum. A permanently
@@ -2407,7 +2430,10 @@ async fn run_app_runtime_account_worker(
                             );
                         }
                     }
-                    None => break 'worker,
+                    None => {
+                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                        break 'worker;
+                    }
                 }
             }
             // A completed optional retry owes durable admission one turn once
@@ -2782,9 +2808,7 @@ async fn run_app_runtime_account_worker(
                         let transport_account = client.adapter.account_id().clone();
                         // Its turns need this client; the reopened one gets
                         // a runner of its own.
-                        if let Some(runner) = recovery_runner.take() {
-                            runner.stop().await;
-                        }
+                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
                         drop(client);
                         client = loop {
                             let reconnect_wait = shared.observer.performance().observe(RuntimeOp::WorkerReconnectWait);
@@ -3006,8 +3030,8 @@ async fn run_app_runtime_account_worker(
                     }
                 }
             }
-            // The recovery runner's storage turns yield to commands and live
-            // input, as comparison admission does.
+            // An idle worker waits for the runner's next turn here; the
+            // loop's top serves one per pass while other work is ready.
             turn = next_runner_turn(&mut recovery_runner), if !client.has_pending_effect_projections() => {
                 turn.serve(&mut client).await;
             }
@@ -3254,10 +3278,9 @@ async fn run_app_runtime_account_worker(
             }
         }
     }
-    // A quantum in flight is preempted; what it staged stays durable.
-    if let Some(runner) = recovery_runner {
-        runner.stop().await;
-    }
+    // Each exit that still held the client stopped the runner on it; any
+    // other exit's drop aborts the task. What a quantum staged stays durable.
+    drop(recovery_runner);
     // An admission in progress keeps its durable prefix; its debt waits for
     // the next session.
     if let Some(network) = comparison_recovery.and_then(|job| job.network) {

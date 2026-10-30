@@ -58,6 +58,24 @@ pub(super) enum SinkStop {
     StaleMark,
     /// The worker is gone.
     WorkerGone,
+    /// A valid event routed to nothing: the account's installed
+    /// subscriptions lag its routes. Not the relay's fault: the slice stays
+    /// owed until they catch up.
+    Unrouted,
+}
+
+/// Route a slice's events to the account. `None` when any valid one routes
+/// to nothing yet ([`SinkStop::Unrouted`]).
+pub(super) async fn route_events<H: RunnerHost>(
+    host: &H,
+    relay: &str,
+    events: Vec<Event>,
+) -> Option<Vec<TransportDelivery>> {
+    let mut deliveries = Vec::with_capacity(events.len());
+    for event in events {
+        deliveries.extend(host.deliveries(relay, event).await?);
+    }
+    Some(deliveries)
 }
 
 /// What one quantum did, in aggregate.
@@ -206,10 +224,12 @@ impl<H: RunnerHost> SweepSink for StageSink<'_, H> {
         } else {
             self.meter.bytes.swap(0, Ordering::Relaxed)
         };
-        let mut deliveries = Vec::with_capacity(events.len());
-        for event in events {
-            deliveries.extend(self.host.deliveries(&self.plan.key.relay, event).await);
-        }
+        let Some(deliveries) = route_events(self.host, &self.plan.key.relay, events).await else {
+            // Nothing was written: settlement charges these bytes instead.
+            self.meter.bytes.fetch_add(fetched_bytes, Ordering::Relaxed);
+            self.stop = Some(SinkStop::Unrouted);
+            return Err(SweepSinkError);
+        };
         let key = self.plan.key.clone();
         let mark = self.plan.mark;
         let range = RecoveryCoverageRange {
@@ -408,7 +428,10 @@ pub(super) fn classify(
 ) -> RecoveryUnitOutcome {
     use RecoveryUnitOutcome as Outcome;
     let local = match end {
-        SweepEnd::SinkFailed => !matches!(stop, Some(SinkStop::StaleMark | SinkStop::WorkerGone)),
+        SweepEnd::SinkFailed => !matches!(
+            stop,
+            Some(SinkStop::StaleMark | SinkStop::WorkerGone | SinkStop::Unrouted)
+        ),
         SweepEnd::StoreFailed => true,
         _ => false,
     };
@@ -422,7 +445,8 @@ pub(super) fn classify(
         return Outcome::Advanced;
     }
     match end {
-        // A stale mark or a gone worker; a store failure is local, above.
+        // A stale mark, a gone worker or an unrouted event; a store failure
+        // is local, above.
         SweepEnd::SinkFailed | SweepEnd::StoreFailed => Outcome::Unanswered,
         // Every slice was proven, but none newly covered: someone else proved
         // them first, or a loss during the fetch took them back.

@@ -1,9 +1,12 @@
 //! The runner host over a real account: a directly owned client's in-place
-//! pass, and the chokepoints that wake the account's runner.
+//! pass, a spawned runner's stop, and the chokepoints that wake the account's
+//! runner.
 
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::MessageStorage;
-use nostr_relay_builder::MockRelay;
+use nostr_relay_builder::prelude::{BoxedFuture, Filter as RelayFilter, PolicyResult, QueryPolicy};
+use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
+use std::sync::Arc;
 use storage_sqlite::{
     RecoveryCause, SqliteAppStorage, StoredEpochBackfillIntent, TransportReconciliationRoute,
 };
@@ -23,6 +26,14 @@ const DAY: u64 = 24 * HOUR;
 async fn direct_client(gate: bool) -> (tempfile::TempDir, MockRelay, crate::MarmotApp, AppClient) {
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
+    let (dir, app, client) = direct_client_on(url, gate).await;
+    (dir, relay, app, client)
+}
+
+async fn direct_client_on(
+    url: String,
+    gate: bool,
+) -> (tempfile::TempDir, crate::MarmotApp, AppClient) {
     let dir = tempfile::tempdir().unwrap();
     crate::AccountHome::open(dir.path())
         .create_account("alice")
@@ -38,7 +49,34 @@ async fn direct_client(gate: bool) -> (tempfile::TempDir, MockRelay, crate::Marm
         app
     };
     let client = app.client("alice").await.unwrap();
-    (dir, relay, app, client)
+    (dir, app, client)
+}
+
+/// Holds every bounded history request (a sweep's slice carries `until`, a
+/// live REQ does not) until released, and says when one arrives.
+#[derive(Clone, Default)]
+struct HeldSweeps {
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl QueryPolicy for HeldSweeps {
+    fn admit_query<'a>(
+        &'a self,
+        query: &'a RelayFilter,
+        _addr: &'a std::net::SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if query.until.is_some() && query.ids.is_none() {
+                let released = self.release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                self.reached.notify_one();
+                released.await;
+            }
+            PolicyResult::Accept
+        })
+    }
 }
 
 fn group_routes(client: &AppClient) -> Vec<TransportReconciliationRoute> {
@@ -141,6 +179,43 @@ async fn a_direct_clients_next_event_runs_a_pass_on_delivery_loss() {
     let waited = tokio::time::timeout(std::time::Duration::from_secs(5), client.next_event()).await;
     assert!(waited.is_err(), "the loss surfaces no event");
     assert_eq!(passes(&client), 2, "the loss runs one pass");
+}
+
+/// Stopping a spawned runner settles the quantum it preempted on the account's
+/// client: the sweep held at the relay ends unanswered, which gives its
+/// attempt back to the account's hour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_runner_settles_the_quantum_it_preempted() {
+    let hold = HeldSweeps::default();
+    let relay = LocalRelay::new(RelayBuilder::default().query_policy(hold.clone()));
+    relay.run().await.unwrap();
+    let (_dir, app, mut client) = direct_client_on(relay.url().await.to_string(), true).await;
+    client.create_group("held", &[]).await.unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    storage
+        .widen_recovery_coverage_goals(&group_routes(&client), unix_now_seconds() - HOUR)
+        .unwrap();
+    let attempts = || {
+        storage
+            .recovery_account_usage(unix_now_seconds())
+            .unwrap()
+            .attempts
+    };
+    let before = attempts();
+
+    // Serve the runner's turns until its sweep waits on the relay.
+    let mut runner = client.spawn_recovery_runner().await.unwrap();
+    loop {
+        tokio::select! {
+            () = hold.reached.notified() => break,
+            turn = runner.next_turn() => turn.serve(&mut client).await,
+        }
+    }
+    assert_eq!(attempts(), before + 1, "the quantum began");
+
+    runner.stop(&mut client).await;
+    assert_eq!(attempts(), before, "the preempted quantum settled");
+    hold.release.notify_waiters();
 }
 
 /// An idle connected account's in-place passes charge nothing: the live
