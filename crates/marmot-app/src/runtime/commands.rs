@@ -1068,6 +1068,51 @@ impl AccountManager {
         local_account_worker_response(response).await
     }
 
+    pub async fn unrecognized_sign_ins(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::UnrecognizedSignIns { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn answer_sign_in(
+        &self,
+        account_ref: &str,
+        slot_id_hex: &str,
+        response: crate::SignInResponse,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, receiver) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AnswerSignIn {
+                slot_id_hex: slot_id_hex.to_owned(),
+                response,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(receiver).await
+    }
+
+    pub async fn check_sign_ins(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CheckSignIns { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn rename_linked_device(
         &self,
         account_ref: &str,

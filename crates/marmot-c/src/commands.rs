@@ -88,6 +88,7 @@ use crate::types::relay::{
     MarmotAccountRelayLists, MarmotRelayEndpointClassificationList, MarmotRelayHealth,
     MarmotRelayTelemetryRuntimeConfig, MarmotRelayTelemetrySettings,
 };
+use crate::types::sign_in::{MarmotSignInResponse, MarmotUnrecognizedSignInList};
 use crate::types::sticker::{
     MarmotStickerAsset, MarmotStickerImportResult, MarmotStickerPack, MarmotStickerPackList,
     MarmotStickerSyncResult,
@@ -798,6 +799,18 @@ c_cmd! {
     /// `LinkedDevicesChanged` event.
     async fn marmot_rename_linked_device(account_ref: str, slot_id_hex: str, label: str) -> unit = rename_linked_device;
 
+    /// List the sign-ins of this account that this device does not
+    /// recognize, the earliest to appear first. Always empty in release
+    /// builds until the roster's spec lands. Re-read on the
+    /// `UnrecognizedSignInsChanged` event. Free with
+    /// `marmot_unrecognized_sign_in_list_free`.
+    async fn marmot_unrecognized_sign_ins(account_ref: str) -> rec(MarmotUnrecognizedSignInList) = unrecognized_sign_ins;
+
+    /// Check the account's KeyPackage slots for new sign-ins now and write
+    /// the list after the check. A read that reached no relay fails. Free
+    /// with `marmot_unrecognized_sign_in_list_free`.
+    async fn marmot_check_sign_ins(account_ref: str) -> rec(MarmotUnrecognizedSignInList) = check_sign_ins;
+
     /// On a new device: ask a device of this account already signed in to
     /// link this one. Refused in release builds until the pairing and
     /// device-group specs land. Re-read on the `DeviceLinkChanged` event.
@@ -1295,6 +1308,38 @@ c_cmd! {
     /// `now_ms` is the caller's wall clock. Free with
     /// `marmot_retention_sweep_report_free`.
     async fn marmot_sweep_expired_retention(account_ref: str, now_ms: val u64) -> rec(MarmotRetentionSweepReport) = sweep_expired_retention;
+}
+
+/// Answer the unrecognized sign-in in `slot_id_hex`. `response` is a
+/// `MarmotSignInResponse` discriminant: `NotNow` keeps it listed with no
+/// prompt, `Reject` records it as rejected in the device group's roster
+/// (now or once that is possible), and `Dismiss` only ends a prompt another
+/// device already answered. An out-of-range `response` is
+/// `MARMOT_STATUS_INVALID_ARGUMENT`.
+///
+/// # Safety
+/// `client` must be a live handle; `account_ref` and `slot_id_hex` must be
+/// valid NUL-terminated strings. Inputs are borrowed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_answer_sign_in(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    slot_id_hex: *const c_char,
+    response: u32,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let slot = try_arg!(unsafe { required_str(slot_id_hex) });
+        let response = try_arg!(MarmotSignInResponse::from_c(response));
+        deliver_unit(
+            client.block_on(
+                client
+                    .marmot
+                    .answer_sign_in(account, slot, response.to_ffi()),
+            ),
+        )
+    })
 }
 
 /// Parse Markdown text into the display token tree. Infallible: malformed

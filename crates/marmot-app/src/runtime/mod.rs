@@ -1560,6 +1560,15 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's unrecognized sign-ins may have changed: re-read
+    /// `unrecognized_sign_ins`. Fires when a check finds a new sign-in or a
+    /// change in one, after an answer, when the device group's roster
+    /// changes, and once each time the account's worker opens or reconnects.
+    /// Carries no slots, and may fire with no visible change.
+    UnrecognizedSignInsChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
     /// Linking a new device may have changed as this device shows it:
     /// re-read `device_link_snapshot`. Also fires once each time the
     /// account's worker opens or reconnects, which ends any link in
@@ -2493,6 +2502,48 @@ impl MarmotAppRuntime {
     /// `KeyPackageRefreshOverdueChanged`.
     pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
         self.accounts.key_package_refresh_overdue(account_ref).await
+    }
+
+    /// Sign-ins of this account that this device does not recognize, the
+    /// earliest to appear first (mdk#2628 3.2). Each is a fresh, valid
+    /// KeyPackage in a slot neither this device nor its device group's roster
+    /// knows. One that `before_this_device` was signed in before this device
+    /// was; ask whether the user still has it. Any other is new; ask whether
+    /// it was them. Always empty in release builds until the roster's spec
+    /// lands. Refresh on `UnrecognizedSignInsChanged`.
+    pub async fn unrecognized_sign_ins(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
+        self.accounts.unrecognized_sign_ins(account_ref).await
+    }
+
+    /// Answer the unrecognized sign-in in `slot_id_hex`. `NotNow` keeps it
+    /// listed without a prompt; `Reject` records it as not the user's in the
+    /// device group's roster, now or once that is possible; `Dismiss` ends a
+    /// prompt another device already answered. Linking one is device
+    /// pairing's. Refusals are `DeviceGroupRefused` with `sign_in_unknown`,
+    /// `sign_in_answered`, `sign_in_answered_elsewhere`, `sign_in_unanswered`
+    /// (Dismiss before any device answered), or `roster_unsupported`.
+    pub async fn answer_sign_in(
+        &self,
+        account_ref: &str,
+        slot_id_hex: &str,
+        response: crate::SignInResponse,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .answer_sign_in(account_ref, slot_id_hex, response)
+            .await
+    }
+
+    /// Check the account's KeyPackage slots for new sign-ins now, rather than
+    /// at the next scheduled check, and return the list after it. A read that
+    /// reached no relay is `DeviceGroupRefused("key_packages_unreachable")`.
+    pub async fn check_sign_ins(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
+        self.accounts.check_sign_ins(account_ref).await
     }
 
     /// Rename one of this account's devices, this one included, by its

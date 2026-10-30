@@ -2088,6 +2088,7 @@ impl MarmotApp {
             key_package_refresh_overdue: None,
             key_package_refresh_overdue_changed: true,
             sign_in_schedule: Default::default(),
+            unrecognized_sign_ins_changed: true,
             device_link_changed: true,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
