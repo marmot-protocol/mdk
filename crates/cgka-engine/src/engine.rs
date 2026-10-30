@@ -2642,6 +2642,7 @@ impl<S: StorageProvider> Engine<S> {
             if let StoredMessagePayload::StagedInviteWelcome {
                 message,
                 origin_commit_id: staged_origin,
+                ..
             } = payload
                 && staged_origin == *origin_commit_id
                 && matches!(message.envelope, TransportEnvelope::Welcome { .. })
