@@ -391,7 +391,10 @@ reported apart from "answered, nothing new". Each call reports its covered slice
 outcome for the caller's backoff. `SdkSweepRelay` (`sdk` feature) runs it over a relay already in a
 `NostrSdkRelayClient`'s pool. nostr-sdk drops NIP-67 hints, so a client built with `from_builder` reads `more` off
 the wire for the sweep's own REQs, and `more` splits a slice. No hint proves one: `finish` is ignored, since a misread
-`finish` would skip history. Nothing schedules the sweep yet; the recovery runner will (#2660).
+`finish` would skip history. A call cut by its deadline or cancellation interrupts the request in flight rather than
+dropping it: `SdkSweepRelay` cancels it and still reports the event bytes it read, so a caller's byte budget sees the
+cut reply too. A request that has not ended within a second (`INTERRUPT_GRACE`) is dropped. Nothing schedules the
+sweep yet; the recovery runner will (#2660).
 
 ## NIP-77 comparison
 
@@ -400,7 +403,8 @@ window at a time from the oldest end, and fetches each window's difference by id
 under the relay's cap). A window whose relay set reaches the 16,384-item limit may hide more, so it halves. A window
 is certified once every id the relay named is fetched; a call cut by its deadline, its event or byte budget, a
 withheld id or a refusal hands over what it fetched uncertified, so its caller holds those events and the next call
-resumes without fetching them again. `SdkSweepRelay` implements the relay side. The recovery runner (#2660) uses it
+resumes without fetching them again. A cut fetch is interrupted as a sweep's request is, so what it read is reported.
+`SdkSweepRelay` implements the relay side. The recovery runner (#2660) uses it
 for owed ranges where the account already holds events, and for its periodic re-checks of covered history.
 
 ## Run tests

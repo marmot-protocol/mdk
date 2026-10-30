@@ -275,7 +275,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
   reached right after a `rate-limited:` reply settles `RateLimited`. Every event byte a required relay sends is
   charged to the account's rolling hour, cut and discarded replies included; best-effort relays are never charged.
-  The one uncharged reply is the one in flight when a quantum is cut (mdk#2719). Logs carry aggregates only.
+  A quantum cut by its deadline, shutdown or the pass deadline interrupts its request in flight rather than dropping
+  it, so the reply it was reading is charged too (`SweepRelay::interrupt`); an interrupted request is no answer and
+  never clears a rate limit. Logs carry aggregates only.
   A comparison or re-check quantum settles through the same table: its end maps to a sweep end (`compare::verdict`).
   A re-check settles the relay and the account budget but never its unit's retry state, records pass progress only
   under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it
