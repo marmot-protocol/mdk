@@ -3320,28 +3320,62 @@ async fn verified_welcome_repair_survives_the_next_convergence_drain() {
         "an unrecoverable group must refuse sends"
     );
 
-    // (2) The verified repair: the sibling author removes the wedged device
-    // from the fleet's branch and re-invites it with a fresh key package.
+    // (2) The verified repair: refresh the exact wedged leaf atomically on
+    // the fleet's branch using a fresh source-bound recovery grant.
     let device_id = MemberId::new(pad32(&f.local_seed));
-    match creator
-        .send(SendIntent::RemoveMembers {
-            group_id: f.group_id.clone(),
-            members: vec![device_id],
-        })
-        .await
-        .unwrap()
-    {
-        SendResult::GroupEvolution { pending, .. } => {
-            creator.confirm_published(pending).await.unwrap();
-        }
-        other => panic!("expected GroupEvolution, got {other:?}"),
-    }
+    let source = creator
+        .group_recovery_source(
+            &f.group_id,
+            &device_id,
+            &local.own_recovery_key_hash(&f.group_id).unwrap(),
+        )
+        .unwrap();
     let fresh_kp = local.fresh_key_package().await.unwrap();
+    let request_id = [7; 32];
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+    let grant = cgka_traits::group_recovery::GroupRecoveryMessage {
+        group_id: f.group_id.clone(),
+        request_id,
+        expires_at,
+        body: cgka_traits::group_recovery::GroupRecoveryBody::Grant {
+            source: source.clone(),
+            key_package: fresh_kp.clone(),
+            device_signature: vec![],
+        },
+    };
+    let mut invalid = grant.clone();
+    invalid.expires_at = 1;
+    assert!(matches!(
+        local.sign_group_recovery(&f.group_id, &creator.self_id(), &invalid),
+        Err(cgka_traits::EngineError::GroupRecoverySourceMismatch { .. })
+    ));
+    let mut invalid = grant.clone();
+    if let cgka_traits::group_recovery::GroupRecoveryBody::Grant { source, .. } = &mut invalid.body
+    {
+        source.device_key_hash[0] ^= 1;
+    }
+    assert!(matches!(
+        local.sign_group_recovery(&f.group_id, &creator.self_id(), &invalid),
+        Err(cgka_traits::EngineError::GroupRecoverySourceMismatch { .. })
+    ));
+    let device_signature = local
+        .sign_group_recovery(&f.group_id, &creator.self_id(), &grant)
+        .unwrap();
     let welcome = match creator
-        .send(SendIntent::Invite {
+        .send(SendIntent::RecoverMembers {
             group_id: f.group_id.clone(),
-            key_packages: vec![fresh_kp],
-            initial_admins: vec![],
+            members: vec![cgka_traits::group_recovery::GroupMemberRecovery {
+                member: device_id,
+                source,
+                key_package: fresh_kp,
+                request_id,
+                expires_at,
+                device_signature,
+            }],
         })
         .await
         .unwrap()
@@ -3367,7 +3401,7 @@ async fn verified_welcome_repair_survives_the_next_convergence_drain() {
     );
     assert_eq!(
         local.epoch(&f.group_id).unwrap(),
-        EpochId(4),
+        EpochId(3),
         "the repaired device joins the fleet's branch at the re-invite epoch"
     );
     assert_eq!(
@@ -3404,7 +3438,7 @@ async fn verified_welcome_repair_survives_the_next_convergence_drain() {
     );
     assert_eq!(
         local.epoch(&f.group_id).unwrap(),
-        EpochId(4),
+        EpochId(3),
         "the drain must not move the repaired tip"
     );
     assert_ne!(

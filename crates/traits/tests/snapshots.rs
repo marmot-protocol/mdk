@@ -94,6 +94,15 @@ fn snapshot_transport_message_group() {
 }
 
 #[test]
+fn snapshot_recovery_evolution() {
+    let semantic = cgka_traits::GroupEvolutionSemantic::RecoverMembers {
+        request_ids: vec![[51; 32]],
+        source_authenticator_hash: [17; 32],
+    };
+    insta::assert_snapshot!(serde_json::to_string(&semantic).unwrap(), @r###"{"kind":"recover_members","request_ids":[[51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51]],"source_authenticator_hash":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17]}"###);
+}
+
+#[test]
 fn snapshot_recovery_dtos() {
     let source = cgka_traits::GroupRecoverySource {
         epoch: EpochId(7),

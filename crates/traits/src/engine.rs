@@ -24,6 +24,7 @@ use crate::engine_state::PendingStateRef;
 use crate::error::EngineError;
 use crate::group::{Member, ProtocolProfile};
 use crate::group_context::{GroupContext, SecretBytes};
+use crate::group_recovery::{GroupMemberRecovery, GroupRecoverySource};
 use crate::ingest::IngestOutcome;
 use crate::transport::{Timestamp, TransportMessage};
 use crate::transport_adapter::TransportEndpoint;
@@ -155,6 +156,13 @@ pub enum SendIntent {
         /// preserved and these invitees are appended.
         #[serde(default)]
         initial_admins: Vec<MemberId>,
+    },
+    /// Atomically refresh exact member leaves using authenticated, source-bound
+    /// recovery grants. Unlike ordinary intents, this is never queued or
+    /// automatically reissued after branch supersession: obtain fresh grants.
+    RecoverMembers {
+        group_id: GroupId,
+        members: Vec<GroupMemberRecovery>,
     },
     /// Remove existing members from the group.
     RemoveMembers {
@@ -466,6 +474,10 @@ pub enum SendAcceptDisposition {
 pub struct AutoPublish {
     pub msg: TransportMessage,
     pub pending: PendingStateRef,
+    /// Exact retained Welcomes to fan out only after commit confirmation.
+    /// Restarted member recovery must resume these with its immutable commit.
+    #[serde(default)]
+    pub welcomes: Vec<TransportMessage>,
 }
 
 /// Why an application message did not become canonical group output.
@@ -1253,6 +1265,18 @@ pub trait CgkaEngine: Send + Sync {
     /// index. Roster order can diverge from MLS leaf positions after removals
     /// blank leaves in the tree.
     fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, EngineError>;
+
+    /// Bind a recovery challenge to the current authenticated branch and exact
+    /// current leaf whose signing-key SHA256 is `device_key_hash`, owned by
+    /// `member`. Requires a healthy, settled copy and current member-edit
+    /// authority: an admin, or an own-account sibling when account-devices is
+    /// required. The coordinator's own leaf is never a replacement target.
+    fn group_recovery_source(
+        &self,
+        group_id: &GroupId,
+        member: &MemberId,
+        device_key_hash: &[u8; 32],
+    ) -> Result<GroupRecoverySource, EngineError>;
 
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError>;
 

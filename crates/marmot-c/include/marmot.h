@@ -243,6 +243,14 @@ enum MarmotStatus
    * names which members or devices hold the group back.
    */
   MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED = 110,
+  /**
+   * Recovery waits for the source group to settle.
+   */
+  MARMOT_STATUS_GROUP_RECOVERY_UNSETTLED = 111,
+  /**
+   * Restart the authenticated recovery challenge; do not retry the grant.
+   */
+  MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH = 112,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

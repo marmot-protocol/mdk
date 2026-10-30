@@ -28,19 +28,28 @@ use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, Requ
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
+use cgka_traits::group_recovery::{
+    GroupMemberRecovery, GroupRecoveryBody, GroupRecoveryMessage, group_recovery_grant_bytes,
+};
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::maintenance::{
+    DurableGroupEvolution, GroupEvolutionPhase, GroupEvolutionSemantic,
+};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    ConvergencePassStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
-    QueuedOutboundIntent,
+    AccountDeviceSignerStorage, ConvergencePassStorage, GroupStorage, MaintenanceStorage,
+    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    StorageProvider,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
-use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
+use storage_sqlite::{
+    GroupRecoveryPhase, GroupRecoveryRecord, GroupRecoveryRole, SqlCipherKey, SqliteAccountStorage,
+};
 
 mod support;
 use support::proof_signer;
@@ -215,7 +224,10 @@ async fn crash_child_runs_late_commit_convergence() {
         return;
     }
     let path = PathBuf::from(std::env::var_os(DATABASE_ENV).expect("child database path"));
-    if std::env::var(CRASH_POINT_ENV).is_ok_and(|point| point.starts_with("canonical-application-"))
+    if std::env::var(CRASH_POINT_ENV).is_ok_and(|point| point.starts_with("recovery_")) {
+        run_recovery_child(&path).await;
+    } else if std::env::var(CRASH_POINT_ENV)
+        .is_ok_and(|point| point.starts_with("canonical-application-"))
     {
         run_application_child(&path).await;
     } else if std::env::var(CRASH_POINT_ENV)
@@ -1374,5 +1386,829 @@ async fn run_application_child(database: &Path) {
             .advance_convergence_inputs_until_settled(&group, 2_000_000)
             .await
             .unwrap();
+    }
+}
+
+const RECOVERY_COORDINATOR: &[u8] = b"recovery-crash-coordinator";
+const RECOVERY_TARGET: &[u8] = b"recovery-crash-target";
+const RECOVERY_SENT_POINT: &str = "recovery_send_before_parent_journal";
+const RECOVERY_PUBLISHING_POINT: &str = "recovery_parent_publishing_before_fanout";
+const PENDING_REF_RESTART_ENV: &str = "MDK_CGKA_PENDING_REF_RESTART";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecoveryCrashExpected {
+    group_id: GroupId,
+    grant: GroupMemberRecovery,
+    group_before: serde_json::Value,
+    authenticator_before: Vec<u8>,
+    prepared: Option<RecoveryPreparedExpected>,
+    ordinary: Option<(GroupId, TransportMessage)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecoveryPreparedExpected {
+    descriptor: DurableGroupEvolution,
+    msg: TransportMessage,
+    pending: cgka_traits::engine_state::PendingStateRef,
+    welcomes: Vec<TransportMessage>,
+}
+
+#[test]
+fn recovery_send_crash() {
+    run_recovery_parent(RECOVERY_SENT_POINT);
+}
+
+#[test]
+fn recovery_publishing_crash() {
+    run_recovery_parent(RECOVERY_PUBLISHING_POINT);
+}
+
+#[test]
+fn recovery_staging_crash() {
+    run_recovery_parent("recovery_after_staging");
+}
+
+#[test]
+fn recovery_preparing_crash() {
+    run_recovery_parent("recovery_after_preparing");
+}
+
+#[tokio::test]
+async fn recovery_ref_eager_reopen() {
+    run_pending_ref_restart("eager").await;
+}
+
+#[tokio::test]
+async fn recovery_ref_deferred_reopen() {
+    run_pending_ref_restart("deferred").await;
+}
+
+#[tokio::test]
+async fn recovery_ref_before_staging() {
+    run_pending_ref_restart("direct").await;
+}
+
+#[tokio::test]
+async fn recovery_ref_frozen_reopen() {
+    run_pending_ref_restart("fanout").await;
+}
+
+async fn stage_ordinary_restart_group(
+    engine: &mut Engine<SqliteAccountStorage>,
+) -> (GroupId, TransportMessage) {
+    let (group_id, created) = engine
+        .create_group(CreateGroupRequest {
+            name: "ordinary publication before recovery hydration".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(created, SendResult::FoundingGroupCreated { .. }));
+    let (msg, _) = evolution(
+        engine
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    (group_id, msg)
+}
+
+async fn run_pending_ref_restart(mode: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("pending-refs.sqlite3");
+    spawn_crash_child(
+        &database,
+        RECOVERY_SENT_POINT,
+        &[(PENDING_REF_RESTART_ENV, mode)],
+    )
+    .kill_when_ready();
+    let expected: RecoveryCrashExpected =
+        serde_json::from_slice(&std::fs::read(database.with_extension("expected.json")).unwrap())
+            .unwrap();
+    let prepared = expected.prepared.as_ref().unwrap();
+    assert_eq!(prepared.pending.as_u64(), 1);
+    let storage =
+        SqliteAccountStorage::open_encrypted(&database, &SqlCipherKey::new(DATABASE_KEY).unwrap())
+            .unwrap();
+    assert_recovery_pending(&storage, &expected);
+    let frozen_before = storage.list_outbound_fanouts().unwrap();
+    let mut restarted = build_recovery_client(RECOVERY_COORDINATOR, storage.clone());
+    let (ordinary_group, ordinary_msg) = if mode == "direct" {
+        // No seeding or hydration has run: construction itself must reserve
+        // the saved recovery handle before a new group can allocate one.
+        stage_ordinary_restart_group(&mut restarted).await
+    } else {
+        expected.ordinary.clone().unwrap()
+    };
+    let ordinary_authenticator = recovery_mls_group(&storage, &ordinary_group)
+        .epoch_authenticator()
+        .as_slice()
+        .to_vec();
+    restarted.hydrate_stable_groups_from_storage().unwrap();
+    if mode == "eager" {
+        assert_eq!(restarted.unhydrated_group_ids()[0], ordinary_group);
+        restarted.hydrate_all_stored_groups().unwrap();
+    } else {
+        restarted.ensure_hydrated(&ordinary_group).unwrap();
+        restarted.ensure_hydrated(&expected.group_id).unwrap();
+    }
+    assert!(restarted.quarantined_groups().is_empty());
+    let work = restarted.drain_auto_publish();
+    let ordinary_pending = if mode == "direct" {
+        storage
+            .list_group_evolutions_for_group(&ordinary_group)
+            .unwrap()[0]
+            .pending_ref
+            .unwrap()
+    } else {
+        let ordinary = work.iter().find(|item| item.msg == ordinary_msg).unwrap();
+        assert!(ordinary.welcomes.is_empty());
+        ordinary.pending
+    };
+    let recovery_pending = if mode == "fanout" {
+        let frozen_after = restarted.outbound_fanouts().unwrap();
+        assert_eq!(frozen_after, frozen_before);
+        assert_eq!(frozen_after.len(), 1);
+        assert_eq!(
+            frozen_after[0].pending_origin_message_id(),
+            Some(&prepared.msg.id)
+        );
+        assert_eq!(
+            frozen_after[0].pending_post_confirmation_welcomes(),
+            prepared.welcomes
+        );
+        assert!(!work.iter().any(|item| item.msg == prepared.msg));
+        frozen_after[0].pending_ref().unwrap()
+    } else {
+        let recovery = work.iter().find(|item| item.msg == prepared.msg).unwrap();
+        assert_eq!(recovery.welcomes, prepared.welcomes);
+        recovery.pending
+    };
+    assert_eq!(recovery_pending, prepared.pending);
+    assert_ne!(ordinary_pending, recovery_pending);
+    assert!(restarted.outstanding_sent_welcomes().unwrap().is_empty());
+    restarted.confirm_published(ordinary_pending).await.unwrap();
+    let ordinary = recovery_mls_group(&storage, &ordinary_group);
+    assert!(ordinary.pending_commit().is_none());
+    assert_ne!(
+        ordinary.epoch_authenticator().as_slice(),
+        ordinary_authenticator
+    );
+    assert_recovery_pending(&storage, &expected);
+    assert_eq!(
+        storage.group_evolution(&prepared.descriptor.id).unwrap(),
+        Some(prepared.descriptor.clone()),
+        "acknowledging A must not confirm or rebind B's evolution"
+    );
+    assert!(restarted.outstanding_sent_welcomes().unwrap().is_empty());
+    for welcome in &prepared.welcomes {
+        assert!(restarted.stored_sent_welcome(&welcome.id).is_err());
+    }
+    restarted.confirm_published(recovery_pending).await.unwrap();
+    assert!(
+        recovery_mls_group(&storage, &expected.group_id)
+            .pending_commit()
+            .is_none()
+    );
+    assert_eq!(
+        storage
+            .group_evolution(&prepared.descriptor.id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        GroupEvolutionPhase::Confirmed
+    );
+    assert_eq!(
+        restarted.outstanding_sent_welcomes().unwrap(),
+        vec![(expected.group_id.clone(), prepared.welcomes[0].clone())]
+    );
+    let target_storage = SqliteAccountStorage::open_encrypted(
+        database.with_extension("target.sqlite3"),
+        &SqlCipherKey::new(DATABASE_KEY).unwrap(),
+    )
+    .unwrap();
+    let mut target = build_recovery_client(RECOVERY_TARGET, target_storage.clone());
+    target.hydrate_all_stored_groups().unwrap();
+    assert!(
+        target
+            .join_welcome(prepared.welcomes[0].clone())
+            .await
+            .is_err()
+    );
+    let offer = target
+        .pending_group_rejoins_for(Some(&expected.group_id))
+        .unwrap()
+        .pop()
+        .unwrap();
+    target
+        .confirm_group_rejoin(&offer.message_id, &offer.rejoin.unwrap().local_state_token)
+        .await
+        .unwrap();
+    assert_eq!(
+        recovery_mls_group(&target_storage, &expected.group_id)
+            .epoch_authenticator()
+            .as_slice(),
+        recovery_mls_group(&storage, &expected.group_id)
+            .epoch_authenticator()
+            .as_slice()
+    );
+}
+
+fn build_recovery_client(
+    seed: &[u8],
+    storage: SqliteAccountStorage,
+) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
+        .identity(identity(seed))
+        .account_identity_proof_signer(proof_signer(seed))
+        .feature_registry(self_remove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+fn recovery_mls_group(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+) -> openmls::group::MlsGroup {
+    openmls::group::MlsGroup::load(
+        storage.mls_storage(),
+        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+    )
+    .unwrap()
+    .unwrap()
+}
+
+fn assert_recovery_pending(storage: &SqliteAccountStorage, expected: &RecoveryCrashExpected) {
+    let group = recovery_mls_group(storage, &expected.group_id);
+    assert_eq!(group.epoch().as_u64(), expected.grant.source.epoch.0);
+    assert_eq!(
+        group.epoch_authenticator().as_slice(),
+        expected.authenticator_before
+    );
+    let pending = group
+        .pending_commit()
+        .expect("actual MLS pending recovery commit");
+    assert_eq!(
+        pending
+            .remove_proposals()
+            .map(|proposal| proposal.remove_proposal().removed().u32())
+            .collect::<Vec<_>>(),
+        vec![expected.grant.source.leaf_index],
+        "the crash fixture must carry an actual exact-leaf removal, not an add-only invite"
+    );
+    assert_eq!(pending.add_proposals().count(), 1);
+}
+
+fn run_recovery_parent(point: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("recovery.sqlite3");
+    spawn_crash_child(&database, point, &[]).kill_when_ready();
+    let expected: RecoveryCrashExpected =
+        serde_json::from_slice(&std::fs::read(database.with_extension("expected.json")).unwrap())
+            .unwrap();
+    let storage =
+        SqliteAccountStorage::open_encrypted(&database, &SqlCipherKey::new(DATABASE_KEY).unwrap())
+            .unwrap();
+    let group_id = &expected.group_id;
+    let descriptors = storage.list_group_evolutions_for_group(group_id).unwrap();
+    assert_eq!(descriptors.len(), 1);
+    let descriptor = &descriptors[0];
+    assert_eq!(descriptor.source_epoch, expected.grant.source.epoch);
+    assert_eq!(
+        descriptor.semantic,
+        GroupEvolutionSemantic::RecoverMembers {
+            request_ids: vec![expected.grant.request_id],
+            source_authenticator_hash: expected.grant.source.epoch_authenticator_hash,
+        }
+    );
+    assert!(
+        storage.list_transport_fanouts().unwrap().is_empty(),
+        "the crash precedes frozen fanout"
+    );
+    let parent_records = storage.list_group_recoveries().unwrap();
+    if point == RECOVERY_PUBLISHING_POINT {
+        assert_eq!(parent_records.len(), 1);
+        let parent = &parent_records[0];
+        assert_eq!(parent.phase, GroupRecoveryPhase::Publishing);
+        assert_eq!(parent.request_id, expected.grant.request_id);
+        assert_eq!(parent.commit_id, descriptor.signed_message_id);
+    } else {
+        assert!(
+            parent_records.is_empty(),
+            "engine durability must not depend on a parent journal"
+        );
+    }
+    let staged_welcomes = storage
+        .list_messages(group_id, EpochId(0))
+        .unwrap()
+        .into_iter()
+        .filter(|record| {
+            StoredMessagePayload::decode(&record.payload)
+                .unwrap()
+                .as_staged_invite_welcome()
+                .is_some()
+        })
+        .collect::<Vec<_>>();
+    if point == "recovery_after_preparing" {
+        assert!(
+            recovery_mls_group(&storage, group_id)
+                .pending_commit()
+                .is_none()
+        );
+        assert!(staged_welcomes.is_empty());
+    } else {
+        assert_recovery_pending(&storage, &expected);
+        assert_eq!(staged_welcomes.len(), 1);
+    }
+
+    let mut restarted = build_recovery_client(RECOVERY_COORDINATOR, storage.clone());
+    restarted.hydrate_all_stored_groups().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    if let Some(prepared) = &expected.prepared {
+        assert_eq!(descriptor, &prepared.descriptor);
+        assert_eq!(descriptor.phase, GroupEvolutionPhase::Prepared);
+        assert_eq!(descriptor.pending_ref, Some(prepared.pending));
+        assert_eq!(
+            descriptor.signed_message_id.as_ref(),
+            Some(&prepared.msg.id)
+        );
+        assert_recovery_pending(&storage, &expected);
+        assert_eq!(
+            storage.group_evolution(&descriptor.id).unwrap().as_ref(),
+            Some(descriptor)
+        );
+        assert_eq!(storage.list_group_recoveries().unwrap(), parent_records);
+        assert!(
+            !restarted
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, GroupEvent::PendingCommitRecovered { .. }))
+        );
+        let mut restored = restarted.drain_auto_publish();
+        assert_eq!(
+            restored.len(),
+            1,
+            "one exact commit is resumed without a parent fanout"
+        );
+        let work = restored.pop().unwrap();
+        assert_eq!(
+            work.pending, prepared.pending,
+            "the original publication handle survives reopen"
+        );
+        assert_eq!(
+            work.msg, prepared.msg,
+            "never regenerate an ambiguous signed commit"
+        );
+        assert_eq!(
+            work.welcomes, prepared.welcomes,
+            "resumed publication carries the exact staged Welcome fanout artifacts"
+        );
+        let signed = storage.get_message(&prepared.msg.id).unwrap();
+        let payload = StoredMessagePayload::decode(&signed.payload).unwrap();
+        assert_eq!(payload.as_exact_transport(), Some(&prepared.msg));
+        assert!(payload.as_openmls_wire().is_some());
+        assert!(restarted.outstanding_sent_welcomes().unwrap().is_empty());
+        assert_eq!(staged_welcomes.len(), prepared.welcomes.len());
+        for (row, welcome) in staged_welcomes.iter().zip(&prepared.welcomes) {
+            assert_eq!(storage.get_message(&row.id).unwrap().payload, row.payload);
+            let payload = StoredMessagePayload::decode(&row.payload).unwrap();
+            assert_eq!(
+                payload.as_staged_invite_welcome(),
+                Some((welcome, &prepared.msg.id))
+            );
+            assert!(
+                restarted.stored_sent_welcome(&welcome.id).is_err(),
+                "a staged Welcome cannot escape before confirmation"
+            );
+        }
+        runtime.block_on(async {
+            restarted.confirm_published(work.pending).await.unwrap();
+            assert!(
+                recovery_mls_group(&storage, group_id)
+                    .pending_commit()
+                    .is_none()
+            );
+            assert_eq!(
+                storage
+                    .group_evolution(&descriptor.id)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                GroupEvolutionPhase::Confirmed
+            );
+            assert_eq!(
+                restarted.outstanding_sent_welcomes().unwrap(),
+                vec![(group_id.clone(), prepared.welcomes[0].clone())]
+            );
+
+            // This fixture raw-signs with a healthy target only to isolate
+            // engine durability. Its Welcome must STILL require active-copy
+            // consent; restoring publication is not authorization to replace it.
+            let target_storage = SqliteAccountStorage::open_encrypted(
+                database.with_extension("target.sqlite3"),
+                &SqlCipherKey::new(DATABASE_KEY).unwrap(),
+            )
+            .unwrap();
+            let mut target = build_recovery_client(RECOVERY_TARGET, target_storage.clone());
+            target.hydrate_all_stored_groups().unwrap();
+            let target_before = target_storage.get_group(group_id).unwrap();
+            assert!(matches!(
+                &target.join_welcome(prepared.welcomes[0].clone()).await,
+                Err(cgka_traits::EngineError::InvalidTransition(error))
+                    if error.from == "ActiveMember" && error.to == "JoinWelcome"
+            ));
+            assert_eq!(target_storage.get_group(group_id).unwrap(), target_before);
+            let mut offers = target.pending_group_rejoins_for(Some(group_id)).unwrap();
+            assert_eq!(offers.len(), 1);
+            let offer = offers.pop().unwrap();
+            target
+                .confirm_group_rejoin(&offer.message_id, &offer.rejoin.unwrap().local_state_token)
+                .await
+                .unwrap();
+            assert_eq!(target.epoch(group_id).unwrap(), descriptor.target_epoch);
+            assert_eq!(
+                recovery_mls_group(&target_storage, group_id)
+                    .epoch_authenticator()
+                    .as_slice(),
+                recovery_mls_group(&storage, group_id)
+                    .epoch_authenticator()
+                    .as_slice(),
+                "the resumed exact Welcome joins the confirmed MLS state"
+            );
+            restarted
+                .mark_sent_welcome_delivered(&prepared.welcomes[0].id)
+                .unwrap();
+            assert!(restarted.outstanding_sent_welcomes().unwrap().is_empty());
+            let SendResult::ApplicationMessage { msg, .. } = restarted
+                .send(SendIntent::AppMessage {
+                    group_id: group_id.clone(),
+                    expected_epoch: None,
+                    payload: app_payload_for(&restarted, b"resumed recovery delivers"),
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("post-recovery application")
+            };
+            assert!(matches!(
+                target.ingest(route(msg, group_id)).await.unwrap(),
+                cgka_traits::IngestOutcome::Processed
+            ));
+        });
+    } else {
+        assert_eq!(descriptor.phase, GroupEvolutionPhase::Preparing);
+        assert!(descriptor.pending_ref.is_none());
+        if point == "recovery_after_staging" {
+            let abandoned_commit = descriptor
+                .signed_message_id
+                .as_ref()
+                .expect("staged commit is linked before the crash");
+            assert_eq!(
+                storage.get_message(abandoned_commit).unwrap().state,
+                MessageState::Failed
+            );
+        } else {
+            assert!(descriptor.signed_message_id.is_none());
+        }
+        assert!(
+            storage
+                .list_group_evolutions_for_group(group_id)
+                .unwrap()
+                .is_empty()
+        );
+        let restored = recovery_mls_group(&storage, group_id);
+        assert!(
+            restored.pending_commit().is_none(),
+            "even a remove-bearing unexposed pending commit must be abandoned"
+        );
+        assert_eq!(
+            restored.epoch_authenticator().as_slice(),
+            expected.authenticator_before
+        );
+        assert_eq!(
+            serde_json::to_value(storage.get_group(group_id).unwrap()).unwrap(),
+            expected.group_before
+        );
+        assert!(restarted.drain_auto_publish().is_empty());
+        assert!(restarted.outstanding_sent_welcomes().unwrap().is_empty());
+        for row in staged_welcomes {
+            let retired = storage.get_message(&row.id).unwrap();
+            assert_eq!(retired.state, MessageState::Failed);
+            assert!(
+                StoredMessagePayload::decode(&retired.payload)
+                    .unwrap()
+                    .as_outbound_welcome()
+                    .is_some()
+            );
+            assert!(restarted.stored_sent_welcome(&row.id).is_err());
+        }
+        // No send returned and no transport/fanout was invoked in this child.
+        // A fresh request/package must complete after atomic abandonment;
+        // the failed unexposed commit must not become a convergence barrier.
+        runtime.block_on(async {
+            let target_storage = SqliteAccountStorage::open_encrypted(
+                database.with_extension("target.sqlite3"),
+                &SqlCipherKey::new(DATABASE_KEY).unwrap(),
+            )
+            .unwrap();
+            let mut target = build_recovery_client(RECOVERY_TARGET, target_storage.clone());
+            target.hydrate_all_stored_groups().unwrap();
+            let mut fresh = expected.grant.clone();
+            fresh.request_id = [42; 32];
+            fresh.key_package = target.fresh_key_package().await.unwrap();
+            let fresh =
+                sign_recovery_crash_grant(&target_storage, group_id, &restarted.self_id(), fresh);
+            let SendResult::GroupEvolution {
+                pending, welcomes, ..
+            } = restarted
+                .send(SendIntent::RecoverMembers {
+                    group_id: group_id.clone(),
+                    members: vec![fresh],
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("recovery retries after unexposed preparation")
+            };
+            let retry = storage.list_group_evolutions_for_group(group_id).unwrap();
+            assert_eq!(retry.len(), 1);
+            assert_ne!(
+                retry[0].id, descriptor.id,
+                "new grant payloads cannot reuse an old descriptor identity"
+            );
+            assert_recovery_pending(&storage, &expected);
+            restarted.confirm_published(pending).await.unwrap();
+            assert!(
+                recovery_mls_group(&storage, group_id)
+                    .pending_commit()
+                    .is_none()
+            );
+            assert_eq!(restarted.epoch(group_id).unwrap(), descriptor.target_epoch);
+            assert_eq!(welcomes.len(), 1);
+            assert_eq!(
+                restarted.outstanding_sent_welcomes().unwrap(),
+                vec![(group_id.clone(), welcomes[0].clone())]
+            );
+        });
+    }
+}
+
+fn sign_recovery_crash_grant(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    coordinator: &MemberId,
+    mut grant: GroupMemberRecovery,
+) -> GroupMemberRecovery {
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_traits::signatures::Signer as _;
+
+    let binding = storage
+        .account_device_signer(&grant.member)
+        .unwrap()
+        .unwrap();
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        cgka_engine::DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    let preimage = group_recovery_grant_bytes(
+        group_id,
+        coordinator,
+        &grant.request_id,
+        grant.expires_at,
+        &grant.source,
+        &grant.key_package,
+    )
+    .unwrap();
+    grant.device_signature = signer.sign(&preimage).unwrap();
+    grant
+}
+
+async fn run_recovery_child(database: &Path) {
+    let key = SqlCipherKey::new(DATABASE_KEY).unwrap();
+    let pending_ref_restart = std::env::var(PENDING_REF_RESTART_ENV).ok();
+    let storage = SqliteAccountStorage::open_encrypted(database, &key).unwrap();
+    let target_storage =
+        SqliteAccountStorage::open_encrypted(database.with_extension("target.sqlite3"), &key)
+            .unwrap();
+    let mut coordinator = build_recovery_client(RECOVERY_COORDINATOR, storage.clone());
+    let mut target = build_recovery_client(RECOVERY_TARGET, target_storage.clone());
+    let (group_id, created) = coordinator
+        .create_group(CreateGroupRequest {
+            name: "durable recovery crash".into(),
+            description: String::new(),
+            members: vec![target.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("current-profile founding group")
+    };
+    let founding = welcomes.remove(0);
+    target.join_welcome(founding.clone()).await.unwrap();
+    coordinator
+        .mark_sent_welcome_delivered(&founding.id)
+        .unwrap();
+    // Make the recovery handle nontrivial: an implementation that allocates
+    // a fresh first handle on hydration must not accidentally pass this test.
+    for _ in 0..if pending_ref_restart.is_some() { 0 } else { 2 } {
+        let (_, pending) = evolution(
+            coordinator
+                .send(SendIntent::SelfUpdate {
+                    group_id: group_id.clone(),
+                })
+                .await
+                .unwrap(),
+        );
+        coordinator.publish_failed(pending).await.unwrap();
+    }
+    let source = coordinator
+        .group_recovery_source(
+            &group_id,
+            &target.self_id(),
+            &target.own_recovery_key_hash(&group_id).unwrap(),
+        )
+        .unwrap();
+    let key_package = target.fresh_key_package().await.unwrap();
+    let request_id = [41; 32];
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3_600;
+    let grant = sign_recovery_crash_grant(
+        &target_storage,
+        &group_id,
+        &coordinator.self_id(),
+        GroupMemberRecovery {
+            member: target.self_id(),
+            source,
+            key_package,
+            request_id,
+            expires_at,
+            device_signature: vec![],
+        },
+    );
+    coordinator
+        .validate_member_recovery(&group_id, &grant)
+        .unwrap();
+    let mut expected = RecoveryCrashExpected {
+        group_id: group_id.clone(),
+        grant: grant.clone(),
+        group_before: serde_json::to_value(storage.get_group(&group_id).unwrap()).unwrap(),
+        authenticator_before: recovery_mls_group(&storage, &group_id)
+            .epoch_authenticator()
+            .as_slice()
+            .to_vec(),
+        prepared: None,
+        ordinary: None,
+    };
+    std::fs::write(
+        database.with_extension("expected.json"),
+        serde_json::to_vec(&expected).unwrap(),
+    )
+    .unwrap();
+    let SendResult::GroupEvolution {
+        msg,
+        pending,
+        welcomes,
+    } = coordinator
+        .send(SendIntent::RecoverMembers {
+            group_id: group_id.clone(),
+            members: vec![grant.clone()],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("remove-and-add recovery evolution")
+    };
+    if pending_ref_restart.is_some() {
+        assert_eq!(pending.as_u64(), 1);
+    } else {
+        assert!(pending.as_u64() > 1);
+    }
+    let mut descriptors = storage.list_group_evolutions_for_group(&group_id).unwrap();
+    assert_eq!(descriptors.len(), 1);
+    expected.prepared = Some(RecoveryPreparedExpected {
+        descriptor: descriptors.pop().unwrap(),
+        msg: msg.clone(),
+        pending,
+        welcomes,
+    });
+    if let Some(mode) = pending_ref_restart.as_deref() {
+        if mode != "direct" {
+            let ordinary = stage_ordinary_restart_group(&mut coordinator).await;
+            // Backfill-first hydration has a deterministic first group even
+            // though the remaining group set is deliberately unordered.
+            storage
+                .delete_transport_group_routes_for_group(&ordinary.0)
+                .unwrap();
+            let route = storage
+                .list_transport_group_routes()
+                .unwrap()
+                .into_iter()
+                .find(|route| route.group_id == group_id)
+                .unwrap();
+            storage
+                .put_transport_group_route(
+                    &route.transport_group_id,
+                    &group_id,
+                    storage.get_group(&group_id).unwrap().epoch,
+                )
+                .unwrap();
+            expected.ordinary = Some(ordinary);
+        }
+        if mode == "fanout" {
+            use cgka_traits::{OutboundFanout, TransportPublishRequest, TransportPublishTarget};
+            let TransportEnvelope::GroupMessage { transport_group_id } = &msg.envelope else {
+                panic!("recovery commit envelope")
+            };
+            let fanout = OutboundFanout::stage_with_post_confirmation_welcomes(
+                TransportPublishRequest {
+                    account_id: coordinator.self_id(),
+                    message: msg.clone(),
+                    target: TransportPublishTarget::Group {
+                        group_id: group_id.clone(),
+                        transport_group_id: transport_group_id.clone(),
+                        endpoints: vec![],
+                    },
+                    required_acks: 1,
+                },
+                Some(pending),
+                Some(group_id.clone()),
+                0,
+                Some(msg.id.clone()),
+                Some(cgka_traits::FanoutPendingKind::GroupEvolution),
+                expected.prepared.as_ref().unwrap().welcomes.clone(),
+            )
+            .unwrap();
+            storage.put_outbound_fanout(&fanout).unwrap();
+        }
+    }
+    std::fs::write(
+        database.with_extension("expected.json"),
+        serde_json::to_vec(&expected).unwrap(),
+    )
+    .unwrap();
+    let point = std::env::var(CRASH_POINT_ENV).unwrap();
+    if point == RECOVERY_PUBLISHING_POINT {
+        storage
+            .put_group_recovery(&GroupRecoveryRecord {
+                group_id: group_id.clone(),
+                request_id,
+                role: GroupRecoveryRole::Coordinator,
+                peer: target.self_id(),
+                leaf_index: grant.source.leaf_index,
+                local_state_token: None,
+                expires_at,
+                retry_at: 0,
+                attempts: 0,
+                phase: GroupRecoveryPhase::Publishing,
+                total_attempts: 0,
+                candidate_set_hash: None,
+                native_epoch: None,
+                observed_epoch: None,
+                remote_rearmed: false,
+                commit_started_at: Some(0),
+                message: GroupRecoveryMessage {
+                    group_id,
+                    request_id,
+                    expires_at,
+                    body: GroupRecoveryBody::Grant {
+                        source: grant.source,
+                        key_package: grant.key_package,
+                        device_signature: grant.device_signature,
+                    },
+                },
+                outbound: None,
+                commit_id: Some(msg.id),
+            })
+            .unwrap();
+    } else {
+        assert_eq!(point, RECOVERY_SENT_POINT);
+    }
+    // Only these two application-owned windows get a test-local pause. The
+    // Preparing windows stop inside the production send path, before return.
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{READY_PREFIX}{point}").unwrap();
+    stdout.flush().unwrap();
+    drop(stdout);
+    loop {
+        std::thread::park();
     }
 }

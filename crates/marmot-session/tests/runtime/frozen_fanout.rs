@@ -1,3 +1,449 @@
+#[tokio::test]
+async fn retained_welcome_retry_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("retained Welcome scheduling key").unwrap();
+    let path = dir.path().join("alice.sqlite");
+    let mut alice = session(&path, &key, b"welcome-retry-alice");
+    let mut bob = session(dir.path().join("bob.sqlite"), &key, b"welcome-retry-bob");
+    let mut carol = session(
+        dir.path().join("carol.sqlite"),
+        &key,
+        b"welcome-retry-carol",
+    );
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "retained Welcome".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group = created.group_id;
+    let PublishWork::GroupCreated { pending, .. } = &created.effects.publish[0] else {
+        panic!("expected group creation");
+    };
+    alice.confirm_published(*pending).await.unwrap();
+    let effects = alice
+        .send(SendIntent::Invite {
+            group_id: group.clone(),
+            key_packages: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let PublishWork::GroupEvolution { welcomes, .. } = &effects.publish[0] else {
+        panic!("expected invite");
+    };
+    assert_eq!(welcomes.len(), 2);
+    let unfinished = welcomes[0].id.clone();
+    let rejected = welcomes[1].clone();
+    let inbox = TransportEndpoint("wss://welcome-retry-inbox.example".into());
+    let endpoint = TransportEndpoint("wss://welcome-retry-group.example".into());
+    let policy = StaticTransportRouting::new(vec![inbox.clone()])
+        .with_inbox_route(bob.self_id(), vec![inbox.clone()])
+        .with_inbox_route(carol.self_id(), vec![inbox.clone()])
+        .with_group_route(
+            group.clone(),
+            group.as_slice().to_vec(),
+            vec![endpoint.clone()],
+        );
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_as(
+        vec![inbox],
+        TransportEndpointFailureKind::RetryableUnavailable,
+    );
+    let wall = Arc::new(TestWallClock::new(100));
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy.clone(),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    // A failed completion persist retains the confirmed parent. The other
+    // recipient's real rejection still persists its own attempt/backoff.
+    runtime.arm_finish_stage_failure(unfinished.clone());
+    let error = runtime.publish_session_effects(effects).await.unwrap_err();
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::Storage(
+            cgka_traits::storage::StorageError::Busy(_)
+        ))
+    ));
+    let fanouts = runtime
+        .session()
+        .outbound_fanouts_for_group(&group)
+        .unwrap();
+    assert_eq!(fanouts.len(), 1);
+    assert!(matches!(fanouts[0].mls_state(), FanoutMlsState::Confirmed));
+    assert_eq!(fanouts[0].outcome().outstanding_targets, 0);
+    assert_eq!(fanouts[0].pending_post_confirmation_welcomes().len(), 2);
+    assert!(runtime.has_pending_outbound_fanouts(&group).unwrap());
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        None
+    );
+    drop(runtime);
+
+    let adapter = RecordingAdapter::default();
+    let mut runtime = AccountDeviceRuntime::new(
+        session(&path, &key, b"welcome-retry-alice"),
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    // Complete only the recipient whose bookkeeping failed. The retained
+    // sibling must now schedule from its rejection, not the accepted commit.
+    let delivered = runtime.redeliver_welcome(&unfinished).await.unwrap();
+    assert!(delivered.welcome_failures.is_empty());
+    assert!(runtime.has_pending_outbound_fanouts(&group).unwrap());
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        Some(30_000)
+    );
+    // A Welcome continuation is not the ordering barrier for a newer Commit.
+    let staged = runtime
+        .session_mut()
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    let PublishWork::GroupEvolution { msg, pending, .. } = &staged.publish[0] else {
+        panic!("expected staged self-update");
+    };
+    let TransportEnvelope::GroupMessage { transport_group_id } = &msg.envelope else {
+        panic!("expected group Commit");
+    };
+    let ready = OutboundFanout::stage(
+        TransportPublishRequest {
+            account_id: runtime.session().self_id(),
+            message: msg.clone(),
+            target: TransportPublishTarget::Group {
+                group_id: group.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint],
+            },
+            required_acks: 1,
+        },
+        Some(*pending),
+        Some(group.clone()),
+        100_001,
+    )
+    .unwrap();
+    runtime.session().put_outbound_fanout(&ready).unwrap();
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        Some(0)
+    );
+    runtime
+        .session()
+        .delete_outbound_fanout(ready.message_id())
+        .unwrap();
+    runtime
+        .session_mut()
+        .publish_failed(*pending)
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        Some(30_000)
+    );
+    wall.set(129);
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        Some(1_000)
+    );
+    assert_eq!(adapter.publishes().len(), 1);
+    wall.set(130);
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        Some(0)
+    );
+    let retried = runtime.resume_outbound_fanouts().await.unwrap();
+    assert!(retried.failures.is_empty());
+    assert!(retried.welcome_failures.is_empty());
+    let publishes = adapter.publishes();
+    assert_eq!(
+        publishes.len(),
+        2,
+        "neither the commit nor delivered sibling is republished"
+    );
+    assert_eq!(publishes[1].message, rejected);
+    assert!(!runtime.has_pending_outbound_fanouts(&group).unwrap());
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+        None
+    );
+    let deliveries = runtime.outstanding_welcome_deliveries().unwrap();
+    assert!(
+        deliveries
+            .iter()
+            .all(|(_, message)| message.id != rejected.id)
+    );
+    runtime.resume_outbound_fanouts().await.unwrap();
+    assert_eq!(adapter.publishes().len(), 2);
+}
+
+#[tokio::test]
+async fn mixed_welcome_retry_cutoff() {
+    for welcome_first in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new("mixed Welcome scheduling key").unwrap();
+        let path = dir.path().join("alice.sqlite");
+        let mut alice = session(&path, &key, b"mixed-retry-alice");
+        let mut bob = session(dir.path().join("bob.sqlite"), &key, b"mixed-retry-bob");
+        let mut carol = session(dir.path().join("carol.sqlite"), &key, b"mixed-retry-carol");
+        let created = alice
+            .create_group(CreateGroupRequest {
+                name: "mixed Welcome retry".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let group = created.group_id;
+        let PublishWork::GroupCreated { pending, .. } = &created.effects.publish[0] else {
+            panic!("expected group creation");
+        };
+        alice.confirm_published(*pending).await.unwrap();
+        let effects = alice
+            .send(SendIntent::Invite {
+                group_id: group.clone(),
+                key_packages: vec![
+                    bob.fresh_key_package().await.unwrap(),
+                    carol.fresh_key_package().await.unwrap(),
+                ],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let PublishWork::GroupEvolution { msg, welcomes, .. } = &effects.publish[0] else {
+            panic!("expected invite");
+        };
+        let commit = msg.clone();
+        assert_eq!(welcomes.len(), 2);
+        let unfinished = welcomes[0].clone();
+        let rejected = welcomes[1].clone();
+        let primary = TransportEndpoint("wss://mixed-retry-primary.example".into());
+        let secondary = TransportEndpoint("wss://mixed-retry-secondary.example".into());
+        let inbox = TransportEndpoint("wss://mixed-retry-inbox.example".into());
+        let policy = StaticTransportRouting::new(vec![inbox.clone()])
+            .with_inbox_route(bob.self_id(), vec![inbox.clone()])
+            .with_inbox_route(carol.self_id(), vec![inbox.clone()])
+            .with_group_route(
+                group.clone(),
+                group.as_slice().to_vec(),
+                vec![primary.clone(), secondary.clone()],
+            );
+        let adapter = RecordingAdapter::default();
+        adapter.fail_endpoints_as(
+            vec![primary, secondary.clone()],
+            TransportEndpointFailureKind::PossiblyExposed,
+        );
+        let wall = Arc::new(TestWallClock::new(100));
+        let mut runtime = AccountDeviceRuntime::new(
+            alice,
+            adapter.clone(),
+            policy.clone(),
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        let first = runtime.publish_session_effects(effects).await.unwrap();
+        assert_eq!(first.unresolved_publishes.len(), 1);
+        assert_eq!(adapter.publishes().len(), 2);
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+            Some(30_000),
+            "unconfirmed Welcomes must not hide the Commit's durable cutoff"
+        );
+
+        // The second Commit attempt confirms MLS, but gives the secondary a
+        // 60-second backoff. A real Welcome completion failure retains both
+        // continuations; its sibling has a persisted 30-second retry cutoff.
+        wall.set(130);
+        adapter.fail_endpoints_as(
+            vec![secondary.clone(), inbox.clone()],
+            TransportEndpointFailureKind::PossiblyExposed,
+        );
+        runtime.arm_finish_stage_failure(unfinished.id.clone());
+        let error = runtime.resume_outbound_fanouts().await.unwrap_err();
+        assert!(matches!(
+            error.as_engine_error(),
+            Some(cgka_traits::EngineError::Storage(
+                cgka_traits::storage::StorageError::Busy(_)
+            ))
+        ));
+        let fanouts = runtime
+            .session()
+            .outbound_fanouts_for_group(&group)
+            .unwrap();
+        assert_eq!(fanouts.len(), 1);
+        assert!(matches!(fanouts[0].mls_state(), FanoutMlsState::Confirmed));
+        assert_eq!(fanouts[0].request().message, commit);
+        assert_eq!(fanouts[0].outcome().accepted_targets, 1);
+        assert_eq!(fanouts[0].outcome().outstanding_targets, 1);
+        assert_eq!(fanouts[0].pending_post_confirmation_welcomes().len(), 2);
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+            None,
+            "unfinished Welcome bookkeeping still needs the ordinary scheduler delay"
+        );
+        drop(runtime);
+
+        let adapter = RecordingAdapter::default();
+        let mut runtime = AccountDeviceRuntime::new(
+            session(&path, &key, b"mixed-retry-alice"),
+            adapter.clone(),
+            policy,
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        let delivered = runtime.redeliver_welcome(&unfinished.id).await.unwrap();
+        assert!(delivered.welcome_failures.is_empty());
+        assert_eq!(adapter.publishes()[0].message, unfinished);
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+            Some(30_000),
+            "the retained Welcome is due at 160, before the secondary at 190"
+        );
+        if !welcome_first {
+            wall.set(140);
+            adapter.fail_endpoints_as(vec![inbox], TransportEndpointFailureKind::PossiblyExposed);
+            let failed = runtime.redeliver_welcome(&rejected.id).await.unwrap();
+            assert_eq!(failed.welcome_failures.len(), 1);
+            assert_eq!(failed.welcome_failures[0].message_id, rejected.id);
+            adapter.fail_endpoints_as(vec![], TransportEndpointFailureKind::PossiblyExposed);
+            assert_eq!(
+                runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+                Some(50_000),
+                "the secondary at 190 precedes the Welcome's new cutoff at 200"
+            );
+        }
+
+        // Stage real newer work without publishing it. The mixed parent, unlike
+        // a Welcome-only continuation, remains the group's ordering barrier.
+        let staged = runtime
+            .session_mut()
+            .send(SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
+            .await
+            .unwrap();
+        let PublishWork::GroupEvolution { msg, pending, .. } = &staged.publish[0] else {
+            panic!("expected staged self-update");
+        };
+        let TransportEnvelope::GroupMessage { transport_group_id } = &msg.envelope else {
+            panic!("expected group Commit");
+        };
+        let newer = OutboundFanout::stage(
+            TransportPublishRequest {
+                account_id: runtime.session().self_id(),
+                message: msg.clone(),
+                target: TransportPublishTarget::Group {
+                    group_id: group.clone(),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: fanouts[0].request().target.endpoints().to_vec(),
+                },
+                required_acks: 1,
+            },
+            Some(*pending),
+            Some(group.clone()),
+            wall.now().0 * 1_000 + 1,
+        )
+        .unwrap();
+        runtime.session().put_outbound_fanout(&newer).unwrap();
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+            Some(if welcome_first { 30_000 } else { 50_000 }),
+            "a later NotAttempted fanout cannot accelerate the mixed parent"
+        );
+        let cutoff = if welcome_first { 160 } else { 190 };
+        wall.set(cutoff - 1);
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+            Some(1_000)
+        );
+        let prior = adapter.publishes().len();
+        wall.set(cutoff);
+        assert_eq!(
+            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+            Some(0)
+        );
+        let retried = runtime.resume_outbound_fanouts().await.unwrap();
+        assert!(retried.failures.is_empty());
+        if welcome_first {
+            let attempts = adapter.publishes();
+            assert_eq!(attempts.len(), prior + 1);
+            assert_eq!(attempts[prior].message, rejected);
+            assert!(retried.pending.is_empty(), "the newer Commit stays blocked");
+            assert_eq!(
+                runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+                Some(30_000)
+            );
+            wall.set(189);
+            assert_eq!(
+                runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+                Some(1_000)
+            );
+            runtime.resume_outbound_fanouts().await.unwrap();
+            assert_eq!(adapter.publishes().len(), prior + 1);
+            wall.set(190);
+            runtime.resume_outbound_fanouts().await.unwrap();
+        }
+        let attempts = adapter.publishes();
+        let target_index = prior + usize::from(welcome_first);
+        assert_eq!(attempts.len(), target_index + 3);
+        assert_eq!(attempts[target_index].message, commit);
+        assert_eq!(attempts[target_index].target.endpoints(), &[secondary]);
+        assert!(
+            attempts[target_index + 1..]
+                .iter()
+                .all(|attempt| attempt.message == *msg)
+        );
+        assert!(!runtime.has_pending_outbound_fanouts(&group).unwrap());
+        if !welcome_first {
+            assert!(
+                runtime
+                    .outstanding_welcome_deliveries()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, message)| message.id == rejected.id)
+            );
+            wall.set(200);
+            let delivered = runtime.redeliver_welcome(&rejected.id).await.unwrap();
+            assert!(delivered.welcome_failures.is_empty());
+            assert_eq!(adapter.publishes().last().unwrap().message, rejected);
+        }
+        assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
+    }
+}
 
 #[derive(Clone, Default)]
 struct CrashDuringFanoutPublishAdapter {
@@ -273,7 +719,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
     .unwrap();
     fanout
         .set_application_message(OutboundApplicationMessage {
- authority: None,
+            authority: None,
             group_id: group_id.clone(),
             app_event_id: "terminal-app-event".into(),
             source_epoch: EpochId(1),
@@ -459,7 +905,11 @@ async fn queued_app_message_with_missing_route_remains_retryable() {
 async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot ordered fanout key").unwrap();
-    let mut alice = session(dir.path().join("alice.sqlite"), &key, b"alice-ordered-fanout");
+    let mut alice = session(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice-ordered-fanout",
+    );
     let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob-ordered-fanout");
     let bob_key_package = bob.fresh_key_package().await.unwrap();
     let created = alice
@@ -618,17 +1068,20 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
     let audit_path = dir.path().join("application-audit.jsonl");
     let open_alice = || {
         let session = session(&alice_path, &key, b"alice-met-quorum-order");
-        session.audit_recorder().swap(Box::new(marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
-            &audit_path,
-            "11".repeat(16),
-            Some("22".repeat(16)),
-            marmot_forensics::v5::Producer {
-                mdk_revision: None,
-                build_profile: marmot_forensics::v5::BuildProfile::Debug,
-                platform: marmot_forensics::v5::Platform::Other,
-                host_build: None,
-            },
-        ).unwrap()));
+        session.audit_recorder().swap(Box::new(
+            marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
+                &audit_path,
+                "11".repeat(16),
+                Some("22".repeat(16)),
+                marmot_forensics::v5::Producer {
+                    mdk_revision: None,
+                    build_profile: marmot_forensics::v5::BuildProfile::Debug,
+                    platform: marmot_forensics::v5::Platform::Other,
+                    host_build: None,
+                },
+            )
+            .unwrap(),
+        ));
         session
     };
     let mut alice = open_alice();
@@ -732,12 +1185,17 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
         newer.mark_attempt_started_at(0, 100_000).unwrap();
         newer.mark_target_accepted(0).unwrap();
         newer.mark_attempt_started_at(1, 100_000).unwrap();
-        newer.record_target_failure(1, TransportEndpointFailure {
-            endpoint: secondary.clone(),
-            reason: "second required acknowledgement unknown".into(),
-            kind: TransportEndpointFailureKind::PossiblyExposed,
-            rejection_category: None,
-        }).unwrap();
+        newer
+            .record_target_failure(
+                1,
+                TransportEndpointFailure {
+                    endpoint: secondary.clone(),
+                    reason: "second required acknowledgement unknown".into(),
+                    kind: TransportEndpointFailureKind::PossiblyExposed,
+                    rejection_category: None,
+                },
+            )
+            .unwrap();
         alice.put_outbound_fanout(&newer).unwrap();
     }
     let convergence_delay = alice
@@ -770,22 +1228,58 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
 
     tokio::time::sleep(Duration::from_millis(convergence_delay.saturating_add(1))).await;
     let held = runtime.advance_convergence(&group_id).await.unwrap();
-    assert_eq!(held.published_app_messages.len(), usize::from(!newer_below_quorum));
-    let early_app_id = held.published_app_messages.first().map(|message| message.message_id.clone());
+    assert_eq!(
+        held.published_app_messages.len(),
+        usize::from(!newer_below_quorum)
+    );
+    let early_app_id = held
+        .published_app_messages
+        .first()
+        .map(|message| message.message_id.clone());
     let early_publishes = adapter.publishes();
-    assert_eq!(early_publishes.len(), if newer_below_quorum { 0 } else { 2 });
+    assert_eq!(
+        early_publishes.len(),
+        if newer_below_quorum { 0 } else { 2 }
+    );
     if let Some(app_id) = &early_app_id {
-        assert!(early_publishes.iter().all(|publish| &publish.message.id == app_id));
-        assert!(early_publishes.iter().any(|publish| publish.target.endpoints() == [healthy.clone()]));
-        assert!(early_publishes.iter().any(|publish| publish.target.endpoints() == [secondary.clone()]));
+        assert!(
+            early_publishes
+                .iter()
+                .all(|publish| &publish.message.id == app_id)
+        );
+        assert!(
+            early_publishes
+                .iter()
+                .any(|publish| publish.target.endpoints() == [healthy.clone()])
+        );
+        assert!(
+            early_publishes
+                .iter()
+                .any(|publish| publish.target.endpoints() == [secondary.clone()])
+        );
     }
     assert!(!runtime.has_pending_convergence_inputs(&group_id).unwrap());
-    assert_eq!(runtime.has_queued_outbound_intents(&group_id).unwrap(), newer_below_quorum);
-    let retained = runtime.session().outbound_fanouts_for_group(&group_id).unwrap();
-    let retained_old = retained.iter().find(|fanout| fanout.message_id() == &older_id).unwrap();
+    assert_eq!(
+        runtime.has_queued_outbound_intents(&group_id).unwrap(),
+        newer_below_quorum
+    );
+    let retained = runtime
+        .session()
+        .outbound_fanouts_for_group(&group_id)
+        .unwrap();
+    let retained_old = retained
+        .iter()
+        .find(|fanout| fanout.message_id() == &older_id)
+        .unwrap();
     assert_eq!(retained_old.request(), older.request());
-    assert_eq!(retained_old.target_status(0), Some(FanoutTargetStatus::Accepted));
-    assert_eq!(retained_old.target_status(1), Some(FanoutTargetStatus::PossiblyExposed));
+    assert_eq!(
+        retained_old.target_status(0),
+        Some(FanoutTargetStatus::Accepted)
+    );
+    assert_eq!(
+        retained_old.target_status(1),
+        Some(FanoutTargetStatus::PossiblyExposed)
+    );
     assert_eq!(
         runtime.outbound_fanout_retry_delay_ms(&group_id).unwrap(),
         Some(30_000),
@@ -803,13 +1297,21 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
         Arc::new(TestMonotonicClock::default()),
         Arc::new(TestRandom::new(0)),
     );
-    assert_eq!(runtime.has_queued_outbound_intents(&group_id).unwrap(), newer_below_quorum);
+    assert_eq!(
+        runtime.has_queued_outbound_intents(&group_id).unwrap(),
+        newer_below_quorum
+    );
     assert_eq!(
         runtime.outbound_fanout_retry_delay_ms(&group_id).unwrap(),
         Some(30_000),
     );
     let deferred = runtime.resume_outbound_fanouts().await.unwrap();
-    assert!(deferred.published_app_messages.iter().all(|published| Some(&published.message_id) == early_app_id.as_ref()));
+    assert!(
+        deferred
+            .published_app_messages
+            .iter()
+            .all(|published| Some(&published.message_id) == early_app_id.as_ref())
+    );
     assert_eq!(adapter.publishes().len(), early_publishes.len());
 
     adapter.fail_endpoints_as(Vec::new(), TransportEndpointFailureKind::PossiblyExposed);
@@ -818,19 +1320,41 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
     let publishes = adapter.publishes();
     assert_eq!(released.published_app_messages.len(), 1);
     let app_id = released.published_app_messages[0].message_id.clone();
-    assert_eq!(publishes.len(), early_publishes.len() + if newer_below_quorum { 4 } else { 2 });
+    assert_eq!(
+        publishes.len(),
+        early_publishes.len() + if newer_below_quorum { 4 } else { 2 }
+    );
     assert_eq!(publishes[early_publishes.len()].message.id, older_id);
-    assert_eq!(publishes[early_publishes.len()].message.payload, older.request().message.payload);
-    assert_eq!(publishes[early_publishes.len()].target.endpoints(), std::slice::from_ref(&secondary));
+    assert_eq!(
+        publishes[early_publishes.len()].message.payload,
+        older.request().message.payload
+    );
+    assert_eq!(
+        publishes[early_publishes.len()].target.endpoints(),
+        std::slice::from_ref(&secondary)
+    );
     if newer_below_quorum {
         assert_eq!(publishes[1].message.id, newer_id);
-        assert_eq!(publishes[1].target.endpoints(), std::slice::from_ref(&secondary));
-        assert!(publishes[2..].iter().all(|publish| publish.message.id == app_id));
+        assert_eq!(
+            publishes[1].target.endpoints(),
+            std::slice::from_ref(&secondary)
+        );
+        assert!(
+            publishes[2..]
+                .iter()
+                .all(|publish| publish.message.id == app_id)
+        );
     } else {
         assert_eq!(early_app_id.as_ref(), Some(&app_id));
         assert_eq!(publishes[early_publishes.len() + 1].message.id, app_id);
-        assert_eq!(publishes[early_publishes.len() + 1].message.payload, early_publishes[0].message.payload);
-        assert_eq!(publishes[early_publishes.len() + 1].target.endpoints(), &[secondary]);
+        assert_eq!(
+            publishes[early_publishes.len() + 1].message.payload,
+            early_publishes[0].message.payload
+        );
+        assert_eq!(
+            publishes[early_publishes.len() + 1].target.endpoints(),
+            &[secondary]
+        );
     }
     assert!(!runtime.has_queued_outbound_intents(&group_id).unwrap());
     runtime
@@ -845,21 +1369,42 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
     assert!(!audit.contains("queued behind met quorum"));
     assert!(!audit.contains("wss://"));
     assert!(!audit.contains(&hex::encode(group_id.as_slice())));
-    let rows = audit.lines().map(|line| {
-        marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
-        serde_json::from_str::<serde_json::Value>(line).unwrap()
-    }).collect::<Vec<_>>();
-    let queued = rows.iter().find(|row| row["event"]["type"] == "send_outcome"
-        && row["event"]["result_kind"] == "queued").expect("queued admission audit");
-    let operation = queued["event"]["record_context"]["operation_ref"].as_str().unwrap();
-    let correlated = rows.iter().filter(|row|
-        row["event"]["record_context"]["operation_ref"].as_str() == Some(operation)
-    ).collect::<Vec<_>>();
-    assert_eq!(correlated.iter().filter(|row| row["event"]["type"] == "send_outcome"
-        && row["event"]["result_kind"] == "application_message").count(), 1);
-    assert_eq!(correlated.iter().filter(|row| row["event"]["type"] == "publish_outcome").count(),
+    let rows = audit
+        .lines()
+        .map(|line| {
+            marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
+            serde_json::from_str::<serde_json::Value>(line).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let queued = rows
+        .iter()
+        .find(|row| {
+            row["event"]["type"] == "send_outcome" && row["event"]["result_kind"] == "queued"
+        })
+        .expect("queued admission audit");
+    let operation = queued["event"]["record_context"]["operation_ref"]
+        .as_str()
+        .unwrap();
+    let correlated = rows
+        .iter()
+        .filter(|row| row["event"]["record_context"]["operation_ref"].as_str() == Some(operation))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        correlated
+            .iter()
+            .filter(|row| row["event"]["type"] == "send_outcome"
+                && row["event"]["result_kind"] == "application_message")
+            .count(),
+        1
+    );
+    assert_eq!(
+        correlated
+            .iter()
+            .filter(|row| row["event"]["type"] == "publish_outcome")
+            .count(),
         if newer_below_quorum { 1 } else { 2 },
-        "queue admission, preparation, first publication and retained retry must share one operation");
+        "queue admission, preparation, first publication and retained retry must share one operation"
+    );
 }
 
 #[tokio::test]
@@ -1039,12 +1584,8 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
         group_id.as_slice().to_vec(),
         vec![endpoint],
     );
-    let mut runtime = AccountDeviceRuntime::new(
-        alice,
-        adapter,
-        policy,
-        RecordingKeyPackages::default(),
-    );
+    let mut runtime =
+        AccountDeviceRuntime::new(alice, adapter, policy, RecordingKeyPackages::default());
     let payload = app_payload_for(&alice_hex, b"only one semantic message");
     let app_event_id = MarmotAppEvent::decode(&payload).unwrap().id;
 
@@ -1061,7 +1602,10 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
     assert!(effects.published_app_messages.is_empty());
     assert_eq!(effects.unresolved_app_messages.len(), 1);
     assert_eq!(effects.unresolved_app_messages[0].group_id, group_id);
-    assert_eq!(effects.unresolved_app_messages[0].app_event_id, app_event_id);
+    assert_eq!(
+        effects.unresolved_app_messages[0].app_event_id,
+        app_event_id
+    );
     assert_eq!(
         effects.unresolved_app_messages[0].message_id,
         transport_event_id
@@ -1266,7 +1810,11 @@ async fn ambiguous_invite_commit_recovery_publishes_its_frozen_welcome() {
         [PendingResolution::Confirmed { .. }]
     ));
     let attempts = adapter.publishes();
-    assert_eq!(attempts.len(), 3, "commit retry must release the frozen Welcome");
+    assert_eq!(
+        attempts.len(),
+        3,
+        "commit retry must release the frozen Welcome"
+    );
     assert_eq!(attempts[1].message, original_commit);
     let recovered_welcome = attempts
         .iter()

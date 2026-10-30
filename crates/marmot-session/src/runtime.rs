@@ -2761,6 +2761,7 @@ where
                                 publish: vec![PublishWork::AutoPublish {
                                     msg: fanout.exact_message,
                                     pending,
+                                    welcomes: Vec::new(),
                                 }],
                                 queued: Vec::new(),
                                 pending_convergence: Vec::new(),
@@ -3427,7 +3428,9 @@ where
         prepared: PreparedSessionCommit,
     ) -> AccountResult<AccountDeviceEffects> {
         let (mut prepared_effects, _welcomes, pending) = prepared.into_parts();
-        prepared_effects.publish.clear();
+        prepared_effects.publish.retain(|work| {
+            !matches!(work, PublishWork::GroupEvolution { pending: own, .. } | PublishWork::GroupCreated { pending: own, .. } if *own == pending)
+        });
 
         let mut output = AccountDeviceEffects::default();
         let mut queue = VecDeque::new();
@@ -3776,20 +3779,23 @@ where
                 let outcome = fanout.outcome();
                 outcome.outstanding_targets > 0
                     || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                    || !fanout.pending_post_confirmation_welcomes().is_empty()
                     || (outcome.accepted_targets > 0 && fanout.application_message().is_some())
             }))
     }
 
-    /// Return the earliest durable retry cutoff for an incomplete frozen
-    /// fanout in `group_id`.
+    /// Return the earliest durable retry cutoff up to the first incomplete
+    /// network fanout, including earlier retained Welcome publications.
     ///
     /// `None` means the group has no network retry cutoff to honor. It may
     /// still have local-only work, such as acknowledgement cleanup for an
-    /// accepted application-message fanout; callers should schedule that on
-    /// their ordinary retry delay. A zero delay means at least one exact event
+    /// accepted application-message fanout or Welcome preparation without a
+    /// stored attempt cutoff; callers should schedule that on their ordinary
+    /// retry delay. A zero delay means at least one exact event
     /// is eligible now (including after a connectivity-restored wake).
     pub fn outbound_fanout_retry_delay_ms(&self, group_id: &GroupId) -> AccountResult<Option<u64>> {
         let now_ms = self.wall_clock.now_ms();
+        let mut welcome_delay = None;
         for fanout in self.session.outbound_fanouts_for_group(group_id)? {
             let outcome = fanout.outcome();
             if outcome.accepted_targets > 0
@@ -3799,6 +3805,16 @@ where
                 // Local projection acknowledgement cleanup should not wait
                 // behind an unrelated transport backoff in the same group.
                 return Ok(None);
+            }
+            if matches!(fanout.mls_state(), FanoutMlsState::Confirmed)
+                && !fanout.pending_post_confirmation_welcomes().is_empty()
+            {
+                let Some(delay) = self
+                    .welcome_retry_delay_ms(fanout.pending_post_confirmation_welcomes(), now_ms)?
+                else {
+                    return Ok(None);
+                };
+                welcome_delay = Some(welcome_delay.map_or(delay, |prior: u64| prior.min(delay)));
             }
             if outcome.outstanding_targets == 0 {
                 if matches!(fanout.mls_state(), FanoutMlsState::Pending(_)) {
@@ -3813,12 +3829,40 @@ where
                     earliest = Some(earliest.map_or(delay_ms, |prior: u64| prior.min(delay_ms)));
                 }
             }
-            // The first incomplete fanout is the group-scoped ordering
+            // The first incomplete network fanout is the group-scoped ordering
             // barrier, so later NotAttempted records cannot pull this cutoff
-            // forward and cause a scheduler polling loop.
-            return Ok(earliest);
+            // forward. Its own retained Welcomes can retry earlier; preceding
+            // Welcome-only continuations are not that barrier.
+            return Ok(match (earliest, welcome_delay) {
+                (Some(retry), Some(welcome)) => Some(retry.min(welcome)),
+                (retry, welcome) => retry.or(welcome),
+            });
         }
-        Ok(None)
+        Ok(welcome_delay)
+    }
+
+    fn welcome_retry_delay_ms(
+        &self,
+        welcomes: &[TransportMessage],
+        now_ms: u64,
+    ) -> AccountResult<Option<u64>> {
+        let mut earliest = None;
+        for welcome in welcomes {
+            let Some(fanout) = self.session.transport_fanout(&welcome.id)? else {
+                // No durable attempt cutoff exists yet. Use the ordinary
+                // scheduler delay for preparation or local bookkeeping.
+                return Ok(None);
+            };
+            for target in &fanout.targets {
+                if let Some(delay_ms) = transport_retry_delay_ms(target, now_ms) {
+                    if target.last_attempt_at.is_none() {
+                        return Ok(None);
+                    }
+                    earliest = Some(earliest.map_or(delay_ms, |prior: u64| prior.min(delay_ms)));
+                }
+            }
+        }
+        Ok(earliest)
     }
 
     pub fn prepare_convergence_cutoff_delay_ms(
@@ -4011,7 +4055,20 @@ where
                     self.publish_founding_group_created(welcomes, output, queue, context.clone())
                         .await?;
                 }
+                PublishWork::AutoPublish {
+                    msg,
+                    pending,
+                    welcomes,
+                } if welcomes.is_empty() => {
+                    self.publish_pending(vec![msg], pending, output, queue, context.clone())
+                        .await?;
+                }
                 PublishWork::GroupEvolution {
+                    msg,
+                    welcomes,
+                    pending,
+                }
+                | PublishWork::AutoPublish {
                     msg,
                     welcomes,
                     pending,
@@ -4025,10 +4082,6 @@ where
                         context.clone(),
                     ))
                     .await?;
-                }
-                PublishWork::AutoPublish { msg, pending } => {
-                    self.publish_pending(vec![msg], pending, output, queue, context.clone())
-                        .await?;
                 }
             }
         }
@@ -4123,6 +4176,7 @@ where
             let outcome = fanout.outcome();
             if outcome.outstanding_targets > 0
                 || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                || !fanout.pending_post_confirmation_welcomes().is_empty()
             {
                 let fanout_group = fanout.group_id().cloned();
                 let status =
@@ -6582,22 +6636,30 @@ fn accepted_fanout_targets(fanout: &DurableTransportFanout) -> usize {
 }
 
 fn transport_fanout_target_retry_due(target: &TransportFanoutTarget, now: Timestamp) -> bool {
+    transport_retry_delay_ms(target, now.0.saturating_mul(1_000)) == Some(0)
+}
+
+fn transport_retry_delay_ms(target: &TransportFanoutTarget, now_ms: u64) -> Option<u64> {
     if matches!(
         target.state,
         TransportFanoutAttemptState::Accepted | TransportFanoutAttemptState::PolicyProhibited
     ) {
-        return false;
+        return None;
     }
     let shift = target.attempt_count.saturating_sub(1).min(7);
     let backoff = 30_u64.saturating_mul(1_u64 << shift).min(60 * 60);
-    target
-        .last_attempt_at
-        .is_none_or(|last| now.0 >= last.0.saturating_add(backoff))
+    Some(target.last_attempt_at.map_or(0, |last| {
+        last.0
+            .saturating_add(backoff)
+            .saturating_mul(1_000)
+            .saturating_sub(now_ms)
+    }))
 }
 
-/// Pull Welcome payloads off publish work so the commit/create can confirm
+/// Pull caller-owned Welcome payloads off publish work so the commit/create can confirm
 /// without waiting for recipient delivery. Empty Welcome vectors remain on the
-/// original work items so later publish still confirms the commit.
+/// original work items so later publish still confirms the commit. Automatic
+/// work retains its Welcomes until its own commit is acknowledged.
 fn take_deferred_welcomes(effects: &mut SessionEffects) -> Vec<TransportMessage> {
     let mut welcomes = Vec::new();
     for work in &mut effects.publish {
@@ -6621,6 +6683,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
     matches!(
         intent,
         SendIntent::Invite { .. }
+            | SendIntent::RecoverMembers { .. }
             | SendIntent::RemoveMembers { .. }
             | SendIntent::AddOwnAccountDevices { .. }
             | SendIntent::RemoveOwnAccountDevices { .. }

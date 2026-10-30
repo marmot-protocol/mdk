@@ -235,6 +235,15 @@ pub enum EngineError {
     #[error("group is unrecoverable and needs a verified repair before it can send")]
     GroupUnrecoverableRepairRequired { group_id: GroupId },
 
+    /// Recovery cannot stage while the source group has unsettled evolution.
+    #[error("group recovery requires a settled source")]
+    GroupRecoveryUnsettled { group_id: GroupId },
+
+    /// The authenticated recovery source advanced or changed. Start a fresh
+    /// challenge; retrying the same grant cannot authorize a replacement.
+    #[error("group recovery source no longer matches")]
+    GroupRecoverySourceMismatch { group_id: GroupId },
+
     /// Illegal state-machine transition (from
     /// [`crate::engine_state::InvalidTransition`]). Indicates an engine bug.
     #[error(transparent)]
@@ -294,7 +303,7 @@ impl EngineError {
     /// say `"storage"`; the app runtime deliberately unwraps one layer further
     /// and reports the nine [`crate::storage::StorageError`] kinds instead
     /// (`storage_busy`, `storage_not_found`, ...). The trade is intentional:
-    /// [`Self::is_transient`] is true for exactly `StorageError::Busy`, so
+    /// among storage errors, [`Self::is_transient`] is true only for `StorageError::Busy`, so
     /// collapsing storage to one word app-side would hide the retryable failure
     /// among eight durable ones. A consumer joining engine rows to app fields
     /// must therefore treat `"storage"` as the prefix of the nine, not as a
@@ -335,6 +344,8 @@ impl EngineError {
                 "group_unrecoverable_repair_required"
             }
             EngineError::InvalidTransition(_) => "invalid_transition",
+            EngineError::GroupRecoveryUnsettled { .. } => "group_recovery_unsettled",
+            EngineError::GroupRecoverySourceMismatch { .. } => "group_recovery_source_mismatch",
             EngineError::Storage(_) => "storage",
             EngineError::Peeler(_) => "peeler",
             EngineError::Serialize(_) => "serialize",
@@ -347,16 +358,20 @@ impl EngineError {
         }
     }
 
-    /// Whether this error reflects transient backend contention (a
-    /// [`crate::storage::StorageError::Busy`] that survived the backend's own
-    /// retries) rather than a durable failure. Callers driving the
+    /// Whether this error reflects transient backend contention or recovery
+    /// waiting for group evolution or local state to settle, rather than a durable
+    /// failure. Ineligible copies and mismatched recovery authority are not
+    /// transient: recheck eligibility and, when appropriate, obtain a fresh
+    /// authenticated challenge rather than retrying the same grant.
+    /// Callers driving the
     /// publish-before-apply lifecycle use this to retry `confirm_published`
     /// instead of surfacing a lock blip as a fatal failure — the confirm path
     /// is structured to be retry-safe (the in-memory state-machine transition
     /// only runs after the durable storage transaction commits).
     #[must_use]
     pub fn is_transient(&self) -> bool {
-        matches!(self, EngineError::Storage(e) if e.is_transient())
+        matches!(self, EngineError::GroupRecoveryUnsettled { .. })
+            || matches!(self, EngineError::Storage(e) if e.is_transient())
     }
 }
 

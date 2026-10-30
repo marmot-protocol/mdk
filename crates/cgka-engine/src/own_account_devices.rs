@@ -19,6 +19,10 @@
 //! delivery per KeyPackage, naming it ([`Engine::wrap_staged_welcomes`]).
 //! Like a self-update, neither intent keeps an `OwnCommitIntent`: when branch
 //! selection supersedes one, nothing re-issues it (mdk#1734).
+//!
+//! Source-bound rejoin shares the by-value member-edit builder below. Its
+//! source checks and durable publish lifecycle remain in maintenance/send;
+//! the same staged classifier authorizes the resulting atomic Remove+Add.
 
 use crate::commit_class::CommitClass;
 use crate::engine::Engine;
@@ -31,7 +35,7 @@ use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::EncryptedPayload;
 use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
-use openmls::prelude::LeafNodeIndex;
+use openmls::prelude::{LeafNodeIndex, MlsMessageOut};
 use openmls_traits::OpenMlsProvider as _;
 use std::collections::HashSet;
 use tls_codec::Serialize as _;
@@ -99,7 +103,12 @@ impl<S: StorageProvider> Engine<S> {
         // account-devices-v1.md, "Sender rules": same-account operations need
         // a canonical state that requires the component. A legacy group never
         // does.
-        if !crate::app_components::group_requires_account_devices(&mls_group)? {
+        if crate::commit_class::classify_member_edit(
+            &mls_group,
+            self.identity.self_id(),
+            self.identity.self_id(),
+        )? != CommitClass::SameAccount
+        {
             return Err(EngineError::InvalidTransition(InvalidTransition {
                 from: "AccountDevicesNotRequired",
                 to: intent,
@@ -117,25 +126,8 @@ impl<S: StorageProvider> Engine<S> {
             PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
-        let leaf_node_parameters = self.own_commit_leaf_parameters(&mls_group, &[])?;
-        let (commit_out, welcome_out, _group_info) = mls_group
-            .commit_builder()
-            .consume_proposal_store(false)
-            .propose_adds(parsed_kps.iter().cloned())
-            .propose_removals(removed_leaves.iter().copied())
-            .leaf_node_parameters(leaf_node_parameters)
-            .load_psks(provider.storage())
-            .map_err(|e| EngineError::Backend(format!("own account devices load_psks: {e:?}")))?
-            .build(
-                provider.rand(),
-                provider.crypto(),
-                &self.identity.signer,
-                |_| true,
-            )
-            .map_err(|e| EngineError::Backend(format!("own account devices build: {e:?}")))?
-            .stage_commit(&provider)
-            .map_err(|e| EngineError::Backend(format!("own account devices stage: {e:?}")))?
-            .into_messages();
+        let (commit_out, welcome_out) =
+            self.stage_member_edits(&mut mls_group, &provider, &parsed_kps, &removed_leaves)?;
         let staged_commit = mls_group.pending_commit().ok_or_else(|| {
             EngineError::Backend("own account devices produced no pending commit".into())
         })?;
@@ -223,6 +215,7 @@ impl<S: StorageProvider> Engine<S> {
                     pre_commit_epoch,
                     &welcome_bytes,
                     &key_packages,
+                    &[],
                     &parsed_kps,
                     None,
                 )
@@ -281,6 +274,38 @@ impl<S: StorageProvider> Engine<S> {
             welcomes,
             pending: pending_ref,
         })
+    }
+
+    /// Stage only the requested by-value Adds/Removes, leaving the proposal
+    /// store untouched. Callers authorize the complete staged Commit before
+    /// exposing it; this primitive grants no membership authority itself.
+    pub(crate) fn stage_member_edits(
+        &self,
+        group: &mut MlsGroup,
+        provider: &EngineOpenMlsProvider<'_, S>,
+        adds: &[openmls::prelude::KeyPackage],
+        removals: &[LeafNodeIndex],
+    ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
+        let leaf_node_parameters = self.own_commit_leaf_parameters(group, &[])?;
+        let (commit, welcome, _group_info) = group
+            .commit_builder()
+            .consume_proposal_store(false)
+            .propose_adds(adds.iter().cloned())
+            .propose_removals(removals.iter().copied())
+            .leaf_node_parameters(leaf_node_parameters)
+            .load_psks(provider.storage())
+            .map_err(|e| EngineError::Backend(format!("member edits load_psks: {e:?}")))?
+            .build(
+                provider.rand(),
+                provider.crypto(),
+                &self.identity.signer,
+                |_| true,
+            )
+            .map_err(|e| EngineError::Backend(format!("member edits build: {e:?}")))?
+            .stage_commit(provider)
+            .map_err(|e| EngineError::Backend(format!("member edits stage: {e:?}")))?
+            .into_messages();
+        Ok((commit, welcome))
     }
 
     /// Parse `key_packages` for a same-account Add: each belongs to

@@ -183,6 +183,7 @@ impl<S: StorageProvider> Engine<S> {
                 pre_commit_epoch,
                 &welcome_bytes,
                 &key_packages,
+                &[],
                 &parsed_kps,
                 Some(deliver_until),
             )

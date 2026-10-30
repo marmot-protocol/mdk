@@ -35,6 +35,9 @@ the default.
 - Publishes fresh KeyPackages through an injected boundary, and drives KeyPackage generator upgrades.
 - Turns `SessionEffects.publish` work into `TransportPublishRequest`s, then confirms or rolls back pending session state
   from the adapter's publish reports.
+- Keeps a confirmed fanout scheduler-visible while linked Welcomes still await publication bookkeeping. Its retry
+  cutoff follows the Welcomes' durable endpoint backoff; work without a stored cutoff uses the ordinary retry delay.
+  Welcome backoff does not postpone earlier-ready group work; an incomplete group publication still orders later ones.
 - Keeps transport routing policy generic, so the first implementation can be Nostr without baking Nostr into the
   session or engine crates.
 
@@ -45,6 +48,8 @@ the default.
 - Surfaces `GroupEvent`s and publishable transport work as `SessionEffects`.
 - Preserves the publish-before-apply contract: callers confirm or fail pending group operations after transport
   publish, including auto-publish work created while ingesting inbound messages.
+- Restored automatic publications retain their own pending reference and linked Welcomes. They cannot supply a
+  caller's deferred fanout; their Welcomes leave only after their own Commit acknowledgement.
 - Exposes convergence advancement (`advance_convergence`, `advance_convergence_inputs`) so queued outbound work can be
   regenerated from canonical state.
 - Exposes durable maintenance, KeyPackage-lifecycle, group-evolution, and transport-fanout records for the account

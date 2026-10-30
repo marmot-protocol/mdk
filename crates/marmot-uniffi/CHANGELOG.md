@@ -10,6 +10,11 @@
   Update exhaustive Swift/Kotlin handling and regenerate bindings with the
   matching native library.
 
+- `MarmotKitError` adds `GroupRecoveryUnsettled { group_id_hex }` and
+  `GroupRecoverySourceMismatch { group_id_hex }`. The former waits for the
+  source or local recovery state to settle. The latter requires checking local
+  eligibility and authenticated authority again, not blindly retrying the same
+  grant; a usable local copy must not recover. Update exhaustive host error handling.
 - `MarmotEventFfi` adds `LinkedDevicesChanged { account_id_hex, account_label }`
   (mdk#2628). Update exhaustive Swift/Kotlin handling and regenerate bindings
   with the matching native library.

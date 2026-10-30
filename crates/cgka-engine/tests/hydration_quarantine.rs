@@ -398,6 +398,7 @@ async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_gr
 struct FlakyGroupRecordStorage {
     inner: SqliteAccountStorage,
     fail_get_group: Arc<AtomicBool>,
+    fail_welcome_read: Arc<AtomicBool>,
     fail_disband_tombstone: Arc<AtomicBool>,
     fail_mark_disband_tombstone_announced: Arc<AtomicBool>,
     fail_list_queued_outbound_intents: Arc<AtomicBool>,
@@ -409,6 +410,7 @@ impl FlakyGroupRecordStorage {
         Self {
             inner,
             fail_get_group: Arc::new(AtomicBool::new(false)),
+            fail_welcome_read: Arc::new(AtomicBool::new(false)),
             fail_disband_tombstone: Arc::new(AtomicBool::new(false)),
             fail_mark_disband_tombstone_announced: Arc::new(AtomicBool::new(false)),
             fail_list_queued_outbound_intents: Arc::new(AtomicBool::new(false)),
@@ -418,6 +420,10 @@ impl FlakyGroupRecordStorage {
 
     fn set_fail_get_group(&self, fail: bool) {
         self.fail_get_group.store(fail, Ordering::SeqCst);
+    }
+
+    fn fail_next_welcome_read(&self) {
+        self.fail_welcome_read.store(true, Ordering::SeqCst);
     }
 
     fn set_fail_disband_tombstone(&self, fail: bool) {
@@ -490,6 +496,20 @@ impl MessageStorage for FlakyGroupRecordStorage {
         at_or_after_epoch: EpochId,
     ) -> StorageResult<Vec<MessageRecord>> {
         self.inner.list_messages(group_id, at_or_after_epoch)
+    }
+    fn list_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        if states == [MessageState::Sent] && self.fail_welcome_read.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::Backend(
+                "injected staged Welcome read failure".into(),
+            ));
+        }
+        self.inner
+            .list_messages_in_states(group_id, states, at_or_after_epoch)
     }
     fn put_pending_application_event(
         &self,
@@ -2477,4 +2497,49 @@ async fn stale_validation_marker_forces_revalidation_and_refresh() {
         refreshed, b"stale-marker-does-not-match",
         "stale marker must be overwritten with the real content-bound marker"
     );
+}
+
+#[tokio::test]
+async fn welcome_load_fallback() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().unwrap());
+    let mut initial = build_flaky_engine(storage.clone());
+    let group = create_confirmed_group_flaky(&mut initial).await;
+    let before = initial.epoch(&group).unwrap();
+    let SendResult::GroupEvolution { .. } = initial
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("prepared self-update")
+    };
+    drop(initial);
+
+    // Only frozen Welcome discovery fails; the original commit and the
+    // compatibility recovery inputs remain readable.
+    storage.fail_next_welcome_read();
+    let mut reopened = build_flaky_engine(storage);
+    reopened.hydrate_all_stored_groups().unwrap();
+    assert!(
+        reopened.quarantined_groups().is_empty(),
+        "ordinary evolution must retain compatibility recovery: {:?}",
+        reopened.quarantined_groups()
+    );
+    assert!(reopened.drain_events().iter().any(|event| matches!(
+        event,
+        GroupEvent::PendingCommitRecovered { group_id, recovered_epoch }
+            if group_id == &group && *recovered_epoch == before
+    )));
+    let SendResult::GroupEvolution { pending, .. } = reopened
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("recovered group accepts a new self-update")
+    };
+    reopened.confirm_published(pending).await.unwrap();
+    assert_eq!(reopened.epoch(&group).unwrap(), EpochId(before.0 + 1));
 }

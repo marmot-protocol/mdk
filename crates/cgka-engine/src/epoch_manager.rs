@@ -120,6 +120,13 @@ impl EpochManager {
         PendingStateRef::new(self.pending_counter)
     }
 
+    /// Reserve a durable handle without installing a group's pending state.
+    /// Construction must reserve every restorable handle before any group
+    /// hydrates or stages new work; per-group restoration alone is too late.
+    pub(crate) fn reserve_pending_ref(&mut self, pending_ref: PendingStateRef) {
+        self.pending_counter = self.pending_counter.max(pending_ref.as_u64());
+    }
+
     // ── Mutation: state transitions ────────────────────────────────────────
 
     /// Set a group's state to `Stable { epoch }`. Used by the join-welcome
@@ -227,7 +234,7 @@ impl EpochManager {
         pending_ref: PendingStateRef,
         kind: PendingKind,
     ) -> Result<(), EngineError> {
-        self.pending_counter = self.pending_counter.max(pending_ref.as_u64());
+        self.reserve_pending_ref(pending_ref);
         self.begin_pending(
             group_id,
             pre_commit_epoch,
