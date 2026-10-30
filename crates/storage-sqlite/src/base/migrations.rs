@@ -294,6 +294,8 @@ mod migration_0140_private_key_packages;
 mod migration_0141_sonar_stickers;
 #[path = "migrations/0142_sticker_asset_history.rs"]
 mod migration_0142_sticker_asset_history;
+#[path = "migrations/0144_announced_key_packages.rs"]
+mod migration_0144_announced_key_packages;
 #[path = "migrations/0146_device_removals.rs"]
 mod migration_0146_device_removals;
 
@@ -1158,6 +1160,10 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0142_sticker_asset_history::apply,
     },
     Migration {
+        version: 144,
+        name: "0144_announced_key_packages",
+        suspend_foreign_keys: &[],
+        apply: migration_0144_announced_key_packages::apply,
         version: 146,
         name: "0146_device_removals",
         suspend_foreign_keys: &[],
