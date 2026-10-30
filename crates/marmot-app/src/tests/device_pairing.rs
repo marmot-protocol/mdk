@@ -816,6 +816,87 @@ async fn reopen(device: Device) -> Device {
     }
 }
 
+/// A failed link's removal that the runtime keeps to retry is not sent again
+/// meanwhile; once its retry is refused and rolls back, the next drive sends
+/// it again, and it removes both the leaf and the roster entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_links_removal_that_rolls_back_is_sent_again() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let slot = choose_link(&relay, &mut phone, &mut laptop).await;
+    laptop.op(DeviceLinkOp::ConfirmMatch).await;
+    laptop.step(&relay).await; // phone's confirm in, laptop's out
+    phone.step(&relay).await; // laptop's confirm in: the group
+    let group = phone.client.trusted_device_group().unwrap().unwrap();
+    let laptop_slot: [u8; 32] = hex::decode(&slot).unwrap().try_into().unwrap();
+    let leaf = hex::decode(link_record(&phone, &group, &slot).leaf_signature_key_hex).unwrap();
+    let state = |phone: &Device| {
+        let has_leaf = phone
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .get_group(&group)
+            .unwrap()
+            .members
+            .iter()
+            .any(|member| member.credential == leaf);
+        (
+            has_leaf,
+            phone.roster(&group).devices.contains_key(&laptop_slot),
+        )
+    };
+    let resolving = |phone: &Device| {
+        phone
+            .client
+            .runtime
+            .epoch_state(&group)
+            .is_some_and(|state| state.is_resolving_local_publish())
+    };
+
+    let deadline = crate::unix_now_seconds() + LINK_DEADLINE_SECS + 1;
+    relay.fail_publishes_as_unavailable();
+    phone.client.drive_device_pairing_at(deadline).await;
+    assert!(resolving(&phone), "the runtime keeps the removal to retry");
+    phone.client.drive_device_pairing_at(deadline + 1).await;
+    assert!(resolving(&phone));
+    assert!(
+        !phone
+            .client
+            .runtime
+            .has_queued_outbound_intents(&group)
+            .unwrap(),
+        "no roster-only removal waits behind the kept one"
+    );
+
+    relay.allow_publishes();
+    relay.reject_next_publish();
+    make_retained_publish_due(&phone.client, &group);
+    let retried = phone
+        .client
+        .runtime
+        .advance_convergence(&group)
+        .await
+        .unwrap();
+    assert!(
+        phone
+            .client
+            .observe_drained_session_events(&retried)
+            .await
+            .is_err()
+    );
+    assert!(
+        !resolving(&phone),
+        "the refused retry rolled the removal back"
+    );
+    assert_eq!(state(&phone), (true, true));
+
+    phone.client.drive_device_pairing_at(deadline + 2).await;
+    assert_eq!(state(&phone), (false, false));
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Failed
+    );
+}
+
 /// A restart drops a first link's prompt while no relay has taken its
 /// founding Welcome. The link is decided by the same gate: pending past the
 /// new device's Welcome wait, failed at the link's deadline.

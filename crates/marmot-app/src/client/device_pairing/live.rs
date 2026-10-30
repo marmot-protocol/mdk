@@ -1470,11 +1470,11 @@ impl AppClient {
     /// Undo a failed link (D40) on every drive until it is undone: withdraw
     /// its Welcome until that succeeds, so no recovery publishes it again,
     /// and while the trusted roster still lists the device as this device's
-    /// link, remove its leaf and roster entry in one commit. A Welcome that
-    /// cannot be withdrawn yet does not hold the removal back: one published
-    /// later opens an epoch before the removal, and the new device's engine
-    /// joins none once its wait ended. A removal the unsettled group refuses
-    /// is tried again on the next drive.
+    /// link, remove its leaf and roster entry in one commit once the group
+    /// is quiet. A Welcome that cannot be withdrawn yet does not hold the
+    /// removal back: one published later opens an epoch before the removal,
+    /// and the new device's engine joins none once its wait ended. A removal
+    /// the unsettled group refuses is tried again on the next drive.
     async fn unlink_failed_device(
         &mut self,
         link: &DeviceLinkRecord,
@@ -1495,6 +1495,15 @@ impl AppClient {
                 _ => false,
             };
             if !listed {
+                return Ok(());
+            }
+            // Only a quiet group's members say whether the leaf is still
+            // there: a removal kept to retry has already left it out of them.
+            let quiet = matches!(
+                self.runtime.epoch_state(&group_id),
+                Some(EpochState::Stable { .. })
+            ) && !self.runtime.has_pending_convergence_inputs(&group_id)?;
+            if !quiet {
                 return Ok(());
             }
             let leaf_signature_key = hex::decode(&link.leaf_signature_key_hex)?;
