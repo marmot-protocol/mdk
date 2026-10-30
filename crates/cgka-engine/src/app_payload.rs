@@ -289,7 +289,7 @@ mod tests {
     fn vanished_source_snapshot_stays_unresolved_and_restores_live_state() {
         use cgka_traits::storage::{GroupStorage, MessageStorage};
         use cgka_traits::{EpochId, GroupId, MessageId};
-        let storage = storage_sqlite::SqliteAccountStorage::in_memory().unwrap();
+        let storage = storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap();
         let group_id = GroupId::new(vec![7; 16]);
         let group = cgka_traits::group::Group {
             id: group_id.clone(),

@@ -114,8 +114,8 @@ where
     /// Announce, in this device's roster entry, the KeyPackage this device is
     /// about to publish, or has published: its pending replacement, otherwise
     /// its current one, along with what this device says about itself
-    /// ([`Self::set_device_self_report`]). The returned effects carry the
-    /// roster commit.
+    /// ([`Self::set_device_self_report`]) and its history key (4.1). The
+    /// returned effects carry the roster commit.
     ///
     /// Does nothing when no device group is set, the entry already reads so,
     /// or the device group cannot take a commit from this device now: it is
@@ -149,10 +149,14 @@ where
             return Ok(AccountDeviceEffects::default());
         };
         let report = self.device_self_report.clone();
+        let history_key = self.own_history_key("announce_key_package");
         match self
             .edit_device_roster_entry(&group_id, &slot, held, |entry| {
                 entry.announced_key_package = Some(key_package_ref);
                 report.apply(entry);
+                if let Some(history_key) = history_key {
+                    entry.history_key = Some(history_key);
+                }
             })
             .await?
         {

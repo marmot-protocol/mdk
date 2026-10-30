@@ -48,6 +48,9 @@ pub struct LinkedDeviceFfi {
     pub bring_history: bool,
     /// Inactivity never removes it.
     pub keep_while_inactive: bool,
+    /// The user removed it on this device, and the device group has not
+    /// taken the removal yet.
+    pub removal_pending: bool,
 }
 
 impl From<LinkedDevice> for LinkedDeviceFfi {
@@ -64,6 +67,7 @@ impl From<LinkedDevice> for LinkedDeviceFfi {
             add_to_all_chats: value.add_to_all_chats,
             bring_history: value.bring_history,
             keep_while_inactive: value.keep_while_inactive,
+            removal_pending: value.removal_pending,
         }
     }
 }

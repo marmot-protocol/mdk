@@ -291,7 +291,7 @@ fn registry() -> FeatureRegistry {
 }
 
 fn build(id: &[u8]) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -302,7 +302,7 @@ fn build(id: &[u8]) -> Engine<SqliteAccountStorage> {
 }
 
 fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -315,7 +315,7 @@ fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccount
 }
 
 fn build_current(id: &[u8]) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .protocol_profile(ProtocolProfile::Current)
@@ -326,7 +326,7 @@ fn build_current(id: &[u8]) -> Engine<SqliteAccountStorage> {
 }
 
 fn build_current_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -342,7 +342,7 @@ fn build_with_storage_and_component(
     id: &[u8],
     component_id: u16,
 ) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut components: Vec<_> = default_group_components().into_iter().collect();
     components.push(component_id);
     let engine = EngineBuilder::new(storage.clone())
@@ -369,7 +369,7 @@ fn converge_buffered_commit(engine: &mut Engine<SqliteAccountStorage>, group_id:
 fn build_with_routing(id: &[u8]) -> Engine<SqliteAccountStorage> {
     let mut components: Vec<_> = default_group_components().into_iter().collect();
     components.push(NOSTR_ROUTING_COMPONENT_ID);
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -383,7 +383,7 @@ fn build_with_routing(id: &[u8]) -> Engine<SqliteAccountStorage> {
 fn build_with_opaque_component(id: &[u8], component_id: u16) -> Engine<SqliteAccountStorage> {
     let mut components: Vec<_> = default_group_components().into_iter().collect();
     components.push(component_id);
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .protocol_profile(ProtocolProfile::Current)
@@ -655,8 +655,8 @@ async fn create_admin_pair_with_peeler(
     SqliteAccountStorage,
     GroupId,
 ) {
-    let alice_storage = SqliteAccountStorage::in_memory().unwrap();
-    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_with_storage_and_peeler(b"alice", alice_storage.clone(), make_peeler());
     let mut bob = build_with_storage_and_peeler(b"bob", bob_storage.clone(), make_peeler());
     let bob_kp = bob.fresh_key_package().await.unwrap();

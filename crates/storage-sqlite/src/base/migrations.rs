@@ -288,6 +288,8 @@ mod migration_0135_recovery_unit_fences;
 mod migration_0136_recovery_conversion;
 #[path = "migrations/0137_device_renames.rs"]
 mod migration_0137_device_renames;
+#[path = "migrations/0138_account_device_history_keys.rs"]
+mod migration_0138_account_device_history_keys;
 #[path = "migrations/0140_private_key_packages.rs"]
 mod migration_0140_private_key_packages;
 #[path = "migrations/0141_sonar_stickers.rs"]
@@ -296,6 +298,8 @@ mod migration_0141_sonar_stickers;
 mod migration_0142_sticker_asset_history;
 #[path = "migrations/0144_announced_key_packages.rs"]
 mod migration_0144_announced_key_packages;
+#[path = "migrations/0146_device_removals.rs"]
+mod migration_0146_device_removals;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1140,6 +1144,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0137_device_renames::apply,
     },
     Migration {
+        version: 138,
+        name: "0138_account_device_history_keys",
+        suspend_foreign_keys: &[],
+        apply: migration_0138_account_device_history_keys::apply,
+    },
+    Migration {
         version: 140,
         name: "0140_private_key_packages",
         suspend_foreign_keys: &[],
@@ -1162,6 +1172,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0144_announced_key_packages",
         suspend_foreign_keys: &[],
         apply: migration_0144_announced_key_packages::apply,
+    },
+    Migration {
+        version: 146,
+        name: "0146_device_removals",
+        suspend_foreign_keys: &[],
+        apply: migration_0146_device_removals::apply,
     },
 ];
 

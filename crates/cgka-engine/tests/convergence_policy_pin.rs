@@ -80,7 +80,7 @@ impl TransportPeeler for StubPeeler {
 }
 
 fn build_engine() -> cgka_engine::Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(valid_identity(b"pin-policy"))
         .account_identity_proof_signer(proof_signer(b"pin-policy"))
         .peeler(Box::new(StubPeeler))
@@ -135,7 +135,7 @@ fn default_build_rejects_non_pinned_absolute_pass_cap() {
 #[cfg(not(feature = "test-policy-overrides"))]
 #[test]
 fn default_build_builder_rejects_non_default_max_past_epochs() {
-    let result = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let result = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(valid_identity(b"pin-policy-epochs"))
         .account_identity_proof_signer(proof_signer(b"pin-policy-epochs"))
         .peeler(Box::new(StubPeeler))

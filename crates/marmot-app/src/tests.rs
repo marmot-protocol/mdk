@@ -15569,6 +15569,50 @@ fn app_error_display_does_not_expose_group_or_account_ids() {
     }
 }
 
+/// The app constructors relax storage for this unit-test process, so a
+/// database opened afterwards skips SQLCipher's memory security even when its
+/// options ask for it.
+#[test]
+fn app_unit_tests_open_databases_without_sqlcipher_memory_security() {
+    static CIPHER_PRAGMAS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn record_cipher_pragma(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+            let sql = sql.to_ascii_lowercase();
+            if sql.starts_with("pragma cipher") {
+                CIPHER_PRAGMAS.lock().unwrap().push(sql);
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let connection = rusqlite::Connection::open(dir.path().join("probe.sqlite")).unwrap();
+    connection.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(record_cipher_pragma),
+    );
+
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &storage_sqlite::SqlCipherKey::raw([0x42; 32]),
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+
+    let pragmas = CIPHER_PRAGMAS.lock().unwrap().clone();
+    assert!(
+        pragmas
+            .iter()
+            .any(|sql| sql.contains("cipher_compatibility")),
+        "{pragmas:?}"
+    );
+    assert!(
+        !pragmas
+            .iter()
+            .any(|sql| sql.contains("cipher_memory_security")),
+        "{pragmas:?}"
+    );
+}
+
 #[test]
 fn telemetry_install_id_is_stable_uuid_per_app_root() {
     let dir = tempfile::tempdir().unwrap();

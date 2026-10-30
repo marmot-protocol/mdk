@@ -74,6 +74,7 @@ pub(crate) mod audit_v5_probe;
 pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
 pub(crate) mod device_pairing;
+mod device_removal;
 mod device_renames;
 pub(crate) mod epoch_stall;
 pub(crate) mod history_notices;
@@ -1482,6 +1483,7 @@ impl AppClient {
             crate::ProductUnit::Attempt,
         );
         self.drive_sign_ins().await;
+        self.drive_device_removals().await;
         self.device_rename_upkeep().await;
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
