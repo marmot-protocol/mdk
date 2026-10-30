@@ -1023,9 +1023,11 @@ pub struct AppClient {
     /// could have changed routing since the sync-start pass).
     pub(crate) checkpoint_route_refresh_recomputes: u64,
     /// Linking a new device of this account (mdk#2628 item 3.3b). In memory
-    /// only: a restart ends every pairing session.
+    /// only: a restart ends every pairing session. Boxed: the client is held
+    /// by value in deep async call chains, whose debug-build frames copy it,
+    /// and linking is rarely in progress.
     #[cfg(feature = "unreleased-device-pairing")]
-    pub(crate) device_pairing: device_pairing::DevicePairing,
+    pub(crate) device_pairing: Box<device_pairing::DevicePairing>,
 }
 
 #[cfg(test)]
