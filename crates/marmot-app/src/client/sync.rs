@@ -1048,6 +1048,23 @@ impl AppClient {
         &mut self,
         effects: &marmot_session::AccountDeviceEffects,
     ) {
+        // Every engine effect passes here. A group's lifecycle decides what the
+        // recovery runner may serve, so it reads its debt again.
+        if effects.events.iter().any(|event| {
+            use cgka_traits::engine::GroupEvent;
+            matches!(
+                event,
+                GroupEvent::GroupCreated { .. }
+                    | GroupEvent::GroupJoined { .. }
+                    | GroupEvent::LocalGroupCopyTerminated { .. }
+                    | GroupEvent::LocalGroupCopyRestored { .. }
+                    | GroupEvent::GroupUnrecoverable { .. }
+                    | GroupEvent::GroupStateInvalidated { .. }
+                    | GroupEvent::GroupStateRevalidated { .. }
+            )
+        }) {
+            self.wake_recovery_runner();
+        }
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return;
         }
@@ -1957,6 +1974,17 @@ impl AppClient {
             }
             // A route the job's admission changed is subscribed before this
             // returns: a directly owned client has no worker to refresh it.
+            if self.pending_runtime_group_subscription_refresh {
+                summary = self.refresh_live_group_subscriptions(summary).await?;
+            }
+        }
+        // Behind the internal `runner_owns_debt` gate, a directly owned client
+        // also runs its recovery runner in place for one pass (mdk#2660).
+        if explicit && self.has_in_place_recovery_runner() {
+            self.pending_applied_sync_summary
+                .merge(std::mem::take(&mut summary));
+            self.run_recovery_runner_pass().await;
+            self.prepend_pending_applied_summary(&mut summary);
             if self.pending_runtime_group_subscription_refresh {
                 summary = self.refresh_live_group_subscriptions(summary).await?;
             }
@@ -2980,7 +3008,7 @@ impl AppClient {
                 // The loss is durable and fences the cursor. A directly owned
                 // client has no worker, so its recovery job runs here.
                 transport_nostr::AccountDeliveryReceive::Overflow(_) => {
-                    match self
+                    let recovered = match self
                         .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Receive)
                         .await?
                     {
@@ -2989,6 +3017,15 @@ impl AppClient {
                         EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending => {
                             SyncSummary::default()
                         }
+                    };
+                    // Behind the internal `runner_owns_debt` gate, its
+                    // recovery runner runs one pass here too (mdk#2660).
+                    if self.has_in_place_recovery_runner() {
+                        self.pending_applied_sync_summary.merge(recovered);
+                        self.run_recovery_runner_pass().await;
+                        self.take_pending_applied_sync_summary()
+                    } else {
+                        recovered
                     }
                 }
             };

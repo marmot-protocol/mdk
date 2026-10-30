@@ -34,6 +34,7 @@ use super::{
     runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
 use crate::client::recovery::AttemptGrant;
+use crate::client::recovery_runner::host::next_runner_turn;
 use crate::client::{
     CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
     CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
@@ -800,6 +801,13 @@ pub(crate) enum AccountWorkerCommand {
     #[cfg(test)]
     UnhydratedGroupCount {
         respond: oneshot::Sender<usize>,
+    },
+    /// Whether the worker runs a recovery runner, and if so one explicit pass
+    /// of it, awaited off the worker. `None` without a runner.
+    #[cfg(test)]
+    RecoveryRunnerPassForTest {
+        budget: Duration,
+        respond: oneshot::Sender<Option<crate::client::recovery_runner::PassReport>>,
     },
 }
 
@@ -1932,6 +1940,8 @@ async fn run_app_runtime_account_worker(
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
     let mut replay_changes = client.adapter.replay_changes().await;
     let mut admission_retry = ReplayAdmissionRetry::default();
+    // Only with the internal `runner_owns_debt` gate on (mdk#2660 phase 4).
+    let mut recovery_runner = client.spawn_recovery_runner().await;
     'worker: loop {
         // Activation may replace the source watch. Reacquire only a live
         // receiver; a closed activation must not turn this into a busy loop.
@@ -2317,6 +2327,21 @@ async fn run_app_runtime_account_worker(
                                     recovery.drain_waiters.push(respond);
                                 } else {
                                     let _ = respond.send(());
+                                }
+                                continue;
+                            }
+                            #[cfg(test)]
+                            AccountWorkerCommand::RecoveryRunnerPassForTest { budget, respond } => {
+                                match &recovery_runner {
+                                    Some(runner) => {
+                                        let handle = runner.handle().clone();
+                                        tokio::spawn(async move {
+                                            let _ = respond.send(handle.run_pass(budget).await);
+                                        });
+                                    }
+                                    None => {
+                                        let _ = respond.send(None);
+                                    }
                                 }
                                 continue;
                             }
@@ -2755,6 +2780,11 @@ async fn run_app_runtime_account_worker(
                         // this leaves room for a one-shot client during a
                         // prolonged transport outage.
                         let transport_account = client.adapter.account_id().clone();
+                        // Its turns need this client; the reopened one gets
+                        // a runner of its own.
+                        if let Some(runner) = recovery_runner.take() {
+                            runner.stop().await;
+                        }
                         drop(client);
                         client = loop {
                             let reconnect_wait = shared.observer.performance().observe(RuntimeOp::WorkerReconnectWait);
@@ -2967,6 +2997,7 @@ async fn run_app_runtime_account_worker(
                             }
                         };
                         replay_changes = client.adapter.replay_changes().await;
+                        recovery_runner = client.spawn_recovery_runner().await;
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -2974,6 +3005,11 @@ async fn run_app_runtime_account_worker(
                         continue 'worker;
                     }
                 }
+            }
+            // The recovery runner's storage turns yield to commands and live
+            // input, as comparison admission does.
+            turn = next_runner_turn(&mut recovery_runner), if !client.has_pending_effect_projections() => {
+                turn.serve(&mut client).await;
             }
             _ = tokio::task::yield_now(), if avatar_due && !lifecycle.is_stopping() => {
                 avatar_due = false;
@@ -3217,6 +3253,10 @@ async fn run_app_runtime_account_worker(
                 phase.finish(TelemetryOutcome::Success);
             }
         }
+    }
+    // A quantum in flight is preempted; what it staged stays durable.
+    if let Some(runner) = recovery_runner {
+        runner.stop().await;
     }
     // An admission in progress keeps its durable prefix; its debt waits for
     // the next session.
@@ -4986,6 +5026,12 @@ fn account_worker_command_future<'a>(
         AccountWorkerCommand::UnhydratedGroupCount { respond } => Box::pin(async move {
             let count = client.runtime.session().unhydrated_group_ids().len();
             let _ = respond.send(count);
+            true
+        }),
+        // The worker loop answers it from its runner before dispatch.
+        #[cfg(test)]
+        AccountWorkerCommand::RecoveryRunnerPassForTest { respond, .. } => Box::pin(async move {
+            let _ = respond.send(None);
             true
         }),
         AccountWorkerCommand::CatchUp { respond } => Box::pin(async move {

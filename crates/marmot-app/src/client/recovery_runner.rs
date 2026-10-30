@@ -48,6 +48,7 @@
 
 mod admission;
 mod compare;
+pub(crate) mod host;
 mod policy;
 mod quantum;
 mod recheck;
@@ -67,7 +68,7 @@ use nostr::prelude::Event;
 use storage_sqlite::{
     RecoveryRelayCaps, RecoveryUnitOutcome, SqliteAppStorage, TransportReconciliationRoute,
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::compare::CompareRelay;
@@ -247,10 +248,22 @@ struct Signals {
     late_findings: AtomicU64,
 }
 
-/// The caller's side of a runner: wake it, steer it, stop it.
+/// One explicit pass a spawned runner owes a caller.
+struct PassRequest {
+    budget: Duration,
+    reply: oneshot::Sender<PassReport>,
+}
+
+/// Pass requests a spawned runner holds before it serves them.
+const PASS_REQUESTS: usize = 4;
+
+/// The caller's side of a runner: wake it, steer it, ask it for a pass, stop
+/// it.
+#[derive(Clone)]
 pub(crate) struct RecoveryRunnerHandle {
     wake: watch::Sender<u64>,
     hints: watch::Sender<PriorityHints>,
+    passes: mpsc::Sender<PassRequest>,
     signals: Arc<Signals>,
     cancel: CancellationToken,
 }
@@ -285,6 +298,16 @@ impl RecoveryRunnerHandle {
         self.cancel.cancel();
     }
 
+    /// Have the spawned task run one explicit pass ([`RecoveryRunner::run_pass`])
+    /// once its current step ends, and wait for its report. `None` once the
+    /// runner has stopped. Never await this on the account worker: the pass
+    /// runs worker turns.
+    pub(crate) async fn run_pass(&self, budget: Duration) -> Option<PassReport> {
+        let (reply, report) = oneshot::channel();
+        self.passes.send(PassRequest { budget, reply }).await.ok()?;
+        report.await.ok()
+    }
+
     /// Events re-checks have found inside ranges already covered, since the
     /// runner was built. An aggregate count, privacy-safe.
     pub(crate) fn late_findings(&self) -> u64 {
@@ -300,6 +323,7 @@ pub(crate) struct RecoveryRunner<H> {
     signals: Arc<Signals>,
     wake: watch::Receiver<u64>,
     hints: watch::Receiver<PriorityHints>,
+    passes: mpsc::Receiver<PassRequest>,
     cancel: CancellationToken,
     memory: Memory,
     admission: admission::Memory,
@@ -317,8 +341,19 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         policy: RecoveryRunnerPolicy,
         credits: Arc<RecoveryCreditPool>,
     ) -> (Self, RecoveryRunnerHandle) {
-        let (wake_tx, wake) = watch::channel(0);
+        Self::waking_on(host, policy, credits, watch::channel(0).0)
+    }
+
+    /// As [`Self::new`], also woken by every bump of `wake`: the account's
+    /// chokepoints bump the sender its routing holds, whoever owns the runner.
+    pub(crate) fn waking_on(
+        host: Arc<H>,
+        policy: RecoveryRunnerPolicy,
+        credits: Arc<RecoveryCreditPool>,
+        wake: watch::Sender<u64>,
+    ) -> (Self, RecoveryRunnerHandle) {
         let (hints_tx, hints) = watch::channel(PriorityHints::default());
+        let (passes_tx, passes) = mpsc::channel(PASS_REQUESTS);
         let signals = Arc::new(Signals::default());
         let cancel = CancellationToken::new();
         let runner = Self {
@@ -326,8 +361,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             policy,
             credits,
             signals: signals.clone(),
-            wake,
+            wake: wake.subscribe(),
             hints,
+            passes,
             cancel: cancel.clone(),
             memory: Memory::default(),
             admission: admission::Memory::default(),
@@ -336,8 +372,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             reported_pause: None,
         };
         let handle = RecoveryRunnerHandle {
-            wake: wake_tx,
+            wake,
             hints: hints_tx,
+            passes: passes_tx,
             signals,
             cancel,
         };
@@ -351,6 +388,10 @@ impl<H: RunnerHost> RecoveryRunner<H> {
 
     async fn run(mut self) {
         loop {
+            if let Ok(request) = self.passes.try_recv() {
+                self.serve_pass(request).await;
+                continue;
+            }
             self.wake.borrow_and_update();
             self.hints.borrow_and_update();
             let next_due = match self.step().await {
@@ -363,12 +404,19 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => break,
+                Some(request) = self.passes.recv() => self.serve_pass(request).await,
                 changed = self.wake.changed() => if changed.is_err() { break },
                 changed = self.hints.changed() => if changed.is_err() { break },
                 () = sleep_for(sleep) => {}
             }
         }
         tracing::debug!(target: TARGET, method = "run", "recovery runner stopped");
+    }
+
+    /// One caller's explicit pass on the spawned task.
+    async fn serve_pass(&mut self, request: PassRequest) {
+        let report = self.run_pass(request.budget).await;
+        let _ = request.reply.send(report);
     }
 
     /// One step: admit, then select, credit, begin, quantum, stage, settle.
