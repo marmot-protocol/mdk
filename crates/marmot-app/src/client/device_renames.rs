@@ -219,12 +219,12 @@ impl AppClient {
         mut record: DeviceRenameRecord,
     ) -> Result<RenameCommit, AppError> {
         bound(&mut record);
+        let held = self.epoch_gap_held_groups()?;
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let previous = storage.device_rename(&record.slot_id_hex)?;
         storage.put_device_rename(&record)?;
         let rename_id = *record.written.last().expect("a rename writes an id");
         let label = record.label.clone();
-        let held = self.epoch_gap_held_groups()?;
         let edit = self
             .runtime
             .edit_device_roster_entry(group_id, &slot, &held, |entry| {
