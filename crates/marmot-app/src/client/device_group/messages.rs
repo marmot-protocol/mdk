@@ -10,6 +10,10 @@
 //! - [`AppClient::observe_device_group_event`] takes each device-group event
 //!   and hands a message to the feature that owns its kind. A feature adds its
 //!   kinds to that one match.
+//! - [`is_device_group_kind`] lists every kind sent only in a device group. A
+//!   device reads one only in the device group it trusts and ignores it in any
+//!   other group, so no chat projects one and no host sends one as a custom
+//!   event.
 //! - [`AppClient::ensure_sent_by`] reads which slot sent a message from the
 //!   sending leaf's device tag (D33), through 3.1d's one tag reader. It reads
 //!   only the current tree, so a message from an earlier epoch has no
@@ -25,6 +29,25 @@ use crate::client::AppClient;
 use crate::{AppError, unix_now_seconds};
 
 const TRACE_TARGET: &str = "marmot_app::client::device_group::messages";
+
+/// A device heartbeat (mdk#2628 3.6a, marmot#462).
+pub(crate) const KIND_DEVICE_HEARTBEAT: u64 = 457;
+/// An anomaly alert (mdk#2628 3.7).
+pub(crate) const KIND_ANOMALY_ALERT: u64 = 462;
+
+/// True for a kind sent only in a device group: a heartbeat, a private
+/// KeyPackage request or hand-off, or an anomaly alert. A device reads these
+/// only in the device group it trusts and ignores them in any other group.
+/// Whatever kind a device-group feature adds goes here too.
+pub(crate) fn is_device_group_kind(kind: u64) -> bool {
+    matches!(
+        kind,
+        KIND_DEVICE_HEARTBEAT
+            | KIND_PRIVATE_KEY_PACKAGE_REQUEST
+            | KIND_PRIVATE_KEY_PACKAGE_HAND_OFF
+            | KIND_ANOMALY_ALERT
+    )
+}
 
 impl AppClient {
     /// Take a message from a device-group event and hand it to the feature

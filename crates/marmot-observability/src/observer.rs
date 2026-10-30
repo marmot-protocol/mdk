@@ -26,6 +26,9 @@ use crate::{
     ProductObservation, ProductUnit, RuntimePerformanceOperation, SyncFailureClassification,
 };
 
+pub use crate::product_analytics::observed::{
+    ObservedOperation, confirmed_or_failure, send_outcome, success_or_failure,
+};
 pub use crate::product_analytics::recording::{ProductBacklogSource, StorageFailureKind};
 
 #[derive(Clone, Debug, Default)]
@@ -101,6 +104,16 @@ impl ProductRecorder {
 
     pub fn backlog_source(&self) -> ProductBacklogSource {
         self.0.backlog_source()
+    }
+
+    /// Begin an operation whose outcome a rule picks from the result of the work it runs.
+    pub fn observed(
+        &self,
+        family: ProductFamily,
+        operation: &'static str,
+        unit: ProductUnit,
+    ) -> ObservedOperation {
+        self.0.observed(family, operation, unit)
     }
 
     /// Begin an operation `marmot-app` records more than an outcome on. Hosts begin theirs with

@@ -23,6 +23,7 @@ members = [
     "crates/marmot-markdown",
     "crates/marmot-account",
     "crates/marmot-pairing",
+    "crates/marmot-observability",
     "crates/marmot-app",
     "crates/marmot-uniffi",
     "crates/marmot-uniffi-macros",
@@ -167,6 +168,7 @@ marmot-forensics = { path = "crates/marmot-forensics" }
 marmot-markdown = { path = "crates/marmot-markdown" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-pairing = { path = "crates/marmot-pairing" }
+marmot-observability = { path = "crates/marmot-observability" }
 marmot-app = { path = "crates/marmot-app" }
 marmot-uniffi = { path = "crates/marmot-uniffi" }
 marmot-uniffi-macros = { path = "crates/marmot-uniffi-macros" }

@@ -798,6 +798,65 @@ async fn a_device_with_no_first_commit_by_the_deadline_is_removed_and_told() {
     );
 }
 
+/// A device whose link failed discarded its copy of the device group, so a
+/// later link's Welcome into that same group is a first join, and the link
+/// is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_whose_link_failed_links_again_into_the_same_device_group() {
+    links_again_after_a_failed_link(false).await;
+}
+
+/// [`a_device_whose_link_failed_links_again_into_the_same_device_group`],
+/// with the new device restarting in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_whose_link_failed_links_again_after_a_restart() {
+    links_again_after_a_failed_link(true).await;
+}
+
+async fn links_again_after_a_failed_link(restart: bool) {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let slot = choose_link(&relay, &mut phone, &mut laptop).await;
+    laptop.op(DeviceLinkOp::ConfirmMatch).await;
+    laptop.step(&relay).await; // phone's confirm in, laptop's out
+    phone.step(&relay).await; // laptop's confirm in: the group
+    let group = phone.client.trusted_device_group().unwrap().unwrap();
+    phone
+        .client
+        .drive_device_pairing_at(crate::unix_now_seconds() + LINK_DEADLINE_SECS + 1)
+        .await;
+    phone.step(&relay).await; // the removal
+    let removed = laptop.step(&relay).await; // the Welcome, then its removal
+    assert_eq!(
+        removed.new_device,
+        Some(NewDeviceLinkState::Ended {
+            reason: DeviceLinkEndReason::LinkFailed
+        })
+    );
+    assert!(laptop.client.runtime.group_record(&group).is_err());
+    let used = link_record(&phone, &group, &slot).key_package_ref_hex;
+    if restart {
+        laptop = reopen(laptop).await;
+    }
+    // The KeyPackage the laptop joined by names no later link.
+    assert!(matches!(
+        laptop.client.device_link(DeviceLinkOp::Start).await,
+        Err(AppError::DeviceGroupRefused("key_package_not_published"))
+    ));
+    published_key_package(&mut laptop.client, &relay).await;
+
+    assert_eq!(link(&relay, &mut phone, &mut laptop, "Laptop").await, group);
+    assert_eq!(laptop.trust(&group), Some(DeviceGroupTrust::Linked));
+    let relinked = link_record(&phone, &group, &slot);
+    assert_eq!(relinked.outcome, DeviceLinkOutcome::Linked);
+    assert_ne!(
+        relinked.key_package_ref_hex, used,
+        "a link never names a KeyPackage the device already joined by"
+    );
+    let laptop_slot: [u8; 32] = hex::decode(&slot).unwrap().try_into().unwrap();
+    assert!(phone.roster(&group).devices.contains_key(&laptop_slot));
+    assert!(laptop.roster(&group).devices.contains_key(&laptop_slot));
+}
+
 /// Closes `device`'s client and opens it again, as a restart does: pairing
 /// keeps nothing across it.
 async fn reopen(device: Device) -> Device {

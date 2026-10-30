@@ -12,6 +12,8 @@
   (mdk#2628). Exhaustive matches add an arm for it.
 - `MarmotAppEvent` adds `KeyPackageRefreshOverdueChanged { account_id_hex,
   account_label }` (mdk#2628). Exhaustive matches add an arm for it.
+- `MarmotAppEvent` adds `UnrecognizedSignInsChanged { account_id_hex,
+  account_label }` (mdk#2628). Exhaustive matches add an arm for it.
 
 - `MarmotDeployment::key_package_client_preference` and
   `KeyPackageClientPreference` are removed (mdk#2628). The KeyPackage `client`
@@ -37,9 +39,9 @@
   (mdk#2628 item 3.6). It goes through the runtime's one roster write path,
   the one slot announcements use, and is refused with nothing sent
   (`device_group_busy`) while an earlier change of this device's in the
-  device group is in flight. A rename whose commit loses a fork to one that
-  also changes that device's entry is not made again, and the winning label
-  stands. Refused in release builds until the roster's spec lands.
+  device group is in flight. A rename whose commit loses a fork
+  is made again on a later maintenance pass, unless another rename of that
+  device won; that one stands (D37). Refused in release builds until the roster's spec lands.
 - `AppGroupMlsState.convergence_parked` reports a group whose convergence
   pass spent its failure budget (mdk#2684). Show it as stuck syncing until
   new group activity arrives or the user retries;
@@ -63,6 +65,13 @@
   3.4), so hosts can tell the user before inviters stop treating the device as
   fresh at 30 days. `KeyPackageRefreshOverdueChanged` says to re-read it. Both
   are false and silent in release builds until the roster's spec lands.
+- `MarmotAppRuntime::unrecognized_sign_ins` lists sign-ins of this account
+  that this device does not recognize as `UnrecognizedSignIn`s (mdk#2628 item
+  3.2): a fresh, valid KeyPackage in a slot neither this device nor its device
+  group's roster knows. `answer_sign_in` takes a `SignInResponse` (Not now,
+  Reject or Dismiss), and `check_sign_ins` checks now instead of at the next
+  scheduled check. `UnrecognizedSignInsChanged` says to re-read the list. All
+  are empty and silent in release builds until the roster's spec lands.
 - Device pairing links a new device of the account through the account runtime (mdk#2628 item 3.3b), behind the
   unreleased `unreleased-device-pairing` feature and `dev_device_groups`. The new device starts a link naming its
   published KeyPackage (`MarmotAppRuntime::start_device_link`), both devices show the same seven emoji with their
@@ -342,6 +351,13 @@
   left from `departed_members` and `GroupStateChanged`, and that this device
   was removed from `LocalGroupCopyTerminated`. MarmotKit and the C ABI
   already left the leaves out.
+- The diagnostics exporters move to the new `marmot-observability` crate
+  (mdk#2627): relay-telemetry export, product analytics and its consent
+  state, the app-performance recorder, the audit OTLP sender and the v4
+  audit upload's HTTP half. `marmot-app` re-exports every type at its old
+  `marmot_app::` path, the `product_analytics` and `audit_otlp_sender`
+  modules included, and its `otlp-export` and `product-analytics-export`
+  features forward to the crate, so hosts change nothing.
 - `marmot_app::product_analytics::configure_product_analytics_from_environment`
   no longer resolves (mdk#2627). Hosts call the same function as
   `marmot_app::configure_product_analytics_from_environment`, as before.
@@ -363,6 +379,11 @@
 
 ### Fixed
 
+- Kinds sent only in a device group (heartbeat 457, private KeyPackage
+  request 459 and hand-off 460, anomaly alert 462) are ignored in any other
+  group (mdk#2628). One received in a chat makes no timeline row, host
+  message or notification, and `send_custom_event` refuses each as reserved
+  (`is_reserved_app_event_kind`). The device group itself still reads them.
 - External-signer sticker installs and uninstalls prepare event IDs and
   finish signing before changing local intent. Refused signatures leave
   existing pending changes untouched.
