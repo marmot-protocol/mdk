@@ -8,23 +8,24 @@
 //! through the worker's in-memory account state, as every archive does
 //! (mdk#178), and the next pass sees it applied. Each chat a pass changed gets
 //! one chat-list update.
+//!
+//! Recovery is a broadcast of every item this device holds, as updates: at
+//! start, at least daily, whenever the device group's tip has moved past the
+//! app-payload window since the last one, and in answer to a sibling's
+//! broadcast request. Nothing tracks what a sibling holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_traits::GroupId;
-use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId};
-use cgka_traits::storage::MaintenanceStorage as _;
 use marmot_session::CanonicalizationPolicy;
 use storage_sqlite::{SmallStateItem, SmallStateItemName};
 
 use super::AppClient;
-use super::device_group::device_slot;
 use crate::small_state::{
-    KIND_SMALL_STATE_SNAPSHOT, KIND_SMALL_STATE_SNAPSHOT_REQUEST, KIND_SMALL_STATE_UPDATE,
-    SmallStateMergeRule, decode_small_state_snapshot, decode_small_state_update,
-    decode_snapshot_request,
+    KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE, SmallStateMergeRule,
+    broadcast_due, decode_broadcast_request, decode_small_state_update,
 };
-use crate::{AppError, AppProjectionUpdate, ChatListUpdateTrigger, MarmotApp};
+use crate::{AppError, AppProjectionUpdate, ChatListUpdateTrigger, MarmotApp, unix_now_seconds};
 
 const TRACE_TARGET: &str = "marmot_app::client::small_state";
 
@@ -36,7 +37,7 @@ impl AppClient {
         }
         if let Err(error) = self
             .sync_small_state(&[])
-            .and_then(|()| self.owe_small_state_round_when_due())
+            .and_then(|()| self.begin_small_state_broadcast_when_due(unix_now_seconds()))
         {
             tracing::warn!(
                 target: TRACE_TARGET,
@@ -47,11 +48,12 @@ impl AppClient {
         }
     }
 
-    /// Owe a new snapshot round once the device group's tip is more than the
-    /// app-payload window past the last round's. A device-group message is
-    /// lost to that window only as the tip moves, so these rounds recover what
-    /// a lost message carried whether or not this device saw it go.
-    pub(crate) fn owe_small_state_round_when_due(&mut self) -> Result<(), AppError> {
+    /// Begin a broadcast when [`broadcast_due`] says one is owed at `now`:
+    /// every item this device holds is owed to its siblings again.
+    pub(crate) fn begin_small_state_broadcast_when_due(
+        &mut self,
+        now: u64,
+    ) -> Result<(), AppError> {
         if !self.app.device_groups_enabled() {
             return Ok(());
         }
@@ -59,15 +61,20 @@ impl AppClient {
             return Ok(());
         };
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        let Some(round_tip) = storage.small_state_snapshot_round_tip()? else {
+        let Some(schedule) = storage.small_state_schedule()? else {
+            return Ok(());
+        };
+        let Some(tip) = self.stored_group(&group_id)?.map(|group| group.epoch.0) else {
             return Ok(());
         };
         let window = CanonicalizationPolicy::default().app_message_past_epoch_limit;
-        if self
-            .stored_group(&group_id)?
-            .is_some_and(|group| group.epoch.0 > round_tip.saturating_add(window))
-        {
-            storage.owe_small_state_snapshots()?;
+        if broadcast_due(&schedule, now, tip, window) {
+            storage.begin_small_state_broadcast(now, tip)?;
+            tracing::debug!(
+                target: TRACE_TARGET,
+                method = "begin_small_state_broadcast_when_due",
+                "small-state broadcast begun"
+            );
         }
         Ok(())
     }
@@ -162,56 +169,37 @@ impl AppClient {
         self.sync_small_state(&items)
     }
 
-    /// Merge a snapshot's items, whoever asked for it, and count the part
-    /// when it answers one of this device's requests.
-    pub(crate) fn receive_small_state_snapshot(
+    /// Take a sibling's broadcast request: owe a broadcast, which
+    /// [`broadcast_due`] spaces at least an hour after the last.
+    pub(crate) fn receive_small_state_broadcast_request(
         &mut self,
         group_id: &GroupId,
         content: &str,
     ) -> Result<(), AppError> {
         self.ensure_small_state_group(group_id)?;
-        let snapshot = decode_small_state_snapshot(content)?;
-        self.sync_small_state(&snapshot.items)?;
+        decode_broadcast_request(content)?;
         self.app
             .account_storage(&self.state.label)?
             .app_storage()
-            .record_small_state_snapshot_part(&snapshot.request, snapshot.part, snapshot.parts)?;
-        Ok(())
-    }
-
-    /// Take a snapshot request: owe an answer when it asks this device.
-    pub(crate) fn receive_small_state_snapshot_request(
-        &mut self,
-        group_id: &GroupId,
-        content: &str,
-    ) -> Result<(), AppError> {
-        self.ensure_small_state_group(group_id)?;
-        let (to, request) = decode_snapshot_request(content)?;
-        if self.own_device_slot()? == Some(to) {
-            self.small_state_snapshot_answers_owed.insert(request);
-        }
+            .owe_small_state_broadcast_answer()?;
         Ok(())
     }
 
     /// Branch selection withdrew a small-state message this device sent or
-    /// merged: owe every item held again, or ask again at once for a request
-    /// of this device's.
+    /// read: owe every item held again for an update, whoever sent it, and a
+    /// new broadcast request for a request.
     pub(crate) fn small_state_message_withdrawn(
         &mut self,
         group_id: &GroupId,
         kind: u64,
-        content: &str,
     ) -> Result<(), AppError> {
         self.ensure_small_state_group(group_id)?;
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         match kind {
-            KIND_SMALL_STATE_UPDATE | KIND_SMALL_STATE_SNAPSHOT => {
+            KIND_SMALL_STATE_UPDATE => {
                 storage.owe_all_small_state_items()?;
             }
-            KIND_SMALL_STATE_SNAPSHOT_REQUEST => {
-                let (_, request) = decode_snapshot_request(content)?;
-                storage.withdraw_small_state_snapshot_request(&request)?;
-            }
+            KIND_SMALL_STATE_BROADCAST_REQUEST => storage.owe_small_state_broadcast_request()?,
             _ => {}
         }
         Ok(())
@@ -227,30 +215,5 @@ impl AppClient {
         } else {
             Err(AppError::DeviceGroupRefused("not_trusted_device_group"))
         }
-    }
-
-    /// This device's slot, if it has one.
-    fn own_device_slot(&self) -> Result<Option<DeviceSlotId>, AppError> {
-        Ok(self
-            .app
-            .account_storage(&self.state.label)?
-            .key_package_lifecycle()?
-            .and_then(|lifecycle| device_slot(&lifecycle.stable_slot_id).ok()))
-    }
-
-    /// The siblings to ask for snapshots: every device in the roster other
-    /// than this one, whatever its status, since any of them may hold a value
-    /// no other device does.
-    pub(crate) fn small_state_snapshot_targets(
-        &self,
-        roster: &DeviceRosterV1,
-    ) -> Result<Vec<DeviceSlotId>, AppError> {
-        let own_slot = self.own_device_slot()?;
-        Ok(roster
-            .devices
-            .keys()
-            .filter(|slot| Some(**slot) != own_slot)
-            .copied()
-            .collect())
     }
 }

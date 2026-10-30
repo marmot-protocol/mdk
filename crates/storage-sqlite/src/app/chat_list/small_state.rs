@@ -26,9 +26,14 @@ use crate::base::connection::CachedSql;
 use crate::{
     SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64, unix_now_ms, unix_now_seconds,
 };
+use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_EDIT;
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// The longest MLS group id a chat with small state has, in bytes, so every
+/// item fits in one update. Other chats hold no item.
+const MAX_SMALL_STATE_CHAT_BYTES: usize = 256;
 
 /// The largest number an item carries, as a version, epoch or time: the
 /// largest integer every JSON reader holds exactly.
@@ -129,6 +134,7 @@ impl SmallStateItem {
     pub fn is_valid(&self) -> bool {
         let number = |value: u64| value <= MAX_SMALL_STATE_NUMBER;
         let chat = !self.group_id_hex.is_empty()
+            && self.group_id_hex.len() <= 2 * MAX_SMALL_STATE_CHAT_BYTES
             && self.group_id_hex.len().is_multiple_of(2)
             && is_lower_hex(&self.group_id_hex);
         let value = match &self.value {
@@ -182,26 +188,35 @@ pub struct SmallStateSync {
     pub recorded: usize,
 }
 
-/// A sibling whose whole snapshot this device still needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SmallStateSnapshotRequest {
-    /// The sibling's slot.
-    pub to: [u8; 32],
-    /// The latest request to it; `None` before the first.
-    pub request: Option<[u8; 16]>,
-    /// When that request was sent, in seconds; `None` to ask at once.
-    pub asked_at: Option<u64>,
+/// When this device last broadcast every item it holds, and what it owes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmallStateSchedule {
+    /// When this device last broadcast, in seconds, and the device group's
+    /// tip epoch then; `None` before its first broadcast.
+    pub last_broadcast: Option<SmallStateBroadcast>,
+    /// This device still has to ask its siblings to broadcast.
+    pub request_owed: bool,
+    /// A sibling asked this device to broadcast since its last broadcast.
+    pub answer_owed: bool,
+}
+
+/// One broadcast: when it began and the device group's tip epoch then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmallStateBroadcast {
+    pub at: u64,
+    pub tip: u64,
 }
 
 impl SqliteAppStorage {
-    /// Start taking part in small state, owing a snapshot request. `true`
+    /// Start taking part in small state, owing a broadcast request. `true`
     /// when this call started it.
     pub fn start_small_state(&self) -> StorageResult<bool> {
         let inserted = self
             .lock()?
             .execute_cached(
-                "INSERT OR IGNORE INTO small_state_sync (id, started_at, snapshot_owed)
-                 VALUES (1, ?1, 1)",
+                "INSERT OR IGNORE INTO small_state_sync
+                     (id, started_at, request_owed, answer_owed)
+                 VALUES (1, ?1, 1, 0)",
                 params![u64_to_i64(unix_now_seconds())?],
             )
             .storage()?;
@@ -212,209 +227,86 @@ impl SqliteAppStorage {
         small_state_started_tx(&*self.lock()?)
     }
 
-    /// Whether this device still has to ask a sibling for a snapshot.
-    pub fn small_state_snapshot_owed(&self) -> StorageResult<bool> {
-        self.lock()?
+    /// This device's broadcast schedule; `None` before small state starts.
+    pub fn small_state_schedule(&self) -> StorageResult<Option<SmallStateSchedule>> {
+        let row = self
+            .lock()?
             .query_row_cached(
-                "SELECT EXISTS(SELECT 1 FROM small_state_sync WHERE id = 1 AND snapshot_owed = 1)",
+                "SELECT broadcast_at, broadcast_tip, request_owed, answer_owed
+                 FROM small_state_sync WHERE id = 1",
                 [],
-                |row| row.get(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
             )
-            .storage()
-    }
-
-    /// Owe snapshot requests: this device may have lost messages its
-    /// siblings sent. Does nothing before [`Self::start_small_state`].
-    pub fn owe_small_state_snapshots(&self) -> StorageResult<()> {
-        self.lock()?
-            .execute_cached(
-                "UPDATE small_state_sync SET snapshot_owed = 1 WHERE id = 1",
-                [],
-            )
+            .optional()
             .storage()?;
-        Ok(())
+        row.map(|(at, tip, request_owed, answer_owed)| {
+            let last_broadcast = match (at, tip) {
+                (Some(at), Some(tip)) => Some(SmallStateBroadcast {
+                    at: i64_to_u64(at)?,
+                    tip: i64_to_u64(tip)?,
+                }),
+                _ => None,
+            };
+            Ok(SmallStateSchedule {
+                last_broadcast,
+                request_owed,
+                answer_owed,
+            })
+        })
+        .transpose()
     }
 
-    /// Begin owed snapshot requests at the device group's tip epoch `tip`:
-    /// this device needs a whole snapshot from each sibling in `to`, and owes
-    /// its siblings every item it holds. Earlier requests are forgotten. Does
-    /// nothing unless requests are owed.
-    pub fn begin_small_state_snapshots(&self, to: &[[u8; 32]], tip: u64) -> StorageResult<()> {
+    /// Begin a broadcast at `at`, with the device group's tip epoch at `tip`:
+    /// owe the siblings every item this device holds, with its version and
+    /// change id. It answers every request read before it. Does nothing
+    /// before [`Self::start_small_state`].
+    pub fn begin_small_state_broadcast(&self, at: u64, tip: u64) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let begun = conn
                 .execute_cached(
-                    "UPDATE small_state_sync SET snapshot_owed = 0, snapshot_round_tip = ?1
-                     WHERE id = 1 AND snapshot_owed = 1",
-                    params![u64_to_i64(tip)?],
+                    "UPDATE small_state_sync
+                     SET broadcast_at = ?1, broadcast_tip = ?2, answer_owed = 0
+                     WHERE id = 1",
+                    params![u64_to_i64(at)?, u64_to_i64(tip)?],
                 )
                 .storage()?;
-            if begun == 0 {
-                return Ok(());
-            }
-            conn.execute_cached("DELETE FROM small_state_snapshot_requests", [])
-                .storage()?;
-            for slot in to {
+            if begun == 1 {
                 conn.execute_cached(
-                    "INSERT OR IGNORE INTO small_state_snapshot_requests (to_slot) VALUES (?1)",
-                    params![slot.as_slice()],
+                    "UPDATE small_state_items SET unsent = 1 WHERE unsent = 0",
+                    [],
                 )
                 .storage()?;
             }
-            conn.execute_cached(
-                "UPDATE small_state_items SET unsent = 1 WHERE unsent = 0",
-                [],
-            )
-            .storage()?;
             Ok(())
         })
     }
 
-    /// The device group's tip epoch when this device last began asking for
-    /// snapshots; `None` before the first time.
-    pub fn small_state_snapshot_round_tip(&self) -> StorageResult<Option<u64>> {
-        self.lock()?
-            .query_row_cached(
-                "SELECT snapshot_round_tip FROM small_state_sync WHERE id = 1",
-                [],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .optional()
-            .storage()?
-            .flatten()
-            .map(i64_to_u64)
-            .transpose()
+    /// Owe a broadcast request: this device's last one was withdrawn.
+    pub fn owe_small_state_broadcast_request(&self) -> StorageResult<()> {
+        self.update_small_state_sync("UPDATE small_state_sync SET request_owed = 1 WHERE id = 1")
     }
 
-    /// The siblings whose whole snapshot this device still needs, in slot
-    /// order.
-    pub fn small_state_snapshot_requests(&self) -> StorageResult<Vec<SmallStateSnapshotRequest>> {
-        let conn = self.lock()?;
-        let mut statement = conn
-            .prepare_cached(
-                "SELECT to_slot, request, asked_at FROM small_state_snapshot_requests
-                 ORDER BY to_slot",
-            )
-            .storage()?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                ))
-            })
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?;
-        let corrupt = || StorageError::Backend("corrupt small-state snapshot request".into());
-        rows.into_iter()
-            .map(|(to, request, asked_at)| {
-                Ok(SmallStateSnapshotRequest {
-                    to: to.try_into().map_err(|_| corrupt())?,
-                    request: request
-                        .map(|request| request.try_into().map_err(|_| corrupt()))
-                        .transpose()?,
-                    asked_at: asked_at.map(i64_to_u64).transpose()?,
-                })
-            })
-            .collect()
+    /// The owed broadcast request was sent.
+    pub fn small_state_broadcast_request_sent(&self) -> StorageResult<()> {
+        self.update_small_state_sync("UPDATE small_state_sync SET request_owed = 0 WHERE id = 1")
     }
 
-    /// Record a request sent to `to` with id `request`. The parts of an
-    /// earlier request's answer no longer count.
-    pub fn record_small_state_snapshot_asked(
-        &self,
-        to: &[u8; 32],
-        request: &[u8; 16],
-        asked_at: u64,
-    ) -> StorageResult<()> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            conn.execute_cached(
-                "DELETE FROM small_state_snapshot_parts
-                 WHERE request = (SELECT request FROM small_state_snapshot_requests
-                                  WHERE to_slot = ?1)",
-                params![to.as_slice()],
-            )
-            .storage()?;
-            conn.execute_cached(
-                "UPDATE small_state_snapshot_requests SET request = ?2, asked_at = ?3
-                 WHERE to_slot = ?1",
-                params![to.as_slice(), request.as_slice(), u64_to_i64(asked_at)?],
-            )
-            .storage()?;
-            Ok(())
-        })
+    /// Owe a broadcast in answer to a sibling's request.
+    pub fn owe_small_state_broadcast_answer(&self) -> StorageResult<()> {
+        self.update_small_state_sync("UPDATE small_state_sync SET answer_owed = 1 WHERE id = 1")
     }
 
-    /// Stop needing `to`'s snapshot: it is no longer an active sibling.
-    pub fn drop_small_state_snapshot_request(&self, to: &[u8; 32]) -> StorageResult<()> {
-        self.lock()?
-            .execute_cached(
-                "DELETE FROM small_state_snapshot_requests WHERE to_slot = ?1",
-                params![to.as_slice()],
-            )
-            .storage()?;
+    fn update_small_state_sync(&self, sql: &str) -> StorageResult<()> {
+        self.lock()?.execute_cached(sql, []).storage()?;
         Ok(())
-    }
-
-    /// Ask again at once for the request `request`, which branch selection
-    /// withdrew. `false` when no sibling's latest request has that id.
-    pub fn withdraw_small_state_snapshot_request(&self, request: &[u8; 16]) -> StorageResult<bool> {
-        Ok(self
-            .lock()?
-            .execute_cached(
-                "UPDATE small_state_snapshot_requests SET asked_at = NULL WHERE request = ?1",
-                params![request.as_slice()],
-            )
-            .storage()?
-            == 1)
-    }
-
-    /// Record that part `part` of `parts` of the answer to `request` was
-    /// merged. `true` when that makes the answer whole: the sibling's snapshot
-    /// is no longer needed.
-    pub fn record_small_state_snapshot_part(
-        &self,
-        request: &[u8; 16],
-        part: u64,
-        parts: u64,
-    ) -> StorageResult<bool> {
-        if part == 0 || part > parts || parts > MAX_SMALL_STATE_NUMBER {
-            return Ok(false);
-        }
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let inserted = conn
-                .execute_cached(
-                    "INSERT OR IGNORE INTO small_state_snapshot_parts (request, parts, part)
-                     SELECT request, ?2, ?3 FROM small_state_snapshot_requests
-                     WHERE request = ?1",
-                    params![request.as_slice(), u64_to_i64(parts)?, u64_to_i64(part)?],
-                )
-                .storage()?;
-            if inserted == 0 {
-                return Ok(false);
-            }
-            let merged: i64 = conn
-                .query_row_cached(
-                    "SELECT COUNT(*) FROM small_state_snapshot_parts
-                     WHERE request = ?1 AND parts = ?2",
-                    params![request.as_slice(), u64_to_i64(parts)?],
-                    |row| row.get(0),
-                )
-                .storage()?;
-            if i64_to_u64(merged)? < parts {
-                return Ok(false);
-            }
-            conn.execute_cached(
-                "DELETE FROM small_state_snapshot_requests WHERE request = ?1",
-                params![request.as_slice()],
-            )
-            .storage()?;
-            Ok(true)
-        })
     }
 
     /// Record local changes, merge `incoming`, and apply winning values, in
@@ -454,7 +346,7 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Every item this device holds, for a snapshot.
+    /// Every item this device holds.
     pub fn small_state_items(&self) -> StorageResult<Vec<SmallStateItem>> {
         items_tx(&*self.lock()?, false)
     }
@@ -484,9 +376,8 @@ impl SqliteAppStorage {
     }
 
     /// Owe the siblings every item this device holds, with its version and
-    /// change id: a small-state message it sent or merged was withdrawn, or it
-    /// may have lost messages its siblings need. Returns how many are owed
-    /// again.
+    /// change id: an update it sent or merged was withdrawn. Returns how many
+    /// are owed again.
     pub fn owe_all_small_state_items(&self) -> StorageResult<usize> {
         self.lock()?
             .execute_cached(
@@ -513,11 +404,15 @@ struct HeldChat {
     /// `muted_until_ms` as stored: `None` without a row, `Some(None)` muted
     /// until unmuted.
     mute: Option<Option<i64>>,
-    /// The read marker's position, when it names a delivered message.
+    /// The furthest delivered message, other than an edit, at or before the
+    /// read marker.
     read: Option<ReadPosition>,
     /// The read marker's canonical order key, to compare a position with.
-    read_key: Option<(u8, u64, u8, u64, String)>,
+    read_key: Option<ReadKey>,
 }
+
+/// A canonical timeline order key: class, epoch, phase, time and message id.
+type ReadKey = (u8, u64, u8, u64, String);
 
 impl HeldChat {
     fn observed(&self, name: SmallStateItemName) -> String {
@@ -555,6 +450,54 @@ impl HeldChat {
             SmallStateItemName::Read => self.read.is_none(),
         }
     }
+}
+
+/// The furthest delivered message of the chat, other than an edit, at or
+/// before `key`: what a read position names when this device's read marker
+/// is on a row no position may name, such as a synthesized group system row
+/// or a send not delivered yet.
+fn furthest_delivered_message_tx(
+    conn: &Connection,
+    group_id_hex: &str,
+    (class, primary, phase, at, id): &ReadKey,
+) -> StorageResult<Option<ReadPosition>> {
+    conn.query_row_cached(
+        "SELECT timeline_order_primary, timeline_order_at, message_id_hex
+         FROM message_timeline
+         WHERE group_id_hex = ?1
+           AND timeline_order_class = 1 AND timeline_order_phase = 1
+           AND kind != ?7
+           AND (timeline_order_class, timeline_order_primary, timeline_order_phase,
+                timeline_order_at, message_id_hex) <= (?2, ?3, ?4, ?5, ?6)
+         ORDER BY timeline_order_primary DESC, timeline_order_at DESC, message_id_hex DESC
+         LIMIT 1",
+        params![
+            group_id_hex,
+            i64::from(*class),
+            u64_to_i64(*primary)?,
+            i64::from(*phase),
+            u64_to_i64(*at)?,
+            id,
+            u64_to_i64(MARMOT_APP_EVENT_KIND_EDIT)?,
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )
+    .optional()
+    .storage()?
+    .map(|(epoch, at, message_id_hex)| {
+        Ok(ReadPosition {
+            epoch: i64_to_u64(epoch)?,
+            at: i64_to_u64(at)?,
+            message_id_hex,
+        })
+    })
+    .transpose()
 }
 
 fn flag_text(flag: bool) -> String {
@@ -596,19 +539,23 @@ fn held_chats_tx(conn: &Connection) -> StorageResult<BTreeMap<String, HeldChat>>
         .storage()?;
     let mut chats = BTreeMap::new();
     for (group_id_hex, archived, pinned, muted_row, muted_until_ms) in rows {
+        if group_id_hex.len() > 2 * MAX_SMALL_STATE_CHAT_BYTES {
+            continue;
+        }
         let read_key = read_state_tx(conn, &group_id_hex)?.and_then(|state| {
             state
                 .canonical_order_key()
                 .map(|(class, primary, phase, at, id)| (class, primary, phase, at, id.to_owned()))
         });
-        let read = read_key
-            .as_ref()
-            .filter(|(class, _, phase, _, _)| *class == 1 && *phase == 1)
-            .map(|(_, epoch, _, at, id)| ReadPosition {
+        let read = match &read_key {
+            Some((1, epoch, 1, at, id)) => Some(ReadPosition {
                 epoch: *epoch,
                 at: *at,
                 message_id_hex: id.clone(),
-            });
+            }),
+            Some(key) => furthest_delivered_message_tx(conn, &group_id_hex, key)?,
+            None => None,
+        };
         chats.insert(
             group_id_hex,
             HeldChat {

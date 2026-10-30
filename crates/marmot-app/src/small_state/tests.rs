@@ -1,4 +1,5 @@
 use super::*;
+use storage_sqlite::SmallStateBroadcast;
 
 fn versioned(chat: &str, value: SmallStateValue, version: u64, id: u8) -> SmallStateItem {
     SmallStateItem {
@@ -92,71 +93,6 @@ fn long_item_lists_split_into_updates_that_each_stand_alone() {
 }
 
 #[test]
-fn a_snapshot_numbers_its_parts_and_may_be_empty() {
-    let request = [0x5a; 16];
-    let items = many(2_000);
-    let pages = encode_small_state_snapshot(&request, &items);
-    let parts = pages.len() as u64;
-    assert!(parts > 1);
-    let mut decoded = Vec::new();
-    for (content, part) in pages.iter().zip(1..) {
-        assert!(content.len() <= MAX_SMALL_STATE_CONTENT_BYTES);
-        assert!(content.starts_with(&format!(
-            "{{\"v\":1,\"request\":\"{}\",\"part\":{part},\"parts\":{parts},\"items\":[{{",
-            "5a".repeat(16)
-        )));
-        let snapshot = decode_small_state_snapshot(content).unwrap();
-        assert_eq!(
-            (snapshot.request, snapshot.part, snapshot.parts),
-            (request, part, parts)
-        );
-        decoded.extend(snapshot.items);
-    }
-    assert_eq!(decoded, items);
-
-    let empty = encode_small_state_snapshot(&request, &[]);
-    assert_eq!(
-        empty,
-        vec![format!(
-            "{{\"v\":1,\"request\":\"{}\",\"part\":1,\"parts\":1,\"items\":[]}}",
-            "5a".repeat(16)
-        )]
-    );
-    assert_eq!(
-        decode_small_state_snapshot(&empty[0]).unwrap(),
-        SmallStateSnapshot {
-            request,
-            part: 1,
-            parts: 1,
-            items: Vec::new(),
-        }
-    );
-    // An update is never empty, and a snapshot is not an update.
-    assert!(decode_small_state_update(&empty[0]).is_err());
-    assert!(decode_small_state_snapshot(&format!("{{\"v\":1,\"items\":[{PIN}]}}")).is_err());
-
-    let request_hex = "5a".repeat(16);
-    for (part, parts) in [
-        ("0", "1"),
-        ("2", "1"),
-        ("1", "0"),
-        ("1.0", "1"),
-        ("1", "9007199254740992"),
-    ] {
-        let content = format!(
-            "{{\"v\":1,\"request\":\"{request_hex}\",\"part\":{part},\"parts\":{parts},\"items\":[]}}"
-        );
-        assert!(decode_small_state_snapshot(&content).is_err(), "{content}");
-    }
-    for request_hex in ["5A".repeat(16), "5a".repeat(15)] {
-        let content = format!(
-            "{{\"v\":1,\"request\":\"{request_hex}\",\"part\":1,\"parts\":1,\"items\":[]}}"
-        );
-        assert!(decode_small_state_snapshot(&content).is_err(), "{content}");
-    }
-}
-
-#[test]
 fn unknown_and_invalid_items_are_skipped() {
     let change = "01".repeat(16);
     let content = format!(
@@ -206,9 +142,8 @@ fn content_of_the_wrong_shape_is_refused() {
         // A member name repeated, at the top or in an item or value.
         format!("{{\"v\":1,\"v\":1,\"items\":[{PIN}]}}"),
         format!("{{\"v\":1,\"items\":[{}]}}", PIN.replace("\"value\":true", "\"value\":true,\"value\":false")),
-        format!(
-            "{{\"v\":1,\"items\":[{{\"chat\":\"0a\",\"item\":\"invite\",\"value\":{{\"a\":1,\"a\":2}}}}]}}"
-        ),
+        "{\"v\":1,\"items\":[{\"chat\":\"0a\",\"item\":\"invite\",\"value\":{\"a\":1,\"a\":2}}]}"
+            .to_owned(),
         // Two items for the same chat and item, even an unknown one.
         format!("{{\"v\":1,\"items\":[{PIN},{}]}}", PIN.replace("true", "false")),
         "{\"v\":1,\"items\":[{\"chat\":\"0a\",\"item\":\"invite\"},{\"chat\":\"0a\",\"item\":\"invite\"}]}"
@@ -237,42 +172,52 @@ fn content_of_the_wrong_shape_is_refused() {
 }
 
 #[test]
-fn snapshot_requests_name_one_slot_and_carry_an_id() {
-    let slot = [0x5a; 32];
-    let request = [0x07; 16];
-    let content = encode_snapshot_request(&slot, &request);
-    assert_eq!(
-        content,
-        format!(
-            "{{\"v\":1,\"to\":\"{}\",\"request\":\"{}\"}}",
-            "5a".repeat(32),
-            "07".repeat(16)
-        )
-    );
-    assert_eq!(decode_snapshot_request(&content).unwrap(), (slot, request));
-    let to = "5a".repeat(32);
-    let id = "07".repeat(16);
+fn a_broadcast_request_is_exactly_its_version() {
+    assert_eq!(BROADCAST_REQUEST, "{\"v\":1}");
+    assert!(decode_broadcast_request(BROADCAST_REQUEST).is_ok());
     for content in [
-        "{\"v\":1}".to_owned(),
-        format!("{{\"v\":1,\"to\":\"{to}\"}}"),
-        format!("{{\"v\":2,\"to\":\"{to}\",\"request\":\"{id}\"}}"),
-        format!(
-            "{{\"v\":1,\"to\":\"{}\",\"request\":\"{id}\"}}",
-            "5a".repeat(31)
-        ),
-        format!(
-            "{{\"v\":1,\"to\":\"{}\",\"request\":\"{id}\"}}",
-            "5A".repeat(32)
-        ),
-        format!(
-            "{{\"v\":1,\"to\":\"{to}\",\"request\":\"{}\"}}",
-            "07".repeat(15)
-        ),
-        format!("{{\"v\":1,\"to\":\"{to}\",\"request\":\"{id}\",\"x\":1}}"),
-        format!("{{\"v\":1,\"to\":\"{to}\",\"to\":\"{to}\",\"request\":\"{id}\"}}"),
+        "",
+        "{}",
+        "{\"v\":2}",
+        "{\"v\":\"1\"}",
+        "{\"v\":1,\"v\":1}",
+        "{\"v\":1,\"to\":\"5a\"}",
+        "{\"v\":1,\"items\":[]}",
     ] {
-        assert!(decode_snapshot_request(&content).is_err(), "{content}");
+        assert!(decode_broadcast_request(content).is_err(), "{content}");
     }
+    // A broadcast request is not an update.
+    assert!(decode_small_state_update(BROADCAST_REQUEST).is_err());
+}
+
+#[test]
+fn a_broadcast_is_due_daily_past_the_window_and_an_hour_after_a_request() {
+    const DAY: u64 = 24 * 60 * 60;
+    const HOUR: u64 = 60 * 60;
+    let schedule = |at, tip, answer_owed| SmallStateSchedule {
+        last_broadcast: Some(SmallStateBroadcast { at, tip }),
+        request_owed: false,
+        answer_owed,
+    };
+    let first = SmallStateSchedule {
+        last_broadcast: None,
+        request_owed: true,
+        answer_owed: false,
+    };
+    assert!(broadcast_due(&first, 0, 0, 5));
+
+    let at = 1_000_000;
+    let quiet = schedule(at, 10, false);
+    assert!(!broadcast_due(&quiet, at, 10, 5));
+    assert!(!broadcast_due(&quiet, at + DAY - 1, 15, 5));
+    assert!(broadcast_due(&quiet, at + DAY, 10, 5));
+    assert!(broadcast_due(&quiet, at + 1, 16, 5));
+    // A clock set back before the last broadcast never holds one back.
+    assert!(broadcast_due(&quiet, at - 1, 10, 5));
+
+    let asked = schedule(at, 10, true);
+    assert!(!broadcast_due(&asked, at + HOUR - 1, 10, 5));
+    assert!(broadcast_due(&asked, at + HOUR, 10, 5));
 }
 
 #[test]

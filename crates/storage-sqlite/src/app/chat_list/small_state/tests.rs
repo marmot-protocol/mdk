@@ -184,20 +184,24 @@ fn nothing_is_recorded_or_applied_before_small_state_starts() {
     assert!(app.small_state_items().unwrap().is_empty());
     assert_eq!(pins(&store), vec!["11"]);
 
-    assert!(!app.small_state_snapshot_owed().unwrap());
-    app.owe_small_state_snapshots().unwrap();
-    assert!(!app.small_state_snapshot_owed().unwrap());
+    assert_eq!(app.small_state_schedule().unwrap(), None);
+    app.owe_small_state_broadcast_request().unwrap();
+    app.owe_small_state_broadcast_answer().unwrap();
+    app.begin_small_state_broadcast(100, 4).unwrap();
+    assert_eq!(app.small_state_schedule().unwrap(), None);
 
+    // Starting owes a broadcast request, and no broadcast has been made.
     assert!(app.start_small_state().unwrap());
     assert!(!app.start_small_state().unwrap());
     assert!(app.small_state_started().unwrap());
-    assert!(app.small_state_snapshot_owed().unwrap());
-    assert_eq!(app.small_state_snapshot_round_tip().unwrap(), None);
-    app.begin_small_state_snapshots(&[], 4).unwrap();
-    assert!(!app.small_state_snapshot_owed().unwrap());
-    assert_eq!(app.small_state_snapshot_round_tip().unwrap(), Some(4));
-    assert!(!app.start_small_state().unwrap());
-    assert!(!app.small_state_snapshot_owed().unwrap());
+    assert_eq!(
+        app.small_state_schedule().unwrap(),
+        Some(SmallStateSchedule {
+            last_broadcast: None,
+            request_owed: true,
+            answer_owed: false,
+        })
+    );
 }
 
 #[test]
@@ -292,115 +296,50 @@ fn an_item_at_the_highest_version_cannot_be_changed() {
 }
 
 #[test]
-fn a_snapshot_is_needed_from_each_sibling_until_its_answer_is_whole() {
-    let store = started_store(&[("11", false)]);
+fn a_broadcast_owes_every_item_and_answers_requests_read_before_it() {
+    let store = started_store(&[("11", false), ("22", false)]);
     let app = store.app_storage();
     let rule = TestRule::new();
     app.set_chat_pinned("11", true).unwrap();
+    app.set_chat_pinned("22", true).unwrap();
     sync(&store, &[], &rule);
     app.mark_small_state_sent(&app.unsent_small_state_items().unwrap())
         .unwrap();
-    let (phone, tablet) = ([1; 32], [2; 32]);
-
-    // Beginning asks every sibling given and owes every item held.
-    assert!(app.small_state_snapshot_owed().unwrap());
-    app.begin_small_state_snapshots(&[tablet, phone], 1)
-        .unwrap();
-    assert!(!app.small_state_snapshot_owed().unwrap());
-    assert_eq!(app.unsent_small_state_items().unwrap().len(), 1);
-    let unasked = |to| SmallStateSnapshotRequest {
-        to,
-        request: None,
-        asked_at: None,
-    };
+    app.small_state_broadcast_request_sent().unwrap();
+    app.owe_small_state_broadcast_answer().unwrap();
     assert_eq!(
-        app.small_state_snapshot_requests().unwrap(),
-        vec![unasked(phone), unasked(tablet)]
+        app.small_state_schedule().unwrap(),
+        Some(SmallStateSchedule {
+            last_broadcast: None,
+            request_owed: false,
+            answer_owed: true,
+        })
     );
 
-    app.record_small_state_snapshot_asked(&phone, &[1; 16], 100)
-        .unwrap();
-    app.record_small_state_snapshot_asked(&tablet, &[2; 16], 100)
-        .unwrap();
-    // Parts of an answer to no request, or out of range, do not count.
-    assert!(
-        !app.record_small_state_snapshot_part(&[9; 16], 1, 1)
-            .unwrap()
-    );
-    assert!(
-        !app.record_small_state_snapshot_part(&[1; 16], 3, 2)
-            .unwrap()
-    );
-    assert!(
-        !app.record_small_state_snapshot_part(&[1; 16], 0, 2)
-            .unwrap()
-    );
-    assert!(
-        !app.record_small_state_snapshot_part(&[1; 16], 1, 2)
-            .unwrap()
-    );
-    assert!(
-        !app.record_small_state_snapshot_part(&[1; 16], 1, 2)
-            .unwrap()
-    );
-    // A part of an answer with another part count belongs to another answer.
-    assert!(
-        !app.record_small_state_snapshot_part(&[1; 16], 2, 3)
-            .unwrap()
-    );
-    assert!(
-        app.record_small_state_snapshot_part(&[1; 16], 2, 2)
-            .unwrap()
-    );
-    assert!(
-        !app.record_small_state_snapshot_part(&[1; 16], 2, 2)
-            .unwrap()
-    );
-
-    // The tablet's request was withdrawn: ask again at once. A new request
-    // starts its answer over.
-    assert!(app.record_small_state_snapshot_part(&[2; 16], 1, 2).is_ok());
-    assert!(app.withdraw_small_state_snapshot_request(&[2; 16]).unwrap());
-    assert!(!app.withdraw_small_state_snapshot_request(&[1; 16]).unwrap());
+    // A broadcast owes every item held, keeps when and at which tip it
+    // began, and answers the request.
+    app.begin_small_state_broadcast(100, 4).unwrap();
+    assert_eq!(app.unsent_small_state_items().unwrap().len(), 2);
     assert_eq!(
-        app.small_state_snapshot_requests().unwrap(),
-        vec![SmallStateSnapshotRequest {
-            to: tablet,
-            request: Some([2; 16]),
-            asked_at: None,
-        }]
-    );
-    app.record_small_state_snapshot_asked(&tablet, &[3; 16], 200)
-        .unwrap();
-    assert!(
-        !app.record_small_state_snapshot_part(&[2; 16], 2, 2)
-            .unwrap()
-    );
-    assert!(
-        !app.record_small_state_snapshot_part(&[3; 16], 2, 2)
-            .unwrap()
+        app.small_state_schedule().unwrap(),
+        Some(SmallStateSchedule {
+            last_broadcast: Some(SmallStateBroadcast { at: 100, tip: 4 }),
+            request_owed: false,
+            answer_owed: false,
+        })
     );
 
-    // A sibling that is no longer active is not waited for.
-    app.drop_small_state_snapshot_request(&tablet).unwrap();
-    assert!(app.small_state_snapshot_requests().unwrap().is_empty());
-
-    // Losing messages again owes requests, and beginning them forgets old
-    // ones.
-    app.owe_small_state_snapshots().unwrap();
-    assert!(app.small_state_snapshot_owed().unwrap());
-    app.begin_small_state_snapshots(&[phone], 7).unwrap();
+    // A withdrawn request is owed again; a later broadcast replaces the
+    // earlier one.
+    app.owe_small_state_broadcast_request().unwrap();
+    app.begin_small_state_broadcast(200, 9).unwrap();
     assert_eq!(
-        app.small_state_snapshot_requests().unwrap(),
-        vec![unasked(phone)]
-    );
-    assert_eq!(app.small_state_snapshot_round_tip().unwrap(), Some(7));
-    // Nothing owed: a second begin changes nothing.
-    app.begin_small_state_snapshots(&[tablet], 9).unwrap();
-    assert_eq!(app.small_state_snapshot_round_tip().unwrap(), Some(7));
-    assert_eq!(
-        app.small_state_snapshot_requests().unwrap(),
-        vec![unasked(phone)]
+        app.small_state_schedule().unwrap(),
+        Some(SmallStateSchedule {
+            last_broadcast: Some(SmallStateBroadcast { at: 200, tip: 9 }),
+            request_owed: true,
+            answer_owed: false,
+        })
     );
 }
 
@@ -621,12 +560,50 @@ fn read_positions_only_move_forward() {
 }
 
 #[test]
-fn items_that_break_the_rules_are_skipped() {
+fn a_read_marker_on_a_row_no_position_names_gives_the_message_before_it() {
     let store = started_store(&[("11", false)]);
     let app = store.app_storage();
     let rule = TestRule::new();
+    app.initialize_chat_read_state(LOCAL, "11", &no_mentions)
+        .unwrap();
+    for (id, epoch, at) in [(7, 7, 200), (8, 8, 150)] {
+        app.record_app_event(&delivered_chat("11", id, epoch, at))
+            .unwrap();
+    }
+    // A send not delivered yet sorts after every delivered message.
+    app.record_app_event(&StoredAppEvent {
+        source_message_id_hex: None,
+        source_epoch: None,
+        direction: "sent".to_owned(),
+        sender: LOCAL.to_owned(),
+        ..delivered_chat("11", 10, 0, 300)
+    })
+    .unwrap();
+    app.refresh_chat_list_row(LOCAL, "11", &no_mentions)
+        .unwrap();
+
+    app.mark_timeline_message_read(LOCAL, "11", &message(10), &no_mentions)
+        .unwrap();
+    assert_eq!(sync(&store, &[], &rule).recorded, 1);
+    assert_eq!(
+        app.unsent_small_state_items().unwrap(),
+        vec![read("11", 8, 150, 8)]
+    );
+}
+
+#[test]
+fn items_that_break_the_rules_are_skipped() {
+    let long_chat = "11".repeat(257);
+    let store = started_store(&[("11", false), (long_chat.as_str(), false)]);
+    let app = store.app_storage();
+    let rule = TestRule::new();
+    // A chat whose MLS group id is longer than 256 bytes has no small state.
+    app.set_chat_pinned(&long_chat, true).unwrap();
+    assert_eq!(sync(&store, &[], &rule).recorded, 0);
+    assert!(versioned(&"11".repeat(256), SmallStateValue::Pin(true), 1, 1).is_valid());
     let too_large = MAX_SMALL_STATE_NUMBER + 1;
     let invalid = [
+        versioned(&long_chat, SmallStateValue::Pin(false), 9, 1),
         versioned("11", SmallStateValue::Pin(true), 0, 1),
         versioned("11", SmallStateValue::Pin(true), too_large, 1),
         versioned("1", SmallStateValue::Pin(true), 1, 1),
@@ -661,7 +638,7 @@ fn items_that_break_the_rules_are_skipped() {
     assert!(invalid.iter().all(|item| !item.is_valid()));
     assert_eq!(sync(&store, &invalid, &rule), SmallStateSync::default());
     assert!(app.small_state_items().unwrap().is_empty());
-    assert!(pins(&store).is_empty());
+    assert_eq!(pins(&store), vec![long_chat]);
 }
 
 #[test]

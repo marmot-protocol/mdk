@@ -30,8 +30,9 @@ use rusqlite::{Connection, OptionalExtension, Params, params};
 pub use selection::{ChatListSelectionError, ChatListSelectionSnapshot};
 use serde::{Deserialize, Serialize};
 pub use small_state::{
-    MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition, SmallStateItem, SmallStateItemName,
-    SmallStateRule, SmallStateSnapshotRequest, SmallStateSync, SmallStateValue, SmallStateVersion,
+    MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition, SmallStateBroadcast, SmallStateItem,
+    SmallStateItemName, SmallStateRule, SmallStateSchedule, SmallStateSync, SmallStateValue,
+    SmallStateVersion,
 };
 use std::collections::{HashMap, HashSet};
 pub use window::{ChatListWindowQuery, ChatListWindowRead};

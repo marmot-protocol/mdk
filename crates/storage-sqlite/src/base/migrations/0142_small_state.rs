@@ -16,15 +16,12 @@
 //!     change the user made here.
 //!   - `unsent` is 1 while this device still owes its siblings the value.
 //! - `small_state_sync`: at most one row, written when this device starts to
-//!   take part in small state. `snapshot_owed` is 1 while this device still
-//!   has to ask its siblings for snapshots, and `snapshot_round_tip` is the
-//!   device group's tip epoch when it last began asking.
-//! - `small_state_snapshot_requests`: one row per sibling (`to_slot`) whose
-//!   whole snapshot this device still needs. `request` is the random id of
-//!   the latest request to it and `asked_at` when, in seconds; NULL in both
-//!   asks at once.
-//! - `small_state_snapshot_parts`: the parts of the answer to a request merged
-//!   so far, by the answer's number of parts.
+//!   take part in small state. `broadcast_at` is when this device last sent
+//!   every item it holds, in seconds, and `broadcast_tip` the device group's
+//!   tip epoch then; NULL in both before its first broadcast.
+//!   `request_owed` is 1 while it still has to ask its siblings to broadcast,
+//!   and `answer_owed` is 1 when a sibling asked it to since its last
+//!   broadcast.
 //!
 //! No rows are seeded.
 use crate::SqliteResultExt;
@@ -67,23 +64,12 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         CREATE TABLE small_state_sync (
             id INTEGER PRIMARY KEY CHECK(id = 1),
             started_at INTEGER NOT NULL CHECK(started_at >= 0),
-            snapshot_owed INTEGER NOT NULL CHECK(snapshot_owed IN (0, 1)),
-            snapshot_round_tip INTEGER CHECK(snapshot_round_tip IS NULL OR snapshot_round_tip >= 0)
-        );
-
-        CREATE TABLE small_state_snapshot_requests (
-            to_slot BLOB PRIMARY KEY CHECK(length(to_slot) = 32),
-            request BLOB UNIQUE CHECK(request IS NULL OR length(request) = 16),
-            asked_at INTEGER CHECK(asked_at IS NULL OR asked_at >= 0)
-        ) WITHOUT ROWID;
-
-        CREATE TABLE small_state_snapshot_parts (
-            request BLOB NOT NULL REFERENCES small_state_snapshot_requests (request)
-                ON DELETE CASCADE,
-            parts INTEGER NOT NULL CHECK(parts >= 1),
-            part INTEGER NOT NULL CHECK(part >= 1 AND part <= parts),
-            PRIMARY KEY (request, parts, part)
-        ) WITHOUT ROWID;",
+            broadcast_at INTEGER CHECK(broadcast_at IS NULL OR broadcast_at >= 0),
+            broadcast_tip INTEGER CHECK(broadcast_tip IS NULL OR broadcast_tip >= 0),
+            request_owed INTEGER NOT NULL CHECK(request_owed IN (0, 1)),
+            answer_owed INTEGER NOT NULL CHECK(answer_owed IN (0, 1)),
+            CHECK((broadcast_at IS NULL) = (broadcast_tip IS NULL))
+        );",
     )
     .storage()
 }
