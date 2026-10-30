@@ -120,6 +120,20 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   one the roster cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a
   rejected KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's
   included, into a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7).
+- Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
+  `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in
+  `observe_device_group_event` (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending
+  leaf's device tag (mdk#2628 D33). That read sees only the current tree, so a message from an earlier epoch has no
+  readable sender.
+- Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
+  Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
+  roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
+  this account's, single-use, unexpired and tagged as that slot's (mdk#2628 D33, through 3.1d's tag reader; never a
+  second one). Never publish one, and never fall back to a public KeyPackage when none is held. A KeyPackage this
+  device has used is never kept again if a sibling hands it over again (mdk#2628 D42).
+  Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
+  ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
+  be untagged.
 - Keep device pairing (mdk#2628 item 3.3b) in `src/client/device_pairing.rs` (host DTOs) and
   `src/client/device_pairing/live.rs` (behind `unreleased-device-pairing`, and inert unless
   `MarmotAppConfig::dev_device_groups` is set). The Welcome peeler opens each gift wrap to the account once and hands
