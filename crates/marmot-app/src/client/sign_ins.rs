@@ -236,8 +236,7 @@ impl AppClient {
         }
         if self.sign_in_schedule.due.is_none_or(|due| now >= due) {
             let next = match self.check_sign_ins().await {
-                Ok(report) if !report.own_slot_complete => OWN_SLOT_READ_RETRY,
-                Ok(_) => SIGN_IN_CHECK_INTERVAL,
+                Ok(report) => next_check_after(&report),
                 Err(error) => {
                     tracing::warn!(
                         target: "marmot_app::client::sign_ins",
@@ -343,14 +342,15 @@ impl AppClient {
         Ok(report)
     }
 
-    /// Check now, for the host, and restart the six-hour clock from this
-    /// check. Returns the sign-ins listed after it. A read that reached no
-    /// relay is `key_packages_unreachable` and leaves the schedule alone.
+    /// Check now, for the host, and restart the schedule from this check as
+    /// a scheduled check would. Returns the sign-ins listed after it. A read
+    /// that reached no relay is `key_packages_unreachable` and leaves the
+    /// schedule alone.
     pub(crate) async fn check_sign_ins_now(&mut self) -> Result<Vec<UnrecognizedSignIn>, AppError> {
         let now = Instant::now();
-        self.check_sign_ins().await?;
+        let report = self.check_sign_ins().await?;
         self.sign_in_schedule.last = Some(now);
-        self.sign_in_schedule.due = Some(now + SIGN_IN_CHECK_INTERVAL);
+        self.sign_in_schedule.due = Some(now + next_check_after(&report));
         self.unrecognized_sign_ins()
     }
 
@@ -595,6 +595,16 @@ impl AppClient {
             slot: Some(lifecycle.stable_slot_id).filter(|slot| !slot.is_empty()),
             events,
         })
+    }
+}
+
+/// How long after a check the next one is due: within the hour while some
+/// relay did not finish reading this device's own slot.
+fn next_check_after(report: &SignInCheckReport) -> Duration {
+    if report.own_slot_complete {
+        SIGN_IN_CHECK_INTERVAL
+    } else {
+        OWN_SLOT_READ_RETRY
     }
 }
 
@@ -1048,5 +1058,17 @@ mod tests {
         assert!(!nudges.take("aa"));
         nudges.nudge("bb");
         assert!(!nudges.take("bb"));
+    }
+
+    /// A scheduled check and a host's check now schedule the next one alike.
+    #[test]
+    fn a_check_that_missed_its_own_slot_runs_again_within_the_hour() {
+        let mut report = SignInCheckReport {
+            own_slot_complete: true,
+            ..Default::default()
+        };
+        assert_eq!(next_check_after(&report), SIGN_IN_CHECK_INTERVAL);
+        report.own_slot_complete = false;
+        assert_eq!(next_check_after(&report), OWN_SLOT_READ_RETRY);
     }
 }
