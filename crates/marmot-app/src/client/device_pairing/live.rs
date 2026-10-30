@@ -1580,17 +1580,15 @@ impl AppClient {
         Ok(())
     }
 
-    /// Withdraw, before startup recovery publishes anything, the Welcome of
-    /// every link that failed and of every pending link past its deadline
-    /// (D40). Startup recovery runs before the gate can decide a link, which
-    /// waits for its device group to be hydrated and quiet, and a crash can
-    /// fall between a failure and its withdrawal. A link past its deadline
-    /// whose first commit already landed loses nothing: its Welcome reached
-    /// the new device.
+    /// Withdraw, before anything publishes, the Welcome of every link that
+    /// failed and of every pending link past its deadline (D40). Welcome
+    /// publishers run before the gate can decide a link, which waits for its
+    /// device group to be hydrated and quiet, and a crash can fall between a
+    /// failure and its withdrawal. A link past its deadline whose first commit
+    /// already landed loses nothing: its Welcome reached the new device. It
+    /// runs with device groups off too: the publishers do, and an earlier run
+    /// with them on may have left links.
     pub(super) fn withdraw_expired_link_welcomes_at(&mut self, now: u64) {
-        if !self.app.device_groups_enabled() {
-            return;
-        }
         let links = match self
             .app
             .account_storage(&self.state.label)

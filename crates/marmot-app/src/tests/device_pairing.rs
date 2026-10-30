@@ -1020,10 +1020,11 @@ async fn a_link_that_crashed_after_its_commit_still_withdraws_its_welcome() {
 /// runs: in its recovery pass, and in any maintenance pass a host queued
 /// while initial sync ran, which replays first. A failed link whose Welcome
 /// a crash left unwithdrawn, and a pending link past its deadline, have their
-/// Welcome withdrawn before either, so it never reaches a relay.
+/// Welcome withdrawn before either, so it never reaches a relay, even when
+/// the next launch turns device groups off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_never_publishes_a_failed_or_expired_links_welcome() {
-    for failed in [true, false] {
+    for (failed, groups_on) in [(true, true), (false, true), (true, false)] {
         let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
         let (group, slot) = create_device_group_unpublished(&relay, &mut phone, &mut laptop).await;
         let owed = phone
@@ -1074,6 +1075,16 @@ async fn startup_never_publishes_a_failed_or_expired_links_welcome() {
             _dir, app, client, ..
         } = phone;
         drop(client);
+        let app = if groups_on {
+            app
+        } else {
+            MarmotApp::with_relay_and_config(
+                _dir.path(),
+                "wss://relay.example",
+                MarmotAppConfig::white_noise().with_dev_scheduled_convergence_delay_ms(0),
+            )
+            .with_test_relay_client(relay.clone())
+        };
 
         relay.allow_publishes();
         let runtime = crate::MarmotAppRuntime::new(app.clone());
@@ -1102,7 +1113,8 @@ async fn startup_never_publishes_a_failed_or_expired_links_welcome() {
         runtime.shutdown().await;
         assert!(
             !relay.published_event_ids().contains(&welcome_id),
-            "startup published the Welcome of a link that failed: {failed}"
+            "startup published the Welcome of a link that failed: {failed}, device groups on: \
+             {groups_on}"
         );
         if failed {
             assert!(link_record_of(&app, &group, &slot).welcome_withdrawn);

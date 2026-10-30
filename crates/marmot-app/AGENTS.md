@@ -139,9 +139,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   failed link ends its prompt as `LinkFailed` with a `CannotLink` cancel. Its Welcome, found by the `KeyPackageRef`
   recorded before the commit (`welcomes_for_key_package`), is withdrawn before the failure is recorded, then again on
   each drive until that succeeds and marks it withdrawn; never rely on a Welcome id written after the commit, which a
-  crash can lose. The worker's startup Welcome recovery runs before the gate, so at startup the worker first
-  withdraws the Welcome of every failed link not marked withdrawn and every pending link past its deadline
-  (`withdraw_expired_link_welcomes`). While the roster
+  crash can lose. Welcome publishers (startup recovery, a maintenance pass, a fanout retry) run before the gate, so
+  every client open, before it returns the client and whether or not device groups are on, withdraws the Welcome of
+  every failed link not marked withdrawn and every pending link past its deadline (`withdraw_expired_link_welcomes`);
+  a new publisher must not run before open returns. While the roster
   lists the device as this device's link, it also removes its entry, and its leaf if the engine's tree still has one, in
   one `SendIntent::UnlinkDevice` commit; never decide the leaf from the stored member list, which a staged removal has
   already changed. A withdrawal that fails never holds the removal back. A link refused as
