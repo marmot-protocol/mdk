@@ -207,6 +207,7 @@ fn reads_are_oldest_first_across_routes() {
     );
     stage(&app, &b, RELAY, &[delivery(5)], range(0, 10), mark);
     let routes = [a.clone(), b.clone()];
+    assert_eq!(app.staged_recovery_routes().unwrap(), routes);
     assert_eq!(
         staged_ids(&app.staged_recovery_events(&routes, NOW, 10).unwrap()),
         vec![3, 5, 9]
@@ -311,6 +312,52 @@ fn an_undecodable_row_is_discarded_and_its_second_owed_again() {
         app.recovery_unit_cursor(&route, RELAY, base, base + 10)
             .unwrap(),
         Some(base + 5)
+    );
+}
+
+/// A route given back loses its staged rows, and each row's second is owed
+/// again on it; other routes keep theirs.
+#[test]
+fn a_reclaimed_route_gives_back_its_rows_and_owes_their_seconds() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let (gone, kept) = (group(1), group(2));
+    let base = i64_to_u64(crate::base::codec::unix_now_seconds_i64()).unwrap() - 1_000;
+    let mark = app.recovery_coverage_mark().unwrap();
+    stage(
+        &app,
+        &gone,
+        RELAY,
+        &[delivery_at(5, base + 5), delivery_at(6, base + 5)],
+        range(base, base + 10),
+        mark,
+    );
+    stage(
+        &app,
+        &kept,
+        RELAY,
+        &[delivery_at(7, base + 7)],
+        range(base, base + 10),
+        mark,
+    );
+    assert_eq!(
+        app.reclaim_staged_recovery_routes(std::slice::from_ref(&gone))
+            .unwrap(),
+        2
+    );
+    assert_eq!(app.staged_recovery_routes().unwrap(), vec![kept.clone()]);
+    let relays = [RELAY.to_owned()];
+    assert!(
+        !app.recovery_coverage_covers(&gone, &relays, base + 5, base + 5)
+            .unwrap()
+    );
+    assert!(
+        app.recovery_coverage_covers(&gone, &relays, base + 6, base + 10)
+            .unwrap()
+    );
+    assert!(
+        app.recovery_coverage_covers(&kept, &relays, base, base + 10)
+            .unwrap()
     );
 }
 

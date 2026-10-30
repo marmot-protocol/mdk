@@ -757,6 +757,31 @@ pub struct AccountKeyPackageSlots {
     /// The read is complete or returned some of the account's publications.
     /// A read that reached no relay proves nothing.
     pub reached: bool,
+    /// The reading device's own slot, read on its own (mdk#2628 item 3.4),
+    /// when the read was asked for it.
+    pub own_slot: Option<OwnSlotRead>,
+}
+
+/// One device's own KeyPackage slot, read by its `d` alone so that the
+/// account's other slots cannot page it out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnSlotRead {
+    /// What each relay serves as the slot's current publication: its newest
+    /// there, the lowest event id on a tie, as relays keep a replaceable
+    /// event. Each publication once, however many relays serve it. A signed
+    /// publication of the account counts whether or not it holds a valid
+    /// KeyPackage, a future-dated or deleted one included.
+    pub current: Vec<SlotPublication>,
+    /// Every relay reached its end of stored events and no page came back
+    /// full, so no relay serves a current publication the read missed.
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotPublication {
+    /// Lowercase hex event id.
+    pub event_id: String,
+    pub created_at: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -767,15 +792,21 @@ pub struct SlotKeyPackage {
 }
 
 /// [`AccountKeyPackageSlots`] from one read of `account`'s KeyPackages and
-/// deletion requests. It drops whatever an inviter would: a deleted,
-/// invalid, legacy or future-dated publication, and every slot whose newest
-/// publication is one of those. Only fresh KeyPackages count.
+/// deletion requests, and of `own_slot` when given. It drops whatever an
+/// inviter would: a deleted, invalid, legacy or future-dated publication, and
+/// every slot whose newest publication is one of those. Only fresh
+/// KeyPackages count. The own slot is read as relays serve it, none dropped.
 pub fn account_key_package_slots_from_records(
     account: &str,
     records: &[RelayEventRecord],
     complete: bool,
     freshness: DirectoryFreshness,
+    own_slot: Option<&str>,
 ) -> AccountKeyPackageSlots {
+    let own_slot = own_slot.map(|slot| OwnSlotRead {
+        current: current_slot_publications(account, slot, records),
+        complete,
+    });
     let complete = complete && !key_package_read_page_full(account, records);
     let reached = complete || records.iter().any(|record| record.event.pubkey == account);
     let candidates = slot_candidates(account, records, freshness, None).candidates;
@@ -812,7 +843,41 @@ pub fn account_key_package_slots_from_records(
         returned_slots,
         complete,
         reached,
+        own_slot,
     }
+}
+
+/// What each relay serves as `slot`'s current publication, each one once.
+fn current_slot_publications(
+    account: &str,
+    slot: &str,
+    records: &[RelayEventRecord],
+) -> Vec<SlotPublication> {
+    let mut newest_by_relay = std::collections::BTreeMap::<&str, &NostrTransportEvent>::new();
+    for record in records.iter().filter(|record| {
+        record.event.kind == KIND_MARMOT_KEY_PACKAGE
+            && record.event.pubkey == account
+            && record.event.tag_value("d") == Some(slot)
+    }) {
+        for endpoint in &record.endpoints {
+            let newest = newest_by_relay
+                .entry(endpoint.as_str())
+                .or_insert(&record.event);
+            if newest_publication_first(&record.event, newest.created_at, &newest.id).is_lt() {
+                *newest = &record.event;
+            }
+        }
+    }
+    let mut current: Vec<SlotPublication> = Vec::new();
+    for event in newest_by_relay.into_values() {
+        if !current.iter().any(|seen| seen.event_id == event.id) {
+            current.push(SlotPublication {
+                event_id: event.id.clone(),
+                created_at: event.created_at,
+            });
+        }
+    }
+    current
 }
 
 /// The author's MLS KeyPackage with a legacy-profile account proof. Current

@@ -7425,7 +7425,7 @@ async fn local_ready_result_does_not_report_an_unrequested_key_package_publicati
     #[cfg(feature = "product-analytics-export")]
     let app = {
         let mut app = app;
-        app.product_analytics = crate::product_analytics::test_product_collector();
+        app.product_analytics = crate::observability_test_support::test_product_collector();
         app.set_usage_diagnostics_consent(true).unwrap();
         app
     };
@@ -19528,7 +19528,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     #[cfg(feature = "product-analytics-export")]
     let app = {
         let mut app = app;
-        app.product_analytics = crate::product_analytics::test_product_collector();
+        app.product_analytics = crate::observability_test_support::test_product_collector();
         app
     };
     #[cfg(feature = "product-analytics-export")]

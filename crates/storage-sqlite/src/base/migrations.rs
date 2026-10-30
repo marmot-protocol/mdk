@@ -282,6 +282,8 @@ mod migration_0132_loss_import_revision;
 mod migration_0133_device_links;
 #[path = "migrations/0134_recovery_recheck_revision.rs"]
 mod migration_0134_recovery_recheck_revision;
+#[path = "migrations/0135_recovery_unit_fences.rs"]
+mod migration_0135_recovery_unit_fences;
 #[path = "migrations/0140_private_key_packages.rs"]
 mod migration_0140_private_key_packages;
 #[path = "migrations/0142_small_state.rs"]
@@ -1110,6 +1112,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0134_recovery_recheck_revision",
         suspend_foreign_keys: &[],
         apply: migration_0134_recovery_recheck_revision::apply,
+    },
+    Migration {
+        version: 135,
+        name: "0135_recovery_unit_fences",
+        suspend_foreign_keys: &[],
+        apply: migration_0135_recovery_unit_fences::apply,
     },
     Migration {
         version: 140,

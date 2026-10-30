@@ -96,6 +96,7 @@ fn reply(status: u16, body: &str) -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_original_bodies_and_full_success_advance_after_reacquiring_ownership() {
+    crate::collector_host_safety::hand_in_direct_http_builder();
     let (_dir, active, state, batch) = prepared();
     let token = batch.token.clone();
     let original_bodies: Vec<String> = batch
@@ -163,6 +164,7 @@ async fn exact_original_bodies_and_full_success_advance_after_reacquiring_owners
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn response_contract_classifies_only_exact_200_as_complete() {
+    crate::collector_host_safety::hand_in_direct_http_builder();
     let (_dir, _active, _state, batch) = prepared();
     for (status, body, expected) in [
         (409, "{}", AuditOtlpSendResult::Partial),
@@ -205,6 +207,7 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parsed_409_blocks_even_if_its_diagnostic_body_is_incomplete_or_stalled() {
+    crate::collector_host_safety::hand_in_direct_http_builder();
     let (_dir, active, state, batch) = prepared();
     let token = batch.token.clone();
     let (endpoint, task) =
@@ -270,6 +273,7 @@ async fn mismatched_destination_never_dials_or_advances_the_source_cursor() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authentication_rejection_leaves_the_prepared_range_replayable() {
+    crate::collector_host_safety::hand_in_direct_http_builder();
     let (_dir, active, state, batch) = prepared();
     let token = batch.token.clone();
     let (endpoint, task) = service(reply(401, "{}")).await;
@@ -289,6 +293,7 @@ async fn authentication_rejection_leaves_the_prepared_range_replayable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_or_unreadable_response_keeps_identical_prepared_bodies() {
+    crate::collector_host_safety::hand_in_direct_http_builder();
     let (_dir, active, state, batch) = prepared();
     let original = batch.bodies.clone();
     let token = batch.token.clone();
@@ -334,6 +339,7 @@ async fn lost_or_unreadable_response_keeps_identical_prepared_bodies() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timeout_after_acceptance_is_unknown() {
+    crate::collector_host_safety::hand_in_direct_http_builder();
     let (_dir, active, state, batch) = prepared();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/v1/logs", listener.local_addr().unwrap());
@@ -367,7 +373,7 @@ fn endpoint_and_batch_limits_are_checked_before_network() {
     ] {
         assert!(AuditOtlpSender::new(TEST_DESTINATION, endpoint, "token").is_err());
     }
-    let retired = crate::retired_relay_hosts();
+    let retired = transport_nostr::retired_relay_hosts();
     let retired_host = &retired[0];
     for host in [
         retired_host.clone(),

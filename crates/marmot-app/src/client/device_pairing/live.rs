@@ -43,7 +43,7 @@ use super::{
 use crate::client::device_group::{
     ConfirmedDeviceLink, LINK_DEADLINE_SECS, WELCOME_WAIT_SECS, device_slot,
 };
-use crate::client::{AppClient, WelcomeDelivery, recover_post_canonical_result};
+use crate::client::{AppClient, WelcomeDelivery};
 use crate::{AccountRelayListStatus, AppError, unix_now_seconds};
 
 const TARGET: &str = "marmot_app::client::device_pairing";
@@ -1240,10 +1240,7 @@ impl AppClient {
             return Ok(());
         }
         let effects = sent?;
-        recover_post_canonical_result(
-            "link_device_welcome_failures",
-            self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects),
-        );
+        self.note_welcome_delivery_failures(&effects);
         Ok(())
     }
 

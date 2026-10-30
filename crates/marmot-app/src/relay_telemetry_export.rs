@@ -2322,7 +2322,7 @@ mod otlp {
                 resource: Some(test_resource()),
                 ..Default::default()
             };
-            let plane = crate::MarmotRelayPlane::full_history();
+            let plane = transport_nostr::MarmotRelayPlane::full_history();
             assert!(
                 crate::RelayTelemetryExporter::new(
                     &plane,

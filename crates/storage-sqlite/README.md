@@ -290,16 +290,18 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   shadow mode: no obligation, retry, fence or schedule reads it.
 - **Retry state and staging (`recovery_units.rs`, `recovery_staging.rs`, migration 0127, mdk#2660).** One row per
   `(route, relay)` unit holds the recovery runner's retry state: active, broken (no progress or refused, with a park
-  revision and one probe a newer loss can earn) or retired, plus backoff, fencing, slicing, planned relay caps and
-  re-check progress. Relay health (unreachable streak, cooldown, NIP-11 caps), the account's rolling-hour attempt and
-  byte budget and each unit's parked and retired spans sit beside it. `settle_recovery_unit` applies one quantum's
+  revision and one probe a newer loss can earn) or retired, plus backoff, slicing, planned relay caps and re-check progress. Relay health (unreachable streak, cooldown, NIP-11 caps), the account's rolling-hour attempt and
+  byte budget, each unit's parked and retired spans and the capture ranges it fences (migration 0135) sit beside it. `settle_recovery_unit` applies one quantum's
   outcome in one transaction with policy values the caller passes; a unit's debt is the route goal minus that relay's
   coverage, its retired spans and, unless it holds a probe, its parked spans. Parked and retired spans are never
   coverage. `stage_recovery_slice` writes a proven slice's unseen events and its coverage, through the subtracting
   write, in one transaction, so a crash before settlement refetches nothing; staged rows leave once seen. A re-check
   settles through `settle_recovery_recheck`, which charges its relay and the account budget but never touches the
   unit's retry state, and records its pass's progress only under the revision it began on (migration 0134): every
-  request that makes the pass due, a long relay cooldown ending among them, bumps it in the same write. Nothing schedules on this state yet.
+  request that makes the pass due, a long relay cooldown ending among them, bumps it in the same write.
+  `staged_recovery_routes` and `recovery_unit_fences` tell the runner which groups to read, and
+  `reclaim_staged_recovery_routes` gives back what a route it no longer lists staged. Nothing schedules on
+  this state yet.
 
 ## Tests and benchmarks
 
