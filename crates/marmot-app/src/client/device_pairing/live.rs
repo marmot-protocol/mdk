@@ -1355,6 +1355,19 @@ impl AppClient {
                 continue;
             };
             self.device_pairing.quiet_since.remove(&key);
+            // Withdraw a failing link's Welcome before recording the failure,
+            // so no crash between the two leaves a failed link with its
+            // Welcome still publishable. The failure path retries it.
+            if outcome == DeviceLinkOutcome::Failed
+                && let Err(error) = self.withdraw_link_welcomes(&link)
+            {
+                tracing::debug!(
+                    target: TARGET,
+                    method = "decide_device_links",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not withdraw a failing link's Welcome yet"
+                );
+            }
             if let Err(error) =
                 storage.decide_device_link(&link.group_id_hex, &link.slot_hex, outcome, now)
             {
@@ -1508,33 +1521,11 @@ impl AppClient {
         }
     }
 
-    /// Withdraw a failed link's Welcome, found by its KeyPackage's ref, and
-    /// record it withdrawn. The lookup needs nothing written after the
-    /// commit, so a crash right after it still leaves the Welcome to find. A
-    /// Welcome the engine no longer retains is withdrawn: nothing can publish
-    /// it. Any other failure leaves it to withdraw on the next drive.
+    /// Withdraw a failed link's Welcome and record it withdrawn. Any failure
+    /// leaves it to withdraw on the next drive.
     fn withdraw_failed_link_welcome(&mut self, link: &DeviceLinkRecord, failed_now: bool) {
         let result = (|| -> Result<(), AppError> {
-            let group_id = GroupId::new(hex::decode(&link.group_id_hex)?);
-            let key_package_ref = hex::decode(&link.key_package_ref_hex)?;
-            for welcome in self
-                .runtime
-                .welcomes_for_key_package(&group_id, &key_package_ref)?
-            {
-                match self
-                    .runtime
-                    .withdraw_welcome(&welcome)
-                    .map_err(AppError::from)
-                {
-                    Ok(_) => {}
-                    Err(error)
-                        if matches!(
-                            error.as_engine_error(),
-                            Some(EngineError::Storage(StorageError::NotFound))
-                        ) => {}
-                    Err(error) => return Err(error),
-                }
-            }
+            self.withdraw_link_welcomes(link)?;
             self.app
                 .account_storage(&self.state.label)?
                 .app_storage()
@@ -1556,6 +1547,84 @@ impl AppClient {
                     error_kind = error.privacy_safe_kind(),
                     "a failed link's Welcome is still not withdrawn; retrying"
                 );
+            }
+        }
+    }
+
+    /// Withdraw every Welcome of `link`, found by its KeyPackage's ref. The
+    /// lookup needs nothing written after the commit, so a crash right after
+    /// it still leaves the Welcome to find, and it reads no group state, so
+    /// it works before hydration. A Welcome the engine no longer retains is
+    /// withdrawn: nothing can publish it.
+    fn withdraw_link_welcomes(&self, link: &DeviceLinkRecord) -> Result<(), AppError> {
+        let group_id = GroupId::new(hex::decode(&link.group_id_hex)?);
+        let key_package_ref = hex::decode(&link.key_package_ref_hex)?;
+        for welcome in self
+            .runtime
+            .welcomes_for_key_package(&group_id, &key_package_ref)?
+        {
+            match self
+                .runtime
+                .withdraw_welcome(&welcome)
+                .map_err(AppError::from)
+            {
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.as_engine_error(),
+                        Some(EngineError::Storage(StorageError::NotFound))
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Withdraw, before startup recovery publishes anything, the Welcome of
+    /// every link that failed and of every pending link past its deadline
+    /// (D40). Startup recovery runs before the gate can decide a link, which
+    /// waits for its device group to be hydrated and quiet, and a crash can
+    /// fall between a failure and its withdrawal. A link past its deadline
+    /// whose first commit already landed loses nothing: its Welcome reached
+    /// the new device.
+    pub(super) fn withdraw_expired_link_welcomes_at(&mut self, now: u64) {
+        if !self.app.device_groups_enabled() {
+            return;
+        }
+        let links = match self
+            .app
+            .account_storage(&self.state.label)
+            .and_then(|storage| Ok(storage.app_storage().device_links()?))
+        {
+            Ok(links) => links,
+            Err(error) => {
+                tracing::warn!(
+                    target: TARGET,
+                    method = "withdraw_expired_link_welcomes",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not read this device's links at startup"
+                );
+                return;
+            }
+        };
+        for link in links {
+            match link.outcome {
+                DeviceLinkOutcome::Failed if !link.welcome_withdrawn => {
+                    self.withdraw_failed_link_welcome(&link, true);
+                }
+                DeviceLinkOutcome::Pending
+                    if now >= link.linked_at.saturating_add(LINK_DEADLINE_SECS) =>
+                {
+                    if let Err(error) = self.withdraw_link_welcomes(&link) {
+                        tracing::warn!(
+                            target: TARGET,
+                            method = "withdraw_expired_link_welcomes",
+                            error_kind = error.privacy_safe_kind(),
+                            "could not withdraw an expired link's Welcome at startup"
+                        );
+                    }
+                }
+                _ => {}
             }
         }
     }

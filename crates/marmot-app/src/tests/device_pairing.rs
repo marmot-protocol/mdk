@@ -236,9 +236,16 @@ fn link_record(
     group: &GroupId,
     slot_hex: &str,
 ) -> storage_sqlite::DeviceLinkRecord {
-    device
-        .app
-        .account_storage("alice")
+    link_record_of(&device.app, group, slot_hex)
+}
+
+/// [`link_record`], read through `app`.
+fn link_record_of(
+    app: &MarmotApp,
+    group: &GroupId,
+    slot_hex: &str,
+) -> storage_sqlite::DeviceLinkRecord {
+    app.account_storage("alice")
         .unwrap()
         .app_storage()
         .device_link(&hex::encode(group.as_slice()), slot_hex)
@@ -1007,6 +1014,71 @@ async fn a_link_that_crashed_after_its_commit_still_withdraws_its_welcome() {
         !relay.published_event_ids().contains(&welcome_id),
         "no recovery publishes the withdrawn Welcome"
     );
+}
+
+/// The account worker's startup recovery publishes owed Welcomes before the
+/// link gate runs. A failed link whose Welcome a crash left unwithdrawn, and
+/// a pending link past its deadline, have their Welcome withdrawn first, so
+/// it never reaches a relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_recovery_never_publishes_a_failed_or_expired_links_welcome() {
+    for failed in [true, false] {
+        let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+        let (group, slot) = create_device_group_unpublished(&relay, &mut phone, &mut laptop).await;
+        let owed = phone
+            .client
+            .runtime
+            .outstanding_welcome_deliveries()
+            .unwrap();
+        let [(_, welcome)] = owed.as_slice() else {
+            panic!("the first link owes one Welcome")
+        };
+        let welcome_id = hex::encode(welcome.id.as_slice());
+        let link = link_record(&phone, &group, &slot);
+        let storage = phone.app.account_storage("alice").unwrap().app_storage();
+        if failed {
+            // The gate recorded the failure; the crash came before the
+            // withdrawal.
+            assert!(
+                storage
+                    .decide_device_link(
+                        &link.group_id_hex,
+                        &link.slot_hex,
+                        DeviceLinkOutcome::Failed,
+                        link.linked_at,
+                    )
+                    .unwrap()
+            );
+        } else {
+            // The restart comes after the deadline of a link still pending.
+            storage
+                .record_device_link(
+                    &link.group_id_hex,
+                    &link.slot_hex,
+                    &link.key_package_ref_hex,
+                    &link.leaf_signature_key_hex,
+                    link.linked_at.saturating_sub(LINK_DEADLINE_SECS + 1),
+                )
+                .unwrap();
+        }
+        let Device {
+            _dir, app, client, ..
+        } = phone;
+        drop(client);
+
+        relay.allow_publishes();
+        let runtime = crate::MarmotAppRuntime::new(app.clone());
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.drain_in_flight_work().await.unwrap();
+        runtime.shutdown().await;
+        assert!(
+            !relay.published_event_ids().contains(&welcome_id),
+            "startup recovery published the Welcome of a link that failed: {failed}"
+        );
+        if failed {
+            assert!(link_record_of(&app, &group, &slot).welcome_withdrawn);
+        }
+    }
 }
 
 /// A restart drops a first link's prompt while no relay has taken its
