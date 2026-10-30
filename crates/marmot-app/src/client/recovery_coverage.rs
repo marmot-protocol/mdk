@@ -577,6 +577,7 @@ impl AppClient {
     /// The account's current routes as its recovery runner reads them, once
     /// per debt turn (mdk#2660 phase 4).
     pub(crate) fn recovery_runner_routes(&self) -> Vec<super::recovery_runner::RunnerRoute> {
+        let windows = self.open_conversation_groups();
         self.current_coverage_routes()
             .into_iter()
             .map(|current| super::recovery_runner::RunnerRoute {
@@ -584,6 +585,10 @@ impl AppClient {
                     .group_id
                     .as_deref()
                     .is_some_and(|group_id| self.group_unrecoverable(group_id)),
+                window: current
+                    .group_id
+                    .as_ref()
+                    .is_some_and(|group_id| windows.contains(group_id)),
                 route: current.route,
                 group_id: current.group_id,
                 required: current.required,
@@ -600,8 +605,7 @@ impl AppClient {
     /// installed (the inbox: still has a relay). A group left with none may
     /// only be waiting to hydrate, so its drop is forgotten. A relay the
     /// routes carry again owes its whole goal. It runs at the start of a debt
-    /// turn,
-    /// between the owner's commands, so a command that drops a route and
+    /// turn, between the owner's commands, so a command that drops a route and
     /// restores it settles nothing. A failed write keeps the changes for the
     /// next turn.
     pub(crate) fn settle_recovery_route_changes(&self, app: &SqliteAppStorage, now: u64) {

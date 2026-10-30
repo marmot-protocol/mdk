@@ -60,6 +60,8 @@ pub(super) struct Survey {
     pub(super) paused_until: Option<u64>,
     /// The routes whose units hold their group's live frames behind a fence.
     pub(super) fenced: BTreeSet<TransportReconciliationRoute>,
+    /// The routes whose group has a conversation window open.
+    pub(super) window: BTreeSet<TransportReconciliationRoute>,
 }
 
 pub(super) enum Pick {
@@ -295,6 +297,12 @@ pub(super) fn survey(
         rechecks: recheck::survey(turn, policy, stalled, &mut admission)?,
         paused_until,
         fenced: admission.fenced_routes()?,
+        window: turn
+            .routes
+            .iter()
+            .filter(|route| route.window)
+            .map(|route| route.route.clone())
+            .collect(),
     })
 }
 

@@ -83,6 +83,7 @@ fn required(route: &Route, relays: &[&str]) -> RunnerRoute {
         required: relays.iter().map(|relay| (*relay).to_owned()).collect(),
         best_effort: Vec::new(),
         unrecoverable: false,
+        window: false,
         goal_until: None,
     }
 }
@@ -1654,6 +1655,33 @@ async fn recovery_runner_serves_held_groups_first_then_small_debts_and_every_gro
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_serves_an_open_conversation_before_smaller_debts() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (open, closed) = (group(1), group(2));
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    account.goal(&open, t0 - DAY);
+    account.goal(&closed, t0 - HOUR);
+    let routes = vec![
+        RunnerRoute {
+            window: true,
+            ..required(&open, &[RELAY])
+        },
+        required(&closed, &[RELAY]),
+    ];
+    let host = TestHost::new(&account, &clock, routes, &[&relay]);
+    for route in [&open, &closed] {
+        host.tails.stand(route, RELAY, t0);
+    }
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    // Without the window the hour would go first, as the smaller debt.
+    assert_eq!(ran(runner.step().await).key.route, open);
+    assert_eq!(ran(runner.step().await).key.route, closed);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_accounts_share_two_credits() {
     let clock = Clock::new();
@@ -2442,6 +2470,7 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
         rechecks: Vec::new(),
         paused_until: None,
         fenced: BTreeSet::new(),
+        window: BTreeSet::new(),
     };
     let select::Pick::Unit(first) =
         select::pick(survey, &mut memory, &PriorityHints::default(), 0, true)

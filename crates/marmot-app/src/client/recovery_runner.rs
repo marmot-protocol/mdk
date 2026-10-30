@@ -110,6 +110,9 @@ pub(crate) struct RunnerRoute {
     /// fetch would only fill the group's deferred input with ciphertext the
     /// copy cannot open.
     pub(crate) unrecoverable: bool,
+    /// Its group has a conversation window open: the survey hints its route
+    /// into the window class.
+    pub(crate) window: bool,
     /// A retained prior route's goal ends here: its switch plus the
     /// clock-skew allowance. Members that had not applied the switch by then
     /// still send there, and its live subscription delivers that; nothing
@@ -138,7 +141,8 @@ pub(crate) struct PriorityHints {
     /// Groups whose live frames are held behind a fence. Each survey adds
     /// the routes its own fences hold.
     pub(crate) held: BTreeSet<TransportReconciliationRoute>,
-    /// Groups with an open conversation window (PR 5 feeds this).
+    /// Groups with an open conversation window. Each survey adds the routes
+    /// whose group has one open.
     pub(crate) window: BTreeSet<TransportReconciliationRoute>,
 }
 
@@ -578,6 +582,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         self.report_pause(survey.paused_until, now);
         let mut hints = self.hints.borrow().clone();
         hints.held.append(&mut survey.fenced);
+        hints.window.append(&mut survey.window);
         let candidate = match select::pick(survey, &mut self.memory, &hints, now, new_round) {
             Pick::Unit(candidate) => candidate,
             Pick::Idle { next_due } => {
