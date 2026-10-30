@@ -6,6 +6,7 @@
 //!   would replace concurrent installs and uninstalls made on other devices.
 //! - Pack (kind 30031) lookup with relay hints. Hints add candidates; they
 //!   never hide a newer version on the account's own relays.
+//! - Cached installed packs refresh even outside the newest public-pack window.
 
 // Test fixtures dial local relays directly; the proxy policy is crate-private.
 #![allow(clippy::disallowed_methods)]
@@ -248,7 +249,7 @@ async fn failed_installed_list_refresh_blocks_stale_publication_until_rebase() {
     runtime.shutdown().await;
 }
 
-fn pack_tags(author: &Keys, identifier: &str, title: &str) -> Vec<Tag> {
+fn pack_tags(author: &Keys, identifier: &str, title: &str, shortcode: &str) -> Vec<Tag> {
     use sonar_stickers::{PackAddress, Sticker, StickerPack, build_pack_tags};
     let hash = "11".repeat(32);
     let pack = StickerPack::new(
@@ -258,7 +259,7 @@ fn pack_tags(author: &Keys, identifier: &str, title: &str) -> Vec<Tag> {
         None,
         vec![
             Sticker::new(
-                "wave".to_owned(),
+                shortcode.to_owned(),
                 format!("https://cdn.example/{hash}.png"),
                 hash.clone(),
                 "image/png".to_owned(),
@@ -322,7 +323,7 @@ async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
         &hint_url,
         &author,
         pack_kind,
-        pack_tags(&author, "cats", "Old"),
+        pack_tags(&author, "cats", "Old", "wave"),
         now - 100,
     )
     .await;
@@ -330,7 +331,7 @@ async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
         &account_url,
         &author,
         pack_kind,
-        pack_tags(&author, "cats", "New"),
+        pack_tags(&author, "cats", "New", "wave"),
         now - 50,
     )
     .await;
@@ -338,7 +339,7 @@ async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
         &hint_url,
         &author,
         pack_kind,
-        pack_tags(&author, "dogs", "Hinted"),
+        pack_tags(&author, "dogs", "Hinted", "wave"),
         now - 50,
     )
     .await;
@@ -381,6 +382,98 @@ async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
         .await
         .expect("a pack only the hint relay holds still resolves");
     assert_eq!(dogs.title, "Hinted");
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sync_refreshes_installed_packs() {
+    install_mock_keyring();
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let keys = Keys::generate();
+    let now = unix_now();
+    for (kind, tag) in [
+        (10002, Tag::custom("r", [url.clone(), "write".to_owned()])),
+        (10050, Tag::custom("relay", [url.clone()])),
+    ] {
+        publish_signed(&url, &keys, kind, vec![tag], now - 400).await;
+    }
+    let author = Keys::generate();
+    let pack_kind = sonar_stickers::STICKER_PACK_KIND;
+    let coordinate = format!("{pack_kind}:{}:installed", author.public_key().to_hex());
+    publish_signed(
+        &url,
+        &author,
+        pack_kind,
+        pack_tags(&author, "installed", "Original", "wave"),
+        now - 300,
+    )
+    .await;
+    publish_installed_list(&url, &keys, &[&coordinate], now - 300).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let account = timeout(
+        Duration::from_secs(40),
+        runtime.create_or_import_account(AccountSetupRequest {
+            identity: None,
+            import_nsec: Some(zeroize::Zeroizing::new(
+                keys.secret_key().to_bech32().unwrap(),
+            )),
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_missing_relay_lists: true,
+            ..AccountSetupRequest::default()
+        }),
+    )
+    .await
+    .expect("account import completes")
+    .expect("account import succeeds");
+    let account_id = account.account.account_id_hex;
+    app.sync_sticker_packs(&account_id).await.unwrap();
+    let cached = app.sticker_pack(&account_id, &coordinate).unwrap().unwrap();
+    assert!(cached.installed);
+    assert_eq!(cached.title, "Original");
+    assert_eq!(cached.stickers.len(), 1);
+    assert_eq!(cached.stickers[0].shortcode, "wave");
+
+    publish_signed(
+        &url,
+        &author,
+        pack_kind,
+        pack_tags(&author, "installed", "Replacement", "dance"),
+        now - 200,
+    )
+    .await;
+    // Explicit timestamps keep every filler newer than the replacement,
+    // excluding the installed address from the newest-100 discovery request.
+    for index in 0..100 {
+        publish_signed(
+            &url,
+            &author,
+            pack_kind,
+            pack_tags(&author, &format!("filler-{index}"), "Filler", "wave"),
+            now - 100 + index,
+        )
+        .await;
+    }
+
+    let synced = app.sync_sticker_packs(&account_id).await.unwrap();
+    assert_eq!(synced.discovered, 100);
+    assert_eq!(synced.installed, 1);
+    let refreshed = app.sticker_pack(&account_id, &coordinate).unwrap().unwrap();
+    assert!(refreshed.installed);
+    assert_eq!(refreshed.created_at, now - 200);
+    assert_eq!(refreshed.title, "Replacement");
+    assert_eq!(refreshed.stickers.len(), 1);
+    assert_eq!(refreshed.stickers[0].shortcode, "dance");
 
     runtime.shutdown().await;
 }

@@ -504,10 +504,13 @@ fn insert_sticker_assets_tx(
         ],
     )
     .storage()?;
-    let mut assets = pack.stickers.clone();
-    if let Some(cover) = &pack.cover {
-        assets.push(cover.clone());
-    }
+    // A cover sharing an exact key must not override the selectable sticker.
+    let cover = pack.cover.as_ref().filter(|cover| {
+        !pack
+            .stickers
+            .iter()
+            .any(|sticker| sticker.shortcode == cover.shortcode && sticker.sha256 == cover.sha256)
+    });
     // A losing event is only worth recording for the exact references that
     // retained messages still need. Those stay insertable at the cap: they are
     // bounded by the retained messages themselves, and the trim path already
@@ -524,7 +527,7 @@ fn insert_sticker_assets_tx(
     {
         protected.insert(cover);
     }
-    for sticker in assets {
+    for sticker in pack.stickers.iter().chain(cover) {
         // History is exact-hash lookup, not an unbounded archive. Always record
         // the incoming pack's own assets. Refuse only an older hash once this
         // pack already holds the cap, so a losing event cannot grow the table.
@@ -546,7 +549,14 @@ fn insert_sticker_assets_tx(
                 pack_coordinate, shortcode, url, sha256, mime, width,
                 height, alt, emoji
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(pack_coordinate, shortcode, sha256) DO NOTHING",
+             ON CONFLICT(pack_coordinate, shortcode, sha256) DO UPDATE SET
+                url = excluded.url,
+                mime = excluded.mime,
+                width = excluded.width,
+                height = excluded.height,
+                alt = excluded.alt,
+                emoji = excluded.emoji
+             WHERE ?10",
             params![
                 &pack.coordinate,
                 &sticker.shortcode,
@@ -557,6 +567,7 @@ fn insert_sticker_assets_tx(
                 sticker.height.map(i64::from),
                 sticker.alt.as_deref(),
                 sticker.emoji.as_deref(),
+                bool_i64(pack_wins_replacement),
             ],
         )
         .storage()?;
@@ -1226,6 +1237,103 @@ mod tests {
                 .sticker_for_ref(&first.coordinate, "wave", &hash_b)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn winning_pack_refreshes_assets() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let hash_a = "11".repeat(32);
+        let hash_b = "22".repeat(32);
+        let first = pack(&"bb".repeat(32), 10, &hash_a);
+        assert!(store.replace_sticker_pack_if_newer(&first).unwrap());
+
+        let mut moved = pack(&"aa".repeat(32), 10, &hash_a);
+        moved.stickers[0].url = "https://example.com/moved.png".to_owned();
+        moved.stickers[0].mime = "image/png".to_owned();
+        moved.stickers[0].width = Some(256);
+        moved.stickers[0].height = Some(128);
+        moved.stickers[0].alt = None;
+        moved.stickers[0].emoji = None;
+        assert!(store.replace_sticker_pack_if_newer(&moved).unwrap());
+        assert_eq!(
+            store
+                .sticker_for_ref(&first.coordinate, "wave", &hash_a)
+                .unwrap()
+                .unwrap(),
+            moved.stickers[0]
+        );
+        assert_eq!(
+            store.sticker_pack(&first.coordinate).unwrap().unwrap(),
+            moved
+        );
+
+        let older = pack(&"00".repeat(32), 9, &hash_a);
+        for losing in [&first, &older] {
+            assert!(!store.replace_sticker_pack_if_newer(losing).unwrap());
+            assert_eq!(
+                store
+                    .sticker_for_ref(&first.coordinate, "wave", &hash_a)
+                    .unwrap()
+                    .unwrap(),
+                moved.stickers[0]
+            );
+            assert_eq!(
+                store.sticker_pack(&first.coordinate).unwrap().unwrap(),
+                moved
+            );
+        }
+
+        let changed = pack(&"cc".repeat(32), 11, &hash_b);
+        assert!(store.replace_sticker_pack_if_newer(&changed).unwrap());
+        assert!(!store.replace_sticker_pack_if_newer(&older).unwrap());
+        assert_eq!(
+            store
+                .sticker_for_ref(&first.coordinate, "wave", &hash_a)
+                .unwrap()
+                .unwrap(),
+            moved.stickers[0]
+        );
+        assert_eq!(
+            store
+                .sticker_for_ref(&first.coordinate, "wave", &hash_b)
+                .unwrap()
+                .unwrap(),
+            changed.stickers[0]
+        );
+        assert_eq!(
+            store.sticker_pack(&first.coordinate).unwrap().unwrap(),
+            changed
+        );
+    }
+
+    #[test]
+    fn sticker_beats_matching_cover() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let hash = "11".repeat(32);
+        let mut first = pack(&"bb".repeat(32), 10, &hash);
+        first.stickers[0].shortcode = "cover".to_owned();
+        assert!(store.replace_sticker_pack_if_newer(&first).unwrap());
+
+        let mut moved = first.clone();
+        moved.version.created_at = 11;
+        moved.version.event_id_hex = "cc".repeat(32);
+        moved.stickers[0].url = "https://example.com/moved.webp".to_owned();
+        assert!(store.replace_sticker_pack_if_newer(&moved).unwrap());
+        assert_eq!(
+            store
+                .sticker_for_ref(&first.coordinate, "cover", &hash)
+                .unwrap()
+                .unwrap(),
+            moved.stickers[0]
+        );
+        assert!(!store.replace_sticker_pack_if_newer(&first).unwrap());
+        assert_eq!(
+            store
+                .sticker_for_ref(&first.coordinate, "cover", &hash)
+                .unwrap()
+                .unwrap(),
+            moved.stickers[0]
         );
     }
 

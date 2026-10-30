@@ -448,9 +448,7 @@ impl MarmotApp {
 
         let desired = context.storage.desired_installed_sticker_packs()?;
         for coordinate in desired.iter().take(MAX_INSTALLED_PACKS) {
-            if context.storage.sticker_pack(coordinate)?.is_none() {
-                let _ = fetch_pack_into_storage(self, &context, coordinate, &[]).await;
-            }
+            let _ = fetch_pack_into_storage(self, &context, coordinate, &[]).await;
         }
         publish_pending_installed_list(self, &context).await?;
         let installed = context.storage.desired_installed_sticker_packs()?.len();
@@ -1435,20 +1433,9 @@ fn inspect_webp(bytes: &[u8]) -> Result<InspectedImage, AppError> {
                     le_u24(bytes, data + 7)?.saturating_add(1),
                 )?;
             }
-            b"VP8L" if length >= 5 && bytes[data] == 0x2f => {
-                let bits = le_u32(bytes, data + 1)?;
-                record_webp_dimensions(
-                    &mut dimensions,
-                    (bits & 0x3fff) + 1,
-                    ((bits >> 14) & 0x3fff) + 1,
-                )?;
-            }
-            b"VP8 " if length >= 10 && bytes.get(data + 3..data + 6) == Some(b"\x9d\x01\x2a") => {
-                record_webp_dimensions(
-                    &mut dimensions,
-                    u32::from(le_u16(bytes, data + 6)? & 0x3fff),
-                    u32::from(le_u16(bytes, data + 8)? & 0x3fff),
-                )?;
+            b"VP8 " | b"VP8L" => {
+                let (width, height) = webp_bitstream_dimensions(kind, &bytes[data..end])?;
+                record_webp_dimensions(&mut dimensions, width, height)?;
             }
             b"ANMF" => {
                 if length < 16 {
@@ -1474,6 +1461,7 @@ fn inspect_webp(bytes: &[u8]) -> Result<InspectedImage, AppError> {
                     frame_width,
                     frame_height,
                 )?;
+                validate_webp_frame(&bytes[data + 16..end], frame_width, frame_height)?;
                 frames = frames.checked_add(1).ok_or_else(|| {
                     invalid_sticker("sticker animation frame count exceeds limits")
                 })?;
@@ -1494,6 +1482,60 @@ fn inspect_webp(bytes: &[u8]) -> Result<InspectedImage, AppError> {
         height,
         frames: frames.max(1),
     })
+}
+
+fn webp_bitstream_dimensions(kind: &[u8], bytes: &[u8]) -> Result<(u32, u32), AppError> {
+    match kind {
+        b"VP8L" if bytes.len() >= 5 && bytes[0] == 0x2f => {
+            let bits = le_u32(bytes, 1)?;
+            Ok(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1))
+        }
+        b"VP8 "
+            if bytes.len() >= 10
+                && bytes[0] & 1 == 0
+                && bytes.get(3..6) == Some(b"\x9d\x01\x2a") =>
+        {
+            Ok((
+                u32::from(le_u16(bytes, 6)? & 0x3fff),
+                u32::from(le_u16(bytes, 8)? & 0x3fff),
+            ))
+        }
+        _ => Err(invalid_sticker("invalid WebP bitstream header")),
+    }
+}
+
+fn validate_webp_frame(bytes: &[u8], width: u32, height: u32) -> Result<(), AppError> {
+    let mut offset = 0_usize;
+    let mut saw_image = false;
+    while offset < bytes.len() {
+        let data = offset
+            .checked_add(8)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| invalid_sticker("truncated WebP frame chunk"))?;
+        let kind = &bytes[offset..offset + 4];
+        let length = le_u32(bytes, offset + 4)? as usize;
+        let end = data
+            .checked_add(length)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| invalid_sticker("invalid WebP frame chunk length"))?;
+        if matches!(kind, b"VP8 " | b"VP8L") {
+            let dimensions = webp_bitstream_dimensions(kind, &bytes[data..end])?;
+            if saw_image || dimensions != (width, height) {
+                return Err(invalid_sticker(
+                    "WebP bitstream dimensions do not match frame",
+                ));
+            }
+            saw_image = true;
+        }
+        offset = end
+            .checked_add(length & 1)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| invalid_sticker("truncated WebP frame chunk padding"))?;
+    }
+    if !saw_image {
+        return Err(invalid_sticker("WebP frame image missing"));
+    }
+    Ok(())
 }
 
 fn record_webp_dimensions(
@@ -1665,7 +1707,11 @@ mod tests {
         let stored_height = frame_height.checked_sub(1).unwrap_or(0xff_ffff);
         anmf.extend_from_slice(&(stored_width & 0xff_ffff).to_le_bytes()[..3]);
         anmf.extend_from_slice(&(stored_height & 0xff_ffff).to_le_bytes()[..3]);
-        anmf.extend_from_slice(&[0; 6]);
+        anmf.extend_from_slice(&[0; 4]);
+        anmf.extend_from_slice(b"VP8L\x05\x00\x00\x00\x2f");
+        let image_dimensions = (stored_width & 0x3fff) | ((stored_height & 0x3fff) << 14);
+        anmf.extend_from_slice(&image_dimensions.to_le_bytes());
+        anmf.push(0);
         let mut payload = Vec::new();
         payload.extend_from_slice(b"VP8X");
         payload.extend_from_slice(&(vp8x.len() as u32).to_le_bytes());
@@ -1947,6 +1993,48 @@ mod tests {
         conflicting[4..8].copy_from_slice(&riff_len.to_le_bytes());
         assert!(inspect_image(&conflicting).is_err());
         assert!(inspect_image(b"not an image").is_err());
+    }
+
+    #[test]
+    fn webp_frames_check_bitstreams() {
+        let replace_image = |image: &[u8]| {
+            let mut bytes = webp_with_frame(32, 32, 0, 0, 16, 16);
+            let frame = bytes.windows(4).position(|bytes| bytes == b"ANMF").unwrap();
+            bytes.truncate(frame + 8 + 16);
+            bytes.extend_from_slice(image);
+            let frame_len = u32::try_from(16 + image.len()).unwrap();
+            bytes[frame + 4..frame + 8].copy_from_slice(&frame_len.to_le_bytes());
+            let riff_len = u32::try_from(bytes.len() - 8).unwrap();
+            bytes[4..8].copy_from_slice(&riff_len.to_le_bytes());
+            bytes
+        };
+        for kind in [b"VP8 ", b"VP8L"] {
+            for (width, height) in [(16_u16, 16_u16), (17, 16), (16, 17), (16383, 16383)] {
+                let mut image = kind.to_vec();
+                if kind == b"VP8 " {
+                    image.extend_from_slice(&10_u32.to_le_bytes());
+                    image.extend_from_slice(b"\x10\x00\x00\x9d\x01\x2a");
+                    image.extend_from_slice(&width.to_le_bytes());
+                    image.extend_from_slice(&height.to_le_bytes());
+                } else {
+                    image.extend_from_slice(&5_u32.to_le_bytes());
+                    image.push(0x2f);
+                    let bits = u32::from(width - 1) | (u32::from(height - 1) << 14);
+                    image.extend_from_slice(&bits.to_le_bytes());
+                    image.push(0);
+                }
+                let bytes = replace_image(&image);
+                assert_eq!(inspect_image(&bytes).is_ok(), (width, height) == (16, 16));
+            }
+        }
+        for image in [
+            &b""[..],
+            &b"VP8 "[..],
+            &b"VP8L\x05\x00\x00\x00\x2f\x0f\xc0\x03"[..],
+            &b"VP8L\x05\x00\x00\x00\x2f\x0f\xc0\x03\x00"[..],
+        ] {
+            assert!(inspect_image(&replace_image(image)).is_err());
+        }
     }
 
     #[test]
