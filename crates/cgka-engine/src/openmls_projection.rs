@@ -15,7 +15,7 @@ use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Member, ProtocolProfile};
 use cgka_traits::message::{MessageState, OwnApplicationConvergenceStamp, StoredMessagePayload};
-use cgka_traits::storage::{StorageError, StorageProvider};
+use cgka_traits::storage::{AnnouncedKeyPackage, StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::{
@@ -346,6 +346,10 @@ struct OpenMlsReplayOutput {
     final_epoch: u64,
     final_members: Vec<Member>,
     epoch_authenticators: BTreeMap<u64, String>,
+    /// What each roster state a canonical apply reached announced, for the
+    /// caller to record in the apply's transaction (mdk#2628 D31 item 7).
+    /// Empty for a candidate probe.
+    announced_key_packages: BTreeSet<AnnouncedKeyPackage>,
 }
 
 /// Presentation output stays private; public replay observations retain their API.
@@ -359,6 +363,7 @@ pub(crate) struct AppliedGroupChanges {
 pub(crate) struct OpenMlsApplyOutput {
     pub(crate) observations: Vec<OpenMlsReplayObservation>,
     pub(crate) group_changes: Vec<AppliedGroupChanges>,
+    pub(crate) announced_key_packages: BTreeSet<AnnouncedKeyPackage>,
 }
 
 #[derive(Debug)]
@@ -3144,6 +3149,7 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
         Ok(OpenMlsApplyOutput {
             observations: output.observations,
             group_changes: output.group_changes,
+            announced_key_packages: output.announced_key_packages,
         })
     })
 }
@@ -3713,6 +3719,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
 
     let mut observations = Vec::new();
     let mut group_changes = Vec::new();
+    let mut announced_key_packages = BTreeSet::new();
     let mut epoch_authenticators = BTreeMap::from([(
         mls_group.epoch().as_u64(),
         own_commit_post_merge_epoch_authenticator(&mls_group),
@@ -3829,12 +3836,16 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             if let Some(max_rewind) = retain_replayed_anchors {
                 crate::maintenance::require_replay_rotation(storage, group_id, &mls_group)
                     .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?;
+                announced_key_packages.extend(crate::announced_key_packages::roster_announcements(
+                    &mls_group,
+                ));
                 let intermediate = OpenMlsReplayOutput {
                     observations: Vec::new(),
                     group_changes: Vec::new(),
                     final_epoch: resulting_epoch,
                     final_members: marmot_members(&mls_group),
                     epoch_authenticators: BTreeMap::new(),
+                    announced_key_packages: BTreeSet::new(),
                 };
                 update_group_record_from_replay(storage, group_id, &intermediate)?;
                 retain_current_group_epoch_snapshot(storage, group_id, max_rewind)?;
@@ -4156,12 +4167,16 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     // Persist every resulting epoch, not only the final tip:
                     // input held for the next generation can still fork from
                     // any intermediate epoch inside the rewind horizon.
+                    announced_key_packages.extend(
+                        crate::announced_key_packages::roster_announcements(&mls_group),
+                    );
                     let intermediate = OpenMlsReplayOutput {
                         observations: Vec::new(),
                         group_changes: Vec::new(),
                         final_epoch: mls_group.epoch().as_u64(),
                         final_members: marmot_members(&mls_group),
                         epoch_authenticators: BTreeMap::new(),
+                        announced_key_packages: BTreeSet::new(),
                     };
                     update_group_record_from_replay(storage, group_id, &intermediate)?;
                     retain_current_group_epoch_snapshot(
@@ -4278,6 +4293,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
         final_epoch: mls_group.epoch().as_u64(),
         final_members: marmot_members(&mls_group),
         epoch_authenticators,
+        announced_key_packages,
     })
 }
 

@@ -58,8 +58,11 @@ use std::time::{Duration, Instant};
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1,
 };
-use cgka_traits::storage::MaintenanceStorage as _;
-use cgka_traits::{MessageId, Timestamp};
+use cgka_traits::storage::{
+    ANNOUNCED_KEY_PACKAGE_RETENTION_SECS, AnnouncedKeyPackage, AnnouncedKeyPackageStorage as _,
+    MaintenanceStorage as _,
+};
+use cgka_traits::{GroupId, MessageId, Timestamp};
 use marmot_session::{ForeignSlotOutcome, ForeignSlotPublication};
 use nostr_directory::OwnSlotRead;
 use storage_sqlite::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord, SqliteAppStorage};
@@ -140,11 +143,11 @@ pub(crate) enum SlotOutcome {
     OwnSlot,
     /// This device's slot, holding a KeyPackage it did not make.
     OwnSlotForeign,
-    /// A roster device's slot. `announced` compares the KeyPackage with the
-    /// one its roster entry announces now. A device announces each
-    /// KeyPackage before publishing it (3.4), so a slot still serving the
-    /// previous one differs until this device keeps the announcements it
-    /// has seen (D31 item 7).
+    /// A roster device's slot. `announced` compares the KeyPackage with
+    /// every one a roster of the trusted device group announced for that
+    /// slot, now or in any roster state this device applied in the last 30
+    /// days (D31 item 7). A device announces each KeyPackage before
+    /// publishing it (3.4), so a slot still serving an earlier one matches.
     KnownDevice {
         announced: Announcement,
     },
@@ -157,8 +160,11 @@ pub(crate) enum SlotOutcome {
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Announcement {
+    /// A roster announced this KeyPackage for the slot.
     Matches,
+    /// No roster announced it, and the slot's entry announces another.
     Differs,
+    /// No roster announced it, and the slot's entry announces none.
     None,
 }
 
@@ -274,7 +280,12 @@ impl AppClient {
         if !read.reached {
             return Err(AppError::DeviceGroupRefused("key_packages_unreachable"));
         }
-        let roster = self.trusted_device_roster()?.map(|(_, roster)| roster);
+        let trusted = self.trusted_device_roster()?;
+        let announced = match &trusted {
+            Some((group_id, _)) => self.announced_key_packages(group_id)?,
+            None => BTreeSet::new(),
+        };
+        let roster = trusted.map(|(_, roster)| roster);
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let rejected_here = rejected_slots_here(&storage.sign_ins()?);
 
@@ -294,6 +305,7 @@ impl AppClient {
                 &fetched.key_package_ref_hex,
                 &own,
                 roster.as_ref(),
+                &announced,
                 &rejected_here,
             );
             if outcome == SlotOutcome::Unrecognized {
@@ -569,6 +581,22 @@ impl AppClient {
         Ok(())
     }
 
+    /// What rosters of the device group `group_id` announced within a
+    /// KeyPackage's lifetime (D31 item 7). The engine records them as it
+    /// applies each roster state.
+    fn announced_key_packages(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<BTreeSet<AnnouncedKeyPackage>, AppError> {
+        let since = unix_now_seconds().saturating_sub(ANNOUNCED_KEY_PACKAGE_RETENTION_SECS);
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .announced_key_packages(group_id, since)?
+            .into_iter()
+            .collect())
+    }
+
     fn own_key_packages(&self) -> Result<OwnKeyPackages, AppError> {
         let Some(lifecycle) = self
             .app
@@ -626,13 +654,15 @@ fn rejected_slots_here(records: &[SignInRecord]) -> BTreeSet<String> {
 /// How a check classifies the publication `event_id_hex`, holding the
 /// KeyPackage `key_package_ref_hex`, in `slot_hex`. In this device's own slot
 /// only the publication counts: one this device did not author is foreign,
-/// whatever KeyPackage it holds, its own earlier ones included.
+/// whatever KeyPackage it holds, its own earlier ones included. `announced`
+/// is what `roster`'s group announced before.
 fn classify(
     slot_hex: &str,
     event_id_hex: &str,
     key_package_ref_hex: &str,
     own: &OwnKeyPackages,
     roster: Option<&DeviceRosterV1>,
+    announced: &BTreeSet<AnnouncedKeyPackage>,
     rejected_slots: &BTreeSet<String>,
 ) -> SlotOutcome {
     if own.slot.as_deref() == Some(slot_hex) {
@@ -649,23 +679,33 @@ fn classify(
     {
         return SlotOutcome::Rejected;
     }
-    let device = roster
-        .zip(slot)
-        .and_then(|(roster, slot)| roster.devices.get(&slot).map(|device| (roster, device)));
-    if let Some((roster, device)) = device {
+    let device = roster.zip(slot).and_then(|(roster, slot)| {
+        roster
+            .devices
+            .get(&slot)
+            .map(|device| (roster, slot, device))
+    });
+    if let Some((roster, slot, device)) = device {
         // A rejected KeyPackage in a device's slot is rejected, not the device.
         if key_package_ref.as_ref().is_some_and(|key_package_ref| {
             roster.rejected_key_packages.contains_key(key_package_ref)
         }) {
             return SlotOutcome::Rejected;
         }
+        let seen = key_package_ref.is_some_and(|key_package_ref| {
+            device.announced_key_package.as_ref() == Some(&key_package_ref)
+                || announced.contains(&AnnouncedKeyPackage {
+                    slot,
+                    key_package_ref,
+                })
+        });
         return SlotOutcome::KnownDevice {
-            announced: match &device.announced_key_package {
-                None => Announcement::None,
-                Some(announced) if key_package_ref.as_ref() == Some(announced) => {
-                    Announcement::Matches
-                }
-                Some(_) => Announcement::Differs,
+            announced: if seen {
+                Announcement::Matches
+            } else if device.announced_key_package.is_some() {
+                Announcement::Differs
+            } else {
+                Announcement::None
             },
         };
     }
@@ -695,6 +735,7 @@ fn foreign_slot_publications(
                 "",
                 own,
                 None,
+                &BTreeSet::new(),
                 &BTreeSet::new(),
             ) == SlotOutcome::OwnSlotForeign
         })
@@ -886,6 +927,22 @@ mod tests {
         };
         let roster = roster();
         let none = Default::default();
+        // Earlier roster states announced 6 for slot 2, 8 for slot 4 and 5
+        // for slot 5, which the roster does not list.
+        let announced = BTreeSet::from([
+            AnnouncedKeyPackage {
+                slot: [2; 32],
+                key_package_ref: vec![6; 32],
+            },
+            AnnouncedKeyPackage {
+                slot: [4; 32],
+                key_package_ref: vec![8; 32],
+            },
+            AnnouncedKeyPackage {
+                slot: [5; 32],
+                key_package_ref: vec![5; 32],
+            },
+        ]);
         let classify = |slot_byte, key_package_byte, roster| {
             classify(
                 &slot(slot_byte),
@@ -893,6 +950,7 @@ mod tests {
                 &key_package(key_package_byte),
                 &own,
                 roster,
+                &announced,
                 &none,
             )
         };
@@ -900,7 +958,15 @@ mod tests {
         assert_eq!(classify(1, 1, Some(&roster)), SlotOutcome::OwnSlot);
         assert_eq!(classify(1, 7, Some(&roster)), SlotOutcome::OwnSlotForeign);
         assert_eq!(
-            super::classify(&slot(1), &event(7), &key_package(1), &own, None, &none),
+            super::classify(
+                &slot(1),
+                &event(7),
+                &key_package(1),
+                &own,
+                None,
+                &BTreeSet::new(),
+                &none
+            ),
             SlotOutcome::OwnSlotForeign
         );
         assert_eq!(
@@ -921,10 +987,28 @@ mod tests {
                 announced: Announcement::None
             }
         );
+        // A KeyPackage an earlier roster announced for the slot matches, even
+        // after the entry moved on or announces none (D31 item 7).
+        for (slot_byte, key_package_byte) in [(2, 6), (4, 8)] {
+            assert_eq!(
+                classify(slot_byte, key_package_byte, Some(&roster)),
+                SlotOutcome::KnownDevice {
+                    announced: Announcement::Matches
+                }
+            );
+        }
+        // An announcement counts for its own slot only.
+        assert_eq!(
+            classify(2, 8, Some(&roster)),
+            SlotOutcome::KnownDevice {
+                announced: Announcement::Differs
+            }
+        );
         // A rejected KeyPackage in a device's slot is rejected, not the
         // device.
         assert_eq!(classify(2, 9, Some(&roster)), SlotOutcome::Rejected);
         assert_eq!(classify(3, 3, Some(&roster)), SlotOutcome::Rejected);
+        // An announcement never makes a slot the roster does not list known.
         assert_eq!(classify(5, 5, Some(&roster)), SlotOutcome::Unrecognized);
         // A rejected KeyPackage in any other slot leaves that slot a sign-in.
         assert_eq!(classify(5, 9, Some(&roster)), SlotOutcome::Unrecognized);
@@ -953,6 +1037,7 @@ mod tests {
                     &key_package(7),
                     &own,
                     Some(&with_letters),
+                    &BTreeSet::new(),
                     &none
                 ),
                 outcome
@@ -972,6 +1057,7 @@ mod tests {
                     &key_package(key_package_byte),
                     &own,
                     None,
+                    &BTreeSet::new(),
                     &here
                 ),
                 outcome
