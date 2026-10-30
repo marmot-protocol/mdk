@@ -278,6 +278,8 @@ mod migration_0130_recovery_coverage_remainders;
 mod migration_0131_account_sign_ins;
 #[path = "migrations/0132_loss_import_revision.rs"]
 mod migration_0132_loss_import_revision;
+#[path = "migrations/0133_device_links.rs"]
+mod migration_0133_device_links;
 #[path = "migrations/0134_recovery_recheck_revision.rs"]
 mod migration_0134_recovery_recheck_revision;
 #[path = "migrations/0135_recovery_unit_fences.rs"]
@@ -1094,6 +1096,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0132_loss_import_revision",
         suspend_foreign_keys: &[],
         apply: migration_0132_loss_import_revision::apply,
+    },
+    Migration {
+        version: 133,
+        name: "0133_device_links",
+        suspend_foreign_keys: &[],
+        apply: migration_0133_device_links::apply,
     },
     Migration {
         version: 134,
@@ -2375,7 +2383,7 @@ mod tests {
         // Call serde_json directly to pin the v1 envelope. The current
         // `StoredMessagePayload::encode` intentionally emits binary v2.
         let payload =
-            serde_json::to_vec(&StoredMessagePayload::outbound_welcome(transport)).unwrap();
+            serde_json::to_vec(&StoredMessagePayload::outbound_welcome(transport, None)).unwrap();
         MessageRecord {
             id: message_id,
             group_id: group_id.clone(),

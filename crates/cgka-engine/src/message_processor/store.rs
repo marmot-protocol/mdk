@@ -111,9 +111,12 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
             storage.put_message(&record)?;
             continue;
         }
-        record.payload = StoredMessagePayload::outbound_welcome(message.clone())
-            .encode()
-            .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+        record.payload = StoredMessagePayload::outbound_welcome(
+            message.clone(),
+            payload.welcome_key_package_ref().map(<[u8]>::to_vec),
+        )
+        .encode()
+        .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
         record.state = state;
         storage.put_message(&record)?;
     }
@@ -307,6 +310,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         msg: &TransportMessage,
         origin_commit_id: &MessageId,
+        key_package_ref: Vec<u8>,
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), EngineError> {
@@ -316,7 +320,11 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             RowEpochs::at(epoch),
             MessageState::Sent,
-            StoredMessagePayload::staged_invite_welcome(msg.clone(), origin_commit_id.clone()),
+            StoredMessagePayload::staged_invite_welcome(
+                msg.clone(),
+                origin_commit_id.clone(),
+                Some(key_package_ref),
+            ),
             None,
         )
     }
@@ -1394,6 +1402,7 @@ mod tests {
                 StoredMessagePayload::staged_invite_welcome(
                     staged_welcome.clone(),
                     origin_commit_id.clone(),
+                    None,
                 ),
                 None,
             )
