@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-11-06
+updated: 2026-11-08
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -136,11 +136,11 @@ with qualified history evidence while the engine remains stalled. EOSE or repeat
 Welcome author and request explicit consent; these commands do not infer consent from ordinary invite acceptance.
 See [invitation recovery](../invitation-recovery.md) for persistence, retry, and integration contracts.
 
-The native engine also supports authenticated `RecoverMembers`: an authorized healthy coordinator replaces exact
-stale device leaves in one Remove+Add Commit, preserving siblings and account roles. Exact Commit/Welcome ownership
-survives restart. Reversible branch loss holds an undelivered Welcome for re-adoption; only terminal loss retires it.
-This is the native operation, not an automatic account-inbox handshake or account-worker workflow; usable forks
-still require consent.
+Durably and natively `Unrecoverable` copies now request automatic rejoin over a private account-inbox handshake.
+A healthy current admin verifies a nonce-bound MLS device proof before atomically replacing the exact stale leaf;
+the confirmed Commit releases a fresh Welcome to the running recipient. History is retained, retries survive
+reopen, and usable forks still require explicit consent. See the
+[automatic rejoin contract](../invitation-recovery.md#automatic-rejoin-of-an-unrecoverable-copy).
 
 The C3 row completion adds bounded selected draft/message/invitation/empty previews and local
 row-action availability to presented rows. Draft invalidations refresh both list APIs without

@@ -8003,6 +8003,8 @@ mod tests {
     use std::sync::Arc;
 
     #[cfg(feature = "test-policy-overrides")]
+    mod automatic_group_recovery_tests;
+    #[cfg(feature = "test-policy-overrides")]
     mod local_submission_queue_tests;
     mod publication_progress_tests;
     mod recovery_runner_host_tests;
