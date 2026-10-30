@@ -43,6 +43,7 @@ use super::{
 use crate::client::device_group::{
     ConfirmedDeviceLink, LINK_DEADLINE_SECS, WELCOME_WAIT_SECS, device_slot,
 };
+use crate::client::device_renames::fresh_rename_id;
 use crate::client::{AppClient, WelcomeDelivery};
 use crate::{AccountRelayListStatus, AppError, unix_now_seconds};
 
@@ -1112,8 +1113,11 @@ impl AppClient {
         let key_package_ref_hex = hex::encode(link.key_package_ref.as_slice());
         let roster_update = if self.trusted_device_group()?.as_ref() == Some(&link.device_group_id)
         {
+            // A fresh rename id (3.6a): a slot linked again after a failed
+            // link never matches a rename kept for its earlier entry.
             let entry = DeviceEntryV1 {
                 label: choices.label.clone(),
+                rename_id: Some(fresh_rename_id()),
                 linked_at: now,
                 linked_by: Some(self.own_slot()?),
                 settings: device_settings(choices),

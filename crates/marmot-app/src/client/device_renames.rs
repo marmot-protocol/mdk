@@ -66,7 +66,10 @@ fn standing(record: &DeviceRenameRecord, rename_id: Option<DeviceRenameId>) -> S
     }
 }
 
-fn fresh_rename_id() -> DeviceRenameId {
+/// A fresh rename id. Every roster entry is created with one and every
+/// rename writes one, so an id this device kept shows up in the roster again
+/// only when a fork brings back an earlier state.
+pub(crate) fn fresh_rename_id() -> DeviceRenameId {
     let mut id = DeviceRenameId::default();
     OsRng.fill_bytes(&mut id);
     id

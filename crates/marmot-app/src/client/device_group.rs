@@ -67,6 +67,7 @@ use storage_sqlite::{DeviceActivityRecord, DeviceGroupRecord, DeviceGroupTrust};
 
 use super::device_heartbeats::sibling_inactive;
 use super::device_pairing::DeviceLinkChoices;
+use super::device_renames::fresh_rename_id;
 use super::{AppClient, UnpublishedWelcomeDelivery, UnpublishedWelcomeKind, group_is_terminal};
 use crate::{AppError, unix_now_seconds};
 
@@ -327,10 +328,13 @@ impl AppClient {
         // founding leaf (3.1d); the new device sets its own once it joins.
         // Nobody chose settings for the founder, so it takes the defaults a
         // new device starts with: siblings add it to chats it is missing, with
-        // their history.
+        // their history. Each entry is created with a fresh rename id (3.6a),
+        // so a later rename of either never reads as one made before it
+        // existed.
         roster.devices.insert(
             own_slot,
             DeviceEntryV1 {
+                rename_id: Some(fresh_rename_id()),
                 linked_at: now,
                 settings: DeviceSettingsV1 {
                     add_to_all_chats: true,
@@ -344,6 +348,7 @@ impl AppClient {
         );
         let sibling_entry = DeviceEntryV1 {
             label: choices.label.clone(),
+            rename_id: Some(fresh_rename_id()),
             linked_at: now,
             linked_by: Some(own_slot),
             settings: DeviceSettingsV1 {
