@@ -27,6 +27,14 @@
 //! active admin: the device group's account. Like a same-account Add, the
 //! intent keeps no `OwnCommitIntent`, so when branch selection supersedes it
 //! nothing re-issues it; the app records whether the link settled.
+//!
+//! `SendIntent::UnlinkDevice` is its undo (D40): when the new device made no
+//! Commit in the device group by the link's deadline, the device that
+//! approved the link removes its leaf and its roster entry in one admin
+//! Commit, under the same rules: never queued, built from those two
+//! proposals only, and checked as every own device-group Commit is. The
+//! engine reads its own tree for the leaf: the Commit removes it only if the
+//! tree still has it, and removes the roster entry either way.
 
 use crate::engine::Engine;
 use crate::message_processor::route_wrapped_group_message;
@@ -34,9 +42,12 @@ use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1, decode_device_roster_update_v1,
+    decode_device_roster_v1,
 };
 use cgka_traits::engine::{KeyPackage, SendResult};
-use cgka_traits::engine_state::{EpochState, InvalidTransition, StagedCommitHandle};
+use cgka_traits::engine_state::{
+    EpochState, InvalidTransition, PendingStateRef, StagedCommitHandle,
+};
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::EncryptedPayload;
@@ -47,6 +58,7 @@ use openmls_traits::OpenMlsProvider as _;
 use tls_codec::Serialize as _;
 
 const INTENT: &str = "LinkDevice";
+const UNLINK_INTENT: &str = "UnlinkDevice";
 
 impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_send_link_device(
@@ -97,6 +109,7 @@ impl<S: StorageProvider> Engine<S> {
         let (commit_out, welcome_out) = self.stage_exact_commit_with_app_data_updates(
             &mut mls_group,
             &provider,
+            Vec::new(),
             vec![parsed_kp.clone()],
             vec![roster_proposal],
             "link_device",
@@ -181,9 +194,171 @@ impl<S: StorageProvider> Engine<S> {
             crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;
         self.storage.put_group(&group_record)?;
 
+        let pending_ref =
+            self.begin_device_group_commit(&group_id, pre_commit_epoch, &commit_msg)?;
+        pending_commit_guard.disarm();
+
+        Ok(SendResult::GroupEvolution {
+            msg: commit_msg,
+            welcomes,
+            pending: pending_ref,
+        })
+    }
+
+    pub(crate) async fn do_send_unlink_device(
+        &mut self,
+        group_id: GroupId,
+        leaf_signature_key: Vec<u8>,
+        roster_update: Vec<u8>,
+    ) -> Result<SendResult, EngineError> {
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mut mls_group = MlsGroup::load(
+            provider.storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        if self
+            .epoch_manager
+            .state(&group_id)
+            .is_some_and(|state| !matches!(state, EpochState::Stable { .. }))
+        {
+            return Err(EngineError::LinkDeviceUnsettled { group_id });
+        }
+        if !crate::app_components::group_requires_device_roster(&mls_group)? {
+            return Err(EngineError::InvalidTransition(InvalidTransition {
+                from: "DeviceRosterNotRequired",
+                to: UNLINK_INTENT,
+                reason: "the group does not require marmot.account.device-roster.v1",
+            }));
+        }
+        crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
+        let existing = self.storage.get_group(&group_id)?;
+        let account = crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
+        // The leaf may already be gone, removed by another Commit or by its
+        // device leaving; the roster entry goes either way, so a failed link
+        // never leaves an entry behind for a device that is not there.
+        let removed = if mls_group
+            .members()
+            .any(|member| member.signature_key == leaf_signature_key)
+        {
+            crate::own_account_devices::own_account_leaves(
+                &mls_group,
+                std::slice::from_ref(&leaf_signature_key),
+                &account,
+            )?
+        } else {
+            Vec::new()
+        };
+        validate_unlink_roster_update(&mls_group, &roster_update)?;
+
+        let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
+        let pending_commit_guard =
+            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+        let pre_commit_ctx =
+            crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
+        let roster_proposal = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
+            DEVICE_ROSTER_COMPONENT_ID,
+            roster_update,
+        )));
+        let (commit_out, welcome_out) = self.stage_exact_commit_with_app_data_updates(
+            &mut mls_group,
+            &provider,
+            removed,
+            Vec::new(),
+            vec![roster_proposal],
+            "unlink_device",
+        )?;
+        if welcome_out.is_some() {
+            return Err(EngineError::Backend(
+                "unlink device produced a Welcome".into(),
+            ));
+        }
+        let own_leaf_index = mls_group.own_leaf_index();
+        let staged_commit = mls_group.pending_commit().ok_or_else(|| {
+            EngineError::Backend("unlink device produced no pending commit".into())
+        })?;
+        crate::commit_class::authorize_own_staged_commit(
+            &mls_group,
+            &group_id,
+            self.identity.self_id(),
+            staged_commit,
+        )?;
+        crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
+            &mls_group,
+            &group_id,
+            staged_commit,
+        )?;
+        crate::app_components::validate_app_component_integrity_for_staged_commit(
+            &mls_group,
+            &group_id,
+            staged_commit,
+        )?;
+        crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+            staged_commit,
+            &mls_group,
+            self.identity.self_id(),
+            self.ciphersuite,
+        )?;
+        crate::app_components::validate_current_profile_invariants_for_staged_commit(
+            &mls_group,
+            staged_commit,
+            own_leaf_index,
+        )?;
+
+        let commit_bytes = commit_out
+            .tls_serialize_detached()
+            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        let commit_msg = self
+            .peeler
+            .wrap_group_message(
+                &EncryptedPayload {
+                    ciphertext: commit_bytes.clone(),
+                    aad: vec![],
+                },
+                &pre_commit_ctx,
+            )
+            .await
+            .map_err(EngineError::Peeler)?;
+        let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
+        self.record_sent_openmls_message(
+            &commit_msg,
+            commit_bytes.as_slice(),
+            &group_id,
+            pre_commit_epoch,
+        )?;
+
+        // `members()` drops the removed leaf while the publish is pending;
+        // `confirm_published` and `publish_failed` re-derive the record from
+        // MLS state.
+        let mut group_record = existing;
+        group_record.members = crate::group_lifecycle::marmot_members(&mls_group);
+        group_record
+            .members
+            .retain(|member| member.credential != leaf_signature_key);
+        self.storage.put_group(&group_record)?;
+
+        let pending_ref =
+            self.begin_device_group_commit(&group_id, pre_commit_epoch, &commit_msg)?;
+        pending_commit_guard.disarm();
+
+        Ok(SendResult::GroupEvolution {
+            msg: commit_msg,
+            welcomes: Vec::new(),
+            pending: pending_ref,
+        })
+    }
+
+    /// Put the device group's staged link or unlink Commit pending publish.
+    fn begin_device_group_commit(
+        &mut self,
+        group_id: &GroupId,
+        pre_commit_epoch: EpochId,
+        commit_msg: &cgka_traits::transport::TransportMessage,
+    ) -> Result<PendingStateRef, EngineError> {
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
         let pending_ref = self.epoch_manager.next_pending_ref();
-        self.invalidate_deferred_peel_candidate_cache(&group_id);
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),
             pre_commit_epoch,
@@ -194,7 +369,7 @@ impl<S: StorageProvider> Engine<S> {
             self.current_audit_context.clone(),
         )?;
         self.audit_group(
-            &group_id,
+            group_id,
             crate::audit_helpers::epoch_state_changed_event(
                 Some("stable"),
                 "pending_publish",
@@ -207,13 +382,7 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.track_pending_origin_commit(pending_ref, commit_msg.id.clone());
-        pending_commit_guard.disarm();
-
-        Ok(SendResult::GroupEvolution {
-            msg: commit_msg,
-            welcomes,
-            pending: pending_ref,
-        })
+        Ok(pending_ref)
     }
 
     /// Parse the KeyPackage to link: this account's, on the group's profile,
@@ -275,5 +444,36 @@ fn validate_link_roster_update(roster_update: &[u8]) -> Result<(), EngineError> 
             "invalid link roster update: it must set exactly one device entry".into(),
         ));
     };
+    Ok(())
+}
+
+/// The unlink's roster update removes exactly one device entry, of a slot the
+/// roster lists.
+fn validate_unlink_roster_update(
+    mls_group: &MlsGroup,
+    roster_update: &[u8],
+) -> Result<(), EngineError> {
+    let update = decode_device_roster_update_v1(roster_update).map_err(|error| {
+        EngineError::Serialize(format!("invalid device roster update: {error}"))
+    })?;
+    let [DeviceRosterOperationV1::RemoveDevice(slot)] = update.operations() else {
+        return Err(EngineError::Other(
+            "invalid unlink roster update: it must remove exactly one device entry".into(),
+        ));
+    };
+    let roster =
+        crate::app_components::app_component_data_of_group(mls_group, DEVICE_ROSTER_COMPONENT_ID)
+            .ok_or_else(|| {
+            EngineError::Other(
+                "invalid device roster state: the required roster has no GroupContext state".into(),
+            )
+        })?;
+    let roster = decode_device_roster_v1(&roster)
+        .map_err(|error| EngineError::Serialize(format!("invalid device roster state: {error}")))?;
+    if !roster.devices.contains_key(slot) {
+        return Err(EngineError::Other(
+            "invalid unlink roster update: the roster lists no such device".into(),
+        ));
+    }
     Ok(())
 }

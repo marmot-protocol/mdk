@@ -18,6 +18,7 @@ use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessa
 use cgka_traits::types::{GroupId, MemberId, MessageId};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use nostr::nips::nip59::UnwrappedGift;
 use nostr::prelude::{
     Event, EventBuilder, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, PublicKey, RelayUrl,
     Tag, Timestamp as NostrTimestamp, UnsignedEvent,
@@ -46,6 +47,29 @@ const GROUP_AAD: &[u8] = b"";
 pub struct WelcomePeelProvenance {
     pub rumor_event_id: [u8; 32],
     pub key_package_event_id: [u8; 32],
+}
+
+/// A gift wrap to the account, opened once.
+#[derive(Debug)]
+pub enum AccountGiftWrap {
+    /// A Welcome rumor, peeled and validated.
+    Welcome(Box<PeeledMessage>, WelcomePeelProvenance),
+    /// Any other rumor. NIP-59 verified the wrap and seal and matched the
+    /// rumor's author to the seal's; nothing else about it is checked.
+    Other(Box<UnwrappedGift>),
+}
+
+impl AccountGiftWrap {
+    /// The Welcome, or the error a Welcome peel returns for any other rumor.
+    pub fn into_welcome(self) -> Result<(PeeledMessage, WelcomePeelProvenance), PeelerError> {
+        match self {
+            Self::Welcome(peeled, provenance) => Ok((*peeled, provenance)),
+            Self::Other(unwrapped) => Err(PeelerError::Malformed(format!(
+                "expected Marmot welcome rumor kind {KIND_MARMOT_WELCOME_RUMOR}, got {}",
+                u16::from(unwrapped.rumor.kind)
+            ))),
+        }
+    }
 }
 
 /// Nostr implementation of the Marmot transport peeler.
@@ -195,6 +219,17 @@ impl NostrMlsPeeler {
         &self,
         msg: &TransportMessage,
     ) -> Result<(PeeledMessage, WelcomePeelProvenance), PeelerError> {
+        self.peel_account_gift_wrap(msg).await?.into_welcome()
+    }
+
+    /// Open a gift wrap to the account once. A Welcome rumor is peeled as
+    /// [`Self::peel_welcome_with_provenance`] peels it; any other rumor comes
+    /// back opened and unread, for the caller to read under its own rules
+    /// (device pairing's, for one).
+    pub async fn peel_account_gift_wrap(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<AccountGiftWrap, PeelerError> {
         let signer = self.welcome_signer()?;
         let event = NostrTransportEvent::from_transport_message(msg).map_err(to_peeler_error)?;
         if event.kind != KIND_NIP59_GIFT_WRAP {
@@ -218,10 +253,7 @@ impl NostrMlsPeeler {
                 .map_err(map_nip59_error)?;
 
         if unwrapped.rumor.kind != Kind::Custom(KIND_MARMOT_WELCOME_RUMOR) {
-            return Err(PeelerError::Malformed(format!(
-                "expected Marmot welcome rumor kind {KIND_MARMOT_WELCOME_RUMOR}, got {}",
-                u16::from(unwrapped.rumor.kind)
-            )));
+            return Ok(AccountGiftWrap::Other(Box::new(unwrapped)));
         }
 
         // NIP-59 verifies the signed gift wrap and seal and matches the rumor
@@ -253,8 +285,8 @@ impl NostrMlsPeeler {
             ));
         }
 
-        Ok((
-            PeeledMessage {
+        Ok(AccountGiftWrap::Welcome(
+            Box::new(PeeledMessage {
                 id: msg.id.clone(),
                 group_id: None,
                 sender: Some(MemberId::new(unwrapped.sender.to_bytes().to_vec())),
@@ -264,7 +296,7 @@ impl NostrMlsPeeler {
                     key_package_event_id: Some(MessageId::new(key_package_event_id.to_vec())),
                 },
                 origin: msg.clone(),
-            },
+            }),
             WelcomePeelProvenance {
                 rumor_event_id,
                 key_package_event_id,
@@ -1335,13 +1367,25 @@ mod tests {
             .to_transport_message()
             .unwrap();
 
-        let err = NostrMlsPeeler::new()
-            .with_welcome_signer(receiver)
+        let peeler = NostrMlsPeeler::new().with_welcome_signer(receiver);
+        let err = peeler
             .peel_welcome(&wrapped)
             .await
             .expect_err("wrong rumor kind should not peel");
 
         assert!(matches!(err, PeelerError::Malformed(_)));
+
+        // Opened once as a gift wrap to the account, the rumor comes back
+        // unread, authored by the seal's signer.
+        let AccountGiftWrap::Other(unwrapped) = peeler
+            .peel_account_gift_wrap(&wrapped)
+            .await
+            .expect("an authentic gift wrap opens")
+        else {
+            panic!("a non-Welcome rumor is not a Welcome");
+        };
+        assert_eq!(unwrapped.rumor.kind, Kind::TextNote);
+        assert_eq!(unwrapped.sender, sender.public_key());
     }
 
     #[tokio::test]

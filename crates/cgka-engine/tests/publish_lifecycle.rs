@@ -642,6 +642,7 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
             payload: StoredMessagePayload::staged_invite_welcome(
                 stale_welcome,
                 MessageId::new(b"rolled-back-origin-commit".to_vec()),
+                None,
             )
             .encode()
             .unwrap(),

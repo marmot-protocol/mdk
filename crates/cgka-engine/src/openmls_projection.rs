@@ -663,7 +663,7 @@ pub(crate) fn stamp_processed_own_commit_record<S: StorageProvider>(
         // Raw-transport rows never enter the OpenMLS candidate graph; a plain
         // state update preserves their shape.
         other @ (StoredMessagePayload::RawTransport(_)
-        | StoredMessagePayload::OutboundWelcome(_)
+        | StoredMessagePayload::OutboundWelcome { .. }
         | StoredMessagePayload::StagedInviteWelcome { .. }) => other,
     };
     record.state = MessageState::Processed;

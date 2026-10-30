@@ -35,7 +35,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::sweep::{
-    ClosedReason, RelayCaps, SweepPolicy, SweepRange, SweepRoute, SweepSinkError, UnreachableKind,
+    ClosedReason, Interrupt, RelayCaps, SweepPolicy, SweepRange, SweepRoute, SweepSinkError,
+    UnreachableKind, ask_until_cut,
 };
 
 #[cfg(test)]
@@ -108,6 +109,13 @@ pub trait CompareRelay: Send + Sync {
     /// counts the events it gets.
     fn take_fetched_bytes(&self) -> u64 {
         0
+    }
+
+    /// End the request in flight early, and every later one at once, as
+    /// [`SweepRelay::interrupt`](crate::sweep::SweepRelay) does. The default,
+    /// `false`, has a cut request dropped at once.
+    fn interrupt(&self) -> bool {
+        false
     }
 }
 
@@ -253,12 +261,6 @@ pub struct CompareReport {
     pub stats: CompareStats,
 }
 
-/// Why a wait stopped early.
-enum Interrupt {
-    Cancelled,
-    Deadline,
-}
-
 impl From<Interrupt> for CompareEnd {
     fn from(interrupt: Interrupt) -> Self {
         match interrupt {
@@ -319,7 +321,8 @@ where
         pending_bytes: 0,
     };
     let end = call.run().await;
-    // A fetch the deadline or a cancellation dropped never reported its bytes.
+    // A fetch the deadline or a cancellation cut left what it read on the
+    // relay's meter.
     call.read_bytes(0);
     let report = CompareReport {
         certified: call.certified,
@@ -640,7 +643,7 @@ where
     }
 
     /// Pace, then run one relay request under the call's cancellation and
-    /// deadline. A request cut by either is dropped.
+    /// deadline, as a sweep does ([`ask_until_cut`]).
     async fn ask<T>(&mut self, request: impl Future<Output = T>) -> Result<T, Interrupt> {
         if let Some(last) = self.last_request {
             self.wait_until(last + self.request.policy.pacing.min_request_interval)
@@ -648,13 +651,11 @@ where
         }
         self.last_request = Some(Instant::now());
         self.stats.requests += 1;
-        let deadline = self.request.deadline;
-        tokio::select! {
-            biased;
-            () = self.cancel.cancelled() => Err(Interrupt::Cancelled),
-            () = sleep_until_deadline(deadline) => Err(Interrupt::Deadline),
-            reply = request => Ok(reply),
-        }
+        let relay = self.relay;
+        ask_until_cut(request, self.cancel, self.request.deadline, || {
+            relay.interrupt()
+        })
+        .await
     }
 
     async fn wait_until(&self, at: Instant) -> Result<(), Interrupt> {
@@ -681,11 +682,4 @@ fn event_bytes(events: &[Event]) -> u64 {
         .iter()
         .map(|event| event.as_json().len() as u64)
         .fold(0u64, u64::saturating_add)
-}
-
-async fn sleep_until_deadline(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
-    }
 }

@@ -5,7 +5,8 @@
 //! The time-sliced sweep over the wire: `SdkSweepRelay` against a local relay
 //! behind the strfry-limits proxy (`support/limit_relay.rs`, 500 clamp, no
 //! NIP-67 hints unless a test turns on wok's). Synthetic group events only; no
-//! MLS.
+//! MLS. Requests cut mid-reply (the proxy's stall) are covered for the
+//! comparison's fetches too.
 
 #[path = "support/limit_relay.rs"]
 mod limit_relay;
@@ -24,10 +25,13 @@ use nostr_sdk::prelude::{
 };
 use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::NostrSdkRelayClient;
+use transport_nostr_adapter::compare::{
+    CompareEnd, ComparePolicy, CompareRequest, CompareSink, run_comparison,
+};
 use transport_nostr_adapter::sweep::{
-    CoveredSlice, RelayCaps, SdkSweepRelay, SliceProof, SliceQuery, SliceReply, SweepCursor,
-    SweepCursorStore, SweepEnd, SweepPolicy, SweepRange, SweepRelay, SweepRequest, SweepRoute,
-    SweepSink, SweepSinkError, SweepStoreError, run_sweep,
+    CoveredSlice, INTERRUPT_GRACE, RelayCaps, SdkSweepRelay, SliceProof, SliceQuery, SliceReply,
+    SweepCursor, SweepCursorStore, SweepEnd, SweepPolicy, SweepRange, SweepRelay, SweepRequest,
+    SweepRoute, SweepSink, SweepSinkError, SweepStoreError, run_sweep,
 };
 
 const GROUP: [u8; 32] = [3; 32];
@@ -476,4 +480,171 @@ async fn more_hint_splits_a_reply_below_the_published_cap() {
         report.covered
     );
     assert_once_in_order(&sink, &wanted);
+}
+
+/// Events whose JSON is all one length, so bytes read are a count of events.
+fn uniform_events(count: usize, created_at: impl Fn(usize) -> u64) -> (Vec<Event>, u64) {
+    let keys = Keys::generate();
+    let events = (0..count)
+        .map(|n| {
+            EventBuilder::new(Kind::MlsGroupMessage, format!("payload-{n:06}"))
+                .tags([Tag::custom("h", [hex::encode(GROUP)])])
+                .custom_created_at(Timestamp::from_secs(created_at(n)))
+                .finalize(&keys)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let one = events[0].as_json().len();
+    assert!(events.iter().all(|event| event.as_json().len() == one));
+    (events, one as u64)
+}
+
+/// A slice reply the deadline cuts mid-stream: the sweep interrupts the
+/// request rather than dropping it, and the relay reports every event byte it
+/// read before the cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slice_cut_mid_reply_reports_every_byte_it_read() {
+    let fixture = Fixture::new().await;
+    let (events, one) = uniform_events(200, |n| T0 + n as u64);
+    fixture.store(&events).await;
+    fixture.limit.stall_after_events(30);
+    let relay = fixture.relay();
+    let mut sweep = request(range());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    sweep.deadline = Some(deadline);
+    let report = run_sweep(
+        sweep,
+        &relay,
+        &mut Sink::default(),
+        &MemoryStore::default(),
+        &CancellationToken::new(),
+    )
+    .await;
+    let returned = tokio::time::Instant::now();
+    assert_eq!(report.end, SweepEnd::DeadlineReached, "{report:?}");
+    assert_eq!((report.stats.requests, report.stats.answers), (1, 0));
+    assert!(report.covered.is_empty());
+    let stats = fixture.limit.stats();
+    assert_eq!(stats.events_before_stall, 30);
+    assert!(stats.stalled_frames > 0, "the reply was cut mid-stream");
+    assert_eq!(relay.take_fetched_bytes(), 30 * one);
+    assert!(returned < deadline + INTERRUPT_GRACE);
+}
+
+/// A saturated second cut by cancellation (shutdown, or a pass preempting
+/// it) after two of its id-fetch chunks completed and mid-way through the
+/// third: every byte the slice and the chunks read is reported, and no
+/// further chunk goes out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_cut_after_completed_chunks_reports_every_byte_it_read() {
+    let fixture = Fixture::with_limits(LimitConfig {
+        req_limit_clamp: Some(50),
+        ..LimitConfig::default()
+    })
+    .await;
+    let burst = T0 + 3_600;
+    let (events, one) = uniform_events(300, |_| burst);
+    fixture.store(&events).await;
+    let relay =
+        fixture.relay_with_caps(r#"{"supported_nips":[1,11,77],"limitation":{"max_limit":50}}"#);
+    // The slice's 50, two whole chunks of 50, and 20 of the third.
+    let read = 50 + 2 * 50 + 20;
+    fixture.limit.stall_after_events(read);
+    let cancel = CancellationToken::new();
+    let cancelled_at = {
+        let cancel = cancel.clone();
+        let limit = &fixture.limit;
+        async move {
+            assert!(
+                limit
+                    .wait_for(Duration::from_secs(10), |stats| {
+                        stats.events_before_stall == read && stats.stalled_frames > 0
+                    })
+                    .await,
+                "the third chunk stalls"
+            );
+            // Let the client take in what the proxy sent.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.cancel();
+            tokio::time::Instant::now()
+        }
+    };
+    let second = SweepRange {
+        since: burst,
+        until: burst,
+    };
+    let (mut sink, store) = (Sink::default(), MemoryStore::default());
+    let (report, cancelled_at) = tokio::join!(
+        run_sweep(request(second), &relay, &mut sink, &store, &cancel),
+        cancelled_at
+    );
+    let returned = tokio::time::Instant::now();
+    assert_eq!(report.end, SweepEnd::Cancelled, "{report:?}");
+    assert_eq!(report.stats.saturated_seconds, 1);
+    assert!(report.covered.is_empty());
+    assert_eq!(relay.take_fetched_bytes(), read as u64 * one);
+    assert!(returned < cancelled_at + INTERRUPT_GRACE);
+    // The slice and three chunks; the interrupted fetch asked for no fourth.
+    let stats = fixture
+        .limit
+        .wait_quiet(Duration::from_millis(300), Duration::from_secs(5))
+        .await;
+    assert_eq!(stats.total_reqs, 4, "{}", stats.summary());
+}
+
+#[derive(Default)]
+struct CompareBatches {
+    events: usize,
+    bytes: u64,
+}
+
+#[async_trait]
+impl CompareSink for CompareBatches {
+    async fn admit(
+        &mut self,
+        _window: SweepRange,
+        _certified: bool,
+        events: Vec<Event>,
+        fetched_bytes: u64,
+    ) -> Result<(), SweepSinkError> {
+        self.events += events.len();
+        self.bytes += fetched_bytes;
+        Ok(())
+    }
+}
+
+/// A comparison's fetch by id cut mid-reply reports what it read, as a
+/// sweep's request does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_comparison_fetch_cut_mid_reply_reports_every_byte_it_read() {
+    let fixture = Fixture::new().await;
+    let (events, one) = uniform_events(200, |n| T0 + n as u64 * 60);
+    fixture.store(&events).await;
+    fixture.limit.stall_after_events(30);
+    let relay = fixture.relay();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut sink = CompareBatches::default();
+    let report = run_comparison(
+        CompareRequest {
+            route: SweepRoute::Group {
+                nostr_group_id: GROUP,
+            },
+            range: range(),
+            local: &[],
+            deadline: Some(deadline),
+            policy: ComparePolicy::new(2_048, 8 * 1024 * 1024),
+        },
+        &relay,
+        &mut sink,
+        &CancellationToken::new(),
+    )
+    .await;
+    let returned = tokio::time::Instant::now();
+    assert_eq!(report.end, CompareEnd::DeadlineReached, "{report:?}");
+    assert!(report.certified.is_empty());
+    assert_eq!(report.stats.missing, 200);
+    assert_eq!(sink.events, 0);
+    assert_eq!(fixture.limit.stats().events_before_stall, 30);
+    assert_eq!(sink.bytes + report.unadmitted_bytes, 30 * one);
+    assert!(returned < deadline + INTERRUPT_GRACE);
 }

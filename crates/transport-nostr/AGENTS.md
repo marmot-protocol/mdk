@@ -14,6 +14,8 @@ dropped delivery's route (`DeliveryRoute::of`, the same rule `marmot-app` keys r
 `DeliveryRoute` and the cap live in the adapter, re-exported here, so a REQ's routes and a delivery's are one type.
 A lag on an account's own SDK context charges each route's REQ floor too; `notification_loss_routes` hands the
 generation's routes to the worker, or none once any of its losses had none (a shared receiver, staged replay).
+`delivery_loss_routes` hands the worker a queue-loss generation's drop routes the same way, so its observation past
+the durable marker count stays routed.
 A generation that adopted a durable marker (a restart, or a failed acknowledgment) takes a fresh token at its first new
 drop: storage imports loss by count, so a token's count must cover every drop under it.
 

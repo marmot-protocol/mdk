@@ -331,7 +331,7 @@ impl<S: StorageProvider> Engine<S> {
 
 /// The leaves a same-account Remove targets: each signature key names a
 /// current leaf of `account` other than this device's own.
-fn own_account_leaves(
+pub(crate) fn own_account_leaves(
     mls_group: &MlsGroup,
     leaf_signature_keys: &[Vec<u8>],
     account: &[u8; 32],

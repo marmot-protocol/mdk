@@ -5,6 +5,8 @@ mod audit_ownership;
 mod canonical_membership;
 #[cfg(feature = "test-policy-overrides")]
 mod device_group;
+#[cfg(feature = "test-policy-overrides")]
+mod device_pairing;
 mod draft_lifecycle;
 mod follow_list_edits;
 mod group_lookup;

@@ -22,6 +22,8 @@ use cgka_traits::types::MemberId;
 use cgka_traits::{GroupEvent, GroupId, MessageId, TransportMessage};
 use marmot_forensics::v5::*;
 use marmot_session::{PublishWork, SessionEffects};
+#[cfg(feature = "unreleased-device-pairing")]
+use transport_nostr_peeler::AccountGiftWrap;
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent, WelcomePeelProvenance};
 
 use crate::AppGroupRecord;
@@ -78,6 +80,29 @@ pub(crate) struct ProbePeeler {
     pub inner: NostrMlsPeeler,
     pub slot: Arc<Mutex<PeelSlot>>,
     pub storage: storage_sqlite::SqliteAppStorage,
+    /// Takes the pairing messages among the gift wraps to the account.
+    #[cfg(feature = "unreleased-device-pairing")]
+    pub pairing: Option<super::device_pairing::PairingInbox>,
+}
+
+impl ProbePeeler {
+    /// Open a gift wrap to the account once: a Welcome peels as before, and
+    /// a pairing message goes to the pairing inbox. Anything not a Welcome
+    /// is still refused, so the engine ignores it.
+    async fn open_welcome(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<(PeeledMessage, WelcomePeelProvenance), PeelerError> {
+        #[cfg(feature = "unreleased-device-pairing")]
+        if let Some(pairing) = &self.pairing {
+            let opened = self.inner.peel_account_gift_wrap(msg).await?;
+            if let AccountGiftWrap::Other(unwrapped) = &opened {
+                pairing.offer(unwrapped);
+            }
+            return opened.into_welcome();
+        }
+        self.inner.peel_welcome_with_provenance(msg).await
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -93,35 +118,34 @@ impl TransportPeeler for ProbePeeler {
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
         let started = Instant::now();
-        let result =
-            self.inner
-                .peel_welcome_with_provenance(msg)
-                .await
-                .and_then(|(peeled, provenance)| {
-                    // The caller holds the account policy lock through admission and
-                    // projection. Only an authenticated Welcome is an invitation.
-                    if matches!(&peeled.content, cgka_traits::PeeledContent::Welcome { .. }) {
-                        let sender = peeled
-                            .sender
-                            .as_ref()
-                            .ok_or(PeelerError::InvalidSignature)?;
-                        let blocked = self
-                            .storage
-                            .is_user_blocked(&hex::encode(sender.as_slice()))
+        let result = self
+            .open_welcome(msg)
+            .await
+            .and_then(|(peeled, provenance)| {
+                // The caller holds the account policy lock through admission and
+                // projection. Only an authenticated Welcome is an invitation.
+                if matches!(&peeled.content, cgka_traits::PeeledContent::Welcome { .. }) {
+                    let sender = peeled
+                        .sender
+                        .as_ref()
+                        .ok_or(PeelerError::InvalidSignature)?;
+                    let blocked = self
+                        .storage
+                        .is_user_blocked(&hex::encode(sender.as_slice()))
+                        .map_err(|_| {
+                            PeelerError::Backend("Welcome policy storage failed".into())
+                        })?;
+                    if blocked {
+                        self.storage
+                            .dismiss_blocked_welcome(&hex::encode(msg.id.as_slice()))
                             .map_err(|_| {
-                                PeelerError::Backend("Welcome policy storage failed".into())
+                                PeelerError::Backend("Welcome dismissal storage failed".into())
                             })?;
-                        if blocked {
-                            self.storage
-                                .dismiss_blocked_welcome(&hex::encode(msg.id.as_slice()))
-                                .map_err(|_| {
-                                    PeelerError::Backend("Welcome dismissal storage failed".into())
-                                })?;
-                            return Err(PeelerError::WrongRecipient);
-                        }
+                        return Err(PeelerError::WrongRecipient);
                     }
-                    Ok((peeled, provenance))
-                });
+                }
+                Ok((peeled, provenance))
+            });
         let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let mut slot = self.slot.lock().unwrap();
         if let Some((id, receive_id, outer)) = slot.armed.take()

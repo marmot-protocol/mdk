@@ -11,8 +11,9 @@
 //! 2. An existing device sends a [`PairingAnswer`] with its own fresh key.
 //! 3. The new device sends a [`PairingReveal`] with its key, which the
 //!    existing device checks against the commitment.
-//! 4. Both derive the same [`SasCode`] and show it, as seven emoji or as
-//!    three numbers. The users compare the two screens.
+//! 4. Both derive the same [`SasCode`] and show it as seven emoji, each
+//!    with its text description for screen readers (D25). The users compare
+//!    the two screens.
 //! 5. Each side whose user confirmed sends a [`PairingConfirm`]: the new
 //!    device's covers its exact `KeyPackageRef`, the existing device's the
 //!    device group it will add the new device to and the MLS signature key

@@ -751,6 +751,7 @@ impl SqliteAppStorage {
             marker_token,
             dropped_count,
             earliest_created_at,
+            None,
         )
         .map(|_| ())
     }

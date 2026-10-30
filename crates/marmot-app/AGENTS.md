@@ -74,9 +74,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `untrusted`, and a group under a row that does not require the roster drops the row; neither arises through the
   engine. A routing rebuild skips a device group a deferred open has not hydrated; the post-hydration reconcile
   installs its route. The founding Add takes the account's own device only through the confirmed `KeyPackageRef`.
-  Creation and links are reachable only through the `test-policy-overrides` hooks (`dev_create_device_group`,
-  `dev_record_confirmed_device_link`, `dev_withdraw_confirmed_device_link`), with `MarmotAppConfig::dev_device_groups`
-  set, until pairing reaches the app.
+  Confirmed links come from device pairing; the `test-policy-overrides` hooks (`dev_create_device_group`,
+  `dev_record_confirmed_device_link`, `dev_withdraw_confirmed_device_link`) stay for tests.
 - Read the device roster only through `trusted_device_roster` (the trusted group's decoded roster, or none). Hosts see
   it only as `linked_devices`, this account's own devices; its errors never name the group. The device group's events
   stay hidden, so every hidden device-group event and every change of trust sets `linked_devices_changed`, which the
@@ -121,6 +120,48 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   one the roster cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a
   rejected KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's
   included, into a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7).
+- Keep device pairing (mdk#2628 item 3.3b) in `src/client/device_pairing.rs` (host DTOs) and
+  `src/client/device_pairing/live.rs` (behind `unreleased-device-pairing`, and inert unless
+  `MarmotAppConfig::dev_device_groups` is set). The Welcome peeler opens each gift wrap to the account once and hands
+  pairing rumors to the `PairingInbox`; the engine still sees them refused. Pairing secrets (the code, keys and session
+  ids) live only in the in-memory `marmot-pairing` sessions: never persist them, and never log them, a slot or a label.
+  A device adds a sibling only after both users confirmed the code and the new device's confirmation verified, through
+  exactly the confirmed `KeyPackageRef`: a first link creates the device group, a later one sends one
+  `SendIntent::LinkDevice` commit, sent through `runtime.send_with_audit_context` so the runtime releases its Welcome
+  only once the commit is confirmed (never split the Welcome off for app delivery). On both paths the prompt stays
+  `Linking` after the commit: `decide_device_links` is the one gate for every link in `device_links`, prompt or not
+  (D40). A link is `Linked` once the new device's first commit, which sets its roster entry's `tag_signature_key` to
+  the leaf key the link added (`leaf_signature_key_hex`), is on the selected branch: the device group is `Stable` with
+  no pending convergence input. It fails when its group was never made, when the quiet roster has not listed it as
+  this device's link for a whole settlement window (`MarmotApp::settlement_quiescence_ms`, in milliseconds, whose
+  override only test-policy builds read), or when that commit is still absent `LINK_DEADLINE_SECS` after the entry's
+  `linked_at`. A decided link never changes, and a link whose approval still waits to be retried is not decided. A
+  failed link ends its prompt as `LinkFailed` with a `CannotLink` cancel. Its Welcome, found by the `KeyPackageRef`
+  recorded before the commit (`welcomes_for_key_package`), is withdrawn before the failure is recorded, then again on
+  each drive until that succeeds and marks it withdrawn; never rely on a Welcome id written after the commit, which a
+  crash can lose. Welcome publishers (startup recovery, a maintenance pass, a fanout retry) run before the gate, so
+  every client open, before it returns the client and whether or not device groups are on, withdraws the Welcome of
+  every failed link not marked withdrawn and every pending link past its deadline (`withdraw_expired_link_welcomes`);
+  a new publisher must not run before open returns. While the roster
+  lists the device as this device's link, it also removes its entry, and its leaf if the engine's tree still has one, in
+  one `SendIntent::UnlinkDevice` commit; never decide the leaf from the stored member list, which a staged removal has
+  already changed. A withdrawal that fails never holds the removal back. A link refused as
+  `LinkDeviceUnsettled` made no commit, even while another commit resolves. Publish an undelivered Welcome again every
+  few seconds until the new device's Welcome wait ends; neither its publication nor its delivery decides a link.
+  `drive_unpublished_welcome_delivery` returns a `#[must_use]` `WelcomeDelivery`; chat creation goes on either way, as
+  the Welcome stays owed. Prompt ids are random, so an id a host kept from before a reopen names no prompt. The engine
+  refuses a link or an unlink with `LinkDeviceUnsettled` rather than queue it; retry a link on each drive until a
+  minute before the new device's Welcome wait ends, counted from when the new device sent its confirmation, never
+  attempt it after that, and cancel it as `LinkFailed`. The existing device's confirmation names `own_signature_key`,
+  its leaf key in the device group, and the new device records it with the link (`record_confirmed_device_link`).
+  Ending the new device's wait (cancel, a withdrawn link, timeout) withdraws the engine's expectation first and keeps
+  the wait until that succeeds, retrying on each drive. Record each link in `device_links` before its commit, so a
+  crash cannot lose it. The new device records a `device_group_joins` row before it trusts the group it joined, nudges
+  its first commit there (`set_device_tag_key`) on each drive rather than waiting for maintenance, and drops the row
+  once that commit landed. Removed from the device group, it forgets its copy (`forget_group_local`); removed before
+  its first commit landed, it shows `Ended { LinkFailed }`. Each drive ends by comparing linking as hosts read it with
+  `DevicePairing::last_view` and sets `device_link_changed` when it differs; the client opens with that flag set, and
+  the same two seams as `linked_devices_changed` drain it into `DeviceLinkChanged`.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.
@@ -275,7 +316,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
   reached right after a `rate-limited:` reply settles `RateLimited`. Every event byte a required relay sends is
   charged to the account's rolling hour, cut and discarded replies included; best-effort relays are never charged.
-  The one uncharged reply is the one in flight when a quantum is cut (mdk#2719). Logs carry aggregates only.
+  A quantum cut by its deadline, shutdown or the pass deadline interrupts its request in flight rather than dropping
+  it, so the reply it was reading is charged too (`SweepRelay::interrupt`); an interrupted request is no answer and
+  never clears a rate limit. Logs carry aggregates only.
   A comparison or re-check quantum settles through the same table: its end maps to a sweep end (`compare::verdict`).
   A re-check settles the relay and the account budget but never its unit's retry state, records pass progress only
   under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it

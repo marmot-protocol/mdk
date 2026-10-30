@@ -10,7 +10,15 @@ default = []
 product-analytics-export = []
 # Test-only convergence timing/rewind overrides. Never enable in app artifacts.
 # marmot-session forwards this to cgka-engine, which is a dev-dependency here.
-test-policy-overrides = ["marmot-session/test-policy-overrides"]
+# Device pairing runs only behind `dev_device_groups`, itself test-policy only.
+test-policy-overrides = ["marmot-session/test-policy-overrides", "unreleased-device-pairing"]
+# Device pairing through the account runtime (#2628). Unreleased until the
+# pairing and device-group specs merge: only `test-policy-overrides` enables
+# it, so no release sends or reads pairing messages.
+unreleased-device-pairing = [
+    "dep:marmot-pairing",
+    "transport-nostr-adapter/unreleased-device-pairing",
+]
 # Opt-in relay-telemetry OTLP exporter wire encoding and HTTP push. The
 # privacy-critical mapping and opt-in gate stay in the default build; this
 # feature only adds the OTLP protobuf dependencies and the push transport.
@@ -40,6 +48,7 @@ jsonschema.workspace = true
 marmot-account.workspace = true
 marmot-forensics.workspace = true
 marmot-markdown.workspace = true
+marmot-pairing = { workspace = true, optional = true }
 nostr-directory.workspace = true
 nostr = { workspace = true, features = ["nip04"] }
 nostr-sdk.workspace = true

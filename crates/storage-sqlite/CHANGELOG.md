@@ -4,6 +4,12 @@
 
 ### Breaking changes
 
+- `mark_account_delivery_recovery_observed` takes the routes the relay plane
+  holds for the generation it observes (mdk#2660 phase 4). An observation past
+  the durable count merges them as `record_account_recovery_loss_routed`
+  would, so the generation stays routed, and lowers the generation's floor to
+  the lowest bound they list; `None` makes it account-wide, as every such
+  observation did before.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it
@@ -14,6 +20,18 @@
   returns whether it recorded. Ending a long cooldown, by an answer or by
   `record_recovery_relay_reconnected` (which now takes the policy and the
   time), makes every re-check on the relay due in the same transaction.
+- Migration 0133 advances account storage to schema 133 (mdk#2628 item 3.3b).
+  It adds `device_links`, one row per device this device approved adding to
+  the account's device group, written before the approving commit, with the
+  added KeyPackage's `KeyPackageRef` (which also finds the link's Welcome) and
+  its leaf's signature key, its outcome (`pending`, `linked` or `failed`), and
+  whether a failed link's Welcome is withdrawn. It also adds
+  `device_group_joins`, the device groups this device joined through a link
+  whose first commit there has not landed yet. `SqliteAppStorage` gains
+  `record_device_link`, `mark_device_link_welcome_withdrawn`, `device_link`,
+  `device_links`, `decide_device_link`, `record_device_group_join`,
+  `device_group_joins` and `delete_device_group_join`. A local forget removes
+  the group's rows. No rows are seeded.
 - Migration 0132 advances account storage to schema 132 (mdk#2660 phase 4).
   It adds `import_revision` to `account_delivery_loss_evidence`: the loss
   revision the import that last charged a generation left. Existing imported
