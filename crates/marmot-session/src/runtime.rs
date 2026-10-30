@@ -74,6 +74,7 @@ mod device_tag_key;
 mod own_slot;
 pub use own_slot::{ForeignSlotOutcome, ForeignSlotPublication};
 mod private_key_packages;
+mod removed_device_slot;
 mod removed_slot_expiry;
 mod sign_in_rejection;
 mod slot_announcement;
@@ -800,6 +801,18 @@ where
         Ok(self
             .session
             .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
+    }
+
+    /// This account's other leaves in `group_id`, by signature key, with the
+    /// roster slot each one's device tag reads as against the device group's
+    /// current `roster`. See
+    /// [`cgka_engine::engine::Engine::own_account_leaf_claims`].
+    pub fn own_account_leaf_claims(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> AccountResult<Vec<(Vec<u8>, DeviceTagClaim)>> {
+        Ok(self.session.own_account_leaf_claims(group_id, roster)?)
     }
 
     pub fn app_component(

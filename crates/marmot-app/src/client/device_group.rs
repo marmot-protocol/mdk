@@ -39,7 +39,9 @@
 //!   client and platform from the app's config into its own entry. Rejected
 //!   sign-ins (3.2) are written as rejected slots, never device entries,
 //!   through the runtime's rejected-slot write (`reject_device_slots`). The
-//!   app keeps no roster write of its own.
+//!   app writes the roster itself only in a commit that also removes a
+//!   device's leaf (`unlink_device_from_group`): undoing a failed link, or
+//!   removing a device (3.6b, in `device_removal.rs`).
 //!
 //! A confirmed link comes from device pairing (`device_pairing`). The
 //! test-policy hooks still supply one directly, for tests.
@@ -54,7 +56,7 @@ use cgka_traits::app_components::{
     DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID, decode_device_roster_v1,
     encode_device_roster_update_v1, encode_device_roster_v1, encode_nostr_routing_v1,
 };
-use cgka_traits::engine::CreateGroupRequest;
+use cgka_traits::engine::{CreateGroupRequest, SendIntent};
 use cgka_traits::storage::{
     DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage as _, GroupStorage as _,
     MaintenanceStorage as _, StorageError,
@@ -140,6 +142,9 @@ pub struct LinkedDevice {
     /// whichever is later. Never this device. Judged here only; `status`
     /// [`LinkedDeviceStatus::Inactive`] is the roster's mark.
     pub inactive: bool,
+    /// The user removed it on this device, and the device group has not
+    /// taken the removal yet (mdk#2628 item 3.6b).
+    pub removal_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -920,28 +925,76 @@ impl AppClient {
         Ok(Some((group_id, roster)))
     }
 
+    /// This device's KeyPackage slot, the key of its roster entry.
+    pub(crate) fn own_slot(&self) -> Result<DeviceSlotId, AppError> {
+        let lifecycle = self
+            .app
+            .account_storage(&self.state.label)?
+            .key_package_lifecycle()?
+            .ok_or(AppError::DeviceGroupRefused("slot_unavailable"))?;
+        device_slot(&lifecycle.stable_slot_id)
+    }
+
+    /// Remove the leaf `leaf_signature_key` from the device group and its
+    /// roster entry in one commit, as `operations` say: undoing a failed link
+    /// (D40) or removing a device (3.6b).
+    pub(crate) async fn unlink_device_from_group(
+        &mut self,
+        group_id: &GroupId,
+        leaf_signature_key: Vec<u8>,
+        operations: Vec<DeviceRosterOperationV1>,
+    ) -> Result<(), AppError> {
+        let roster_update = DeviceRosterUpdateV1::new(operations)
+            .and_then(|update| encode_device_roster_update_v1(&update).map_err(|e| e.to_string()))
+            .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
+        let audit_context = Self::local_human_action_context(
+            "unlink_device",
+            vec!["members"],
+            vec![DEVICE_ROSTER_COMPONENT_ID],
+            Some(1),
+        );
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::UnlinkDevice {
+                    group_id: group_id.clone(),
+                    leaf_signature_key,
+                    roster_update,
+                },
+                audit_context,
+            )
+            .await?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await
+    }
+
     /// This account's devices from the trusted device group's roster: this
     /// device first, then by when each was linked, then by slot. Empty when
     /// [`Self::trusted_device_roster`] has no roster.
     pub(crate) fn linked_devices(&mut self) -> Result<Vec<LinkedDevice>, AppError> {
-        let Some((_, roster)) = self.trusted_device_roster()? else {
+        let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Ok(Vec::new());
         };
+        let storage = self.app.account_storage(&self.state.label)?;
         // A slot that is not 32 bytes names no roster entry.
-        let own_slot = self
-            .app
-            .account_storage(&self.state.label)?
+        let own_slot = storage
             .key_package_lifecycle()?
             .and_then(|lifecycle| device_slot(&lifecycle.stable_slot_id).ok());
-        let activity: BTreeMap<String, DeviceActivityRecord> = self
-            .app
-            .account_storage(&self.state.label)?
+        let activity: BTreeMap<String, DeviceActivityRecord> = storage
             .app_storage()
             .device_activity()?
             .into_iter()
             .map(|activity| (activity.slot_id_hex.clone(), activity))
             .collect();
         let now = unix_now_seconds();
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let removing: std::collections::BTreeSet<String> = storage
+            .app_storage()
+            .device_removals()?
+            .into_iter()
+            .filter(|removal| removal.group_id_hex == group_id_hex)
+            .map(|removal| removal.slot_hex)
+            .collect();
         let mut devices: Vec<_> = roster
             .devices
             .into_iter()
@@ -956,6 +1009,7 @@ impl AppClient {
                     device.last_active_at = activity.and_then(|activity| activity.last_active_at);
                     device.inactive = sibling_inactive(activity, now);
                 }
+                device.removal_pending = removing.contains(&device.slot_id_hex);
                 device
             })
             .collect();
@@ -1034,6 +1088,7 @@ fn linked_device(
         keep_while_inactive: entry.settings.keep_while_inactive,
         last_active_at: None,
         inactive: false,
+        removal_pending: false,
     }
 }
 

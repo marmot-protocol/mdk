@@ -57,6 +57,9 @@ pub struct LinkedDeviceFfi {
     /// is later. Never this device. Judged on this device only; `status`
     /// `Inactive` is the roster's mark.
     pub inactive: bool,
+    /// The user removed it on this device, and the device group has not
+    /// taken the removal yet.
+    pub removal_pending: bool,
 }
 
 impl From<LinkedDevice> for LinkedDeviceFfi {
@@ -75,6 +78,7 @@ impl From<LinkedDevice> for LinkedDeviceFfi {
             keep_while_inactive: value.keep_while_inactive,
             last_active_at: value.last_active_at,
             inactive: value.inactive,
+            removal_pending: value.removal_pending,
         }
     }
 }

@@ -26,6 +26,8 @@ c_mirror! {
     /// device. `inactive` is this device's own judgement, 30 days after the
     /// later of that and when it first found the device in the roster; the
     /// roster's mark is `status` `Inactive`.
+    /// `removal_pending` is set while a removal decided on this device waits
+    /// for the device group.
     MarmotLinkedDevice from LinkedDeviceFfi,
     list(MarmotLinkedDeviceList, marmot_linked_device_list_free) {
         str slot_id_hex,
@@ -41,6 +43,7 @@ c_mirror! {
         copy keep_while_inactive: bool,
         opt_copy has_last_active_at/last_active_at: u64,
         copy inactive: bool,
+        copy removal_pending: bool,
     }
 }
 
@@ -68,6 +71,7 @@ mod tests {
                 keep_while_inactive: false,
                 last_active_at: None,
                 inactive: false,
+                removal_pending: false,
             },
             LinkedDeviceFfi {
                 slot_id_hex: "cd".repeat(32),
@@ -83,6 +87,7 @@ mod tests {
                 keep_while_inactive: true,
                 last_active_at: Some(11),
                 inactive: true,
+                removal_pending: true,
             },
         ]));
         unsafe {
@@ -113,6 +118,8 @@ mod tests {
             assert!(second.has_last_active_at);
             assert_eq!(second.last_active_at, 11);
             assert!(second.inactive);
+            assert!(!first.removal_pending);
+            assert!(second.removal_pending);
             marmot_linked_device_list_free(list);
             marmot_linked_device_list_free(std::ptr::null_mut());
         }

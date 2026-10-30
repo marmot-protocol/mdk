@@ -101,6 +101,7 @@ pub use app::chat_presentation::{
 };
 pub use app::device_groups::{DeviceGroupRecord, DeviceGroupTrust};
 pub use app::device_links::{DeviceLinkOutcome, DeviceLinkRecord};
+pub use app::device_removals::DeviceRemovalRecord;
 pub use app::message_drafts::{
     ChatListDraftVersion, MessageDraftRevision, MessageDraftRevisionError, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent, StoredMessageDraft,
@@ -149,6 +150,8 @@ pub use app::transport::transport_reconciliation::{
     TRANSPORT_RECONCILIATION_MAX_ITEMS_PER_ROUTE, TRANSPORT_RECONCILIATION_RETENTION_SECS,
     TransportReconciliationInventory, TransportReconciliationItem, TransportReconciliationRoute,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use base::connection::relax_storage_for_test_process;
 pub use base::connection::{
     CloseableConnection, ConnectionGuard, DatabaseCloser, SqlCipherHardening, SqlCipherKey,
     SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, SqliteTimingObserver,

@@ -260,7 +260,11 @@ async fn canonical_apply_cost_with_stored_history() {
     let mut alice = build_client(alice_store, b"alice", Some(applied.clone()));
     // Bob is only a message source; keep his store in memory so setup time is
     // spent on Alice's file-backed SQLCipher ledger.
-    let mut bob = build_client(SqliteAccountStorage::in_memory().unwrap(), b"bob", None);
+    let mut bob = build_client(
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        b"bob",
+        None,
+    );
 
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let (group_id, result) = alice

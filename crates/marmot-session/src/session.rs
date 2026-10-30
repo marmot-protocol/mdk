@@ -1035,6 +1035,15 @@ impl AccountDeviceSession {
             .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
     }
 
+    /// See [`cgka_engine::engine::Engine::own_account_leaf_claims`].
+    pub fn own_account_leaf_claims(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> SessionResult<Vec<(Vec<u8>, DeviceTagClaim)>> {
+        Ok(self.engine.own_account_leaf_claims(group_id, roster)?)
+    }
+
     pub fn app_component(
         &self,
         group_id: &GroupId,

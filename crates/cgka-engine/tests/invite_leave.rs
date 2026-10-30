@@ -253,7 +253,7 @@ fn build_client_on_storage(
 }
 
 fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = build_client_on_storage(id, storage.clone());
     (engine, storage)
 }
@@ -559,7 +559,7 @@ fn app_payload_for(engine: &Engine<SqliteAccountStorage>, payload: impl AsRef<[u
 }
 
 fn try_build_raw_identity_client(id: &[u8]) -> Result<Engine<SqliteAccountStorage>, EngineError> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(id.to_vec())
         .account_identity_proof_signer(proof_signer(b"raw-identity"))
@@ -586,7 +586,7 @@ async fn sibling_device_membership_preserves_activity_targets() {
         // Use current-profile proofs and independent stores: duplicate signature
         // keys are forbidden, but distinct devices may authenticate the same account.
         let current_device = |label: &[u8]| {
-            EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+            EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
                 .identity(pad32(label))
                 .account_identity_proof_signer(proof_signer(label))
                 .feature_registry(selfremove_registry())
@@ -781,11 +781,14 @@ struct TwoDeviceAccountGroup {
 }
 
 async fn two_device_account_group() -> TwoDeviceAccountGroup {
-    let mut alice = current_device_on(b"alice", SqliteAccountStorage::in_memory().unwrap());
-    let mut bob = current_device_on(b"bob", SqliteAccountStorage::in_memory().unwrap());
-    let bob_sibling_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = current_device_on(
+        b"alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let mut bob = current_device_on(b"bob", SqliteAccountStorage::in_memory_for_test().unwrap());
+    let bob_sibling_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut bob_sibling = current_device_on(b"bob", bob_sibling_storage.clone());
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut carol = current_device_on(b"carol", carol_storage.clone());
     // One invitee per Welcome: the mock peeler names a Welcome by its bytes.
     let (group_id, created) = alice
@@ -1722,7 +1725,7 @@ async fn strict_cutover_add_replay_retires_raw_and_content_rows() {
 async fn invite_rejects_invitee_missing_required_capability() {
     let mut alice = build_client(b"alice");
     let mut bob = build_client(b"bob");
-    let mut stripped = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut stripped = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(b"stripped"))
         .account_identity_proof_signer(proof_signer(b"stripped"))

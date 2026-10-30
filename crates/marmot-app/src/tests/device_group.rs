@@ -22,6 +22,7 @@ mod chat_kinds;
 mod devices;
 mod heartbeats;
 mod private_key_packages;
+mod removal;
 
 fn device_group_app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
     MarmotApp::with_relay_and_config(
@@ -1059,6 +1060,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         keep_while_inactive: false,
         last_active_at: None,
         inactive: false,
+        removal_pending: false,
     };
     // The dev hook links the new device with both settings off.
     let new_device = |this| LinkedDevice {
@@ -1155,6 +1157,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         keep_while_inactive: false,
         last_active_at: None,
         inactive: false,
+        removal_pending: false,
     };
     let desk = LinkedDevice {
         slot_id_hex: "08".repeat(32),
@@ -1166,6 +1169,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         add_to_all_chats: false,
         bring_history: true,
         keep_while_inactive: true,
+        removal_pending: false,
         ..tablet.clone()
     };
     assert_eq!(
