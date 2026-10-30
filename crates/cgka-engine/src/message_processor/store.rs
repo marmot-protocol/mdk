@@ -11,7 +11,7 @@ use cgka_traits::message::{
     OwnApplicationConvergenceStamp, StoredMessagePayload,
 };
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
-use cgka_traits::transport::{TransportEnvelope, TransportMessage};
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 
 fn fresh_deferred_peel_lifecycle(
@@ -114,6 +114,7 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
         record.payload = StoredMessagePayload::outbound_welcome(
             message.clone(),
             payload.welcome_key_package_ref().map(<[u8]>::to_vec),
+            payload.welcome_deliver_until(),
         )
         .encode()
         .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
@@ -311,6 +312,7 @@ impl<S: StorageProvider> Engine<S> {
         msg: &TransportMessage,
         origin_commit_id: &MessageId,
         key_package_ref: Vec<u8>,
+        deliver_until: Option<Timestamp>,
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), EngineError> {
@@ -324,6 +326,7 @@ impl<S: StorageProvider> Engine<S> {
                 msg.clone(),
                 origin_commit_id.clone(),
                 Some(key_package_ref),
+                deliver_until,
             ),
             None,
         )
@@ -1402,6 +1405,7 @@ mod tests {
                 StoredMessagePayload::staged_invite_welcome(
                     staged_welcome.clone(),
                     origin_commit_id.clone(),
+                    None,
                     None,
                 ),
                 None,

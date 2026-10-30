@@ -16,6 +16,7 @@ fn representative_welcome() -> StoredMessagePayload {
             },
         },
         Some(vec![0x33; 32]),
+        None,
     )
 }
 

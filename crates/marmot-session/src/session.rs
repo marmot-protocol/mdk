@@ -22,6 +22,12 @@ pub use cgka_engine::group_authority::{CanonicalGroupMembership, GroupAuthorityS
 pub use cgka_engine::key_package::{
     KeyPackageRequirements, durably_owned_key_packages, key_package_metadata,
 };
+pub use cgka_engine::private_key_packages::{
+    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,
+    MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW, PRIVATE_KEY_PACKAGE_STOCK_TARGET,
+    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, private_key_package_stock,
+    validate_received_private_key_package,
+};
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{
     AppComponentId, AppComponentSet, DeviceRosterV1, DeviceTagClaim, default_group_components,
@@ -41,7 +47,7 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, MaintenanceStorage, StorageError};
-use cgka_traits::transport::TransportMessage;
+use cgka_traits::transport::{Timestamp, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::{
     OutboundFanout, SecretBytes, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
@@ -718,6 +724,49 @@ impl AccountDeviceSession {
         Ok(self.engine.own_leaf_hash(group_id)?)
     }
 
+    /// See [`cgka_engine::Engine::issue_private_key_packages`].
+    pub fn issue_private_key_packages(
+        &mut self,
+        recipient: &cgka_traits::app_components::DeviceSlotId,
+        count: usize,
+        request: Option<&MessageId>,
+        now: u64,
+    ) -> SessionResult<usize> {
+        Ok(self
+            .engine
+            .issue_private_key_packages(recipient, count, request, now)?)
+    }
+
+    pub fn issued_private_key_packages(
+        &self,
+    ) -> SessionResult<Vec<cgka_traits::storage::IssuedPrivateKeyPackage>> {
+        Ok(self.engine.issued_private_key_packages()?)
+    }
+
+    pub fn set_private_key_package_hand_offs_queued(
+        &mut self,
+        references: &[Vec<u8>],
+        queued: bool,
+    ) -> SessionResult<()> {
+        Ok(self
+            .engine
+            .set_private_key_package_hand_offs_queued(references, queued)?)
+    }
+
+    /// See [`cgka_engine::Engine::uncount_outdated_private_key_packages`].
+    pub fn uncount_outdated_private_key_packages(&mut self) -> SessionResult<usize> {
+        Ok(self.engine.uncount_outdated_private_key_packages()?)
+    }
+
+    /// See [`cgka_engine::Engine::discard_private_key_packages`].
+    pub fn discard_private_key_packages(
+        &mut self,
+        now: u64,
+        recipient: Option<&cgka_traits::app_components::DeviceSlotId>,
+    ) -> SessionResult<usize> {
+        Ok(self.engine.discard_private_key_packages(now, recipient)?)
+    }
+
     /// Supported component ids this device's own leaf in `group_id` does not
     /// advertise yet; non-empty means a self-update would refresh the leaf.
     pub fn own_leaf_missing_app_components(
@@ -830,8 +879,14 @@ impl AccountDeviceSession {
     pub(crate) fn outbound_welcome_status(
         &self,
         id: &MessageId,
+        now: Timestamp,
     ) -> SessionResult<OutboundWelcomeStatus> {
-        Ok(self.engine.outbound_welcome_status(id)?)
+        Ok(self.engine.outbound_welcome_status(id, now)?)
+    }
+
+    /// See `Engine::sent_welcome_deliver_until`.
+    pub fn sent_welcome_deliver_until(&self, id: &MessageId) -> SessionResult<Option<Timestamp>> {
+        Ok(self.engine.sent_welcome_deliver_until(id)?)
     }
 
     /// See `Engine::sent_welcome_awaits_commit`.
@@ -1134,10 +1189,13 @@ impl AccountDeviceSession {
         Ok(CreateGroupEffects { group_id, effects })
     }
 
+    /// Create a group under a group id chosen before it exists, as a device
+    /// link needs; see `Engine::create_group_with_chosen_id_and_audit_context`.
     pub async fn create_group_with_chosen_id_and_audit_context(
         &mut self,
         req: CreateGroupRequest,
         group_id: GroupId,
+        welcome_deliver_until: Timestamp,
         context: AuditEventContext,
     ) -> SessionResult<CreateGroupEffects> {
         tracing::debug!(
@@ -1148,7 +1206,12 @@ impl AccountDeviceSession {
         );
         let (group_id, result) = self
             .engine
-            .create_group_with_chosen_id_and_audit_context(req, group_id, Some(context))
+            .create_group_with_chosen_id_and_audit_context(
+                req,
+                group_id,
+                welcome_deliver_until,
+                Some(context),
+            )
             .await?;
         let effects = self.collect_effects(vec![result]);
         Ok(CreateGroupEffects { group_id, effects })

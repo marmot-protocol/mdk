@@ -19,6 +19,7 @@ use cgka_traits::engine::SendIntent;
 use storage_sqlite::DeviceGroupTrust;
 
 mod devices;
+mod private_key_packages;
 
 fn device_group_app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
     MarmotApp::with_relay_and_config(
@@ -1472,6 +1473,23 @@ async fn next_device_group_change(
     .unwrap_or_else(|_| panic!("{name}"));
 }
 
+/// [`tagging_devices`] once they have handed each other private KeyPackages
+/// (3.4b), so a maintenance pass sends nothing in the device group unless a
+/// test makes it owe something. In [`tagging_devices`] the phone served the
+/// laptop and asked for its own; the laptop's pass here hands those over.
+async fn settled_linked_devices() -> (Devices, GroupId) {
+    let (mut devices, group) = tagging_devices().await;
+    devices.laptop.run_due_maintenance().await.unwrap();
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    (devices, group)
+}
+
+async fn deliver_all(client: &mut AppClient, relay: &ScriptedPushRelayClient) {
+    let mut cursor = 0;
+    deliver_new(client, relay, &mut cursor).await;
+    client.sync().await.unwrap();
+}
+
 /// A phone and laptop in one device group, the laptop joined.
 async fn linked_devices() -> (Devices, GroupId) {
     let mut devices = phone_and_laptop().await;
@@ -1577,7 +1595,7 @@ async fn a_key_package_is_announced_before_it_reaches_the_slot() {
             ..
         },
         group,
-    ) = tagging_devices().await;
+    ) = settled_linked_devices().await;
     for client in [&phone, &laptop] {
         assert_eq!(announced(client, &group, &laptop), current_ref(&laptop));
         assert_eq!(announced(client, &group, &phone), current_ref(&phone));
@@ -1614,7 +1632,7 @@ async fn a_key_package_waits_for_its_announcement() {
             ..
         },
         group,
-    ) = tagging_devices().await;
+    ) = settled_linked_devices().await;
     let before = relay.published_events.lock().unwrap().len();
     let announced_before = announced(&laptop, &group, &laptop);
     relay.reject_next_publish();
@@ -1761,7 +1779,7 @@ async fn a_refresh_held_back_a_week_is_overdue_until_it_publishes() {
             ..
         },
         _group,
-    ) = linked_devices().await;
+    ) = settled_linked_devices().await;
     assert!(laptop.take_key_package_refresh_overdue_changed());
     laptop.run_due_maintenance().await.unwrap();
     let _ = laptop.take_key_package_refresh_overdue_changed();
@@ -2191,7 +2209,7 @@ async fn a_removed_device_record_is_dropped_after_30_days() {
             ..
         },
         group,
-    ) = tagging_devices().await;
+    ) = settled_linked_devices().await;
     let now = unix_now_seconds();
     let rejected = |reason, days_ago: u64, tag_signature_key| RejectedSlotV1 {
         reason,

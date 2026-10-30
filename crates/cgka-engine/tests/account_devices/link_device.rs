@@ -7,11 +7,12 @@
 
 use super::activation::{buffer_unsettled, queued_intents};
 use super::device_roster::{
-    create_under, entry, expect_link_welcome, found_device_group, phone_and_laptop, roster,
-    roster_device, roster_of, roster_update, slot,
+    NO_WELCOME_DEADLINE, create_under, entry, expect_link_welcome, found_device_group,
+    phone_and_laptop, roster, roster_device, roster_of, roster_update, slot,
 };
 use super::send_intents::{pending_proposals, store_pending_add};
 use super::*;
+use cgka_engine::engine::OutboundWelcomeStatus;
 use cgka_traits::app_components::{
     DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1, MAX_LEAVES_PER_ACCOUNT,
     RejectedSlotReasonV1, RejectedSlotV1, encode_device_roster_update_v1,
@@ -52,7 +53,66 @@ fn link(
         group_id: gid.clone(),
         key_package: key_package.clone(),
         roster_update: update(operations),
+        deliver_until: NO_WELCOME_DEADLINE,
     }
+}
+
+/// A link's Welcome keeps its delivery deadline, staged with the Commit and
+/// once the Commit confirms, and the linker counts it as settled from then
+/// on: it is never published once the new device stopped waiting (D40).
+#[tokio::test]
+async fn a_links_welcome_keeps_its_delivery_deadline() {
+    let (mut phone, _laptop, gid) = phone_and_laptop().await;
+    let key_package = roster_device(b"alice")
+        .engine
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let deadline = Timestamp(1_700_000_600);
+    let mut intent = link(
+        &gid,
+        &key_package,
+        vec![DeviceRosterOperationV1::SetDevice(
+            slot(3),
+            linked_entry("Tablet", &key_package),
+        )],
+    );
+    let SendIntent::LinkDevice { deliver_until, .. } = &mut intent else {
+        unreachable!()
+    };
+    *deliver_until = deadline;
+
+    let SendResult::GroupEvolution {
+        welcomes, pending, ..
+    } = phone.engine.send(intent).await.unwrap()
+    else {
+        panic!("expected GroupEvolution")
+    };
+    let id = &welcomes[0].id;
+    assert!(phone.engine.sent_welcome_awaits_commit(id).unwrap());
+    assert_eq!(
+        phone.engine.sent_welcome_deliver_until(id).unwrap(),
+        Some(deadline)
+    );
+
+    phone.engine.confirm_published(pending).await.unwrap();
+    assert!(!phone.engine.sent_welcome_awaits_commit(id).unwrap());
+    assert_eq!(
+        phone.engine.sent_welcome_deliver_until(id).unwrap(),
+        Some(deadline),
+        "promotion keeps the deadline"
+    );
+    assert!(matches!(
+        phone
+            .engine
+            .outbound_welcome_status(id, Timestamp(deadline.0 - 1))
+            .unwrap(),
+        OutboundWelcomeStatus::Owed { .. }
+    ));
+    assert_eq!(
+        phone.engine.outbound_welcome_status(id, deadline).unwrap(),
+        OutboundWelcomeStatus::Settled
+    );
 }
 
 #[tokio::test]

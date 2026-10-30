@@ -298,7 +298,7 @@ async fn a_group_context_device_tag_entry_is_unknown_data() {
 
 /// Gives `device` the KeyPackage publication slot `slot`, which makes the
 /// roster entry there its own.
-fn hold_slot(device: &Device, slot: DeviceSlotId) {
+pub(super) fn hold_slot(device: &Device, slot: DeviceSlotId) {
     device
         .storage
         .put_key_package_lifecycle(&KeyPackageLifecycleState::slot_only(hex::encode(slot)))
@@ -307,7 +307,7 @@ fn hold_slot(device: &Device, slot: DeviceSlotId) {
 
 /// `device` sets its own `tag_signature_key` in its entry at `own_slot` in
 /// the device group `gid`, and `others` apply the roster update.
-async fn set_own_key(
+pub(super) async fn set_own_key(
     device: &mut Device,
     own_slot: DeviceSlotId,
     gid: &GroupId,
