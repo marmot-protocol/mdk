@@ -15276,11 +15276,13 @@ fn custom_intent_rejects_every_reserved_kind() {
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
         // Device-group kinds: heartbeat, private KeyPackage request and
-        // hand-off, anomaly alert.
+        // hand-off, anomaly alert, small-state update and broadcast request.
         457,
         459,
         460,
         462,
+        475,
+        476,
     ] {
         assert!(crate::is_reserved_app_event_kind(kind));
         let result = build_inner_event(
