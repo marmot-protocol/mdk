@@ -145,6 +145,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.
+- Heartbeats (mdk#2628 item 3.6, D35) live in `src/client/device_heartbeats.rs`. Send one only from the trusted
+  device group, once this device's own leaf reads as its slot, at most once an hour. Record the sent time only once the
+  send returns that it went out (published, unresolved or queued), and leave the record alone when it reached no one
+  or failed, so a crash mid-send costs at most one extra heartbeat, never an hour's silence. Count one only when the sending leaf's tag reads as a
+  sibling in the tree this device holds when it reads it (one from an earlier epoch counts for no device), never read
+  its content, and date it `min(created_at, now)`. Judge `inactive` locally for the Devices screen; never write the
+  roster's `inactive` status from it.
 - Keep device pairing (mdk#2628 item 3.3b) in `src/client/device_pairing.rs` (host DTOs) and
   `src/client/device_pairing/live.rs` (behind `unreleased-device-pairing`, and inert unless
   `MarmotAppConfig::dev_device_groups` is set). The Welcome peeler opens each gift wrap to the account once and hands

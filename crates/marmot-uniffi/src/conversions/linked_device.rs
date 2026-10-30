@@ -48,6 +48,15 @@ pub struct LinkedDeviceFfi {
     pub bring_history: bool,
     /// Inactivity never removes it.
     pub keep_while_inactive: bool,
+    /// When a heartbeat last showed it running, in Unix seconds. `None` for
+    /// this device, and for a sibling none of whose heartbeats has counted
+    /// yet.
+    pub last_active_at: Option<u64>,
+    /// This device judges it inactive: 30 days have passed since its last
+    /// activity or since this device first found it in the roster, whichever
+    /// is later. Never this device. Judged on this device only; `status`
+    /// `Inactive` is the roster's mark.
+    pub inactive: bool,
 }
 
 impl From<LinkedDevice> for LinkedDeviceFfi {
@@ -64,6 +73,8 @@ impl From<LinkedDevice> for LinkedDeviceFfi {
             add_to_all_chats: value.add_to_all_chats,
             bring_history: value.bring_history,
             keep_while_inactive: value.keep_while_inactive,
+            last_active_at: value.last_active_at,
+            inactive: value.inactive,
         }
     }
 }

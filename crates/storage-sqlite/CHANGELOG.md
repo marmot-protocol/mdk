@@ -4,6 +4,16 @@
 
 ### Breaking changes
 
+- Migration 0143 advances account storage to schema 143 (mdk#2628 item 3.6).
+  It adds `device_activity`, one row per sibling the trusted device group's
+  roster lists (that entry's `linked_at`, when this device first found it
+  there and the newest time one of its heartbeats counted for), and
+  `device_heartbeat_sent`, the
+  device group this device last sent its own heartbeat in and when.
+  `SqliteAppStorage` gains `device_activity`, `track_device_activity`,
+  `note_device_active`, `device_heartbeat_sent` and
+  `put_device_heartbeat_sent`, with `DeviceActivityRecord` and
+  `DeviceHeartbeatSent`.
 - Migration 0137 advances account storage to schema 137 (mdk#2628 item 3.6).
   It adds `device_renames`, one row per device this device renamed in its
   device group's roster: the label its latest rename sets, the rename ids
