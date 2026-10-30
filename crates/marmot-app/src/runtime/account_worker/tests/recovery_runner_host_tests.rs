@@ -1,8 +1,9 @@
 //! The account worker runs its recovery runner only with the internal
 //! `runner_owns_debt` gate on: the runner spawns with the worker, serves the
-//! account's debt over its own relay pool, answers a pass, and stops with
-//! `shutdown_and_close` even while a quantum waits on its relay. With the gate
-//! off nothing spawns.
+//! account's debt over its own relay pool, answers a pass, stops with
+//! `shutdown_and_close` even while a quantum waits on its relay, and gives a
+//! preempted quantum's attempt back across a reconnect. With the gate off
+//! nothing spawns.
 
 use super::*;
 use crate::runtime::account_worker::recovery_credits::{MAX_CONCURRENT_JOBS, available_credits};
@@ -11,7 +12,7 @@ use nostr_relay_builder::prelude::{
 };
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use storage_sqlite::TransportReconciliationRoute;
 
 const HOUR: u64 = 60 * 60;
@@ -25,6 +26,8 @@ struct HeldSweep {
     release: Arc<tokio::sync::Notify>,
     /// The earliest `since` a held request asked from.
     oldest_since: Arc<AtomicU64>,
+    /// Requests it has held.
+    held: Arc<AtomicUsize>,
 }
 
 impl HeldSweep {
@@ -68,6 +71,7 @@ impl QueryPolicy for HeldSweep {
             if held {
                 let since = query.since.map_or(0, |since| since.as_secs());
                 self.oldest_since.fetch_min(since, Ordering::SeqCst);
+                self.held.fetch_add(1, Ordering::SeqCst);
                 released.await;
             }
             PolicyResult::Accept
@@ -281,4 +285,73 @@ async fn shutdown_and_close_stops_the_runner_mid_quantum() {
         .await
         .expect("the pass ends with its runner");
     assert_eq!(available_credits(&worker.credits), MAX_CONCURRENT_JOBS);
+}
+
+/// A reconnect stops the worker's runner mid-quantum while storage is open:
+/// the preempted quantum's attempt is given back before the next runner
+/// begins its own on the same debt, so the account is charged once for the
+/// two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_mid_quantum_gives_the_preempted_attempt_back() {
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let hold = HeldSweep::default();
+    let _release = ReleaseOnDrop(hold.clone());
+    let relay = LocalRelay::new(RelayBuilder::default().query_policy(hold.clone()));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let started = crate::unix_now_seconds();
+    let worker = GatedWorker::start(&url, true).await;
+    worker.served_after(started).await;
+    let storage = worker
+        .app
+        .account_storage(&worker.label)
+        .unwrap()
+        .app_storage();
+    let charged = || {
+        storage
+            .recovery_account_usage(crate::unix_now_seconds())
+            .unwrap()
+            .attempts
+    };
+    let held = |count: usize| {
+        let hold = hold.clone();
+        async move {
+            timeout(SETTLE, async {
+                while hold.held.load(Ordering::SeqCst) < count {
+                    sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("a sweep of the owed day reaches the relay");
+        }
+    };
+
+    // Owe an earlier day, and ask for the pass that sweeps it into the hold.
+    hold.arm(&worker.route_hex);
+    storage
+        .widen_recovery_coverage_goals(
+            std::slice::from_ref(&worker.route),
+            crate::unix_now_seconds() - 24 * HOUR,
+        )
+        .unwrap();
+    let _pass = worker.pass().await;
+    held(1).await;
+    let in_flight = charged();
+
+    worker
+        .runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_consumer_exit_for_test();
+    held(2).await;
+    assert_eq!(
+        charged(),
+        in_flight,
+        "the preempted attempt was given back before the next one began"
+    );
+    hold.release();
+    timeout(SETTLE, worker.runtime.shutdown_and_close())
+        .await
+        .unwrap()
+        .unwrap();
 }

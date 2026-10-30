@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use cgka_traits::{MemberId, TransportDelivery, TransportEndpoint};
 use nostr::prelude::{Event, RelayUrl};
-use storage_sqlite::SqliteAppStorage;
+use storage_sqlite::{RecoveryUnitPolicy, SqliteAppStorage};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use transport_nostr::MarmotRelayPlane;
@@ -32,17 +32,18 @@ use transport_nostr_adapter::{NostrRelayEvent, NostrSdkRelayClient};
 use transport_nostr_peeler::NostrTransportEvent;
 
 use super::{
-    Admitted, DebtTurn, PassReport, RecoveryRunner, RecoveryRunnerHandle, RecoveryRunnerPolicy,
-    RunnerHost, TARGET, WorkerTurn,
+    Admitted, DebtTurn, OpenAttempts, PassReport, RecoveryRunner, RecoveryRunnerHandle,
+    RecoveryRunnerPolicy, RunnerHost, TARGET, WorkerTurn,
 };
+use crate::MarmotApp;
 use crate::client::sync::{RecoveredDelivery, TRANSPORT_RECONCILIATION_QUANTUM};
 use crate::client::{AppClient, InventoryWrite};
 use crate::relay_caps::RelayCapsCache;
 
 /// How long a stopping worker serves its runner's last turns, the preempted
 /// quantum's settlement among them, before it aborts the task. The runner
-/// holds no storage, so an abort loses nothing durable: an unsettled quantum
-/// leaves its attempt charged and its unstaged bytes uncharged.
+/// holds no storage, so an abort loses nothing durable, and an attempt it
+/// left unsettled is refunded ([`OpenAttemptRefund`]).
 const STOP_WAIT: Duration = Duration::from_secs(1);
 
 type ClientFuture<'c, T> = Pin<Box<dyn Future<Output = T> + Send + 'c>>;
@@ -304,11 +305,36 @@ fn unix_now() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
+/// Refunds the attempts a runner left unsettled when its owner lets go of
+/// it: after a stop, an abort, or a dropped in-place pass. Its owner serves no
+/// more of the runner's turns by then, so what is left will never settle. It
+/// writes only to storage already open, so after `shutdown_and_close` it
+/// refunds nothing.
+struct OpenAttemptRefund {
+    open: OpenAttempts,
+    app: MarmotApp,
+    label: String,
+    policy: RecoveryUnitPolicy,
+}
+
+impl Drop for OpenAttemptRefund {
+    fn drop(&mut self) {
+        if self.open.is_empty() {
+            return;
+        }
+        if let Some(storage) = self.app.open_account_storage(&self.label) {
+            self.open
+                .refund(&storage.app_storage(), &self.policy, unix_now());
+        }
+    }
+}
+
 /// The account's runner before its owner serves it.
 struct AccountRunner {
     runner: RecoveryRunner<AccountRunnerHost>,
     handle: RecoveryRunnerHandle,
     turns: mpsc::Receiver<RunnerTurn>,
+    refund: OpenAttemptRefund,
 }
 
 impl AppClient {
@@ -329,16 +355,24 @@ impl AppClient {
             relay_plane: self.relay_plane.clone(),
             account_id,
         };
+        let policy = RecoveryRunnerPolicy::default();
         let (runner, handle) = RecoveryRunner::waking_on(
             Arc::new(host),
-            RecoveryRunnerPolicy::default(),
+            policy,
             self.recovery_credits.clone(),
             self.routing.recovery_runner_wake(),
         );
+        let refund = OpenAttemptRefund {
+            open: runner.open_attempts(),
+            app: self.app.clone(),
+            label: self.state.label.clone(),
+            policy: policy.unit,
+        };
         AccountRunner {
             runner,
             handle,
             turns,
+            refund,
         }
     }
 
@@ -352,11 +386,13 @@ impl AppClient {
             runner,
             handle,
             turns,
+            refund,
         } = self.build_recovery_runner().await;
         Some(SpawnedRunner {
             task: runner.spawn(),
             handle,
             turns,
+            _refund: refund,
         })
     }
 
@@ -383,7 +419,8 @@ impl AppClient {
             RunnerSeat::Absent => return None,
             RunnerSeat::InPlace(seat) => match seat.take() {
                 Some(seat) => seat,
-                // A pass dropped mid-way took its runner with it.
+                // A pass dropped mid-way took its runner with it, and refunded
+                // the attempt it left open.
                 None => Box::new(InPlaceRunner::from(self.build_recovery_runner().await)),
             },
         };
@@ -431,12 +468,14 @@ pub(crate) enum RunnerSeat {
     InPlace(Option<Box<InPlaceRunner>>),
 }
 
-/// A directly owned client's runner. Not `Debug`.
+/// A directly owned client's runner. Not `Debug`. Dropped mid-pass, it
+/// refunds the attempt its pass left open.
 pub(crate) struct InPlaceRunner {
     runner: RecoveryRunner<AccountRunnerHost>,
     turns: mpsc::Receiver<RunnerTurn>,
     /// Keeps its hints sender alive for later steering.
     _handle: RecoveryRunnerHandle,
+    _refund: OpenAttemptRefund,
     /// Passes started on this runner.
     #[cfg(test)]
     passes: u32,
@@ -448,6 +487,7 @@ impl From<AccountRunner> for InPlaceRunner {
             runner: built.runner,
             turns: built.turns,
             _handle: built.handle,
+            _refund: built.refund,
             #[cfg(test)]
             passes: 0,
         }
@@ -456,11 +496,13 @@ impl From<AccountRunner> for InPlaceRunner {
 
 /// A worker account's runner task. The worker serves its turns
 /// ([`Self::next_turn`]) and stops it on its way out; dropping it aborts the
-/// task.
+/// task and refunds the attempts it left open.
 pub(crate) struct SpawnedRunner {
     handle: RecoveryRunnerHandle,
     task: JoinHandle<()>,
     turns: mpsc::Receiver<RunnerTurn>,
+    /// Declared last: it drops after the task is aborted.
+    _refund: OpenAttemptRefund,
 }
 
 impl SpawnedRunner {
@@ -484,28 +526,42 @@ impl SpawnedRunner {
 
     /// Stop the runner while `client`, the account's own, is still open. A
     /// quantum in flight is preempted and settles on it: its storage turns
-    /// are served until the task ends or [`STOP_WAIT`] passes, then a turn
-    /// still waiting answers `None` and the task is aborted. An admission is
-    /// refused, so nothing is ingested after the worker's last publication;
-    /// its event stays staged for the next runner. Once storage is closed
-    /// (`shutdown_and_close`) nothing settles: the attempt stays charged.
-    pub(crate) async fn stop(mut self, client: &mut AppClient) {
+    /// are served until the task ends or [`STOP_WAIT`] passes, and a turn
+    /// already sent by then is still served, so a settle that came in time
+    /// keeps its verdict and its bytes. Then the turns close and the task is
+    /// aborted, and an attempt it left unsettled is refunded as `Unanswered`:
+    /// a slow cancel loses only the relay's verdict and the bytes it read
+    /// meanwhile. An admission is refused, so nothing is ingested after the
+    /// worker's last publication; its event stays staged for the next runner.
+    /// Once storage is closed (`shutdown_and_close`) nothing settles or is
+    /// refunded: the attempt stays charged until it ages out of the hour.
+    pub(crate) async fn stop(self, client: &mut AppClient) {
+        self.stop_within(client, STOP_WAIT).await;
+    }
+
+    async fn stop_within(mut self, client: &mut AppClient, wait: Duration) {
         self.handle.shutdown();
-        let deadline = tokio::time::Instant::now() + STOP_WAIT;
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
             tokio::select! {
                 biased;
                 _ = &mut self.task => break,
                 () = tokio::time::sleep_until(deadline) => break,
-                Some(turn) = self.turns.recv() => {
-                    if !turn.ingests {
-                        turn.serve(client).await;
-                    }
-                }
+                Some(turn) = self.turns.recv() => Self::serve_stopping(turn, client).await,
             }
         }
+        // Closed first, so what is served here is what came by the deadline.
         self.turns.close();
-        while self.turns.try_recv().is_ok() {}
+        while let Ok(turn) = self.turns.try_recv() {
+            Self::serve_stopping(turn, client).await;
+        }
+    }
+
+    /// Serve a stopping runner's storage turn; refuse an admission.
+    async fn serve_stopping(turn: RunnerTurn, client: &mut AppClient) {
+        if !turn.ingests {
+            turn.serve(client).await;
+        }
     }
 }
 

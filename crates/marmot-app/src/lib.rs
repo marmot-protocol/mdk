@@ -6950,6 +6950,18 @@ impl MarmotApp {
         Ok(store)
     }
 
+    /// The account's storage if it is already open, and only while app
+    /// storage is: it never opens a database, so a drop path cannot reopen one
+    /// that `shutdown_and_close` or a removal let go of.
+    pub(crate) fn open_account_storage(&self, label: &str) -> Option<SqliteAccountStorage> {
+        self.ensure_storage_open("account storage").ok()?;
+        self.account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .cloned()
+    }
+
     /// Observe account-open admission before analytics or cache locks; preserve the original storage result.
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
         let probe = self

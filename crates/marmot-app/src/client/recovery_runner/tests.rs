@@ -1487,6 +1487,76 @@ async fn recovery_runner_cancelled_or_crashed_mid_sweep_requests_no_slice_twice(
     assert_eq!(available_credits(&credits), 2);
 }
 
+/// A runner aborted mid-quantum leaves its attempt open, and its owner's
+/// refund settles it as unanswered: the charge goes back, the unit keeps its
+/// retry state and the relay gets no verdict. A runner whose quantum settles
+/// leaves nothing open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_refunds_the_attempt_an_aborted_quantum_left_open() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let relay = ModelRelay::new(RELAY, caps(20, true))
+        .with_events(every([1; 32], floor, t0, HOUR))
+        .checking(&account)
+        .build();
+    account.goal(&route, floor);
+    account.rechecked(&route, RELAY, t0);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    host.tails.stand(&route, RELAY, t0);
+    let attempts = || {
+        account
+            .app
+            .recovery_account_usage(clock.now())
+            .unwrap()
+            .attempts
+    };
+
+    relay.gate.hold_from(0);
+    let (aborted, _handle) = runner(&host, test_policy());
+    let open = aborted.open_attempts();
+    let task = aborted.spawn();
+    wait_until("a held request", WAIT, || relay.gate.waiting() == 1).await;
+    assert_eq!(attempts(), 1, "the quantum began");
+    assert!(!open.is_empty());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    open.refund(&account.app, &test_policy().unit, clock.now());
+    assert!(open.is_empty());
+    assert_eq!(attempts(), 0, "the refund gave the charge back");
+    let unit = account.app.recovery_unit(&route, RELAY).unwrap().unwrap();
+    assert_eq!(
+        (
+            unit.no_progress,
+            unit.backoff_step,
+            unit.next_attempt_at_seconds
+        ),
+        (0, 0, 0),
+        "the unit keeps its retry state"
+    );
+    let health = account.app.recovery_relay_health(RELAY).unwrap().unwrap();
+    assert_eq!(
+        (health.unreachable_streak, health.cooldown),
+        (0, None),
+        "the relay gets no verdict"
+    );
+
+    relay.gate.open();
+    let (mut settled, _handle) = runner(&host, test_policy());
+    let open = settled.open_attempts();
+    let outcomes = run_until_idle(&mut settled, 20).await;
+    assert!(!outcomes.is_empty());
+    assert!(open.is_empty(), "every quantum settled");
+}
+
 // A paused clock (Tokio allows one only on the current-thread runtime) makes
 // each request take exactly its latency, so every quantum is cut at a known
 // point.

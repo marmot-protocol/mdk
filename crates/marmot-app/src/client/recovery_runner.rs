@@ -51,6 +51,7 @@
 mod admission;
 mod compare;
 pub(crate) mod host;
+mod open_attempts;
 mod policy;
 mod quantum;
 mod recheck;
@@ -82,6 +83,8 @@ pub(crate) use tails::LiveTailRead;
 
 use crate::AppError;
 use crate::runtime::account_worker::recovery_credits::{self, RecoveryCreditPool};
+use open_attempts::AttemptKind;
+pub(crate) use open_attempts::OpenAttempts;
 use select::{Candidate, Memory, Pick};
 
 const TARGET: &str = "marmot_app::recovery_runner";
@@ -338,6 +341,8 @@ pub(crate) struct RecoveryRunner<H> {
     reconnect_failures: u32,
     /// The account breaker's pause last reported, so each pause logs once.
     reported_pause: Option<u64>,
+    /// Attempts begun and not settled, for its owner to refund on a stop.
+    open: OpenAttempts,
 }
 
 impl<H: RunnerHost> RecoveryRunner<H> {
@@ -375,6 +380,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             survey_failures: 0,
             reconnect_failures: 0,
             reported_pause: None,
+            open: OpenAttempts::default(),
         };
         let handle = RecoveryRunnerHandle {
             wake,
@@ -384,6 +390,12 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             cancel,
         };
         (runner, handle)
+    }
+
+    /// The attempts it has begun and not settled, for its owner to refund
+    /// once it has stopped ([`OpenAttempts::refund`]).
+    pub(crate) fn open_attempts(&self) -> OpenAttempts {
+        self.open.clone()
     }
 
     /// Run the account's task until it is shut down or its worker is gone.
@@ -531,9 +543,19 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let key = candidate.key.clone();
         let best_effort = candidate.best_effort;
         let compares = self.memory.compares(&key.relay);
+        let open = self.open.clone();
         let plan = match self
             .host
-            .debt_turn(move |turn| select::begin(turn, &key, best_effort, caps, compares, &policy))
+            .debt_turn(move |turn| {
+                let plan = select::begin(turn, &key, best_effort, caps, compares, &policy);
+                // A best-effort relay is charged nothing.
+                if let Ok(Some(plan)) = &plan
+                    && !plan.best_effort
+                {
+                    open.begun(&plan.key, AttemptKind::Debt);
+                }
+                plan
+            })
             .await
         {
             None => return Step::Stopped,
@@ -588,9 +610,13 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         if facts.is_some_and(|facts| compare::would_not_compare(facts.end)) {
             self.memory.would_not_compare(&candidate.key.relay);
         }
+        let open = self.open.clone();
         let outcome = match self
             .host
-            .turn(move |turn| quantum::settle(turn, &plan, &report, &policy))
+            .turn(move |turn| {
+                open.settled(&plan.key);
+                quantum::settle(turn, &plan, &report, &policy)
+            })
             .await
         {
             None => return Step::Stopped,
@@ -636,9 +662,16 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             Err(step) => return step,
         };
         let key = candidate.key.clone();
+        let open = self.open.clone();
         let plan = match self
             .host
-            .debt_turn(move |turn| recheck::begin(turn, &key, caps, &policy))
+            .debt_turn(move |turn| {
+                let plan = recheck::begin(turn, &key, caps, &policy);
+                if let Ok(Some(plan)) = &plan {
+                    open.begun(&plan.compare.key, AttemptKind::Recheck);
+                }
+                plan
+            })
             .await
         {
             None => return Step::Stopped,
@@ -675,9 +708,13 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         if compare::would_not_compare(facts.end) {
             self.memory.would_not_compare(&candidate.key.relay);
         }
+        let open = self.open.clone();
         let settled = match self
             .host
-            .turn(move |turn| recheck::settle(turn, &plan, &report, &facts, &policy))
+            .turn(move |turn| {
+                open.settled(&plan.compare.key);
+                recheck::settle(turn, &plan, &report, &facts, &policy)
+            })
             .await
         {
             None => return Step::Stopped,

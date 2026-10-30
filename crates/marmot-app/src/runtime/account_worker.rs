@@ -3279,7 +3279,8 @@ async fn run_app_runtime_account_worker(
         }
     }
     // Each exit that still held the client stopped the runner on it; any
-    // other exit's drop aborts the task. What a quantum staged stays durable.
+    // other exit's drop aborts the task and refunds the attempts it left
+    // open. What a quantum staged stays durable.
     drop(recovery_runner);
     // An admission in progress keeps its durable prefix; its debt waits for
     // the next session.
