@@ -44,11 +44,10 @@ use crate::relay_caps::RelayCapsCache;
 const STOP_WAIT: Duration = Duration::from_secs(1);
 
 type ClientFuture<'c, T> = Pin<Box<dyn Future<Output = T> + Send + 'c>>;
+type ClientTurn = Box<dyn for<'c> FnOnce(&'c mut AppClient) -> ClientFuture<'c, ()> + Send>;
 
 /// One runner turn, waiting for the account's client. Not `Debug`.
-pub(crate) struct RunnerTurn(
-    Box<dyn for<'c> FnOnce(&'c mut AppClient) -> ClientFuture<'c, ()> + Send>,
-);
+pub(crate) struct RunnerTurn(ClientTurn);
 
 impl RunnerTurn {
     /// Run the turn on `client`, the account's own.

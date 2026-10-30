@@ -11,7 +11,7 @@ use nostr_relay_builder::prelude::{
 };
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use storage_sqlite::TransportReconciliationRoute;
 
 const HOUR: u64 = 60 * 60;
@@ -22,9 +22,7 @@ const SETTLE: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug, Default)]
 struct HeldSweep {
     route: Arc<Mutex<Option<String>>>,
-    entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
-    held: Arc<AtomicUsize>,
     /// The earliest `since` a held request asked from.
     oldest_since: Arc<AtomicU64>,
 }
@@ -70,8 +68,6 @@ impl QueryPolicy for HeldSweep {
             if held {
                 let since = query.since.map_or(0, |since| since.as_secs());
                 self.oldest_since.fetch_min(since, Ordering::SeqCst);
-                self.held.fetch_add(1, Ordering::SeqCst);
-                self.entered.notify_one();
                 released.await;
             }
             PolicyResult::Accept
@@ -264,15 +260,14 @@ async fn shutdown_and_close_stops_the_runner_mid_quantum() {
             crate::unix_now_seconds() - 24 * HOUR,
         )
         .unwrap();
-    let entered = hold.entered.notified();
     let pass = worker.pass().await;
-    timeout(SETTLE, entered)
-        .await
-        .expect("the pass's quantum reaches the relay");
-    assert!(
-        hold.oldest_since.load(Ordering::SeqCst) < started - HOUR,
-        "the held request sweeps the newly owed day"
-    );
+    timeout(SETTLE, async {
+        while hold.oldest_since.load(Ordering::SeqCst) >= started - HOUR {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the pass's sweep of the newly owed day reaches the relay");
     assert!(
         available_credits(&worker.credits) < MAX_CONCURRENT_JOBS,
         "the quantum holds its credit"
