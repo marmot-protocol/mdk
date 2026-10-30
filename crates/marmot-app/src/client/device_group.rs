@@ -42,9 +42,8 @@
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
     DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1, DeviceSettingsV1, DeviceSlotId,
-    DeviceStatusV1,
-    NOSTR_ROUTING_COMPONENT_ID, decode_device_roster_v1, encode_device_roster_update_v1,
-    encode_device_roster_v1, encode_nostr_routing_v1,
+    DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID, decode_device_roster_v1,
+    encode_device_roster_update_v1, encode_device_roster_v1, encode_nostr_routing_v1,
 };
 use cgka_traits::engine::{CreateGroupRequest, SendIntent};
 use cgka_traits::storage::{
