@@ -39,9 +39,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     tag from (`set_device_tag_group`). Maintenance, and the host before each KeyPackage publication
     (`set_device_tag_key_holding`), set this device's MLS signature key in its own roster entry when the entry lacks
     it, under the announcement's gates. No KeyPackage is staged, announced or published while the key is due and not
-    in the merged roster, or while another device's entry carries it (the engine tags from whichever entry does), and
-    a staged one that no longer advertises what this device would build is replaced. A refresh held back this way
-    counts toward `key_package_refresh_overdue` like one held back by its announcement.
+    in the merged roster, and a staged one that no longer advertises what this device would build is replaced. The
+    engine tags only from the entry at this device's slot. A refresh held back this way counts toward
+    `key_package_refresh_overdue` like one held back by its announcement.
   - `runtime/removed_slot_expiry.rs` — maintenance drops `removed` slot records 30 days after their `rejected_at`, by
     this device's clock (device-roster-v1.md), in one roster update after the KeyPackage steps. `not_me` records stay.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,

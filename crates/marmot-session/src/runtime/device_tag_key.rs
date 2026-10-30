@@ -28,12 +28,10 @@ enum TagKey {
         slot: DeviceSlotId,
         entry: Box<DeviceEntryV1>,
     },
-    /// Another device's entry carries this device's key. The engine tags from
-    /// whichever entry carries it, so a KeyPackage built now would read as
-    /// that device's: nothing is staged until the roster is repaired.
-    HeldByAnotherDevice,
     /// It cannot be set now: the device group is unreadable, holds no entry
-    /// for this device's slot, or a removed slot keeps the key.
+    /// for this device's slot, or another device's entry or a removed slot
+    /// keeps the key. The engine tags only from this device's own entry, so a
+    /// KeyPackage staged meanwhile is untagged.
     Blocked(&'static str),
 }
 
@@ -61,8 +59,7 @@ where
     /// build it: no device group is named, the slot is withdrawn, the merged
     /// roster carries this device's tag signature key in its own entry, or
     /// the device cannot tag from that roster at all. False while the key is
-    /// due, whether or not an update setting it is on its way, and while
-    /// another device's entry carries it.
+    /// due, whether or not an update setting it is on its way.
     pub(super) fn device_tag_key_settled(&mut self) -> AccountResult<bool> {
         let Some(group_id) = self.device_tag_group.clone() else {
             return Ok(true);
@@ -72,7 +69,7 @@ where
         }
         Ok(!matches!(
             self.device_tag_key(&group_id)?,
-            TagKey::Due { .. } | TagKey::HeldByAnotherDevice
+            TagKey::Due { .. }
         ))
     }
 
@@ -122,15 +119,6 @@ where
         let (slot, mut entry) = match self.device_tag_key(&group_id)? {
             TagKey::Set => return Ok(AccountDeviceEffects::default()),
             TagKey::Due { slot, entry } => (slot, *entry),
-            TagKey::HeldByAnotherDevice => {
-                tracing::debug!(
-                    target: TRACE_TARGET,
-                    method = "set_device_tag_key",
-                    reason = "key_held_by_another_device",
-                    "cannot set this device's tag signature key; no key package is staged"
-                );
-                return Ok(AccountDeviceEffects::default());
-            }
             TagKey::Blocked(reason) => {
                 tracing::debug!(
                     target: TRACE_TARGET,
@@ -181,7 +169,7 @@ where
             .values()
             .any(|other| other.tag_signature_key.as_deref() == Some(own_key.as_slice()))
         {
-            return Ok(TagKey::HeldByAnotherDevice);
+            return Ok(TagKey::Blocked("key_held_by_another_device"));
         }
         if roster
             .rejected_slots

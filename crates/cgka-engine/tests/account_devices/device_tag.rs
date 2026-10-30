@@ -8,7 +8,8 @@
 //! the spec vector are tested in the engine's `device_tag` module.
 //!
 //! A device tags from the roster of the device group its host names, once its
-//! entry there carries its MLS signature key. It sets that key in a roster
+//! entry there, the one at its KeyPackage publication slot, carries its MLS
+//! signature key. Another entry carrying that key is not its own. It sets that key in a roster
 //! update whose UpdatePath already carries a tag. From then on every
 //! KeyPackage it builds carries a fresh tag, and so does every replacement of
 //! a leaf whose tag does not read as its own, whichever own Commit makes it.
@@ -23,7 +24,8 @@ use cgka_traits::app_components::{
     DEVICE_TAG_COMPONENT_ID, DeviceRosterOperationV1, DeviceRosterV1, DeviceSlotId,
     decode_components_list,
 };
-use cgka_traits::storage::GroupStorage as _;
+use cgka_traits::maintenance::KeyPackageLifecycleState;
+use cgka_traits::storage::{GroupStorage as _, MaintenanceStorage as _};
 use cgka_traits::types::EpochId;
 use openmls_traits::types::SignatureScheme;
 
@@ -294,6 +296,15 @@ async fn a_group_context_device_tag_entry_is_unknown_data() {
     assert_accepted(&mut bob, &commit, &gid).await;
 }
 
+/// Gives `device` the KeyPackage publication slot `slot`, which makes the
+/// roster entry there its own.
+fn hold_slot(device: &Device, slot: DeviceSlotId) {
+    device
+        .storage
+        .put_key_package_lifecycle(&KeyPackageLifecycleState::slot_only(hex::encode(slot)))
+        .unwrap();
+}
+
 /// `device` sets its own `tag_signature_key` in its entry at `own_slot` in
 /// the device group `gid`, and `others` apply the roster update.
 async fn set_own_key(
@@ -358,6 +369,7 @@ fn tag_is_due(device: &Device, gid: &GroupId) -> bool {
 #[tokio::test]
 async fn setting_its_own_key_starts_tagging() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    hold_slot(&laptop, slot(2));
     laptop
         .engine
         .set_device_tag_group(Some(gid.clone()))
@@ -425,13 +437,66 @@ async fn setting_its_own_key_starts_tagging() {
         "a KeyPackage from before the key is due for replacement"
     );
 
+    laptop.engine.set_device_tag_group(None).unwrap();
+    let after = laptop.engine.fresh_key_package().await.unwrap();
+    assert_eq!(key_package_tag(&after), (None, false));
+    assert!(
+        !laptop
+            .engine
+            .key_package_advertises_current_capabilities(&first)
+            .unwrap()
+    );
+    assert!(!tag_is_due(&laptop, &gid));
+}
+
+/// The laptop tags only from its own entry, the one at its slot. While
+/// another entry carries its key and its own entry does not, it tags nothing.
+/// Once its own entry carries the key it tags, and when that entry moves to
+/// another slot its tags are stale and it builds untagged again.
+#[tokio::test]
+async fn only_the_entry_at_its_own_slot_tags() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    hold_slot(&laptop, slot(2));
+    laptop
+        .engine
+        .set_device_tag_group(Some(gid.clone()))
+        .unwrap();
+    let mut elsewhere = entry("Tablet");
+    elsewhere.tag_signature_key = Some(laptop.engine.own_signature_key());
+    let update = roster_update(
+        &gid,
+        vec![DeviceRosterOperationV1::SetDevice(slot(3), elsewhere)],
+    );
+    let commit = send_commit(&mut phone, update, &gid).await;
+    assert_accepted(&mut laptop, &commit, &gid).await;
+    let untagged = laptop.engine.fresh_key_package().await.unwrap();
+    assert_eq!(key_package_tag(&untagged), (None, false));
+    assert!(
+        laptop
+            .engine
+            .key_package_advertises_current_capabilities(&untagged)
+            .unwrap()
+    );
+    assert!(!tag_is_due(&laptop, &gid));
+
+    let remove = roster_update(&gid, vec![DeviceRosterOperationV1::RemoveDevice(slot(3))]);
+    let commit = send_commit(&mut phone, remove, &gid).await;
+    assert_accepted(&mut laptop, &commit, &gid).await;
+    set_own_key(&mut laptop, slot(2), &gid, &mut [&mut phone]).await;
+    let tagged = laptop.engine.fresh_key_package().await.unwrap();
+    assert_eq!(
+        key_package_claim(&tagged, &roster_of(&laptop, &gid)),
+        DeviceTagClaim::Device(slot(2))
+    );
+
     // A tag that no longer reads as the laptop's is stale even though its
-    // KeyPackage advertises 0x800f: here the laptop's entry moves slots.
+    // KeyPackage advertises 0x800f.
+    let own_entry = roster_of(&phone, &gid).devices[&slot(2)].clone();
     let moved = roster_update(
         &gid,
         vec![
             DeviceRosterOperationV1::RemoveDevice(slot(2)),
-            DeviceRosterOperationV1::SetDevice(slot(3), tagged.devices[&slot(2)].clone()),
+            DeviceRosterOperationV1::SetDevice(slot(3), own_entry),
         ],
     );
     let commit = send_commit(&mut phone, moved, &gid).await;
@@ -439,26 +504,14 @@ async fn setting_its_own_key_starts_tagging() {
     assert!(
         !laptop
             .engine
-            .key_package_advertises_current_capabilities(&first)
-            .unwrap()
-    );
-    assert!(tag_is_due(&laptop, &gid));
-    let in_new_slot = laptop.engine.fresh_key_package().await.unwrap();
-    assert_eq!(
-        key_package_claim(&in_new_slot, &roster_of(&laptop, &gid)),
-        DeviceTagClaim::Device(slot(3))
-    );
-
-    laptop.engine.set_device_tag_group(None).unwrap();
-    let after = laptop.engine.fresh_key_package().await.unwrap();
-    assert_eq!(key_package_tag(&after), (None, false));
-    assert!(
-        !laptop
-            .engine
-            .key_package_advertises_current_capabilities(&in_new_slot)
+            .key_package_advertises_current_capabilities(&tagged)
             .unwrap()
     );
     assert!(!tag_is_due(&laptop, &gid));
+    assert_eq!(
+        key_package_tag(&laptop.engine.fresh_key_package().await.unwrap()),
+        (None, false)
+    );
 }
 
 /// A founder whose entry in the roster it founds carries its key tags its
@@ -468,6 +521,7 @@ async fn setting_its_own_key_starts_tagging() {
 async fn a_founder_tags_its_founding_leaf_from_the_roster_it_founds() {
     let mut phone = roster_device(b"alice");
     let mut laptop = roster_device(b"alice");
+    hold_slot(&phone, slot(1));
     let mut initial = roster(&[(1, "Phone"), (2, "Laptop")]);
     initial.devices.get_mut(&slot(1)).unwrap().tag_signature_key =
         Some(phone.engine.own_signature_key());
@@ -486,6 +540,22 @@ async fn a_founder_tags_its_founding_leaf_from_the_roster_it_founds() {
         ),
         Some(DeviceTagClaim::Device(slot(1)))
     );
+
+    // A founder whose key sits in another entry founds an untagged leaf.
+    let mut tablet = roster_device(b"carol");
+    let mut watch = roster_device(b"carol");
+    hold_slot(&tablet, slot(1));
+    let mut misplaced = roster(&[(1, "Tablet"), (2, "Watch")]);
+    misplaced
+        .devices
+        .get_mut(&slot(2))
+        .unwrap()
+        .tag_signature_key = Some(tablet.engine.own_signature_key());
+    let gid = found_device_group(&mut tablet, &misplaced, &mut [&mut watch]).await;
+    assert_eq!(
+        own_leaf_claim(&tablet, &gid, &misplaced),
+        DeviceTagClaim::Unclaimed
+    );
 }
 
 /// Once the laptop can tag, its leaf in each group it joined before carries
@@ -500,6 +570,7 @@ async fn every_kind_of_own_commit_tags_a_leaf_that_needs_a_tag() {
         let bob_kp = bob.engine.fresh_key_package().await.unwrap();
         groups.push(found_group(&mut laptop, vec![bob_kp], true, &mut [&mut bob]).await);
     }
+    hold_slot(&laptop, slot(2));
     laptop
         .engine
         .set_device_tag_group(Some(device_gid.clone()))
@@ -582,6 +653,7 @@ async fn every_kind_of_own_commit_tags_a_leaf_that_needs_a_tag() {
 #[tokio::test]
 async fn a_leaf_whose_tag_reads_as_its_own_keeps_it() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    hold_slot(&phone, slot(1));
     phone
         .engine
         .set_device_tag_group(Some(gid.clone()))
@@ -619,6 +691,7 @@ async fn a_leaf_whose_tag_reads_as_its_own_keeps_it() {
 #[tokio::test]
 async fn only_a_live_device_group_tags() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    hold_slot(&laptop, slot(2));
     laptop
         .engine
         .set_device_tag_group(Some(gid.clone()))
