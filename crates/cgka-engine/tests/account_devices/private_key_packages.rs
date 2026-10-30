@@ -619,8 +619,8 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
     );
     assert_eq!(held(&laptop), 2);
 
-    // Another carrier of the Welcome keeps its own offer: the withdrawn one is
-    // retired and the delivered one joins.
+    // Another carrier of the Welcome keeps its own offer, and retires the one
+    // whose carrier was withdrawn; the delivered one joins.
     let (remove, welcome) = remove_and_add_back(&mut phone, &laptop, &gid, private(3)).await;
     let sibling = sibling_welcome(&welcome, SLOT, reference(3));
     deliver_carrier(&laptop, &device_group, b"withdrawn");
@@ -641,10 +641,7 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
         .into_iter()
         .map(|offer| offer.rejoin.unwrap().sibling.unwrap().carrier)
         .collect();
-    assert_eq!(
-        carriers,
-        vec![hash_id(b"withdrawn"), hash_id(b"redelivered")]
-    );
+    assert_eq!(carriers, vec![hash_id(b"redelivered")]);
     remove_laptop(&mut laptop, &gid, remove).await;
     assert!(
         laptop
