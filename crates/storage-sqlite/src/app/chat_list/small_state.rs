@@ -452,10 +452,11 @@ impl HeldChat {
     }
 }
 
-/// The furthest delivered message of the chat, other than an edit, at or
-/// before `key`: what a read position names when this device's read marker
-/// is on a row no position may name, such as a synthesized group system row
-/// or a send not delivered yet.
+/// The furthest delivered message of the chat, other than an edit and with
+/// its epoch and time in range, at or before `key`: what a read position
+/// names when this device's read marker is on a row no position may name,
+/// such as a synthesized group system row (first in its epoch), a send not
+/// delivered yet (after every delivered message) or a message out of range.
 fn furthest_delivered_message_tx(
     conn: &Connection,
     group_id_hex: &str,
@@ -467,6 +468,7 @@ fn furthest_delivered_message_tx(
          WHERE group_id_hex = ?1
            AND timeline_order_class = 1 AND timeline_order_phase = 1
            AND kind != ?7
+           AND timeline_order_primary <= ?8 AND timeline_order_at <= ?8
            AND (timeline_order_class, timeline_order_primary, timeline_order_phase,
                 timeline_order_at, message_id_hex) <= (?2, ?3, ?4, ?5, ?6)
          ORDER BY timeline_order_primary DESC, timeline_order_at DESC, message_id_hex DESC
@@ -479,6 +481,7 @@ fn furthest_delivered_message_tx(
             u64_to_i64(*at)?,
             id,
             u64_to_i64(MARMOT_APP_EVENT_KIND_EDIT)?,
+            u64_to_i64(MAX_SMALL_STATE_NUMBER)?,
         ],
         |row| {
             Ok((
@@ -548,11 +551,15 @@ fn held_chats_tx(conn: &Connection) -> StorageResult<BTreeMap<String, HeldChat>>
                 .map(|(class, primary, phase, at, id)| (class, primary, phase, at, id.to_owned()))
         });
         let read = match &read_key {
-            Some((1, epoch, 1, at, id)) => Some(ReadPosition {
-                epoch: *epoch,
-                at: *at,
-                message_id_hex: id.clone(),
-            }),
+            Some((1, epoch, 1, at, id))
+                if *epoch <= MAX_SMALL_STATE_NUMBER && *at <= MAX_SMALL_STATE_NUMBER =>
+            {
+                Some(ReadPosition {
+                    epoch: *epoch,
+                    at: *at,
+                    message_id_hex: id.clone(),
+                })
+            }
             Some(key) => furthest_delivered_message_tx(conn, &group_id_hex, key)?,
             None => None,
         };
