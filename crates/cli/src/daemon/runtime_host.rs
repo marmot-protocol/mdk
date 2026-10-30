@@ -789,6 +789,9 @@ pub(crate) async fn handle_app_runtime_event(
         // Whether this device's KeyPackage refresh is overdue may have
         // changed; the answer is read from the runtime.
         marmot_app::MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. } => {}
+        // Linking a new device may have changed; the CLI does not link
+        // devices.
+        marmot_app::MarmotAppEvent::DeviceLinkChanged { .. } => {}
     }
 }
 

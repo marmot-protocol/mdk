@@ -409,24 +409,20 @@ impl<S: StorageProvider> Engine<S> {
 
     /// [`Self::stage_commit_with_app_data_updates`] for a commit that carries
     /// only the given proposals, by value: proposals pending in the store
-    /// stay there. The link Commit uses it, so linking one device never
-    /// executes another member's queued Add, Remove or roster update.
+    /// stay there. The link Commit and its undo use it, so linking or
+    /// unlinking one device never executes another member's queued Add,
+    /// Remove or roster update.
     pub(crate) fn stage_exact_commit_with_app_data_updates(
         &self,
         mls_group: &mut MlsGroup,
         provider: &EngineOpenMlsProvider<'_, S>,
+        removals: Vec<LeafNodeIndex>,
         adds: Vec<MlsKeyPackage>,
         proposals: Vec<Proposal>,
         context: &str,
     ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
         self.stage_app_data_commit(
-            mls_group,
-            provider,
-            Vec::new(),
-            adds,
-            proposals,
-            false,
-            context,
+            mls_group, provider, removals, adds, proposals, false, context,
         )
     }
 

@@ -249,7 +249,7 @@ fn stored_message_payload_distinguishes_raw_outbound_welcome_and_openmls_wire() 
     };
 
     let raw_payload = StoredMessagePayload::raw_transport(raw);
-    let outbound_welcome_payload = StoredMessagePayload::outbound_welcome(outbound_welcome);
+    let outbound_welcome_payload = StoredMessagePayload::outbound_welcome(outbound_welcome, None);
     let openmls_payload = StoredMessagePayload::openmls_wire(openmls);
 
     insta::assert_json_snapshot!("stored_payload_raw_transport", raw_payload);
