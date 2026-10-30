@@ -282,7 +282,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   runs only when no debt unit is eligible, on required relays whose recorded caps show NIP-77. Storage makes a relay's
   re-checks due in the same write that ends a cooldown longer than an hour; do not split that into a second write.
   Admission releases a group's staged events oldest first below its admission frontier, never past an event the
-  engine kept no trace of. Only capture debt below a non-empty live count fences; the fence is a query
+  engine kept no trace of. Nothing is swept, compared or re-checked for a group admission cannot drain (held, or
+  admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences; the fence is a query
   (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own
   `LiveCount`, never the coverage recorder's facts. Logs carry aggregates only.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,

@@ -32,7 +32,7 @@ use transport_nostr_adapter::sweep::{
     SweepRange, SweepRelay, SweepRoute, UnreachableKind,
 };
 
-use super::admission::{LiveFence, live_fences};
+use super::admission::{LiveFence, Stalled, live_fences};
 use super::policy::{
     RUNNER_BACKOFF_BASE_SECS, RUNNER_QUANTUM, RUNNER_RECHECK_INTERVAL_SECS, RUNNER_REQUEST_TIMEOUT,
     RUNNER_UNREACHABLE_RETRY_SECS,
@@ -822,6 +822,8 @@ struct TestHost {
     admitted: AdmittedLog,
     /// Events the engine keeps no trace of.
     no_trace: Mutex<BTreeSet<Vec<u8>>>,
+    /// Events whose ingest fails locally.
+    failing_ingests: Mutex<BTreeSet<Vec<u8>>>,
     /// A laggard every admission is checked against: each admitted event's
     /// second, with the first second the laggard owed then.
     laggard: Mutex<Option<UnitKey>>,
@@ -888,6 +890,7 @@ impl TestHost {
             counts: Mutex::default(),
             admitted: admitted.clone(),
             no_trace: Mutex::default(),
+            failing_ingests: Mutex::default(),
             laggard: Mutex::default(),
             behind: Mutex::default(),
             client,
@@ -926,7 +929,7 @@ impl TestHost {
     }
 
     async fn survey(&self, policy: RecoveryRunnerPolicy) -> Survey {
-        self.debt_turn(move |turn| survey(turn, &policy).unwrap())
+        self.debt_turn(move |turn| survey(turn, &policy, &Stalled::default()).unwrap())
             .await
             .unwrap()
     }
@@ -1030,6 +1033,9 @@ impl RunnerHost for TestHost {
         let event_id = delivery.message.id.as_slice().to_vec();
         if self.no_trace.lock().unwrap().contains(&event_id) {
             return Some(Ok(Admitted::NoTrace));
+        }
+        if self.failing_ingests.lock().unwrap().contains(&event_id) {
+            return Some(Err("storage"));
         }
         if let Some(laggard) = self.laggard.lock().unwrap().as_ref() {
             let now = self.clock.now();
@@ -3017,6 +3023,68 @@ async fn recovery_runner_holds_a_full_relay_back_until_the_laggard_advances_or_l
     assert_eq!(account.admitted_events(), 20);
 }
 
+/// As above, a laggard leaves the frontier once its last quantum made no
+/// progress or was refused, and while its relay cools down; the full relay
+/// ahead of it is then eligible.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_stops_waiting_on_a_laggard_without_progress_refused_or_cooling_down() {
+    for outcome in [Outcome::NoProgress, Outcome::Refused, Outcome::RateLimited] {
+        let account = account();
+        let clock = Clock::new();
+        let t0 = clock.now();
+        let route = group(1);
+        let floor = t0 - HOUR;
+        let events = every([1; 32], floor, t0, 60);
+        let a = slow_relay(RELAY, events.clone()).build();
+        let b = slow_relay(OTHER_RELAY, events).build();
+        account.goal(&route, floor);
+        let host = TestHost::new(
+            &account,
+            &clock,
+            vec![required(&route, &[RELAY, OTHER_RELAY])],
+            &[&a, &b],
+        );
+        host.tails.stand(&route, RELAY, t0);
+        host.tails.stand(&route, OTHER_RELAY, t0);
+        let mut policy = five_minute_slices();
+        policy.staging.group_events = 5;
+        let (mut runner, _handle) = runner(&host, policy);
+
+        // A goes first, stages past B and waits on it.
+        assert_eq!(ran(runner.step().await).key.relay, RELAY);
+        assert_eq!(blocked(host.survey(policy).await).get(RELAY), Some(&true));
+
+        account
+            .app
+            .settle_recovery_unit(&route, OTHER_RELAY, outcome, &policy.unit, clock.now())
+            .unwrap();
+        assert_eq!(
+            blocked(host.survey(policy).await).get(RELAY),
+            Some(&false),
+            "B still holds the frontier after {outcome:?}"
+        );
+        if outcome == Outcome::Refused {
+            // A loss above A's coverage earns B's park a probe, so B owes
+            // from the floor again; broken, it still stays off the frontier.
+            let reached = account.covered_through(&route, RELAY);
+            account
+                .app
+                .uncover_recovery_coverage(std::slice::from_ref(&route), reached + 1)
+                .unwrap();
+            assert!(account.unit(&route, OTHER_RELAY).probe);
+            assert_eq!(
+                account.debt(&route, OTHER_RELAY, t0 - 1)[0].since_seconds,
+                floor
+            );
+            assert_eq!(
+                blocked(host.survey(policy).await).get(RELAY),
+                Some(&false),
+                "a probing broken unit holds the frontier"
+            );
+        }
+    }
+}
+
 /// A route of the MLS group with id `[9; 16]`.
 fn shared(route: &Route, relays: &[&str]) -> RunnerRoute {
     RunnerRoute {
@@ -3215,4 +3283,123 @@ async fn recovery_runner_holds_a_group_behind_an_event_the_engine_kept_no_trace_
     first.extend_from_slice(&s[2..]);
     assert_eq!(admitted(), first);
     assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+}
+
+// A paused clock, as above.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_fetches_nothing_for_a_group_held_behind_an_untraced_event() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let events = every([1; 32], floor, t0, 60);
+    let relay = slow_relay(RELAY, events.clone()).build();
+    account.goal(&route, floor);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    host.tails.stand(&route, RELAY, t0);
+    // For now the engine refuses the group's second event.
+    host.no_trace
+        .lock()
+        .unwrap()
+        .insert(events[1].id.to_bytes().to_vec());
+    let (mut runner, _handle) = runner(&host, five_minute_slices());
+    let routes = [route.clone()];
+
+    let first = ran(runner.step().await);
+    assert_eq!(first.outcome, Outcome::Advanced);
+    let staged = account.staged_from(&routes, RELAY);
+    let reached = account.covered_through(&route, RELAY);
+
+    // The next step admits the first event and holds the group behind the
+    // second. Nothing more is fetched for it while it cannot drain, though
+    // its relay holds the frontier and owes the rest of the hour.
+    let due = idle(runner.step().await).expect("the held group is retried");
+    assert_eq!(account.admitted_events(), 1);
+    let queries = relay.queries().len();
+    clock.advance_to(due - 1);
+    assert_eq!(idle(runner.step().await), Some(due));
+    assert_eq!(relay.queries().len(), queries);
+    assert_eq!(account.staged_from(&routes, RELAY), staged - 1);
+    assert_eq!(account.covered_through(&route, RELAY), reached);
+
+    // Once the engine takes it, the group drains and the sweep goes on.
+    host.no_trace.lock().unwrap().clear();
+    clock.advance_to(due);
+    let resumed = ran(runner.step().await);
+    assert_eq!(
+        (resumed.key.relay.as_str(), resumed.outcome),
+        (RELAY, Outcome::Advanced)
+    );
+    assert_eq!(account.admitted_events(), staged);
+    assert!(account.covered_through(&route, RELAY) > reached);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_fetches_nothing_while_admission_waits_after_a_local_failure() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (failing, other) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    let mid = t0 - HOUR / 2;
+    // The failing group's hour was swept and staged already. The other group
+    // owes its newer half hour, and its older one is due a re-check.
+    let failing_events = every([1; 32], floor, t0, 10 * 60);
+    account.goal(&failing, floor);
+    account.swept(&failing, RELAY, &failing_events, floor, t0 - 1);
+    account.goal(&other, floor);
+    account.live_boundary(&other, RELAY, floor, mid);
+    account
+        .app
+        .record_recovery_relay_caps(
+            RELAY,
+            Some(RecoveryRelayCaps {
+                max_limit: Some(500),
+                negentropy: true,
+            }),
+            t0,
+        )
+        .unwrap();
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(every([2; 32], floor, t0, 10 * 60))
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&failing, &[RELAY]), required(&other, &[RELAY])],
+        &[&relay],
+    );
+    host.tails.stand(&failing, RELAY, t0);
+    host.tails.stand(&other, RELAY, t0);
+    // For now the failing group's first event fails to go in.
+    host.failing_ingests
+        .lock()
+        .unwrap()
+        .insert(failing_events[0].id.to_bytes().to_vec());
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    // Admission waits after the failure, and nothing is fetched for any group
+    // meanwhile: not the other group's debt, nor its re-check.
+    let due = idle(runner.step().await).expect("admission is retried");
+    assert!(account.admitted().is_empty());
+    assert!(relay.queries().is_empty());
+    assert!(relay.comparisons().is_empty());
+    assert_eq!(
+        account.debt(&other, RELAY, t0 - 1),
+        [range(mid + 1, t0 - 1)]
+    );
+
+    // Once the wait ends and the ingest goes through, the other group's debt
+    // runs.
+    host.failing_ingests.lock().unwrap().clear();
+    clock.advance_to(due);
+    let resumed = ran(runner.step().await);
+    assert_eq!((&resumed.key.route, resumed.recheck), (&other, false));
+    assert_eq!(account.admitted_events(), failing_events.len() as u64);
 }

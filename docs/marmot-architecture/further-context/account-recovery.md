@@ -807,9 +807,14 @@ worker command each, so commands and live input go between them. An event the en
 trace of stays staged, and its group waits behind it on the local-failure backoff while other
 groups go on. A relay that holds a group's staging bound (2,048 events or 8 MiB), or any relay
 once the account holds 64 MiB, is not eligible while another relay holds that group's frontier.
-A relay at the frontier is never held back, so the runner never waits on itself. What a route
-the runner no longer lists staged is given back, its seconds owed again on that route, so it
-never holds the account's bound.
+A debt unit at the frontier is never held back, so the runner never waits on itself; a
+re-check, which never moves the frontier, waits at the bound like any other. Nothing is fetched
+for a group admission cannot drain: one held behind an event the engine kept no trace of, or
+every group while admission waits after local failures. The bounds hold while admission can
+drain the group; a stalled group is not swept, and the runner idles until the hold or the wait
+ends. A stalled group's fence stays where it is meanwhile, since the capture debt that would
+drop it is not swept. What a route the runner no longer lists staged is given back, its seconds owed again on
+that route, so it never holds the account's bound.
 
 Only capture debt fences live frames: the part `[since, oldest seen]` of a live REQ's range
 that its relay's non-empty count left unproven. An empty count's range is cold-start debt,

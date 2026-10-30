@@ -16,10 +16,16 @@
 //! - **Backpressure.** A relay at a group's staging bound (its events or
 //!   bytes for the group), or any relay while the account is at its own, is
 //!   not eligible while another unit holds the group's frontier, until that
-//!   laggard advances or leaves. A unit at the frontier is never held back,
-//!   so the runner never waits on itself. What a route the runner no longer
+//!   laggard advances or leaves. A debt unit at the frontier is never held
+//!   back, so the runner never waits on itself. A re-check never moves the
+//!   frontier, so it has no such exemption. What a route the runner no longer
 //!   lists staged is given back, its seconds owed again on that route, so it
 //!   never holds the account's bound.
+//! - **Stalls.** Nothing is fetched for a group admission cannot drain: one
+//!   held behind a staged event the engine kept no trace of, or every group
+//!   while admission waits after local failures. Its sweeps and re-checks
+//!   wait until the hold or the wait ends, so the staging bounds hold while
+//!   admission can drain the group.
 //! - **The fence.** Only capture debt holds a group's live frames: the part
 //!   `[since, oldest seen]` of a live REQ's range that its relay's non-empty
 //!   count left unproven. An empty count's range is cold-start debt, owed but
@@ -33,7 +39,8 @@
 //! Each admission turn ingests at most a few events, one worker command each,
 //! so the worker serves commands and live input between them. An event the
 //! engine keeps no trace of (refused for resources) stays staged, and its
-//! group waits behind it on the local-failure backoff; other groups go on.
+//! group waits behind it on the local-failure backoff, stalled; other groups
+//! go on.
 //!
 //! Nothing runs this before the switch-over (PR 5), which maps the coverage
 //! recorder's live count facts into [`LiveCount`] and has the adapter's hold
@@ -122,6 +129,22 @@ fn group_key(route: &RunnerRoute) -> GroupKey {
         .group_id
         .clone()
         .map_or_else(|| GroupKey::Route(route.route.clone()), GroupKey::Group)
+}
+
+/// The groups admission cannot drain now: every group while admission waits
+/// after local failures, else those held behind a staged event the engine
+/// kept no trace of. Not `Debug`: it carries group ids.
+#[derive(Clone, Default)]
+pub(super) struct Stalled {
+    all: bool,
+    groups: BTreeSet<GroupKey>,
+}
+
+impl Stalled {
+    /// Whether `route`'s group is stalled: nothing is fetched for it.
+    pub(super) fn holds(&self, route: &RunnerRoute) -> bool {
+        self.all || self.groups.contains(&group_key(route))
+    }
 }
 
 /// One required (route, relay) of a group, as one debt turn reads it.
@@ -217,12 +240,14 @@ impl<'t> Admission<'t> {
     }
 
     /// Whether staging holds `key` back: its relay is at the group's staging
-    /// bound, or the account at its own, while another unit holds the
-    /// group's frontier.
+    /// bound, or the account at its own, while the group has a frontier. A
+    /// debt unit holding the frontier is exempt (`moves_frontier`); a
+    /// re-check, which never moves it, is not.
     pub(super) fn backpressured(
         &mut self,
         key: &UnitKey,
         bounds: &RecoveryStagingBounds,
+        moves_frontier: bool,
     ) -> StorageResult<bool> {
         let Some(group_key) = self.route_groups.get(&key.route).cloned() else {
             return Ok(false);
@@ -242,9 +267,11 @@ impl<'t> Admission<'t> {
         let Some(frontier) = group.frontier() else {
             return Ok(false);
         };
-        if group.members.iter().any(|member| {
-            member.key == *key && member.on_frontier && member.position == Some(frontier)
-        }) {
+        if moves_frontier
+            && group.members.iter().any(|member| {
+                member.key == *key && member.on_frontier && member.position == Some(frontier)
+            })
+        {
             return Ok(false);
         }
         if account_full {
@@ -616,6 +643,23 @@ impl Memory {
             .min()
     }
 
+    /// The groups held behind an untraced event at `now`.
+    fn held_at(&self, now: u64) -> BTreeSet<GroupKey> {
+        self.held
+            .iter()
+            .filter(|(_, (until, _))| *until > now)
+            .map(|(group, _)| group.clone())
+            .collect()
+    }
+
+    /// What admission cannot drain at `now`.
+    pub(super) fn stalled(&self, now: u64) -> Stalled {
+        Stalled {
+            all: self.paused_until > now,
+            groups: self.held_at(now),
+        }
+    }
+
     fn hold(&mut self, group: GroupKey, now: u64, policy: &RecoveryRunnerPolicy) {
         let tries = self
             .held
@@ -664,13 +708,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             if self.admission.paused_until > now {
                 return Ok(self.admission.next_due(now));
             }
-            let held = self
-                .admission
-                .held
-                .iter()
-                .filter(|(_, (until, _))| *until > now)
-                .map(|(group, _)| group.clone())
-                .collect::<BTreeSet<_>>();
+            let held = self.admission.held_at(now);
             let policy = self.policy;
             let batch = match self
                 .host

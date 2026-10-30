@@ -36,7 +36,8 @@
 //!
 //! Each step first admits what staging may release ([`admission`]): per MLS
 //! group, oldest first, up to its admission frontier. The same reads hold back
-//! a relay staging is full for and serve fenced groups first.
+//! a relay staging is full for, block every unit of a group admission cannot
+//! drain, and serve fenced groups first.
 //!
 //! Live tails are a query, never a stored value ([`tails`]): the select and
 //! begin turns each read them fresh, and nothing keeps an answer across an
@@ -410,9 +411,10 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             Err(step) => return step,
         };
         let policy = self.policy;
+        let stalled = self.admission.stalled(self.host.now_seconds());
         let mut survey = match self
             .host
-            .debt_turn(move |turn| select::survey(turn, &policy))
+            .debt_turn(move |turn| select::survey(turn, &policy, &stalled))
             .await
         {
             None => return Step::Stopped,
