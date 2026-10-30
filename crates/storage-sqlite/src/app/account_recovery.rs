@@ -363,6 +363,18 @@ pub(crate) fn arm_overflow_tx(
         .storage()?;
     let past_durable = durable.is_none_or(|durable| durable < dropped);
     let routes = loss::listed_routes(routes);
+    // A marker write reads its floor and routes together, but the worker
+    // reads the routes after its snapshot, so they can name an older drop
+    // the snapshot missed. Recovery fetches from the floor, so it reaches
+    // down to every bound listed, as the marker's next write would.
+    let earliest_created_at = match routes {
+        Some(routes) if past_durable => earliest_created_at.map(|earliest| {
+            routes
+                .iter()
+                .fold(earliest, |lowest, (_, at)| lowest.min(*at))
+        }),
+        _ => earliest_created_at,
+    };
     let (bound_state, bound_seconds) = loss_bound_values(earliest_created_at)?;
     conn.execute_cached(
         &format!(
@@ -966,6 +978,7 @@ impl SqliteAppStorage {
     /// count merges `routes` into its generation as
     /// [`Self::record_account_recovery_loss_routed`] would: the relay plane's
     /// route map for every drop it counted, or `None` to un-cover every route.
+    /// The generation's floor drops to the lowest bound they list.
     pub fn mark_account_delivery_recovery_observed(
         &self,
         label: &str,

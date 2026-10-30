@@ -1765,7 +1765,10 @@ mod tests {
     /// With the relay plane's route map, an observation past the durable
     /// count merges it as a marker write would: the generation keeps its
     /// routes, each at its lowest bound, and a route no drop reached keeps its
-    /// coverage. A generation no marker write has reached yet starts routed.
+    /// coverage. The map is read after the worker's snapshot, so it can name
+    /// a drop older than the snapshot's floor; the floor recovery fetches
+    /// from drops to it. A generation no marker write has reached yet starts
+    /// routed.
     #[test]
     fn an_observation_past_the_durable_count_keeps_the_routes_it_names() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
@@ -1782,12 +1785,18 @@ mod tests {
                 "alice",
                 41,
                 2,
-                Some(500),
+                Some(550),
                 Some(&[(first.clone(), 600), (second.clone(), 500)]),
             )
             .unwrap()
             .unwrap();
         assert!(!observed.every_route);
+        assert_eq!(observed.goal_floor, Some(500));
+        assert_eq!(
+            app.recovery_loss_goal_floor("alice", crate::RecoveryLossCause::Queue)
+                .unwrap(),
+            Some(500)
+        );
         assert_eq!(
             ranges(&app, &first, RELAY_A),
             vec![(100, 599, RecoveryCoverageProof::Comparison)]
