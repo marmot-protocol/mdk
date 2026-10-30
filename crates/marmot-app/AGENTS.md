@@ -578,7 +578,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
   every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. It builds every collector
   client through the `http_builder` that both `MarmotApp` constructors hand in (`hand_in_http_builder`); before that
-  it builds none, so nothing dials. Endpoint parsers and the exporters' resolved config live in `export_config.rs`;
+  it builds none, so nothing dials, tests included: a test that dials hands in a builder itself. Endpoint parsers and the exporters' resolved config live in `export_config.rs`;
   `config.rs` keeps the settings that resolve against `MarmotServiceEndpoints`. Explicit SOCKS5 routing
   must send the validated IP rather than delegate HTTP DNS to the proxy. Build every relay client with
   `network_proxy::nostr_builder()` (in `transport-nostr`, its own `nostr_builder()`, which calls the same adapter
@@ -595,6 +595,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and `AuditOtlpSender`, so do not make their crate-private methods `pub` and do not call them from outside the
   moving set; add the method to a view or to `wiring.rs`. Items the rest of the crate names from a private module
   in the set are `pub` there.
+- Tests in the moving set need nothing else from this crate. Tests that need a `MarmotApp`, its runtime or the
+  network-proxy policy live in `src/observability_tests/`, one module per set file, and reach the set as the rest of
+  the crate does, plus the fixtures in `observability_test_support.rs` and the `_for_test` hooks. Those are gated
+  `cfg(any(test, feature = "test-support"))` and reach state through methods, never fields.
+  `observability_crossings_tests` keeps the crossing list in `src/observability_crossings.txt` at zero.
 
 ## Code map (modules not covered above)
 
@@ -650,7 +655,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   build).
 - `product-analytics-export`: product analytics export path.
 - `media-benchmarks`: internal surface for the media transport benchmarks.
-- `test-support`: exposes `error_kind_table` to the host crates' tests. Enable it only as a dev-dependency.
+- `test-support`: exposes `error_kind_table` to the host crates' tests and compiles the diagnostics test fixtures
+  and hooks. Enable it only as a dev-dependency.
 
 ## Verification
 
