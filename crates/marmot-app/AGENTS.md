@@ -192,6 +192,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   drive. It announces each Welcome once per process (`announced_welcome_failures`) and leaves a failure without a
   group (the startup retry's) to `reconcile_pending_welcome_delivery_index`. The worker's projection drain
   (`publish_client_pending_projection_updates`) broadcasts the queued events, so every worker seam does.
+  `note_welcome_delivery_failures` and that reconcile are the pending table's only writers; never write a row before a
+  commit is exposed, since the engine stages an invite's Welcomes with its commit.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.
