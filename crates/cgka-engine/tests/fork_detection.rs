@@ -202,7 +202,7 @@ fn build_client(id: &[u8]) -> impl CgkaEngine {
 }
 
 fn build_client_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -226,7 +226,7 @@ fn build_client_with_recorder(
     tempfile::TempDir,
     std::path::PathBuf,
 ) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let audit_dir = tempfile::TempDir::new().unwrap();
     let audit_path = audit_dir.path().join("audit.jsonl");
     let recorder = marmot_forensics::JsonlRecorder::open(&audit_path, hex::encode(id)).unwrap();

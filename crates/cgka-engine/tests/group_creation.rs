@@ -566,7 +566,7 @@ fn build_client_with_components(
     identity: &[u8],
     components: impl IntoIterator<Item = u16>,
 ) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
@@ -590,7 +590,7 @@ fn selfremove_registry() -> FeatureRegistry {
 }
 
 fn build_client(identity: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
@@ -601,7 +601,7 @@ fn build_client(identity: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
 }
 
 fn build_current_client(identity: &[u8]) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .protocol_profile(ProtocolProfile::Current)
@@ -633,7 +633,7 @@ fn build_client_with_welcome_sender(
     registry: FeatureRegistry,
     welcome_sender: MemberId,
 ) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
@@ -1014,7 +1014,7 @@ fn current_proof_rejects_missing_support_advertisement() {
 
 #[tokio::test]
 async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let current_components = default_group_components()
         .into_iter()
         .chain([GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID])
@@ -1027,7 +1027,7 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
         .peeler(Box::new(MockPeeler::default()))
         .build()
         .unwrap();
-    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(pad32(b"bob-current-group"))
         .account_identity_proof_signer(proof_signer(b"bob-current-group"))
         .supported_app_components(current_components)
@@ -1209,7 +1209,7 @@ async fn welcome_scan_filters_rows() {
         (result, MESSAGE_READS.get())
     }
 
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_profile_client_on_storage(
         b"alice-welcome-scan",
         storage.clone(),
@@ -1344,7 +1344,7 @@ async fn welcome_scan_filters_rows() {
 
 #[tokio::test]
 async fn welcome_index_keeps_lifecycle() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_profile_client_on_storage(
         b"alice-welcome-lifecycle",
         storage.clone(),
@@ -1464,7 +1464,7 @@ async fn current_group_initial_retention_is_canonical_for_creator_invitee_and_re
         .peeler(Box::new(MockPeeler::default()))
         .build()
         .unwrap();
-    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(pad32(b"bob-founding-retention"))
         .account_identity_proof_signer(proof_signer(b"bob-founding-retention"))
         .supported_app_components(supported.clone())
@@ -1529,7 +1529,7 @@ async fn current_group_initial_retention_is_canonical_for_creator_invitee_and_re
 
 #[tokio::test]
 async fn current_group_initial_retention_rejects_unsupported_invitee_before_state() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let supported = default_group_components()
         .into_iter()
         .chain([GROUP_MESSAGE_RETENTION_COMPONENT_ID])
@@ -1572,12 +1572,12 @@ async fn current_group_initial_retention_rejects_unsupported_invitee_before_stat
 
 #[tokio::test]
 async fn cancelling_founding_retention_before_canonicalization_leaves_no_group() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let supported = default_group_components()
         .into_iter()
         .chain([GROUP_MESSAGE_RETENTION_COMPONENT_ID])
         .collect::<Vec<_>>();
-    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(pad32(b"bob-cancel-founding-retention"))
         .account_identity_proof_signer(proof_signer(b"bob-cancel-founding-retention"))
         .supported_app_components(supported.clone())
@@ -1638,7 +1638,7 @@ async fn cancelling_founding_retention_before_canonicalization_leaves_no_group()
 
 #[tokio::test]
 async fn current_group_rejects_colliding_founding_welcome_ids_atomically() {
-    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(pad32(b"alice-colliding-welcomes"))
         .account_identity_proof_signer(proof_signer(b"alice-colliding-welcomes"))
         .protocol_profile(ProtocolProfile::Current)
@@ -1734,7 +1734,7 @@ async fn current_solo_group_is_canonical_at_epoch_zero_without_confirmation() {
 
 #[tokio::test]
 async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let identity = b"alice-current-solo-disband";
     let clock = ManualConvergenceClock::new(0, 10_000);
     let mut alice = EngineBuilder::new(storage.clone())
@@ -1933,7 +1933,7 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
 /// nor stamped terminal.
 #[tokio::test]
 async fn own_sends_survive_the_pass_that_settles_their_senders_disband() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let identity = b"alice-own-sends-before-disband";
     let clock = ManualConvergenceClock::new(0, 10_000);
     let mut alice = EngineBuilder::new(storage.clone())
@@ -2020,7 +2020,7 @@ async fn own_sends_survive_the_pass_that_settles_their_senders_disband() {
 /// Helper for the announce-once tests: drive one solo group all the way to a
 /// settled, durable disband and hand back the storage that outlives the engine.
 async fn settle_solo_disband(identity: &[u8]) -> (SqliteAccountStorage, cgka_traits::GroupId) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(0, 10_000);
     let mut alice = EngineBuilder::new(storage.clone())
         .identity(pad32(identity))
@@ -2202,7 +2202,7 @@ async fn a_tombstone_only_group_announces_itself_once_across_repeated_opens() {
 
 #[tokio::test]
 async fn current_configured_engine_reopens_and_uses_a_legacy_group() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut legacy = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(b"legacy-reopen"))
@@ -2622,7 +2622,7 @@ async fn create_group_rejects_invitee_keypackage_with_excessive_lifetime_range()
 
 #[test]
 fn engine_builder_defaults_to_current_and_requires_explicit_legacy_fixture_seam() {
-    let current = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let current = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(pad32(b"default-current"))
         .account_identity_proof_signer(proof_signer(b"default-current"))
         .peeler(Box::new(MockPeeler::default()))
@@ -2630,7 +2630,7 @@ fn engine_builder_defaults_to_current_and_requires_explicit_legacy_fixture_seam(
         .expect("default engine builds");
     assert_eq!(current.new_protocol_profile(), ProtocolProfile::Current);
 
-    let legacy_result = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let legacy_result = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(pad32(b"implicit-legacy"))
         .account_identity_proof_signer(proof_signer(b"implicit-legacy"))
         .protocol_profile(ProtocolProfile::Legacy)
@@ -2657,7 +2657,7 @@ async fn freshly_generated_key_package_is_durably_owned_before_publication() {
 
 #[tokio::test]
 async fn strict_cutover_retires_all_legacy_key_package_bundles_idempotently() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut legacy =
         build_profile_client_on_storage(b"retirement", storage.clone(), ProtocolProfile::Legacy);
     legacy.fresh_key_package().await.unwrap();
@@ -2687,7 +2687,7 @@ async fn strict_cutover_retires_all_legacy_key_package_bundles_idempotently() {
 /// chosen id, and the refusal writes nothing.
 #[tokio::test]
 async fn a_legacy_engine_refuses_a_chosen_group_id() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut legacy =
         build_profile_client_on_storage(b"legacy-chosen", storage.clone(), ProtocolProfile::Legacy);
     let chosen = GroupId::new(vec![0x42; 16]);
@@ -2750,7 +2750,7 @@ async fn missing_welcome_key_package() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("audit.jsonl");
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut missing = EngineBuilder::new(storage.clone())
         .identity(pad32(b"bob"))
         .account_identity_proof_signer(proof_signer(b"bob"))
@@ -2791,7 +2791,7 @@ async fn missing_welcome_key_package() {
 
 #[tokio::test]
 async fn strict_cutover_rejects_new_and_replayed_legacy_welcomes_without_group_state() {
-    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut legacy_bob = build_profile_client_on_storage(
         b"legacy-welcome-bob",
         bob_storage.clone(),
@@ -2802,7 +2802,7 @@ async fn strict_cutover_rejects_new_and_replayed_legacy_welcomes_without_group_s
 
     let mut legacy_alice = build_profile_client_on_storage(
         b"legacy-welcome-alice",
-        SqliteAccountStorage::in_memory().unwrap(),
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
         ProtocolProfile::Legacy,
     );
     let (group_id, created) = legacy_alice
@@ -2972,11 +2972,11 @@ fn key_package_with_advertised_capabilities(
 #[tokio::test]
 async fn create_and_invite_reject_explicit_default_key_package_capabilities() {
     for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let mut alice = build_profile_client_on_storage(b"alice", storage.clone(), profile);
         let mut bob = build_profile_client_on_storage(
             b"valid-first-invitee",
-            SqliteAccountStorage::in_memory().unwrap(),
+            SqliteAccountStorage::in_memory_for_test().unwrap(),
             profile,
         );
         let valid_first = bob.fresh_key_package().await.unwrap();
@@ -3069,7 +3069,7 @@ async fn fresh_key_packages_omit_default_mls_capabilities() {
     for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
         let mut alice = build_profile_client_on_storage(
             b"alice",
-            SqliteAccountStorage::in_memory().unwrap(),
+            SqliteAccountStorage::in_memory_for_test().unwrap(),
             profile,
         );
         let kp = alice.fresh_key_package().await.unwrap();
@@ -3152,7 +3152,7 @@ async fn registry_defaults_are_implicit_for_key_packages_and_group_membership() 
                 },
             );
         }
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let builder = EngineBuilder::new(storage.clone())
             .identity(pad32(b"alice"))
             .account_identity_proof_signer(proof_signer(b"alice"))
@@ -3197,7 +3197,7 @@ async fn registry_defaults_are_implicit_for_key_packages_and_group_membership() 
         // them, but must be accepted when GroupContext explicitly requires them.
         let mut bob = build_profile_client_on_storage(
             b"bob",
-            SqliteAccountStorage::in_memory().unwrap(),
+            SqliteAccountStorage::in_memory_for_test().unwrap(),
             profile,
         );
         let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -3248,7 +3248,7 @@ async fn registry_defaults_are_implicit_for_key_packages_and_group_membership() 
         }));
         let mut carol = build_profile_client_on_storage(
             b"carol",
-            SqliteAccountStorage::in_memory().unwrap(),
+            SqliteAccountStorage::in_memory_for_test().unwrap(),
             profile,
         );
         let result = alice
@@ -3277,7 +3277,7 @@ async fn registry_defaults_are_implicit_for_key_packages_and_group_membership() 
 #[tokio::test]
 async fn founding_leaves_omit_default_mls_capabilities() {
     for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let mut alice = build_profile_client_on_storage(b"alice", storage.clone(), profile);
         let (group_id, _) = alice
             .create_group(CreateGroupRequest {
@@ -3522,7 +3522,7 @@ async fn join_welcome_dedup_survives_engine_rebuild_on_same_storage() {
     // not rely only on in-memory `seen_message_ids`. A rebuilt engine on
     // the same storage must reject the duplicate before re-staging it.
     let mut alice = build_client(b"alice", selfremove_registry());
-    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut bob = build_client_on_storage(b"bob", selfremove_registry(), bob_storage.clone());
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
@@ -3567,7 +3567,7 @@ async fn join_welcome_rejected_when_client_no_longer_supports_required_capabilit
     // so her runtime no longer supports SelfRemove. Joining the group must now
     // be rejected.
     let mut alice = build_client(b"alice", selfremove_registry());
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut capable_carol =
         build_client_on_storage(b"carol", selfremove_registry(), carol_storage.clone());
     let carol_kp = capable_carol.fresh_key_package().await.unwrap();
@@ -3640,7 +3640,7 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
         .chain([CUSTOM_COMPONENT])
         .collect();
     let mut alice = build_client_with_components(b"alice", components.clone());
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let capable_carol = EngineBuilder::new(carol_storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(b"carol"))
@@ -3806,7 +3806,7 @@ async fn audit_log_records_welcome_recipient_expectation() {
     let recorder =
         marmot_forensics::JsonlRecorder::open(&path, "test-engine-recip".to_string()).unwrap();
 
-    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
         .account_identity_proof_signer(proof_signer(b"alice"))
@@ -3921,7 +3921,7 @@ async fn audit_log_recipient_expectation_counts_each_account_once() {
     let path = dir.path().join("audit.jsonl");
     let recorder =
         marmot_forensics::JsonlRecorder::open(&path, "test-engine-devices".to_string()).unwrap();
-    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
         .account_identity_proof_signer(proof_signer(b"alice"))
@@ -3999,7 +3999,7 @@ async fn audit_log_recipient_expectation_counts_each_account_once() {
 /// with that storage error rather than fall through to later stages.
 #[tokio::test]
 async fn current_invite_to_unknown_group_fails_on_missing_record() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut current = build_profile_client_on_storage(
         b"missing-record-invite",
         storage.clone(),
@@ -4038,7 +4038,7 @@ async fn one_convergence_pass_preserves_rename_before_disband() {
 
     let clock = ManualConvergenceClock::new(0, 10_000);
     let build = |seed: &[u8]| {
-        EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
             .identity(pad32(seed))
             .account_identity_proof_signer(proof_signer(seed))
             .protocol_profile(ProtocolProfile::Current)

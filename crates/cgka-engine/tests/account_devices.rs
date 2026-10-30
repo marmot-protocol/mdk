@@ -238,7 +238,7 @@ struct Device {
 /// A current-profile device of `account`. Devices built from one label share
 /// the account identity and differ in their MLS signature keys.
 fn device(account: &[u8], advertises_account_devices: bool) -> Device {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut supported: Vec<_> = default_group_components().into_iter().collect();
     if advertises_account_devices {
         supported.push(ACCOUNT_DEVICES_COMPONENT_ID);
@@ -920,7 +920,7 @@ fn standalone_dictionary_extensions(
 // ── Builder ─────────────────────────────────────────────────────────────────
 
 fn try_build(supported: Vec<u16>) -> Result<Engine<SqliteAccountStorage>, EngineError> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(pad32(b"builder"))
         .account_identity_proof_signer(proof_signer(b"builder"))
         .feature_registry(registry())
@@ -1332,7 +1332,7 @@ async fn standalone_proposals_breaking_the_rules_are_rejected_at_ingest() {
 #[tokio::test]
 async fn legacy_groups_are_not_subject_to_the_rules() {
     let legacy_device = |account: &[u8]| {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let mut supported: Vec<_> = default_group_components().into_iter().collect();
         supported.push(ACCOUNT_DEVICES_COMPONENT_ID);
         let engine = EngineBuilder::new(storage.clone())

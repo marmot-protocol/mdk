@@ -8902,7 +8902,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn avatar_dispatch_shares_media_capacity_and_holds_it_through_publication() {
-        let store = storage_sqlite::SqliteAccountStorage::in_memory()
+        let store = storage_sqlite::SqliteAccountStorage::in_memory_for_test()
             .unwrap()
             .app_storage();
         for n in 0..5 {
@@ -8964,7 +8964,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn avatar_shutdown_cancels_io_and_leaves_resumable_intent() {
-        let store = storage_sqlite::SqliteAccountStorage::in_memory()
+        let store = storage_sqlite::SqliteAccountStorage::in_memory_for_test()
             .unwrap()
             .app_storage();
         let reference = store
