@@ -717,7 +717,7 @@ fn the_cursor_is_the_first_second_the_relay_leaves_uncovered() {
     );
 }
 
-/// Fencing, slicing, re-check progress, parks, relay health and the budget
+/// A fence, slicing, re-check progress, parks, relay health and the budget
 /// survive closing and reopening the database.
 #[test]
 fn state_survives_a_reopen() {
@@ -733,7 +733,8 @@ fn state_survives_a_reopen() {
         let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let app = storage.app_storage();
         owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
-        app.set_recovery_unit_fencing(&route, RELAY, true).unwrap();
+        app.set_recovery_unit_fences(&route, RELAY, &[range(NOW - 1_000, NOW - 900)])
+            .unwrap();
         app.record_recovery_unit_slicing(&route, RELAY, 3_600, Some(500))
             .unwrap();
         app.record_recovery_recheck(&route, RELAY, 0, NOW - 400, false, NOW)
@@ -759,7 +760,14 @@ fn state_survives_a_reopen() {
     let app = storage.app_storage();
     let after = unit(&app, &route, RELAY);
     assert!(after == before);
-    assert!(after.fencing);
+    assert_eq!(
+        fences(&app),
+        vec![(
+            route.clone(),
+            RELAY.to_owned(),
+            range(NOW - 1_000, NOW - 900)
+        )]
+    );
     assert_eq!(after.planned_caps, Some(caps));
     assert_eq!(
         (after.slice_width_seconds, after.observed_cap),
@@ -777,6 +785,50 @@ fn state_survives_a_reopen() {
             retired: None
         }]
     );
+}
+
+/// A unit keeps every range it fences, until it drops them; ranges must be
+/// ordered and must not overlap.
+#[test]
+fn fenced_ranges_are_listed_until_their_unit_drops_them() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let (fenced, other) = (group(1), group(2));
+    settle(&app, &other, RELAY, RecoveryUnitOutcome::Advanced, NOW);
+    let kept = [range(NOW - 30, NOW - 20), range(NOW - 10, NOW - 5)];
+    app.set_recovery_unit_fences(&fenced, OTHER, &kept).unwrap();
+    assert_eq!(
+        fences(&app),
+        kept.iter()
+            .map(|range| (fenced.clone(), OTHER.to_owned(), *range))
+            .collect::<Vec<_>>()
+    );
+    for refused in [
+        vec![range(NOW - 5, NOW - 10)],
+        vec![range(NOW - 10, NOW - 5), range(NOW - 30, NOW - 20)],
+        vec![range(NOW - 30, NOW - 10), range(NOW - 10, NOW - 5)],
+    ] {
+        assert!(
+            app.set_recovery_unit_fences(&fenced, OTHER, &refused)
+                .is_err()
+        );
+    }
+    assert_eq!(fences(&app).len(), 2, "a refused write keeps the ranges");
+    app.set_recovery_unit_fences(&fenced, OTHER, &kept[1..])
+        .unwrap();
+    assert_eq!(fences(&app).len(), 1);
+    app.set_recovery_unit_fences(&fenced, OTHER, &[]).unwrap();
+    assert!(fences(&app).is_empty());
+}
+
+fn fences(
+    app: &SqliteAppStorage,
+) -> Vec<(TransportReconciliationRoute, String, RecoveryCoverageRange)> {
+    app.recovery_unit_fences()
+        .unwrap()
+        .into_iter()
+        .map(|fence| (fence.route, fence.relay, fence.range))
+        .collect()
 }
 
 fn remainder(
@@ -804,11 +856,26 @@ fn the_retention_prune_trims_spans_at_its_floor() {
     }
     let revision = unit(&app, &retired, RELAY).park.unwrap().revision;
     assert!(app.dismiss_recovery_route_park(&retired, revision).unwrap());
+    app.set_recovery_unit_fences(
+        &parked,
+        OTHER,
+        &[range(NOW - 900, NOW - 201), range(NOW - 200, NOW - 100)],
+    )
+    .unwrap();
     let routes = [
         (parked.clone(), vec![RELAY.to_owned()]),
         (retired.clone(), vec![RELAY.to_owned()]),
     ];
     app.prune_recovery_coverage(NOW - 200, &routes).unwrap();
+    assert_eq!(
+        fences(&app),
+        vec![(
+            parked.clone(),
+            OTHER.to_owned(),
+            range(NOW - 200, NOW - 100)
+        )],
+        "a fenced range wholly below the floor goes"
+    );
     assert_eq!(
         remainder(&app, &parked).unwrap().range,
         range(NOW - 500, NOW - 201)

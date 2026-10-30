@@ -4,6 +4,16 @@
 
 ### Breaking changes
 
+- Migration 0135 advances account storage to schema 135 (mdk#2660 phase 4).
+  It replaces `account_recovery_units.fencing`, which nothing set, with
+  `account_recovery_unit_fences`: each capture range a unit fences, one row
+  each, never overlapping. `RecoveryUnit::fencing` goes, and
+  `set_recovery_unit_fencing` becomes `set_recovery_unit_fences`, which
+  replaces a unit's ranges. `recovery_unit_fences` lists every fenced range,
+  `staged_recovery_routes` the routes with staged events, and
+  `reclaim_staged_recovery_routes` drops the rows of routes the runner no
+  longer lists, owing their seconds again. The retention prune drops fenced
+  ranges below its floor.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it

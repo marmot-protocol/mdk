@@ -118,7 +118,11 @@ async fn recovery_runner_compares_a_large_difference_in_prefixes_over_several_qu
     let fetched = relay.fetched_ids();
     assert_eq!(fetched.len(), missing.len(), "an id was fetched twice");
     assert_eq!(fetched.into_iter().collect::<BTreeSet<_>>(), ids(&missing));
-    assert_eq!(account.staged_events(&route), missing.len() as u64);
+    // Admission releases what lies below the relay's position as it goes.
+    assert_eq!(
+        account.staged_events(&route) + account.admitted_events(),
+        missing.len() as u64
+    );
 }
 
 /// A unit compares only where the account already holds events in the owed

@@ -797,6 +797,32 @@ pass un-covers nothing and resumes from its position after the unit backoff's do
 re-check charges the account budget and the relay's streak like any quantum, never the unit's
 own retry state. These values are decision A20.
 
+Each step first admits from staging. A group's staged events, across its current and retained
+routes, go to the recovered-ingest path oldest first by `(created_at, id)`, below the group's
+admission frontier: the first second, after the live tail, that its furthest-behind required
+relay still owes. A relay leaves the frontier after an answer without progress or an
+unreachable or refused end, and while it cools down or is broken or retired; what it staged
+ahead of the others then goes in as late input. An admission turn ingests four events, one
+worker command each, so commands and live input go between them. An event the engine keeps no
+trace of stays staged, and its group waits behind it on the local-failure backoff while other
+groups go on. A relay that holds a group's staging bound (2,048 events or 8 MiB), or any relay
+once the account holds 64 MiB, is not eligible while another relay holds that group's frontier.
+A relay at the frontier is never held back, so the runner never waits on itself. What a route
+the runner no longer lists staged is given back, its seconds owed again on that route, so it
+never holds the account's bound.
+
+Only capture debt fences live frames: the part `[since, oldest seen]` of a live REQ's range
+that its relay's non-empty count left unproven. An empty count's range is cold-start debt,
+owed and swept but never fencing, and loss, re-check and epoch-gap debt never fence either. A
+group's held frames may go below the first second its fencing relays still owe in their
+capture (`live_fences`), and a relay off the frontier fences nothing. Each unit keeps every
+capture range it still owes (migration 0135), up to 8, so the hold survives a restart, which
+forgets the counts. Past 8 the newest are joined into one, which can only fence more.
+Once a capture is covered its fence drops, even while its staged events wait behind another
+relay's cold-start debt; those events then follow the released frames. Fenced groups are the
+runner's first class. Until the switch-over the adapter's hold keeps owner capture, and PR 5
+maps the recorder's live counts into the runner's own input.
+
 ## What gets deleted
 
 Deleted in step 2:

@@ -151,8 +151,6 @@ pub struct RecoveryUnit {
     pub no_progress: u32,
     pub backoff_step: u32,
     pub next_attempt_at_seconds: u64,
-    /// Its unproven live range holds the group's live frames.
-    pub fencing: bool,
     pub slice_width_seconds: Option<u64>,
     pub observed_cap: Option<u32>,
     /// The caps its last attempt was planned with; `None` when unknown.
@@ -182,6 +180,16 @@ pub struct RecoveryRelayHealth {
 pub struct RecoveryAccountUsage {
     pub attempts: u64,
     pub event_bytes: u64,
+}
+
+/// One range of capture debt a unit fences: the part of a live REQ's range
+/// its relay's non-empty count left unproven. Not `Debug`: it carries the
+/// route and the relay.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RecoveryUnitFence {
+    pub route: TransportReconciliationRoute,
+    pub relay: String,
+    pub range: RecoveryCoverageRange,
 }
 
 /// A parked or retired range on one unit.
@@ -278,10 +286,9 @@ fn caps_columns(caps: Option<RecoveryRelayCaps>) -> (i64, Option<i64>, i64) {
 }
 
 const UNIT_COLUMNS: &str = "route_kind, route_id, relay, state, broken_reason, probe, no_progress,
-    backoff_step, next_attempt_at_seconds, fencing, slice_width_seconds, observed_cap,
-    planned_caps_known, planned_max_limit, planned_negentropy, park_revision, parked_at_seconds,
-    recheck_position_seconds, recheck_completed_at_seconds, last_served_at_seconds,
-    recheck_revision";
+    backoff_step, next_attempt_at_seconds, slice_width_seconds, observed_cap, planned_caps_known,
+    planned_max_limit, planned_negentropy, park_revision, parked_at_seconds,
+    recheck_position_seconds, recheck_completed_at_seconds, last_served_at_seconds, recheck_revision";
 
 fn unit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UnitRow> {
     Ok(UnitRow {
@@ -294,18 +301,17 @@ fn unit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UnitRow> {
         no_progress: row.get(6)?,
         backoff_step: row.get(7)?,
         next_attempt_at: row.get(8)?,
-        fencing: row.get(9)?,
-        slice_width: row.get(10)?,
-        observed_cap: row.get(11)?,
-        planned_known: row.get(12)?,
-        planned_max_limit: row.get(13)?,
-        planned_negentropy: row.get(14)?,
-        park_revision: row.get(15)?,
-        parked_at: row.get(16)?,
-        recheck_position: row.get(17)?,
-        recheck_completed_at: row.get(18)?,
-        last_served_at: row.get(19)?,
-        recheck_revision: row.get(20)?,
+        slice_width: row.get(9)?,
+        observed_cap: row.get(10)?,
+        planned_known: row.get(11)?,
+        planned_max_limit: row.get(12)?,
+        planned_negentropy: row.get(13)?,
+        park_revision: row.get(14)?,
+        parked_at: row.get(15)?,
+        recheck_position: row.get(16)?,
+        recheck_completed_at: row.get(17)?,
+        last_served_at: row.get(18)?,
+        recheck_revision: row.get(19)?,
     })
 }
 
@@ -319,7 +325,6 @@ struct UnitRow {
     no_progress: i64,
     backoff_step: i64,
     next_attempt_at: i64,
-    fencing: i64,
     slice_width: Option<i64>,
     observed_cap: Option<i64>,
     planned_known: i64,
@@ -358,7 +363,6 @@ impl UnitRow {
             no_progress: count(self.no_progress)?,
             backoff_step: count(self.backoff_step)?,
             next_attempt_at_seconds: i64_to_u64(self.next_attempt_at)?,
-            fencing: self.fencing == 1,
             slice_width_seconds: optional(self.slice_width)?,
             observed_cap: self
                 .observed_cap
@@ -1131,9 +1135,15 @@ fn remainder_revision_tx(
 /// Drop parked and retired span parts below the retention floor, as the
 /// coverage prune does for ranges and goals, so every span stays inside the
 /// route's goal and any re-arm turns a parked span back into ordinary debt.
-/// Parked parts were added to the route's remainder first. Runs inside that
-/// prune.
+/// Parked parts were added to the route's remainder first. Fenced ranges
+/// wholly below the floor go too: nothing there is owed any more. Runs inside
+/// that prune.
 pub(crate) fn prune_spans_tx(conn: &Connection, floor: i64) -> StorageResult<()> {
+    conn.execute_cached(
+        "DELETE FROM account_recovery_unit_fences WHERE until_seconds < ?1",
+        [floor],
+    )
+    .storage()?;
     conn.execute_cached(
         "DELETE FROM account_recovery_unit_spans WHERE until_seconds < ?1",
         [floor],
@@ -1537,23 +1547,48 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Mark the unit's live range as fencing, or drop the fence.
-    pub fn set_recovery_unit_fencing(
+    /// Replace the capture debt the unit fences with `fences`: sorted,
+    /// disjoint ranges, none to drop its fence.
+    pub fn set_recovery_unit_fences(
         &self,
         route: &TransportReconciliationRoute,
         relay: &str,
-        fencing: bool,
+        fences: &[RecoveryCoverageRange],
     ) -> StorageResult<()> {
+        if relay.is_empty()
+            || fences
+                .iter()
+                .any(|range| range.since_seconds > range.until_seconds)
+            || fences
+                .windows(2)
+                .any(|pair| pair[1].since_seconds <= pair[0].until_seconds)
+        {
+            return Err(invalid());
+        }
+        let (kind, id) = route.storage_key();
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            ensure_unit_tx(&conn, route, relay)?;
-            let (kind, id) = route.storage_key();
             conn.execute_cached(
-                "UPDATE account_recovery_units SET fencing = ?4
+                "DELETE FROM account_recovery_unit_fences
                  WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3",
-                params![kind, id, relay, i64::from(fencing)],
+                params![kind, id, relay],
             )
             .storage()?;
+            for range in fences {
+                conn.execute_cached(
+                    "INSERT INTO account_recovery_unit_fences
+                     (route_kind, route_id, relay, since_seconds, until_seconds)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        kind,
+                        id,
+                        relay,
+                        integer(range.since_seconds)?,
+                        integer(range.until_seconds)?
+                    ],
+                )
+                .storage()?;
+            }
             Ok(())
         })
     }
@@ -1651,6 +1686,39 @@ impl SqliteAppStorage {
     /// Every unit the runner has touched.
     pub fn recovery_units(&self) -> StorageResult<Vec<RecoveryUnit>> {
         units_tx(&*self.lock()?, "", [])
+    }
+
+    /// Every fenced range, by unit and oldest first.
+    pub fn recovery_unit_fences(&self) -> StorageResult<Vec<RecoveryUnitFence>> {
+        self.lock()?
+            .prepare_cached(
+                "SELECT route_kind, route_id, relay, since_seconds, until_seconds
+                 FROM account_recovery_unit_fences
+                 ORDER BY route_kind, route_id, relay, since_seconds",
+            )
+            .storage()?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .storage()?
+            .map(|row| {
+                let (kind, id, relay, since, until) = row.storage()?;
+                Ok(RecoveryUnitFence {
+                    route: route_from(kind, &id)?,
+                    relay,
+                    range: RecoveryCoverageRange {
+                        since_seconds: i64_to_u64(since)?,
+                        until_seconds: i64_to_u64(until)?,
+                    },
+                })
+            })
+            .collect()
     }
 
     /// A unit's parked and retired spans, oldest first.

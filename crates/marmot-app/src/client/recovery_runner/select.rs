@@ -21,6 +21,7 @@ use storage_sqlite::{
 };
 use transport_nostr_adapter::sweep::{RelayCaps, SweepRange};
 
+use super::admission::Admission;
 use super::compare::{self, ComparePlan, PlannedRange};
 use super::quantum::QuantumReport;
 use super::{
@@ -55,6 +56,8 @@ pub(super) struct Survey {
     pub(super) rechecks: Vec<Candidate>,
     /// The account breaker's pause, while a cap is reached.
     pub(super) paused_until: Option<u64>,
+    /// The routes whose units hold their group's live frames behind a fence.
+    pub(super) fenced: BTreeSet<TransportReconciliationRoute>,
 }
 
 pub(super) enum Pick {
@@ -210,18 +213,6 @@ pub(super) fn suspended(_route: &RunnerRoute) -> bool {
     false
 }
 
-/// Whether staging holds this relay back until the group's laggard advances
-/// or leaves the admission frontier. PR 4b fills this from the staging bounds;
-/// until then nothing is held back.
-fn backpressured(
-    _app: &SqliteAppStorage,
-    _route: &RunnerRoute,
-    _relay: &str,
-    _policy: &RecoveryRunnerPolicy,
-) -> StorageResult<bool> {
-    Ok(false)
-}
-
 /// When the relay's cooldown ends, if one is running at `now`.
 pub(super) fn cooldown_until(
     app: &SqliteAppStorage,
@@ -250,6 +241,7 @@ pub(super) fn survey(turn: &DebtTurn<'_>, policy: &RecoveryRunnerPolicy) -> Stor
         .recovery_account_paused_until(&policy.unit, now)?
         .filter(|until| *until > now);
     let mut cooldowns = BTreeMap::new();
+    let mut admission = Admission::new(turn);
     let mut candidates = Vec::new();
     for route in sweepable(turn.routes) {
         for (relay, best_effort) in route.relays() {
@@ -272,17 +264,21 @@ pub(super) fn survey(turn: &DebtTurn<'_>, policy: &RecoveryRunnerPolicy) -> Stor
                 ),
             };
             let cooldown = cooldown_until(app, &mut cooldowns, relay, now)?;
+            let key = UnitKey {
+                route: route.route.clone(),
+                relay: relay.to_owned(),
+            };
+            // Staging holds a relay back until the group's laggard advances or
+            // leaves the admission frontier.
+            let backpressured = admission.backpressured(&key, &policy.staging)?;
             candidates.push(Candidate {
-                key: UnitKey {
-                    route: route.route.clone(),
-                    relay: relay.to_owned(),
-                },
+                key,
                 best_effort,
                 owed_seconds,
                 position: first.since_seconds,
                 last_served_at: unit.as_ref().and_then(|unit| unit.last_served_at_seconds),
                 due_at: retry_at.max(cooldown.unwrap_or(0)),
-                blocked: broken || suspended(route) || backpressured(app, route, relay, policy)?,
+                blocked: broken || suspended(route) || backpressured,
                 recheck: false,
             });
         }
@@ -291,6 +287,7 @@ pub(super) fn survey(turn: &DebtTurn<'_>, policy: &RecoveryRunnerPolicy) -> Stor
         candidates,
         rechecks: recheck::survey(turn, policy)?,
         paused_until,
+        fenced: admission.fenced_routes()?,
     })
 }
 
@@ -505,6 +502,9 @@ pub(super) fn begin(
                 || matches!(unit.state, RecoveryUnitState::Broken(_)) && !unit.probe
         })
     {
+        return Ok(None);
+    }
+    if Admission::new(turn).backpressured(key, &policy.staging)? {
         return Ok(None);
     }
     let mark = app.recovery_coverage_mark()?;
