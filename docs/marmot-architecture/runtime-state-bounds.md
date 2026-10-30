@@ -32,7 +32,7 @@ Tracking issue: marmot-protocol/mdk#381.
 
 ### Automatic Unrecoverable rejoin (`marmot-session/src/runtime/group_recovery.rs`)
 
-These bounds belong to convergence ledger policy A19, separate from A18's history-recovery parking budgets.
+These bounds belong to convergence ledger policy A21, separate from A18's history-recovery parking budgets.
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |

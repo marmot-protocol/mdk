@@ -1,5 +1,45 @@
 // Recovery eligibility must be checked before account-wide work or public KP rotation.
 #[tokio::test]
+async fn recovery_control_identity() {
+    let mut peers = recovery_peers(0).await;
+    let challenge = issue_recovery_challenge(&mut peers).await;
+    let expected = recovery_control(b"cancel-bob", &challenge).await;
+    let accepted = peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(
+            peers.recipient.self_id(),
+            challenge,
+        ))
+        .await
+        .unwrap();
+    assert!(!accepted.left_object_unpersisted);
+    let cgka_traits::IngestOutcome::GroupRecovery { recovery } = accepted.outcome else {
+        panic!("accepted control must retain its authenticated identity");
+    };
+    assert_eq!(*recovery, expected);
+
+    let expired = cgka_traits::GroupRecoveryMessage {
+        expires_at: peers.wall.now().0,
+        ..expected.message
+    };
+    let carrier = nostr_peeler(b"cancel-alice")
+        .wrap_group_recovery(&expired, &peers.recipient.self_id())
+        .await
+        .unwrap();
+    let rejected = peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(peers.recipient.self_id(), carrier))
+        .await
+        .unwrap();
+    assert!(rejected.left_object_unpersisted);
+    let cgka_traits::IngestOutcome::GroupRecovery { recovery } = rejected.outcome else {
+        panic!("rejected control must retain its authenticated identity");
+    };
+    assert_eq!(recovery.message, expired);
+    assert_eq!(recovery.sender, peers.coordinator.self_id());
+}
+
+#[tokio::test]
 async fn recovery_halted_job_retires() {
     use cgka_traits::GroupStorage;
     use storage_sqlite::{GroupRecoveryPhase, GroupRecoveryRole};
@@ -35,7 +75,11 @@ async fn recovery_halted_job_retires() {
             .find(|record| record.role == GroupRecoveryRole::Coordinator)
             .unwrap()
             .request_id;
-        peers.coordinator.advance_group_recovery().await.unwrap();
+        peers
+            .coordinator
+            .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+            .await
+            .unwrap();
         assert_eq!(peers.adapter.publishes().len(), published);
         let retired = storage
             .group_recovery(&peers.group, GroupRecoveryRole::Coordinator, &request_id)
@@ -156,7 +200,10 @@ async fn recovery_legacy_no_rotation() {
         recipient.prepare_group_recovery().unwrap(),
         vec![alice_id.clone()]
     );
-    recipient.advance_group_recovery().await.unwrap();
+    recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     coordinator
         .ingest_delivery(&recovery_inbox_delivery(
             alice_id.clone(),
@@ -165,7 +212,10 @@ async fn recovery_legacy_no_rotation() {
         .await
         .unwrap();
     coordinator.prepare_group_recovery().unwrap();
-    coordinator.advance_group_recovery().await.unwrap();
+    coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let challenged = recipient
         .ingest_delivery(&recovery_inbox_delivery(
             bob_id,
@@ -175,8 +225,9 @@ async fn recovery_legacy_no_rotation() {
         .unwrap();
     assert!(matches!(
         challenged.outcome,
-        cgka_traits::IngestOutcome::Processed
+        cgka_traits::IngestOutcome::GroupRecovery { .. }
     ));
+    assert!(!challenged.left_object_unpersisted);
     drop(recipient);
 
     let publisher = RecordingKeyPackages::default();
@@ -204,7 +255,9 @@ async fn recovery_legacy_no_rotation() {
     for elapsed in [0, 5, 20, 600, 1_200, 2_400] {
         wall.set(now + elapsed);
         recipient.prepare_group_recovery().unwrap();
-        let result = recipient.advance_group_recovery().await;
+        let result = recipient
+            .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+            .await;
         assert!(
             publisher.publications().is_empty(),
             "incompatible recovery must not publish a fresh KeyPackage"
@@ -294,7 +347,11 @@ async fn recovery_quarantine_isolated() {
     // The older orphan may consume a reservation, but cannot abort this or the next turn.
     for _ in 0..2 {
         peers.recipient.prepare_group_recovery().unwrap();
-        peers.recipient.advance_group_recovery().await.unwrap();
+        peers
+            .recipient
+            .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+            .await
+            .unwrap();
     }
     let controls = peers.bob_adapter.publishes();
     assert_eq!(
@@ -314,10 +371,15 @@ async fn recovery_quarantine_isolated() {
         .unwrap();
     assert!(matches!(
         received.outcome,
-        cgka_traits::IngestOutcome::Processed
+        cgka_traits::IngestOutcome::GroupRecovery { .. }
     ));
+    assert!(!received.left_object_unpersisted);
     peers.coordinator.prepare_group_recovery().unwrap();
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let challenge = peers.adapter.publishes().last().unwrap().message.clone();
     let received = peers
         .recipient
@@ -326,10 +388,15 @@ async fn recovery_quarantine_isolated() {
         .unwrap();
     assert!(matches!(
         received.outcome,
-        cgka_traits::IngestOutcome::Processed
+        cgka_traits::IngestOutcome::GroupRecovery { .. }
     ));
+    assert!(!received.left_object_unpersisted);
     peers.recipient.prepare_group_recovery().unwrap();
-    peers.recipient.advance_group_recovery().await.unwrap();
+    peers
+        .recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     assert_eq!(
         peers.bob_adapter.publishes().len(),
         2,
@@ -366,13 +433,21 @@ async fn recovery_same_device_refresh() {
         .unwrap();
     let advanced_epoch = peers.coordinator.session().epoch(&peers.group).unwrap();
     assert!(advanced_epoch > old_source.epoch);
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     peers.wall.set(peers.wall.now().0 + 5);
     assert_eq!(
         peers.coordinator.prepare_group_recovery().unwrap(),
         vec![peers.recipient.self_id()]
     );
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let refreshed = peers.adapter.publishes().last().unwrap().message.clone();
     let authenticated = recovery_control(b"cancel-bob", &refreshed).await;
     let GroupRecoveryBody::Challenge { source } = &authenticated.message.body else {
@@ -396,10 +471,15 @@ async fn recovery_same_device_refresh() {
         .unwrap();
     assert!(matches!(
         accepted.outcome,
-        cgka_traits::IngestOutcome::Processed
+        cgka_traits::IngestOutcome::GroupRecovery { .. }
     ));
+    assert!(!accepted.left_object_unpersisted);
     peers.recipient.prepare_group_recovery().unwrap();
-    peers.recipient.advance_group_recovery().await.unwrap();
+    peers
+        .recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let grant = peers
         .bob_adapter
         .publishes()
@@ -414,10 +494,15 @@ async fn recovery_same_device_refresh() {
         .unwrap();
     assert!(matches!(
         accepted.outcome,
-        cgka_traits::IngestOutcome::Processed
+        cgka_traits::IngestOutcome::GroupRecovery { .. }
     ));
+    assert!(!accepted.left_object_unpersisted);
     peers.coordinator.prepare_group_recovery().unwrap();
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let welcome = peers
         .adapter
         .publishes()

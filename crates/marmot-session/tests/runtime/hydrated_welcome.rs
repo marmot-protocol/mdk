@@ -237,8 +237,9 @@ async fn recovery_ingest_drains_native() {
 
         assert!(matches!(
             ingested.outcome,
-            cgka_traits::IngestOutcome::Ignored { .. }
+            cgka_traits::IngestOutcome::GroupRecovery { .. }
         ));
+        assert!(ingested.left_object_unpersisted);
         assert!(matches!(
             runtime.epoch_state(&group),
             Some(cgka_traits::EpochState::Stable { .. })

@@ -137,8 +137,8 @@ it from a Welcome. They use the account inbox, not the broken group's encryption
 Kind `1159` is proposed, not allocated; the wire contract and older-client rollout questions are tracked in
 [marmot#451](https://github.com/marmot-protocol/marmot/issues/451).
 
-Migration 0131 advances account storage to schema 131 after migration 0130. It adds the
-protocol-owned `cgka_group_rejoin` journal and gates older writers. These rejoin bounds belong to ledger policy A19,
+Migration 0135 advances account storage to schema 135 after migration 0134. It adds the
+protocol-owned `cgka_group_rejoin` journal and gates older writers. These rejoin bounds belong to ledger policy A21,
 separate from A18's history-recovery parking budgets. Retry reservations precede directory and network work. One recipient episode
 permits 32 reservations across nonce rotation, request expiry, phase changes, cancellation and reopen. A newer
 authenticated coordinator epoch may refill that budget once. The persisted `remote_rearmed` flag survives nonce rotation
@@ -174,6 +174,11 @@ Restored coordinators hydrate their group before advancing a retained Challenge 
 Rust hosts drive `prepare_group_recovery`, resolve only
 the returned members' safe inbox routes, then call `advance_group_recovery` in their existing account loop. Both
 methods belong to the same runtime owner; preparation durably reserves each turn before cancellable lookup work.
+Pass the host-held group IDs and a caller-owned `AccountDeviceEffects` buffer. Apply appended effects before
+propagating the result, including an error: a roster update may have committed before a later publication failed.
+Name the trusted device group through `set_key_package_announcement_group` and `set_device_tag_group` before
+advancing. Recovery settles this device's tag signature key and announces the exact replacement KeyPackage before
+publishing it. A held device group defers those roster writes without replacing the retained Challenge or Grant.
 Hosts can read `group_rejoin_status` as `Inactive`, `Pending { attempts }` or `Parked { attempts }`. A parked episode
 lets a host ask the user to retry or request an admin re-add.
 `retry_group_rejoin` explicitly starts a new budget only for an eligible Unrecoverable copy; it grants no authority

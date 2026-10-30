@@ -3948,14 +3948,21 @@ where
                 ..
             }) => {
                 let ingested = self
-                    .ingest_group_recovery(&delivery.message, *recovery)
+                    .ingest_group_recovery(&delivery.message, &recovery)
                     .await;
                 observe(
                     AccountIngestPhase::Engine,
                     started.elapsed(),
                     ingested.is_ok(),
                 );
-                let mut ingested = ingested?;
+                let accepted = ingested?;
+                let mut ingested = AccountIngestEffects {
+                    // Preserve the authenticated classification for consumers;
+                    // accepting a recovery control is not accepting a Welcome.
+                    outcome: IngestOutcome::GroupRecovery { recovery },
+                    left_object_unpersisted: !accepted,
+                    effects: AccountDeviceEffects::default(),
+                };
                 let restored = self.session.drain();
                 if !restored.is_empty() {
                     let started = Instant::now();

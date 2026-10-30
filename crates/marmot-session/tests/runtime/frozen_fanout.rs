@@ -2833,7 +2833,11 @@ async fn recovery_one_admin_device() {
     );
     let prior = peers.adapter.publishes().len();
     peers.recipient.prepare_group_recovery().unwrap();
-    peers.recipient.advance_group_recovery().await.unwrap();
+    peers
+        .recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let request = peers
         .bob_adapter
         .publishes()
@@ -2847,7 +2851,10 @@ async fn recovery_one_admin_device() {
             .await
             .unwrap();
         coordinator.prepare_group_recovery().unwrap();
-        coordinator.advance_group_recovery().await.unwrap();
+        coordinator
+            .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+            .await
+            .unwrap();
     }
     for adapter in [&peers.adapter, &sibling_adapter] {
         let challenge = adapter.publishes().last().unwrap().message.clone();
@@ -2858,7 +2865,11 @@ async fn recovery_one_admin_device() {
             .unwrap();
     }
     peers.recipient.prepare_group_recovery().unwrap();
-    peers.recipient.advance_group_recovery().await.unwrap();
+    peers
+        .recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let grant = peers
         .bob_adapter
         .publishes()
@@ -2872,7 +2883,10 @@ async fn recovery_one_admin_device() {
             .await
             .unwrap();
         coordinator.prepare_group_recovery().unwrap();
-        coordinator.advance_group_recovery().await.unwrap();
+        coordinator
+            .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+            .await
+            .unwrap();
     }
     let sent = peers.adapter.publishes();
     let commits = sent[prior..]
@@ -2928,7 +2942,11 @@ async fn recovery_lost_welcome() {
     let mut peers = recovery_peers(0).await;
     let old_leaf = peers.recipient.own_leaf_index(&peers.group).unwrap();
     exchange_recovery(&mut peers).await;
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let bob_id = peers.recipient.self_id();
     let current = peers
         .coordinator
@@ -2951,7 +2969,11 @@ async fn recovery_lost_welcome() {
         .message;
     peers.wall.set(peers.wall.now().0 + 1_200);
     exchange_recovery(&mut peers).await;
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let replacement = peers
         .adapter
         .publishes()
@@ -2995,7 +3017,11 @@ enum RecoveryCancelPoint {
 async fn recovery_heal_race() {
     let mut peers = recovery_peers(0).await;
     exchange_recovery(&mut peers).await;
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let first = peers
         .adapter
         .publishes()
@@ -3019,7 +3045,11 @@ async fn recovery_heal_race() {
             .unrecoverable
     );
     // Its second grant was already delivered before the first Welcome healed it.
-    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers
+        .coordinator
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let attempts = peers.adapter.publishes();
     let commit = attempts
         .iter()
@@ -3230,11 +3260,17 @@ async fn exchange_recovery(peers: &mut RecoveryPeers) {
         .await
         .unwrap();
     assert!(
-        matches!(challenged.outcome, cgka_traits::IngestOutcome::Processed),
+        matches!(
+            challenged.outcome,
+            cgka_traits::IngestOutcome::GroupRecovery { .. }
+        ) && !challenged.left_object_unpersisted,
         "a selected coordinator's source must not be ordered against the losing native branch"
     );
     recipient.prepare_group_recovery().unwrap();
-    recipient.advance_group_recovery().await.unwrap();
+    recipient
+        .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+        .await
+        .unwrap();
     let grant = bob_adapter.publishes().last().unwrap().message.clone();
     coordinator
         .ingest_delivery(&recovery_inbox_delivery(alice_id.clone(), grant))
@@ -3266,7 +3302,8 @@ async fn assert_recovery_cancel(point: RecoveryCancelPoint) {
         RecoveryCancelPoint::Welcome => inbox,
     };
     *adapter.inner.endpoint_gate.lock().unwrap() = Some((endpoint, gate));
-    let mut publication = Box::pin(coordinator.advance_group_recovery());
+    let mut in_flight = AccountDeviceEffects::default();
+    let mut publication = Box::pin(coordinator.advance_group_recovery(&[], &mut in_flight));
     tokio::time::timeout(Duration::from_secs(10), async {
         tokio::select! {
             _ = async {
@@ -3330,7 +3367,11 @@ async fn assert_recovery_cancel(point: RecoveryCancelPoint) {
     // owns its exact retry and Welcome on this same live runtime.
     wall.set(now + 1_200);
     coordinator.prepare_group_recovery().unwrap();
-    let resumed = coordinator.advance_group_recovery().await.unwrap();
+    let mut resumed = AccountDeviceEffects::default();
+    coordinator
+        .advance_group_recovery(&[], &mut resumed)
+        .await
+        .unwrap();
     if matches!(point, RecoveryCancelPoint::Commit) {
         assert!(matches!(
             resumed.pending.as_slice(),

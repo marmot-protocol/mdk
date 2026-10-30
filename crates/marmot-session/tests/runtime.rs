@@ -35,8 +35,8 @@ use cgka_traits::{
     TransportPublishTarget,
 };
 use marmot_session::{
-    AccountDeviceRuntime, AccountDeviceSession, AccountError, KeyPackagePublication,
-    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
+    AccountDeviceEffects, AccountDeviceRuntime, AccountDeviceSession, AccountError,
+    KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
     KeyPackageSlotWithdrawal, MaintenanceRandom, MaintenanceTiming, MonotonicClock,
     NoopKeyPackagePublisher, PendingResolution, PublishWork, PublishedApplicationMessage,
     SessionConfig, SessionError, StaticTransportRouting, TransportRoutingError,
