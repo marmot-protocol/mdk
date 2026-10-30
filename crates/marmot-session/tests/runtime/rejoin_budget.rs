@@ -1,5 +1,43 @@
 // Exercise the runtime owner: reservations precede lookup and survive request TTLs.
 #[tokio::test]
+async fn recovery_batch_keeps_effects() {
+    let mut peers = recovery_peers(0).await;
+    exchange_recovery(&mut peers).await;
+    let before = peers.coordinator.session().epoch(&peers.group).unwrap();
+    let connection = rusqlite::Connection::open(peers._dir.path().join("alice.sqlite")).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &SqlCipherKey::new("live recovery cancellation key").unwrap(),
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_recovery_completion BEFORE UPDATE ON cgka_group_rejoin
+         WHEN NEW.role = 1 AND json_extract(CAST(NEW.record AS TEXT), '$.record.phase') = 'complete'
+         BEGIN SELECT RAISE(ABORT, 'injected recovery completion failure'); END;",
+        )
+        .unwrap();
+    let mut effects = AccountDeviceEffects::default();
+    assert!(
+        peers
+            .coordinator
+            .advance_group_recovery(&[], &mut effects)
+            .await
+            .is_err()
+    );
+    let after = peers.coordinator.session().epoch(&peers.group).unwrap();
+    assert_eq!(after, EpochId(before.0 + 1));
+    assert!(
+        effects.events.iter().any(|event| matches!(
+            event, GroupEvent::EpochChanged { group_id, from, to }
+                if group_id == &peers.group && from == &before && to == &after
+        )),
+        "a confirmed recovery Commit's effects must survive its later journal failure"
+    );
+}
+
+#[tokio::test]
 async fn recovery_welcome_live_retry() {
     let mut peers = recovery_peers(0).await;
     peers.coordinator.run_due_maintenance().await.unwrap();

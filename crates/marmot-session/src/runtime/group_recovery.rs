@@ -466,7 +466,7 @@ where
             .first()
             .is_some_and(|record| record.role == Role::Coordinator && record.phase == Phase::Grant)
         {
-            output.extend(self.stage_recovery_batch(ready).await?);
+            self.stage_recovery_batch(ready, output).await?;
             return Ok(());
         }
         for mut record in ready {
@@ -1003,8 +1003,8 @@ where
     async fn stage_recovery_batch(
         &mut self,
         mut records: Vec<Record>,
-    ) -> AccountResult<AccountDeviceEffects> {
-        let mut output = AccountDeviceEffects::default();
+        output: &mut AccountDeviceEffects,
+    ) -> AccountResult<()> {
         let now = self.wall_clock.now().0;
         let retained = self
             .session
@@ -1027,7 +1027,7 @@ where
                 })
         });
         if records.is_empty() {
-            return Ok(output);
+            return Ok(());
         }
         let mut members = Vec::with_capacity(records.len());
         for record in &records {
@@ -1040,7 +1040,7 @@ where
                 return Err(EngineError::Backend("invalid durable recovery grant".into()).into());
             };
             if record.expires_at <= now {
-                return Ok(output);
+                return Ok(());
             }
             // The retained challenge already has the correct inbox envelope.
             if let Some(carrier) = &record.outbound {
@@ -1082,7 +1082,7 @@ where
                         .put_group_recovery(record)
                         .map_err(SessionError::from)?;
                 }
-                return Ok(output);
+                return Ok(());
             }
             Err(error) => return Err(error.into()),
         };
@@ -1107,7 +1107,7 @@ where
         if let Err(error) = saved {
             // No transport call has occurred. Roll back the staged MLS change.
             let rollback = self.session.publish_failed(pending).await?;
-            self.publish_session_effects(rollback).await?;
+            output.extend(self.publish_session_effects(rollback).await?);
             return Err(SessionError::from(error).into());
         }
         // Direct recovery sends bypass the prepared-send Welcome watcher.
@@ -1116,7 +1116,7 @@ where
                 self.watch_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
             }
         }
-        output.absorb_account_effects(self.publish_session_effects(effects).await?);
+        output.extend(self.publish_session_effects(effects).await?);
         for record in &mut records {
             self.reconcile_recovery_commit(record)?;
             self.session
@@ -1124,7 +1124,7 @@ where
                 .put_group_recovery(record)
                 .map_err(SessionError::from)?;
         }
-        Ok(output)
+        Ok(())
     }
 
     fn recovery_commit_withdrawn(&self, record: &Record) -> AccountResult<bool> {
