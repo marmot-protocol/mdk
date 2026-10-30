@@ -513,15 +513,17 @@ fn deliver_carrier(device: &Device, device_group: &GroupId, carrier: &[u8]) {
 /// A sibling Welcome back into a chat whose copy the laptop still holds
 /// active, such as one that reaches it before the removal it follows, leaves
 /// a rejoin offer that keeps its route and the KeyPackage issued. The removal
-/// landing joins it, and so does consent. An offer whose carrier is withdrawn
-/// first is retired and joins nothing.
+/// landing joins it, and so does consent. Each carrier of the Welcome keeps
+/// its own offer, so a withdrawn one is retired and joins nothing while
+/// another still joins, and a retired one leaves the Welcome free to join
+/// when it arrives again.
 #[tokio::test]
 async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route() {
     let mut phone = device(b"alice", true);
     let mut laptop = device(b"alice", true);
     laptop
         .engine
-        .issue_private_key_packages(&SLOT, 4, None, NOW)
+        .issue_private_key_packages(&SLOT, 5, None, NOW)
         .unwrap();
     let issued = laptop.engine.issued_private_key_packages().unwrap();
     let private = |index: usize| current(issued[index].key_package.clone());
@@ -555,7 +557,7 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
         .await,
         offered
     );
-    assert_eq!(held(&laptop), 3);
+    assert_eq!(held(&laptop), 4);
     let offers = laptop.engine.pending_group_rejoins_for(Some(&gid)).unwrap();
     assert_eq!(offers.len(), 1);
     assert_eq!(
@@ -566,12 +568,7 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
             key_package_ref: reference(1).to_vec(),
         })
     );
-    laptop.engine.ingest(remove).await.unwrap();
-    laptop
-        .engine
-        .converge_stored_openmls_messages_at(&gid, 1_000_000)
-        .unwrap();
-    assert!(laptop.engine.group_record(&gid).unwrap().removed);
+    remove_laptop(&mut laptop, &gid, remove).await;
     assert!(
         laptop
             .engine
@@ -584,7 +581,7 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
         laptop.engine.epoch(&gid).unwrap(),
         phone.engine.epoch(&gid).unwrap()
     );
-    assert_eq!(held(&laptop), 2);
+    assert_eq!(held(&laptop), 3);
     assert!(
         laptop
             .engine
@@ -620,29 +617,90 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
         laptop.engine.epoch(&gid).unwrap(),
         phone.engine.epoch(&gid).unwrap()
     );
-    assert_eq!(held(&laptop), 1);
+    assert_eq!(held(&laptop), 2);
 
-    // A withdrawn carrier retires the offer, and the KeyPackage stays issued.
+    // Another carrier of the Welcome keeps its own offer: the withdrawn one is
+    // retired and the delivered one joins.
     let (remove, welcome) = remove_and_add_back(&mut phone, &laptop, &gid, private(3)).await;
+    let sibling = sibling_welcome(&welcome, SLOT, reference(3));
     deliver_carrier(&laptop, &device_group, b"withdrawn");
     assert_eq!(
-        join_sibling(
-            &mut laptop,
-            b"withdrawn",
-            &sibling_welcome(&welcome, SLOT, reference(3))
-        )
-        .await,
+        join_sibling(&mut laptop, b"withdrawn", &sibling).await,
         offered
     );
-    laptop
-        .storage
-        .update_message_state(&hash_id(b"withdrawn"), MessageState::EpochInvalidated)
-        .unwrap();
-    laptop.engine.ingest(remove).await.unwrap();
-    laptop
+    withdraw_carrier(&laptop, b"withdrawn");
+    deliver_carrier(&laptop, &device_group, b"redelivered");
+    assert_eq!(
+        join_sibling(&mut laptop, b"redelivered", &sibling).await,
+        offered
+    );
+    let carriers: Vec<_> = laptop
         .engine
-        .converge_stored_openmls_messages_at(&gid, 1_000_000)
-        .unwrap();
+        .pending_group_rejoins_for(Some(&gid))
+        .unwrap()
+        .into_iter()
+        .map(|offer| offer.rejoin.unwrap().sibling.unwrap().carrier)
+        .collect();
+    assert_eq!(
+        carriers,
+        vec![hash_id(b"withdrawn"), hash_id(b"redelivered")]
+    );
+    remove_laptop(&mut laptop, &gid, remove).await;
+    assert!(
+        laptop
+            .engine
+            .retry_rejoins_after_trusted_removal()
+            .await
+            .unwrap()
+    );
+    assert!(!laptop.engine.group_record(&gid).unwrap().removed);
+    assert_eq!(
+        laptop.engine.epoch(&gid).unwrap(),
+        phone.engine.epoch(&gid).unwrap()
+    );
+    assert_eq!(held(&laptop), 1);
+    assert!(
+        laptop
+            .engine
+            .pending_group_rejoins_for(None)
+            .unwrap()
+            .is_empty()
+    );
+
+    // A withdrawn carrier retires its offer, on confirmation and on the retry,
+    // leaving the KeyPackage issued and the Welcome free to arrive again.
+    let (remove, welcome) = remove_and_add_back(&mut phone, &laptop, &gid, private(4)).await;
+    let sibling = sibling_welcome(&welcome, SLOT, reference(4));
+    deliver_carrier(&laptop, &device_group, b"withdrawn before consent");
+    assert_eq!(
+        join_sibling(&mut laptop, b"withdrawn before consent", &sibling).await,
+        offered
+    );
+    withdraw_carrier(&laptop, b"withdrawn before consent");
+    let [offer] =
+        <[_; 1]>::try_from(laptop.engine.pending_group_rejoins_for(Some(&gid)).unwrap()).unwrap();
+    let token = offer.rejoin.unwrap().local_state_token;
+    assert!(matches!(
+        laptop
+            .engine
+            .confirm_group_rejoin(&offer.message_id, &token)
+            .await,
+        Err(EngineError::InvalidWelcome)
+    ));
+    assert!(
+        laptop
+            .engine
+            .pending_group_rejoins_for(None)
+            .unwrap()
+            .is_empty()
+    );
+    deliver_carrier(&laptop, &device_group, b"withdrawn before removal");
+    assert_eq!(
+        join_sibling(&mut laptop, b"withdrawn before removal", &sibling).await,
+        offered
+    );
+    withdraw_carrier(&laptop, b"withdrawn before removal");
+    remove_laptop(&mut laptop, &gid, remove).await;
     assert!(
         !laptop
             .engine
@@ -659,6 +717,31 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
             .is_empty()
     );
     assert_eq!(held(&laptop), 1);
+    assert_eq!(
+        join_sibling(&mut laptop, b"after removal", &sibling).await,
+        IngestOutcome::Processed
+    );
+    assert!(!laptop.engine.group_record(&gid).unwrap().removed);
+    assert_eq!(held(&laptop), 0);
+}
+
+/// Withdraw the message that carried a sibling Welcome, as a branch switch
+/// does.
+fn withdraw_carrier(device: &Device, carrier: &[u8]) {
+    device
+        .storage
+        .update_message_state(&hash_id(carrier), MessageState::EpochInvalidated)
+        .unwrap();
+}
+
+/// The laptop takes in the commit removing it from `gid`.
+async fn remove_laptop(laptop: &mut Device, gid: &GroupId, remove: TransportMessage) {
+    laptop.engine.ingest(remove).await.unwrap();
+    laptop
+        .engine
+        .converge_stored_openmls_messages_at(gid, 1_000_000)
+        .unwrap();
+    assert!(laptop.engine.group_record(gid).unwrap().removed);
 }
 
 /// A sibling Welcome decodes only from its exact encoding.

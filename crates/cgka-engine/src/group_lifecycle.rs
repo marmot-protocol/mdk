@@ -1890,12 +1890,18 @@ impl<S: StorageProvider> Engine<S> {
         });
         if let Some(candidate) = pending_rejoin {
             // Bound stored offers; retain the exact first copy/revision on duplicates.
+            // A sibling offer is its carrier's, so another carrier of the same
+            // Welcome keeps its own: withdrawing one retires only that one.
             let existing = self.storage.list_welcomes()?;
             if existing.iter().any(|old| {
                 old.rejoin
                     .as_ref()
                     .zip(candidate.rejoin.as_ref())
-                    .is_some_and(|(a, b)| a.content_id == b.content_id)
+                    .is_some_and(|(a, b)| {
+                        a.content_id == b.content_id
+                            && a.sibling.as_ref().map(|route| &route.carrier)
+                                == b.sibling.as_ref().map(|route| &route.carrier)
+                    })
             }) {
                 // Keep the first offer without terminally deduplicating its
                 // content: trusted removal may still make it auto-joinable.
