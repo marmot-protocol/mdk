@@ -55,8 +55,14 @@ pub(crate) fn is_device_group_kind(kind: u64) -> bool {
 impl AppClient {
     /// Take a message from a device-group event and hand it to the feature
     /// that owns its kind. Anything else is ignored, and so is anything that
-    /// feature finds not addressed to this device.
-    pub(crate) fn observe_device_group_event(&mut self, event: &GroupEvent) {
+    /// feature finds not addressed to this device. A refused message is
+    /// logged and dropped. An error means a sibling Welcome was admitted but
+    /// not kept: the event's projection fails and is retried, as any failed
+    /// projection write is.
+    pub(crate) fn observe_device_group_event(
+        &mut self,
+        event: &GroupEvent,
+    ) -> Result<(), AppError> {
         let GroupEvent::MessageReceived {
             group_id,
             message_id,
@@ -66,10 +72,10 @@ impl AppClient {
             ..
         } = event
         else {
-            return;
+            return Ok(());
         };
         let Ok(message) = MarmotAppEvent::decode(payload) else {
-            return;
+            return Ok(());
         };
         let result = match message.kind {
             KIND_PRIVATE_KEY_PACKAGE_REQUEST => self.receive_key_package_request(
@@ -83,14 +89,18 @@ impl AppClient {
                 (*epoch, *sender_leaf_index),
                 &message.content,
             ),
-            KIND_SIBLING_WELCOME => self.receive_sibling_welcome(
+            KIND_SIBLING_WELCOME => match self.admit_sibling_welcome(
                 group_id,
                 message_id,
                 (*epoch, *sender_leaf_index),
                 message.created_at,
                 &message.content,
-            ),
-            _ => return,
+            ) {
+                Ok(Some(admitted)) => return self.stash_sibling_welcome(&admitted),
+                Ok(None) => Ok(()),
+                Err(refused) => Err(refused),
+            },
+            _ => return Ok(()),
         };
         if let Err(error) = result {
             tracing::warn!(
@@ -101,6 +111,7 @@ impl AppClient {
                 "a device-group message was refused"
             );
         }
+        Ok(())
     }
 
     /// Refuse a message unless the leaf that sent it, at the message's epoch,

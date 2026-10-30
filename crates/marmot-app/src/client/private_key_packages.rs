@@ -36,7 +36,10 @@
 //!   when its relays are valid and its KeyPackage is one this device issued
 //!   to its sender. The dispatch that reads it cannot wait for a join, so an
 //!   admitted one is stashed (migration 0160) and each maintenance pass joins
-//!   from the stash, before upkeep tops the sender's stock up again.
+//!   from the stash, before upkeep tops the sender's stock up again. A
+//!   refused one is dropped like a refused hand-off; one admitted but not
+//!   stashed fails the event's projection, which is retried, so a failed
+//!   write never loses it.
 
 use base64::Engine as _;
 use cgka_traits::app_components::{
@@ -221,21 +224,22 @@ impl AppClient {
         Ok(())
     }
 
-    /// Stash a sibling Welcome that adds this device to a chat, for the next
-    /// maintenance pass to join. Beyond a hand-off's checks, its relays must
-    /// be one to [`NOSTR_ROUTING_MAX_RELAYS`] distinct relay URLs, and its
-    /// KeyPackage one this device issued to the sender and still holds; the
-    /// join checks that KeyPackage again.
-    pub(super) fn receive_sibling_welcome(
+    /// Admit a sibling Welcome that adds this device to a chat, for
+    /// [`Self::stash_sibling_welcome`] to keep. Beyond a hand-off's checks,
+    /// its relays must be one to [`NOSTR_ROUTING_MAX_RELAYS`] distinct relay
+    /// URLs, and its KeyPackage one this device issued to the sender and
+    /// still holds; the join checks that KeyPackage again. `None` when it is
+    /// not addressed to this device.
+    pub(super) fn admit_sibling_welcome(
         &mut self,
         group_id: &GroupId,
         message_id: &MessageId,
         sender: (EpochId, Option<u32>),
         created_at: u64,
         content: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<Option<StashedSiblingWelcome>, AppError> {
         let Some(exchange) = self.private_key_package_exchange()? else {
-            return Ok(());
+            return Ok(None);
         };
         let invalid = || AppError::InvalidAppMessagePayload("sibling Welcome".into());
         let bytes = base64::engine::general_purpose::STANDARD
@@ -243,7 +247,7 @@ impl AppClient {
             .map_err(|_| invalid())?;
         let welcome = SiblingWelcome::decode(&bytes).map_err(|_| invalid())?;
         if &exchange.group_id != group_id || welcome.to != exchange.own_slot {
-            return Ok(());
+            return Ok(None);
         }
         if !exchange.is_sibling(&welcome.from) {
             return Err(AppError::DeviceGroupRefused("unknown_sibling"));
@@ -265,19 +269,29 @@ impl AppClient {
                 "key_package_not_issued_to_sender",
             ));
         }
+        Ok(Some(StashedSiblingWelcome {
+            message_id_hex: hex::encode(message_id.as_slice()),
+            content: bytes,
+            created_at,
+            received_at: unix_now_seconds(),
+        }))
+    }
+
+    /// Keep an admitted sibling Welcome for the next maintenance pass to
+    /// join. One more than the stash holds is dropped; its sender's resend
+    /// (3.5e) is the repair.
+    pub(super) fn stash_sibling_welcome(
+        &mut self,
+        admitted: &StashedSiblingWelcome,
+    ) -> Result<(), AppError> {
         let stashed = self
             .app
             .account_storage(&self.state.label)?
             .app_storage()
-            .stash_sibling_welcome(&StashedSiblingWelcome {
-                message_id_hex: hex::encode(message_id.as_slice()),
-                content: bytes,
-                created_at,
-                received_at: unix_now_seconds(),
-            })?;
+            .stash_sibling_welcome(admitted)?;
         tracing::debug!(
             target: TRACE_TARGET,
-            method = "receive_sibling_welcome",
+            method = "stash_sibling_welcome",
             stashed,
             "stashed a sibling Welcome"
         );

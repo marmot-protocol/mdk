@@ -661,3 +661,93 @@ async fn a_device_stashes_only_a_sibling_welcome_it_can_trust() {
     deliver_all(&mut devices.phone, &devices.relay).await;
     assert_eq!(stashed(&devices.phone), 1);
 }
+
+/// Deliver every group message on `relay` to `client`, whatever projecting
+/// it does.
+async fn deliver_group_messages_letting_projection_fail(
+    client: &mut AppClient,
+    relay: &ScriptedPushRelayClient,
+) -> usize {
+    let events = relay.published_events.lock().unwrap().clone();
+    let account = client
+        .app
+        .account_home()
+        .account(&client.state.label)
+        .unwrap();
+    let mut failed = 0;
+    for event in events
+        .iter()
+        .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+    {
+        let delivery = cgka_traits::TransportDelivery {
+            account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+            group_id_hint: None,
+            message: event.to_transport_message().unwrap(),
+            received_at: cgka_traits::Timestamp(unix_now_seconds()),
+            source: cgka_traits::TransportDeliverySource {
+                transport: cgka_traits::transport::TransportSource("nostr".into()),
+                plane: cgka_traits::TransportDeliveryPlane::Group,
+                endpoint: None,
+                subscription_id: None,
+                wire: None,
+            },
+        };
+        failed += usize::from(client.ingest_received_delivery(delivery).await.is_err());
+    }
+    failed
+}
+
+/// A sibling Welcome admitted while its stash write fails is not lost: the
+/// event's projection fails, is retried once the write works again, and the
+/// phone joins the chat once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_whose_stash_write_fails_is_kept_on_retry() {
+    let (mut devices, group) = tagging_devices().await;
+    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
+    send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
+
+    let app = &devices.phone_app;
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_stash BEFORE INSERT ON sibling_welcomes_received
+             BEGIN SELECT RAISE(ABORT, 'injected stash failure'); END;",
+        )
+        .unwrap();
+    let failed =
+        deliver_group_messages_letting_projection_fail(&mut devices.phone, &devices.relay).await;
+    assert!(failed > 0);
+    assert_eq!(stashed(&devices.phone), 0);
+
+    connection.execute_batch("DROP TRIGGER fail_stash").unwrap();
+    devices.phone.drain_pending_session_events().await.unwrap();
+    assert_eq!(stashed(&devices.phone), 1);
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert_eq!(stashed(&devices.phone), 0);
+    assert!(devices.phone.state_group_record(&chat).is_some());
+
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert_eq!(stashed(&devices.phone), 0);
+    assert_eq!(
+        devices
+            .phone
+            .state
+            .groups
+            .iter()
+            .filter(|record| record.group_id_hex == hex::encode(chat.as_slice()))
+            .count(),
+        1
+    );
+}

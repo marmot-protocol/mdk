@@ -207,7 +207,7 @@ impl AppClient {
             // Its roster may now hold a slot this device rejected, or have
             // lost a rejection it made (mdk#2628 3.2).
             self.recheck_sign_in_rejections();
-            self.observe_device_group_event(event);
+            self.observe_device_group_event(event)?;
             return Ok(Some(self.ensure_device_group_route(group_id)?));
         }
         if batch_start_frontier.is_none() && self.state_group_record(group_id).is_some() {

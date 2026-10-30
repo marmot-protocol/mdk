@@ -143,7 +143,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   device has used is never kept again if a sibling hands it over again (mdk#2628 D42).
   Stash a sibling Welcome (461, mdk#2628 3.5b) only after a hand-off's checks, a relay list of one to 16 distinct
   relay URLs, and a KeyPackage this device issued to its sender; join from the stash (migration 0160) in the
-  maintenance pass, never in the synchronous dispatch, and drain the joins' events as a confirmed rejoin does.
+  maintenance pass, never in the synchronous dispatch, and drain the joins' events as a confirmed rejoin does. A
+  refused 461 is dropped; one admitted but not stashed fails the event's projection, which is retried.
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.
