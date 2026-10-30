@@ -180,10 +180,7 @@ pub(crate) enum UnpublishedWelcomeKind {
     },
     /// The invite's Welcomes by id. The engine holds their bytes; the drive
     /// asks the runtime to publish those still owed.
-    Invite {
-        welcome_ids: Vec<MessageId>,
-        welcome_intents: Vec<String>,
-    },
+    Invite { welcome_ids: Vec<MessageId> },
 }
 
 pub(crate) struct UnpublishedWelcomeDelivery {
@@ -3158,58 +3155,14 @@ impl AppClient {
             }
             _ => None,
         };
-        // The invite is staged locally but not canonical yet. Record every
-        // Welcome destination atomically before exposing the commit; if that
-        // persistence fails, roll back the staged MLS change and return the
-        // original error so a retry cannot create phantom local membership.
-        let welcome_intent_result = if cfg!(feature = "test-policy-overrides")
-            && self.app.config.dev_fail_invite_welcome_intent
-        {
-            Err(AppError::Publish(
-                "injected invite welcome intent failure".into(),
-            ))
-        } else {
-            self.record_welcome_delivery_intents(group_id, prepared.welcomes())
-        };
-        let welcome_intents = match welcome_intent_result {
-            Ok(welcome_intents) => welcome_intents,
-            Err(error) => {
-                if let Some(snapshot) = push_snapshot {
-                    self.restore_push_snapshot_owed(snapshot);
-                }
-                let rollback = self
-                    .runtime
-                    .rollback_prepared_session_commit(prepared)
-                    .await
-                    .map_err(AppError::from);
-                record_app_performance(
-                    telemetry,
-                    AppPerformanceOperation::GroupInviteEnginePublish,
-                    engine_publish_started_at.elapsed(),
-                    false,
-                );
-                rollback?;
-                self.refresh_group(group_id);
-                if let Err(refresh_error) =
-                    self.save_state_with_pending_local_group_deletion_frontier_clears()
-                {
-                    tracing::warn!(
-                        target: "marmot_app::client",
-                        method = "invite_members_intent_failure_rollback",
-                        error_kind = refresh_error.privacy_safe_kind(),
-                        "rolled back staged invite but could not persist the refreshed app projection"
-                    );
-                }
-                return Err(error);
-            }
-        };
+        // The engine staged each Welcome with the commit, so its destination
+        // is durable before the commit is exposed; the app keeps only ids.
         let (session_effects, welcomes) = prepared.into_effects_and_welcomes();
         self.unpublished_welcome_delivery = Some(UnpublishedWelcomeDelivery {
             group_id: group_id.clone(),
             audit_context: audit_context.clone(),
             kind: UnpublishedWelcomeKind::Invite {
                 welcome_ids: welcomes.into_iter().map(|welcome| welcome.id).collect(),
-                welcome_intents,
             },
         });
 
@@ -6236,8 +6189,8 @@ impl AppClient {
 
     /// Send an app-defined event with an arbitrary non-reserved kind. `tags`
     /// and `content` pass through verbatim; kinds MDK owns (chat, reaction,
-    /// edit, delete, agent, group system, push token) are rejected so an app
-    /// cannot forge protocol events.
+    /// edit, delete, agent, group system, push token, device group) are
+    /// rejected so an app cannot forge protocol events.
     pub async fn send_custom_event(
         &mut self,
         group_id: &GroupId,
@@ -7356,38 +7309,6 @@ impl AppClient {
         Ok(message_ids)
     }
 
-    fn record_welcome_delivery_intents(
-        &mut self,
-        group_id: &GroupId,
-        welcomes: &[cgka_traits::transport::TransportMessage],
-    ) -> Result<Vec<String>, AppError> {
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let recorded_at = unix_now_seconds();
-        let storage = self.app.account_storage(&self.state.label)?;
-        let mut records = Vec::with_capacity(welcomes.len());
-        for welcome in welcomes {
-            let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
-                return Err(AppError::Publish(
-                    "delivery artifact was not a Welcome".into(),
-                ));
-            };
-            let message_id_hex = hex::encode(welcome.id.as_slice());
-            records.push(storage_sqlite::PendingWelcomeDeliveryRecord {
-                message_id_hex,
-                group_id_hex: group_id_hex.clone(),
-                recipient_hex: hex::encode(recipient.as_slice()),
-                recorded_at,
-            });
-        }
-        storage
-            .app_storage()
-            .record_pending_welcome_deliveries(&records)?;
-        Ok(records
-            .into_iter()
-            .map(|record| record.message_id_hex)
-            .collect())
-    }
-
     fn clear_confirmed_welcome_intent(
         &self,
         storage: &storage_sqlite::SqliteAppStorage,
@@ -7410,9 +7331,11 @@ impl AppClient {
         Ok(())
     }
 
-    /// Clear only intent rows whose exact Welcome met its acknowledgement
-    /// policy. Failed or unattempted rows stay durable for re-delivery.
-    fn clear_delivered_founding_welcome_intents(
+    /// Clear only the pending rows whose exact Welcome met its
+    /// acknowledgement policy, counting each row removed as a confirmed
+    /// publish. A Welcome has a row only once a publish failed or a reconcile
+    /// wrote it; failed or unattempted rows stay durable for re-delivery.
+    fn clear_delivered_welcome_rows(
         &mut self,
         message_ids: &[String],
         effects: &marmot_session::AccountDeviceEffects,
@@ -7586,8 +7509,8 @@ impl AppClient {
                 );
                 let delivery = WelcomeDelivery::of(published, &effects);
                 recover_post_canonical_result(
-                    "clear_delivered_founding_welcome_intents",
-                    self.clear_delivered_founding_welcome_intents(&welcome_intents, &effects),
+                    "clear_delivered_welcome_rows",
+                    self.clear_delivered_welcome_rows(&welcome_intents, &effects),
                 );
                 // Non-fatal here: this classification only logs, so no
                 // refusal is lost to an early return. It still arms through the
@@ -7601,10 +7524,7 @@ impl AppClient {
                 self.remember_published_reports(&effects);
                 delivery
             }
-            UnpublishedWelcomeKind::Invite {
-                welcome_ids,
-                welcome_intents,
-            } => {
+            UnpublishedWelcomeKind::Invite { welcome_ids } => {
                 let welcome_publish_started_at = Instant::now();
                 let publish_result = self
                     .runtime
@@ -7633,7 +7553,11 @@ impl AppClient {
                         return WelcomeDelivery::Undelivered;
                     }
                 };
-                let _ = self.clear_delivered_founding_welcome_intents(&welcome_intents, &effects);
+                let welcome_ids = welcome_ids
+                    .iter()
+                    .map(|id| hex::encode(id.as_slice()))
+                    .collect::<Vec<_>>();
+                let _ = self.clear_delivered_welcome_rows(&welcome_ids, &effects);
                 self.remember_published_reports(&effects);
                 WelcomeDelivery::of(true, &effects)
             }
@@ -7721,8 +7645,7 @@ impl AppClient {
                         },
                     );
                 }
-                let _ =
-                    self.clear_delivered_founding_welcome_intents(&completed.welcome_ids, &effects);
+                let _ = self.clear_delivered_welcome_rows(&completed.welcome_ids, &effects);
                 self.remember_published_reports(&effects);
             }
             Err(error) => {

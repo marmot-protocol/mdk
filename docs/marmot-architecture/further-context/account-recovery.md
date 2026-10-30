@@ -832,6 +832,23 @@ relay's cold-start debt; those events then follow the released frames. Fenced gr
 runner's first class. Until the switch-over the adapter's hold keeps owner capture, and PR 5
 maps the recorder's live counts into the runner's own input.
 
+The adapter's hold (PR 5c) holds one group, and nothing enables it before the switch-over. A
+count becomes a fact only once its boundary is admitted, and a boundary is admitted only once
+its group's frames have left the adapter, so a fence read from facts alone would come too late.
+The adapter therefore arms a provisional hold, from the REQ's `since`, at the EOSE of every
+non-empty count it did not clamp, until the runner answers with a plan whose ticket saw that
+count. A clamped count is paged by the adapter itself. The plan releases each group's frames
+below its fence and keeps the rest held, with their claims. A hold lasts at most one replay
+deadline (30 s); then its frames go in as late input, the range stays owed, and plans hold the
+group no more until a new count arms it. A hold covers only what is still in the adapter's
+buffer: frames already handed on, to native ingress or a draining batch, go in as late input in
+the same way, and the range stays owed. Held frames count neither in the account's pending
+admission nor against other groups' placement, so other groups' boundaries, tails and ingest go
+on. The recorder writes no live boundary on a held route until its frames are released; its
+tail still stands. Held frames stay under the replay buffer bounds, so overflow is loss, and the
+relay plane's cursor seal stops at the oldest one its restart floor does not cover, since no
+queue holds it yet.
+
 ## What gets deleted
 
 Deleted in step 2:

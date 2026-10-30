@@ -18,6 +18,7 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::SendIntent;
 use storage_sqlite::DeviceGroupTrust;
 
+mod chat_kinds;
 mod devices;
 mod private_key_packages;
 

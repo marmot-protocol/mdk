@@ -45,6 +45,8 @@
 
 mod messages;
 
+pub(crate) use messages::is_device_group_kind;
+
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
     DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1, DeviceSettingsV1, DeviceSlotId,
@@ -304,13 +306,16 @@ impl AppClient {
         let now = unix_now_seconds();
         let mut roster = DeviceRosterV1::default();
         OsRng.fill_bytes(&mut roster.leaf_tag_key);
-        // Each founding entry announces the KeyPackage in that device's slot
-        // (3.4), so neither device owes a roster commit before it publishes.
-        // This device's entry also carries its tag signature key, so the
-        // engine tags its founding leaf (3.1d); the new device sets its own
-        // once it joins. Nobody chose settings for the founder, so it takes the
-        // defaults a new device starts with: siblings add it to chats it is
-        // missing, with their history.
+        // The founding roster lists only this device and its rejections; the
+        // founding Add sets the new device's entry, as every later Add does,
+        // so no entry ever names a device without its leaf (D41). Each entry
+        // announces the KeyPackage in that device's slot (3.4), so neither
+        // device owes a roster commit before it publishes. This device's
+        // entry also carries its tag signature key, so the engine tags its
+        // founding leaf (3.1d); the new device sets its own once it joins.
+        // Nobody chose settings for the founder, so it takes the defaults a
+        // new device starts with: siblings add it to chats it is missing, with
+        // their history.
         roster.devices.insert(
             own_slot,
             DeviceEntryV1 {
@@ -325,25 +330,28 @@ impl AppClient {
                 ..DeviceEntryV1::default()
             },
         );
-        roster.devices.insert(
-            sibling_slot,
-            DeviceEntryV1 {
-                label: choices.label.clone(),
-                linked_at: now,
-                linked_by: Some(own_slot),
-                settings: DeviceSettingsV1 {
-                    add_to_all_chats: choices.add_to_all_chats,
-                    bring_history: choices.bring_history,
-                    keep_while_inactive: false,
-                },
-                announced_key_package: Some(hex::decode(&link.key_package_ref_hex)?),
-                ..DeviceEntryV1::default()
+        let sibling_entry = DeviceEntryV1 {
+            label: choices.label.clone(),
+            linked_at: now,
+            linked_by: Some(own_slot),
+            settings: DeviceSettingsV1 {
+                add_to_all_chats: choices.add_to_all_chats,
+                bring_history: choices.bring_history,
+                keep_while_inactive: false,
             },
-        );
+            announced_key_package: Some(hex::decode(&link.key_package_ref_hex)?),
+            ..DeviceEntryV1::default()
+        };
         // Rejections this device made before it had a device group (3.2).
-        self.founding_sign_in_rejections(&mut roster)?;
+        self.founding_sign_in_rejections(&mut roster, &sibling_slot)?;
         let roster = encode_device_roster_v1(&roster)
             .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
+        let roster_update = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
+            sibling_slot,
+            sibling_entry,
+        )])
+        .and_then(|update| encode_device_roster_update_v1(&update).map_err(|e| e.to_string()))
+        .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
         let routing = encode_nostr_routing_v1(&self.app.new_nostr_routing(None)?)
             .map_err(AppError::InvalidNostrRouting)?;
         let request = CreateGroupRequest {
@@ -388,6 +396,7 @@ impl AppClient {
             .prepare_create_group_with_chosen_id_and_audit_context(
                 request,
                 link.device_group_id.clone(),
+                Some(roster_update),
                 Timestamp(wait_ends),
                 audit_context.clone(),
             )
@@ -438,10 +447,12 @@ impl AppClient {
 
     /// The new device's side of a confirmed link, before it sends its own
     /// confirmation: wait [`WELCOME_WAIT_SECS`] for the Welcome into the
-    /// device group the link names, from the leaf it names. The engine joins
-    /// that group only through that Welcome, and refuses every other Welcome
-    /// into its id meanwhile, so a group someone else founded under the id
-    /// never joins and never takes it.
+    /// device group the link names, from the leaf it names, adding this
+    /// device by the KeyPackage it confirmed. The engine joins that group only
+    /// through that Welcome, and refuses every other Welcome into its id
+    /// meanwhile, so a group someone else founded under the id never joins
+    /// and never takes it. Nor does any other Welcome that adds this device
+    /// by that KeyPackage, into any group (D41).
     ///
     /// The group must be new to this device. Its waiting row is written
     /// first and removed again if the engine cannot record the expectation.
@@ -460,6 +471,7 @@ impl AppClient {
         if self.stored_group(&link.device_group_id)?.is_some() {
             return Err(AppError::DeviceGroupRefused("device_group_exists"));
         }
+        let key_package_ref = hex::decode(&link.key_package_ref_hex)?;
         let group_id_hex = hex::encode(link.device_group_id.as_slice());
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         if !storage.insert_device_group(&DeviceGroupRecord {
@@ -475,6 +487,7 @@ impl AppClient {
             .expect_device_group_welcome(&DeviceGroupWelcomeExpectation {
                 group_id: link.device_group_id.clone(),
                 sender_signature_key: link.welcome_sender_key.clone(),
+                key_package_ref,
                 expires_at: now.saturating_add(WELCOME_WAIT_SECS),
             });
         if let Err(error) = expected {

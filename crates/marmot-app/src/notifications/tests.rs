@@ -2227,6 +2227,16 @@ fn poll_notification_alerts_without_exposing_question_or_options() {
     );
 }
 
+/// A device-group kind neither alerts nor previews, even as a reaction's
+/// target, so its content never reaches a notification.
+#[test]
+fn device_group_kinds_never_notify_or_preview() {
+    for kind in [457, 459, 460, 462] {
+        assert_eq!(notification_traffic_for_kind(kind), None);
+        assert_eq!(preview_text_for_kind(kind, "{\"v\":1}"), None);
+    }
+}
+
 #[test]
 fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
     use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY;

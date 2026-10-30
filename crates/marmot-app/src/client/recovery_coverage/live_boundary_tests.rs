@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use storage_sqlite::{RecoveryCause, RecoveryCoverageProof, TransportReconciliationRoute};
 use transport_nostr_adapter::{
-    ReplayLiveCount, ReplaySourceGeneration, SubscriptionRefusal, SubscriptionRefusalDisposition,
+    RELAY_REPLAY_PAGE_LIMIT, ReplayFenceTicket, ReplayLiveCount, ReplaySourceGeneration,
+    SubscriptionRefusal, SubscriptionRefusalDisposition,
 };
 
 use super::scenario_tests::{
@@ -13,8 +14,10 @@ use super::scenario_tests::{
     reactivate, relay, report, routes,
 };
 use super::{
-    LiveCountFact, LiveCoverage, live_boundary_since, observe_live_counts, retention_floor,
+    LiveCountFact, LiveCoverage, fence_plan, live_boundary_since, observe_live_counts,
+    retention_floor,
 };
+use crate::client::recovery_runner::LiveFence;
 use crate::unix_now_seconds;
 
 const HOUR: u64 = 60 * 60;
@@ -49,6 +52,7 @@ fn fact(
         count,
         ended,
         placed: true,
+        held: Vec::new(),
     }
 }
 
@@ -56,7 +60,7 @@ fn fact(
 fn durable(live: &LiveCoverage, facts: &[LiveCountFact]) -> Vec<Option<(u64, u64)>> {
     live.durable(facts)
         .into_iter()
-        .map(|(_, range)| range)
+        .map(|(_, range, _)| range)
         .collect()
 }
 
@@ -100,7 +104,7 @@ fn a_durable_proof_stops_before_the_request_and_the_tail_runs_from_it() {
     let mut live = LiveCoverage::opened_at(None);
     let written = live.durable(&facts);
     assert_eq!(written.len(), 1);
-    assert_eq!(written[0].0.routes, groups);
+    assert_eq!(written[0].2, groups.iter().collect::<Vec<_>>());
     assert_eq!(written[0].1, Some((401, REQUESTED - 1)));
     let tails = live.tails(&facts, |_, since| Some(since));
     for route in &groups {
@@ -117,7 +121,10 @@ fn a_durable_proof_stops_before_the_request_and_the_tail_runs_from_it() {
         "a route no REQ carries owes through now"
     );
 
-    live.settled.insert(facts[0].key.clone());
+    live.settled
+        .entry(facts[0].key.clone())
+        .or_default()
+        .extend(groups.iter().cloned());
     assert!(durable(&live, &facts).is_empty(), "written once");
 }
 
@@ -220,6 +227,99 @@ fn the_tail_starts_past_released_seconds() {
     });
     assert_eq!(tails.owed_until(&first, &relay(), 5_000), 1_500);
     assert_eq!(tails.owed_until(&second, &relay(), 5_000), 5_000);
+}
+
+/// The runner's fence reads a count's emptiness and its oldest event: only a
+/// non-empty count leaves capture debt below that event. A count its relay
+/// cut at the page limit fences nothing, since the adapter pages the rest.
+#[test]
+fn a_count_fences_below_its_oldest_event_only_when_it_counted_one() {
+    let groups = vec![TransportReconciliationRoute::Group([1; 32])];
+    let counted = fact(groups.clone(), count(3, Some(150)), false).live_count();
+    assert_eq!(counted.routes, groups);
+    assert_eq!(counted.relay, relay());
+    assert_eq!(counted.since, 100);
+    assert_eq!(counted.oldest_seen, Some(150));
+    let ended = fact(groups.clone(), count(3, Some(150)), true).live_count();
+    assert_eq!(ended.oldest_seen, Some(150), "an ended count still fences");
+    for empty in [count(0, None), count(0, Some(150))] {
+        assert_eq!(
+            fact(groups.clone(), empty, false).live_count().oldest_seen,
+            None
+        );
+    }
+    let cut = count(RELAY_REPLAY_PAGE_LIMIT, Some(150));
+    assert_eq!(fact(groups, cut, false).live_count().oldest_seen, None);
+}
+
+/// The adapter's hold is per group route: a fence names each of its group's
+/// routes at the group's release point, and none for the inbox.
+#[test]
+fn a_fence_plan_names_each_group_route_and_never_the_inbox() {
+    let ticket = ReplayFenceTicket::default();
+    let fences = [
+        LiveFence {
+            routes: vec![
+                TransportReconciliationRoute::Group([1; 32]),
+                TransportReconciliationRoute::Group([2; 32]),
+            ],
+            release_before: 40,
+        },
+        LiveFence {
+            routes: vec![INBOX],
+            release_before: 50,
+        },
+    ];
+    let plan = fence_plan(ticket, &fences);
+    assert_eq!(plan.ticket, ticket);
+    assert_eq!(
+        plan.fences
+            .iter()
+            .map(|fence| (fence.route, fence.release_before))
+            .collect::<Vec<_>>(),
+        [([1; 32], 40), ([2; 32], 40)]
+    );
+}
+
+/// A route whose group's live frames a fence holds waits for its live
+/// boundary until they are released; the count's other routes are written
+/// meanwhile, and each route is written once.
+#[test]
+fn a_held_route_waits_while_its_counts_other_routes_are_written() {
+    let first = TransportReconciliationRoute::Group([1; 32]);
+    let second = TransportReconciliationRoute::Group([2; 32]);
+    let mut held = fact(
+        vec![first.clone(), second.clone()],
+        count(2, Some(400)),
+        false,
+    );
+    held.held = vec![first.clone()];
+    let facts = [held];
+    let mut live = LiveCoverage::opened_at(None);
+    let written = live.durable(&facts);
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].1, Some((401, REQUESTED - 1)));
+    assert_eq!(written[0].2, [&second]);
+    live.settled
+        .entry(facts[0].key.clone())
+        .or_default()
+        .insert(second.clone());
+    assert!(durable(&live, &facts).is_empty(), "the held route waits");
+    assert_eq!(
+        live.tails(&facts, |_, since| Some(since))
+            .owed_until(&first, &relay(), 5_000),
+        REQUESTED - 1,
+        "its tail stands, so only capture debt is owed"
+    );
+
+    let released = [fact(
+        vec![first.clone(), second],
+        count(2, Some(400)),
+        false,
+    )];
+    let written = live.durable(&released);
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].2, [&first], "only the released route");
 }
 
 /// Owe every current route its retained window, as startup history does, so
@@ -344,6 +444,58 @@ async fn a_tail_lapses_when_the_connection_changes_during_the_write() {
         );
         assert!(live_until(&fixture, &route).is_some(), "the proof stays");
     }
+}
+
+/// With the adapter fencing, a counted group's live frames wait for the
+/// runner's answer: the group is held from the next EOSE, its new live
+/// boundary waits, so the gap since its last one stays owed, while the inbox
+/// REQ's boundary is written. Once the runner answers with no fence, the
+/// group's boundary is written too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fenced_groups_boundary_waits_for_the_runners_answer() {
+    let mut fixture = fixture().await;
+    owe_retained_window(&fixture);
+    let app = fixture.storage.app_storage();
+    let group = group_route(&fixture);
+    let first = live_until(&fixture, &group).expect("the first boundary");
+    let read = fixture.client.recovery_runner_live_counts().await;
+    assert!(read.held.is_empty(), "nothing fences before it is enabled");
+    fixture.client.enable_live_fences().await;
+    // The next request goes out in a later second, so a gap exists.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    reactivate(&mut fixture).await;
+
+    let read = fixture.client.recovery_runner_live_counts().await;
+    assert_eq!(read.held.iter().collect::<Vec<_>>(), [&group]);
+    let counted = read
+        .counts
+        .iter()
+        .find(|count| count.routes.contains(&group))
+        .expect("the group's count");
+    assert_eq!(counted.oldest_seen, Some(STORED_AT));
+    let later = unix_now_seconds() + HOUR;
+    let _ = fixture.client.live_tails(&app, later).await;
+    assert_eq!(live_until(&fixture, &group), Some(first), "the group waits");
+    assert!(
+        live_until(&fixture, &INBOX) > Some(first),
+        "the inbox is written"
+    );
+    assert!(owed(&fixture, &group, later).await, "the gap stays owed");
+
+    fixture.client.fence_live_frames(read.ticket, &[]).await;
+    assert!(
+        fixture
+            .client
+            .recovery_runner_live_counts()
+            .await
+            .held
+            .is_empty()
+    );
+    assert!(
+        !owed(&fixture, &group, later).await,
+        "the boundary is written"
+    );
+    assert!(live_until(&fixture, &group) > Some(first));
 }
 
 /// An EOSE with no event before it proves nothing durable, so the account
