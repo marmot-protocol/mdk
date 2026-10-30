@@ -9,8 +9,9 @@
   sibling inside its device group: `cgka_private_key_packages` (one issuer
   record per KeyPackage, its key in the OpenMLS bundle store),
   `private_key_packages_received` (what siblings handed this device, by
-  issuer slot) and `private_key_package_requests` (what this device still
-  wants from each issuer). `SqliteAccountStorage` implements the new
+  issuer slot; one this device used keeps its ref until it expires, so it
+  is not kept again if handed over again) and `private_key_package_requests`
+  (what this device still wants from each issuer). `SqliteAccountStorage` implements the new
   `PrivateKeyPackageStorage`; `SqliteAppStorage` gains the received-KeyPackage
   and need reads and writes. Nothing writes them unless device groups are on.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).

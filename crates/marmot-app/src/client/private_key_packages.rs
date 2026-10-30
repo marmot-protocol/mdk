@@ -28,7 +28,9 @@
 //!   upkeep tops the sibling up afterwards.
 //! - A lost hand-off is repaired by the next request: a sibling with no usable
 //!   KeyPackage from a device asks again at most once an hour. There are no
-//!   receipts.
+//!   receipts. An issuer at its cap answers with the newest KeyPackages it
+//!   already issued, handed over again, and this device never keeps one it
+//!   has used (mdk#2628 D42).
 
 use base64::Engine as _;
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};

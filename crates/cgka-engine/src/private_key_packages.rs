@@ -45,7 +45,9 @@ pub const MAX_PRIVATE_KEY_PACKAGE_WANT: u32 = 100;
 pub const MAX_HAND_OFF_KEY_PACKAGES: usize = 20;
 /// Unexpired records an issuer keeps per sibling, three full requests' worth.
 /// Issuing stops there until some are used or expire, so repeated requests
-/// cannot grow storage, and no key goes before its `not_after`.
+/// cannot grow storage, and no key goes before its `not_after`. A request
+/// that finds the cap reached is answered with KeyPackages the sibling was
+/// already given, handed over again (mdk#2628 D42).
 pub const MAX_RETAINED_PRIVATE_KEY_PACKAGES: usize = 3 * MAX_PRIVATE_KEY_PACKAGE_WANT as usize;
 const HAND_OFF_VERSION: u8 = 1;
 const REQUEST_VERSION: u64 = 1;
@@ -286,13 +288,17 @@ pub fn private_key_package_stock(
 impl<S: StorageProvider> Engine<S> {
     /// Issue `count` private KeyPackages to the sibling in `recipient`, each
     /// recorded in the same transaction as its private bundle, its hand-off
-    /// not yet queued. Returns how many were issued: fewer once the sibling
+    /// not yet queued. Returns how many answer it: fewer once the sibling
     /// holds [`MAX_RETAINED_PRIVATE_KEY_PACKAGES`] unexpired records.
     ///
     /// With `request`, they answer that request from the sibling: every
     /// earlier record for it stops counting, since their hand-offs may have
     /// been lost, but keeps its key until used or expired, since the sibling
-    /// may still hold it. A request already answered issues nothing.
+    /// may still hold it. A request already answered issues nothing. At the
+    /// cap, the newest unexpired records for the sibling make up the rest:
+    /// they count again and their hand-offs go out again, so a sibling whose
+    /// hand-offs were all lost still gets some, and nothing is deleted before
+    /// `not_after` (mdk#2628 D42). The sibling ignores one it has used.
     pub fn issue_private_key_packages(
         &mut self,
         recipient: &DeviceSlotId,
@@ -325,8 +331,8 @@ impl<S: StorageProvider> Engine<S> {
                 .iter()
                 .filter(|record| &record.recipient_slot == recipient && now < record.not_after)
                 .count();
-            let count = count.min(MAX_RETAINED_PRIVATE_KEY_PACKAGES.saturating_sub(retained));
-            for _ in 0..count {
+            let fresh = count.min(MAX_RETAINED_PRIVATE_KEY_PACKAGES.saturating_sub(retained));
+            for _ in 0..fresh {
                 let (wire, key_package) = self.build_key_package(storage, false)?;
                 private.put_issued_private_key_package(&IssuedPrivateKeyPackage {
                     key_package_ref: key_package_ref(&key_package)?.as_slice().to_vec(),
@@ -340,7 +346,32 @@ impl<S: StorageProvider> Engine<S> {
                     request_id: request.cloned(),
                 })?;
             }
-            Ok::<_, EngineError>(count)
+            let Some(request) = request else {
+                return Ok::<_, EngineError>(fresh);
+            };
+            let mut held: Vec<_> = records
+                .iter()
+                .filter(|record| &record.recipient_slot == recipient && now < record.not_after)
+                .collect();
+            held.sort_by(|a, b| {
+                (b.issued_at, b.not_after, &b.key_package_ref).cmp(&(
+                    a.issued_at,
+                    a.not_after,
+                    &a.key_package_ref,
+                ))
+            });
+            let again = held.into_iter().take(count - fresh);
+            let mut answered = fresh;
+            for record in again {
+                private.put_issued_private_key_package(&IssuedPrivateKeyPackage {
+                    hand_off_queued: false,
+                    counted: true,
+                    request_id: Some(request.clone()),
+                    ..record.clone()
+                })?;
+                answered += 1;
+            }
+            Ok(answered)
         })
     }
 

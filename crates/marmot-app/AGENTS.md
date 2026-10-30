@@ -130,7 +130,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
   roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
   this account's, single-use, unexpired and tagged as that slot's (mdk#2628 D33, through 3.1d's tag reader; never a
-  second one). Never publish one, and never fall back to a public KeyPackage when none is held.
+  second one). Never publish one, and never fall back to a public KeyPackage when none is held. A KeyPackage this
+  device has used is never kept again if a sibling hands it over again (mdk#2628 D42).
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.

@@ -7,8 +7,10 @@
 //!   KeyPackage, a serialized `IssuedPrivateKeyPackage`. The engine writes and
 //!   deletes each row in the same transaction as its OpenMLS private bundle.
 //! - `private_key_packages_received` is the receiver's side: the KeyPackages a
-//!   sibling handed over, keyed by the issuer's slot, until this device uses
-//!   one or it expires.
+//!   sibling handed over, keyed by the issuer's slot, until they expire. One
+//!   this device used keeps its row with `taken_at` set and its bytes
+//!   dropped, so the same KeyPackage handed over again is not kept twice
+//!   (mdk#2628 D42).
 //! - `private_key_package_requests` holds this device's unmet need from one
 //!   sibling and when it last asked, so a request repeats at most once an
 //!   hour while the need lasts.
@@ -31,7 +33,8 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             not_before INTEGER NOT NULL CHECK(not_before >= 0),
             not_after INTEGER NOT NULL CHECK(not_after >= not_before),
             key_package BLOB NOT NULL,
-            received_at INTEGER NOT NULL CHECK(received_at >= 0)
+            received_at INTEGER NOT NULL CHECK(received_at >= 0),
+            taken_at INTEGER CHECK(taken_at >= 0)
         );
         CREATE INDEX private_key_packages_received_by_issuer
             ON private_key_packages_received (issuer_slot_hex, not_after);

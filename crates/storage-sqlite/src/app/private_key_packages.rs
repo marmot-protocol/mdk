@@ -39,8 +39,8 @@ pub struct PrivateKeyPackageNeed {
 }
 
 impl SqliteAppStorage {
-    /// Keep handed-over KeyPackages, skipping any already held. Returns how
-    /// many were new.
+    /// Keep handed-over KeyPackages, skipping any already held and any this
+    /// device has used (mdk#2628 D42). Returns how many were new.
     pub fn insert_received_private_key_packages(
         &self,
         records: &[ReceivedPrivateKeyPackage],
@@ -70,12 +70,14 @@ impl SqliteAppStorage {
         Ok(inserted)
     }
 
-    /// Every handed-over KeyPackage, by issuer, then expiry.
+    /// Every handed-over KeyPackage this device has not used, by issuer, then
+    /// expiry.
     pub fn received_private_key_packages(&self) -> StorageResult<Vec<ReceivedPrivateKeyPackage>> {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare_cached(&format!(
                 "SELECT {RECEIVED_COLUMNS} FROM private_key_packages_received
+                 WHERE taken_at IS NULL
                  ORDER BY issuer_slot_hex, not_after, key_package_ref_hex"
             ))
             .storage()?;
@@ -87,9 +89,10 @@ impl SqliteAppStorage {
         rows.into_iter().map(received_record).collect()
     }
 
-    /// Remove and return one KeyPackage from `issuer_slot_hex` to use at
-    /// `now`: the usable one that expires first, else the unexpired one that
-    /// expires last. `None` when it holds none unexpired.
+    /// Take one KeyPackage from `issuer_slot_hex` to use at `now`: the usable
+    /// one that expires first, else the unexpired one that expires last.
+    /// `None` when it holds none unexpired. Its ref stays, its bytes dropped,
+    /// until it expires, so it is not kept again if handed over again.
     pub fn take_received_private_key_package(
         &self,
         issuer_slot_hex: &str,
@@ -101,7 +104,7 @@ impl SqliteAppStorage {
             let mut stmt = tx
                 .prepare_cached(&format!(
                     "SELECT {RECEIVED_COLUMNS} FROM private_key_packages_received
-                     WHERE issuer_slot_hex = ?1 AND not_after > ?2
+                     WHERE issuer_slot_hex = ?1 AND not_after > ?2 AND taken_at IS NULL
                      ORDER BY not_after, key_package_ref_hex"
                 ))
                 .storage()?;
@@ -122,8 +125,9 @@ impl SqliteAppStorage {
             return Ok(None);
         };
         tx.execute_cached(
-            "DELETE FROM private_key_packages_received WHERE key_package_ref_hex = ?1",
-            params![taken.key_package_ref_hex],
+            "UPDATE private_key_packages_received SET taken_at = ?2, key_package = X''
+             WHERE key_package_ref_hex = ?1",
+            params![taken.key_package_ref_hex, u64_to_i64(now)?],
         )
         .storage()?;
         tx.commit().storage()?;
@@ -340,6 +344,36 @@ mod tests {
             2
         );
         assert!(store.received_private_key_packages().unwrap().is_empty());
+    }
+
+    /// A KeyPackage this device used is not kept again when it is handed over
+    /// again, and its ref goes when it expires (mdk#2628 D42).
+    #[test]
+    fn a_used_key_package_is_not_kept_again() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let batch = [received("a1", "aa", 0)];
+        store.insert_received_private_key_packages(&batch).unwrap();
+        let taken = store.take_received_private_key_package("aa", 10).unwrap();
+        assert_eq!(taken.unwrap().key_package_ref_hex, "a1");
+        assert_eq!(
+            store.insert_received_private_key_packages(&batch).unwrap(),
+            0
+        );
+        assert!(store.received_private_key_packages().unwrap().is_empty());
+        assert_eq!(
+            store.take_received_private_key_package("aa", 10).unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .delete_expired_received_private_key_packages(100)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.insert_received_private_key_packages(&batch).unwrap(),
+            1
+        );
     }
 
     #[test]

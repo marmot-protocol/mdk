@@ -170,29 +170,71 @@ async fn a_request_stops_earlier_records_counting_and_is_answered_once() {
 }
 
 /// Repeated requests never delete a key the sibling may still hold. Issuing
-/// stops once the sibling holds the cap's worth of unexpired records.
+/// stops once the sibling holds the cap's worth of unexpired records; a
+/// request after that is answered with the newest ones it was given, handed
+/// over again (mdk#2628 D42), and only once.
 #[tokio::test]
 async fn repeated_requests_keep_earlier_keys_up_to_the_cap() {
     let mut phone = device(b"alice", true);
     let want = cgka_engine::private_key_packages::MAX_PRIVATE_KEY_PACKAGE_WANT as usize;
     let cap = cgka_engine::private_key_packages::MAX_RETAINED_PRIVATE_KEY_PACKAGES;
     let mut first = None;
-    for request in 0..=cap / want {
+    for request in 0..cap / want {
         let issued = phone
             .engine
             .issue_private_key_packages(
                 &SLOT,
                 want,
                 Some(&MessageId::new(vec![u8::try_from(request).unwrap(); 32])),
-                NOW,
+                NOW + request as u64,
             )
             .unwrap();
-        assert_eq!(issued, if request < cap / want { want } else { 0 });
+        assert_eq!(issued, want);
         first.get_or_insert_with(|| phone.engine.issued_private_key_packages().unwrap());
     }
+    let newest: Vec<_> = phone
+        .engine
+        .issued_private_key_packages()
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.issued_at == NOW + (cap / want - 1) as u64)
+        .map(|record| record.key_package_ref)
+        .collect();
+    assert_eq!(newest.len(), want);
+    let every: Vec<_> = phone
+        .engine
+        .issued_private_key_packages()
+        .unwrap()
+        .into_iter()
+        .map(|record| record.key_package_ref)
+        .collect();
+    phone
+        .engine
+        .set_private_key_package_hand_offs_queued(&every, true)
+        .unwrap();
+
+    let at_cap = MessageId::new(vec![0xee; 32]);
+    let answered = phone
+        .engine
+        .issue_private_key_packages(&SLOT, want, Some(&at_cap), NOW + 10)
+        .unwrap();
+    assert_eq!(answered, want);
+    assert_eq!(
+        phone
+            .engine
+            .issue_private_key_packages(&SLOT, want, Some(&at_cap), NOW + 11)
+            .unwrap(),
+        0
+    );
 
     let issued = phone.engine.issued_private_key_packages().unwrap();
     assert_eq!(issued.len(), cap);
+    for record in &issued {
+        let again = newest.contains(&record.key_package_ref);
+        assert_eq!(record.request_id.as_ref() == Some(&at_cap), again);
+        assert_eq!(record.counted, again);
+        assert_eq!(record.hand_off_queued, !again);
+    }
     for record in first.unwrap() {
         assert!(
             issued

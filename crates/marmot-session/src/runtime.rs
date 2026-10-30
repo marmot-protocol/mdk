@@ -71,8 +71,8 @@ use crate::time::{
 mod device_roster;
 pub use device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport};
 mod device_tag_key;
-mod removed_slot_expiry;
 mod private_key_packages;
+mod removed_slot_expiry;
 mod slot_announcement;
 mod welcome_delivery;
 

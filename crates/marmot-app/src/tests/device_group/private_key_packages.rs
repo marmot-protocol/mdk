@@ -287,6 +287,50 @@ async fn a_lost_hand_off_is_repaired_by_the_next_request() {
     );
 }
 
+/// Lost hand-offs can fill the phone's cap for the laptop, after which it
+/// issues no more. Once delivery is back, the laptop's next request is
+/// answered with the newest KeyPackages the phone already issued, handed
+/// over again, long before any expires (mdk#2628 D42).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_at_the_cap_hands_over_again_what_was_lost() {
+    let (mut devices, _) = settled_linked_devices().await;
+    let (phone_slot, laptop_slot) = (slot(&devices.phone), slot(&devices.laptop));
+    let cap = cgka_engine::private_key_packages::MAX_RETAINED_PRIVATE_KEY_PACKAGES;
+    let to_laptop = |phone: &AppClient| {
+        issued(phone)
+            .into_iter()
+            .filter(|record| record.recipient_slot == laptop_slot)
+            .count()
+    };
+    let ask_for_a_burst = |devices: &mut Devices| {
+        devices
+            .laptop
+            .want_private_key_packages(&phone_slot, 100)
+            .unwrap();
+    };
+
+    // Each burst is issued and handed over, and the laptop loses it.
+    for _ in 0..3 {
+        ask_for_a_burst(&mut devices);
+        devices.laptop.run_due_maintenance().await.unwrap();
+        deliver_all(&mut devices.phone, &devices.relay).await;
+        devices.phone.run_due_maintenance().await.unwrap();
+        deliver_all(&mut devices.laptop, &devices.relay).await;
+        devices_storage(&devices.laptop)
+            .delete_received_private_key_packages_from(&hex::encode(phone_slot))
+            .unwrap();
+    }
+    assert_eq!(to_laptop(&devices.phone), cap);
+
+    ask_for_a_burst(&mut devices);
+    devices.laptop.run_due_maintenance().await.unwrap();
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(to_laptop(&devices.phone), cap, "nothing new is issued");
+    devices.phone.run_due_maintenance().await.unwrap();
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    assert_eq!(received_from(&devices.laptop, &phone_slot).len(), 100);
+}
+
 /// A request or hand-off that every relay refused is sent again at the next
 /// upkeep, and a refused request does not start the hour. One that went out
 /// is never sent twice.

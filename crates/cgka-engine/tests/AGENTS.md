@@ -239,7 +239,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `account_devices/private_key_packages.rs`
   - **Owns:** Private KeyPackages (mdk#2628 item 3.4b) through the engine: issued ones keep their keys in the same
     transaction as their records and stay out of the KeyPackage inventory; a request stops earlier records counting
-    without deleting their keys, is answered once, and issues nothing past the per-sibling cap; records that no longer
+    without deleting their keys, is answered once, and past the per-sibling cap is answered with the newest ones handed over again (D42); records that no longer
     advertise this client's capabilities stop counting; an ordinary Welcome never consumes one; and a hand-off keeps
     only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only).
 
