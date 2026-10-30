@@ -5540,6 +5540,31 @@ fn imported_rows_never_count_as_unread() {
 }
 
 #[test]
+fn an_import_never_displaces_a_pending_preview() {
+    let app = setup_store().app_storage();
+    app.record_app_event(&live("live", 3, 30)).unwrap();
+    let mut pending = chat("pending", LOCAL, 50, "unsent");
+    pending.source_message_id_hex = None;
+    app.record_app_event(&pending).unwrap();
+    let before = app
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.last_message.unwrap().message_id_hex, "pending");
+
+    app.import_app_events(GROUP, &SOURCE_SLOT, &[imported("old", 1, 10, None)], 100)
+        .unwrap();
+    for row in [
+        app.refresh_chat_list_row_for_messages(LOCAL, GROUP, &["old".to_owned()], &no_mentions),
+        app.refresh_chat_list_row(LOCAL, GROUP, &no_mentions),
+    ] {
+        let row = row.unwrap().unwrap();
+        assert_eq!(row.last_message.unwrap().message_id_hex, "pending");
+        assert_eq!(row.activity_sort_at, before.activity_sort_at);
+    }
+}
+
+#[test]
 fn an_import_with_no_read_position_stays_read() {
     let app = setup_store().app_storage();
     app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)

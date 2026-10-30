@@ -1203,6 +1203,8 @@ fn accepted_activity_order_sql(group_id_expression: &str) -> String {
     let accepted_activity_filter = chat_list_activity_filter_sql("accepted.");
     // Walk newest insertions first; the first eligible row is the high water.
     // CROSS JOIN keeps the ordered source index outside the timeline lookup.
+    // A row imported from a sibling's history is older history, not new
+    // activity, so it never displaces a pending send (mdk#2628 4.2a).
     format!(
         "SELECT accepted_source.insert_order
          FROM app_events AS accepted_source INDEXED BY idx_app_events_accepted_insert_order
@@ -1216,6 +1218,11 @@ fn accepted_activity_order_sql(group_id_expression: &str) -> String {
            AND NOT (
                accepted.direction = 'sent'
                AND accepted.source_message_id_hex IS NULL
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM app_event_imports AS imported
+               WHERE imported.group_id_hex = accepted_source.group_id_hex
+                 AND imported.message_id_hex = accepted_source.message_id_hex
            )
          ORDER BY accepted_source.insert_order DESC
          LIMIT 1"

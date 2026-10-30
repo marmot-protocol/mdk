@@ -167,13 +167,18 @@ fn a_bundle_that_breaks_the_format_is_refused_whole() {
         good.replacen(&chat, "", 1),
         good.replacen(&chat, &"5a".repeat(257), 1),
         good.replacen(
-            &format!(r#""id":"{id}","pubkey""#),
-            &format!(r#""id":"{}","pubkey""#, id.to_uppercase()),
-            0,
-        )
-        .replacen(
             &format!(r#""at":1,"id":"{id}""#),
             &format!(r#""at":1,"id":"{}""#, id.to_uppercase()),
+            1,
+        ),
+        good.replacen(
+            &format!(r#"{{"id":"{id}","pubkey""#),
+            &format!(r#"{{"id":"{}","pubkey""#, id.to_uppercase()),
+            1,
+        ),
+        good.replacen(
+            &format!(r#"{{"id":"{id}","pubkey""#),
+            &format!(r#"{{"id":"{}","pubkey""#, &id[2..]),
             1,
         ),
         good.replacen(&"bb".repeat(32), &"bb".repeat(31), 1),
@@ -294,16 +299,26 @@ fn a_long_history_splits_into_bundles_over_consecutive_stretches() {
 }
 
 #[test]
-fn an_event_too_large_for_any_bundle_stays_out() {
+fn an_event_no_bundle_can_carry_stays_out() {
     let small = bundled(1, 1, "small");
     let large = bundled(1, 2, &"x".repeat(400));
+    // A custom kind past the bundle's integer range.
+    let mut unrepresentable = bundled(1, 3, "");
+    unrepresentable.event = event(3, MAX_INTEGER + 1, "custom");
     let budget = HistoryBundle::header_bound(&CHAT) + 2 * small.encoded_len();
     let mut builder = HistoryBundleBuilder::new(&CHAT, None, budget);
     assert!(builder.take(position(&small), Some(small.clone())));
     assert!(builder.take(position(&large), Some(large.clone())));
+    assert!(builder.take(position(&unrepresentable), Some(unrepresentable.clone())));
     let bundle = builder.finish().unwrap();
     assert_eq!(bundle.events, [small]);
-    assert_eq!(bundle.to, position(&large));
+    assert_eq!(bundle.to, position(&unrepresentable));
+    // What is left still opens on the receiver.
+    let sealed = seal_history_bundle(&bundle).unwrap();
+    assert_eq!(
+        open_history_bundle(&sealed.key, &sealed.ciphertext_sha256, &sealed.ciphertext).unwrap(),
+        bundle
+    );
 }
 
 #[test]

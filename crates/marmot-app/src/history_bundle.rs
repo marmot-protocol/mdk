@@ -233,18 +233,22 @@ impl HistoryBundleBuilder {
     /// Takes the next row after the last one taken, with what the bundle
     /// carries for it, or none for a row that stays out but still lies in the
     /// stretch. Returns false, taking nothing, when the event does not fit.
-    /// An event too large for any bundle stays out.
+    /// An event no bundle can carry, too large or outside the format, stays
+    /// out, so a receiver never refuses a whole bundle for it. The size check
+    /// reserves room for the widest ends, so an event within that reserve of
+    /// the budget stays out too; none comes close, as relays cap an event at
+    /// 2 MiB.
     pub(crate) fn take(&mut self, position: ChatPosition, event: Option<BundledEvent>) -> bool {
         if !position.is_well_formed() {
             return true;
         }
         if let Some(event) = event {
             let len = event.encoded_len();
-            if len > self.capacity {
+            if !event.is_well_formed() || len > self.capacity {
                 tracing::warn!(
                     target: TRACE_TARGET,
                     method = "take",
-                    "leaving out an event too large for any history bundle",
+                    "leaving out an event no history bundle can carry",
                 );
             } else if self.used + len > self.capacity {
                 return false;
@@ -314,7 +318,8 @@ impl BundledEvent {
 
     fn is_well_formed(&self) -> bool {
         let event = &self.event;
-        is_hash_hex(&event.pubkey)
+        is_hash_hex(&event.id)
+            && is_hash_hex(&event.pubkey)
             && event.created_at <= MAX_INTEGER
             && event.kind <= MAX_INTEGER
             && self.epoch <= MAX_INTEGER

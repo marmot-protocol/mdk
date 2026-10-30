@@ -36,38 +36,42 @@ impl AppClient {
     ) -> Result<Option<HistoryBundle>, AppError> {
         let group_id_hex = self.history_chat(group_id)?;
         let storage = self.app.account_storage(&self.state.label)?;
-        let storage = storage.app_storage();
         let now = unix_now_seconds();
-        let mut bundle = HistoryBundleBuilder::new(
-            group_id.as_slice(),
-            after.cloned(),
-            HISTORY_BUNDLE_MAX_PLAINTEXT,
-        );
-        let mut cursor = after.cloned();
-        loop {
-            let page = storage.history_export_page(
-                &group_id_hex,
-                cursor
-                    .as_ref()
-                    .map(|position| (position.epoch, position.at, position.id.as_str())),
-                now,
-                EXPORT_PAGE_ROWS,
-            )?;
-            let last_page = page.len() < EXPORT_PAGE_ROWS;
-            for row in page {
-                let position = ChatPosition::of_row(&row);
-                let event = row
-                    .event
-                    .map(|event| BundledEvent::exported(event, row.source_epoch));
-                if !bundle.take(position.clone(), event) {
+        // Every page of one bundle comes from one snapshot, so a row that lands
+        // inside the stretch already read is never vouched for but left out.
+        cgka_traits::StorageProvider::with_read_snapshot(&storage, |storage| {
+            let storage = storage.app_storage();
+            let mut bundle = HistoryBundleBuilder::new(
+                group_id.as_slice(),
+                after.cloned(),
+                HISTORY_BUNDLE_MAX_PLAINTEXT,
+            );
+            let mut cursor = after.cloned();
+            loop {
+                let page = storage.history_export_page(
+                    &group_id_hex,
+                    cursor
+                        .as_ref()
+                        .map(|position| (position.epoch, position.at, position.id.as_str())),
+                    now,
+                    EXPORT_PAGE_ROWS,
+                )?;
+                let last_page = page.len() < EXPORT_PAGE_ROWS;
+                for row in page {
+                    let position = ChatPosition::of_row(&row);
+                    let event = row
+                        .event
+                        .map(|event| BundledEvent::exported(event, row.source_epoch));
+                    if !bundle.take(position.clone(), event) {
+                        return Ok(bundle.finish());
+                    }
+                    cursor = Some(position);
+                }
+                if last_page {
                     return Ok(bundle.finish());
                 }
-                cursor = Some(position);
             }
-            if last_page {
-                return Ok(bundle.finish());
-            }
-        }
+        })
     }
 
     /// Import one bundle of the chat `group_id`'s history, sent by the device
