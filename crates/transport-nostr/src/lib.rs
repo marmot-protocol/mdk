@@ -36,7 +36,7 @@ use transport_nostr_adapter::{
 
 pub use transport_nostr_adapter::{
     DeliveryRoute, MAX_DELIVERY_LOSS_ROUTES, ReplayAdmissionStatus, ReplayCaptureOutcome,
-    ReplayCapturePlan,
+    ReplayCapturePlan, ReplayFence, ReplayFencePlan, ReplayFenceTicket,
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -618,9 +618,10 @@ impl AccountDeliveryOverflowState {
 
     /// How far a commit may promote the cursor, decided under the placement
     /// lock: `candidate`, capped at the lowest key the persisted cursor still
-    /// covers of a delivery queued or taken and not yet released, plus the
-    /// lookback. `None` while loss or a spill hand-off is pending, and for a
-    /// replaced adapter, whose queue is not the one tracked here. The restart
+    /// covers of a delivery queued or taken and not yet released, or of a
+    /// frame the adapter's fence holds, plus the lookback. `None` while loss
+    /// or a spill hand-off is pending, and for a replaced adapter, whose
+    /// queue is not the one tracked here. The restart
     /// floor rises here, before the commit's save starts, so any delivery
     /// placed while that save runs and falls below it goes to the spill. A
     /// settled commit moves the settled floor up once its save succeeds; a
@@ -649,11 +650,18 @@ impl AccountDeliveryOverflowState {
         };
         let admission = &mut state.admission;
         let covered = admission.durable_since.unwrap_or(0);
+        // A frame a fence holds in the adapter is in no queue yet: it caps
+        // the commit like a queued delivery.
+        let held = replay.fence_held_since(covered);
         let cap = admission
             .queued
             .range(covered..)
             .next()
-            .map(|(key, _)| key.saturating_add(lookback));
+            .map(|(key, _)| *key)
+            .into_iter()
+            .chain(held)
+            .min()
+            .map(|key| key.saturating_add(lookback));
         let reached = cap.map_or(candidate, |cap| candidate.min(cap));
         let since = reached.saturating_sub(lookback);
         admission.durable_since = Some(admission.durable_since.map_or(since, |d| d.max(since)));
@@ -3747,6 +3755,31 @@ impl MarmotRelayPlaneAccountAdapter {
             .adapter
             .capture_replay(&self.account_id, plan, cancellation)
             .await
+    }
+
+    /// Hold this account's groups' live frames behind the owner's fences from
+    /// now on (mdk#2660). Call it before activation, so the first counts are
+    /// held too.
+    #[doc(hidden)]
+    pub async fn enable_replay_fencing(&self) {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .enable_replay_fencing(&self.account_id)
+            .await;
+    }
+
+    /// Apply the owner's fences on this account's groups' live frames, as of
+    /// the status `plan`'s ticket came from. Schedules no IO.
+    #[doc(hidden)]
+    pub async fn fence_replay(&self, plan: &ReplayFencePlan) {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .fence_replay(&self.account_id, plan)
+            .await;
     }
 
     /// Register ordered native input before activation. Retained group spill

@@ -437,7 +437,7 @@ impl<S: StorageProvider> Engine<S> {
 /// The link's roster update sets exactly one device entry. That the entry is
 /// for a new slot and announces the linked KeyPackage is the sender rule
 /// every own device-group Commit meets.
-fn validate_link_roster_update(roster_update: &[u8]) -> Result<(), EngineError> {
+pub(crate) fn validate_link_roster_update(roster_update: &[u8]) -> Result<(), EngineError> {
     let update = decode_device_roster_update_v1(roster_update).map_err(|error| {
         EngineError::Serialize(format!("invalid device roster update: {error}"))
     })?;

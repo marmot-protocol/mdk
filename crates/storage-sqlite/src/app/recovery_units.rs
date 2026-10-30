@@ -695,6 +695,28 @@ fn rearm_tx(
     replace_spans_tx(conn, route, relay, PARKED_SPAN, &[])
 }
 
+/// [`SqliteAppStorage::rearm_all_recovery_units`] inside the caller's
+/// transaction.
+pub(crate) fn rearm_all_units_tx(conn: &Connection) -> StorageResult<usize> {
+    let rearmed = conn
+        .execute_cached(
+            "UPDATE account_recovery_units SET state = 0, broken_reason = NULL, probe = 0,
+             no_progress = 0, backoff_step = 0, next_attempt_at_seconds = 0,
+             parked_at_seconds = NULL WHERE state != 0",
+            [],
+        )
+        .storage()?;
+    conn.execute_cached("DELETE FROM account_recovery_unit_spans", [])
+        .storage()?;
+    conn.execute_cached(
+        "UPDATE account_recovery_units SET recheck_position_seconds = NULL,
+         recheck_completed_at_seconds = NULL, recheck_revision = recheck_revision + 1",
+        [],
+    )
+    .storage()?;
+    Ok(rearmed)
+}
+
 fn budget_add_tx(conn: &Connection, minute: u64, attempts: i64, bytes: u64) -> StorageResult<()> {
     conn.execute_cached(
         "DELETE FROM account_recovery_budget WHERE minute < ?1",
@@ -1159,6 +1181,90 @@ pub(crate) fn prune_spans_tx(conn: &Connection, floor: i64) -> StorageResult<()>
     Ok(())
 }
 
+/// The upgrade conversion's park (mdk#2660 PR 5d): a parked obligation of the
+/// old owner becomes a park on each of `relays` that owes the route history
+/// up to `now_seconds`. Each breaks for no progress, keeping
+/// `parked_at_seconds`, the time the obligation parked. The route's converted
+/// parks share one revision, its remainder's when it has one, so they are one
+/// notice whose id stays put while some of them re-arm. A relay that owes
+/// nothing is left as it is, and so is one already broken: its own park
+/// stands. Returns the units broken.
+pub(crate) fn break_converted_route_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    relays: &[String],
+    parked_at_seconds: u64,
+    now_seconds: u64,
+) -> StorageResult<u64> {
+    let mut revision = None;
+    let mut broken = 0;
+    for relay in relays {
+        if unit_tx(conn, route, relay)?
+            .is_some_and(|unit| matches!(unit.state, RecoveryUnitState::Broken(_)))
+            || unit_debt_tx(conn, route, relay, now_seconds)?.is_empty()
+        {
+            continue;
+        }
+        let revision = match revision {
+            Some(revision) => revision,
+            None => *revision.insert(match remainder_revision_tx(conn, route)? {
+                Some(revision) => revision,
+                None => i64_to_u64(next_park_revision_tx(conn)?)?,
+            }),
+        };
+        ensure_unit_tx(conn, route, relay)?;
+        let unit = unit_tx(conn, route, relay)?.ok_or_else(invalid)?;
+        park_tx(
+            conn,
+            &unit,
+            RecoveryUnitBreak::NoProgress,
+            Some(RecoveryUnitPark {
+                revision,
+                parked_at_seconds,
+            }),
+            now_seconds,
+        )?;
+        broken += 1;
+    }
+    Ok(broken)
+}
+
+/// The upgrade conversion's dismissal (mdk#2660 PR 5d): a notice the user
+/// dismissed under the old owner becomes `ranges` retired as dismissed on this
+/// unit, never coverage, so the runner does not raise it again. What the relay
+/// already covers or has retired is left out. An active unit becomes retired,
+/// as a dismissal leaves it; a broken or retired one keeps its state.
+pub(crate) fn retire_converted_ranges_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    relay: &str,
+    ranges: &[RecoveryCoverageRange],
+) -> StorageResult<()> {
+    let retired = spans_tx(conn, route, relay, RETIRED_SPAN)?;
+    let mut taken = relay_covered_tx(conn, route, relay)?;
+    taken.extend(retired.iter().map(|span| span.range));
+    let added = subtract_all(&union(ranges.to_vec()), &union(taken));
+    if added.is_empty() {
+        return Ok(());
+    }
+    ensure_unit_tx(conn, route, relay)?;
+    let mut spans = retired;
+    spans.extend(added.into_iter().map(|range| RecoveryUnitSpan {
+        range,
+        retired: Some(RecoverySpanRetirement::Dismissed),
+    }));
+    spans.sort_by_key(|span| span.range);
+    replace_spans_tx(conn, route, relay, RETIRED_SPAN, &spans)?;
+    let (kind, id) = route.storage_key();
+    conn.execute_cached(
+        "UPDATE account_recovery_units SET state = ?4
+         WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3 AND state = ?5",
+        params![kind, id, relay, RETIRED, ACTIVE],
+    )
+    .storage()?;
+    Ok(())
+}
+
 impl SqliteAppStorage {
     /// The runner picked this unit: remember when and with which caps, and
     /// charge one attempt to the account's rolling hour.
@@ -1408,26 +1514,8 @@ impl SqliteAppStorage {
     /// fresh budget, every parked and retired span is owed again, and every
     /// unit's re-check falls due now. Returns the units re-armed.
     pub fn rearm_all_recovery_units(&self) -> StorageResult<usize> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let rearmed = conn
-                .execute_cached(
-                    "UPDATE account_recovery_units SET state = 0, broken_reason = NULL, probe = 0,
-                     no_progress = 0, backoff_step = 0, next_attempt_at_seconds = 0,
-                     parked_at_seconds = NULL WHERE state != 0",
-                    [],
-                )
-                .storage()?;
-            conn.execute_cached("DELETE FROM account_recovery_unit_spans", [])
-                .storage()?;
-            conn.execute_cached(
-                "UPDATE account_recovery_units SET recheck_position_seconds = NULL,
-                 recheck_completed_at_seconds = NULL, recheck_revision = recheck_revision + 1",
-                [],
-            )
-            .storage()?;
-            Ok(rearmed)
-        })
+        self.connection
+            .with_transaction(|| rearm_all_units_tx(&*self.lock()?))
     }
 
     /// Record a relay's NIP-11 caps. An unknown read is never evidence and

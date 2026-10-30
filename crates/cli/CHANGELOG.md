@@ -136,6 +136,19 @@ versioning through the workspace version in the root `Cargo.toml`.
   deliverable is recorded only after its Welcome is withdrawn, and opening a client no longer withdraws link Welcomes
   first. A chosen-id create is refused on the legacy profile, which keeps no delivery deadline. Reachable only in
   test-policy builds.
+- A device group is now founded with only its creator in the roster, plus its sign-in rejections, and the founding
+  Add sets the linked device's entry as every later link's Commit does (mdk#2628 item 3.3b, D41).
+  `create_group_with_chosen_id_and_audit_context` takes that roster update, in the engine, the session and the runtime.
+  A device group founded with a member adds exactly one KeyPackage, the update sets that device's entry for a slot the
+  founding roster does not list, announcing the KeyPackage, and the founding Add meets the same sender rule as a link.
+  Any other device-group founding with a member, and a roster update on any other create, is refused and leaves no
+  group state behind. Reachable only in test-policy builds.
+- A new device now joins its device group only through a Welcome that adds it by the KeyPackage the link confirmed
+  (mdk#2628 item 3.3b, D41). `DeviceGroupWelcomeExpectation` gains `key_package_ref`, which `marmot-app` fills from
+  the confirmed link; an expectation stored without it matches no Welcome. While an expectation is unexpired, the
+  engine also refuses, with `EngineError::UnexpectedDeviceGroupWelcome`, a Welcome into any other group, a chat
+  included, that adds this device by that KeyPackage, so no other invite uses it up. Storage providers implement the
+  new `DeviceGroupWelcomeStorage::device_group_welcome_expectations`. Reachable only in test-policy builds.
 - The conformance simulator models `marmot.group.account-devices.v1` (0x800d) support per client (mdk#2628). Scenario
   IR v3 gains `set_account_devices_support`, `require_account_devices` and `expect_require_account_devices_error`, and
   vectors gain an `account_devices_state` expectation that checks the component's state rules on a client's exact
@@ -164,6 +177,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- `messages send-event` refuses the device-group kinds 457, 459, 460 and 462 with `reserved_app_event_kind`, and one
+  received in a chat makes no timeline row or message (mdk#2628). They are read only in the account's device group.
 - Creating a group now refuses an initial entry for `marmot.group.account-devices.v1` (0x800d), or any other protocol
   component that carries no data, with `EngineError::NoDataAppComponent` before anything is created or published
   (mdk#2628). Hosts could pass one among the optional initial components and create a GroupContext entry the spec
@@ -224,6 +239,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- SQLite `delete_group` now joins a caller's transaction instead of failing inside one. A current-profile group
+  creation that failed after writing its MLS state used to leave that state behind, because its cleanup ran
+  `delete_group` inside a transaction and only logged the failure; the group id stayed taken.
 - `groups management` and the TUI group detail screen offer no member actions on a device that was removed while another
   device of its account stays in the group (mdk#2628). Both used to read that account's roster entry as this device, so
   the TUI could mark it "(you)" and refuse to leave as the group's only admin.

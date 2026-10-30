@@ -521,7 +521,11 @@ fn prune_uncover_log_tx(conn: &Connection, now_seconds: Option<u64>) -> StorageR
 /// widens their goals afterwards. The log
 /// records the loss for every route, so a fetch already running on any route
 /// keeps the debt too.
-pub(crate) fn uncover_loss_tx(conn: &Connection, floor_seconds: u64) -> StorageResult<()> {
+pub(crate) fn uncover_loss_tx(
+    conn: &Connection,
+    floor_seconds: u64,
+    now_seconds: u64,
+) -> StorageResult<()> {
     let floor = integer(floor_seconds)?;
     conn.execute_cached(
         "INSERT INTO account_recovery_coverage_goals (route_kind, route_id, since_seconds)
@@ -540,12 +544,23 @@ pub(crate) fn uncover_loss_tx(conn: &Connection, floor_seconds: u64) -> StorageR
     )
     .storage()?;
     remove_coverage_tx(conn, None, floor_seconds, None)?;
-    log_uncover_tx(
-        conn,
-        None,
-        &[(floor_seconds, None)],
-        i64_to_u64(crate::base::codec::unix_now_seconds_i64())?,
+    log_uncover_tx(conn, None, &[(floor_seconds, None)], now_seconds)
+}
+
+/// Every route is settled below `floor_seconds`: its goal starts no lower,
+/// and a later prune parks only from there up. Whatever is still owed below
+/// the floor and must stay owed is parked first: the prune parks what current
+/// routes owe there, and the upgrade conversion what live loss reached.
+pub(crate) fn settle_goals_tx(conn: &Connection, floor_seconds: u64) -> StorageResult<()> {
+    conn.execute_cached(
+        "UPDATE account_recovery_coverage_goals
+         SET since_seconds = MAX(since_seconds, ?1),
+             settled_below_seconds = MAX(settled_below_seconds, ?1)
+         WHERE since_seconds < ?1 OR settled_below_seconds < ?1",
+        [integer(floor_seconds)?],
     )
+    .storage()?;
+    Ok(())
 }
 
 /// Loss on one route from `floor_seconds` upward, inside the transaction
@@ -889,14 +904,7 @@ impl SqliteAppStorage {
             .storage()?;
             // Every route is now settled below the floor: a current route
             // parked what it owed there, and the rest keep nothing below it.
-            conn.execute_cached(
-                "UPDATE account_recovery_coverage_goals
-                 SET since_seconds = MAX(since_seconds, ?1),
-                     settled_below_seconds = MAX(settled_below_seconds, ?1)
-                 WHERE since_seconds < ?1 OR settled_below_seconds < ?1",
-                [floor],
-            )
-            .storage()?;
+            settle_goals_tx(&conn, floor_seconds)?;
             crate::app::recovery_units::prune_spans_tx(&conn, floor)?;
             Ok(deleted)
         })
@@ -2404,7 +2412,13 @@ mod tests {
 
         storage
             .connection
-            .with_transaction(|| uncover_loss_tx(&*storage.lock()?, 700))
+            .with_transaction(|| {
+                uncover_loss_tx(
+                    &*storage.lock()?,
+                    700,
+                    i64_to_u64(crate::base::codec::unix_now_seconds_i64())?,
+                )
+            })
             .unwrap();
         assert_eq!(
             app.recovery_coverage_lost_since(after).unwrap(),

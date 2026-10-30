@@ -297,6 +297,28 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   `staged_recovery_routes` and `recovery_unit_fences` tell the runner which groups to read, and
   `reclaim_staged_recovery_routes` gives back what a route it no longer lists staged. Nothing schedules on
   this state yet.
+- **Upgrade conversion (`account_recovery/convert.rs`, migration 0136, mdk#2660 phase 4).**
+  `convert_recovery_obligations` turns the old owner's queue-loss, notification-loss, explicit, incremental and
+  native-replay obligations into ledger debt and runner retry state, once, before the runner first starts.
+  Epoch-gap, known-event and maintenance obligations stay. The caller passes what storage does not have: every
+  current route (the inbox included, so routing is hydrated) with its required relays and standing floor, the
+  ledger's spelling of a relay a stored scope names, the retention floor and the time. Each step is one transaction
+  that also advances the marker (`recovery_conversion_pending`), so a crash leaves every row intact or converted and
+  gone, the next call resumes, and a finished conversion does nothing. In order: phase 2's live-boundary ranges and
+  shadow remainders are dropped (comparison, sweep and re-check ranges stay), goals settle at the window floor and
+  every current route's standing goal starts; dismissed rows retire their uncertified scopes' windows on the relays
+  they recorded, below where live loss reaches that route; live loss un-covers what it reached once, as an import
+  charges it (a generation that named its routes reaches only those, from their bounds; any other reaches every route
+  from its floor), parks what lies below the window, and counts as imported, generations no import charged yet under
+  a new loss revision they are stamped with; parked rows break their routes' required relays that still owe history,
+  under one revision per route (one notice), keeping the earliest park time; a pending explicit repair re-arms every
+  unit; satisfied rows go. Converted rows are deleted with their scopes, with no third state, and nothing becomes
+  coverage. `recovery_conversion_report` keeps the counts by cause and disposition until
+  `acknowledge_recovery_conversion_report`, and `recovery_conversion_notices_changed` asks for one announcement of
+  the changed "history may be incomplete" notices. Converted loss evidence stays, imported and with no obligation;
+  `converted_recovery_loss` lists it by account and cause until the worker has finished the relay plane's overflow
+  recovery and calls `reclaim_converted_recovery_loss`, which deletes each generation still at its converted count
+  (newer or grown loss stays for the import). Nothing calls the conversion yet.
 
 ## Tests and benchmarks
 

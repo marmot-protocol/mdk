@@ -94,6 +94,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- `marmot_send_custom_event` refuses the device-group kinds 457, 459, 460
+  and 462 as reserved, and one received in a chat makes no timeline row,
+  message or notification (mdk#2628). They are read only in the account's
+  device group.
 - Creating a group or inviting adds every device of each recipient account
   (mdk#2628, mdk#1696): every valid, compatible KeyPackage published in the
   last 30 days, at most 20, or the single best one when none is that recent.

@@ -41,8 +41,10 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   metadata. Handle payload variants in its private `dispatch_sdk_notification`; do not add a second dispatcher here.
   Keep metadata through worker queueing and fence receiver loss before resuming. Directory Client input stays separate.
 - Recovery debt, retry selection and native input qualification belong to the app's AccountRecoveryOwner.
-  Bridge frozen capture plans and borrowed source guards; never schedule quiet-period repair here. Import
-  actual loss before cursor authorization and retain placement/spill locking through the owner's callback.
+  Bridge frozen capture plans, the owner's fence plans and borrowed source guards; never schedule quiet-period
+  repair here. Import actual loss before cursor authorization and retain placement/spill locking through the owner's
+  callback. The cursor seal caps at the oldest frame the adapter's fence holds at or above the restart floor, as it
+  does at a queued delivery.
 - Test hooks and accessors (`*_for_test`, `test_support`) are `cfg(any(test, feature = "test-support"))`.
   `marmot-app` enables `test-support` only through its dev-dependency; never enable it in app artifacts.
 - Widen an item to `pub` only when another crate names it. `marmot-app` re-exports `MarmotRelayPlane` and
