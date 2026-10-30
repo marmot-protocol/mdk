@@ -20,6 +20,10 @@
 //! - While this device trusts one, it names each KeyPackage in its own roster
 //!   entry before that KeyPackage reaches its slot (3.4). The runtime holds
 //!   publication until the roster does; this module tells it which group.
+//! - Siblings hand each other private KeyPackages inside the group
+//!   (`private_key_packages.rs`, 3.4b). Messages between this account's
+//!   devices there share one send, one dispatch by kind and one sender read
+//!   (`device_group/messages.rs`).
 //!
 //! - While this device trusts one, it tags its KeyPackages and leaves from
 //!   its roster (3.1d). The founder's own entry carries its tag signature key
@@ -38,6 +42,8 @@
 //!
 //! A confirmed link comes from device pairing. Until pairing reaches the app,
 //! only the test-policy hook supplies one.
+
+mod messages;
 
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,

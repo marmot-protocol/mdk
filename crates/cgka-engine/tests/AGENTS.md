@@ -236,6 +236,13 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     tagged; naming a seeded group hydrates it, and a quarantined one tags nothing while a tagged KeyPackage stays
     current. The tag crypto and the spec vector are unit-tested in `src/device_tag.rs`.
 
+- **File:** `account_devices/private_key_packages.rs`
+  - **Owns:** Private KeyPackages (mdk#2628 item 3.4b) through the engine: issued ones keep their keys in the same
+    transaction as their records and stay out of the KeyPackage inventory; a request stops earlier records counting
+    without deleting their keys, is answered once, and issues nothing past the per-sibling cap; records that no longer
+    advertise this client's capabilities stop counting; an ordinary Welcome never consumes one; and a hand-off keeps
+    only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only).
+
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and
     `RemoveOwnAccountDevices`: the committer's Commit is classified same-account, stamped `ordinary`, carries its

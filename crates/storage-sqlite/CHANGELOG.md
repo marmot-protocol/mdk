@@ -4,6 +4,15 @@
 
 ### Breaking changes
 
+- Migration 0135 advances account storage to schema 135 (mdk#2628 item 3.4).
+  It adds private KeyPackages, single-use KeyPackages a device hands to one
+  sibling inside its device group: `cgka_private_key_packages` (one issuer
+  record per KeyPackage, its key in the OpenMLS bundle store),
+  `private_key_packages_received` (what siblings handed this device, by
+  issuer slot) and `private_key_package_requests` (what this device still
+  wants from each issuer). `SqliteAccountStorage` implements the new
+  `PrivateKeyPackageStorage`; `SqliteAppStorage` gains the received-KeyPackage
+  and need reads and writes. Nothing writes them unless device groups are on.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it

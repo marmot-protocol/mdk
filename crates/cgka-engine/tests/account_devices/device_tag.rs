@@ -307,7 +307,7 @@ fn hold_slot(device: &Device, slot: DeviceSlotId) {
 
 /// `device` sets its own `tag_signature_key` in its entry at `own_slot` in
 /// the device group `gid`, and `others` apply the roster update.
-async fn set_own_key(
+pub(super) async fn set_own_key(
     device: &mut Device,
     own_slot: DeviceSlotId,
     gid: &GroupId,
