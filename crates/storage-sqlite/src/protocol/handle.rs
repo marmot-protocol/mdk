@@ -68,8 +68,20 @@ impl SqliteAccountStorage {
         crate::protocol::storage::snapshots::import_replay(self, group_id, snapshot)
     }
 
+    /// An unencrypted in-memory store with the default options. Only tests
+    /// open these, so test builds leave out SQLCipher's memory security here:
+    /// it turns every allocation in the process into system calls (see
+    /// `relax_storage_for_test_process`). Pass the option to
+    /// [`Self::in_memory_with_options`] to keep it.
     pub fn in_memory() -> StorageResult<Self> {
-        Self::in_memory_with_options(SqliteStorageOptions::default())
+        #[cfg(any(test, feature = "test-support"))]
+        let options = SqliteStorageOptions {
+            cipher_memory_security: false,
+            ..SqliteStorageOptions::default()
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
+        let options = SqliteStorageOptions::default();
+        Self::in_memory_with_options(options)
     }
 
     pub fn in_memory_with_options(options: SqliteStorageOptions) -> StorageResult<Self> {

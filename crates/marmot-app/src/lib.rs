@@ -1629,6 +1629,11 @@ impl MarmotApp {
         relay_urls: Vec<String>,
         mut config: MarmotAppConfig,
     ) -> Self {
+        // Unit tests skip SQLCipher's memory security and full fsync, which
+        // made up most of their run time. They change nothing a test here
+        // observes; storage-sqlite's own tests pin the production settings.
+        #[cfg(test)]
+        storage_sqlite::relax_storage_for_test_process();
         // These relay-only constructors are dev/test entry points (production
         // opens through `with_relays_and_account_home*`). Explicit test-policy
         // builds default them to instant settlement so multi-client tests are
@@ -1741,6 +1746,9 @@ impl MarmotApp {
         account_home: AccountHome,
         mut config: MarmotAppConfig,
     ) -> Self {
+        // As in `with_relays_and_config`.
+        #[cfg(test)]
+        storage_sqlite::relax_storage_for_test_process();
         // `deployment` is a public field, so a struct literal can skip
         // `with_deployment`; normalize once where the app keeps it.
         config.deployment = config.deployment.normalize();

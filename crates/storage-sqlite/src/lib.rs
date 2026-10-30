@@ -152,6 +152,8 @@ pub use base::connection::{
     SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, SqliteTimingObserver,
     SqliteTimingOperation, open_hardened_sqlcipher,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use base::connection::relax_storage_for_test_process;
 pub use cross::outbound::MessageDraftCommitObserver;
 pub use protocol::handle::SqliteAccountStorage;
 #[allow(deprecated)]
