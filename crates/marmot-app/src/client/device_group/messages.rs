@@ -15,15 +15,17 @@
 //!   other group, so no chat projects one and no host sends one as a custom
 //!   event.
 //! - [`AppClient::ensure_sent_by`] reads which slot sent a message from the
-//!   sending leaf's device tag (D33), through 3.1d's one tag reader. It reads
-//!   only the current tree, so a message from an earlier epoch has no
-//!   readable sender.
+//!   sending leaf's device tag (D33), through 3.1d's one tag reader. A
+//!   message from an earlier epoch is read from that epoch's retained anchor,
+//!   so one older than the retained anchors has no readable sender.
 
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
 use cgka_traits::app_event::MarmotAppEvent;
 use cgka_traits::engine::{GroupEvent, SendIntent};
 use cgka_traits::{EpochId, GroupId};
-use marmot_session::{KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST};
+use marmot_session::{
+    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
+};
 
 use crate::client::AppClient;
 use crate::{AppError, unix_now_seconds};
@@ -36,7 +38,7 @@ pub(crate) const KIND_DEVICE_HEARTBEAT: u64 = 457;
 pub(crate) const KIND_ANOMALY_ALERT: u64 = 462;
 
 /// True for a kind sent only in a device group: a heartbeat, a private
-/// KeyPackage request or hand-off, or an anomaly alert. A device reads these
+/// KeyPackage request or hand-off, a sibling Welcome, or an anomaly alert. A device reads these
 /// only in the device group it trusts and ignores them in any other group.
 /// Whatever kind a device-group feature adds goes here too.
 pub(crate) fn is_device_group_kind(kind: u64) -> bool {
@@ -45,6 +47,7 @@ pub(crate) fn is_device_group_kind(kind: u64) -> bool {
         KIND_DEVICE_HEARTBEAT
             | KIND_PRIVATE_KEY_PACKAGE_REQUEST
             | KIND_PRIVATE_KEY_PACKAGE_HAND_OFF
+            | KIND_SIBLING_WELCOME
             | KIND_ANOMALY_ALERT
     )
 }
@@ -80,6 +83,13 @@ impl AppClient {
                 (*epoch, *sender_leaf_index),
                 &message.content,
             ),
+            KIND_SIBLING_WELCOME => self.receive_sibling_welcome(
+                group_id,
+                message_id,
+                (*epoch, *sender_leaf_index),
+                message.created_at,
+                &message.content,
+            ),
             _ => return,
         };
         if let Err(error) = result {
@@ -97,8 +107,8 @@ impl AppClient {
     /// carries a device tag that reads as `from`'s in `roster` (mdk#2628 D33).
     /// A sibling whose leaf is not tagged yet is refused and not counted; it
     /// sends again once it has tagged its leaf. So is a removed device, whose
-    /// tag reads as its rejected slot, and a message from an epoch that is no
-    /// longer current.
+    /// tag reads as its rejected slot, and a message from an epoch that is
+    /// neither current nor retained.
     pub(crate) fn ensure_sent_by(
         &mut self,
         group_id: &GroupId,

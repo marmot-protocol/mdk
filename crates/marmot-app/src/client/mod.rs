@@ -1483,6 +1483,7 @@ impl AppClient {
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;
+        self.join_stashed_sibling_welcomes().await;
         self.sibling_key_package_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
         self.note_key_package_refresh_overdue();

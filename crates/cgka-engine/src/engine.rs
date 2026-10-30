@@ -3748,14 +3748,17 @@ impl<S: StorageProvider> Engine<S> {
         self.with_mls_group(group_id, f)
     }
 
-    /// Which roster slot the leaf at `leaf_index` belongs to, read from its
-    /// device tag against `roster`, the device group's current roster
-    /// (device-tag-v1.md, "Reading tags").
+    /// Which roster slot the leaf at `leaf_index` belonged to at `epoch`, read
+    /// from its device tag against `roster`, the device group's current
+    /// roster (device-tag-v1.md, "Reading tags").
     ///
-    /// `None` when `epoch` is not the group's current epoch or no leaf sits
-    /// at that index, so a caller holding an older event never reads a leaf
-    /// that has since changed hands. A leaf of another account reads as
-    /// unclaimed: tags are read only on the reader's own account's leaves.
+    /// A past epoch is read from its own retained anchor, never from another
+    /// epoch's tree, so a message read after later commits still names the
+    /// leaf that sent it, as that leaf was then (mdk#2628 3.5). That read
+    /// writes nothing: it rewinds inside a savepoint it always rolls back.
+    /// `None` when `epoch` is neither current nor retained, or no leaf sat at
+    /// that index. A leaf of another account reads as unclaimed: tags are
+    /// read only on the reader's own account's leaves.
     pub fn member_device_tag_claim(
         &self,
         group_id: &GroupId,
@@ -3763,26 +3766,64 @@ impl<S: StorageProvider> Engine<S> {
         leaf_index: u32,
         roster: &DeviceRosterV1,
     ) -> Result<Option<DeviceTagClaim>, EngineError> {
-        self.with_live_mls_group(group_id, |mls_group| {
-            if mls_group.epoch().as_u64() != epoch.0 {
-                return Ok(None);
-            }
-            let Some(leaf) = mls_group
+        let claim = |mls_group: &openmls::group::MlsGroup| {
+            let leaf = mls_group
                 .public_group()
-                .leaf(openmls::prelude::LeafNodeIndex::new(leaf_index))
-            else {
-                return Ok(None);
-            };
+                .leaf(openmls::prelude::LeafNodeIndex::new(leaf_index))?;
             let own_account = openmls::prelude::BasicCredential::try_from(
                 leaf.credential().clone(),
             )
             .is_ok_and(|credential| credential.identity() == self.identity.self_id().as_slice());
-            Ok(Some(if own_account {
+            Some(if own_account {
                 crate::device_tag::device_tag_claim(leaf, roster)
             } else {
                 DeviceTagClaim::Unclaimed
-            }))
-        })
+            })
+        };
+        if let Some(current) = self.with_live_mls_group(group_id, |mls_group| {
+            Ok((mls_group.epoch().as_u64() == epoch.0).then(|| claim(mls_group)))
+        })? {
+            return Ok(current);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-device-tag-restore/v1");
+        hasher.update(group_id.as_slice());
+        hasher.update(epoch.0.to_be_bytes());
+        let suffix = hex::encode(&hasher.finalize()[..8]);
+        let site = crate::snapshot_guard::RewindSite::DeviceTagSource;
+        // The read leaves through the savepoint's error path, so every write
+        // the rewind made, its guard included, is rolled back.
+        enum Undone {
+            Read(Result<Option<DeviceTagClaim>, EngineError>),
+            Storage(StorageError),
+        }
+        impl From<StorageError> for Undone {
+            fn from(error: StorageError) -> Self {
+                Self::Storage(error)
+            }
+        }
+        let undone = self.storage.with_group_savepoint(
+            group_id,
+            &site.snapshot_name(&format!("{suffix}-undo")),
+            |storage| {
+                Err::<std::convert::Infallible, _>(Undone::Read(
+                    crate::openmls_projection::with_retained_anchor_group(
+                        storage,
+                        &self.crypto,
+                        group_id,
+                        epoch,
+                        site,
+                        &suffix,
+                        |historical_group, _| Ok(claim(historical_group)),
+                    ),
+                ))
+            },
+        );
+        match undone {
+            Ok(never) => match never {},
+            Err(Undone::Read(read)) => read,
+            Err(Undone::Storage(error)) => Err(error.into()),
+        }
     }
 
     /// Return the current Marmot admin policy keys mirrored from signed MLS
@@ -3967,7 +4008,12 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &mut self,
         welcome_msg: TransportMessage,
     ) -> Result<GroupId, EngineError> {
-        self.do_join_welcome(welcome_msg, None).await
+        self.do_join_welcome(
+            welcome_msg,
+            None,
+            crate::group_lifecycle::WelcomeRoute::Delivery,
+        )
+        .await
     }
 
     fn feature_status(

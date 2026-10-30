@@ -357,7 +357,8 @@
 ### Fixed
 
 - Kinds sent only in a device group (heartbeat 457, private KeyPackage
-  request 459 and hand-off 460, anomaly alert 462) are ignored in any other
+  request 459 and hand-off 460, sibling Welcome 461, anomaly alert 462) are
+  ignored in any other
   group (mdk#2628). One received in a chat makes no timeline row, host
   message or notification, and `send_custom_event` refuses each as reserved
   (`is_reserved_app_event_kind`). The device group itself still reads them.

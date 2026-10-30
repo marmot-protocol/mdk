@@ -1,17 +1,21 @@
 //! Private KeyPackages (mdk#2628 item 3.4b): single-use KeyPackages this
 //! device issues to one sibling and hands over inside the device group. The
 //! engine keeps each one's record with its private key; the host decides when
-//! to issue, sends the hand-offs and reports them queued.
+//! to issue, sends the hand-offs and reports them queued. A sibling Welcome
+//! (3.5) joins a chat with one; the host admits it first.
 
 use cgka_traits::MessageId;
 use cgka_traits::TransportAdapter;
 use cgka_traits::app_components::DeviceSlotId;
+use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::storage::IssuedPrivateKeyPackage;
+use cgka_traits::transport::Timestamp;
 
 use super::AccountDeviceRuntime;
 use crate::error::AccountResult;
 use crate::key_package::KeyPackagePublisher;
 use crate::routing::TransportRoutingPolicy;
+use crate::session::SiblingWelcome;
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
 where
@@ -33,6 +37,22 @@ where
         Ok(self
             .session
             .issue_private_key_packages(recipient, count, request, now)?)
+    }
+
+    /// Join a chat from a sibling Welcome carried by the device-group message
+    /// `message_id`. The caller admits it from the trusted device group first,
+    /// and drains the join's events afterwards, as for a confirmed rejoin.
+    /// See [`cgka_engine::Engine::join_sibling_welcome`].
+    pub async fn join_sibling_welcome(
+        &mut self,
+        message_id: &MessageId,
+        welcome: &SiblingWelcome,
+        created_at: Option<Timestamp>,
+    ) -> AccountResult<IngestOutcome> {
+        Ok(self
+            .session
+            .join_sibling_welcome(message_id, welcome, created_at)
+            .await?)
     }
 
     /// Every private KeyPackage this device issued, oldest first.

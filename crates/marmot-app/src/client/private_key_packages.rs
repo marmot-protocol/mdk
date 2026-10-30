@@ -31,19 +31,28 @@
 //!   receipts. An issuer at its cap answers with the newest KeyPackages it
 //!   already issued, handed over again, and this device never keeps one it
 //!   has used (mdk#2628 D42).
+//! - A sibling Welcome (461) adds this device to a chat with one of the
+//!   KeyPackages it issued (3.5b). It is read like a hand-off, and also only
+//!   when its relays are valid and its KeyPackage is one this device issued
+//!   to its sender. The dispatch that reads it cannot wait for a join, so an
+//!   admitted one is stashed (migration 0160) and each maintenance pass joins
+//!   from the stash, before upkeep tops the sender's stock up again.
 
 use base64::Engine as _;
-use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
+use cgka_traits::app_components::{
+    DeviceRosterV1, DeviceSlotId, DeviceTagClaim, NOSTR_ROUTING_MAX_RELAYS,
+    validate_nostr_relay_url,
+};
 use cgka_traits::storage::{IssuedPrivateKeyPackage, MaintenanceStorage as _};
-use cgka_traits::{EpochId, GroupId, KeyPackage, MemberId, MessageId};
+use cgka_traits::{EpochId, GroupId, IngestOutcome, KeyPackage, MemberId, MessageId, Timestamp};
 use marmot_session::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,
     MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW, PRIVATE_KEY_PACKAGE_STOCK_TARGET,
-    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, private_key_package_stock,
+    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, SiblingWelcome, private_key_package_stock,
     validate_received_private_key_package,
 };
-use std::collections::BTreeMap;
-use storage_sqlite::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage};
+use std::collections::{BTreeMap, BTreeSet};
+use storage_sqlite::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage, StashedSiblingWelcome};
 
 use super::AppClient;
 use super::device_group::device_slot;
@@ -209,6 +218,138 @@ impl AppClient {
             kept,
             "kept handed-over private KeyPackages"
         );
+        Ok(())
+    }
+
+    /// Stash a sibling Welcome that adds this device to a chat, for the next
+    /// maintenance pass to join. Beyond a hand-off's checks, its relays must
+    /// be one to [`NOSTR_ROUTING_MAX_RELAYS`] distinct relay URLs, and its
+    /// KeyPackage one this device issued to the sender and still holds; the
+    /// join checks that KeyPackage again.
+    pub(super) fn receive_sibling_welcome(
+        &mut self,
+        group_id: &GroupId,
+        message_id: &MessageId,
+        sender: (EpochId, Option<u32>),
+        created_at: u64,
+        content: &str,
+    ) -> Result<(), AppError> {
+        let Some(exchange) = self.private_key_package_exchange()? else {
+            return Ok(());
+        };
+        let invalid = || AppError::InvalidAppMessagePayload("sibling Welcome".into());
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .map_err(|_| invalid())?;
+        let welcome = SiblingWelcome::decode(&bytes).map_err(|_| invalid())?;
+        if &exchange.group_id != group_id || welcome.to != exchange.own_slot {
+            return Ok(());
+        }
+        if !exchange.is_sibling(&welcome.from) {
+            return Err(AppError::DeviceGroupRefused("unknown_sibling"));
+        }
+        self.ensure_sent_by(&exchange.group_id, &exchange.roster, sender, &welcome.from)?;
+        if !valid_sibling_welcome_relays(&welcome.relays) {
+            return Err(invalid());
+        }
+        if !self
+            .runtime
+            .issued_private_key_packages()?
+            .iter()
+            .any(|record| {
+                record.key_package_ref == welcome.key_package_ref
+                    && record.recipient_slot == welcome.from
+            })
+        {
+            return Err(AppError::DeviceGroupRefused(
+                "key_package_not_issued_to_sender",
+            ));
+        }
+        let stashed = self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .stash_sibling_welcome(&StashedSiblingWelcome {
+                message_id_hex: hex::encode(message_id.as_slice()),
+                content: bytes,
+                created_at,
+                received_at: unix_now_seconds(),
+            })?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "receive_sibling_welcome",
+            stashed,
+            "stashed a sibling Welcome"
+        );
+        Ok(())
+    }
+
+    /// Join a chat from every stashed sibling Welcome, oldest first, and
+    /// project the joins. A Welcome leaves the stash once its join settles,
+    /// whether it joined or was refused; one whose join failed stays for the
+    /// next pass. A failure waits for the next pass.
+    pub(crate) async fn join_stashed_sibling_welcomes(&mut self) {
+        if !self.app.device_groups_enabled() || self.runtime.maintenance_is_paused() {
+            return;
+        }
+        if let Err(error) = self.try_join_stashed_sibling_welcomes().await {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "join_stashed_sibling_welcomes",
+                error_kind = error.privacy_safe_kind(),
+                "could not join from stashed sibling Welcomes"
+            );
+        }
+    }
+
+    async fn try_join_stashed_sibling_welcomes(&mut self) -> Result<(), AppError> {
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let stashed = storage.stashed_sibling_welcomes()?;
+        if stashed.is_empty() {
+            return Ok(());
+        }
+        // As for any other join, keep block updates out until the joins and
+        // their projection have settled.
+        let policy_lock = self.app.block_update_lock(&self.state.label).await;
+        let _policy_guard = policy_lock.lock().await;
+        let (mut joined, mut refused, mut failed) = (0usize, 0usize, 0usize);
+        for record in stashed {
+            let Ok(welcome) = SiblingWelcome::decode(&record.content) else {
+                storage.delete_stashed_sibling_welcome(&record.message_id_hex)?;
+                refused += 1;
+                continue;
+            };
+            let message_id = MessageId::new(hex::decode(&record.message_id_hex)?);
+            match self
+                .runtime
+                .join_sibling_welcome(&message_id, &welcome, Some(Timestamp(record.created_at)))
+                .await
+            {
+                Ok(outcome) => {
+                    storage.delete_stashed_sibling_welcome(&record.message_id_hex)?;
+                    if matches!(outcome, IngestOutcome::Processed) {
+                        joined += 1;
+                    } else {
+                        refused += 1;
+                    }
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "join_stashed_sibling_welcomes",
+            joined,
+            refused,
+            failed,
+            "joined from stashed sibling Welcomes"
+        );
+        if joined > 0 {
+            // GroupJoined is journaled durably, so a failed projection is
+            // repaired by the ordinary reopen and drain path.
+            let summary = self.drain_pending_session_events().await?;
+            self.pending_applied_sync_summary.merge(summary);
+        }
         Ok(())
     }
 
@@ -466,4 +607,14 @@ impl AppClient {
             .delete_received_private_key_packages_from(&hex::encode(sibling))?;
         Ok(())
     }
+}
+
+/// Whether `relays` is a sibling Welcome's valid relay list: one to
+/// [`NOSTR_ROUTING_MAX_RELAYS`] Nostr relay URLs, none repeated.
+fn valid_sibling_welcome_relays(relays: &[String]) -> bool {
+    (1..=NOSTR_ROUTING_MAX_RELAYS).contains(&relays.len())
+        && relays.iter().collect::<BTreeSet<_>>().len() == relays.len()
+        && relays
+            .iter()
+            .all(|relay| validate_nostr_relay_url(relay).is_ok())
 }

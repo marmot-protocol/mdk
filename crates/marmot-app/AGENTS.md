@@ -130,16 +130,20 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
   `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in
   `observe_device_group_event` (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending
-  leaf's device tag (mdk#2628 D33). That read sees only the current tree, so a message from an earlier epoch has no
-  readable sender. List every kind sent only in a device group in `is_device_group_kind` (457, 459, 460, 462), the
-  one list: `observe_event` drops one received in any other group before the host summary and the stored
-  projection, the notification preview refuses it, and the custom path rejects it as reserved.
+  leaf's device tag (mdk#2628 D33). A message from an earlier epoch is read from that epoch's retained anchor, so one
+  older than the retained anchors has no readable sender. List every kind sent only in a device group in
+  `is_device_group_kind` (457, 459, 460, 461, 462), the one list: `observe_event` drops one received in any other
+  group before the host summary and the stored projection, the notification preview refuses it, and the custom path
+  rejects it as reserved.
 - Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
   Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
   roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
   this account's, single-use, unexpired and tagged as that slot's (mdk#2628 D33, through 3.1d's tag reader; never a
   second one). Never publish one, and never fall back to a public KeyPackage when none is held. A KeyPackage this
   device has used is never kept again if a sibling hands it over again (mdk#2628 D42).
+  Stash a sibling Welcome (461, mdk#2628 3.5b) only after a hand-off's checks, a relay list of one to 16 distinct
+  relay URLs, and a KeyPackage this device issued to its sender; join from the stash (migration 0160) in the
+  maintenance pass, never in the synchronous dispatch, and drain the joins' events as a confirmed rejoin does.
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.

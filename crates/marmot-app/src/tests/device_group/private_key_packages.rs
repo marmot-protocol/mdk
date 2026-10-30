@@ -1,15 +1,21 @@
 //! Private KeyPackages (mdk#2628 item 3.4b): once their leaves are tagged
 //! (3.1d), siblings hand each other single-use KeyPackages inside the device
 //! group, never publish them, take only a sibling's own, repair a lost
-//! hand-off by asking again, and send again what reached no relay.
+//! hand-off by asking again, and send again what reached no relay. A sibling
+//! Welcome (3.5b) adds a device to a chat with one of them.
 
 use super::*;
 use base64::Engine as _;
 use cgka_traits::app_components::DeviceSlotId;
+use cgka_traits::app_components::{
+    AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NOSTR_ROUTING_MAX_RELAYS, encode_nostr_routing_v1,
+};
+use cgka_traits::engine::CreateGroupRequest;
 use cgka_traits::storage::IssuedPrivateKeyPackage;
 use marmot_session::{
-    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,
-    PrivateKeyPackageHandOff, PrivateKeyPackageRequest,
+    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
+    MAX_HAND_OFF_KEY_PACKAGES, PrivateKeyPackageHandOff, PrivateKeyPackageRequest, PublishWork,
+    SiblingWelcome,
 };
 use storage_sqlite::ReceivedPrivateKeyPackage;
 
@@ -457,4 +463,201 @@ async fn expired_private_key_packages_go_while_maintenance_is_paused_or_frozen()
     phone.run_due_maintenance().await.unwrap();
     assert!(issued(&phone).is_empty());
     assert!(received_from(&phone, &laptop_slot).is_empty());
+}
+
+/// A chat the laptop makes with one of the phone's private KeyPackages, and
+/// the sibling Welcome that adds the phone to it, built by hand until the
+/// laptop sends one itself (3.5b-2). Until then the laptop wraps every
+/// Welcome for the transport, so the KeyPackage names a stand-in event and
+/// the test unwraps the Welcome from a gift wrap it never publishes.
+async fn chat_adding_the_phone(devices: &mut Devices) -> (GroupId, SiblingWelcome) {
+    let (phone_slot, laptop_slot) = (slot(&devices.phone), slot(&devices.laptop));
+    let private = devices
+        .laptop
+        .take_private_key_package(&phone_slot)
+        .unwrap()
+        .unwrap();
+    let key_package_ref = issued(&devices.phone)
+        .into_iter()
+        .find(|record| record.key_package == private.bytes())
+        .unwrap()
+        .key_package_ref;
+    let private = KeyPackage {
+        source: Some(cgka_traits::engine::KeyPackageSource {
+            event_id: MessageId::new(vec![0x42; 32]),
+        }),
+        ..private
+    };
+    let routing = devices.laptop.app.new_nostr_routing(None).unwrap();
+    let created = devices
+        .laptop
+        .runtime
+        .session_mut()
+        .create_group(CreateGroupRequest {
+            name: "chat".into(),
+            description: String::new(),
+            members: vec![private],
+            required_features: Vec::new(),
+            app_components: vec![AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: encode_nostr_routing_v1(&routing).unwrap(),
+            }],
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let wrap = created
+        .effects
+        .publish
+        .iter()
+        .find_map(|work| match work {
+            PublishWork::GroupCreated { welcomes, .. }
+            | PublishWork::FoundingGroupCreated { welcomes } => welcomes.first().cloned(),
+            _ => None,
+        })
+        .unwrap();
+    let keys = devices
+        .laptop_app
+        .account_home()
+        .load_signing_keys("alice")
+        .unwrap();
+    let wrap = transport_nostr_peeler::NostrTransportEvent::from_transport_message(&wrap)
+        .unwrap()
+        .to_verified_nostr_event()
+        .unwrap();
+    let rumor = nostr::nips::nip59::extract_rumor(&keys, &wrap)
+        .unwrap()
+        .rumor;
+    let welcome = base64::engine::general_purpose::STANDARD
+        .decode(&rumor.content)
+        .unwrap();
+    (
+        created.group_id,
+        SiblingWelcome {
+            from: laptop_slot,
+            to: phone_slot,
+            key_package_ref,
+            welcome,
+            relays: vec!["wss://relay.example".into()],
+        },
+    )
+}
+
+async fn send_sibling_welcome(client: &mut AppClient, group: &GroupId, welcome: &SiblingWelcome) {
+    let content = base64::engine::general_purpose::STANDARD.encode(welcome.encode().unwrap());
+    assert!(
+        client
+            .send_device_group_message(group, KIND_SIBLING_WELCOME, content)
+            .await
+            .unwrap()
+    );
+}
+
+fn stashed(client: &AppClient) -> usize {
+    devices_storage(client)
+        .stashed_sibling_welcomes()
+        .unwrap()
+        .len()
+}
+
+/// The phone stashes a sibling Welcome from the laptop and joins the chat
+/// from the stash in its next maintenance pass, after a restart too. The
+/// join consumes the private KeyPackage, so the same Welcome sent again is
+/// refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_adds_this_device_to_a_chat() {
+    let (mut devices, group) = tagging_devices().await;
+    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
+
+    send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 1);
+    assert!(devices.phone.state_group_record(&chat).is_none());
+
+    drop(devices.phone);
+    let mut phone = devices.phone_app.client("alice").await.unwrap();
+    assert_eq!(stashed(&phone), 1);
+    phone.run_due_maintenance().await.unwrap();
+    assert_eq!(stashed(&phone), 0);
+    assert!(phone.state_group_record(&chat).is_some());
+    assert!(
+        issued(&phone)
+            .iter()
+            .all(|record| record.key_package_ref != welcome.key_package_ref)
+    );
+
+    send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
+    deliver_all(&mut phone, &devices.relay).await;
+    assert_eq!(stashed(&phone), 0);
+}
+
+/// The phone stashes only a sibling Welcome addressed to it, from a sibling
+/// the roster lists, with a valid relay list and a KeyPackage it issued to
+/// that sibling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_stashes_only_a_sibling_welcome_it_can_trust() {
+    let (mut devices, group) = tagging_devices().await;
+    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
+    let (phone_slot, laptop_slot) = (slot(&devices.phone), slot(&devices.laptop));
+    let refs = |client: &AppClient| -> Vec<Vec<u8>> {
+        issued(client)
+            .into_iter()
+            .map(|record| record.key_package_ref)
+            .collect()
+    };
+    let issued_before = refs(&devices.phone);
+
+    let many: Vec<String> = (0..=NOSTR_ROUTING_MAX_RELAYS)
+        .map(|index| format!("wss://relay{index}.example"))
+        .collect();
+    let refused = [
+        // From a slot the roster does not list, and from the phone's own.
+        SiblingWelcome {
+            from: [0x77; 32],
+            ..welcome.clone()
+        },
+        SiblingWelcome {
+            from: phone_slot,
+            ..welcome.clone()
+        },
+        // Addressed to the laptop.
+        SiblingWelcome {
+            to: laptop_slot,
+            ..welcome.clone()
+        },
+        // A KeyPackage the phone never issued.
+        SiblingWelcome {
+            key_package_ref: vec![5; 32],
+            ..welcome.clone()
+        },
+        // No relay, one off the relay URL profile, one repeated, too many.
+        SiblingWelcome {
+            relays: Vec::new(),
+            ..welcome.clone()
+        },
+        SiblingWelcome {
+            relays: vec!["http://relay.example".into()],
+            ..welcome.clone()
+        },
+        SiblingWelcome {
+            relays: vec!["wss://relay.example".into(); 2],
+            ..welcome.clone()
+        },
+        SiblingWelcome {
+            relays: many,
+            ..welcome.clone()
+        },
+    ];
+    for sibling_welcome in &refused {
+        send_sibling_welcome(&mut devices.laptop, &group, sibling_welcome).await;
+    }
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert_eq!(stashed(&devices.phone), 0);
+    assert!(devices.phone.state_group_record(&chat).is_none());
+    assert_eq!(refs(&devices.phone), issued_before);
+
+    send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 1);
 }

@@ -23,10 +23,10 @@ pub use cgka_engine::key_package::{
     KeyPackageRequirements, durably_owned_key_packages, key_package_metadata,
 };
 pub use cgka_engine::private_key_packages::{
-    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,
-    MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW, PRIVATE_KEY_PACKAGE_STOCK_TARGET,
-    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, private_key_package_stock,
-    validate_received_private_key_package,
+    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
+    MAX_HAND_OFF_KEY_PACKAGES, MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW,
+    PRIVATE_KEY_PACKAGE_STOCK_TARGET, PrivateKeyPackageHandOff, PrivateKeyPackageRequest,
+    SiblingWelcome, private_key_package_stock, validate_received_private_key_package,
 };
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{
@@ -1334,6 +1334,28 @@ impl AccountDeviceSession {
             effects,
             valid_proposal_groups,
         })
+    }
+
+    /// Join a chat from a sibling Welcome the caller admitted from the
+    /// trusted device group. Its events wait for the next drain, as a
+    /// confirmed rejoin's do. See [`cgka_engine::Engine::join_sibling_welcome`].
+    pub async fn join_sibling_welcome(
+        &mut self,
+        message_id: &MessageId,
+        welcome: &SiblingWelcome,
+        created_at: Option<Timestamp>,
+    ) -> SessionResult<IngestOutcome> {
+        let outcome = self
+            .engine
+            .join_sibling_welcome(message_id, welcome, created_at)
+            .await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "join_sibling_welcome",
+            outcome_kind = ingest_outcome_kind(&outcome),
+            "sibling Welcome ingested"
+        );
+        Ok(outcome)
     }
 
     pub async fn advance_convergence(

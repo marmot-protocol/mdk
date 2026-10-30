@@ -292,6 +292,8 @@ mod migration_0140_private_key_packages;
 mod migration_0141_sonar_stickers;
 #[path = "migrations/0142_sticker_asset_history.rs"]
 mod migration_0142_sticker_asset_history;
+#[path = "migrations/0160_sibling_welcomes.rs"]
+mod migration_0160_sibling_welcomes;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1146,6 +1148,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0142_sticker_asset_history",
         suspend_foreign_keys: &[],
         apply: migration_0142_sticker_asset_history::apply,
+    },
+    Migration {
+        version: 160,
+        name: "0160_sibling_welcomes",
+        suspend_foreign_keys: &[],
+        apply: migration_0160_sibling_welcomes::apply,
     },
 ];
 

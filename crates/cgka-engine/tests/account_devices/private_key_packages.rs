@@ -5,12 +5,13 @@
 //! in its inventory. A request stops earlier records counting, keeps their
 //! keys, and is answered once. An ordinary Welcome never consumes one. A hand-off round-trips, and
 //! the receiver accepts only this account's single-use KeyPackages whose
-//! device tag reads as the sender's slot.
+//! device tag reads as the sender's slot. A sibling Welcome (mdk#2628 3.5)
+//! consumes only the private KeyPackage it names, issued to its sender.
 
 use super::*;
 use cgka_engine::key_package::{durably_owned_key_packages, key_package_metadata};
 use cgka_engine::private_key_packages::{
-    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, private_key_package_stock,
+    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, SiblingWelcome, private_key_package_stock,
     validate_received_private_key_package,
 };
 use cgka_traits::app_components::{DeviceEntryV1, DeviceRosterV1};
@@ -308,6 +309,211 @@ async fn an_ordinary_welcome_never_consumes_a_private_key_package() {
     );
     assert_eq!(phone.engine.issued_private_key_packages().unwrap().len(), 1);
     assert_eq!(phone.storage.stored_key_package_bundles().unwrap().len(), 1);
+}
+
+fn sibling_welcome(
+    welcome: &TransportMessage,
+    from: [u8; 32],
+    key_package_ref: &[u8],
+) -> SiblingWelcome {
+    SiblingWelcome {
+        from,
+        to: OTHER_SLOT,
+        key_package_ref: key_package_ref.to_vec(),
+        welcome: welcome.payload.clone(),
+        relays: vec![],
+    }
+}
+
+async fn join_sibling(
+    device: &mut Device,
+    carrier: &[u8],
+    welcome: &SiblingWelcome,
+) -> IngestOutcome {
+    device
+        .engine
+        .join_sibling_welcome(&hash_id(carrier), welcome, None)
+        .await
+        .unwrap()
+}
+
+/// The laptop issued private KeyPackages to the phone's slot, and the phone
+/// added the laptop to a chat with one. The laptop joins from the phone's
+/// sibling Welcome only when it names that KeyPackage and the phone's slot,
+/// and the join deletes its record. A sibling Welcome consumes no other
+/// KeyPackage, and a used one never joins again.
+#[tokio::test]
+async fn a_sibling_welcome_joins_with_the_private_key_package_issued_to_its_sender() {
+    let mut phone = device(b"alice", true);
+    let mut laptop = device(b"alice", true);
+    laptop
+        .engine
+        .issue_private_key_packages(&SLOT, 2, None, NOW)
+        .unwrap();
+    let issued = laptop.engine.issued_private_key_packages().unwrap();
+    let private = current(issued[0].key_package.clone());
+    let reference = issued[0].key_package_ref.clone();
+    let (gid, welcomes) = create(&mut phone, vec![private.clone()], vec![])
+        .await
+        .unwrap();
+    let welcome = &welcomes[0];
+
+    // A delivery, a sender the KeyPackage was not issued to and another ref
+    // all leave it held, and the Welcome open.
+    assert_eq!(
+        join_outcome(&mut laptop, welcome).await,
+        refused(InputRejectionCategory::NotAddressedToThisDevice)
+    );
+    for (carrier, refusal) in [
+        (
+            &b"another sender"[..],
+            sibling_welcome(welcome, [9; 32], &reference),
+        ),
+        (
+            b"another ref",
+            sibling_welcome(welcome, SLOT, &issued[1].key_package_ref),
+        ),
+    ] {
+        assert_eq!(
+            join_sibling(&mut laptop, carrier, &refusal).await,
+            refused(InputRejectionCategory::NotAddressedToThisDevice)
+        );
+    }
+    assert_eq!(
+        laptop.engine.issued_private_key_packages().unwrap().len(),
+        2
+    );
+    assert_eq!(
+        laptop.storage.stored_key_package_bundles().unwrap().len(),
+        2
+    );
+
+    let sibling = sibling_welcome(welcome, SLOT, &reference);
+    let sibling = SiblingWelcome::decode(&sibling.encode().unwrap()).unwrap();
+    assert_eq!(
+        join_sibling(&mut laptop, b"461", &sibling).await,
+        IngestOutcome::Processed
+    );
+    assert!(laptop.engine.epoch(&gid).is_ok());
+    let joined: Vec<_> = laptop
+        .engine
+        .drain_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            GroupEvent::GroupJoined {
+                group_id, welcomer, ..
+            } => Some((group_id, welcomer)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(joined, vec![(gid.clone(), Some(phone.engine.self_id()))]);
+    let left = laptop.engine.issued_private_key_packages().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].key_package_ref, issued[1].key_package_ref);
+    assert_eq!(
+        laptop.storage.stored_key_package_bundles().unwrap().len(),
+        1
+    );
+
+    // The same Welcome in another message is a duplicate, and another chat's
+    // Welcome for the used KeyPackage finds no key.
+    assert_eq!(
+        join_sibling(&mut laptop, b"461 again", &sibling).await,
+        refused(InputRejectionCategory::Duplicate)
+    );
+    let (_, again) = create(&mut phone, vec![private], vec![]).await.unwrap();
+    assert_eq!(
+        join_sibling(
+            &mut laptop,
+            b"used",
+            &sibling_welcome(&again[0], SLOT, &reference)
+        )
+        .await,
+        refused(InputRejectionCategory::MissingWelcomeKeyPackage)
+    );
+
+    // A sibling Welcome for a published KeyPackage consumes nothing; its
+    // delivery still joins.
+    let public = laptop.engine.fresh_key_package().await.unwrap();
+    let public_ref =
+        hex::decode(key_package_metadata(&public).unwrap().key_package_ref_hex).unwrap();
+    let (other, welcomes) = create(&mut phone, vec![public], vec![]).await.unwrap();
+    assert_eq!(
+        join_sibling(
+            &mut laptop,
+            b"public",
+            &sibling_welcome(&welcomes[0], SLOT, &public_ref)
+        )
+        .await,
+        refused(InputRejectionCategory::NotAddressedToThisDevice)
+    );
+    assert_eq!(
+        join_outcome(&mut laptop, &welcomes[0]).await,
+        IngestOutcome::Processed
+    );
+    assert!(laptop.engine.epoch(&other).is_ok());
+}
+
+/// A sibling Welcome decodes only from its exact encoding.
+#[tokio::test]
+async fn a_sibling_welcome_decodes_only_its_exact_encoding() {
+    let mut phone = device(b"alice", true);
+    let mut laptop = device(b"alice", true);
+    let public = laptop.engine.fresh_key_package().await.unwrap();
+    let (_, welcomes) = create(&mut phone, vec![public], vec![]).await.unwrap();
+    let sibling = SiblingWelcome {
+        relays: vec!["wss://one".into(), "wss://two".into()],
+        ..sibling_welcome(&welcomes[0], SLOT, &[1; 32])
+    };
+    let bytes = sibling.encode().unwrap();
+    assert_eq!(SiblingWelcome::decode(&bytes).unwrap(), sibling);
+
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    let mut version = bytes.clone();
+    version[0] = 2;
+    for refused in [&bytes[..bytes.len() - 1], &trailing, &version, &bytes[..65]] {
+        assert!(SiblingWelcome::decode(refused).is_err());
+    }
+    for refused in [
+        SiblingWelcome {
+            key_package_ref: vec![],
+            ..sibling.clone()
+        },
+        SiblingWelcome {
+            key_package_ref: vec![1; 65],
+            ..sibling.clone()
+        },
+        SiblingWelcome {
+            welcome: [sibling.welcome.as_slice(), &[0]].concat(),
+            ..sibling.clone()
+        },
+        SiblingWelcome {
+            welcome: not_a_welcome(&mut laptop).await,
+            ..sibling.clone()
+        },
+        SiblingWelcome {
+            relays: vec![String::new()],
+            ..sibling.clone()
+        },
+        SiblingWelcome {
+            relays: vec!["w".repeat(513)],
+            ..sibling.clone()
+        },
+    ] {
+        assert!(refused.encode().is_err());
+    }
+}
+
+/// A KeyPackage's bytes, which are no Welcome.
+async fn not_a_welcome(device: &mut Device) -> Vec<u8> {
+    device
+        .engine
+        .fresh_key_package()
+        .await
+        .unwrap()
+        .bytes()
+        .to_vec()
 }
 
 #[tokio::test]

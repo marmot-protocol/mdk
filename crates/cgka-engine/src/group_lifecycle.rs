@@ -21,7 +21,7 @@ use crate::wire_format::{
 use cgka_traits::TransportEndpoint;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet,
-    DEVICE_ROSTER_COMPONENT_ID, decode_device_roster_v1, default_group_components,
+    DEVICE_ROSTER_COMPONENT_ID, DeviceSlotId, decode_device_roster_v1, default_group_components,
 };
 use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
@@ -160,6 +160,22 @@ pub(crate) fn welcome_key_package_of_this_device(
             .ok_or(EngineError::WelcomeNotAddressedToThisDevice),
         _ => first_held.ok_or(EngineError::MissingWelcomeKeyPackage),
     }
+}
+
+/// The route a Welcome arrived by, which decides whether it may consume a
+/// private KeyPackage (mdk#2628 3.5).
+#[derive(Clone, Debug)]
+pub(crate) enum WelcomeRoute {
+    /// A transport delivery, a stored rejoin offer or a direct join. It never
+    /// consumes a private KeyPackage.
+    Delivery,
+    /// A sibling Welcome the app admitted from the trusted device group. It
+    /// consumes only the private KeyPackage it names, and only one this
+    /// device issued to `from`'s slot.
+    Sibling {
+        from: DeviceSlotId,
+        key_package_ref: Vec<u8>,
+    },
 }
 
 pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
@@ -1087,7 +1103,10 @@ impl<S: StorageProvider> Engine<S> {
                     method = "retry_rejoins_after_trusted_removal", "skipping a group awaiting hydration repair");
                 continue;
             }
-            match self.do_join_welcome(welcome, None).await {
+            match self
+                .do_join_welcome(welcome, None, WelcomeRoute::Delivery)
+                .await
+            {
                 Ok(_) => joined = true,
                 Err(error) if terminal_welcome_error(&error) => {
                     self.storage.take_welcome(&candidate.message_id)?;
@@ -1145,6 +1164,7 @@ impl<S: StorageProvider> Engine<S> {
             peeled,
             content_id,
             Some((&candidate.group_id, local_state_token)),
+            WelcomeRoute::Delivery,
         )
         .await
     }
@@ -1177,6 +1197,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         welcome_msg: TransportMessage,
         prepeeled: Option<(cgka_traits::ingest::PeeledMessage, MessageId)>,
+        route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
         // 1. Dedupe. The ingest-path welcome handler already guards with
         // `seen_message_ids`; direct `CgkaEngine::join_welcome` callers
@@ -1236,7 +1257,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let result = self
-            .do_join_peeled_welcome(welcome_msg, peeled, content_id.clone())
+            .do_join_peeled_welcome(welcome_msg, peeled, content_id.clone(), route)
             .await;
         match &result {
             Ok(_) => {}
@@ -1257,8 +1278,9 @@ impl<S: StorageProvider> Engine<S> {
         welcome_msg: TransportMessage,
         peeled: cgka_traits::ingest::PeeledMessage,
         content_id: MessageId,
+        route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
-        self.join_peeled_welcome_with_consent(welcome_msg, peeled, content_id, None)
+        self.join_peeled_welcome_with_consent(welcome_msg, peeled, content_id, None, route)
             .await
     }
 
@@ -1269,6 +1291,7 @@ impl<S: StorageProvider> Engine<S> {
         peeled: cgka_traits::ingest::PeeledMessage,
         content_id: MessageId,
         consent: Option<(&GroupId, &[u8])>,
+        route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
         let welcome_id = welcome_msg.id.clone();
         let (welcome_bytes, welcome_created_at, key_package_claim) = match peeled.content {
@@ -1387,11 +1410,28 @@ impl<S: StorageProvider> Engine<S> {
                 decided => decided?,
             };
             // A private KeyPackage joins only through a sibling Welcome from
-            // the device group (mdk#2628 3.5). Refusing it as not addressed
-            // here remembers only this wrapper, so that Welcome stays open.
-            if crate::private_key_packages::is_issued(storage, &consumed_key_package_ref)? {
-                return Err(EngineError::WelcomeNotAddressedToThisDevice);
-            }
+            // the device group, and only the one that Welcome names, issued
+            // to the sibling that sent it; a sibling Welcome consumes nothing
+            // else (mdk#2628 3.5). Refusing one as not addressed here
+            // remembers only this wrapper, so its content stays open to the
+            // route it belongs to.
+            let issued =
+                crate::private_key_packages::issued_record(storage, &consumed_key_package_ref)?;
+            let sibling_record = match (&route, issued) {
+                (WelcomeRoute::Delivery, None) => None,
+                (
+                    WelcomeRoute::Sibling {
+                        from,
+                        key_package_ref,
+                    },
+                    Some(record),
+                ) if &record.recipient_slot == from
+                    && key_package_ref == &consumed_key_package_ref =>
+                {
+                    Some(record)
+                }
+                _ => return Err(EngineError::WelcomeNotAddressedToThisDevice),
+            };
             let processed = openmls::group::ProcessedWelcome::new_from_welcome(
                 &provider,
                 &join_config,
@@ -1637,6 +1677,13 @@ impl<S: StorageProvider> Engine<S> {
             }
 
             if let Some(local_state_token) = confirmation_token {
+                // A sibling Welcome adds a device missing from the chat, and
+                // this one holds an active copy. An offer would also be
+                // confirmed by the delivery route, which refuses a private
+                // KeyPackage.
+                if sibling_record.is_some() {
+                    return Err(EngineError::InvalidWelcome);
+                }
                 pending_rejoin = Some(PendingWelcome {
                     message_id: welcome_id.clone(),
                     group_id: group_id.clone(),
@@ -1786,6 +1833,10 @@ impl<S: StorageProvider> Engine<S> {
                     .unwrap_or_else(|| KeyPackageLifecycleState::slot_only(String::new()));
                 lifecycle.record_consumed_key_package(&consumed_key_package_ref, joined_at);
                 maintenance.put_key_package_lifecycle(&lifecycle)?;
+            }
+            // The issued record goes with the bundle the join consumed.
+            if let Some(record) = &sibling_record {
+                crate::private_key_packages::delete_issued(storage, record)?;
             }
 
             // A Welcome-installed member must retain the joined epoch

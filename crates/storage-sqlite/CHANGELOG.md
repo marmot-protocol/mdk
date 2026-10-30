@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- Migration 0160 advances account storage to schema 160 (mdk#2628 item 3.5b).
+  It adds `sibling_welcomes_received`, the sibling Welcomes this device
+  admitted from its device group and has not joined from yet, keyed by the
+  message that carried each, at most `MAX_STASHED_SIBLING_WELCOMES` at once.
+  `SqliteAppStorage` gains `stash_sibling_welcome`, `stashed_sibling_welcomes`
+  and `delete_stashed_sibling_welcome`, over `StashedSiblingWelcome`. Nothing
+  writes them unless device groups are on.
 - Migration 0136 advances account storage to schema 136 (mdk#2660 phase 4).
   It adds `account_recovery_conversion`, the marker of the one-time upgrade
   conversion (its next step, whether the changed "history may be incomplete"
