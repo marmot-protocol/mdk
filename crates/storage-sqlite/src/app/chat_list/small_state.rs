@@ -182,7 +182,9 @@ pub struct SmallStateSync {
     /// Chats whose local pin, mute or read state this call changed.
     pub applied: BTreeMap<String, BTreeSet<SmallStateItemName>>,
     /// Winning archive states the caller still has to apply. The next call
-    /// records them as applied once the chat's state matches.
+    /// records them as applied once the chat's state matches, and applies a
+    /// pin that waited for an unarchive, so the caller makes it right after
+    /// applying them.
     pub archive_to_apply: Vec<(String, bool)>,
     /// Local changes this call recorded; they are owed to the siblings.
     pub recorded: usize,
@@ -918,6 +920,17 @@ fn apply_winners_tx(
             }
         }
         let mut pinned = chat.pinned;
+        let unarchiving = chat.archived
+            && matches!(
+                held_row_tx(conn, group_id_hex, SmallStateItemName::Archive)?,
+                Some(HeldRow {
+                    item: SmallStateItem {
+                        value: SmallStateValue::Archive(false),
+                        ..
+                    },
+                    observed: None,
+                })
+            );
         for name in SmallStateItemName::VERSIONED {
             let Some(HeldRow {
                 item,
@@ -928,7 +941,11 @@ fn apply_winners_tx(
             };
             let observed = match item.value {
                 SmallStateValue::Pin(pin) => {
-                    // An archived chat is never pinned here.
+                    // An archived chat is never pinned here. A pin that comes
+                    // with an unarchive waits for the caller to apply it.
+                    if pin && unarchiving {
+                        continue;
+                    }
                     let pin = pin && !chat.archived;
                     if pin != pinned {
                         set_pinned_tx(conn, group_id_hex, pin, rule)?;

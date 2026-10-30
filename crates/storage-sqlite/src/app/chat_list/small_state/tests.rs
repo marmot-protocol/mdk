@@ -472,6 +472,33 @@ fn archive_winners_go_back_to_the_caller_and_settle_once_applied() {
 }
 
 #[test]
+fn a_pin_that_comes_with_an_unarchive_waits_for_it() {
+    let store = started_store(&[("11", true)]);
+    let rule = TestRule::new();
+    sync(&store, &[], &rule);
+    let unarchive = versioned("11", SmallStateValue::Archive(false), 2, 9);
+    let pin = versioned("11", SmallStateValue::Pin(true), 1, 9);
+    let outcome = sync(&store, &[unarchive, pin], &rule);
+    assert_eq!(outcome.archive_to_apply, vec![("11".to_owned(), false)]);
+    assert!(outcome.applied.is_empty());
+    assert!(pins(&store).is_empty());
+    assert_eq!(
+        sync(&store, &[], &rule).archive_to_apply,
+        vec![("11".to_owned(), false)]
+    );
+    assert!(pins(&store).is_empty());
+
+    // Once the caller unarchives, the pin goes on, as no change of this
+    // device's.
+    save_groups(&store, &[("11", false)]);
+    let outcome = sync(&store, &[], &rule);
+    assert!(outcome.archive_to_apply.is_empty());
+    assert_eq!(pins(&store), vec!["11".to_owned()]);
+    assert_eq!(outcome.recorded, 0);
+    assert_eq!(sync(&store, &[], &rule).recorded, 0);
+}
+
+#[test]
 fn items_for_a_chat_not_held_yet_apply_when_it_arrives() {
     let store = started_store(&[("11", false)]);
     let app = store.app_storage();

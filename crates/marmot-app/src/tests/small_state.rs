@@ -121,7 +121,8 @@ async fn a_pass_records_this_devices_changes_and_applies_its_siblings() {
     );
 
     // A sibling's archive goes through the account state. Archiving unpins,
-    // and that unpin is the phone's own change, owed at the next version.
+    // and that unpin is the phone's own change, owed at the next version
+    // from the same pass.
     let archive = sibling_value(&chat_hex, SmallStateValue::Archive(true));
     phone.sync_small_state(&[archive]).unwrap();
     assert!(phone.state_group_record(&chat).unwrap().archived);
@@ -129,7 +130,6 @@ async fn a_pass_records_this_devices_changes_and_applies_its_siblings() {
         triggers(phone),
         vec![(chat_hex.clone(), ChatListUpdateTrigger::ArchiveChanged)]
     );
-    phone.sync_small_state(&[]).unwrap();
     let owed = storage().unsent_small_state_items().unwrap();
     assert_eq!(owed.len(), 1);
     assert_eq!(owed[0].value, SmallStateValue::Pin(false));
@@ -137,6 +137,78 @@ async fn a_pass_records_this_devices_changes_and_applies_its_siblings() {
     phone.sync_small_state(&[]).unwrap();
     assert_eq!(storage().unsent_small_state_items().unwrap(), owed);
     assert!(triggers(phone).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unarchive_right_after_a_siblings_archive_is_this_devices_change() {
+    let mut devices = phone_and_laptop().await;
+    let (_bob_dir, chat) =
+        chat_with_bob(&devices.phone_app, &mut devices.phone, &devices.relay).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    link(&mut devices).await;
+    let storage = devices
+        .phone_app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage();
+    let phone = &mut devices.phone;
+    phone.sync_small_state(&[]).unwrap();
+    storage
+        .mark_small_state_sent(&storage.unsent_small_state_items().unwrap())
+        .unwrap();
+
+    let archive = sibling_value(&chat_hex, SmallStateValue::Archive(true));
+    phone.sync_small_state(&[archive]).unwrap();
+    assert!(phone.state_group_record(&chat).unwrap().archived);
+    phone.set_group_archived(&chat, false).unwrap();
+    phone.sync_small_state(&[]).unwrap();
+    assert!(!phone.state_group_record(&chat).unwrap().archived);
+    let owed = storage.unsent_small_state_items().unwrap();
+    assert_eq!(owed.len(), 1);
+    assert_eq!(owed[0].value, SmallStateValue::Archive(false));
+    assert_eq!(owed[0].version.unwrap().version, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pin_that_comes_with_an_unarchive_is_applied_with_it() {
+    let mut devices = phone_and_laptop().await;
+    let (_bob_dir, chat) =
+        chat_with_bob(&devices.phone_app, &mut devices.phone, &devices.relay).await;
+    devices.phone.set_group_archived(&chat, true).unwrap();
+    let chat_hex = hex::encode(chat.as_slice());
+    link(&mut devices).await;
+    let storage = devices
+        .phone_app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage();
+    let phone = &mut devices.phone;
+    // The phone's archive is owed at version 1.
+    phone.sync_small_state(&[]).unwrap();
+    storage
+        .mark_small_state_sent(&storage.unsent_small_state_items().unwrap())
+        .unwrap();
+    phone.take_pending_projection_updates();
+
+    let unarchive = SmallStateItem {
+        version: Some(SmallStateVersion {
+            version: 2,
+            change_id: [7; 16],
+        }),
+        ..sibling_value(&chat_hex, SmallStateValue::Archive(false))
+    };
+    let pin = sibling_value(&chat_hex, SmallStateValue::Pin(true));
+    phone.sync_small_state(&[unarchive, pin]).unwrap();
+    let updates = phone.take_pending_projection_updates();
+    assert_eq!(updates.len(), 1);
+    let row = updates[0].chat_list_row.as_ref().unwrap();
+    assert!(!row.archived && row.pinned);
+    assert_eq!(
+        updates[0].chat_list_trigger,
+        ChatListUpdateTrigger::ArchiveChanged
+    );
+    phone.sync_small_state(&[]).unwrap();
+    assert!(storage.unsent_small_state_items().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

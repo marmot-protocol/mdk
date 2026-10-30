@@ -154,7 +154,9 @@ impl AppClient {
             &SmallStateMergeRule,
             &classifier,
         )?;
+        let mut recorded = outcome.recorded;
         let mut changed = outcome.applied;
+        let mut archives_applied = false;
         for (group_id_hex, archived) in outcome.archive_to_apply {
             let applied = hex::decode(&group_id_hex)
                 .map_err(AppError::from)
@@ -163,6 +165,7 @@ impl AppClient {
                 });
             match applied {
                 Ok(_) => {
+                    archives_applied = true;
                     changed
                         .entry(group_id_hex)
                         .or_default()
@@ -177,11 +180,27 @@ impl AppClient {
                 ),
             }
         }
-        if outcome.recorded > 0 || !changed.is_empty() {
+        // At once, before this device's user can change the chats again:
+        // record the archives as applied, so a later change is taken for
+        // one, and apply the pins that waited for them. An archive left
+        // unapplied waits for the next pass.
+        if archives_applied {
+            let outcome = storage.sync_small_state(
+                &account.account_id_hex,
+                &[],
+                &SmallStateMergeRule,
+                &classifier,
+            )?;
+            recorded += outcome.recorded;
+            for (group_id_hex, names) in outcome.applied {
+                changed.entry(group_id_hex).or_default().extend(names);
+            }
+        }
+        if recorded > 0 || !changed.is_empty() {
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "sync_small_state",
-                recorded = outcome.recorded,
+                recorded,
                 applied_chats = changed.len(),
                 "small state synced"
             );
