@@ -63,6 +63,8 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     Whichever attempt meets a Welcome's acknowledgement policy marks it delivered, maintenance's retry of its stored
     fanout included. A host that names Welcomes by id (the app's invite drive) publishes them through
     `deliver_owed_welcomes_with_audit_context`, which sends only those the engine says are owed now.
+  - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b). The request
+    and hand-off checks read device tags through `member_device_tag_claim`.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.

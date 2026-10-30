@@ -1319,6 +1319,12 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 decided => decided?,
             };
+            // A private KeyPackage joins only through a sibling Welcome from
+            // the device group (mdk#2628 3.5). Refusing it as not addressed
+            // here remembers only this wrapper, so that Welcome stays open.
+            if crate::private_key_packages::is_issued(storage, &consumed_key_package_ref)? {
+                return Err(EngineError::WelcomeNotAddressedToThisDevice);
+            }
             let processed = openmls::group::ProcessedWelcome::new_from_welcome(
                 &provider,
                 &join_config,
