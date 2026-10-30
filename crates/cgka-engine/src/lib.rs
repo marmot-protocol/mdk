@@ -62,6 +62,7 @@ pub mod group_authority;
 pub mod group_context_view;
 pub mod group_lifecycle;
 pub mod group_state_changes;
+pub mod history_key;
 pub mod identity;
 pub mod key_package;
 pub mod leaf_advertisement;

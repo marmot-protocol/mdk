@@ -10,6 +10,7 @@ Map for Marmot engine-side SQLite tables (the `cgka_traits` storage traits). App
 | `mod.rs` | Module wiring and shared helpers. |
 | `groups.rs` | `GroupStorage`: group CRUD, listing, cascade delete; delegates route rows to `transport_routes.rs`. |
 | `transport_routes.rs` | Durable transport-route index rows (routing id → group id + observing epoch) seeded at session open (mdk#1161). |
+| `account_device_history_key.rs` | `AccountDeviceHistoryKeyStorage`: this device's HPKE history key pair (mdk#2628 4.1). |
 | `account_device_signer.rs` | Marmot identity to MLS signing-key binding. |
 | `device_group_welcome.rs` | `DeviceGroupWelcomeStorage`: the device-group Welcome a confirmed link expects (sender key, deadline). |
 | `messages.rs` | `MessageStorage`: message rows (storage format 2 columns), deferred-message metadata, format promotion. |
