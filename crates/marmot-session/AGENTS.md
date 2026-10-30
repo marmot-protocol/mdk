@@ -61,7 +61,8 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     that no attempt record (stored fanout or detached startup retry) holds, so one whose publish stored nothing (no
     route) or whose fanout expired goes out again on the next pass, as the startup pass would send it.
     Whichever attempt meets a Welcome's acknowledgement policy marks it delivered, maintenance's retry of its stored
-    fanout included.
+    fanout included. A host that names Welcomes by id (the app's invite drive) publishes them through
+    `deliver_owed_welcomes_with_audit_context`, which sends only those the engine says are owed now.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.
