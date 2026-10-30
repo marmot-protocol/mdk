@@ -41,7 +41,7 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, MaintenanceStorage, StorageError};
-use cgka_traits::transport::TransportMessage;
+use cgka_traits::transport::{Timestamp, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::{
     OutboundFanout, SecretBytes, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
@@ -830,8 +830,14 @@ impl AccountDeviceSession {
     pub(crate) fn outbound_welcome_status(
         &self,
         id: &MessageId,
+        now: Timestamp,
     ) -> SessionResult<OutboundWelcomeStatus> {
-        Ok(self.engine.outbound_welcome_status(id)?)
+        Ok(self.engine.outbound_welcome_status(id, now)?)
+    }
+
+    /// See `Engine::sent_welcome_deliver_until`.
+    pub fn sent_welcome_deliver_until(&self, id: &MessageId) -> SessionResult<Option<Timestamp>> {
+        Ok(self.engine.sent_welcome_deliver_until(id)?)
     }
 
     /// See `Engine::sent_welcome_awaits_commit`.
@@ -1134,10 +1140,13 @@ impl AccountDeviceSession {
         Ok(CreateGroupEffects { group_id, effects })
     }
 
+    /// Create a group under a group id chosen before it exists, as a device
+    /// link needs; see `Engine::create_group_with_chosen_id_and_audit_context`.
     pub async fn create_group_with_chosen_id_and_audit_context(
         &mut self,
         req: CreateGroupRequest,
         group_id: GroupId,
+        welcome_deliver_until: Timestamp,
         context: AuditEventContext,
     ) -> SessionResult<CreateGroupEffects> {
         tracing::debug!(
@@ -1148,7 +1157,12 @@ impl AccountDeviceSession {
         );
         let (group_id, result) = self
             .engine
-            .create_group_with_chosen_id_and_audit_context(req, group_id, Some(context))
+            .create_group_with_chosen_id_and_audit_context(
+                req,
+                group_id,
+                welcome_deliver_until,
+                Some(context),
+            )
             .await?;
         let effects = self.collect_effects(vec![result]);
         Ok(CreateGroupEffects { group_id, effects })
