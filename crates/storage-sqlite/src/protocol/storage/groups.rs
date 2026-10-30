@@ -82,13 +82,14 @@ impl GroupStorage for SqliteAccountStorage {
 
     fn delete_group(&self, id: &GroupId) -> StorageResult<()> {
         self.connection.note_openmls_write();
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        if delete_group_tx(&tx, id)? == 0 {
-            return Err(StorageError::NotFound);
-        }
-        tx.commit().storage()?;
-        Ok(())
+        // Joins a caller's `with_transaction` rather than beginning its own.
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if delete_group_tx(&conn, id)? == 0 {
+                return Err(StorageError::NotFound);
+            }
+            Ok(())
+        })
     }
 
     fn list_groups(&self) -> StorageResult<Vec<GroupId>> {
@@ -145,11 +146,9 @@ impl GroupStorage for SqliteAccountStorage {
     }
 }
 
-/// Called inside the same transaction as the local-forget marker and app wipe.
-pub(crate) fn delete_group_tx(
-    tx: &rusqlite::Transaction<'_>,
-    id: &GroupId,
-) -> StorageResult<usize> {
+/// Runs in the caller's transaction: `delete_group`'s, or the local-forget
+/// marker's and app wipe's.
+pub(crate) fn delete_group_tx(tx: &rusqlite::Connection, id: &GroupId) -> StorageResult<usize> {
     let mls_group_key = mls_group_key(id)?;
     crate::cross::routes::delete_route_app_state(
         tx,
@@ -566,6 +565,37 @@ mod tests {
                 .is_empty()
         );
         assert!(store.convergence_policy(&group.id).unwrap().is_none());
+        let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn group_delete_joins_the_callers_transaction() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 0, 1);
+        store.put_group(&group).unwrap();
+        let mls_group_id = openmls::group::GroupId::from_slice(group.id.as_slice());
+        store
+            .mls_storage()
+            .write_group_state(&mls_group_id, &TestGroupState(b"epoch-0".to_vec()))
+            .unwrap();
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.delete_group(&group.id)?;
+            Err(StorageError::Backend("force rollback".to_string()))
+        });
+        assert!(matches!(result, Err(StorageError::Backend(_))));
+        assert_eq!(store.get_group(&group.id).unwrap(), group);
+        let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
+        assert!(state.is_some());
+
+        store
+            .with_transaction(|storage| storage.delete_group(&group.id))
+            .unwrap();
+        assert!(matches!(
+            store.get_group(&group.id),
+            Err(StorageError::NotFound)
+        ));
         let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
         assert!(state.is_none());
     }

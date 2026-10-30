@@ -199,6 +199,12 @@
   published announce was built under, and settles the debt only while it
   still holds that value; a new Welcome drops it.
 
+### Fixed
+
+- `delete_group` joins a caller's `with_transaction` instead of beginning its
+  own, which failed inside one, so the engine's cleanup of a failed group
+  creation now removes the group's MLS state.
+
 ## 0.14.0 - 2026-10-23
 
 Account storage advances from migration 107 through 116 on first open; downgrade

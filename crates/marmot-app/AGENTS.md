@@ -73,7 +73,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   with an `awaiting_welcome` row joined in time, whatever the row's age. A held device group with no row stays
   `untrusted`, and a group under a row that does not require the roster drops the row; neither arises through the
   engine. A routing rebuild skips a device group a deferred open has not hydrated; the post-hydration reconcile
-  installs its route. The founding Add takes the account's own device only through the confirmed `KeyPackageRef`.
+  installs its route. The founding roster lists only this device and its sign-in rejections; the founding Add takes
+  the account's own device only through the confirmed `KeyPackageRef` and sets its entry, as a later link does (D41).
   Confirmed links come from device pairing; the `test-policy-overrides` hooks (`dev_create_device_group`,
   `dev_record_confirmed_device_link`, `dev_withdraw_confirmed_device_link`) stay for tests.
 - Read the device roster only through `trusted_device_roster` (the trusted group's decoded roster, or none). Hosts see

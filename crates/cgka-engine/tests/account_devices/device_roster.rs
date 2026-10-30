@@ -113,7 +113,7 @@ fn roster_component(roster: &DeviceRosterV1) -> AppComponentData {
     }
 }
 
-fn update_bytes(operations: Vec<DeviceRosterOperationV1>) -> Vec<u8> {
+pub(super) fn update_bytes(operations: Vec<DeviceRosterOperationV1>) -> Vec<u8> {
     encode_device_roster_update_v1(&DeviceRosterUpdateV1::new(operations).unwrap()).unwrap()
 }
 
@@ -145,30 +145,136 @@ fn requires_roster(device: &Device, gid: &GroupId) -> bool {
     required(&device.engine, gid).contains(DEVICE_ROSTER_COMPONENT_ID)
 }
 
-/// `creator` founds a device group holding `initial`, with each of `joiners`
-/// joining from its founding Welcome.
+/// `creator` founds a device group that `joiners` join, each by the Add that
+/// sets its entry, as every device group grows (D41). The joiners take the
+/// last slots of `initial`, in order, and the founding roster lists the rest.
+/// The founding Add adds the first joiner, and the creator links each later
+/// one. Once all have joined, the group holds `initial` with each joiner's
+/// entry announcing the KeyPackage it joined with.
 pub(super) async fn found_device_group(
     creator: &mut Device,
     initial: &DeviceRosterV1,
     joiners: &mut [&mut Device],
 ) -> GroupId {
-    let mut key_packages = Vec::new();
-    for joiner in joiners.iter_mut() {
-        key_packages.push(joiner.engine.fresh_key_package().await.unwrap());
-    }
+    let (founding, joiner_slots) = founding_roster(initial, joiners.len());
+    let Some((first, rest)) = joiners.split_first_mut() else {
+        let (gid, created) = creator
+            .engine
+            .create_group(device_group_request(&founding, vec![]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(created, SendResult::FoundingGroupCreated { .. }),
+            "current-profile founding group"
+        );
+        return gid;
+    };
+    let key_package = first.engine.fresh_key_package().await.unwrap();
+    let roster_update = update_bytes(vec![DeviceRosterOperationV1::SetDevice(
+        joiner_slots[0],
+        announced_entry(initial, &joiner_slots[0], &key_package),
+    )]);
     let (gid, created) = creator
         .engine
-        .create_group(device_group_request(initial, key_packages))
+        .create_group_with_chosen_id_and_audit_context(
+            device_group_request(&founding, vec![key_package]),
+            fresh_device_group_id(),
+            Some(roster_update),
+            NO_WELCOME_DEADLINE,
+            None,
+        )
         .await
         .unwrap();
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
-    for (joiner, welcome) in joiners.iter_mut().zip(&welcomes) {
+    expect_link_welcome(first, &gid, creator);
+    assert_joins(first, &welcomes[0], &gid, creator).await;
+    for index in 0..rest.len() {
+        let (joined, waiting) = rest.split_at_mut(index);
+        let joiner = &mut waiting[0];
+        let joiner_slot = joiner_slots[index + 1];
+        let key_package = joiner.engine.fresh_key_package().await.unwrap();
+        let roster_update = update_bytes(vec![DeviceRosterOperationV1::SetDevice(
+            joiner_slot,
+            announced_entry(initial, &joiner_slot, &key_package),
+        )]);
+        let SendResult::GroupEvolution {
+            msg,
+            welcomes,
+            pending,
+        } = creator
+            .engine
+            .send(SendIntent::LinkDevice {
+                group_id: gid.clone(),
+                key_package,
+                roster_update,
+                deliver_until: NO_WELCOME_DEADLINE,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("a link is a group evolution")
+        };
+        creator.engine.confirm_published(pending).await.unwrap();
+        let commit = route_to_group(&msg, &gid);
+        assert_accepted(first, &commit, &gid).await;
+        for member in joined.iter_mut() {
+            assert_accepted(member, &commit, &gid).await;
+        }
         expect_link_welcome(joiner, &gid, creator);
-        assert_joins(joiner, welcome, &gid, creator).await;
+        assert_joins(joiner, &welcomes[0], &gid, creator).await;
     }
     gid
+}
+
+/// `initial` without its last `joiners` slots, which it returns: the roster
+/// a device group is founded with when those devices join it afterwards.
+fn founding_roster(
+    initial: &DeviceRosterV1,
+    joiners: usize,
+) -> (DeviceRosterV1, Vec<DeviceSlotId>) {
+    let slots: Vec<DeviceSlotId> = initial.devices.keys().copied().collect();
+    let joiner_slots = slots[slots.len() - joiners..].to_vec();
+    let mut founding = initial.clone();
+    for joiner_slot in &joiner_slots {
+        founding.devices.remove(joiner_slot);
+    }
+    (founding, joiner_slots)
+}
+
+/// `initial`'s entry for `slot`, announcing `key_package`, as the Add that
+/// brings that device writes it.
+pub(super) fn announced_entry(
+    initial: &DeviceRosterV1,
+    slot: &DeviceSlotId,
+    key_package: &KeyPackage,
+) -> DeviceEntryV1 {
+    DeviceEntryV1 {
+        announced_key_package: Some(key_package_ref(key_package)),
+        ..initial.devices[slot].clone()
+    }
+}
+
+pub(super) fn key_package_ref(key_package: &KeyPackage) -> Vec<u8> {
+    hex::decode(
+        cgka_engine::key_package::key_package_metadata(key_package)
+            .unwrap()
+            .key_package_ref_hex,
+    )
+    .unwrap()
+}
+
+/// A device-group id no other founding in this test process uses.
+fn fresh_device_group_id() -> GroupId {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut id = vec![0xD6; 16];
+    id[8..].copy_from_slice(
+        &NEXT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_be_bytes(),
+    );
+    GroupId::new(id)
 }
 
 /// The founding request of a device group holding `initial` and adding
@@ -191,18 +297,31 @@ pub(super) fn device_group_request(
 pub(super) const NO_WELCOME_DEADLINE: Timestamp = Timestamp(u64::MAX);
 
 /// `creator` founds a device group under `chosen`, the id a device link
-/// chose before the group existed.
+/// chose before the group existed. The device in `key_packages`, if any,
+/// takes the last slot of `initial`, as in [`found_device_group`].
 pub(super) async fn create_under(
     creator: &mut Device,
     initial: &DeviceRosterV1,
     key_packages: Vec<KeyPackage>,
     chosen: &GroupId,
 ) -> Result<(GroupId, SendResult), EngineError> {
+    let (founding, joiner_slots) = founding_roster(initial, key_packages.len().min(1));
+    let roster_update =
+        key_packages
+            .first()
+            .zip(joiner_slots.first())
+            .map(|(key_package, joiner_slot)| {
+                update_bytes(vec![DeviceRosterOperationV1::SetDevice(
+                    *joiner_slot,
+                    announced_entry(initial, joiner_slot, key_package),
+                )])
+            });
     creator
         .engine
         .create_group_with_chosen_id_and_audit_context(
-            device_group_request(initial, key_packages),
+            device_group_request(&founding, key_packages),
             chosen.clone(),
+            roster_update,
             NO_WELCOME_DEADLINE,
             None,
         )
@@ -237,7 +356,18 @@ fn test_policy_builds_may_advertise_the_device_roster() {
 #[tokio::test]
 async fn a_device_group_holds_its_roster_from_creation() {
     let (phone, laptop, gid) = phone_and_laptop().await;
-    let expected = roster(&[(1, "Phone"), (2, "Laptop")]);
+    // The founding Add set the laptop's entry, announcing the KeyPackage it
+    // joined with (D41).
+    let mut expected = roster(&[(1, "Phone"), (2, "Laptop")]);
+    let announced = roster_of(&phone, &gid).devices[&slot(2)]
+        .announced_key_package
+        .clone();
+    assert!(announced.is_some());
+    expected
+        .devices
+        .get_mut(&slot(2))
+        .unwrap()
+        .announced_key_package = announced;
     for device in [&phone, &laptop] {
         assert!(requires_roster(device, &gid));
         assert_eq!(roster_of(device, &gid), expected);
@@ -251,7 +381,7 @@ async fn a_device_group_is_created_under_the_id_its_link_chose() {
     let chosen = GroupId::new(vec![0x42; 16]);
     let key_package = laptop.engine.fresh_key_package().await.unwrap();
     let initial = roster(&[(1, "Phone"), (2, "Laptop")]);
-    let (gid, created) = create_under(&mut phone, &initial, vec![key_package], &chosen)
+    let (gid, created) = create_under(&mut phone, &initial, vec![key_package.clone()], &chosen)
         .await
         .unwrap();
     assert_eq!(gid, chosen);
@@ -260,10 +390,145 @@ async fn a_device_group_is_created_under_the_id_its_link_chose() {
     };
     expect_link_welcome(&mut laptop, &chosen, &phone);
     assert_joins(&mut laptop, &welcomes[0], &chosen, &phone).await;
+    let mut expected = initial.clone();
+    expected
+        .devices
+        .insert(slot(2), announced_entry(&initial, &slot(2), &key_package));
     for device in [&phone, &laptop] {
         assert!(requires_roster(device, &chosen));
-        assert_eq!(roster_of(device, &chosen), initial);
+        assert_eq!(roster_of(device, &chosen), expected);
     }
+}
+
+/// A device group's founding Add is a link's (D41): it adds exactly one
+/// KeyPackage and sets that device's entry, for a slot the founding roster
+/// does not list, announcing that KeyPackage. Every other founding with a
+/// member, and a roster update on any other create, is refused and leaves no
+/// group state behind.
+#[tokio::test]
+async fn a_device_groups_founding_add_sets_exactly_its_one_devices_entry() {
+    let mut phone = roster_device(b"alice");
+    let mut laptop = roster_device(b"alice");
+    let mut tablet = roster_device(b"alice");
+    let chosen = GroupId::new(vec![0x42; 16]);
+    let founding = roster(&[(1, "Phone")]);
+    let full = roster(&[(1, "Phone"), (2, "Laptop")]);
+    let key_package = laptop.engine.fresh_key_package().await.unwrap();
+    let other_key_package = tablet.engine.fresh_key_package().await.unwrap();
+    let sets_laptop = |key_package: &KeyPackage| {
+        update_bytes(vec![DeviceRosterOperationV1::SetDevice(
+            slot(2),
+            announced_entry(&full, &slot(2), key_package),
+        )])
+    };
+    let exactly_one = "adds exactly one device and sets its roster entry";
+    let needs_founding_add = "a founding roster update needs a device group's founding Add";
+    let refusals = [
+        (
+            "no roster update",
+            device_group_request(&founding, vec![key_package.clone()]),
+            None,
+            exactly_one,
+        ),
+        (
+            "two KeyPackages",
+            device_group_request(
+                &founding,
+                vec![key_package.clone(), other_key_package.clone()],
+            ),
+            Some(sets_laptop(&key_package)),
+            exactly_one,
+        ),
+        (
+            "no KeyPackage",
+            device_group_request(&founding, vec![]),
+            Some(sets_laptop(&key_package)),
+            needs_founding_add,
+        ),
+        (
+            "a chat",
+            CreateGroupRequest {
+                name: String::new(),
+                description: String::new(),
+                members: vec![key_package.clone()],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            },
+            Some(sets_laptop(&key_package)),
+            needs_founding_add,
+        ),
+        (
+            "two entries set",
+            device_group_request(&founding, vec![key_package.clone()]),
+            Some(update_bytes(vec![
+                DeviceRosterOperationV1::SetDevice(
+                    slot(2),
+                    announced_entry(&full, &slot(2), &key_package),
+                ),
+                DeviceRosterOperationV1::SetDevice(slot(3), entry("Tablet")),
+            ])),
+            "",
+        ),
+        (
+            "a slot the founding roster lists",
+            device_group_request(&full, vec![key_package.clone()]),
+            Some(sets_laptop(&key_package)),
+            "",
+        ),
+        (
+            "another KeyPackage announced",
+            device_group_request(&founding, vec![key_package.clone()]),
+            Some(sets_laptop(&other_key_package)),
+            "",
+        ),
+    ];
+    for (case, request, roster_update, error) in refusals {
+        let refused = phone
+            .engine
+            .create_group_with_chosen_id_and_audit_context(
+                request,
+                chosen.clone(),
+                roster_update,
+                NO_WELCOME_DEADLINE,
+                None,
+            )
+            .await
+            .expect_err(case)
+            .to_string();
+        assert!(refused.contains(error), "{case}: {refused}");
+        assert!(
+            phone.storage.get_group(&chosen).is_err(),
+            "{case}: nothing written"
+        );
+    }
+
+    // An ordinary create founds a device group only with no member.
+    let refused = phone
+        .engine
+        .create_group(device_group_request(&founding, vec![key_package.clone()]))
+        .await
+        .expect_err("an ordinary create adds no device")
+        .to_string();
+    assert!(refused.contains(exactly_one), "{refused}");
+
+    // The refusals left the id free: the link's founding goes through.
+    let (gid, created) = phone
+        .engine
+        .create_group_with_chosen_id_and_audit_context(
+            device_group_request(&founding, vec![key_package.clone()]),
+            chosen.clone(),
+            Some(sets_laptop(&key_package)),
+            NO_WELCOME_DEADLINE,
+            None,
+        )
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
+        panic!("current-profile founding group")
+    };
+    expect_link_welcome(&mut laptop, &gid, &phone);
+    assert_joins(&mut laptop, &welcomes[0], &gid, &phone).await;
 }
 
 #[tokio::test]
@@ -376,6 +641,7 @@ async fn a_roster_update_sets_and_removes_single_entries() {
 #[tokio::test]
 async fn the_committer_refuses_a_roster_update_that_breaks_the_roster() {
     let (mut phone, _laptop, gid) = phone_and_laptop().await;
+    let founded = roster_of(&phone, &gid);
     let too_many = (10..10 + MAX_LEAVES_PER_ACCOUNT as u8)
         .map(|n| DeviceRosterOperationV1::SetDevice(slot(n), entry("Spare")))
         .collect();
@@ -445,10 +711,7 @@ async fn the_committer_refuses_a_roster_update_that_breaks_the_roster() {
             .await,
     );
     assert!(error.contains("device roster update"), "{error}");
-    assert_eq!(
-        roster_of(&phone, &gid),
-        roster(&[(1, "Phone"), (2, "Laptop")])
-    );
+    assert_eq!(roster_of(&phone, &gid), founded);
 }
 
 /// A member that resolves a roster update its own way, for example by taking
@@ -532,14 +795,16 @@ async fn a_device_group_holds_only_its_accounts_devices() {
     let bob_kp = bob.engine.fresh_key_package().await.unwrap();
     let error = phone
         .engine
-        .create_group(CreateGroupRequest {
-            name: String::new(),
-            description: String::new(),
-            members: vec![bob_kp.clone()],
-            required_features: vec![],
-            app_components: vec![roster_component(&roster(&[(1, "Phone")]))],
-            initial_admins: vec![],
-        })
+        .create_group_with_chosen_id_and_audit_context(
+            device_group_request(&roster(&[(1, "Phone")]), vec![bob_kp.clone()]),
+            GroupId::new(vec![0x42; 16]),
+            Some(update_bytes(vec![DeviceRosterOperationV1::SetDevice(
+                slot(2),
+                announced_entry(&roster(&[(2, "Bob")]), &slot(2), &bob_kp),
+            )])),
+            NO_WELCOME_DEADLINE,
+            None,
+        )
         .await
         .expect_err("a device group founded with another account is refused");
     assert!(error.to_string().contains("another account"), "{error}");
@@ -725,12 +990,18 @@ async fn roster_bytes_are_unknown_data_in_other_groups() {
     );
 }
 
-fn replace(gid: &GroupId, n: u8, expected: &str, label: &str) -> SendIntent {
+/// `device` renames the entry of slot `n` to `label`, computed from the entry
+/// it reads now.
+fn replace(device: &Device, gid: &GroupId, n: u8, label: &str) -> SendIntent {
+    let expected = roster_of(device, gid).devices[&slot(n)].clone();
     SendIntent::ReplaceDeviceEntry {
         group_id: gid.clone(),
         slot: slot(n),
-        expected: Box::new(entry(expected)),
-        entry: Box::new(entry(label)),
+        entry: Box::new(DeviceEntryV1 {
+            label: label.into(),
+            ..expected.clone()
+        }),
+        expected: Box::new(expected),
     }
 }
 
@@ -765,12 +1036,13 @@ async fn a_queued_device_entry_replacement_never_lands_on_a_changed_entry() {
         &mut [&mut laptop],
     )
     .await;
-    let laptop_rename = send_commit(&mut laptop, replace(&gid, 2, "Laptop", "Mine"), &gid).await;
+    let rename = replace(&laptop, &gid, 2, "Mine");
+    let laptop_rename = send_commit(&mut laptop, rename, &gid).await;
     buffer_unsettled(&mut phone, &laptop_rename).await;
 
     let queued = phone
         .engine
-        .send(replace(&gid, 2, "Laptop", "Work"))
+        .send(replace(&phone, &gid, 2, "Work"))
         .await
         .unwrap();
     assert!(matches!(queued, SendResult::Queued { .. }), "{queued:?}");
@@ -786,7 +1058,7 @@ async fn a_queued_device_entry_replacement_never_lands_on_a_changed_entry() {
 
     let SendResult::GroupEvolution { pending, .. } = phone
         .engine
-        .send(replace(&gid, 2, "Mine", "Work"))
+        .send(replace(&phone, &gid, 2, "Work"))
         .await
         .unwrap()
     else {
@@ -811,11 +1083,13 @@ async fn a_device_entry_replacement_never_lands_on_an_entry_its_send_changed() {
     )
     .await;
     let read_at = phone.engine.epoch(&gid).unwrap();
-    let laptop_rename = send_commit(&mut laptop, replace(&gid, 2, "Laptop", "Mine"), &gid).await;
+    let rename = replace(&laptop, &gid, 2, "Mine");
+    let laptop_rename = send_commit(&mut laptop, rename, &gid).await;
     buffer_unsettled(&mut phone, &laptop_rename).await;
     clock.advance_ms(30_000);
 
-    let refused = phone.engine.send(replace(&gid, 2, "Laptop", "Work")).await;
+    let stale = replace(&phone, &gid, 2, "Work");
+    let refused = phone.engine.send(stale).await;
     assert!(
         matches!(&refused, Err(EngineError::DeviceEntryChanged { group_id }) if *group_id == gid),
         "{refused:?}"
@@ -845,7 +1119,8 @@ async fn a_device_entry_replacement_never_lands_on_a_rival_branch_at_the_same_ep
         &mut [&mut laptop, &mut tablet],
     )
     .await;
-    let laptop_rename = send_commit(&mut laptop, replace(&gid, 2, "Laptop", "Mine"), &gid).await;
+    let rename = replace(&laptop, &gid, 2, "Mine");
+    let laptop_rename = send_commit(&mut laptop, rename, &gid).await;
     let tablet_update = send_commit(
         &mut tablet,
         SendIntent::SelfUpdate {
@@ -862,7 +1137,8 @@ async fn a_device_entry_replacement_never_lands_on_a_rival_branch_at_the_same_ep
     buffer_unsettled(&mut phone, &laptop_rename).await;
     clock.advance_ms(30_000);
 
-    let refused = phone.engine.send(replace(&gid, 2, "Laptop", "Work")).await;
+    let stale = replace(&phone, &gid, 2, "Work");
+    let refused = phone.engine.send(stale).await;
     assert!(
         matches!(&refused, Err(EngineError::DeviceEntryChanged { group_id }) if *group_id == gid),
         "{refused:?}"
@@ -893,19 +1169,10 @@ async fn race_entry_replacements(
         &mut [&mut laptop],
     )
     .await;
-    let label = |n: u8| if n == 1 { "Phone" } else { "Laptop" };
-    let phone_commit = send_commit(
-        &mut phone,
-        replace(&gid, phone_slot, label(phone_slot), "By phone"),
-        &gid,
-    )
-    .await;
-    let laptop_commit = send_commit(
-        &mut laptop,
-        replace(&gid, laptop_slot, label(laptop_slot), "By laptop"),
-        &gid,
-    )
-    .await;
+    let by_phone = replace(&phone, &gid, phone_slot, "By phone");
+    let phone_commit = send_commit(&mut phone, by_phone, &gid).await;
+    let by_laptop = replace(&laptop, &gid, laptop_slot, "By laptop");
+    let laptop_commit = send_commit(&mut laptop, by_laptop, &gid).await;
     for (device, rival) in [(&mut phone, &laptop_commit), (&mut laptop, &phone_commit)] {
         device
             .engine

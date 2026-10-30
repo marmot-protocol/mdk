@@ -298,13 +298,16 @@ impl AppClient {
         let now = unix_now_seconds();
         let mut roster = DeviceRosterV1::default();
         OsRng.fill_bytes(&mut roster.leaf_tag_key);
-        // Each founding entry announces the KeyPackage in that device's slot
-        // (3.4), so neither device owes a roster commit before it publishes.
-        // This device's entry also carries its tag signature key, so the
-        // engine tags its founding leaf (3.1d); the new device sets its own
-        // once it joins. Nobody chose settings for the founder, so it takes the
-        // defaults a new device starts with: siblings add it to chats it is
-        // missing, with their history.
+        // The founding roster lists only this device and its rejections; the
+        // founding Add sets the new device's entry, as every later Add does,
+        // so no entry ever names a device without its leaf (D41). Each entry
+        // announces the KeyPackage in that device's slot (3.4), so neither
+        // device owes a roster commit before it publishes. This device's
+        // entry also carries its tag signature key, so the engine tags its
+        // founding leaf (3.1d); the new device sets its own once it joins.
+        // Nobody chose settings for the founder, so it takes the defaults a
+        // new device starts with: siblings add it to chats it is missing, with
+        // their history.
         roster.devices.insert(
             own_slot,
             DeviceEntryV1 {
@@ -319,25 +322,28 @@ impl AppClient {
                 ..DeviceEntryV1::default()
             },
         );
-        roster.devices.insert(
-            sibling_slot,
-            DeviceEntryV1 {
-                label: choices.label.clone(),
-                linked_at: now,
-                linked_by: Some(own_slot),
-                settings: DeviceSettingsV1 {
-                    add_to_all_chats: choices.add_to_all_chats,
-                    bring_history: choices.bring_history,
-                    keep_while_inactive: false,
-                },
-                announced_key_package: Some(hex::decode(&link.key_package_ref_hex)?),
-                ..DeviceEntryV1::default()
+        let sibling_entry = DeviceEntryV1 {
+            label: choices.label.clone(),
+            linked_at: now,
+            linked_by: Some(own_slot),
+            settings: DeviceSettingsV1 {
+                add_to_all_chats: choices.add_to_all_chats,
+                bring_history: choices.bring_history,
+                keep_while_inactive: false,
             },
-        );
+            announced_key_package: Some(hex::decode(&link.key_package_ref_hex)?),
+            ..DeviceEntryV1::default()
+        };
         // Rejections this device made before it had a device group (3.2).
-        self.founding_sign_in_rejections(&mut roster)?;
+        self.founding_sign_in_rejections(&mut roster, &sibling_slot)?;
         let roster = encode_device_roster_v1(&roster)
             .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
+        let roster_update = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
+            sibling_slot,
+            sibling_entry,
+        )])
+        .and_then(|update| encode_device_roster_update_v1(&update).map_err(|e| e.to_string()))
+        .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
         let routing = encode_nostr_routing_v1(&self.app.new_nostr_routing(None)?)
             .map_err(AppError::InvalidNostrRouting)?;
         let request = CreateGroupRequest {
@@ -382,6 +388,7 @@ impl AppClient {
             .prepare_create_group_with_chosen_id_and_audit_context(
                 request,
                 link.device_group_id.clone(),
+                Some(roster_update),
                 Timestamp(wait_ends),
                 audit_context.clone(),
             )

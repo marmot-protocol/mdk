@@ -680,6 +680,7 @@ async fn a_link_welcome_is_never_published_from_its_deadline_on() {
                 initial_admins: Vec::new(),
             },
             chosen.clone(),
+            None,
             Timestamp(300_100),
             Default::default(),
         )

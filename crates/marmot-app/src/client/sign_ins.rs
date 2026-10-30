@@ -472,12 +472,13 @@ impl AppClient {
     }
 
     /// Rejections this device made while it had no device group, for the
-    /// founding roster of the one it creates: every one but the slot it is
-    /// linking, which the user just confirmed. The commit that settles them
-    /// reads that roster.
+    /// founding roster of the one it creates: every one but `linking`, the
+    /// slot the user just confirmed, which the founding Add lists as a device
+    /// (D41). The commit that settles them reads that roster.
     pub(crate) fn founding_sign_in_rejections(
         &self,
         roster: &mut DeviceRosterV1,
+        linking: &DeviceSlotId,
     ) -> Result<(), AppError> {
         if !self.app.device_groups_enabled() {
             return Ok(());
@@ -487,7 +488,9 @@ impl AppClient {
             if !record.roster_pending {
                 continue;
             }
-            if let Some((slot, rejected)) = rejected_slot(&record, roster)? {
+            if let Some((slot, rejected)) = rejected_slot(&record, roster)?
+                && slot != *linking
+            {
                 roster.rejected_slots.insert(slot, rejected);
             }
         }

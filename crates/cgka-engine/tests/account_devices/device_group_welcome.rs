@@ -8,11 +8,12 @@
 //! leaf.
 
 use super::device_roster::{
-    NO_WELCOME_DEADLINE, create_under, device_group_request, expect_link_welcome, roster,
-    roster_device,
+    NO_WELCOME_DEADLINE, announced_entry, create_under, device_group_request, expect_link_welcome,
+    roster, roster_device, slot, update_bytes,
 };
 use super::*;
 use cgka_engine::engine::OutboundWelcomeStatus;
+use cgka_traits::app_components::DeviceRosterOperationV1;
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage as _};
 
 /// The id the existing device's confirmation named.
@@ -116,6 +117,7 @@ async fn a_chat_welcome_under_the_reserved_id_is_refused() {
                 initial_admins: vec![],
             },
             chosen(),
+            None,
             NO_WELCOME_DEADLINE,
             None,
         )
@@ -147,8 +149,12 @@ async fn a_founding_welcome_keeps_its_delivery_deadline() {
     let (_, created) = phone
         .engine
         .create_group_with_chosen_id_and_audit_context(
-            device_group_request(&roster(&[(1, "Phone"), (2, "Laptop")]), vec![key_package]),
+            device_group_request(&roster(&[(1, "Phone")]), vec![key_package.clone()]),
             chosen(),
+            Some(update_bytes(vec![DeviceRosterOperationV1::SetDevice(
+                slot(2),
+                announced_entry(&roster(&[(2, "Laptop")]), &slot(2), &key_package),
+            )])),
             deadline,
             None,
         )
@@ -207,24 +213,89 @@ async fn a_welcome_after_the_wait_or_a_withdrawal_is_refused() {
             .unwrap()
     );
 
-    let initial = roster(&[(1, "Phone"), (2, "Laptop"), (3, "Tablet")]);
-    let (_, created) = create_under(
-        &mut phone,
-        &initial,
-        vec![laptop_key_package, tablet_key_package],
-        &chosen(),
-    )
-    .await
-    .unwrap();
-    let SendResult::FoundingGroupCreated { welcomes } = created else {
-        panic!("current-profile founding group")
-    };
-    for (device, welcome) in [(&mut laptop, &welcomes[0]), (&mut tablet, &welcomes[1])] {
+    let founding = found_under_chosen(&mut phone, laptop_key_package).await;
+    let (_, linked) = link_under_chosen(&mut phone, tablet_key_package, 3, "Tablet").await;
+    for (device, welcome) in [(&mut laptop, &founding), (&mut tablet, &linked)] {
         assert_eq!(
             join_outcome(device, welcome).await,
             refused(InputRejectionCategory::AuthorizationFailed)
         );
         assert!(!holds(device, &chosen()));
+    }
+}
+
+/// `linker` links the device in `key_package` into the device group under
+/// [`chosen`], at slot `n`, and returns the link's Commit and Welcome.
+async fn link_under_chosen(
+    linker: &mut Device,
+    key_package: KeyPackage,
+    n: u8,
+    label: &str,
+) -> (TransportMessage, TransportMessage) {
+    let roster_update = update_bytes(vec![DeviceRosterOperationV1::SetDevice(
+        slot(n),
+        announced_entry(&roster(&[(n, label)]), &slot(n), &key_package),
+    )]);
+    let SendResult::GroupEvolution {
+        msg,
+        welcomes,
+        pending,
+    } = linker
+        .engine
+        .send(SendIntent::LinkDevice {
+            group_id: chosen(),
+            key_package,
+            roster_update,
+            deliver_until: NO_WELCOME_DEADLINE,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("a link is a group evolution")
+    };
+    linker.engine.confirm_published(pending).await.unwrap();
+    let welcome = welcomes.into_iter().next().expect("one Welcome");
+    (route_to_group(&msg, &chosen()), welcome)
+}
+
+/// The approving device's leaf keeps the signature key a new device recorded
+/// at Confirm through the Commit that adds that device: the founding Add,
+/// and a later link's Commit, with or without an UpdatePath (D41). Each new
+/// device joins through the key it confirmed.
+#[tokio::test]
+async fn the_key_a_new_device_confirmed_signs_the_commit_that_adds_it() {
+    let mut phone = roster_device(b"alice");
+    let mut laptop = roster_device(b"alice");
+    let mut tablet = roster_device(b"alice");
+    let confirmed = phone.engine.own_signature_key();
+    for device in [&mut laptop, &mut tablet] {
+        device
+            .engine
+            .expect_device_group_welcome(&DeviceGroupWelcomeExpectation {
+                group_id: chosen(),
+                sender_signature_key: confirmed.clone(),
+                expires_at: u64::MAX,
+            })
+            .unwrap();
+    }
+    let key_package = laptop.engine.fresh_key_package().await.unwrap();
+    let founding = found_under_chosen(&mut phone, key_package).await;
+    assert_joins(&mut laptop, &founding, &chosen(), &phone).await;
+    let leaf = phone.engine.own_leaf_index(&chosen()).unwrap();
+    let phone_leaf = |device: &Device| {
+        load_group(device, &chosen())
+            .members()
+            .find(|member| member.index.u32() == leaf)
+            .expect("the phone's leaf")
+    };
+    assert_eq!(phone_leaf(&phone).signature_key, confirmed);
+
+    let key_package = tablet.engine.fresh_key_package().await.unwrap();
+    let (commit, linked) = link_under_chosen(&mut phone, key_package, 3, "Tablet").await;
+    assert_accepted(&mut laptop, &commit, &chosen()).await;
+    assert_joins(&mut tablet, &linked, &chosen(), &phone).await;
+    for device in [&phone, &laptop, &tablet] {
+        assert_eq!(phone_leaf(device).signature_key, confirmed);
     }
 }
 

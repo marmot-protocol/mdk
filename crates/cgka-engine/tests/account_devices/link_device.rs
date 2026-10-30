@@ -8,7 +8,7 @@
 use super::activation::{buffer_unsettled, queued_intents};
 use super::device_roster::{
     NO_WELCOME_DEADLINE, create_under, entry, expect_link_welcome, found_device_group,
-    phone_and_laptop, roster, roster_device, roster_of, roster_update, slot,
+    key_package_ref, phone_and_laptop, roster, roster_device, roster_of, roster_update, slot,
 };
 use super::send_intents::{pending_proposals, store_pending_add};
 use super::*;
@@ -21,15 +21,6 @@ use openmls::prelude::ProposalOrRefType;
 
 /// The sender rule's refusal of an Add without its roster entry.
 const UNANNOUNCED: &str = "a device group's Commit that adds a device sets its roster entry, for a new slot, announcing the added KeyPackage";
-
-fn key_package_ref(key_package: &KeyPackage) -> Vec<u8> {
-    hex::decode(
-        cgka_engine::key_package::key_package_metadata(key_package)
-            .unwrap()
-            .key_package_ref_hex,
-    )
-    .unwrap()
-}
 
 /// The entry a link writes for the device in `key_package`.
 fn linked_entry(label: &str, key_package: &KeyPackage) -> DeviceEntryV1 {
@@ -118,6 +109,7 @@ async fn a_links_welcome_keeps_its_delivery_deadline() {
 #[tokio::test]
 async fn a_link_adds_the_device_and_writes_its_entry_in_one_commit() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let mut expected = roster_of(&phone, &gid);
     let mut tablet = roster_device(b"alice");
     let key_package = tablet.engine.fresh_key_package().await.unwrap();
     let tablet_entry = linked_entry("Tablet", &key_package);
@@ -154,7 +146,6 @@ async fn a_link_adds_the_device_and_writes_its_entry_in_one_commit() {
     expect_link_welcome(&mut tablet, &gid, &phone);
     assert_joins(&mut tablet, &welcomes[0], &gid, &phone).await;
 
-    let mut expected = roster(&[(1, "Phone"), (2, "Laptop")]);
     expected.devices.insert(slot(3), tablet_entry);
     for device in [&phone, &laptop, &tablet] {
         assert_eq!(roster_of(device, &gid), expected);
@@ -709,6 +700,7 @@ async fn link_tablet(phone: &mut Device, laptop: &mut Device, gid: &GroupId) -> 
 #[tokio::test]
 async fn an_unlink_removes_the_device_and_its_entry_in_one_commit() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let expected = roster_of(&phone, &gid);
     let mut tablet = link_tablet(&mut phone, &mut laptop, &gid).await;
     let intent = unlink(
         &gid,
@@ -738,7 +730,6 @@ async fn an_unlink_removes_the_device_and_its_entry_in_one_commit() {
     assert_accepted(&mut tablet, &commit, &gid).await;
     assert!(tablet.engine.group_record(&gid).unwrap().removed);
 
-    let expected = roster(&[(1, "Phone"), (2, "Laptop")]);
     for device in [&phone, &laptop] {
         assert_eq!(roster_of(device, &gid), expected);
         assert_eq!(load_group(device, &gid).members().count(), 2);
@@ -751,6 +742,7 @@ async fn an_unlink_removes_the_device_and_its_entry_in_one_commit() {
 #[tokio::test]
 async fn an_unlink_whose_leaf_is_gone_removes_only_the_entry() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let expected = roster_of(&phone, &gid);
     let tablet = link_tablet(&mut phone, &mut laptop, &gid).await;
     let tablet_key = signature_key(&tablet, &gid);
     let leaf_only = send_commit(
@@ -777,7 +769,6 @@ async fn an_unlink_whose_leaf_is_gone_removes_only_the_entry() {
     )
     .await;
     assert_accepted(&mut laptop, &commit, &gid).await;
-    let expected = roster(&[(1, "Phone"), (2, "Laptop")]);
     for device in [&phone, &laptop] {
         assert_eq!(roster_of(device, &gid), expected);
         assert_eq!(load_group(device, &gid).members().count(), 2);
