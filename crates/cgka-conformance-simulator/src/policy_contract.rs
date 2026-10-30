@@ -40,7 +40,7 @@ pub struct ConstantDecision {
     pub versioning: VersioningRule,
 }
 
-pub const CONSTANT_DECISIONS: [ConstantDecision; 40] = [
+pub const CONSTANT_DECISIONS: [ConstantDecision; 43] = [
     decision(
         "P1",
         ConstantInfluence::SelectedStateSemantic,
@@ -158,6 +158,11 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 40] = [
         VersioningRule::OperationalNonInterference,
     ),
     decision(
+        "E14",
+        ConstantInfluence::OperationalScheduler,
+        VersioningRule::OperationalNonInterference,
+    ),
+    decision(
         "A1",
         ConstantInfluence::OperationalScheduler,
         VersioningRule::OperationalNonInterference,
@@ -247,6 +252,21 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 40] = [
     // changes which history arrives, never what counts as covered.
     decision(
         "A18",
+        ConstantInfluence::InputAcquisition,
+        VersioningRule::OperationalNonInterference,
+    ),
+    // The recovery runner's retry, breaker and quantum values pace which
+    // history it fetches and when; they certify nothing a fetch did not prove.
+    decision(
+        "A19",
+        ConstantInfluence::InputAcquisition,
+        VersioningRule::OperationalNonInterference,
+    ),
+    // Comparison windows and the re-check schedule pace which history the
+    // runner fetches; a window certifies only once every id the relay holds
+    // in it is fetched or already held.
+    decision(
+        "A20",
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),

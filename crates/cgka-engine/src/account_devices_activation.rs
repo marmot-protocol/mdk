@@ -18,8 +18,8 @@
 //! A send that has to wait for convergence is checked before it is queued,
 //! so a refusal the current state already shows is answered at once. The
 //! drain checks again on the settled state; a refusal there retires the
-//! queued intent ([`is_refused_queued_activation`]) instead of leaving a
-//! record that fails every later drain.
+//! queued intent like any other refused queued intent
+//! ([`crate::queued_intent_refusal`]).
 //!
 //! The Commit goes through the generic AppDataUpdate path, which does not
 //! commit proposals by reference: in normal operation retained inbound
@@ -38,7 +38,7 @@ use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
     MAX_LEAVES_PER_ACCOUNT, encode_components_list,
 };
-use cgka_traits::engine::{SendIntent, SendResult};
+use cgka_traits::engine::SendResult;
 use cgka_traits::error::{AccountDevicesActivationRefusal, EngineError};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::storage::StorageProvider;
@@ -107,18 +107,6 @@ fn refusal_error(group_id: GroupId, reason: AccountDevicesActivationRefusal) -> 
         AccountDevicesActivationRefusal::NotAdmin => EngineError::NotGroupAdmin { group_id },
         reason => EngineError::AccountDevicesActivationRefused { group_id, reason },
     }
-}
-
-/// Whether preparing a queued `intent` failed because the settled state
-/// refuses the activation. The user's request has then failed, as a direct
-/// send's refusal would, so the drain retires the intent rather than keep a
-/// record every later drain fails on.
-pub(crate) fn is_refused_queued_activation(intent: &SendIntent, error: &EngineError) -> bool {
-    matches!(intent, SendIntent::EnableAccountDevices { .. })
-        && matches!(
-            error,
-            EngineError::AccountDevicesActivationRefused { .. } | EngineError::NotGroupAdmin { .. }
-        )
 }
 
 impl<S: StorageProvider> Engine<S> {

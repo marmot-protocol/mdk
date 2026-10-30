@@ -115,6 +115,10 @@ impl AppClient {
         welcome_id: &cgka_traits::MessageId,
         token: &[u8],
     ) -> Result<crate::GroupRecoveryStatus, AppError> {
+        // Rejoining unwraps the retained Welcome again. Keep block updates out
+        // until both the native replacement and its app projection have settled.
+        let policy_lock = self.app.block_update_lock(&self.state.label).await;
+        let _policy_guard = policy_lock.lock().await;
         let group_id = self.runtime.confirm_group_rejoin(welcome_id, token).await?;
         // GroupJoined is durably journaled by the engine, so a failed app
         // projection refresh is repaired by the ordinary reopen/drain path.
@@ -199,9 +203,15 @@ impl AppClient {
         {
             return Ok(());
         }
-        if self.runtime.retry_rejoins_after_trusted_removal().await? {
-            let summary = self.drain_pending_session_events().await?;
-            self.pending_applied_sync_summary.merge(summary);
+        {
+            // Normal inbox admission owns this lock itself; this separate retry
+            // seam must hold it through projection without nesting that path.
+            let policy_lock = self.app.block_update_lock(&self.state.label).await;
+            let _policy_guard = policy_lock.lock().await;
+            if self.runtime.retry_rejoins_after_trusted_removal().await? {
+                let summary = self.drain_pending_session_events().await?;
+                self.pending_applied_sync_summary.merge(summary);
+            }
         }
         let now_ms = super::sync::epoch_stall_now_ms();
         // One bounded lookup per seam; reserve before await so cancellations,

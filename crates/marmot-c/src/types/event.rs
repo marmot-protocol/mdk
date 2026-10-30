@@ -81,6 +81,14 @@ pub enum MarmotGroupEventKind {
     GroupMemberLeavesRemoved {
         epoch: u64,
     },
+    /// A send that waited for the group to settle was dropped unsent: the
+    /// settled state refused it. Nothing retries it; the user may try again.
+    /// `intent_kind` names the action and `reason` is a stable tag.
+    QueuedIntentRefused {
+        intent_id_hex: *mut c_char,
+        intent_kind: *mut c_char,
+        reason: *mut c_char,
+    },
 }
 
 impl From<GroupEventKindFfi> for MarmotGroupEventKind {
@@ -91,6 +99,15 @@ impl From<GroupEventKindFfi> for MarmotGroupEventKind {
                 Self::LocalGroupCopyTerminated { voluntary }
             }
             F::LocalGroupCopyRestored => Self::LocalGroupCopyRestored,
+            F::QueuedIntentRefused {
+                intent_id_hex,
+                intent_kind,
+                reason,
+            } => Self::QueuedIntentRefused {
+                intent_id_hex: owned_c_string(intent_id_hex),
+                intent_kind: owned_c_string(intent_kind),
+                reason: owned_c_string(reason),
+            },
             F::GroupMemberLeavesRemoved { epoch } => Self::GroupMemberLeavesRemoved { epoch },
             F::GroupCreated => Self::GroupCreated,
             F::GroupJoined {
@@ -198,6 +215,15 @@ impl CFree for MarmotGroupEventKind {
                 } => {
                     free_c_string(*message_id_hex);
                     free_c_string(*resource);
+                }
+                Self::QueuedIntentRefused {
+                    intent_id_hex,
+                    intent_kind,
+                    reason,
+                } => {
+                    free_c_string(*intent_id_hex);
+                    free_c_string(*intent_kind);
+                    free_c_string(*reason);
                 }
                 Self::MessageReceived { sender_id_hex, .. } => free_c_string(*sender_id_hex),
                 Self::AppMessageInvalidated {
@@ -324,6 +350,14 @@ pub enum MarmotEvent {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
+    /// Whether this device's KeyPackage refresh is overdue may have changed;
+    /// re-read `marmot_key_package_refresh_overdue`. Also fires once each
+    /// time the account's worker opens or reconnects, and may fire with no
+    /// change.
+    KeyPackageRefreshOverdueChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
 }
 
 impl From<MarmotEventFfi> for MarmotEvent {
@@ -438,6 +472,13 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 account_id_hex: owned_c_string(account_id_hex),
                 account_label: owned_c_string(account_label),
             },
+            F::KeyPackageRefreshOverdueChanged {
+                account_id_hex,
+                account_label,
+            } => Self::KeyPackageRefreshOverdueChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
         }
     }
 }
@@ -491,6 +532,10 @@ impl CFree for MarmotEvent {
                     account_label,
                 }
                 | Self::LinkedDevicesChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::KeyPackageRefreshOverdueChanged {
                     account_id_hex,
                     account_label,
                 } => {
@@ -612,6 +657,37 @@ mod tests {
             assert_eq!(
                 std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
                 "carol"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn key_package_refresh_overdue_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(
+            MarmotEventFfi::KeyPackageRefreshOverdueChanged {
+                account_id_hex: "ae".repeat(32),
+                account_label: "dave".to_owned(),
+            },
+        ));
+        unsafe {
+            let MarmotEvent::KeyPackageRefreshOverdueChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "ae".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "dave"
             );
             marmot_event_free(event);
         }

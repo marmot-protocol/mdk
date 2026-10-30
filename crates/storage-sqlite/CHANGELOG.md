@@ -4,6 +4,58 @@
 
 ### Breaking changes
 
+- Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
+  It adds `recheck_revision` to `account_recovery_units`, which existing rows
+  start at 0. Every request that makes a re-check pass due bumps it
+  (`make_recovery_recheck_due`, `rearm_all_recovery_units`, and a cooldown
+  longer than `RecoveryUnitPolicy::recheck_after_cooldown_seconds` ending),
+  and `RecoveryRecheckPass::revision` reports it. `record_recovery_recheck`
+  takes the revision its quantum began on, records nothing once it moved, and
+  returns whether it recorded. Ending a long cooldown, by an answer or by
+  `record_recovery_relay_reconnected` (which now takes the policy and the
+  time), makes every re-check on the relay due in the same transaction.
+- Migration 0132 advances account storage to schema 132 (mdk#2660 phase 4).
+  It adds `import_revision` to `account_delivery_loss_evidence`: the loss
+  revision the import that last charged a generation left. Existing imported
+  rows take the current loss revision; rows no import charged stay NULL. It
+  also adds `acknowledged_import_revision` to `account_recovery_state`: the
+  highest `import_revision` an acknowledgment deleted, starting at the current
+  loss revision. `recovery_loss_reach` and `recovery_loss_reach_after` return
+  a `RecoveryLossReach`: where unresolved loss of one cause, or loss imported
+  after a loss revision, may have lost events, by route.
+  `recovery_loss_reach_after` returns `None` below the acknowledged revision.
+- Migration 0131 advances account storage to schema 131 (mdk#2628 item 3.2).
+  It adds `account_sign_ins`, one row per KeyPackage slot of the account that
+  this device found and does not recognize: whether this device's first check
+  returned its slot, its client name, when it appeared and last published, its newest
+  KeyPackage, whether it is still signed in, and this device's answer, with
+  whether the device group's roster records a rejection yet.
+  `account_sign_in_baseline` holds when the first check ran, and
+  `account_sign_in_baseline_slots` every slot its read returned.
+  `SqliteAppStorage` gains `record_sign_in_check`, `sign_ins`, `sign_in`,
+  `answer_sign_in`, `settle_sign_in_rejection`,
+  `rearm_sign_in_rejections` and `sign_in_baseline`.
+- Migration 0130 advances account storage to schema 130 (mdk#2660 phase 4).
+  It adds `account_recovery_coverage_remainders`, each route's parked
+  remainder, and `settled_below_seconds` to
+  `account_recovery_coverage_goals` (an existing goal starts settled at its
+  own floor, where the earlier prune left it).
+  `prune_recovery_coverage` takes the current routes with their certifying
+  relays, parks what they still owe between each route's settled floor and
+  the retention floor, then settles every route at the retention floor; loss
+  lowers a route's settled floor to the loss floor.
+  `recovery_coverage_remainders` reads the remainders.
+  `dismiss_recovery_route_park` clears a route's remainder too, and accepts
+  the newest revision among its broken units and its remainder, which
+  `parked_recovery_routes` now reports. A released receipt (or a discarded
+  staged event) below the retention window no longer changes the ledger.
+- Migration 0129 advances account storage to schema 129 (mdk#2628 item 3.3b).
+  It adds `cgka_device_group_welcome_expectations`, one row per device group a
+  confirmed link waits to join: the sender leaf's signature key and the end of
+  the wait. `SqliteAccountStorage` implements the new
+  `DeviceGroupWelcomeStorage` trait over it. The engine consumes a row with
+  the join it admits, and the app deletes it when a link is withdrawn or its
+  wait ends. No rows are seeded.
 - Migration 0128 advances account storage to schema 128 (mdk#2660 phase 4).
   It adds `route_state` to `account_delivery_loss_evidence`, which existing
   rows leave 0, and `account_delivery_loss_evidence_routes`: the routes a loss
@@ -90,6 +142,16 @@
 
 ### Added
 
+- `settle_recovery_recheck` applies one re-check quantum's outcome to its
+  relay and the account's rolling-hour budget, never to its unit's retry
+  state (mdk#2660 phase 4). `staged_recovery_items` lists the ids and times a
+  route has staged in a range, from every relay. `make_recovery_recheck_due`
+  keeps what a due or running pass would check below an epoch gap's bound.
+- `OpenMlsContentFilter::CommitsAndProposalsBetween` lists only the commits and
+  proposals whose MLS epoch falls in a range, plus the rows SQLite cannot
+  classify (mdk#2684). A failed convergence batch checks its horizon through it
+  on every load, reading neither the group's applications nor its older
+  history.
 - `queue_current_push_registration_share_for_group` queues the stored
   registration for one joined group again, including a revision whose share
   already completed. It does nothing while native push is off or without a

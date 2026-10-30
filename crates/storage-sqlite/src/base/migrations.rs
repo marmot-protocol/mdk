@@ -270,6 +270,16 @@ mod migration_0126_recovery_coverage_uncovers;
 mod migration_0127_recovery_units;
 #[path = "migrations/0128_loss_evidence_routes.rs"]
 mod migration_0128_loss_evidence_routes;
+#[path = "migrations/0129_device_group_welcome_expectations.rs"]
+mod migration_0129_device_group_welcome_expectations;
+#[path = "migrations/0130_recovery_coverage_remainders.rs"]
+mod migration_0130_recovery_coverage_remainders;
+#[path = "migrations/0131_account_sign_ins.rs"]
+mod migration_0131_account_sign_ins;
+#[path = "migrations/0132_loss_import_revision.rs"]
+mod migration_0132_loss_import_revision;
+#[path = "migrations/0134_recovery_recheck_revision.rs"]
+mod migration_0134_recovery_recheck_revision;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1059,6 +1069,36 @@ const MIGRATIONS: &[Migration] = &[
         suspend_foreign_keys: &[],
         apply: migration_0128_loss_evidence_routes::apply,
     },
+    Migration {
+        version: 129,
+        name: "0129_device_group_welcome_expectations",
+        suspend_foreign_keys: &[],
+        apply: migration_0129_device_group_welcome_expectations::apply,
+    },
+    Migration {
+        version: 130,
+        name: "0130_recovery_coverage_remainders",
+        suspend_foreign_keys: &[],
+        apply: migration_0130_recovery_coverage_remainders::apply,
+    },
+    Migration {
+        version: 131,
+        name: "0131_account_sign_ins",
+        suspend_foreign_keys: &[],
+        apply: migration_0131_account_sign_ins::apply,
+    },
+    Migration {
+        version: 132,
+        name: "0132_loss_import_revision",
+        suspend_foreign_keys: &[],
+        apply: migration_0132_loss_import_revision::apply,
+    },
+    Migration {
+        version: 134,
+        name: "0134_recovery_recheck_revision",
+        suspend_foreign_keys: &[],
+        apply: migration_0134_recovery_recheck_revision::apply,
+    },
 ];
 
 /// Run migration 0117's push-token share repair on an open database. Test
@@ -1705,6 +1745,13 @@ mod tests {
         drop(conn);
         let mut conn = keyed_connection(&path);
         assert_eq!(run_all(&mut conn).unwrap(), 0);
+        let loss_revision: i64 = conn
+            .query_row(
+                "SELECT loss_revision FROM account_recovery_state",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         for (table, expected) in preserved.iter().zip(&before) {
             let mut upgraded = expected.clone();
             if *table == "cgka_released_transport_receipts" {
@@ -1723,10 +1770,17 @@ mod tests {
             }
             if *table == "account_delivery_loss_evidence" {
                 // Older loss has no known created_at, so it bounds no goal,
-                // none of it was retired, and it named no routes.
+                // none of it was retired, and it named no routes. What was
+                // imported takes the current loss revision.
                 for row in &mut upgraded {
                     use rusqlite::types::Value::{Integer, Null};
+                    let imported = !matches!(row[5], Null);
                     row.extend([Integer(2), Null, Null, Integer(0)]);
+                    row.push(if imported {
+                        Integer(loss_revision)
+                    } else {
+                        Null
+                    });
                 }
             }
             if *table == "account_recovery_obligations" {
@@ -1755,8 +1809,9 @@ mod tests {
         use rusqlite::types::Value::{Integer, Null};
         assert_eq!(
             &state[0][retry_before[0].len()..],
-            &[Null, Integer(0), Integer(0)],
-            "route identity and qualified observation allocators must start empty"
+            &[Null, Integer(0), Integer(0), Integer(loss_revision)],
+            "route identity and qualified observation allocators must start empty, \
+             and acknowledgment at the loss revision"
         );
         assert!(conn.execute("INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms) VALUES ('explicit:second',3,1001,1001)",[]).is_err());
         assert_eq!(
@@ -1999,6 +2054,13 @@ mod tests {
             recovery_completion_rows(&conn, "account_delivery_loss_evidence"),
         ];
         run_all(&mut conn).unwrap();
+        let loss_revision: i64 = conn
+            .query_row(
+                "SELECT loss_revision FROM account_recovery_state",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         for (table, expected) in [
             "account_recovery_obligations",
             "account_delivery_loss_evidence",
@@ -2024,8 +2086,10 @@ mod tests {
                             rusqlite::types::Value::Integer(0),
                         ]);
                     } else {
-                        // No existing generation named its routes.
+                        // No existing generation named its routes, and an
+                        // imported one takes the current loss revision.
                         row.push(rusqlite::types::Value::Integer(0));
+                        row.push(rusqlite::types::Value::Integer(loss_revision));
                     }
                     row
                 })

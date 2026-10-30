@@ -27,7 +27,12 @@ pub(crate) fn daemon_status_sentence(daemon: &DaemonView) -> String {
     } else {
         format!(" {streams}")
     };
-    format!("daemon running{activity}{streams}")
+    let state = if daemon.starting {
+        "starting"
+    } else {
+        "running"
+    };
+    format!("daemon {state}{activity}{streams}")
 }
 
 pub(crate) fn stream_watch_status(daemon: &DaemonView) -> String {

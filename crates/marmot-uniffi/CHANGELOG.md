@@ -4,9 +4,19 @@
 
 ### Breaking changes
 
+- `GroupEventKindFfi` adds `QueuedIntentRefused { intent_id_hex, intent_kind,
+  reason }` (mdk#2694): a send that waited for the group to settle was dropped
+  because the settled state refused it; tell the user, who may try again.
+  Update exhaustive Swift/Kotlin handling and regenerate bindings with the
+  matching native library.
+
 - `MarmotEventFfi` adds `LinkedDevicesChanged { account_id_hex, account_label }`
   (mdk#2628). Update exhaustive Swift/Kotlin handling and regenerate bindings
   with the matching native library.
+
+- `MarmotEventFfi` adds `KeyPackageRefreshOverdueChanged { account_id_hex,
+  account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
+  regenerate bindings with the matching native library.
 
 - `MarmotKitError` adds `AccountDevicesActivationRefused { group_id_hex, reason }`
   for an `enable_account_devices` call the group cannot take now (mdk#2628).
@@ -30,11 +40,35 @@
 
 ### Added
 
+- `MarmotOptions.devicePlatform` names the platform this device runs on, such
+  as `iOS`. With `clientName`, each device writes it into its own roster
+  entry, so `linked_devices` shows every device's client and platform
+  (mdk#2628 item 3.6). Defaults to none; written only where device groups are.
+
+- `rename_linked_device(account_ref, slot_id_hex, label)` renames one of this
+  account's devices, this one included, with one roster commit in the device
+  group (mdk#2628 item 3.6). It is refused with nothing sent while the device
+  group has an earlier change in flight (`device_group_busy`; retry later),
+  and in release builds until the roster's spec lands. A rename whose commit
+  loses a fork to one that also changes that device's entry is not made
+  again.
+
+- `AppGroupMlsStateFfi.convergence_parked` (default `false`) reports a group
+  whose convergence pass spent its failure budget (mdk#2684). Show it as stuck
+  syncing; `retry_group_convergence` grants one more attempt. Regenerate
+  bindings with the matching native library.
+
 - `linked_devices(account_ref)` returns this account's own devices as
   `LinkedDeviceFfi` records, from the roster of the device group this device
   trusts, this device first (mdk#2628 item 3.1). Re-read it on
   `LinkedDevicesChanged`. It is empty in release builds until the roster's
   spec lands.
+
+- `key_package_refresh_overdue(account_ref)` says when this device's device
+  group has held its KeyPackage refresh back for a week (mdk#2628 item 3.4),
+  so the app can tell the user before inviters stop treating the device as
+  fresh at 30 days. Re-read it on `KeyPackageRefreshOverdueChanged`. It is
+  false in release builds until the roster's spec lands.
 
 - An admin can turn on account-devices in an existing group (mdk#2628):
   `enable_account_devices(account_ref, group_id_hex)` sends one admin Commit,

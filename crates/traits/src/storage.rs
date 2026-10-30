@@ -259,6 +259,9 @@ pub enum OpenMlsContentFilter {
     WithoutProcessedApplications,
     /// Only applications whose epoch is this one.
     ApplicationsAt(EpochId),
+    /// Only commits and proposals whose epoch is from `from` through
+    /// `through`, the selection input inside a convergence pass's horizon.
+    CommitsAndProposalsBetween { from: EpochId, through: EpochId },
 }
 
 /// Messages + epoch-scoped snapshot/rollback hooks.
@@ -336,9 +339,10 @@ pub trait MessageStorage {
     /// The filter only narrows what is read: a backend may return rows it
     /// excludes, and the default returns every row, so callers classify each
     /// returned row themselves. It must not leave out any other row.
-    /// Convergence pass seeding, the send gate, and the deferred-peel commit
-    /// fingerprint list through this, so a backend that classifies rows does
-    /// not hand them the group's whole delivered history.
+    /// Convergence pass seeding, the send gate, the deferred-peel commit
+    /// fingerprint and a failed batch's check for new selection input list
+    /// through this, so a backend that classifies rows does not hand them the
+    /// group's whole delivered history.
     fn list_openmls_messages_in_states(
         &self,
         group_id: &GroupId,
@@ -842,6 +846,37 @@ pub trait AccountDeviceSignerStorage {
     ) -> StorageResult<Option<AccountDeviceSignerBinding>>;
 }
 
+// ── DeviceGroupWelcomeStorage ──────────────────────────────────────────────
+
+/// The Welcome a new device waits for after a confirmed device link
+/// (mdk#2628 D28, D30): into `group_id`, a group that requires the device
+/// roster, sent by the leaf whose MLS signature key is
+/// `sender_signature_key`, before `expires_at` (Unix seconds).
+///
+/// While it is stored, it reserves `group_id`: the engine joins no other
+/// Welcome into that group. The join that matches it consumes it in the
+/// join's own transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceGroupWelcomeExpectation {
+    pub group_id: GroupId,
+    pub sender_signature_key: Vec<u8>,
+    pub expires_at: u64,
+}
+
+pub trait DeviceGroupWelcomeStorage {
+    /// Store `expectation`, replacing any for the same group.
+    fn put_device_group_welcome_expectation(
+        &self,
+        expectation: &DeviceGroupWelcomeExpectation,
+    ) -> StorageResult<()>;
+    fn device_group_welcome_expectation(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<DeviceGroupWelcomeExpectation>>;
+    /// Whether an expectation for `group_id` was there to delete.
+    fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool>;
+}
+
 // ── KeyPackageBundleStorage ────────────────────────────────────────────────
 
 /// Account-device-local enumeration of persisted OpenMLS KeyPackage bundles.
@@ -1001,6 +1036,7 @@ pub trait StorageProvider:
     + DeferredPeelGenerationStorage
     + MemberValidationCacheStorage
     + AccountDeviceSignerStorage
+    + DeviceGroupWelcomeStorage
     + KeyPackageBundleStorage
     + Send
     + Sync

@@ -10,14 +10,17 @@ use crate::message::{
     ConfirmSender, PairingAnswer, PairingCancel, PairingConfirm, PairingMessage, PairingRequest,
     PairingReveal,
 };
-use crate::sas::{EphemeralKey, MacItem, MacSender, SessionBinding, SharedSecret, commitment};
+use crate::sas::{
+    EphemeralKey, MacItem, MacSender, SessionBinding, SharedSecret, commitment, device_group_value,
+};
 use crate::session::{
     ANSWER_WINDOW_SECS, ConfirmedLink, EndReason, IgnoreReason, MAX_ANSWERS_PER_WINDOW,
     MAX_TRACKED_REQUESTS, PairingError, REQUEST_MAX_FUTURE_SECS, REQUEST_TTL_SECS,
     SESSION_TTL_SECS,
 };
 use crate::types::{
-    AccountKey, KeyPackageEventId, KeyPackageRef, SessionId, SlotId, valid_group_id_len,
+    AccountKey, KeyPackageEventId, KeyPackageRef, SessionId, SignatureKey, SlotId,
+    valid_group_id_len,
 };
 
 /// The new device's KeyPackage as the existing device found it: fetched by the
@@ -72,7 +75,7 @@ struct Comparing {
     binding: SessionBinding,
     shared: SharedSecret,
     code: SasCode,
-    device_group_id: Option<GroupId>,
+    device_group: Option<(GroupId, SignatureKey)>,
 }
 
 impl Tracked {
@@ -158,7 +161,7 @@ impl ExistingDevicePairing {
         let tracked = self.sessions.get(session_id)?;
         match &tracked.state {
             State::Comparing(comparing)
-                if comparing.device_group_id.is_none() && tracked.is_live(now) =>
+                if comparing.device_group.is_none() && tracked.is_live(now) =>
             {
                 Some(&comparing.code)
             }
@@ -174,7 +177,7 @@ impl ExistingDevicePairing {
         };
         let undecided = matches!(
             &tracked.state,
-            State::Comparing(comparing) if comparing.device_group_id.is_none()
+            State::Comparing(comparing) if comparing.device_group.is_none()
         );
         undecided && tracked.is_live(now) && self.live_count(now) == 1
     }
@@ -393,7 +396,7 @@ impl ExistingDevicePairing {
             binding,
             shared,
             code,
-            device_group_id: None,
+            device_group: None,
         }));
         ExistingDeviceEvent::CodeReady { session_id }
     }
@@ -411,7 +414,7 @@ impl ExistingDevicePairing {
         let State::Comparing(comparing) = &mut tracked.state else {
             return ExistingDeviceEvent::Ignored(IgnoreReason::WrongStep);
         };
-        if comparing.device_group_id.is_none() {
+        if comparing.device_group.is_none() {
             return ExistingDeviceEvent::Ignored(IgnoreReason::WrongStep);
         }
         if !comparing.shared.verify_mac(
@@ -427,13 +430,16 @@ impl ExistingDevicePairing {
     }
 
     /// This user confirmed at `now` that the codes match and chose the device
-    /// group to add the new device to. Send the confirmation; the link is
-    /// confirmed when the new device's follows. One decision per session, and
-    /// only while no other request is live.
+    /// group to add the new device to. `signature_key` is this device's MLS
+    /// signature key in that group, the key it creates the group with on a
+    /// first link: the new device accepts the Welcome only from it. Send the
+    /// confirmation; the link is confirmed when the new device's follows. One
+    /// decision per session, and only while no other request is live.
     pub fn confirm_link(
         &mut self,
         session_id: &SessionId,
         device_group_id: GroupId,
+        signature_key: SignatureKey,
         now: u64,
     ) -> Result<PairingConfirm, PairingError> {
         let competing = self.competing_requests(now);
@@ -444,7 +450,7 @@ impl ExistingDevicePairing {
         let State::Comparing(comparing) = &mut tracked.state else {
             unreachable!("live_comparing checked the state");
         };
-        if comparing.device_group_id.is_some() {
+        if comparing.device_group.is_some() {
             return Err(PairingError::WrongStep);
         }
         if competing {
@@ -455,14 +461,15 @@ impl ExistingDevicePairing {
             mac: comparing.shared.mac(
                 &comparing.binding,
                 MacSender::ExistingDevice,
-                MacItem::DeviceGroupId,
-                device_group_id.as_slice(),
+                MacItem::DeviceGroup,
+                &device_group_value(device_group_id.as_slice(), signature_key.as_slice()),
             ),
             sender: ConfirmSender::ExistingDevice {
                 device_group_id: device_group_id.clone(),
+                signature_key: signature_key.clone(),
             },
         };
-        comparing.device_group_id = Some(device_group_id);
+        comparing.device_group = Some((device_group_id, signature_key));
         Ok(confirm)
     }
 
@@ -475,7 +482,7 @@ impl ExistingDevicePairing {
         let tracked = self.live_comparing(session_id, now)?;
         if matches!(
             &tracked.state,
-            State::Comparing(comparing) if comparing.device_group_id.is_some()
+            State::Comparing(comparing) if comparing.device_group.is_some()
         ) {
             return Err(PairingError::WrongStep);
         }
@@ -613,14 +620,16 @@ fn link_tracked(session_id: &SessionId, tracked: &mut Tracked) -> ConfirmedLink 
     let State::Comparing(comparing) = &tracked.state else {
         unreachable!("linking starts from a comparison");
     };
+    let (device_group_id, welcome_sender_key) = comparing
+        .device_group
+        .clone()
+        .expect("linking needs this user's confirmation");
     let link = ConfirmedLink {
         session_id: *session_id,
         key_package_event_id: tracked.request.key_package_event_id,
         key_package_ref: tracked.request.key_package_ref.clone(),
-        device_group_id: comparing
-            .device_group_id
-            .clone()
-            .expect("linking needs this user's confirmation"),
+        device_group_id,
+        welcome_sender_key,
         existing_device_slot: comparing.binding.existing_device_slot,
     };
     tracked.state = State::Linked(link.clone());

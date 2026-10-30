@@ -5,16 +5,16 @@ use cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID,
     AppComponentData, AppComponentId, AppComponentSet, DEVICE_ROSTER_COMPONENT_ID,
-    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, GROUP_LIFECYCLE_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupLifecycleV1,
-    GroupProfileV1, MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
-    PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID, apply_device_roster_update_v1,
-    decode_components_list, decode_device_roster_v1, decode_encrypted_media_policy_v1,
-    decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
-    decode_group_lifecycle_v1, decode_group_profile_v1, decode_nostr_routing_v1,
-    decode_quic_varint, encode_component_vectors, encode_components_list,
+    DEVICE_TAG_COMPONENT_ID, DeviceEntryV1, DeviceSlotId, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    GROUP_LIFECYCLE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    GroupLifecycleV1, GroupProfileV1, MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID,
+    NostrRoutingV1, PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID,
+    apply_device_roster_update_v1, decode_components_list, decode_device_roster_v1,
+    decode_encrypted_media_policy_v1, decode_encrypted_media_policy_v2, decode_group_avatar_url_v1,
+    decode_group_blossom_image_v1, decode_group_lifecycle_v1, decode_group_profile_v1,
+    decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors, encode_components_list,
     encode_group_lifecycle_v1, encode_group_profile_v1,
 };
 use cgka_traits::error::EngineError;
@@ -56,6 +56,13 @@ pub const CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS: [AppComponentId; 1] =
 /// no GroupContext state for it; the component's own rules say what an entry
 /// under its id means.
 const NO_DATA_APP_COMPONENTS: [AppComponentId; 1] = [ACCOUNT_DEVICES_COMPONENT_ID];
+
+/// Protocol components whose data lives only in LeafNodes and that no group
+/// may require (device-tag-v1.md, "Registry"). Unlike the account proof, a
+/// GroupContext entry under one of these ids is unknown data, not an error.
+/// Requiring one fails as an unsupported requirement, which is also how a
+/// client that does not know the id rejects it, so both kinds of client agree.
+const NEVER_REQUIRED_APP_COMPONENTS: [AppComponentId; 1] = [DEVICE_TAG_COMPONENT_ID];
 
 /// Protocol-owned component ids this engine implements and may advertise in
 /// its KeyPackages and leaves. A protocol id outside this list is refused by
@@ -113,15 +120,22 @@ pub(crate) struct InitialComponentState {
     pub(crate) optional_app_components: Vec<AppComponentData>,
 }
 
+/// The `app_data_dictionary` of a new own LeafNode. A leaf that carries
+/// `device_tag` also advertises `0x800f` (device-tag-v1.md, "Producing
+/// tags"); the host never lists it among its supported components.
 pub(crate) fn leaf_app_components_extension(
     supported: &AppComponentSet,
     account_identity_proof: Option<&[u8]>,
+    device_tag: Option<Vec<u8>>,
 ) -> Result<Extension, EngineError> {
     let mut dict = AppDataDictionary::new();
     let mut advertised = supported.ids.clone();
     advertised.insert(APP_COMPONENTS_COMPONENT_ID);
     if account_identity_proof.is_some() {
         advertised.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+    }
+    if device_tag.is_some() {
+        advertised.insert(DEVICE_TAG_COMPONENT_ID);
     }
     dict.insert(
         APP_COMPONENTS_COMPONENT_ID,
@@ -133,6 +147,9 @@ pub(crate) fn leaf_app_components_extension(
     );
     if let Some(proof) = account_identity_proof {
         dict.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, proof.to_vec());
+    }
+    if let Some(tag) = device_tag {
+        dict.insert(DEVICE_TAG_COMPONENT_ID, tag);
     }
     Ok(Extension::AppDataDictionary(
         AppDataDictionaryExtension::new(dict),
@@ -278,6 +295,17 @@ pub(crate) fn app_component_data_of_group(
     component_id: AppComponentId,
 ) -> Option<Vec<u8>> {
     app_component_bytes(mls_group, component_id).map(ToOwned::to_owned)
+}
+
+/// The entry of `slot` in the device roster `mls_group` holds. `None` when
+/// the roster lists no device there or cannot be read.
+pub(crate) fn device_entry_of_group(
+    mls_group: &MlsGroup,
+    slot: &DeviceSlotId,
+) -> Option<DeviceEntryV1> {
+    app_component_bytes(mls_group, DEVICE_ROSTER_COMPONENT_ID)
+        .and_then(|bytes| decode_device_roster_v1(bytes).ok())
+        .and_then(|mut roster| roster.devices.remove(slot))
 }
 
 pub(crate) fn message_retention_seconds_of_group(
@@ -560,24 +588,39 @@ fn authorize_proposal(
                 validate_standalone_app_data_update(update).map_err(|_| {
                     StandaloneProposalRejection::invalid("app_data_update_payload_invalid")
                 })?;
-                // account-devices-v1.md, "Data": no AppDataUpdate targets the
-                // component once its source state requires it. "Removal": no
-                // proposal drops it from the required list either.
-                let unrequires = match update.operation() {
+                // The required list this update proposes, when it sets one.
+                let proposed_required = match update.operation() {
                     AppDataUpdateOperation::Update(data)
                         if update.component_id() == APP_COMPONENTS_COMPONENT_ID =>
                     {
-                        !AppComponentSet::from(decode_components_list(data.as_slice()).map_err(
-                            |_| {
+                        Some(AppComponentSet::from(
+                            decode_components_list(data.as_slice()).map_err(|_| {
                                 StandaloneProposalRejection::invalid(
                                     "app_data_update_payload_invalid",
                                 )
-                            },
-                        )?)
-                        .contains(ACCOUNT_DEVICES_COMPONENT_ID)
+                            })?,
+                        ))
                     }
-                    _ => false,
+                    _ => None,
                 };
+                // device-tag-v1.md, "Registry": no group requires a
+                // never-required LeafNode component, and neither does a
+                // proposal.
+                if proposed_required.as_ref().is_some_and(|ids| {
+                    NEVER_REQUIRED_APP_COMPONENTS
+                        .iter()
+                        .any(|component_id| ids.contains(*component_id))
+                }) {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "app_components_require_never_required_component",
+                    ));
+                }
+                // account-devices-v1.md, "Data": no AppDataUpdate targets the
+                // component once its source state requires it. "Removal": no
+                // proposal drops it from the required list either.
+                let unrequires = proposed_required
+                    .as_ref()
+                    .is_some_and(|ids| !ids.contains(ACCOUNT_DEVICES_COMPONENT_ID));
                 if (update.component_id() == ACCOUNT_DEVICES_COMPONENT_ID || unrequires)
                     && group_requires_account_devices(mls_group).map_err(|_| {
                         StandaloneProposalRejection::invalid("proposal_group_state_invalid")
@@ -594,13 +637,9 @@ fn authorize_proposal(
                 let roster_required = group_requires_device_roster(mls_group).map_err(|_| {
                     StandaloneProposalRejection::invalid("proposal_group_state_invalid")
                 })?;
-                if let AppDataUpdateOperation::Update(data) = update.operation()
-                    && update.component_id() == APP_COMPONENTS_COMPONENT_ID
-                    && AppComponentSet::from(decode_components_list(data.as_slice()).map_err(
-                        |_| StandaloneProposalRejection::invalid("app_data_update_payload_invalid"),
-                    )?)
-                    .contains(DEVICE_ROSTER_COMPONENT_ID)
-                        != roster_required
+                if proposed_required
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(DEVICE_ROSTER_COMPONENT_ID) != roster_required)
                 {
                     return Err(StandaloneProposalRejection::invalid(
                         "app_components_change_device_roster_requirement",
@@ -1616,12 +1655,14 @@ fn required_app_components_of_extensions(
 
 fn is_known_group_component(component_id: AppComponentId) -> bool {
     // Protocol-owned minus the ids that carry no GroupContext state at all:
-    // the leaf-only account proof and the no-data components. Reading the
-    // canonical list keeps a newly assigned component id format-validated
-    // without editing this function.
+    // the leaf-only account proof, the no-data components and the
+    // never-required LeafNode components. Reading the canonical list keeps a
+    // newly assigned component id format-validated without editing this
+    // function.
     PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(&component_id)
         && !CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS.contains(&component_id)
         && !NO_DATA_APP_COMPONENTS.contains(&component_id)
+        && !NEVER_REQUIRED_APP_COMPONENTS.contains(&component_id)
 }
 
 pub(crate) fn ratchet_tree_nodes(
@@ -1987,7 +2028,24 @@ fn app_component_bytes(mls_group: &MlsGroup, component_id: AppComponentId) -> Op
         .get(&component_id)
 }
 
+/// Refuse a GroupContext entry this client must never create: a
+/// never-required LeafNode component's data belongs in leaves only
+/// (device-tag-v1.md, "Registry"). An entry another client created stays
+/// unknown data, so only local writes are refused.
+pub(crate) fn refuse_local_group_context_entry(
+    component_id: AppComponentId,
+) -> Result<(), EngineError> {
+    if NEVER_REQUIRED_APP_COMPONENTS.contains(&component_id) {
+        return Err(EngineError::Other(format!(
+            "app component {component_id:#06x} lives only in LeafNodes and cannot be set in \
+             GroupContext"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_initial_app_component(component: &AppComponentData) -> Result<(), EngineError> {
+    refuse_local_group_context_entry(component.component_id)?;
     // A no-data component has no entry for a client to create
     // (app-components/README.md, "Placement"); the engine decides whether a
     // group requires it.
@@ -2389,7 +2447,7 @@ mod tests {
         let mut supported = AppComponentSet::from(default_group_components());
         supported.insert(NOSTR_ROUTING_COMPONENT_ID);
 
-        let ext = leaf_app_components_extension(&supported, None).unwrap();
+        let ext = leaf_app_components_extension(&supported, None, None).unwrap();
         let Extension::AppDataDictionary(ext) = ext else {
             panic!("expected an AppDataDictionary extension");
         };
@@ -2512,6 +2570,68 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn device_tag_is_never_required_and_unknown_data_in_group_context() {
+        // device-tag-v1.md, "Registry": an entry another client put in the
+        // GroupContext is unknown data, a group that requires the id is
+        // invalid, and this client never creates such an entry.
+        let component = AppComponentData {
+            component_id: DEVICE_TAG_COMPONENT_ID,
+            data: vec![0x77; 128],
+        };
+        validate_app_component_update(&component).expect("received entry is unknown data");
+        validate_standalone_app_data_update(&AppDataUpdateProposal::update(
+            DEVICE_TAG_COMPONENT_ID,
+            component.data.clone(),
+        ))
+        .expect("received standalone update is unknown data");
+
+        let mandatory = [
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+            ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+        ];
+        let with_entry = |required: &[AppComponentId]| {
+            let extensions = current_profile_extensions(
+                required.iter().copied(),
+                true,
+                false,
+                &[ExtensionType::AppDataDictionary],
+                &[ProposalType::AppDataUpdate],
+            );
+            let mut dictionary = extensions
+                .app_data_dictionary()
+                .unwrap()
+                .dictionary()
+                .clone();
+            dictionary.insert(DEVICE_TAG_COMPONENT_ID, component.data.clone());
+            Extensions::from_vec(vec![
+                Extension::RequiredCapabilities(
+                    extensions.required_capabilities().unwrap().clone(),
+                ),
+                Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary)),
+            ])
+            .unwrap()
+        };
+        validate_current_profile_group_context(&with_entry(&mandatory), "optional")
+            .expect("an unrequired GroupContext entry is unknown data");
+        let error = validate_current_profile_group_context(
+            &with_entry(&[mandatory[0], mandatory[1], DEVICE_TAG_COMPONENT_ID]),
+            "required",
+        )
+        .expect_err("no group may require the device tag");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported required component 0x800f"),
+            "{error}"
+        );
+
+        assert!(validate_initial_app_component(&component).is_err());
+        assert!(refuse_local_group_context_entry(DEVICE_TAG_COMPONENT_ID).is_err());
+        refuse_local_group_context_entry(DEVICE_ROSTER_COMPONENT_ID)
+            .expect("only never-required LeafNode ids are refused");
     }
 
     #[test]

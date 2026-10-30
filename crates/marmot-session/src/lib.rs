@@ -23,11 +23,11 @@ pub use key_package::{
 pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy};
 pub use runtime::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, AccountIngestPhase,
-    CompletedWelcomePublishTask, FailedApplicationMessage, MaintenanceActivity,
-    MaintenanceAttemptDuration, MaintenanceTiming, PendingResolution, PreparedSessionCommit,
-    PreparedSessionSend, PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage,
-    UndeliveredCommit, UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
-    WelcomeDeliveryFailure,
+    CompletedWelcomePublishTask, DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport,
+    FailedApplicationMessage, MaintenanceActivity, MaintenanceAttemptDuration, MaintenanceTiming,
+    PendingResolution, PreparedSessionCommit, PreparedSessionSend, PreparedWelcomePublishTask,
+    PublishFailure, PublishedApplicationMessage, UndeliveredCommit, UnresolvedApplicationMessage,
+    UnresolvedPublish, UnresolvedPublishReason, WelcomeDeliveryFailure,
 };
 pub use session::{
     CreateGroupEffects, GroupAuthorityView, HydrationProgress, PublishWork, QueuedIntentRef,
@@ -42,7 +42,7 @@ pub use session::{AccountDeviceSession, IngestEffects};
 pub use session::{
     AccountIdentityProofRequest, AccountIdentityProofSigner, CanonicalGroupMembership,
     CanonicalizationPolicy, FeatureRegistry, GroupAuthoritySnapshot, KeyPackageMetadata,
-    KeyPackageRequirements, V1_SETTLEMENT_QUIESCENCE_MS, WelcomeDeliveryIndex,
+    KeyPackageRequirements, V1_SETTLEMENT_QUIESCENCE_MS, WelcomeDeliveryIndex, WelcomeWithdrawal,
     application_message_len, durably_owned_key_packages, key_package_metadata,
 };
 pub use time::{

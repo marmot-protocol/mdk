@@ -634,9 +634,22 @@ wn --account <npub-or-hex> chats list
 wn daemon stop
 ```
 
+- `wn daemon start` returns once it knows how the `wnd` it launched turned out. It prints `daemon started` when that
+  daemon reports its accounts open, or `daemon already running` when another daemon answers on the socket first; both
+  exit 0. If the daemon exits first, the command fails at once with JSON error code `daemon_start_failed`, the log
+  path, and the log's last lines. If the daemon is still running but not ready after 60 seconds, the command stops it
+  and fails with `daemon_start_timeout`. Ctrl-C stops it too and fails with `daemon_start_interrupted`. A failed start
+  never leaves a daemon running. The 60 seconds cover the runtime's 45-second budget for opening accounts, and macOS
+  can hold the first launch of a newly installed `wnd` for several seconds before it runs.
+- `wn daemon stop` prints `daemon stopped` only once the daemon process has exited. The daemon answers the request
+  before it shuts down its runtime, which can wait on relays; if it is still running 30 seconds later, the command
+  fails with `daemon_stop_timeout` and names its pid, and leaves it to finish shutting down.
 - When a daemon socket exists for a home, normal `wn --home <path> ...` commands are forwarded to it. `wn daemon status`,
   `wn daemon stop`, and `wn tui` handle daemon access directly. Use `--socket` or `WN_SOCKET` to target a specific
   daemon.
+- `wnd` answers on its socket as soon as it binds it, before it has opened its accounts, which the runtime allows 45
+  seconds. Meanwhile `wn daemon status` prints `daemon starting` (`"starting": true` in `--json`), `wn daemon stop`
+  stops it, and other commands wait until the accounts are open.
 - `wn daemon status --json` includes `last_runtime_activity`, background `stream_watches`, and a redacted `relay_health`
   object with aggregate relay counts and connection-status buckets. It does not include relay URLs, account ids, group
   ids, subscription ids, or message ids.

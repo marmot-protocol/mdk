@@ -15,7 +15,9 @@
 //!    three numbers. The users compare the two screens.
 //! 5. Each side whose user confirmed sends a [`PairingConfirm`]: the new
 //!    device's covers its exact `KeyPackageRef`, the existing device's the
-//!    device group it will add the new device to.
+//!    device group it will add the new device to and the MLS signature key
+//!    of its own leaf there, the only sender whose Welcome the new device
+//!    accepts.
 //!
 //! Either side may send a [`PairingCancel`]. Holding the account key never
 //! authenticates a device here: only the code compared on both screens does.
@@ -57,5 +59,5 @@ pub use session::{
 };
 pub use types::{
     AccountKey, ExchangeKey, GROUP_ID_MAX_LEN, KEY_PACKAGE_REF_MAX_LEN, KeyPackageEventId,
-    KeyPackageRef, SessionId, SlotId,
+    KeyPackageRef, SIGNATURE_KEY_MAX_LEN, SessionId, SignatureKey, SlotId,
 };

@@ -409,6 +409,30 @@ until the roster's spec lands. The device group's own events never reach hosts; 
 says to re-read. It also fires once each time the account's worker opens or reconnects, so it may fire with no visible
 change.
 
+Each device writes its own `client` and `platform`: `MarmotAppConfig::key_package_client_name` and
+`MarmotAppConfig::device_platform` (a short name such as `iOS`), trimmed, and empty when blank or over 64 bytes. It
+writes them with its next KeyPackage announcement in the device group.
+
+`MarmotAppRuntime::rename_linked_device(account_ref, slot_id_hex, label)` renames any of the account's devices, this one
+included: one roster commit in the device group, through the same roster write path as slot announcements, that changes
+only that entry's label. The label is at most 64 bytes of UTF-8; empty clears it. While the device group has an earlier
+change of this device's in flight, the rename is refused as `DeviceGroupRefused("device_group_busy")` with nothing
+sent, since a commit then could build on a roster that is about to change; retry later. A rename whose commit loses a
+fork to one that also changes that device's entry is not made again, and the winning label stands. Show the label the
+next list returns after `LinkedDevicesChanged`, not the one the user typed.
+
+### Overdue KeyPackage refresh
+
+While this device trusts a device group, each KeyPackage it publishes is first announced in its own roster entry there,
+so a device group that can't take that Commit holds the refresh back.
+`MarmotAppRuntime::key_package_refresh_overdue(account_ref)` is true once a refresh is owed, the KeyPackage it would
+publish is still unannounced, and the slot's newest publication by this device is a week old, or there is none. Inviters stop treating the device as fresh at 30
+days, so tell the user. A routine refresh announces and publishes in one maintenance pass and never shows; one that is
+announced but failing at the relays doesn't count. The client recomputes the answer after each maintenance pass, and
+`MarmotAppEvent::KeyPackageRefreshOverdueChanged` says to re-read. Like `LinkedDevicesChanged`, it also fires once each
+time the account's worker opens or reconnects. It is false, and the event silent, in every release build until the
+roster's spec lands.
+
 ## History may be incomplete notices
 
 Recovery parks an obligation after its fixed budget of fruitless attempts instead of retrying forever.

@@ -9,10 +9,11 @@ pub enum AccountIngestPhase {
 }
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cgka_traits::AppComponentId;
+use cgka_traits::app_components::{DeviceRosterV1, DeviceTagClaim};
 use cgka_traits::engine::{
     CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage, SendIntent,
     SupersededIntentReport,
@@ -24,10 +25,12 @@ use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
 use cgka_traits::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
     GroupMaintenanceStatus, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
-    MaintenanceTrigger, PeriodicMaintenancePolicy, PostJoinHistoryFetch,
-    PostJoinHistoryFetchCompletion, PostJoinHistoryFetchOutcome, RetainedKeyPackagePrivateMaterial,
-    SendMaintenanceDisposition, TransportFanoutAttemptState, TransportFanoutTarget,
+    MaintenanceTrigger, PendingKeyPackageReplacement, PeriodicMaintenancePolicy,
+    PostJoinHistoryFetch, PostJoinHistoryFetchCompletion, PostJoinHistoryFetchOutcome,
+    RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition, TransportFanoutAttemptState,
+    TransportFanoutTarget,
 };
+use cgka_traits::storage::DeviceGroupWelcomeExpectation;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     EngineError, EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, MessageState,
@@ -58,12 +61,21 @@ use crate::session::{
     AccountDeviceSession, CanonicalGroupMembership, CreateGroupEffects, GroupAuthorityView,
     HydrationProgress, IngestEffects, KeyPackageMetadata, KeyPackageRequirements, PublishWork,
     QueuedIntentRef, SessionConfig, SessionEffects, SessionError, SessionOpenTimings,
-    SessionResult,
+    SessionResult, WelcomeWithdrawal,
 };
 use crate::time::{
     MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
     WallClock,
 };
+
+mod device_roster;
+pub use device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport};
+mod device_tag_key;
+mod removed_slot_expiry;
+mod slot_announcement;
+mod welcome_delivery;
+
+use welcome_delivery::WelcomeHold;
 
 const TRACE_TARGET: &str = "marmot_session::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
@@ -195,6 +207,12 @@ struct PublishStatus {
     possible_ambiguous_exposure: bool,
     retry_deferred: bool,
     terminal_failure: bool,
+    /// The Welcome was withdrawn or retired, so nothing was published and
+    /// nothing is owed.
+    withdrawn: bool,
+    /// The Welcome is staged with its unconfirmed commit, so nothing was
+    /// published and nothing is recorded or owed yet.
+    awaits_commit: bool,
 }
 
 struct PendingFanoutContinuation {
@@ -271,7 +289,10 @@ pub struct PreparedWelcomePublishTask {
     adapter: Arc<dyn TransportAdapter>,
     prepared: PreparedWelcomePublish,
     message_ids: Vec<cgka_traits::MessageId>,
+    withdrawals: DetachedWelcomeWithdrawals,
 }
+
+type DetachedWelcomeWithdrawals = Arc<Mutex<HashSet<cgka_traits::MessageId>>>;
 
 /// Opaque relay results from [`PreparedWelcomePublishTask::run`].
 #[doc(hidden)]
@@ -290,7 +311,10 @@ impl PreparedWelcomePublishTask {
     /// SQLite state and is therefore safe to poll beside the account worker.
     pub async fn run(self) -> CompletedWelcomePublishTask {
         CompletedWelcomePublishTask {
-            completed: self.prepared.publish(self.adapter.as_ref()).await,
+            completed: self
+                .prepared
+                .publish(self.adapter.as_ref(), Some(&self.withdrawals))
+                .await,
             message_ids: self.message_ids,
         }
     }
@@ -304,10 +328,24 @@ impl PreparedWelcomePublish {
             .collect()
     }
 
-    async fn publish(mut self, adapter: &dyn TransportAdapter) -> CompletedWelcomePublish {
+    /// `withdrawals` names Welcomes withdrawn after preparation; one whose
+    /// relay attempt has not started is skipped and reported withdrawn.
+    async fn publish(
+        mut self,
+        adapter: &dyn TransportAdapter,
+        withdrawals: Option<&Mutex<HashSet<cgka_traits::MessageId>>>,
+    ) -> CompletedWelcomePublish {
         let publish = |index, attempt: Box<PreparedLegacyPublishAttempt>| async move {
+            if withdrawals.is_some_and(|withdrawals| {
+                withdrawals
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .contains(&attempt.message_id)
+            }) {
+                return (index, attempt, None);
+            }
             let result = adapter.publish(attempt.request.clone()).await;
-            (index, attempt, result)
+            (index, attempt, Some(result))
         };
         let mut in_flight = FuturesUnordered::new();
         while in_flight.len() < WELCOME_PUBLISH_CONCURRENCY {
@@ -317,7 +355,13 @@ impl PreparedWelcomePublish {
             in_flight.push(publish(index, attempt));
         }
         while let Some((index, attempt, result)) = in_flight.next().await {
-            self.completions[index] = Some(LegacyPublishCompletion::Network(attempt, result));
+            self.completions[index] = Some(match result {
+                Some(result) => LegacyPublishCompletion::Network(attempt, result),
+                None => LegacyPublishCompletion::Complete(PublishStatus {
+                    withdrawn: true,
+                    ..PublishStatus::default()
+                }),
+            });
             if let Some((next_index, next_attempt)) = self.pending.pop_front() {
                 in_flight.push(publish(next_index, next_attempt));
             }
@@ -457,6 +501,16 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// it publishes nothing more, whether or not a relay accepted. The next
     /// runtime for the account republishes.
     key_package_slot_withdrawn: bool,
+    /// The device group this device announces its KeyPackages in before it
+    /// publishes them (mdk#2628 3.4). The host sets it; `None` publishes as
+    /// a device with no device group does.
+    key_package_announcement_group: Option<GroupId>,
+    /// What this device says about itself in its roster entry there (mdk#2628
+    /// 3.6); every announcement writes it too.
+    device_self_report: DeviceSelfReport,
+    /// The device group this device tags its KeyPackages and leaves from
+    /// (mdk#2628 3.1d), as the host last named it to the engine.
+    device_tag_group: Option<GroupId>,
     maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
     /// Monotonic time each group's own-leaf currency was last read from the
@@ -472,6 +526,19 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// paths skip these ids until their results are reconciled, preventing two
     /// concurrent publications of the same retained event.
     detached_welcome_publishes: HashSet<cgka_traits::MessageId>,
+    /// Detached Welcomes withdrawn after their task was prepared. The task
+    /// skips each one whose relay attempt has not started.
+    detached_welcome_withdrawals: DetachedWelcomeWithdrawals,
+    /// Outbound Welcomes, staged or owed, that no attempt record holds yet,
+    /// in the order this runtime met them. Maintenance publishes each once it
+    /// is owed (see `welcome_delivery`).
+    watched_welcomes: Vec<cgka_traits::MessageId>,
+    /// Whether the store has been read for `watched_welcomes`: the startup
+    /// pass reads it, or else the first maintenance pass.
+    welcome_store_read: bool,
+    /// Groups that read skipped because they were not live. Maintenance
+    /// reads each once it is.
+    unread_welcome_groups: Vec<GroupId>,
     /// Test-only fault injection: while armed, the finish stage of a prepared
     /// legacy publish for this message id fails with a transient storage
     /// error. Never set by production code.
@@ -530,11 +597,18 @@ where
             maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
             key_package_slot_withdrawn: false,
+            key_package_announcement_group: None,
+            device_self_report: DeviceSelfReport::default(),
+            device_tag_group: None,
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
             component_migration_checked_at: HashMap::new(),
             pending_leaf_reconciliations: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
+            detached_welcome_withdrawals: DetachedWelcomeWithdrawals::default(),
+            watched_welcomes: Vec::new(),
+            welcome_store_read: false,
+            unread_welcome_groups: Vec::new(),
             finish_stage_failure: None,
             publication_progress: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -688,6 +762,22 @@ where
         Ok(self.session.admin_pubkeys(group_id)?)
     }
 
+    /// Which roster slot the leaf at `leaf_index` belongs to, read from its
+    /// device tag against the device group's current `roster`. `None` when
+    /// `epoch` is not the group's current epoch or no leaf sits at that
+    /// index. See [`cgka_engine::engine::Engine::member_device_tag_claim`].
+    pub fn member_device_tag_claim(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> AccountResult<Option<DeviceTagClaim>> {
+        Ok(self
+            .session
+            .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
+    }
+
     pub fn app_component(
         &self,
         group_id: &GroupId,
@@ -773,6 +863,24 @@ where
 
     pub fn self_id(&self) -> MemberId {
         self.session.self_id()
+    }
+
+    /// This device's MLS signature key (`CgkaEngine::own_signature_key`).
+    pub fn own_signature_key(&self) -> Vec<u8> {
+        self.session.own_signature_key()
+    }
+
+    /// See `CgkaEngine::expect_device_group_welcome`.
+    pub fn expect_device_group_welcome(
+        &mut self,
+        expectation: &DeviceGroupWelcomeExpectation,
+    ) -> SessionResult<()> {
+        Ok(self.session.expect_device_group_welcome(expectation)?)
+    }
+
+    /// See `CgkaEngine::withdraw_device_group_welcome`.
+    pub fn withdraw_device_group_welcome(&mut self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.session.withdraw_device_group_welcome(group_id)?)
     }
 
     pub fn open_timings(&self) -> &SessionOpenTimings {
@@ -938,6 +1046,22 @@ where
         Ok(())
     }
 
+    /// Why [`Self::republish_key_package`] publishes a fresh KeyPackage
+    /// instead of the current one, if it does for a reason the current
+    /// lifecycle shows.
+    fn current_key_package_republish_fallback(
+        &self,
+        lifecycle: &KeyPackageLifecycleState,
+    ) -> Option<&'static str> {
+        current_key_package_republish_blocker(lifecycle, self.wall_clock.now()).or_else(|| {
+            lifecycle
+                .current_key_package
+                .as_ref()
+                .is_some_and(|current| !self.advertises_current_capabilities(current))
+                .then_some("advertised_capabilities_changed")
+        })
+    }
+
     /// Re-send the exact current durable authored KeyPackage event to the
     /// current authoritative publication targets without staging a replacement.
     ///
@@ -963,16 +1087,7 @@ where
             )
             .into());
         }
-        let now = self.wall_clock.now();
-        let fallback_reason =
-            current_key_package_republish_blocker(&lifecycle, now).or_else(|| {
-                lifecycle
-                    .current_key_package
-                    .as_ref()
-                    .is_some_and(|current| !self.advertises_current_capabilities(current))
-                    .then_some("advertised_capabilities_changed")
-            });
-        if let Some(fallback_reason) = fallback_reason {
+        if let Some(fallback_reason) = self.current_key_package_republish_fallback(&lifecycle) {
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "republish_key_package",
@@ -1018,6 +1133,12 @@ where
             );
             return self.publish_fresh_key_package().await;
         };
+        self.ensure_key_package_announced(
+            lifecycle
+                .current_key_package_ref
+                .as_deref()
+                .unwrap_or_default(),
+        )?;
 
         lifecycle.phase = cgka_traits::MaintenancePhase::Fanout;
         self.session.put_key_package_lifecycle(&lifecycle)?;
@@ -1135,6 +1256,12 @@ where
             "preparing fresh key package for later publication"
         );
         self.ensure_key_package_slot_not_withdrawn()?;
+        // A KeyPackage staged while this device's tag signature key is due
+        // would go out untagged once the key is set (mdk#2628 3.1d), so it
+        // waits for the key, as publication waits for its announcement.
+        if !self.device_tag_key_settled()? {
+            return Err(AccountError::KeyPackageAnnouncementPending);
+        }
         let now = self.wall_clock.now();
         let mut lifecycle = match self.session.key_package_lifecycle()? {
             Some(state) => state,
@@ -1181,10 +1308,7 @@ where
             || lifecycle
                 .pending_replacement
                 .as_ref()
-                .is_none_or(|pending| {
-                    pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
-                        || withdrawn_with_slot(&lifecycle, pending.authored_created_at)
-                })
+                .is_none_or(|pending| self.pending_replacement_obsolete(&lifecycle, pending))
         {
             // Newer than every publication in the slot, and than its
             // withdrawal: relays drop anything up to that.
@@ -1295,6 +1419,9 @@ where
                 .pending_replacement
                 .as_ref()
                 .expect("pending replacement exists");
+            // A device group's roster names it before it reaches the slot;
+            // maintenance announces it.
+            self.ensure_key_package_announced(&pending.key_package_ref)?;
             let artifact = pending
                 .signed_event
                 .as_ref()
@@ -1507,8 +1634,7 @@ where
             None => true,
             Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
                 Some(pending) => {
-                    pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
-                        || withdrawn_with_slot(&lifecycle, pending.authored_created_at)
+                    self.pending_replacement_obsolete(&lifecycle, pending)
                         || pending.signed_event.is_none()
                         || pending
                             .targets
@@ -1541,6 +1667,20 @@ where
             || !lifecycle.upgrade_rotation_recorded
             || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
             || !self.advertises_current_capabilities(current)
+    }
+
+    /// Whether `pending` must be replaced before it is published: built by an
+    /// older generator revision, staged before the slot was withdrawn, or
+    /// built without the capabilities this device now advertises, such as a
+    /// device tag once this device tags (mdk#2628 3.1d).
+    fn pending_replacement_obsolete(
+        &self,
+        lifecycle: &KeyPackageLifecycleState,
+        pending: &PendingKeyPackageReplacement,
+    ) -> bool {
+        pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+            || withdrawn_with_slot(lifecycle, pending.authored_created_at)
+            || !self.advertises_current_capabilities(&pending.key_package)
     }
 
     /// Whether `key_package` advertises what one built now would. A package
@@ -1696,6 +1836,15 @@ where
         let Some(key_package) = lifecycle.current_key_package.clone() else {
             return Ok(());
         };
+        // An unannounced event waits for maintenance to announce it.
+        if !self.key_package_announced(
+            lifecycle
+                .current_key_package_ref
+                .as_deref()
+                .unwrap_or_default(),
+        )? {
+            return Ok(());
+        }
         lifecycle.phase = cgka_traits::MaintenancePhase::Fanout;
         self.session.put_key_package_lifecycle(&lifecycle)?;
         let publication = KeyPackagePublication {
@@ -2184,6 +2333,18 @@ where
         // it is where a stranded evolution would otherwise do its damage.
         let superseded = self.reconcile_superseded_maintenance_from_state(now)?;
         output.superseded_intents.extend(superseded);
+        // A device sets its tag signature key before it stages a KeyPackage,
+        // so the KeyPackage is built tagged (mdk#2628 3.1d). Until the merged
+        // roster carries the key, nothing is staged, announced or published.
+        let tag_key = self.set_device_tag_key_for_maintenance(held).await;
+        output.absorb_account_effects(tag_key);
+        let tag_key_settled = self.device_tag_key_settled()?;
+        // While a device group is set, its roster names a KeyPackage before
+        // it reaches the slot (mdk#2628 3.4), so announce first.
+        if tag_key_settled {
+            let announced = self.announce_key_package_for_maintenance(held).await?;
+            output.absorb_account_effects(announced);
+        }
         // Fanout of an already-acknowledged exact event is publication
         // recovery, not a new preparation, so it continues while paused.
         if self.key_package_has_pending_fanout()? {
@@ -2200,10 +2361,10 @@ where
                 );
             }
         }
-        let key_package_due = self.key_package_network_maintenance_due()?;
+        let key_package_due = tag_key_settled && self.key_package_network_maintenance_due()?;
         // Paused maintenance may finish existing publication intent, but an
-        // obsolete pending generator revision requires fresh private material
-        // and therefore waits for resume like every other new preparation.
+        // obsolete pending replacement requires fresh private material and
+        // therefore waits for resume like every other new preparation.
         let key_package_prepared = self
             .session
             .key_package_lifecycle()?
@@ -2211,30 +2372,42 @@ where
                 lifecycle
                     .pending_replacement
                     .as_ref()
-                    .is_some_and(|pending| {
-                        pending.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
-                            && !withdrawn_with_slot(&lifecycle, pending.authored_created_at)
-                    })
+                    .is_some_and(|pending| !self.pending_replacement_obsolete(&lifecycle, pending))
             });
         if key_package_due && (!self.maintenance_paused || key_package_prepared) {
             let started = self.monotonic_clock.elapsed();
-            let result = self.publish_fresh_key_package().await;
-            self.note_key_package_maintenance_attempt(result.is_err());
-            self.note_maintenance_duration(started, true, result.is_err());
-            if let Err(error) = result {
-                tracing::warn!(
+            match self.publish_fresh_key_package().await {
+                // Nothing went out: the announcement above is not confirmed
+                // yet, and a later pass publishes.
+                Err(AccountError::KeyPackageAnnouncementPending) => tracing::debug!(
                     target: TRACE_TARGET,
                     method = "run_due_maintenance",
-                    error_kind = if matches!(error, AccountError::ClockSkewBlocked) {
-                        "clock_skew_blocked"
-                    } else {
-                        "key_package_retry"
-                    },
-                    "key package maintenance remains retryable"
-                );
+                    "key package publication waits for its announcement"
+                ),
+                result => {
+                    self.note_key_package_maintenance_attempt(result.is_err());
+                    self.note_maintenance_duration(started, true, result.is_err());
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            method = "run_due_maintenance",
+                            error_kind = if matches!(error, AccountError::ClockSkewBlocked) {
+                                "clock_skew_blocked"
+                            } else {
+                                "key_package_retry"
+                            },
+                            "key package maintenance remains retryable"
+                        );
+                    }
+                }
             }
         }
         self.retry_confirmed_transport_fanouts(&mut output).await?;
+        self.deliver_watched_welcomes(&mut output).await?;
+        // Roster housekeeping waits behind the KeyPackage steps' commits
+        // (mdk#2628 3.1d).
+        let expired = self.drop_expired_removed_slots_for_maintenance(held).await;
+        output.absorb_account_effects(expired);
 
         // Old groups have no enrollment row and are intentionally excluded.
         let active_obligations = self.session.maintenance_obligations()?;
@@ -3217,7 +3390,11 @@ where
             .session
             .send_with_audit_context(intent, context)
             .await?;
-        classify_prepared_session_send(session_effects)
+        let prepared = classify_prepared_session_send(session_effects)?;
+        if let PreparedSessionSend::Commit(commit) = &prepared {
+            self.watch_welcomes(commit.welcomes().iter().map(|welcome| welcome.id.clone()));
+        }
+        Ok(prepared)
     }
 
     /// Roll back a prepared commit before that commit has any transport side
@@ -3281,86 +3458,6 @@ where
                 SendMaintenanceDisposition::PostJoinRotationPendingRetryable;
         }
         Ok((output, welcomes))
-    }
-
-    /// Publish previously deferred Welcome obligations with bounded concurrency.
-    pub async fn publish_welcome_messages_with_audit_context(
-        &mut self,
-        welcomes: Vec<TransportMessage>,
-        group_id: Option<GroupId>,
-        context: AuditEventContext,
-    ) -> AccountResult<AccountDeviceEffects> {
-        let mut output = AccountDeviceEffects::default();
-        self.publish_welcome_fanout(welcomes, group_id, &mut output, Some(context), false)
-            .await?;
-        Ok(output)
-    }
-
-    /// Retry retained Welcome obligations immediately with the shared bounded
-    /// fanout, bypassing the automatic backoff for this explicit startup pass.
-    pub async fn retry_welcome_messages_with_audit_context(
-        &mut self,
-        welcomes: Vec<TransportMessage>,
-        context: AuditEventContext,
-    ) -> AccountResult<AccountDeviceEffects> {
-        let mut output = AccountDeviceEffects::default();
-        self.publish_welcome_fanout(welcomes, None, &mut output, Some(context), true)
-            .await?;
-        Ok(output)
-    }
-
-    /// Prepare a startup Welcome retry whose relay I/O can run independently
-    /// from the serialized account worker.
-    ///
-    /// Preparation persists the exact event/endpoint attempts and reserves
-    /// their message ids in-memory before this returns. The returned task owns
-    /// only a cloned transport adapter; callers must pass its completion to
-    /// [`Self::finish_welcome_publish_task`] or release its reservation with
-    /// [`Self::abandon_welcome_publish_task`].
-    #[doc(hidden)]
-    pub fn prepare_welcome_retry_task_with_audit_context(
-        &mut self,
-        welcomes: Vec<TransportMessage>,
-        context: AuditEventContext,
-    ) -> AccountResult<PreparedWelcomePublishTask>
-    where
-        A: Clone + 'static,
-    {
-        let prepared = self.prepare_welcome_publish(welcomes, None, Some(context), true)?;
-        let message_ids = prepared.network_message_ids();
-        self.detached_welcome_publishes
-            .extend(message_ids.iter().cloned());
-        Ok(PreparedWelcomePublishTask {
-            adapter: Arc::new(self.adapter.clone()),
-            prepared,
-            message_ids,
-        })
-    }
-
-    /// Reconcile every relay result from a detached Welcome publish in input
-    /// order, then release its in-memory exact-event reservations.
-    #[doc(hidden)]
-    pub async fn finish_welcome_publish_task(
-        &mut self,
-        task: CompletedWelcomePublishTask,
-    ) -> AccountResult<AccountDeviceEffects> {
-        let CompletedWelcomePublishTask {
-            completed,
-            message_ids,
-        } = task;
-        let mut output = AccountDeviceEffects::default();
-        let result = self.finish_welcome_publish(completed, &mut output).await;
-        self.abandon_welcome_publish_task(&message_ids);
-        result.map(|()| output)
-    }
-
-    /// Release the in-memory reservation after a detached relay task is
-    /// cancelled or panics. Durable fanout remains retryable.
-    #[doc(hidden)]
-    pub fn abandon_welcome_publish_task(&mut self, message_ids: &[cgka_traits::MessageId]) {
-        for message_id in message_ids {
-            self.detached_welcome_publishes.remove(message_id);
-        }
     }
 
     pub async fn queue_app_message_with_audit_context(
@@ -3483,6 +3580,17 @@ where
 
     pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> AccountResult<bool> {
         Ok(self.session.has_pending_convergence_inputs(group_id)?)
+    }
+
+    /// Whether this group's convergence pass parked after repeated failures
+    /// and waits for new input or an explicit retry (mdk#2684).
+    pub fn convergence_pass_parked(&self, group_id: &GroupId) -> AccountResult<bool> {
+        Ok(self.session.convergence_pass_parked(group_id)?)
+    }
+
+    /// Let a failed convergence pass make its next attempt now (mdk#2684).
+    pub fn retry_failed_convergence_pass(&mut self, group_id: &GroupId) -> AccountResult<bool> {
+        Ok(self.session.retry_failed_convergence_pass(group_id)?)
     }
 
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> AccountResult<bool> {
@@ -4606,123 +4714,6 @@ where
             .await
     }
 
-    /// Bounded-concurrency Welcome publication used by founding creates and by
-    /// deferred existing-group invite fanout after the commit is confirmed.
-    async fn publish_welcome_fanout(
-        &mut self,
-        welcomes: Vec<TransportMessage>,
-        group_id: Option<GroupId>,
-        output: &mut AccountDeviceEffects,
-        context: Option<AuditEventContext>,
-        force_retry: bool,
-    ) -> AccountResult<()> {
-        let prepared = self.prepare_welcome_publish(welcomes, group_id, context, force_retry)?;
-        let completed = prepared.publish(&self.adapter).await;
-        self.finish_welcome_publish(completed, output).await
-    }
-
-    fn prepare_welcome_publish(
-        &self,
-        welcomes: Vec<TransportMessage>,
-        group_id: Option<GroupId>,
-        context: Option<AuditEventContext>,
-        force_retry: bool,
-    ) -> AccountResult<PreparedWelcomePublish> {
-        let mut metadata = Vec::with_capacity(welcomes.len());
-        let mut completions = Vec::with_capacity(welcomes.len());
-        completions.resize_with(welcomes.len(), || None);
-        let mut pending = VecDeque::new();
-        for (index, welcome) in welcomes.into_iter().enumerate() {
-            let recipient = welcome_recipient(&welcome);
-            let welcome_id = welcome.id.clone();
-            let mut effects = AccountDeviceEffects::default();
-            match self.prepare_legacy_publish(
-                welcome,
-                &mut effects,
-                context.clone(),
-                force_retry,
-            )? {
-                PreparedLegacyPublish::Complete(status) => {
-                    completions[index] = Some(LegacyPublishCompletion::Complete(status));
-                }
-                PreparedLegacyPublish::Network(attempt) => pending.push_back((index, attempt)),
-            }
-            metadata.push(WelcomePublishMetadata {
-                recipient,
-                welcome_id,
-                effects,
-            });
-        }
-
-        Ok(PreparedWelcomePublish {
-            group_id,
-            metadata,
-            completions,
-            pending,
-        })
-    }
-
-    async fn finish_welcome_publish(
-        &mut self,
-        completed: CompletedWelcomePublish,
-        output: &mut AccountDeviceEffects,
-    ) -> AccountResult<()> {
-        let CompletedWelcomePublish {
-            group_id,
-            metadata,
-            completions,
-        } = completed;
-        // Every network attempt above has already been exposed to relays, so a
-        // finish-stage failure for one recipient must not skip completion
-        // bookkeeping for the rest: reconcile every completion in input order
-        // and surface the first error only after all exposed publishes have
-        // been durably finished. Otherwise later recipients' fanout state
-        // would stay `Unattempted` and a restart could republish Welcomes that
-        // were already delivered.
-        let mut first_error = None;
-        for (metadata, completion) in metadata.into_iter().zip(completions) {
-            let WelcomePublishMetadata {
-                recipient,
-                welcome_id,
-                mut effects,
-            } = metadata;
-            let status = match completion.expect("every Welcome publish completed") {
-                LegacyPublishCompletion::Complete(status) => Ok(status),
-                LegacyPublishCompletion::Network(attempt, result) => {
-                    self.finish_prepared_legacy_publish(*attempt, result, &mut effects)
-                        .await
-                }
-            };
-            let status = match status {
-                Ok(status) => Some(status),
-                Err(error) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                    None
-                }
-            };
-            if let Some(status) = status {
-                if status.met_required_acks {
-                    self.mark_welcome_delivered_best_effort(&welcome_id);
-                } else if let Some(recipient) = recipient {
-                    effects.welcome_failures.push(self.welcome_delivery_failure(
-                        welcome_id,
-                        recipient,
-                        group_id.clone(),
-                        &effects,
-                        0,
-                    ));
-                }
-            }
-            output.extend(effects);
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
     async fn publish_group_evolution(
         &mut self,
         commit: TransportMessage,
@@ -4856,6 +4847,16 @@ where
         let Some(mut fanout) = self.session.transport_fanout(message_id)? else {
             return Ok(());
         };
+        match self.welcome_hold(message_id, &fanout.exact_message.envelope)? {
+            // A withdrawn Welcome's remaining retries go with it.
+            Some(WelcomeHold::Withdrawn) => {
+                self.session.delete_transport_fanout(message_id)?;
+                return Ok(());
+            }
+            // A staged one keeps them for when its commit confirms.
+            Some(WelcomeHold::AwaitsCommit) => return Ok(()),
+            None => {}
+        }
         let remaining = fanout
             .targets
             .iter()
@@ -4863,6 +4864,8 @@ where
             .map(|target| target.endpoint.clone())
             .collect::<Vec<_>>();
         if !remaining.is_empty() {
+            let required_acks = fanout.required_acks.max(1);
+            let accepted_before = accepted_fanout_targets(&fanout);
             // Secondary retries are audited like the first pass, so a relay
             // that never received the exact event is visible (mdk#2255).
             let msg_id_hex = hex::encode(message_id.as_slice());
@@ -4969,11 +4972,7 @@ where
                 }
             }
             self.session.put_transport_fanout(&fanout)?;
-            let accepted_total = fanout
-                .targets
-                .iter()
-                .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
-                .count();
+            let accepted_total = accepted_fanout_targets(&fanout);
             self.record_audit_event(
                 fanout.group_id.as_ref(),
                 Some(publish_context),
@@ -4985,7 +4984,7 @@ where
                     accepted_relay_urls: pass_accepted,
                     failed_relays: pass_failed,
                     required_acks: fanout.required_acks as u64,
-                    met_required_acks: accepted_total >= fanout.required_acks.max(1),
+                    met_required_acks: accepted_total >= required_acks,
                     transport: Some(wire),
                     event_age_secs: publish_event_age_secs(
                         &fanout.exact_message,
@@ -4993,112 +4992,17 @@ where
                     ),
                 },
             );
+            // A Welcome is delivered by whichever attempt meets its policy,
+            // this retry included, so it stops being owed now rather than at
+            // the next open.
+            if matches!(artifact_kind, Some(MessageArtifactKind::Welcome))
+                && accepted_before < required_acks
+                && accepted_total >= required_acks
+            {
+                self.mark_welcome_delivered_best_effort(message_id);
+            }
         }
         Ok(())
-    }
-
-    /// Re-publish a stored welcome whose original delivery failed after its
-    /// commit was already confirmed (mdk#352).
-    ///
-    /// The wrapped welcome is loaded from the engine's sent-message store, so
-    /// no re-commit happens and no pending confirm/rollback lifecycle is
-    /// involved — the group evolution this welcome belongs to was confirmed
-    /// when the failure was recorded. A re-delivery that again misses the ack
-    /// threshold records a fresh [`WelcomeDeliveryFailure`] on the returned
-    /// effects, so the caller can keep retrying from the same handle.
-    pub async fn redeliver_welcome(
-        &mut self,
-        message_id: &cgka_traits::MessageId,
-    ) -> AccountResult<AccountDeviceEffects> {
-        let (group_id, message) = self.session.stored_sent_welcome(message_id)?;
-        // `stored_sent_welcome` only returns welcome envelopes.
-        let recipient = welcome_recipient(&message);
-        let mut output = AccountDeviceEffects::default();
-        let failures_before = output.failures.len();
-        // This is an explicit operator/user retry, so do not make the caller
-        // wait for the automatic fanout backoff window. The original exact
-        // Welcome and target snapshot are still reused.
-        let status = self
-            .publish_one_with_retry_policy(message, &mut output, None, true)
-            .await?;
-        if status.met_required_acks {
-            self.mark_welcome_delivered_best_effort(message_id);
-        } else if let Some(recipient) = recipient {
-            let failure = self.welcome_delivery_failure(
-                message_id.clone(),
-                recipient,
-                Some(group_id),
-                &output,
-                failures_before,
-            );
-            output.welcome_failures.push(failure);
-        }
-        Ok(output)
-    }
-
-    /// Retained outbound Welcome obligations that have not met their
-    /// acknowledgement policy. Unlike app projections, this list is rooted in
-    /// the engine transaction that made the corresponding group state
-    /// canonical, so non-app callers and cold restarts can recover it.
-    pub fn outstanding_welcome_deliveries(
-        &self,
-    ) -> AccountResult<Vec<(GroupId, TransportMessage)>> {
-        Ok(self.session.outstanding_sent_welcomes()?)
-    }
-
-    /// IDs of delivery-aware outbound Welcomes, including completed ones.
-    ///
-    /// This lets app projections clear a completed founding intent without
-    /// disturbing older pending-delivery rows whose engine payloads predate
-    /// delivery-aware tagging.
-    pub fn tracked_outbound_welcome_ids(&self) -> AccountResult<Vec<cgka_traits::MessageId>> {
-        Ok(self.session.tracked_outbound_welcome_ids()?)
-    }
-
-    /// Outstanding Welcome obligations and tracked IDs from one engine scan.
-    pub fn welcome_delivery_index(&self) -> AccountResult<crate::session::WelcomeDeliveryIndex> {
-        Ok(self.session.welcome_delivery_index()?)
-    }
-
-    /// Delivery is already externally visible when this runs. A local state
-    /// write failure must therefore leave the Welcome conservatively retryable
-    /// rather than turn canonical creation/evolution into a false hard error.
-    fn mark_welcome_delivered_best_effort(&self, message_id: &cgka_traits::MessageId) {
-        if let Err(error) = self.session.mark_sent_welcome_delivered(message_id) {
-            tracing::warn!(
-                target: TRACE_TARGET,
-                method = "mark_welcome_delivered_best_effort",
-                transient = error.is_transient(),
-                "acknowledged Welcome remains conservatively retryable"
-            );
-        }
-    }
-
-    /// Build the structured re-delivery record for a welcome that just failed
-    /// to publish, pairing the recipient with the reason `publish_one` pushed.
-    fn welcome_delivery_failure(
-        &self,
-        message_id: cgka_traits::MessageId,
-        recipient: MemberId,
-        group_id: Option<GroupId>,
-        output: &AccountDeviceEffects,
-        failures_before: usize,
-    ) -> WelcomeDeliveryFailure {
-        // `publish_one` pushes exactly one `PublishFailure` on each failing
-        // path (routing, adapter, required_acks); the defensive fallback only
-        // guards against that contract changing.
-        let reason = output
-            .failures
-            .get(failures_before..)
-            .and_then(<[PublishFailure]>::last)
-            .map(|failure| failure.reason.clone())
-            .unwrap_or_else(|| "welcome publish failed".into());
-        WelcomeDeliveryFailure {
-            message_id,
-            recipient,
-            group_id,
-            reason,
-        }
     }
 
     async fn publish_one(
@@ -5485,6 +5389,8 @@ where
             retry_deferred: fanout_outcome.outstanding_targets > 0,
             terminal_failure: report.accepted_count() == 0
                 && fanout_outcome.outstanding_targets == 0,
+            withdrawn: false,
+            awaits_commit: false,
         };
         let publish_failure_reason =
             if fanout_outcome.outstanding_targets > 0 && !status.met_required_acks {
@@ -5651,6 +5557,23 @@ where
                 retry_deferred: true,
                 ..PublishStatus::default()
             }));
+        }
+        // Every Welcome publish passes here, whichever path still holds the
+        // Welcome, or through maintenance's retry of its fanout.
+        match self.welcome_hold(&message_id, &message.envelope)? {
+            Some(WelcomeHold::Withdrawn) => {
+                return Ok(PreparedLegacyPublish::Complete(PublishStatus {
+                    withdrawn: true,
+                    ..PublishStatus::default()
+                }));
+            }
+            Some(WelcomeHold::AwaitsCommit) => {
+                return Ok(PreparedLegacyPublish::Complete(PublishStatus {
+                    awaits_commit: true,
+                    ..PublishStatus::default()
+                }));
+            }
+            None => {}
         }
         let msg_id_hex = hex::encode(message_id.as_slice());
         // Capture the outbound wire envelope before `message` is moved into the
@@ -5848,6 +5771,8 @@ where
                 possible_ambiguous_exposure: fanout.possible_exposure,
                 retry_deferred,
                 terminal_failure: false,
+                withdrawn: false,
+                awaits_commit: false,
             }));
         }
         let attempt_target = publish_target_with_endpoints(&target, retry_endpoints.clone());
@@ -6058,6 +5983,8 @@ where
                     possible_ambiguous_exposure: true,
                     retry_deferred: false,
                     terminal_failure: false,
+                    withdrawn: false,
+                    awaits_commit: false,
                 });
             }
         };
@@ -6144,6 +6071,8 @@ where
             possible_ambiguous_exposure: fanout.possible_exposure,
             retry_deferred: false,
             terminal_failure: !published && !accepted_by_any_endpoint && !fanout.possible_exposure,
+            withdrawn: false,
+            awaits_commit: false,
         })
     }
 
@@ -6614,6 +6543,14 @@ fn key_package_target_retry_due(target: &TransportFanoutTarget, now: Timestamp) 
     transport_fanout_target_retry_due(target, now)
 }
 
+fn accepted_fanout_targets(fanout: &DurableTransportFanout) -> usize {
+    fanout
+        .targets
+        .iter()
+        .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
+        .count()
+}
+
 fn transport_fanout_target_retry_due(target: &TransportFanoutTarget, now: Timestamp) -> bool {
     if matches!(
         target.state,
@@ -6659,6 +6596,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::RemoveOwnAccountDevices { .. }
             | SendIntent::SelfUpdate { .. }
             | SendIntent::UpdateAppComponents { .. }
+            | SendIntent::ReplaceDeviceEntry { .. }
             | SendIntent::UpdateGroupData { .. }
             | SendIntent::EnableDisbanding { .. }
             | SendIntent::EnableAccountDevices { .. }

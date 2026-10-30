@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use crate::capabilities::{
     capabilities_of_key_package, extension_from_group_capabilities, leaf_capabilities,
 };
+use crate::device_tag::{OwnDeviceTag, own_device_slot};
 use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
@@ -20,7 +21,7 @@ use crate::wire_format::{
 use cgka_traits::TransportEndpoint;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet,
-    default_group_components,
+    DEVICE_ROSTER_COMPONENT_ID, decode_device_roster_v1, default_group_components,
 };
 use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
@@ -169,6 +170,7 @@ pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
             | EngineError::Peeler(cgka_traits::error::PeelerError::WrongRecipient)
             | EngineError::Serialize(_)
             | EngineError::InvalidWelcome
+            | EngineError::UnexpectedDeviceGroupWelcome
             | EngineError::MissingWelcomeKeyPackage
             | EngineError::InvalidCredentialIdentity(_)
             | EngineError::InvalidAccountIdentityProof(_)
@@ -274,8 +276,7 @@ impl<S: StorageProvider> Drop for NewGroupCleanupGuard<S> {
     }
 }
 
-/// The longest group id a host may choose: the bound a device-roster
-/// leaf-map key puts on the group ids it names.
+/// The longest group id a host may choose.
 pub(crate) const MAX_CHOSEN_GROUP_ID_LEN: usize = 255;
 
 impl<S: StorageProvider> Engine<S> {
@@ -462,9 +463,30 @@ impl<S: StorageProvider> Engine<S> {
             self.new_protocol_profile,
             "identity proof material must match the new-state profile"
         );
+        // The founding leaf of a device group is tagged from the roster it
+        // founds, so the founder's first leaf there already reads as its own;
+        // a leaf in any other group from the device group's roster.
+        let own_tag = if required_caps
+            .app_components
+            .contains(DEVICE_ROSTER_COMPONENT_ID)
+        {
+            let own_slot = own_device_slot(&self.storage).ok().flatten();
+            req.app_components
+                .iter()
+                .find(|component| component.component_id == DEVICE_ROSTER_COMPONENT_ID)
+                .and_then(|component| decode_device_roster_v1(&component.data).ok())
+                .and_then(|roster| {
+                    OwnDeviceTag::find(roster, own_slot, self.identity.signer.public())
+                })
+        } else {
+            self.own_device_tag(&self.storage).ok().flatten()
+        };
+        let device_tag = own_tag
+            .map(|own| own.seal(&self.crypto, &self.identity.signer))
+            .transpose()?;
         let leaf_extensions = self
             .identity
-            .leaf_extensions(&self.supported_app_components)?;
+            .leaf_extensions(&self.supported_app_components, device_tag)?;
 
         // Validate the creator (implicit admin) on the SAME x-only secp256k1
         // basis as the co-admins below (mdk#737 review), so no admin-set entry
@@ -975,7 +997,7 @@ impl<S: StorageProvider> Engine<S> {
                     method = "retry_rejoins_after_trusted_removal", "skipping a group awaiting hydration repair");
                 continue;
             }
-            match self.do_join_welcome(welcome).await {
+            match self.do_join_welcome(welcome, None).await {
                 Ok(_) => joined = true,
                 Err(error) if terminal_welcome_error(&error) => {
                     self.storage.take_welcome(&candidate.message_id)?;
@@ -1064,6 +1086,7 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_join_welcome(
         &mut self,
         welcome_msg: TransportMessage,
+        prepeeled: Option<(cgka_traits::ingest::PeeledMessage, MessageId)>,
     ) -> Result<GroupId, EngineError> {
         // 1. Dedupe. The ingest-path welcome handler already guards with
         // `seen_message_ids`; direct `CgkaEngine::join_welcome` callers
@@ -1105,12 +1128,18 @@ impl<S: StorageProvider> Engine<S> {
         let welcome_id = welcome_msg.id.clone();
 
         // 3. Peel.
-        let peeled = self
-            .peeler
-            .peel_welcome(&welcome_msg)
-            .await
-            .map_err(EngineError::Peeler)?;
-        let content_id = welcome_content_dedup_id(&peeled)?;
+        let (peeled, content_id) = match prepeeled {
+            Some(prepared) => prepared,
+            None => {
+                let peeled = self
+                    .peeler
+                    .peel_welcome(&welcome_msg)
+                    .await
+                    .map_err(EngineError::Peeler)?;
+                let content_id = welcome_content_dedup_id(&peeled)?;
+                (peeled, content_id)
+            }
+        };
         if self.storage.has_ingress_dedup_marker(&content_id)? {
             self.storage.put_ingress_dedup_marker(&welcome_id)?;
             return Err(EngineError::WelcomeAlreadyProcessed);
@@ -1389,6 +1418,7 @@ impl<S: StorageProvider> Engine<S> {
                 .welcome_sender()
                 .map_err(|_| EngineError::InvalidWelcome)?;
             let welcome_sender_id = crate::identity::validated_member_id_of_leaf(welcome_sender)?;
+            let welcome_sender_key = welcome_sender.signature_key().as_slice().to_vec();
             // Bind the timestamp's authenticated author to the MLS inviter;
             // an unrelated sender rewrapping old Welcome bytes cannot make
             // those bytes a fresh invitation across a reset boundary.
@@ -1472,6 +1502,27 @@ impl<S: StorageProvider> Engine<S> {
                 storage @ EngineError::Storage(_) => storage,
                 _ => EngineError::InvalidWelcome,
             })?;
+
+            // 5f. A Welcome into a group that requires the device roster, or
+            // into a group id a confirmed device link reserved, joins only as
+            // that link's Welcome: into a device group, from the leaf whose
+            // signature key the link named, before its wait ends (mdk#2628
+            // D28, D30). The group id alone is no proof: anyone holding the
+            // account key can read it and found a group under it. The join
+            // consumes the expectation in this transaction.
+            let roster_required = crate::app_components::group_requires_device_roster(&mls_group)?;
+            match storage.device_group_welcome_expectation(&group_id)? {
+                Some(expected)
+                    if roster_required
+                        && expected.sender_signature_key == welcome_sender_key
+                        && joined_at.0 < expected.expires_at =>
+                {
+                    storage.delete_device_group_welcome_expectation(&group_id)?;
+                }
+                Some(_) => return Err(EngineError::UnexpectedDeviceGroupWelcome),
+                None if roster_required => return Err(EngineError::UnexpectedDeviceGroupWelcome),
+                None => {}
+            }
 
             if let Some(local_state_token) = confirmation_token {
                 pending_rejoin = Some(PendingWelcome {

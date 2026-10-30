@@ -29,6 +29,8 @@ mod quarantine_receive;
 mod relay_plane_runtime;
 mod replaceable_delivery;
 mod report_backfill;
+#[cfg(feature = "test-policy-overrides")]
+mod sign_ins;
 mod suspension_close;
 mod unreachable_group_relays;
 mod user_blocks;
@@ -537,6 +539,16 @@ pub(crate) struct ScriptedPushRelayClient {
     pub(crate) indexer_publish_release: tokio::sync::Notify,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     scoped_subscriptions: std::sync::Mutex<Vec<(String, NostrSubscription)>>,
+    /// When set, [`report_scripted_eose`] answers each REQ still awaiting
+    /// EOSE with one stored event created at this second before its EOSE.
+    pub(crate) stored_before_eose: std::sync::Mutex<Option<u64>>,
+    /// Every relay reads as connected on this attempt, as its own state, so
+    /// moving it is a reconnect no notification reports.
+    pub(crate) connection_attempt: std::sync::atomic::AtomicUsize,
+    /// How many times the adapter has asked for a relay's connection.
+    pub(crate) connection_reads: std::sync::atomic::AtomicUsize,
+    /// The 1-based read that first sees the next connection; zero never.
+    pub(crate) reconnect_at_read: std::sync::atomic::AtomicUsize,
     subscription_attempts: std::sync::Mutex<Vec<NostrSubscription>>,
     block_next_subscribe: std::sync::atomic::AtomicBool,
     blocked_subscribe_count: std::sync::atomic::AtomicUsize,
@@ -1146,6 +1158,20 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for ScriptedPushRelayClient {
+    fn relay_connection(
+        &self,
+        _: &MemberId,
+        _: &TransportEndpoint,
+    ) -> Option<transport_nostr_adapter::RelayConnection> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let read = self.connection_reads.fetch_add(1, SeqCst) + 1;
+        if read == self.reconnect_at_read.load(SeqCst) {
+            self.connection_attempt.fetch_add(1, SeqCst);
+        }
+        let attempt = self.connection_attempt.load(SeqCst);
+        Some(transport_nostr_adapter::RelayConnection::new(0, attempt))
+    }
+
     async fn acquire_history(
         &self,
         request: transport_nostr_adapter::NostrAcquisitionRequest,
@@ -1596,13 +1622,21 @@ pub(crate) async fn report_scripted_eose(
     relay: &ScriptedPushRelayClient,
     accept: fn(&NostrSubscription) -> bool,
 ) {
+    let stored = *relay.stored_before_eose.lock().unwrap();
+    let eose = |endpoint: TransportEndpoint, id: String| async move {
+        // Counts only a REQ still awaiting EOSE on that relay.
+        if let Some(created_at) = stored {
+            plane
+                .count_stored_replay_event_for_test(endpoint.clone(), id.clone(), created_at)
+                .await;
+        }
+        plane.handle_relay_eose_for_test(endpoint, id).await;
+    };
     let scoped = relay.scoped_subscriptions.lock().unwrap().clone();
     for (id, subscription) in scoped {
         if accept(&subscription) {
             for endpoint in subscription.endpoints() {
-                plane
-                    .handle_relay_eose_for_test(endpoint.clone(), id.clone())
-                    .await;
+                eose(endpoint.clone(), id.clone()).await;
             }
         }
     }
@@ -1611,9 +1645,7 @@ pub(crate) async fn report_scripted_eose(
             continue;
         }
         for endpoint in subscription.endpoints() {
-            plane
-                .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
-                .await;
+            eose(endpoint.clone(), subscription.subscription_id()).await;
         }
     }
 }
@@ -1621,6 +1653,33 @@ pub(crate) async fn report_scripted_eose(
 /// Every subscription reaches end-of-stored-events.
 pub(crate) fn every_subscription(_: &NostrSubscription) -> bool {
     true
+}
+
+/// Let end-of-stored-events admit `client`'s live REQs' native replay. Until
+/// then its group messages wait behind the unanswered sources, a sync admits
+/// them only through its recovery job, and that job can return before it does
+/// (mdk#2624). Call this before the client's first grant: a job that starts
+/// before a source's EOSE captures that source; the scripted relay serves no
+/// history, so the capture leaves it incomplete and no later EOSE admits it.
+/// Its `SubscriptionReplay` duty would then join every grant (mdk#2693).
+pub(crate) async fn settle_live_replay(
+    plane: &MarmotRelayPlane,
+    relay: &ScriptedPushRelayClient,
+    client: &mut AppClient,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        report_scripted_eose(plane, relay, every_subscription).await;
+        client.synchronize_native_replay().await.unwrap();
+        if client.recovery_owner.test_replay_complete() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the live REQs' replay settles"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 const EXPLICIT_CATCH_UP_BACKFILL_DEADLINE: Duration = Duration::from_secs(5);
@@ -22518,6 +22577,200 @@ async fn unavailable_group_invite_retries_the_exact_commit_after_transport_recov
     runtime.shutdown().await;
 }
 
+/// Alice's client with a group ready to invite Bob into, and a relay that
+/// fails every group-message publish with an untyped error, so the invite's
+/// commit is retained with its acknowledgement unknown (mdk#2726).
+struct UnresolvedInvite {
+    _dir: tempfile::TempDir,
+    _plane: MarmotRelayPlane,
+    _bob_client: AppClient,
+    relay: Arc<ScriptedPushRelayClient>,
+    alice: AppClient,
+    group: GroupId,
+    bob_id_hex: String,
+    attempted_before: usize,
+}
+
+async fn unresolved_invite() -> UnresolvedInvite {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group = alice.create_group("unresolved invite", &[]).await.unwrap();
+    let attempted_before = relay.attempted_events().len();
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE);
+    UnresolvedInvite {
+        _dir: dir,
+        _plane: plane,
+        _bob_client: bob_client,
+        relay,
+        alice,
+        group,
+        bob_id_hex: bob.account_id_hex,
+        attempted_before,
+    }
+}
+
+/// Kinds of the events attempted since `before`.
+fn attempted_kinds_since(relay: &ScriptedPushRelayClient, before: usize) -> Vec<u64> {
+    relay.attempted_events()[before..]
+        .iter()
+        .map(|event| event.kind)
+        .collect()
+}
+
+/// mdk#2726: the public invite call publishes no Welcome while its Add
+/// commit's acknowledgement is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_with_unresolved_commit_holds_its_welcome() {
+    let mut invite = unresolved_invite().await;
+    let summary = invite
+        .alice
+        .invite_members(&invite.group, &[invite.bob_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+
+    let attempted = attempted_kinds_since(&invite.relay, invite.attempted_before);
+    assert!(
+        attempted.contains(&transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE),
+        "the invite attempted its commit"
+    );
+    assert!(
+        !attempted.contains(&transport_nostr_peeler::KIND_NIP59_GIFT_WRAP),
+        "no Welcome may be published before its Add commit confirms"
+    );
+}
+
+/// mdk#2726: an invite whose commit is retained leaves no Welcome slot for a
+/// later caller to drive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_with_unresolved_commit_leaves_no_welcome_slot() {
+    let mut invite = unresolved_invite().await;
+    let telemetry = crate::observer::PerformanceRecorder::default();
+    let summary = invite
+        .alice
+        .invite_members_with_telemetry(
+            &invite.group,
+            &[invite.bob_id_hex.as_str()],
+            &[],
+            &telemetry,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    assert!(invite.alice.unpublished_welcome_delivery.is_none());
+}
+
+/// mdk#2726: the account worker drives an invite's Welcomes only when its
+/// commit is published, but a retained invite used to leave its slot behind.
+/// A later create that only returns an existing group, as a retried
+/// prepared-image create does, then drove that slot and published the
+/// invite's Welcome before its commit confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_invite_leaves_no_welcome_for_a_later_create_to_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("sender").unwrap();
+    let invited = home.create_account("invited").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://retained-invite.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(
+        &app,
+        &invited.account_id_hex,
+        "wss://retained-invite.example",
+    );
+    // A group already created from a prepared image, so creating from that
+    // image again returns it without creating anything.
+    let (upload_id, image_group) = {
+        let mut client = app.client("sender").await.unwrap();
+        let staged = client
+            .stage_prepared_initial_group_image(&one_pixel_png(), "image/png")
+            .unwrap();
+        client
+            .finish_initial_group_image_upload(&staged.upload_id, &Ok(()))
+            .unwrap();
+        let created = client
+            .create_group_with_prepared_initial_image_and_telemetry(
+                "image group",
+                &[],
+                AppCreateGroupOptions::default(),
+                &staged.upload_id,
+                &crate::observer::PerformanceRecorder::default(),
+            )
+            .await
+            .unwrap();
+        (staged.upload_id, created.group_id)
+    };
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("sender", "retained invite", &[], None)
+        .await
+        .unwrap();
+
+    let attempted_before = relay.attempted_events().len();
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE);
+    let summary = runtime
+        .invite_members("sender", &group_id, &[invited.account_id_hex])
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    let again = runtime
+        .create_group_with_prepared_initial_image(
+            "sender",
+            "retried image group",
+            &[],
+            None,
+            upload_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(again, image_group);
+    // Worker mutations run in order, so this one starts only after the
+    // create's post-reply Welcome delivery has finished.
+    runtime
+        .create_group("sender", "after the retry", &[], None)
+        .await
+        .unwrap();
+
+    let attempted = attempted_kinds_since(&relay, attempted_before);
+    assert!(
+        attempted.contains(&transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE),
+        "the invite attempted its commit"
+    );
+    assert!(
+        !attempted.contains(&transport_nostr_peeler::KIND_NIP59_GIFT_WRAP),
+        "no Welcome may be published before its Add commit confirms"
+    );
+    runtime.shutdown().await;
+}
+
 // ---- mdk#1380: steady-state reconciliation passes must not rescan full state ----
 
 #[test]
@@ -23731,6 +23984,136 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
     );
 }
 
+/// Plant a frozen batch whose failure budget ran out (mdk#2684), however it
+/// got there.
+fn plant_parked_convergence_pass(app: &MarmotApp, group_id: &cgka_traits::GroupId, epoch: u64) {
+    use cgka_traits::convergence_pass::{
+        ConvergencePassPhase, ConvergencePassRetry, ConvergencePassStep, DurableConvergencePass,
+    };
+    use cgka_traits::storage::ConvergencePassStorage;
+    app.account_storage("alice")
+        .unwrap()
+        .put_convergence_pass(&DurableConvergencePass {
+            group_id: group_id.clone(),
+            generation: 1,
+            phase: ConvergencePassPhase::Frozen,
+            base_epoch: cgka_traits::EpochId(epoch),
+            clock_instance_id: 0,
+            opened_monotonic_ms: 0,
+            quiescence_deadline_monotonic_ms: 0,
+            absolute_deadline_monotonic_ms: 0,
+            opened_wall_ms: 0,
+            quiescence_deadline_wall_ms: 0,
+            absolute_deadline_wall_ms: 0,
+            members: Vec::new(),
+            frozen_at_wall_ms: Some(0),
+            cutoff_cause: None,
+            fairness_slot_available: false,
+            retry: Some(ConvergencePassRetry {
+                failed_attempts: 12,
+                failed_step: ConvergencePassStep::Apply,
+                next_attempt_monotonic_ms: 0,
+                next_attempt_wall_ms: 0,
+                parked_at_wall_ms: Some(0),
+            }),
+        })
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_convergence_pass_owes_hosts_one_notice_per_change() {
+    use cgka_traits::storage::ConvergencePassStorage;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("parked", &[]).await.unwrap();
+    let epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    assert!(client.take_convergence_park_notices().is_empty());
+    plant_parked_convergence_pass(&app, &group_id, epoch);
+
+    let mut notices = Vec::new();
+    for _ in 0..2 {
+        assert!(matches!(
+            client.convergence_schedule_state(&group_id).unwrap(),
+            crate::ConvergenceScheduleState::Idle
+        ));
+        notices.push(client.take_convergence_park_notices());
+    }
+    assert_eq!(
+        notices,
+        [vec![group_id.clone()], Vec::new()],
+        "the park is announced once, whichever schedule read sees it"
+    );
+    assert!(
+        client
+            .group_mls_state(&group_id)
+            .unwrap()
+            .convergence_parked
+    );
+
+    app.account_storage("alice")
+        .unwrap()
+        .delete_convergence_pass(&group_id)
+        .unwrap();
+    let mut notices = Vec::new();
+    for _ in 0..2 {
+        client.convergence_schedule_state(&group_id).unwrap();
+        notices.push(client.take_convergence_park_notices());
+    }
+    assert_eq!(
+        notices,
+        [vec![group_id.clone()], Vec::new()],
+        "leaving the park is announced once too"
+    );
+    assert!(
+        !client
+            .group_mls_state(&group_id)
+            .unwrap()
+            .convergence_parked
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_convergence_retry_whose_advance_fails_still_wakes_the_group() {
+    use cgka_traits::storage::ConvergencePassStorage;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("parked", &[]).await.unwrap();
+    let epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    plant_parked_convergence_pass(&app, &group_id, epoch);
+    client.take_pending_convergence_groups();
+
+    // The retry un-parks the batch, then its advance fails before any attempt
+    // could park it again (mdk#2684).
+    client.fail_next_convergence_retry_advance = true;
+    assert!(client.retry_group_convergence(&group_id).await.is_err());
+    let pass = app
+        .account_storage("alice")
+        .unwrap()
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("the batch survives the failed advance");
+    assert!(!pass.is_parked());
+    assert_eq!(
+        client.take_pending_convergence_groups(),
+        vec![group_id.clone()],
+        "the worker's next schedule read must still see the group"
+    );
+    assert!(matches!(
+        client.convergence_schedule_state(&group_id).unwrap(),
+        crate::ConvergenceScheduleState::Ready
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn voluntary_left_classification_survives_reopen_but_resets_on_rejoin() {
     let dir = tempfile::tempdir().unwrap();
@@ -23792,7 +24175,7 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
     for member in [&bob, &carol] {
         remember_test_member_inbox(&app, &member.account_id_hex, "wss://relay.example");
     }
-    let plane = MarmotRelayPlane::new(None, relay);
+    let plane = MarmotRelayPlane::new(None, relay.clone());
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
         .await
@@ -23830,6 +24213,9 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
             .joined_groups
             .contains(&group_id)
     );
+    // Bob's leave reaches Alice behind her live REQs' replay; settle it so
+    // her next sync ingests the proposal instead of leaving it to a grant.
+    settle_live_replay(&plane, &relay, &mut alice).await;
     bob_client.leave_group(&group_id).await.unwrap();
     alice.sync().await.unwrap();
     let delay = alice

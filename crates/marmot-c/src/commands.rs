@@ -777,6 +777,22 @@ c_cmd! {
     /// `marmot_linked_device_list_free`.
     async fn marmot_linked_devices(account_ref: str) -> rec(MarmotLinkedDeviceList) = linked_devices;
 
+    /// Whether this device's KeyPackage refresh is overdue because its device
+    /// group can't take the announcement that must come first; warn the user
+    /// while it is. Always false until this device trusts a device group,
+    /// and in release builds until the device group's spec lands. Re-read on
+    /// the `KeyPackageRefreshOverdueChanged` event.
+    async fn marmot_key_package_refresh_overdue(account_ref: str) -> scalar(bool) = key_package_refresh_overdue;
+    /// Rename one of this account's devices, this one included, by its
+    /// `slot_id_hex` from `marmot_linked_devices`: one roster commit in the
+    /// device group. The label is at most 64 bytes of UTF-8; an empty
+    /// string clears it. Fails while device groups are off, for an unknown
+    /// device, or while the device group has an earlier change in flight
+    /// (retry later). A rename whose commit loses a fork to one that also
+    /// changes that device's entry is not made again. Re-read on the
+    /// `LinkedDevicesChanged` event.
+    async fn marmot_rename_linked_device(account_ref: str, slot_id_hex: str, label: str) -> unit = rename_linked_device;
+
     /// Accept a pending group invite; writes the now-confirmed group
     /// record. Free with `marmot_app_group_record_free`.
     async fn marmot_accept_group_invite(account_ref: str, group_id_hex: str) -> rec(MarmotAppGroupRecord) = accept_group_invite;

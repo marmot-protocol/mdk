@@ -1579,9 +1579,9 @@ typedef struct MarmotSecretStore {
 
 /**
  * Borrowed construction options. Zero initialization selects public-only
- * endpoints, an advancing cursor, no client label, and the platform keychain
- * (under the deployment's keychain service). The deployment itself is a
- * separate, required argument.
+ * endpoints, an advancing cursor, no client label or device platform, and the
+ * platform keychain (under the deployment's keychain service). The deployment
+ * itself is a separate, required argument.
  * Use this struct only with the matching header/library version.
  */
 typedef struct MarmotClientOptions {
@@ -1605,6 +1605,12 @@ typedef struct MarmotClientOptions {
    * 0 = NativeAutomatic (default), 1 = HostManaged (initially denied).
    */
   uint32_t attachment_acquisition_mode;
+  /**
+   * Optional UTF-8 short name of the platform this device runs on, such as
+   * "iOS", for this device's entry on the account's Devices screen; NULL,
+   * blank or over 64 bytes leaves it out.
+   */
+  const char *device_platform;
 } MarmotClientOptions;
 
 /**
@@ -2512,6 +2518,11 @@ typedef struct MarmotAppGroupMlsState {
   char **disbanding_blockers;
   uintptr_t disbanding_blockers_len;
   struct MarmotDisbandRequest *disband_request;
+  /**
+   * Convergence stopped retrying a batch that kept failing; new
+   * input or `marmot_retry_group_convergence` resumes it.
+   */
+  bool convergence_parked;
 } MarmotAppGroupMlsState;
 
 /**
@@ -5197,6 +5208,12 @@ typedef enum MarmotGroupEventKind_Tag {
   MARMOT_GROUP_EVENT_KIND_LOCAL_GROUP_COPY_TERMINATED,
   MARMOT_GROUP_EVENT_KIND_LOCAL_GROUP_COPY_RESTORED,
   MARMOT_GROUP_EVENT_KIND_GROUP_MEMBER_LEAVES_REMOVED,
+  /**
+   * A send that waited for the group to settle was dropped unsent: the
+   * settled state refused it. Nothing retries it; the user may try again.
+   * `intent_kind` names the action and `reason` is a stable tag.
+   */
+  MARMOT_GROUP_EVENT_KIND_QUEUED_INTENT_REFUSED,
 } MarmotGroupEventKind_Tag;
 
 typedef struct MarmotGroupEventKind_GroupJoined_Body {
@@ -5280,6 +5297,12 @@ typedef struct MarmotGroupEventKind_GroupMemberLeavesRemoved_Body {
   uint64_t epoch;
 } MarmotGroupEventKind_GroupMemberLeavesRemoved_Body;
 
+typedef struct MarmotGroupEventKind_QueuedIntentRefused_Body {
+  char *intent_id_hex;
+  char *intent_kind;
+  char *reason;
+} MarmotGroupEventKind_QueuedIntentRefused_Body;
+
 typedef struct MarmotGroupEventKind {
   MarmotGroupEventKind_Tag tag;
   union {
@@ -5297,6 +5320,7 @@ typedef struct MarmotGroupEventKind {
     MarmotGroupEventKind_GroupHydrationRecovered_Body GROUP_HYDRATION_RECOVERED;
     MarmotGroupEventKind_LocalGroupCopyTerminated_Body LOCAL_GROUP_COPY_TERMINATED;
     MarmotGroupEventKind_GroupMemberLeavesRemoved_Body GROUP_MEMBER_LEAVES_REMOVED;
+    MarmotGroupEventKind_QueuedIntentRefused_Body QUEUED_INTENT_REFUSED;
   };
 } MarmotGroupEventKind;
 
@@ -5345,6 +5369,13 @@ typedef enum MarmotEvent_Tag {
    * may fire with no visible change.
    */
   MARMOT_EVENT_LINKED_DEVICES_CHANGED,
+  /**
+   * Whether this device's KeyPackage refresh is overdue may have changed;
+   * re-read `marmot_key_package_refresh_overdue`. Also fires once each
+   * time the account's worker opens or reconnects, and may fire with no
+   * change.
+   */
+  MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -5421,6 +5452,11 @@ typedef struct MarmotEvent_LinkedDevicesChanged_Body {
   char *account_label;
 } MarmotEvent_LinkedDevicesChanged_Body;
 
+typedef struct MarmotEvent_KeyPackageRefreshOverdueChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_KeyPackageRefreshOverdueChanged_Body;
+
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
   union {
@@ -5436,6 +5472,7 @@ typedef struct MarmotEvent {
     MarmotEvent_GroupChangeSuperseded_Body GROUP_CHANGE_SUPERSEDED;
     MarmotEvent_HistoryNoticesChanged_Body HISTORY_NOTICES_CHANGED;
     MarmotEvent_LinkedDevicesChanged_Body LINKED_DEVICES_CHANGED;
+    MarmotEvent_KeyPackageRefreshOverdueChanged_Body KEY_PACKAGE_REFRESH_OVERDUE_CHANGED;
   };
 } MarmotEvent;
 
@@ -7437,6 +7474,44 @@ MarmotStatus marmot_dismiss_history_notice(const struct MarmotClient *client,
 MarmotStatus marmot_linked_devices(const struct MarmotClient *client,
                                    const char *account_ref,
                                    struct MarmotLinkedDeviceList **out);
+
+/**
+ * Whether this device's KeyPackage refresh is overdue because its device
+ * group can't take the announcement that must come first; warn the user
+ * while it is. Always false until this device trusts a device group,
+ * and in release builds until the device group's spec lands. Re-read on
+ * the `KeyPackageRefreshOverdueChanged` event.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_key_package_refresh_overdue(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                bool *out);
+
+/**
+ * Rename one of this account's devices, this one included, by its
+ * `slot_id_hex` from `marmot_linked_devices`: one roster commit in the
+ * device group. The label is at most 64 bytes of UTF-8; an empty
+ * string clears it. Fails while device groups are off, for an unknown
+ * device, or while the device group has an earlier change in flight
+ * (retry later). A rename whose commit loses a fork to one that also
+ * changes that device's entry is not made again. Re-read on the
+ * `LinkedDevicesChanged` event.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_rename_linked_device(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *slot_id_hex,
+                                         const char *label);
 
 /**
  * Accept a pending group invite; writes the now-confirmed group

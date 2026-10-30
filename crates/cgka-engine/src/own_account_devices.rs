@@ -117,11 +117,13 @@ impl<S: StorageProvider> Engine<S> {
             PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
+        let leaf_node_parameters = self.own_commit_leaf_parameters(&mls_group, &[])?;
         let (commit_out, welcome_out, _group_info) = mls_group
             .commit_builder()
             .consume_proposal_store(false)
             .propose_adds(parsed_kps.iter().cloned())
             .propose_removals(removed_leaves.iter().copied())
+            .leaf_node_parameters(leaf_node_parameters)
             .load_psks(provider.storage())
             .map_err(|e| EngineError::Backend(format!("own account devices load_psks: {e:?}")))?
             .build(

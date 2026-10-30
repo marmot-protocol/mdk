@@ -9,8 +9,8 @@
 //! decodes, by un-covering its second so the history is fetched again. Rows
 //! are encoded like spill rows, in the account's encrypted database.
 //!
-//! Nothing stages yet. Route ids, relay URLs and event ids are account-private
-//! and must never be logged.
+//! Only the recovery runner stages, and nothing starts it yet. Route ids,
+//! relay URLs and event ids are account-private and must never be logged.
 #[cfg(test)]
 mod tests;
 
@@ -22,7 +22,9 @@ use crate::app::recovery_units::charge_event_bytes_tx;
 use crate::app::transport::delivery_spill::{EncodedDelivery, already_seen};
 use crate::base::codec::i64_to_u64;
 use crate::base::connection::CachedSql;
-use crate::{SqliteAppStorage, SqliteResultExt, TransportReconciliationRoute};
+use crate::{
+    SqliteAppStorage, SqliteResultExt, TransportReconciliationItem, TransportReconciliationRoute,
+};
 use cgka_traits::TransportDelivery;
 use cgka_traits::storage::StorageResult;
 use rusqlite::{OptionalExtension, params};
@@ -207,6 +209,45 @@ impl SqliteAppStorage {
             }
         }
         Ok(read)
+    }
+
+    /// The ids of events staged on `route` from any relay, sent from
+    /// `since_seconds` through `until_seconds`, oldest first. A comparison
+    /// counts them as held, so it never fetches a staged event again. Ids
+    /// that are not 32 bytes are not Nostr events and are left out.
+    pub fn staged_recovery_items(
+        &self,
+        route: &TransportReconciliationRoute,
+        since_seconds: u64,
+        until_seconds: u64,
+    ) -> StorageResult<Vec<TransportReconciliationItem>> {
+        let (kind, id) = route.storage_key();
+        let conn = self.lock()?;
+        let rows = conn
+            .prepare_cached(
+                "SELECT event_id, created_at_seconds FROM account_recovery_staged
+                 WHERE route_kind = ?1 AND route_id = ?2
+                 AND created_at_seconds >= ?3 AND created_at_seconds <= ?4
+                 ORDER BY created_at_seconds, event_id",
+            )
+            .storage()?
+            .query_map(
+                params![kind, id, integer(since_seconds)?, integer(until_seconds)?],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        let mut items = Vec::with_capacity(rows.len());
+        for (event_id, created_at) in rows {
+            if let Ok(event_id) = <[u8; 32]>::try_from(event_id) {
+                items.push(TransportReconciliationItem {
+                    event_id,
+                    created_at: i64_to_u64(created_at)?,
+                });
+            }
+        }
+        Ok(items)
     }
 
     /// Remove staged rows whose events are now in the seen index. Rows whose

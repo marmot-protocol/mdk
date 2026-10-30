@@ -17,7 +17,7 @@
 //! `Box<dyn CgkaEngine + Send + Sync>` today and can be dropped later without
 //! breaking the contract.
 
-use crate::app_components::{AppComponentData, AppComponentId};
+use crate::app_components::{AppComponentData, AppComponentId, DeviceEntryV1, DeviceSlotId};
 use crate::app_event::AppMessageRetentionDecision;
 use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
@@ -220,6 +220,23 @@ pub enum SendIntent {
         group_id: GroupId,
         updates: Vec<AppComponentData>,
     },
+    /// Replace the entry of `slot` in the roster of a device group with
+    /// `entry`, in one `marmot.account.device-roster.v1` `SetDevice`, while
+    /// the roster still holds `expected` there (mdk#2628 3.6).
+    ///
+    /// `SetDevice` replaces an entry whole, so an entry computed from an
+    /// older read would put back every field changed since. The engine
+    /// compares the slot's entry with `expected` each time it prepares the
+    /// Commit: on a direct send once the send has settled the group's
+    /// convergence input, when a queued copy is drained, and when it re-issues
+    /// the intent after a lost fork. Any other entry, or none, refuses it with
+    /// [`EngineError::DeviceEntryChanged`] and nothing is staged.
+    ReplaceDeviceEntry {
+        group_id: GroupId,
+        slot: DeviceSlotId,
+        expected: Box<DeviceEntryV1>,
+        entry: Box<DeviceEntryV1>,
+    },
     /// Update the group's `marmot.group.profile.v1` app component fields.
     UpdateGroupData {
         group_id: GroupId,
@@ -349,7 +366,8 @@ pub enum SendResult {
     /// The engine accepted the local intent but did not publish anything
     /// yet because the group has unresolved convergence input. The intent
     /// will be regenerated from the canonical state when the group becomes
-    /// stable.
+    /// stable. If that state refuses it, the engine drops it and announces
+    /// [`GroupEvent::QueuedIntentRefused`] with this `intent_id`.
     Queued {
         group_id: GroupId,
         intent_id: MessageId,
@@ -635,6 +653,22 @@ pub enum GroupEvent {
     /// Restores participation without an invitation or changing local archive intent.
     LocalGroupCopyRestored {
         group_id: GroupId,
+    },
+    /// A queued intent was dropped unsent: once the group settled, the
+    /// settled state refused it, as it would have refused the same intent
+    /// sent directly (the sender is no longer an admin, a precondition no
+    /// longer holds, the change is not valid on that state). The engine does
+    /// not prepare it again; the user may ask again (mdk#2694).
+    QueuedIntentRefused {
+        group_id: GroupId,
+        /// The id [`SendResult::Queued`] returned for the intent.
+        intent_id: MessageId,
+        /// Stable name of the intent's kind, such as `update_group_data`.
+        intent_kind: String,
+        /// Stable, privacy-safe name of the refusal: the
+        /// [`EngineError::privacy_safe_kind`](crate::error::EngineError::privacy_safe_kind)
+        /// of the error the preparation returned, such as `not_group_admin`.
+        reason: String,
     },
     /// Device destinations invalidated by an actual canonical state transition.
     /// Derived from the live pre-apply tree and the final selected tree, rather
@@ -1206,6 +1240,34 @@ pub trait CgkaEngine: Send + Sync {
 
     /// Stable identity of the local client across every group.
     fn self_id(&self) -> MemberId;
+
+    /// This device's MLS signature public key. In this engine it is the
+    /// `signature_key` of every leaf the device creates, in every group, since
+    /// the signer is made once per account-device and never rotated; the
+    /// protocol does not require that (mdk#2628 D33). So it is also this
+    /// device's leaf key in the device group, which device pairing names in
+    /// the existing device's confirmation even before the group exists
+    /// (mdk#2628 D28).
+    fn own_signature_key(&self) -> Vec<u8>;
+
+    /// Expect the Welcome into the account's device group that a confirmed
+    /// device link names; the new device records it before it sends its own
+    /// confirmation (mdk#2628 D28, D30). Until `expires_at` the engine joins
+    /// `group_id` only through a Welcome into a group that requires the device
+    /// roster, sent by the leaf whose signature key is
+    /// `sender_signature_key`, and that join consumes the expectation. It
+    /// refuses every other Welcome into that group id, and every Welcome into a
+    /// group that requires the device roster that no expectation names, with
+    /// [`EngineError::UnexpectedDeviceGroupWelcome`]. Replaces an earlier
+    /// expectation for the same group.
+    fn expect_device_group_welcome(
+        &mut self,
+        expectation: &crate::storage::DeviceGroupWelcomeExpectation,
+    ) -> Result<(), EngineError>;
+
+    /// Drop the expectation for `group_id`, when its link is withdrawn or its
+    /// wait ends. Whether there was one.
+    fn withdraw_device_group_welcome(&mut self, group_id: &GroupId) -> Result<bool, EngineError>;
 
     /// Produce a fresh KeyPackage suitable for publishing to a KeyPackage
     /// directory. Expiry and refresh scheduling live above the engine.

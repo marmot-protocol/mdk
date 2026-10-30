@@ -13,8 +13,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - A new `marmot-pairing` crate implements device pairing's code exchange (mdk#2628): Matrix's `m.sas.v1`
   verification in Marmot encodings, with seven emoji or three numbers to compare, a commitment to the new device's
-  key, and confirmations that cover the new device's exact `KeyPackageRef` and the device group's id. It ends in a
-  verified link and does no I/O. `transport-nostr-adapter` gift-wraps its messages to the account's own key behind
+  key, and confirmations that cover the new device's exact `KeyPackageRef`, the device group's id, and the MLS
+  signature key of the existing device's leaf in it, the only sender whose Welcome the new device accepts. It ends in
+  a verified link and does no I/O. `transport-nostr-adapter` gift-wraps its messages to the account's own key behind
   the `unreleased-device-pairing` feature. Nothing enables that feature, so no release sends pairing messages until
   the pairing spec merges.
 - `wn-agent doctor` checks a standalone connector setup without changing anything (mdk#2570). It prints one line per
@@ -26,16 +27,39 @@ versioning through the workspace version in the root `Cargo.toml`.
   that messages are delivered.
 - The engine implements `marmot.account.device-roster.v1` (0x800e), the roster of an account's device group
   (mdk#2628 item 3.1). A group that requires it is a device group. It holds the roster from creation and keeps
-  requiring it, and only one account's devices may be members. A roster update is a list of operations that each set
-  or remove one entry: a device keyed by its KeyPackage slot, a leaf-map entry keyed by a device's slot and a group,
-  a rejected slot or a rejected KeyPackage. Every member applies the operations to the parent's roster. A roster may
-  hold at most 20 devices, and each leaf-map entry belongs to a device or to a slot recorded as removed. Until the component's spec
-  is adopted, only test-policy builds may advertise it. A release build can't create or join a device group, and it
-  treats roster bytes in other groups as unknown data, so nothing ships the format.
+  requiring it, and only one account's devices may be members. The roster holds the key that seals the account's
+  device tags, which no update changes. A roster update is a list of operations that each set or remove one entry: a
+  device keyed by its KeyPackage slot, with the key it signs its device tags with, a rejected slot (a removed device's
+  keeps that key) or a rejected KeyPackage. Every member applies the operations to the parent's roster. A roster may
+  hold at most 20 devices, no two with one tag signature key. The device that creates a device group draws its tag key
+  at random. Until the component's spec is adopted, only test-policy builds may advertise it. A release build can't
+  create or join a device group, and it treats roster bytes in other groups as unknown data, so nothing ships the
+  format.
+- The engine reads device tags (`marmot.member.device-tag.v1`, 0x800f; mdk#2628 item 3.1d), which say which of an
+  account's devices holds a leaf. A tag names the device's roster slot, is signed with that device's tag signature key
+  and is sealed under the roster's tag key, so only the account's devices can read it. Read against the roster, a leaf
+  belongs to a device, to a removed slot, or to no one. A tag that doesn't decode, open or verify reads as no tag and
+  never makes anything invalid. `AccountDeviceRuntime::member_device_tag_claim` reads a member's leaf in the group's
+  current epoch. No group may require 0x800f: a Commit, standalone proposal or Welcome that would is rejected. A
+  GroupContext entry under it is unknown data, which MDK accepts but never writes.
+- The engine puts device tags in this device's KeyPackages and leaves (mdk#2628 item 3.1d). The host names the device
+  group it trusts with `AccountDeviceRuntime::set_device_tag_group`, which hydrates it. A group that isn't live tags
+  nothing; it stays named, and the call returns an error while that holds. A device signs its tags with its MLS
+  signature key (`own_signature_key`), which it sets as its roster entry's tag signature key in an ordinary roster
+  update; that Commit's own leaf already carries a tag. From then on every KeyPackage it builds carries a fresh tag, a
+  KeyPackage whose tag doesn't read as its own is due for replacement, and every own Commit or self-update that replaces
+  a leaf without such a tag adds one. A founder whose entry in a new device group's roster carries its key tags its
+  founding leaf. A tagged leaf advertises 0x800f, which the host still can't list. Only test-policy builds hold a device
+  group, so release builds tag nothing.
 - `marmot-app` keeps an account's device group (mdk#2628 item 3.1). A confirmed device link creates it under the
   group id the link chose, and the founding Add takes this account's own device only through the exact confirmed
   KeyPackage. The device that created the group trusts it, and so does a device that joined through the Welcome a
-  confirmed link named. A Welcome into any other device group installs a group the device holds but never trusts.
+  confirmed link waits for. The new device records what that link expects (the group id, the signature key of the
+  existing device's leaf, and the end of a 10-minute wait) before it confirms, and the engine joins a device group
+  only through a Welcome that matches it, consuming the expectation in the join. Every other device-group Welcome,
+  and any Welcome into a waiting link's group id, is refused before the join with the new
+  `EngineError::UnexpectedDeviceGroupWelcome`, so a group someone else founded under the id can't take it.
+  Storage providers implement the new `DeviceGroupWelcomeStorage` trait for these expectations.
   No device group is ever a chat: it stays out of the chat list, invites, timelines and host events, while its
   relay route stays live. Pairing doesn't reach the app yet, so only test-policy builds reach any of this, through
   `MarmotAppConfig::dev_device_groups` and two hidden hooks.
@@ -43,6 +67,24 @@ versioning through the workspace version in the root `Cargo.toml`.
   `linked_devices` in `marmot-app`, UniFFI and C, with this device first, and a `LinkedDevicesChanged` event to
   re-read it, since the device group's own events never reach hosts. Release builds list nothing until the roster's
   spec lands.
+- Hosts can tell the user when the device group has held this device's KeyPackage refresh back for a week (mdk#2628
+  item 3.4): `key_package_refresh_overdue` in `marmot-app`, UniFFI and C, and a `KeyPackageRefreshOverdueChanged`
+  event to re-read it. It is false in release builds until the roster's spec lands.
+- A device notices new sign-ins on its account (mdk#2628 item 3.2). It reads every KeyPackage slot of the account at
+  open, every six hours and soon after one of the account's KeyPackages arrives live, and keeps what an inviter would
+  add: each slot's newest publication, not deleted, valid and fresh, with no cap on how many. A slot that is neither
+  this device's nor in its device group's roster is an unrecognized sign-in. Slots this device's first check returned,
+  fresh or not, are devices that were there before it; other slots are new sign-ins, whatever their publication times
+  say. Malformed input and client tags never raise one. Rejecting a sign-in records its slot as rejected in the device
+  group's roster in one commit, or keeps it on the device until it has a device group; a device that later creates one
+  founds the roster with it. Each device keeps its rejections until the roster holds the slot as a device, a link the
+  user confirmed, and commits one again whenever the roster has no entry for the slot; it never replaces an entry. A
+  rejection names the slot alone, never its KeyPackage, which may be a copy of a real device's, and a rejected
+  KeyPackage never makes another slot rejected. A sign-in another device answered keeps its prompt, saying so, until
+  dismissed, and is listed again if the roster loses that answer; one whose slot a complete check finds empty stays
+  listed as no longer signed in. A publication that is only stale never signs a slot out, and a check of fallback
+  relays, when the account lists none, is never complete. Hosts can't reach it yet, and only test-policy builds run
+  it.
 - `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
   one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
   pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster
@@ -52,6 +94,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   device group is settling, it is refused with the new `EngineError::LinkDeviceUnsettled`, and the caller retries
   while the new device still waits for its Welcome. The device gets its Welcome as an invited device does. Like the
   roster, it is reachable only in test-policy builds until the device group's spec is adopted.
+- New `SendIntent::ReplaceDeviceEntry` replaces one entry of a device group's roster while the roster still holds
+  the entry it was computed from (mdk#2628). The engine compares the entry each time it prepares the commit: on the
+  send after it settles convergence input, when a queued copy drains, and when it re-issues the edit after a lost
+  fork. Otherwise the new `EngineError::DeviceEntryChanged` refuses it and nothing is staged; a drained copy is
+  retired with `QueuedIntentRefused`. A lost edit is re-issued when the winner left that entry alone, even if it
+  changed others. The device roster's write path uses it, so an entry read before a sibling's change never
+  overwrites it.
 - The engine can create a group under a group id the host chose before the group exists
   (`create_group_with_chosen_id_and_audit_context`), as a device link needs (mdk#2628). The id has 1 to 255 bytes.
   An id that names any group this device holds, a removed or forgotten copy included, is refused before anything is
@@ -156,6 +205,24 @@ versioning through the workspace version in the root `Cargo.toml`.
   message, and the socket refusals (a world-accessible or group-writable socket directory, a file in the socket's
   place, a socket already in use), which printed only an `io_kind=`, say what to change. The line still carries no
   paths, account ids or relay URLs.
+- `wnd` answers `wn daemon status`, `wn daemon stop` and pings while it is still opening its accounts, which the
+  runtime allows 45 seconds (part of mdk#2696). It used to bind its socket and accept nothing until then, so those
+  commands connected and waited with no reply. `wn daemon status` and the TUI status line now say `daemon starting`
+  in that window, and `--json` carries a new `starting` field. Other commands wait for the accounts as before. A stop during startup
+  cancels the start and shuts down what it had opened.
+- `wn daemon start` no longer reports a failed start while the daemon it launched keeps starting (mdk#2696). It gave
+  up after five seconds with `daemon_start_failed`, but the first launch of a newly built `wnd` on a loaded macOS
+  machine can wait longer than that before it runs, and the daemon then came up behind the error. The command now
+  watches the `wnd` it launched: it reports `daemon started` once that daemon reports its accounts open, fails at
+  once with `daemon_start_failed` and the log's last lines if it exits, and stops it and fails with
+  `daemon_start_timeout` if it is not ready after 60 seconds, which covers the runtime's own 45-second wait for
+  accounts to open. Ctrl-C stops it as well and fails with `daemon_start_interrupted`; the daemon runs in its own
+  process group, so it used to keep starting behind the interrupted command. When another start wins the socket, it
+  stops its own `wnd` and reports `daemon already running`.
+- `wn daemon stop` no longer reports `daemon stopped` while the daemon is still running (mdk#2696). It reported
+  success as soon as the daemon accepted the request, before the daemon shut down its runtime and exited, so a slow
+  or stuck shutdown left a daemon behind a successful stop. It now waits for the process to exit, and fails with
+  `daemon_stop_timeout` if it is still running after 30 seconds.
 
 ## [0.14.0] - 2026-10-23
 

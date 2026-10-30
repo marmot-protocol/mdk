@@ -11,6 +11,7 @@ Map for Marmot engine-side SQLite tables (the `cgka_traits` storage traits). App
 | `groups.rs` | `GroupStorage`: group CRUD, listing, cascade delete; delegates route rows to `transport_routes.rs`. |
 | `transport_routes.rs` | Durable transport-route index rows (routing id → group id + observing epoch) seeded at session open (mdk#1161). |
 | `account_device_signer.rs` | Marmot identity to MLS signing-key binding. |
+| `device_group_welcome.rs` | `DeviceGroupWelcomeStorage`: the device-group Welcome a confirmed link expects (sender key, deadline). |
 | `messages.rs` | `MessageStorage`: message rows (storage format 2 columns), deferred-message metadata, format promotion. |
 | `snapshots.rs`, `snapshots/` | Snapshot capture, rollback, listing, release, checkpoints, replay fingerprints; see its local `AGENTS.md`. |
 | `outbound.rs` | `OutboundIntentStorage` / `OutboundFanoutStorage`: durable queued outbound intents and fanouts. |

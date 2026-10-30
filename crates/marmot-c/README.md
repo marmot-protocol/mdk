@@ -189,7 +189,7 @@ records retain ordinary strings and do not use this C-only encoding.
 ## Runtime construction
 
 `marmot_client_new_with_configuration` takes a `MarmotClientOptions` struct combining relay policy, cursor
-persistence, client label, secret store and attachment acquisition mode; NULL options or zero initialization selects
+persistence, client label, secret store, attachment acquisition mode and device platform; NULL options or zero initialization selects
 the same defaults as the Swift/Kotlin `MarmotOptions` (see the
 [shared contract](../marmot-uniffi/README.md#runtime-options-and-client-label)). Use the matching header and library
 for that struct's layout. `marmot_client_new_with_client_name` is the older label-only constructor.
@@ -449,7 +449,14 @@ cargo run --release -p marmot-c --example nip46_smoke
 `slot_id_hex` handle, `is_this_device`, `label`, `client` and `platform` (empty until set), `linked_at`, a
 `linked_by_slot_id_hex` that is NULL for the founder, a `MarmotLinkedDeviceStatus` and three setting flags. The list
 is empty until this device trusts a device group, and in every release build until the roster's spec lands. Re-read
-it on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`. See the [shared contract](../marmot-uniffi/README.md#linked-devices).
+it on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`. `marmot_rename_linked_device` blocks on the account worker and renames one
+device by its `slot_id_hex` with one roster commit; an empty label clears it. See the
+[shared contract](../marmot-uniffi/README.md#linked-devices).
+
+`marmot_key_package_refresh_overdue` blocks on the account worker, reads local state only, and writes whether this
+device's device group has held its KeyPackage refresh back for a week. Re-read it on
+`MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED`. See the
+[shared contract](../marmot-uniffi/README.md#overdue-keypackage-refresh).
 
 ## History may be incomplete notices
 

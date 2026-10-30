@@ -1550,6 +1550,13 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// Whether this device's KeyPackage refresh is overdue may have changed:
+    /// re-read `key_package_refresh_overdue`. Also fires once each time the
+    /// account's worker opens or reconnects, and may fire with no change.
+    KeyPackageRefreshOverdueChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
 }
 
 impl MarmotAppRuntime {
@@ -2473,6 +2480,40 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<Vec<crate::LinkedDevice>, AppError> {
         self.accounts.linked_devices(account_ref).await
+    }
+
+    /// Whether this device's KeyPackage refresh is overdue because its device
+    /// group can't take the announcement that must come first. While it is,
+    /// the device keeps its old KeyPackage in its slot, and after 30 days
+    /// inviters stop treating it as fresh, so a host warns the user. True
+    /// once its publication is a week old with the refresh still held back;
+    /// a routine refresh never shows.
+    /// Always false until this device trusts a device group, and in release
+    /// builds until the device group's spec lands. Refresh on
+    /// `KeyPackageRefreshOverdueChanged`.
+    pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
+        self.accounts.key_package_refresh_overdue(account_ref).await
+    }
+
+    /// Rename one of this account's devices, this one included, by its
+    /// `slot_id_hex` from `linked_devices`: one roster commit in the device
+    /// group. Any device may rename any device. The label is at most 64
+    /// bytes of UTF-8; empty clears it. Refused with
+    /// `DeviceGroupRefused`: `roster_unsupported` (release builds),
+    /// `label_too_long`, `no_device_group`, `unknown_device`,
+    /// `roster_unavailable`, or `device_group_busy` while the device group
+    /// has an earlier change in flight (retry later). A rename whose commit
+    /// loses a fork to one that also changes that device's entry is not made
+    /// again; refresh on `LinkedDevicesChanged`.
+    pub async fn rename_linked_device(
+        &self,
+        account_ref: &str,
+        slot_id_hex: String,
+        label: String,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .rename_linked_device(account_ref, slot_id_hex, label)
+            .await
     }
 
     /// Record that the user accepts the risk of changing a group that is still

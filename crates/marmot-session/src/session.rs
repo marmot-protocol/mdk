@@ -15,14 +15,17 @@ pub use cgka_engine::account_identity_proof::{
 };
 pub use cgka_engine::application_message_len;
 pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
-pub use cgka_engine::engine::WelcomeDeliveryIndex;
+pub(crate) use cgka_engine::engine::{OutboundWelcomeStatus, OutboundWelcomeWork};
+pub use cgka_engine::engine::{WelcomeDeliveryIndex, WelcomeWithdrawal};
 pub use cgka_engine::feature_registry::FeatureRegistry;
 pub use cgka_engine::group_authority::{CanonicalGroupMembership, GroupAuthoritySnapshot};
 pub use cgka_engine::key_package::{
     KeyPackageRequirements, durably_owned_key_packages, key_package_metadata,
 };
 use cgka_engine::{Engine, EngineBuilder};
-use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
+use cgka_traits::app_components::{
+    AppComponentId, AppComponentSet, DeviceRosterV1, DeviceTagClaim, default_group_components,
+};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage,
     SendIntent, SendResult, SupersededIntentReport,
@@ -37,7 +40,7 @@ use cgka_traits::maintenance::{
     WallClock,
 };
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{MaintenanceStorage, StorageError};
+use cgka_traits::storage::{DeviceGroupWelcomeExpectation, MaintenanceStorage, StorageError};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::{
@@ -810,6 +813,32 @@ impl AccountDeviceSession {
         Ok(self.engine.outstanding_sent_welcomes()?)
     }
 
+    /// See `Engine::outbound_welcome_work`.
+    pub(crate) fn outbound_welcome_work(&self) -> SessionResult<OutboundWelcomeWork> {
+        Ok(self.engine.outbound_welcome_work()?)
+    }
+
+    /// See `Engine::outbound_welcome_work_in`.
+    pub(crate) fn outbound_welcome_work_in(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Option<OutboundWelcomeWork>> {
+        Ok(self.engine.outbound_welcome_work_in(group_id)?)
+    }
+
+    /// See `Engine::outbound_welcome_status`.
+    pub(crate) fn outbound_welcome_status(
+        &self,
+        id: &MessageId,
+    ) -> SessionResult<OutboundWelcomeStatus> {
+        Ok(self.engine.outbound_welcome_status(id)?)
+    }
+
+    /// See `Engine::sent_welcome_awaits_commit`.
+    pub fn sent_welcome_awaits_commit(&self, id: &MessageId) -> SessionResult<bool> {
+        Ok(self.engine.sent_welcome_awaits_commit(id)?)
+    }
+
     /// IDs of delivery-aware outbound Welcomes, including completed ones.
     pub fn tracked_outbound_welcome_ids(&self) -> SessionResult<Vec<MessageId>> {
         Ok(self.engine.tracked_outbound_welcome_ids()?)
@@ -824,6 +853,16 @@ impl AccountDeviceSession {
     /// transport reports the required acknowledgements.
     pub fn mark_sent_welcome_delivered(&self, id: &MessageId) -> SessionResult<()> {
         Ok(self.engine.mark_sent_welcome_delivered(id)?)
+    }
+
+    /// See `Engine::withdraw_sent_welcome`.
+    pub fn withdraw_sent_welcome(&self, id: &MessageId) -> SessionResult<WelcomeWithdrawal> {
+        Ok(self.engine.withdraw_sent_welcome(id)?)
+    }
+
+    /// See `Engine::sent_welcome_withdrawn`.
+    pub fn sent_welcome_withdrawn(&self, id: &MessageId) -> SessionResult<bool> {
+        Ok(self.engine.sent_welcome_withdrawn(id)?)
     }
 
     /// Stored groups that failed session-open hydration and were skipped
@@ -910,6 +949,24 @@ impl AccountDeviceSession {
 
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> SessionResult<Vec<[u8; 32]>> {
         Ok(self.engine.admin_pubkeys(group_id)?)
+    }
+
+    /// See [`cgka_engine::engine::Engine::set_device_tag_group`].
+    pub fn set_device_tag_group(&mut self, group_id: Option<GroupId>) -> SessionResult<()> {
+        Ok(self.engine.set_device_tag_group(group_id)?)
+    }
+
+    /// See [`cgka_engine::engine::Engine::member_device_tag_claim`].
+    pub fn member_device_tag_claim(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> SessionResult<Option<DeviceTagClaim>> {
+        Ok(self
+            .engine
+            .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
     }
 
     pub fn app_component(
@@ -1255,6 +1312,16 @@ impl AccountDeviceSession {
         Ok(self.engine.has_pending_convergence_inputs(group_id)?)
     }
 
+    /// See `Engine::convergence_pass_parked` (mdk#2684).
+    pub fn convergence_pass_parked(&self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.engine.convergence_pass_parked(group_id)?)
+    }
+
+    /// See `Engine::retry_failed_convergence_pass` (mdk#2684).
+    pub fn retry_failed_convergence_pass(&mut self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.engine.retry_failed_convergence_pass(group_id)?)
+    }
+
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> SessionResult<bool> {
         Ok(self.engine.has_queued_outbound_intents(group_id)?)
     }
@@ -1583,6 +1650,27 @@ impl AccountDeviceSession {
         self.engine.self_id()
     }
 
+    /// This device's MLS signature key (`CgkaEngine::own_signature_key`).
+    pub fn own_signature_key(&self) -> Vec<u8> {
+        self.engine.own_signature_key()
+    }
+
+    /// See `CgkaEngine::expect_device_group_welcome`.
+    pub fn expect_device_group_welcome(
+        &mut self,
+        expectation: &DeviceGroupWelcomeExpectation,
+    ) -> Result<(), EngineError> {
+        self.engine.expect_device_group_welcome(expectation)
+    }
+
+    /// See `CgkaEngine::withdraw_device_group_welcome`.
+    pub fn withdraw_device_group_welcome(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        self.engine.withdraw_device_group_welcome(group_id)
+    }
+
     #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub fn set_convergence_policy(
         &mut self,
@@ -1714,6 +1802,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::Leave { .. } => "leave",
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
+        SendIntent::ReplaceDeviceEntry { .. } => "replace_device_entry",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",

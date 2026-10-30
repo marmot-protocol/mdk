@@ -25,9 +25,9 @@ use nostr_sdk::prelude::{
 use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::NostrSdkRelayClient;
 use transport_nostr_adapter::sweep::{
-    CoveredSlice, RelayCaps, SdkSweepRelay, SliceProof, SweepCursor, SweepCursorStore, SweepEnd,
-    SweepPolicy, SweepRange, SweepRequest, SweepRoute, SweepSink, SweepSinkError, SweepStoreError,
-    run_sweep,
+    CoveredSlice, RelayCaps, SdkSweepRelay, SliceProof, SliceQuery, SliceReply, SweepCursor,
+    SweepCursorStore, SweepEnd, SweepPolicy, SweepRange, SweepRelay, SweepRequest, SweepRoute,
+    SweepSink, SweepSinkError, SweepStoreError, run_sweep,
 };
 
 const GROUP: [u8; 32] = [3; 32];
@@ -323,6 +323,51 @@ async fn saturated_second_over_a_default_page_and_byte_budget() {
         && slice.proof == SliceProof::Negentropy
         && slice.events == 5_200));
     assert_once_in_order(&sink, &wanted);
+}
+
+/// A reply the byte budget cuts short keeps no events, but the relay sent
+/// them: the relay reports every byte it read, so a caller's byte budget sees
+/// what the cut discarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cut_reply_still_reports_the_bytes_it_read() {
+    let fixture = Fixture::new().await;
+    let keys = Keys::generate();
+    let events = (0..50)
+        .map(|n| group_event(&keys, GROUP, T0 + n as u64, n))
+        .collect::<Vec<_>>();
+    fixture.store(&events).await;
+    let one = events[0].as_json().len();
+    let relay = fixture.relay().with_reply_max_bytes(4 * one);
+    let query = SliceQuery {
+        route: SweepRoute::Group {
+            nostr_group_id: GROUP,
+        },
+        since: T0,
+        until: T0 + DAY - 1,
+        limit: Some(500),
+    };
+
+    let reply = relay.fetch_slice(query).await;
+    assert!(
+        matches!(&reply, SliceReply::Answered { events, more: true, .. } if events.is_empty()),
+        "{reply:?}"
+    );
+    let read = relay.take_fetched_bytes();
+    assert!(
+        read > 4 * one as u64,
+        "the over-budget event counts too: {read}"
+    );
+    assert_eq!(relay.take_fetched_bytes(), 0, "taking the count resets it");
+
+    // A reply that fits reports what it kept.
+    let relay = fixture.relay();
+    let reply = relay.fetch_slice(query).await;
+    let SliceReply::Answered { events: kept, .. } = reply else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(kept.len(), events.len());
+    let kept_bytes: u64 = kept.iter().map(|event| event.as_json().len() as u64).sum();
+    assert_eq!(relay.take_fetched_bytes(), kept_bytes);
 }
 
 /// A wok-like NIP-11 document with a 50-event cap.

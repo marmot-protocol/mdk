@@ -358,6 +358,12 @@ pub struct AppGroupMlsState {
     pub member_count: usize,
     #[serde(default)]
     pub unrecoverable: bool,
+    /// Convergence stopped retrying a batch that kept failing (mdk#2684).
+    /// The group waits for new input from another member or an explicit
+    /// `retry_group_convergence`; sends stay queued meanwhile. Unlike
+    /// `unrecoverable`, nothing is lost and a retry can clear it.
+    #[serde(default)]
+    pub convergence_parked: bool,
     pub required_app_components: Vec<u16>,
     pub disbanding_enabled: bool,
     /// True while all ordinary outbound group work, including application
@@ -2407,6 +2413,7 @@ pub(crate) fn event_group_id(event: &GroupEvent) -> Option<&GroupId> {
     match event {
         GroupEvent::LocalGroupCopyTerminated { group_id, .. }
         | GroupEvent::LocalGroupCopyRestored { group_id }
+        | GroupEvent::QueuedIntentRefused { group_id, .. }
         | GroupEvent::GroupMemberLeavesRemoved { group_id, .. }
         | GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }
@@ -3104,6 +3111,7 @@ mod group_roster_api_tests {
             epoch: 7,
             member_count: 1,
             unrecoverable: false,
+            convergence_parked: false,
             required_app_components: Vec::new(),
             disbanding_enabled: false,
             disbanding: false,

@@ -160,7 +160,11 @@ impl<S: StorageProvider> Engine<S> {
                 }),
         )?;
         let roster_required = crate::app_components::group_requires_device_roster(&mls_group)?;
-        let mut commit_builder = mls_group.commit_builder();
+        let leaf_node_parameters =
+            self.own_commit_leaf_parameters(&mls_group, &app_component_updates)?;
+        let mut commit_builder = mls_group
+            .commit_builder()
+            .leaf_node_parameters(leaf_node_parameters);
         if let Some(new_extensions) = new_extensions {
             commit_builder = commit_builder
                 .propose_group_context_extensions(new_extensions)

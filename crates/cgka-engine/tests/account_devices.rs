@@ -97,6 +97,16 @@ mod device_roster;
 #[path = "account_devices/link_device.rs"]
 mod link_device;
 
+// A device group joins only through the Welcome its link expects
+// (mdk#2628 D28, D30).
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/device_group_welcome.rs"]
+mod device_group_welcome;
+
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/device_tag.rs"]
+mod device_tag;
+
 const ACCOUNT_DEVICES: Feature = Feature("account-devices");
 
 fn pad32(name: &[u8]) -> Vec<u8> {

@@ -24,6 +24,7 @@ mod avatar_url;
 mod blossom_image;
 mod codec;
 mod device_roster;
+mod device_tag;
 mod encrypted_media;
 mod encrypted_media_v2;
 mod host_safety;
@@ -47,12 +48,17 @@ pub use codec::{
     encode_quic_varint,
 };
 pub use device_roster::{
-    AccountEntryV1, DEVICE_ROSTER_KEY_PACKAGE_REF_MAX_LEN, DEVICE_ROSTER_LEAF_MAP_VALUE_MAX_LEN,
-    DEVICE_ROSTER_RESERVED_KEY_MAX_LEN, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
+    AccountEntryV1, DEVICE_ROSTER_KEY_PACKAGE_REF_MAX_LEN, DEVICE_ROSTER_RESERVED_KEY_MAX_LEN,
+    DEVICE_ROSTER_TAG_SIGNATURE_KEY_MAX_LEN, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
     DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1, DeviceSettingsV1, DeviceSlotId,
-    DeviceStatusV1, LeafMapKeyV1, RejectedKeyPackageV1, RejectedSlotReasonV1, RejectedSlotV1,
+    DeviceStatusV1, RejectedKeyPackageV1, RejectedSlotReasonV1, RejectedSlotV1,
     apply_device_roster_update_v1, decode_device_roster_update_v1, decode_device_roster_v1,
     encode_device_roster_update_v1, encode_device_roster_v1,
+};
+pub use device_tag::{
+    DEVICE_TAG_NONCE_LEN, DEVICE_TAG_VECTOR_MAX_LEN, DeviceTagClaim, DeviceTagContentV1,
+    DeviceTagV1, decode_device_tag_content_v1, decode_device_tag_v1, encode_device_tag_content_v1,
+    encode_device_tag_signed_content_v1, encode_device_tag_v1,
 };
 pub use encrypted_media::{
     BlobStoreEndpointV1, EncryptedMediaPolicyV1, decode_encrypted_media_policy_v1,
@@ -136,9 +142,16 @@ pub const MAX_LEAVES_PER_ACCOUNT: usize = 20;
 /// its spec lands, so the engine advertises it only in test-policy builds.
 pub const DEVICE_ROSTER_COMPONENT_ID: AppComponentId = 0x800e;
 
+/// `marmot.member.device-tag.v1`: a LeafNode entry that says which of the
+/// account's linked devices holds the leaf (mdk#2628 D32). It is sealed under
+/// the device roster's `leaf_tag_key`, so only the account's devices can read
+/// it. No group may require it, and an entry under its id anywhere but a
+/// LeafNode is unknown data.
+pub const DEVICE_TAG_COMPONENT_ID: AppComponentId = 0x800f;
+
 /// First component id applications may allocate for themselves.
 ///
-/// The protocol registry allocates upward from `0x8001` and is at `0x800e`
+/// The protocol registry allocates upward from `0x8001` and is at `0x800f`
 /// today, so "any private-use id the registry has not taken yet" is not a
 /// safe rule for applications: an id chosen that way can be assigned by a
 /// later registry entry, stranding state already committed in live groups.
@@ -180,6 +193,7 @@ pub const PROTOCOL_OWNED_APP_COMPONENT_IDS: &[AppComponentId] = &[
     GROUP_LIFECYCLE_COMPONENT_ID,
     ACCOUNT_DEVICES_COMPONENT_ID,
     DEVICE_ROSTER_COMPONENT_ID,
+    DEVICE_TAG_COMPONENT_ID,
 ];
 
 /// Lookup key for the encrypted-media secret in the

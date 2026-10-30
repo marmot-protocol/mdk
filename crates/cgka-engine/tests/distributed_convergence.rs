@@ -54,6 +54,8 @@ mod encrypted_media_source_secret;
 mod historical_application_sender;
 #[path = "distributed_convergence/phantom_own_commit_branch.rs"]
 mod phantom_own_commit_branch;
+#[path = "distributed_convergence/refused_queued_intents.rs"]
+mod refused_queued_intents;
 mod support;
 use support::proof_signer;
 
@@ -3780,14 +3782,20 @@ async fn admin_attempt_failure_consumes_reservation_and_inbound_proceeds() {
         .unwrap()
         .expect("pass survives the failed attempt");
     assert!(!consumed.fairness_slot_available);
-    assert_eq!(
+    // The settled state refuses the invite, so its attempt also retires it
+    // (mdk#2694): no later drain fails on it.
+    assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)
             .unwrap()
-            .len(),
-        1,
-        "the durable intent stays queued after its failed attempt"
+            .is_empty(),
+        "the refused intent is retired by its failed attempt"
     );
+    assert!(carol.drain_events().iter().any(|event| matches!(
+        event,
+        GroupEvent::QueuedIntentRefused { intent_kind, reason, .. }
+            if intent_kind == "invite" && reason == "serialize"
+    )));
 
     let syncing = carol
         .converge_stored_openmls_messages_at(&group_id, 1_100_000)
@@ -9911,8 +9919,11 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
     );
 }
 
+/// An intent the settled state refuses is retired and announced instead of
+/// failing the drain; storage failures keep it queued
+/// (`record_write_atomicity.rs::a_queued_intent_held_by_a_storage_failure_stays_queued`).
 #[tokio::test]
-async fn advance_convergence_retains_queued_intent_when_regeneration_fails() {
+async fn advance_convergence_retires_a_queued_intent_the_settled_state_refuses() {
     let (mut alice, alice_storage) = build_client(b"alice");
 
     let (group_id, create) = alice
@@ -9947,16 +9958,33 @@ async fn advance_convergence_retains_queued_intent_when_regeneration_fails() {
         })
         .unwrap();
 
-    let err = alice.advance_convergence(&group_id).await.err().unwrap();
+    let drained = alice
+        .advance_convergence(&group_id)
+        .await
+        .expect("a refused queued intent does not fail the drain");
+    assert!(drained.is_empty());
     assert!(
-        matches!(err, cgka_traits::EngineError::Other(ref msg) if msg.contains("no fields")),
-        "expected validation error from queued intent regeneration, got {err:?}"
+        alice_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
     );
-    let queued = alice_storage
-        .list_queued_outbound_intents(&group_id)
-        .unwrap();
-    assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].id, intent_id);
+    assert_eq!(
+        alice
+            .drain_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                GroupEvent::QueuedIntentRefused {
+                    intent_id,
+                    intent_kind,
+                    reason,
+                    ..
+                } => Some((intent_id, intent_kind, reason)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![(intent_id, "update_group_data".into(), "other".into())]
+    );
 }
 
 #[tokio::test]

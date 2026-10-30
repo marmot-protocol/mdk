@@ -59,16 +59,24 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `suppress_local_deleted_group_event` (both event loops), `refresh_group`, `reconcile_live_engine_groups` and
   `refresh_routing`. Every host surface built from engine or recovery state rather than the projection filters with
   `host_may_see_group`, which fails closed: quarantine, history notices and their changes, epoch-stall escalations,
-  deferred events, recovery-status and superseded-change updates, and Welcome redelivery. A new such surface filters
-  too. Trust is separate from hiding. Act on a device group's roster only once `device_groups` says
-  `created` or `linked`; a Welcome into a group no confirmed link named stays `untrusted`. Decide from the engine's
-  durable group record (`stored_group`), never the live group a deferred open has not hydrated, and settle trust in
-  one place (`settle_held_device_group`: the live join, the restart reconcile and a later link); a group that takes a
-  link's id without requiring the roster drops the link's row and projects as any other. A routing rebuild skips a
-  device group a deferred open has not hydrated; the post-hydration reconcile installs its route. The founding Add
-  takes the account's own device only through the confirmed `KeyPackageRef`. Creation and links are reachable only
-  through the `test-policy-overrides` hooks (`dev_create_device_group`, `dev_record_confirmed_device_link`), with
-  `MarmotAppConfig::dev_device_groups` set, until pairing reaches the app.
+  deferred events, recovery-status and superseded-change updates, convergence park notices, and Welcome redelivery. A
+  new such surface filters too. Trust is separate from hiding. Act on a device group's roster only once `device_groups`
+  says `created` or `linked`. Never judge a joined Welcome: the engine decides which Welcome joins, before the join
+  (mdk#2628 D28, D30). `record_confirmed_device_link` refuses a group this device already holds, writes the
+  `awaiting_welcome` row, then records the engine's `DeviceGroupWelcomeExpectation` (group, the existing device's leaf
+  signature key, `WELCOME_WAIT_SECS`), deleting the row if that fails. Withdrawing a link and ending a wait
+  (`withdraw_confirmed_device_link`, `end_welcome_waits` on every record and reconcile) delete the expectation before
+  the row, so once either returns no Welcome under the link joins. A row a crash or failure leaves without its
+  expectation admits nothing, and `end_welcome_waits` drops it at once rather than at the wait's end. Decide
+  from the engine's durable group record (`stored_group`), never the live group a deferred open has not hydrated, and
+  settle trust in one place (`settle_held_device_group`: the live join and the restart reconcile). A held device group
+  with an `awaiting_welcome` row joined in time, whatever the row's age. A held device group with no row stays
+  `untrusted`, and a group under a row that does not require the roster drops the row; neither arises through the
+  engine. A routing rebuild skips a device group a deferred open has not hydrated; the post-hydration reconcile
+  installs its route. The founding Add takes the account's own device only through the confirmed `KeyPackageRef`.
+  Creation and links are reachable only through the `test-policy-overrides` hooks (`dev_create_device_group`,
+  `dev_record_confirmed_device_link`, `dev_withdraw_confirmed_device_link`), with `MarmotAppConfig::dev_device_groups`
+  set, until pairing reaches the app.
 - Read the device roster only through `trusted_device_roster` (the trusted group's decoded roster, or none). Hosts see
   it only as `linked_devices`, this account's own devices; its errors never name the group. The device group's events
   stay hidden, so every hidden device-group event and every change of trust sets `linked_devices_changed`, which the
@@ -76,6 +84,43 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   opens with it set: a client dropped before a drain (a reconnect attempt whose transport fails) takes its change with
   it, and its replacement cannot see that change. Startup and reconnect settle trust with no command after them, so a
   new seam that settles trust must reach one of those two.
+- Name the device group to tag from (mdk#2628 3.1d) with `sync_device_tag_group`, which picks the same group the
+  announcement does. Naming hydrates it, so never name it at a deferred open's end: the post-hydration reconcile
+  does, as do settling a join, creating a group, maintenance and every KeyPackage publication. Name it before reading
+  whether the current KeyPackage still serves (`key_package_republish_falls_back`), since an untagged one is stale once
+  this device tags. The founder's founding entry carries its own tag signature key; every other device sets its own
+  in maintenance or, before a host KeyPackage publication, through `set_device_tag_key`, once per call, since the
+  runtime stages no KeyPackage while the key is due.
+- The overdue-refresh warning (`key_package_refresh_overdue`) asks the runtime's announcement gate, never a copy of
+  the roster. The client recomputes it after each maintenance pass; a change sets
+  `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
+  `KeyPackageRefreshOverdueChanged`. It opens set, for the same reason as `linked_devices_changed`.
+- Write a device entry of the roster only through the runtime's `edit_device_roster_entry` (renaming, announcements).
+  It refuses while the device group has anything of this device's in flight; surface that as `device_group_busy`.
+  The engine stages a `ReplaceDeviceEntry` only while the entry is still the one the edit read, so a whole-entry
+  replacement never undoes a change that lands in between. A rename (`client/device_renames.rs`) whose commit loses a
+  fork to one that also changes that device's entry is not made again; the engine re-issues it only when the winner
+  left that entry alone. Rejected slots (3.2's sign-in rejections, below) are written by `commit_device_roster_update`
+  instead, never as device entries.
+- New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
+  inviter's rules; a live KeyPackage from the directory subscription only brings a check forward (`SignInNudges`). The
+  first check's baseline, every slot id its read returned whether or not it counted, never a publication time,
+  separates devices that were here first from new sign-ins. Only a complete read changes whether a listed sign-in is
+  still signed in, and a slot holding a valid publication that is merely stale (`current_slots`) stays signed in. A
+  read of the configured directory relays, when the account lists none, is never complete. Rejections are recorded
+  locally first, then committed to the trusted roster only while the device group is quiet
+  (`device_group_quiet`); a device with no device group keeps them until `create_device_group` founds the roster with
+  them or it trusts a group it joined. A rejection is committed only while the roster has no entry for the slot, and
+  never replaces one; a slot the roster holds as a device ends it, since the user confirmed that link. A rejection stays
+  pending until the roster shows it. A sign-in this device dismissed is listed again once the roster has no entry for
+  its slot. Every device-group event and every superseded roster update rechecks every rejection
+  (`recheck_sign_in_rejections`): it ends at once a rejection of a slot the roster now holds as a device, so a link
+  that branch selection drops before the next pass asks again rather than restoring `not_me`, and re-arms the rest. A
+  rejection settled from another device's commit is lost when that commit loses convergence, and only a device that
+  made the rejection restores it. A slot is its `d` as published, compared as bytes;
+  one the roster cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a
+  rejected KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's
+  included, into a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7).
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.
@@ -188,12 +233,54 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   un-cover mark when it is selected (`AttemptGrant::coverage_mark`); its certificates are recorded through
   `record_recovery_coverage_since`, which leaves out whatever was un-covered after that. Its writes are best effort
   and nothing schedules, retries or fences on the ledger; do not read it from recovery decisions until phase 4
-  replaces the obligations. It records no live boundary while a loss obligation is pending, and storage keeps a
-  released receipt's second out of every live boundary; only a fetch proof covers it, on its own relay. `coverage_shadow_report`
-  is the test-visible comparison with pending obligations; a scope holds proof only as completion would count it (its
-  predicate at the current loss, route, inventory and obligation revisions), and a scope whose floor is unknown or
-  older than the retained window is owed from the retention floor. It logs aggregate counts only. Known disagreements
+  replaces the obligations. A live boundary proves only what its relay's count does, once per generation: from the
+  second after the oldest event counted (never before the REQ's `since`) through the second before the count's
+  `requested_at`. An empty count proves nothing, and no NIP-11 limit is read: the relay pool drops some frames
+  uncounted, so a count cannot show a reply was not cut, and relays are assumed to cut newest first. Read the
+  un-cover mark before each look at the adapter and write through `record_recovery_coverage_since`; a generation that
+  loss imported since the last look may have reached never proves again (`LiveCoverage`), and the log is read again
+  after the look so loss imported during it gives no tail; the adapter is looked at again after the write, and a
+  generation it no longer reports streaming with the same count gives none either. Past the request an open,
+  healthy REQ vouches only provisionally: `LiveTails`, held in memory and never written to the ledger, because nothing
+  proves when an open REQ stopped delivering. A tail starts at the count's `live_from`, which for a REQ the relay pool
+  sent again is its EOSE, never the request stamp, and stands only while the adapter reports the count streaming
+  (`ReplayEndpointView::streaming`: the relay client still names the connection its serial started on); a count
+  that is not streaming is recorded as ended. A tail can outlive its REQ by the time the adapter takes to process
+  notifications already queued for that relay, an accepted limit: a forwarder that falls behind records loss, which
+  breaks it, and a tail never reaches the ledger. Read tails at every debt read; they lapse without an event. Debt that drives work reads the ledger only up to
+  `LiveTails::owed_until`, refreshed by `AppClient::live_tails`; without it an idle connected account owes its own
+  live frames. Storage keeps a released receipt's second out of every live boundary, and a tail starts past the
+  newest one on its route; only a fetch proof covers it, on its own relay. Live-boundary tests live in
+  `recovery_coverage/live_boundary_tests.rs`. `coverage_shadow_report`
+  is the test-visible comparison with pending obligations; a scope holds proof only as completion would count it once
+  loss invalidates by route (its predicate at the current route, inventory and obligation revisions; newer loss voids
+  it only where storage's `recovery_loss_reach_after` says loss imported after the scope's loss revision, retired or
+  not, reached its route inside its window; a scope that would hold but whose newer loss was since acknowledged is not
+  comparable, because acknowledgment deletes where it reached). A loss obligation's scope on a route its own loss
+  (`recovery_loss_reach`) never reached there is not comparable, and loss goals are restored only on reached routes,
+  from their reach. A scope whose floor is unknown or older than the
+  retained window is owed from the retention floor. Before it prunes, it passes the current routes and
+  their required relays, so what they still owe below the floor is parked as each route's remainder; the prune settles
+  every route there, so restoring a pending loss's goal below it each report parks nothing twice. Standing goals
+  (startup history, epoch gaps) start at `standing_floor`: a group copy's Welcome time less the allowance, never below
+  the window. That time is only a hint: never use it to retire, un-cover or drop debt. It logs aggregate counts only.
+  Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
+- Keep the recovery runner in `src/client/recovery_runner.rs` and its `select`, `quantum`, `compare`, `recheck`,
+  `policy` and `tails` modules (mdk#2660 phase 4). It is built but not started: nothing outside its tests constructs,
+  wakes or reads it until the switch-over replaces the comparison owner, so do not wire it from `account_worker.rs` or
+  a host surface in passing. Every ledger and retry-state write happens in a worker turn; the credit wait, caps read and sweep run
+  off the worker, and nothing read before the credit wait is planned on. Live tails are a query read fresh in each
+  turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
+  covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
+  reached right after a `rate-limited:` reply settles `RateLimited`. Every event byte a required relay sends is
+  charged to the account's rolling hour, cut and discarded replies included; best-effort relays are never charged.
+  The one uncharged reply is the one in flight when a quantum is cut (mdk#2719). Logs carry aggregates only.
+  A comparison or re-check quantum settles through the same table: its end maps to a sweep end (`compare::verdict`).
+  A re-check settles the relay and the account budget but never its unit's retry state, records pass progress only
+  under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it
+  runs only when no debt unit is eligible, on required relays whose recorded caps show NIP-77. Storage makes a relay's
+  re-checks due in the same write that ends a cooldown longer than an hour; do not split that into a second write.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown
@@ -332,7 +419,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   fence while any loss obligation is pending, clears the plane only against the exact observed generation, and
   never counts a recovery success. Notice ids are opaque and must not be logged.
 - Keep an account's delivery route open when its relay notification consumer lags: charge the lag as notification
-  loss with the REQ floor its SDK context reported at the lag, and enqueue the generation's control record. Only an
+  loss with the REQ floors its SDK context reported at the lag (per route when known; record them through
+  `record_account_recovery_loss_routed`), and enqueue the generation's control record. Only an
   unexpected consumer exit closes the route and sends the worker through reconnect (mdk#2070). The worker persists
   notification loss before waiting for its control record.
 - AccountRecoveryOwner owns the SubscriptionReplay goal, original unresolved windows, retry and completion.
@@ -480,7 +568,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
   (runtime-only network approval; never restore it from disk).
 - `src/client/`: `recovery.rs` (recovery grant authorization), `recovery_coverage.rs` (the shadow coverage-ledger
-  recorder and its comparison with pending obligations, mdk#2660), `invite_recovery.rs` (durable invitation recovery),
+  recorder and its comparison with pending obligations, mdk#2660), `recovery_runner.rs` (the per-account recovery
+  runner, not started yet, mdk#2660), `invite_recovery.rs` (durable invitation recovery),
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
   job).

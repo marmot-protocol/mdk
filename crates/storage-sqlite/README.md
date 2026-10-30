@@ -260,7 +260,12 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   those routes, each from its own bound, and widens their goals; any other generation un-covers every route the ledger
   holds from its floor upward (all of it when a floor is unknown) and widens their goals to it. Imports stay
   count-driven, since the relay plane gives an adopted marker's new drops a fresh token, and a worker observation past
-  the durable count makes its generation account-wide.
+  the durable count makes its generation account-wide. Each import stamps every generation it charges with the loss
+  revision its join left (`import_revision`, migration 0132). `recovery_loss_reach` reads where one cause's unresolved loss
+  may have lost events, by route, and `recovery_loss_reach_after` reads the same for loss imported after a loss
+  revision: what a checkpoint captured at that revision has not seen. Acknowledgment deletes the generations it
+  reclaims and keeps the highest stamp it deleted (`acknowledged_import_revision`), so below it the read answers
+  `None`: where that loss reached is no longer known.
   `uncover_recovery_coverage` does the same for the given routes only. A released receipt (`cross/release.rs`) un-covers its event's second on each route its inventory row
   placed it on. Live boundaries never cover that second again, since the REQ that delivered the event will not
   deliver it again; only a fetch proof (comparison, sweep slice, re-check) covers it, on its own relay, and the hold
@@ -270,7 +275,12 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   generation before a fetch, and `record_recovery_coverage_since` subtracts from its slices every range un-covered
   on their routes after the mark, or records nothing once the log (an hour, at most 4,096 rows) no longer reaches
   back to it. `prune_recovery_coverage` drops coverage below the retention floor, raises goals to it and ages the log;
-  pruning is not an un-cover. The ledger is in shadow mode: no obligation, retry, fence or schedule reads it.
+  pruning is not an un-cover. First, what each route the caller passes still owes below the floor on any of its
+  certifying relays joins the route's parked remainder (migration 0130): one range per route under a park revision,
+  never coverage, cleared only by dismissal. The prune then marks every route settled below its floor, and a later
+  prune parks only from that mark up, so a goal widened back below it parks nothing twice; loss lowers the mark to its
+  floor. A released receipt below the window changes nothing in the ledger (its coverage stays until the prune), so only loss parks debt from below it. The ledger is in
+  shadow mode: no obligation, retry, fence or schedule reads it.
 - **Retry state and staging (`recovery_units.rs`, `recovery_staging.rs`, migration 0127, mdk#2660).** One row per
   `(route, relay)` unit holds the recovery runner's retry state: active, broken (no progress or refused, with a park
   revision and one probe a newer loss can earn) or retired, plus backoff, fencing, slicing, planned relay caps and
@@ -279,8 +289,10 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   outcome in one transaction with policy values the caller passes; a unit's debt is the route goal minus that relay's
   coverage, its retired spans and, unless it holds a probe, its parked spans. Parked and retired spans are never
   coverage. `stage_recovery_slice` writes a proven slice's unseen events and its coverage, through the subtracting
-  write, in one transaction, so a crash before settlement refetches nothing; staged rows leave once seen. Nothing
-  schedules on this state yet.
+  write, in one transaction, so a crash before settlement refetches nothing; staged rows leave once seen. A re-check
+  settles through `settle_recovery_recheck`, which charges its relay and the account budget but never touches the
+  unit's retry state, and records its pass's progress only under the revision it began on (migration 0134): every
+  request that makes the pass due, a long relay cooldown ending among them, bumps it in the same write. Nothing schedules on this state yet.
 
 ## Tests and benchmarks
 

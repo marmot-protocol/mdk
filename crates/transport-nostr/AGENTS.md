@@ -11,6 +11,9 @@ not depend on `marmot-app` or `storage-sqlite`. The app supplies storage and pol
 (`AccountDeliverySpillStore`, `AccountDeliveryRecoveryMarker`, `RelayExportGate`). A queue-loss marker carries each
 dropped delivery's route (`DeliveryRoute::of`, the same rule `marmot-app` keys reconciliation by) with the earliest
 `created_at` dropped there, or no routes once any drop had none or a generation passed `MAX_DELIVERY_LOSS_ROUTES`.
+`DeliveryRoute` and the cap live in the adapter, re-exported here, so a REQ's routes and a delivery's are one type.
+A lag on an account's own SDK context charges each route's REQ floor too; `notification_loss_routes` hands the
+generation's routes to the worker, or none once any of its losses had none (a shared receiver, staged replay).
 A generation that adopted a durable marker (a restart, or a failed acknowledgment) takes a fresh token at its first new
 drop: storage imports loss by count, so a token's count must cover every drop under it.
 

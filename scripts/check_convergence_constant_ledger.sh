@@ -11,7 +11,7 @@ inventory_path="docs/marmot-architecture/convergence-constant-inventory.txt"
 plan_path="docs/marmot-architecture/convergence-reliability-plan.md"
 # A10 includes #1946 qualified local observations; no new numeric policy or ledger id.
 # A15's quiet-period relay repair timer was replaced by the existing account owner.
-expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11 A12 A13 A14 A16 A17 A18)
+expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11 A12 A13 A14 A16 A17 A18 A19 A20)
 inventory_pairs=("__inventory_sentinel__")
 inventory_ids=()
 fail=0
@@ -122,6 +122,9 @@ discover_constants \
     "crates/cgka-engine/src/openmls_projection.rs" \
     "CANDIDATE_REPLAY_BUDGET_[A-Z0-9_]+"
 discover_constants \
+    "crates/cgka-engine/src/distributed_convergence.rs" \
+    "CONVERGENCE_PASS_[A-Z0-9_]+"
+discover_constants \
     "crates/marmot-app/src/runtime/account_worker.rs" \
     "(CONVERGENCE_[A-Z0-9_]+|MIN_CONVERGENCE_[A-Z0-9_]+|IDLE_CONVERGENCE_[A-Z0-9_]+)"
 discover_constants \
@@ -140,6 +143,10 @@ discover_constants \
     "crates/storage-sqlite/src/app/account_recovery/plan.rs" \
     "RECOVERY_PARK_AFTER_[A-Z0-9_]+"
 discover_constants "crates/marmot-app/src/client/epoch_stall.rs" "EPOCH_STALL_[A-Z0-9_]+"
+discover_constants \
+    "crates/marmot-app/src/client/recovery_runner/policy.rs" \
+    "RUNNER_[A-Z0-9_]+"
+discover_constants "crates/transport-nostr-adapter/src/compare/mod.rs" "COMPARE_[A-Z0-9_]+"
 discover_constants \
     "crates/marmot-app/src/lib.rs" \
     "(APP_RUNTIME_RELAY_REBUILD_LOOKBACK|TRANSPORT_CURSOR_MAX_FUTURE_SKEW|HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE)"

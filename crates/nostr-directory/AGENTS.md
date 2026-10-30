@@ -15,6 +15,8 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
   migrations.
 - **Ask for a cache when it is about to be used, never before a network step.** A handle taken before a fetch can
   outlive its account's eviction and keep writing to a closed account's cache.
+- **A live KeyPackage of an account only nudges.** The sync worker tells the host through
+  `DirectoryResources::account_key_package_published`; the host's new-sign-in check reads the relays itself.
 - **Block-list work runs where the worker runs it.** `BlockListSink` returns futures and starts nothing: the sync
   worker spawns adoptions into its bounded set and reconciles into one abort-on-drop task, never inline in its event
   loop, where an account's update lock would park it.
@@ -35,7 +37,7 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
 | `src/store.rs` | The directory store: entry reads, the `remember_*`/`save_directory_entry*` writes across the caches and the shared tier, relay-event ingest, the freshness bound and record hydration. |
 | `src/methods.rs` | Relay-list, profile, KeyPackage and follow-list fetches, refreshes, the cached identity page, synchronous user-directory search and the sync plan. |
 | `src/records.rs` | The public `UserDirectory*`/`UserProfileMetadata`/`DirectoryKeyPackage` DTOs and stateless record helpers: cached <-> shared conversion, recency selection, profile and follow-list parsing, search-match ranking, `profile_content_json`. |
-| `src/published_records.rs`, `src/ids.rs` | Stateless relay-list and KeyPackage handling for other accounts (status, tag validation, fresh-vs-cached reconciliation, per-account ranking and selection of up to 20 KeyPackages, deletion and revocation evidence), the record-selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`), and the Nostr account-id helpers. |
+| `src/published_records.rs`, `src/ids.rs` | Stateless relay-list and KeyPackage handling for other accounts (status, tag validation, fresh-vs-cached reconciliation, per-account ranking and selection of up to 20 KeyPackages, deletion and revocation evidence), the same per-slot validation over a local account's own slots for its new-sign-in check (`AccountKeyPackageSlots`: every valid fresh slot, with no cap and no signature-key collapse, and the id of every slot the read returned), the record-selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`), and the Nostr account-id helpers. |
 | `src/member_key_packages.rs`, `src/key_package_recovery.rs` | Whole-roster KeyPackage resolution for create, invite and prewarm, and bounded discovery recovery. |
 | `src/search.rs`, `src/cached_search.rs`, `src/open_ranking.rs` | Streaming web-of-trust search, network-free cached search, and the bounded Open Ranking client. |
 | `src/previews.rs` | Verified previews of `nostr:` references, stored in the directory cache (tests in `src/previews/tests.rs`). |

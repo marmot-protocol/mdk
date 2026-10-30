@@ -488,8 +488,8 @@ async fn abandoned_notification_lane_counts_queued_loss_for_only_its_account() {
         abandoned_notification_lane(Box::pin(futures::stream::empty()), &pending, &source);
     assert_eq!(outcome.exit, RelayNotificationConsumerExit::Lagged(3));
     assert_eq!(
-        outcome.lag_floor,
-        NostrNotificationLossFloor::Unbounded,
+        outcome.lag_bounds,
+        NostrNotificationLossBounds::account_wide(NostrNotificationLossFloor::Unbounded),
         "an account context with no REQ has no floor"
     );
     assert_eq!(alice_loss.borrow().as_ref().unwrap().cumulative_skipped, 3);
@@ -502,7 +502,7 @@ async fn abandoned_notification_lane_counts_queued_loss_for_only_its_account() {
     recover_relay_notification_forwarder_scoped(
         &plane.inner.transport,
         outcome.exit,
-        outcome.lag_floor,
+        outcome.lag_bounds,
         Some(&alice),
     );
     assert_eq!(
@@ -569,9 +569,9 @@ impl RelayNotificationSource for QueuedWorkerFailureSource {
         false
     }
 
-    fn record_loss(&self, skipped: u64) -> NostrNotificationLossFloor {
+    fn record_loss(&self, skipped: u64) -> NostrNotificationLossBounds {
         self.loss.record_notification_gap(skipped);
-        self.loss.notification_loss_floor()
+        self.loss.notification_loss_bounds()
     }
 
     fn receiver_replaced(&self) {
@@ -868,7 +868,7 @@ async fn notification_lag_keeps_account_delivery_open_and_bounds_the_loss() {
         recover_relay_notification_forwarder_scoped(
             transport,
             RelayNotificationConsumerExit::Lagged(skipped),
-            floor,
+            NostrNotificationLossBounds::account_wide(floor),
             Some(&account),
         )
     };
@@ -929,6 +929,81 @@ async fn notification_lag_keeps_account_delivery_open_and_bounds_the_loss() {
     );
     assert_eq!(health.unexpected_exits, 0);
     relay_plane.shutdown().await;
+}
+
+/// Each lag carries its SDK context's floor per route. The generation keeps
+/// the lowest floor per route across its lags, until a loss whose routes are
+/// unknown (a shared receiver, staged replay) makes it loss on every route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notification_lag_keeps_each_routes_lowest_floor_for_its_generation() {
+    use NostrNotificationLossFloor::{Since, Unbounded};
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let adapter = relay_plane.account_adapter(account.clone(), relay.clone());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 32]),
+                transport_group_id: vec![0xD4; 32],
+                endpoints: vec![endpoint],
+                retained_since: None,
+            }],
+            since: Some(Timestamp(1_000)),
+        })
+        .await
+        .unwrap();
+    let group = DeliveryRoute::Group([0xD4; 32]);
+    let lag = |routes: Option<&[(DeliveryRoute, u64)]>, floor| {
+        relay_plane.simulate_routed_notification_lag_for_test(
+            &account,
+            1,
+            NostrNotificationLossBounds {
+                floor,
+                routes: routes.map(|routes| routes.iter().copied().collect()),
+            },
+        );
+    };
+
+    lag(
+        Some(&[(DeliveryRoute::Inbox, 900), (group, 1_200)]),
+        Since(900),
+    );
+    lag(Some(&[(group, 1_100)]), Since(1_100));
+    let overflow = adapter.pending_delivery_overflow().unwrap();
+    assert_eq!(overflow.notification_floor, Some(900));
+    assert_eq!(
+        adapter.notification_loss_routes(&overflow),
+        Some(vec![(DeliveryRoute::Inbox, 900), (group, 1_100)])
+    );
+    // Another generation's routes say nothing about this one.
+    let earlier = AccountDeliveryOverflow {
+        generation: overflow.generation.wrapping_sub(1),
+        ..overflow
+    };
+    assert_eq!(adapter.notification_loss_routes(&earlier), None);
+
+    lag(None, Since(1_300));
+    assert_eq!(adapter.notification_loss_routes(&overflow), None);
+    lag(Some(&[(group, 1_000)]), Since(1_000));
+    assert_eq!(
+        adapter.notification_loss_routes(&overflow),
+        None,
+        "unknown routes stay unknown for the generation"
+    );
+
+    // An unbounded lag reaches every route from the start.
+    lag(None, Unbounded);
+    assert_eq!(
+        adapter
+            .pending_delivery_overflow()
+            .unwrap()
+            .notification_floor,
+        None
+    );
 }
 
 /// The worker drops its client, and with it the account queue, before it
@@ -1851,8 +1926,8 @@ impl RelayNotificationSource for TestNotificationSource {
         self.shutdown.load(Ordering::SeqCst)
     }
 
-    fn record_loss(&self, _skipped: u64) -> NostrNotificationLossFloor {
-        self.lag_floor
+    fn record_loss(&self, _skipped: u64) -> NostrNotificationLossBounds {
+        NostrNotificationLossBounds::account_wide(self.lag_floor)
     }
 }
 
@@ -6023,7 +6098,9 @@ fn publish_report_preserves_fallback_message_id() {
 #[test]
 fn loss_authority_notification_cannot_claim_the_queue_writer() {
     let overflow = AccountDeliveryOverflowState::default();
-    overflow.record_notification_loss(NostrNotificationLossFloor::Unbounded);
+    overflow.record_notification_loss(&NostrNotificationLossBounds::account_wide(
+        NostrNotificationLossFloor::Unbounded,
+    ));
     assert!(
         !overflow.start_marker_persistence(),
         "notification incidents must be persisted by the account worker"

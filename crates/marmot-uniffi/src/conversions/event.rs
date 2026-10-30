@@ -17,6 +17,7 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
     match event {
         GroupEvent::LocalGroupCopyTerminated { group_id, .. }
         | GroupEvent::LocalGroupCopyRestored { group_id }
+        | GroupEvent::QueuedIntentRefused { group_id, .. }
         | GroupEvent::GroupMemberLeavesRemoved { group_id, .. }
         | GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }
@@ -129,6 +130,13 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
+    /// Whether this device's KeyPackage refresh is overdue may have changed:
+    /// re-read `key_package_refresh_overdue`. Also fires once each time the
+    /// account's worker opens or reconnects, and may fire with no change.
+    KeyPackageRefreshOverdueChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
 }
 
 /// FFI projection of [`cgka_traits::engine::GroupEvent`]. The previous FFI
@@ -214,6 +222,19 @@ pub enum GroupEventKindFfi {
     GroupMemberLeavesRemoved {
         epoch: u64,
     },
+    /// A send that waited for the group to settle (its summary said
+    /// `AcceptedPending`) was dropped unsent: the settled state refused it, as
+    /// it would have refused the same action sent then (the sender is no
+    /// longer an admin, the change is no longer valid). Nothing retries it;
+    /// tell the user, who may try again. `intent_kind` names the action
+    /// (`update_group_data`, `invite`, ...), `reason` is a stable
+    /// low-cardinality tag (`not_group_admin`, ...) and `intent_id_hex`
+    /// identifies the dropped send, so a repeated delivery can be ignored.
+    QueuedIntentRefused {
+        intent_id_hex: String,
+        intent_kind: String,
+        reason: String,
+    },
 }
 
 /// Stable, low-cardinality tag for a [`GroupStateChange`] — surfaced to FFI in
@@ -273,6 +294,16 @@ impl From<GroupEvent> for GroupEventKindFfi {
                 Self::LocalGroupCopyTerminated { voluntary }
             }
             GroupEvent::LocalGroupCopyRestored { .. } => Self::LocalGroupCopyRestored,
+            GroupEvent::QueuedIntentRefused {
+                intent_id,
+                intent_kind,
+                reason,
+                ..
+            } => Self::QueuedIntentRefused {
+                intent_id_hex: hex::encode(intent_id.as_slice()),
+                intent_kind,
+                reason,
+            },
             GroupEvent::GroupMemberLeavesRemoved { epoch, .. } => {
                 Self::GroupMemberLeavesRemoved { epoch: epoch.0 }
             }
@@ -469,6 +500,13 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_id_hex,
                 account_label,
             },
+            MarmotAppEvent::KeyPackageRefreshOverdueChanged {
+                account_id_hex,
+                account_label,
+            } => Self::KeyPackageRefreshOverdueChanged {
+                account_id_hex,
+                account_label,
+            },
         }
     }
 }
@@ -611,5 +649,37 @@ mod tests {
                 other => panic!("incorrect membership mapping: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_refused_queued_intent_reaches_the_ffi_with_its_id_kind_and_reason() {
+        let converted =
+            MarmotEventFfi::from(MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+                account_id_hex: "account".into(),
+                account_label: "alice".into(),
+                event: GroupEvent::QueuedIntentRefused {
+                    group_id: cgka_traits::GroupId::new(vec![0x31; 16]),
+                    intent_id: cgka_traits::MessageId::new(vec![0x42; 32]),
+                    intent_kind: "update_group_data".into(),
+                    reason: "not_group_admin".into(),
+                },
+            }));
+        let MarmotEventFfi::GroupEvent {
+            group_id_hex,
+            event:
+                GroupEventKindFfi::QueuedIntentRefused {
+                    intent_id_hex,
+                    intent_kind,
+                    reason,
+                },
+            ..
+        } = converted
+        else {
+            panic!("expected a refused queued intent: {converted:?}");
+        };
+        assert_eq!(group_id_hex, "31".repeat(16));
+        assert_eq!(intent_id_hex, "42".repeat(32));
+        assert_eq!(intent_kind, "update_group_data");
+        assert_eq!(reason, "not_group_admin");
     }
 }

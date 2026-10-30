@@ -230,6 +230,7 @@ pub use client::AppClient;
 #[doc(hidden)]
 pub use client::device_group::ConfirmedDeviceLink;
 pub use client::device_group::{LinkedDevice, LinkedDeviceStatus};
+pub use client::sign_ins::{SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
 pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
@@ -595,6 +596,9 @@ pub struct MarmotApp {
     audit_v5_peel_slot: Option<(String, Arc<Mutex<client::audit_v5_probe::PeelSlot>>)>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
+    /// Live KeyPackages of this app's accounts that their clients have not
+    /// checked for new sign-ins yet (mdk#2628 3.2).
+    pub(crate) sign_in_nudges: Arc<client::sign_ins::SignInNudges>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
@@ -1667,6 +1671,7 @@ impl MarmotApp {
             audit_v5_peel_slot: None,
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
+            sign_in_nudges: Arc::new(Default::default()),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
@@ -1768,6 +1773,7 @@ impl MarmotApp {
             audit_v5_peel_slot: None,
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
+            sign_in_nudges: Arc::new(Default::default()),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
@@ -1983,6 +1989,15 @@ impl MarmotApp {
             Instant::now(),
             recovery_policy,
         )?;
+        // Before the client activates any REQ; a failed read trusts none.
+        let live_coverage = client::LiveCoverage::open(
+            self.account_storage(&open.state.label)?
+                .app_storage()
+                .recovery_coverage_mark()
+                .ok(),
+            &open.adapter,
+        )
+        .await;
         let incremental_request = if relay_plane
             .subscription_rebuild_since(open.state.last_transport_timestamp)
             .is_none()
@@ -2046,9 +2061,14 @@ impl MarmotApp {
             pending_seen_event_count: 0,
             pending_group_projection_updates: std::collections::HashSet::new(),
             pending_recovery_status_updates: std::collections::HashSet::new(),
+            announced_convergence_parks: std::collections::HashSet::new(),
+            pending_convergence_park_notices: std::collections::HashSet::new(),
             history_notice_baseline: None,
             // A fresh client cannot know what hosts last read.
             linked_devices_changed: true,
+            key_package_refresh_overdue: None,
+            key_package_refresh_overdue_changed: true,
+            sign_in_schedule: Default::default(),
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
@@ -2068,6 +2088,7 @@ impl MarmotApp {
             native_sync_deliveries: 0,
             explicit_history_window_certified: false,
             recovery_job_network_cut: false,
+            live_coverage: tokio::sync::Mutex::new(live_coverage),
             recovery_job_admission_expired: false,
             pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
@@ -2115,6 +2136,8 @@ impl MarmotApp {
             fail_next_released_backfill_reload: false,
             #[cfg(test)]
             fail_next_terminal_recovery_retire: false,
+            #[cfg(test)]
+            fail_next_convergence_retry_advance: false,
             post_join_maintenance_subscriptions: HashMap::new(),
             post_join_history_sessions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
@@ -2155,6 +2178,7 @@ impl MarmotApp {
         }
         // Hosts read the notice list after open; later changes raise an event.
         client.take_history_notice_changes();
+        client.sync_key_package_announcement_group()?;
         Ok(client)
     }
 
@@ -2184,7 +2208,7 @@ impl MarmotApp {
                     .app
                     .clear_key_package_cutover_replacement_pending(&client.state.label);
             } else {
-                match client.runtime.publish_fresh_key_package().await {
+                match client.publish_fresh_key_package_announced().await {
                     Ok(_) => tracing::info!(
                         target: "marmot_app::key_packages",
                         method = "finish_client_open_network_maintenance",
@@ -2193,7 +2217,7 @@ impl MarmotApp {
                     Err(error) => tracing::warn!(
                         target: "marmot_app::key_packages",
                         method = "finish_client_open_network_maintenance",
-                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        error_kind = error.privacy_safe_kind(),
                         "deferred current key package replacement after strict cutover"
                     ),
                 }
@@ -2222,16 +2246,16 @@ impl MarmotApp {
         if self.cursor_persistence() == CursorPersistence::Advance {
             let result = async {
                 if client.runtime.key_package_generation_upgrade_due()? {
-                    client.runtime.publish_fresh_key_package().await?;
+                    client.publish_fresh_key_package_announced().await?;
                 }
-                Ok::<_, marmot_session::AccountError>(())
+                Ok::<_, AppError>(())
             }
             .await;
             if let Err(error) = result {
                 tracing::warn!(
                     target: "marmot_app::key_packages",
                     method = "finish_client_open_network_maintenance",
-                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    error_kind = error.privacy_safe_kind(),
                     "key package generator upgrade remains retryable"
                 );
             }
@@ -4882,6 +4906,7 @@ impl MarmotApp {
             Box::new(client::audit_v5_probe::ProbePeeler {
                 inner: peeler,
                 slot: audit_v5_peel_slot.clone(),
+                storage: self.account_storage(label)?.app_storage(),
             });
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
         // The engine gets its own connection to `session.sqlite`, which no
@@ -5546,6 +5571,59 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
         method: &'static str,
     ) -> Result<Vec<nostr_directory::FetchedKeyPackage>, AppError> {
+        let (account_id_hex, source_relays, _) = self
+            .account_key_package_source_relays(label, bootstrap_relays)
+            .await?;
+        let mut relay_records = self
+            .directory()
+            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
+            .await?;
+        sort_directory_records(&mut relay_records);
+        let mut packages = Vec::new();
+        for record in relay_records {
+            match key_package_from_record(record) {
+                Ok(fetched) => packages.push(fetched),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = method,
+                        error_kind = err.privacy_safe_kind(),
+                        "skipping invalid key package event while listing account packages"
+                    );
+                }
+            }
+        }
+        Ok(packages)
+    }
+
+    /// Read every KeyPackage slot of the account for new sign-ins (mdk#2628
+    /// 3.2), from the relays its KeyPackages are listed from, under the
+    /// inviter's rules. A read of the configured directory relays, when the
+    /// account lists none, is never complete: they need not be where its
+    /// KeyPackages are.
+    pub(crate) async fn read_account_key_package_slots(
+        &self,
+        label: &str,
+    ) -> Result<nostr_directory::AccountKeyPackageSlots, AppError> {
+        let (account_id_hex, source_relays, listed) = self
+            .account_key_package_source_relays(label, Vec::new())
+            .await?;
+        let mut slots = self
+            .directory()
+            .read_account_key_package_slots(&account_id_hex, &source_relays)
+            .await?;
+        slots.complete &= listed;
+        Ok(slots)
+    }
+
+    /// The account id, the relays its KeyPackages are listed from, and
+    /// whether those are the account's own listed relays rather than the
+    /// configured directory relays it falls back to.
+    async fn account_key_package_source_relays(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<(String, Vec<TransportEndpoint>, bool), AppError> {
         let account = self.account_home().account(label)?;
         let account_id_hex = account.account_id_hex;
 
@@ -5586,7 +5664,8 @@ impl MarmotApp {
                 .collect(),
             "account key package listing",
         );
-        if source_relays.is_empty() {
+        let listed = !source_relays.is_empty();
+        if !listed {
             source_relays = self.directory().directory_source_relays(&[]);
         }
         if source_relays.is_empty() {
@@ -5594,27 +5673,7 @@ impl MarmotApp {
                 MissingRelayListKind::Nip65,
             ]));
         }
-
-        let mut relay_records = self
-            .directory()
-            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
-            .await?;
-        sort_directory_records(&mut relay_records);
-        let mut packages = Vec::new();
-        for record in relay_records {
-            match key_package_from_record(record) {
-                Ok(fetched) => packages.push(fetched),
-                Err(err) => {
-                    tracing::warn!(
-                        target: "marmot_app::key_packages",
-                        method = method,
-                        error_kind = err.privacy_safe_kind(),
-                        "skipping invalid key package event while listing account packages"
-                    );
-                }
-            }
-        }
-        Ok(packages)
+        Ok((account_id_hex, source_relays, listed))
     }
 
     pub async fn account_key_package_records(

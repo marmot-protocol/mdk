@@ -14,7 +14,9 @@ use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
 use async_trait::async_trait;
 use cgka_traits::OutboundFanout;
-use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
+use cgka_traits::app_components::{
+    AppComponentId, AppComponentSet, DeviceRosterV1, DeviceTagClaim, default_group_components,
+};
 use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
     AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason,
@@ -63,6 +65,49 @@ pub struct WelcomeDeliveryIndex {
     pub outstanding: Vec<(GroupId, TransportMessage)>,
     /// Delivery-aware and staged Welcome IDs, including completed and canceled ones.
     pub tracked_ids: Vec<MessageId>,
+}
+
+/// Owed Welcomes and staged Welcome ids from one pass over the message store.
+#[derive(Debug, Default)]
+pub struct OutboundWelcomeWork {
+    /// Delivery-aware Welcomes still awaiting acknowledgement, as
+    /// [`Engine::outstanding_sent_welcomes`] lists them.
+    pub owed: Vec<(GroupId, TransportMessage)>,
+    /// Welcomes staged with an unconfirmed commit. Each becomes owed if its
+    /// commit confirms, or is retired if it rolls back.
+    pub staged: Vec<MessageId>,
+    /// Groups the pass did not read because they are not live (unhydrated
+    /// or quarantined). [`Engine::outbound_welcome_work_in`] reads one once
+    /// it is.
+    pub unread_groups: Vec<GroupId>,
+}
+
+/// Where one retained outbound Welcome stands for delivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutboundWelcomeStatus {
+    /// Not deliverable yet: staged with its unconfirmed commit, or in a
+    /// group that is not live (unhydrated or quarantined).
+    Waiting,
+    /// Owed and deliverable now.
+    Owed {
+        group_id: GroupId,
+        message: TransportMessage,
+    },
+    /// Nothing is left to send: delivered, withdrawn, retired with its
+    /// commit, or not a delivery-aware Welcome.
+    Settled,
+}
+
+/// What [`Engine::withdraw_sent_welcome`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WelcomeWithdrawal {
+    /// The Welcome was still owed, or staged with its commit, and is now
+    /// withdrawn: nothing publishes it again.
+    Withdrawn,
+    /// The Welcome already met its delivery policy; there is nothing to stop.
+    AlreadyDelivered,
+    /// The Welcome was already withdrawn, or retired with its staged commit.
+    AlreadyWithdrawn,
 }
 
 #[derive(Clone, Copy)]
@@ -174,6 +219,10 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) identity: Identity,
     pub(crate) registry: FeatureRegistry,
     pub(crate) supported_app_components: AppComponentSet,
+    /// The device group whose roster this device tags its KeyPackages and
+    /// leaves from; the host sets it once it trusts that group
+    /// ([`Self::set_device_tag_group`]).
+    pub(crate) device_tag_group: Option<GroupId>,
     /// Profile emitted by newly created KeyPackages and groups. Existing
     /// groups retain their independently persisted/wire-classified profile.
     pub(crate) new_protocol_profile: ProtocolProfile,
@@ -655,6 +704,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             identity,
             registry: self.registry,
             supported_app_components: self.supported_app_components,
+            device_tag_group: None,
             new_protocol_profile: self.new_protocol_profile,
             peeler,
             ciphersuite: self.ciphersuite,
@@ -3160,6 +3210,9 @@ impl<S: StorageProvider> Engine<S> {
                 group_id: group, ..
             }
             | GroupEvent::LocalGroupCopyRestored { group_id: group }
+            | GroupEvent::QueuedIntentRefused {
+                group_id: group, ..
+            }
             | GroupEvent::GroupMemberLeavesRemoved {
                 group_id: group, ..
             }
@@ -3325,6 +3378,32 @@ impl<S: StorageProvider> Engine<S> {
         Ok((record.group_id.clone(), message.clone()))
     }
 
+    /// Whether `id` names a Welcome still staged with its unconfirmed invite
+    /// commit (mdk#2726). Such a Welcome must not be published: it becomes
+    /// deliverable only when the commit confirms and promotes it, and is
+    /// retired if the commit rolls back. A missing row is not staged, so a
+    /// caller publishing an artifact this engine never retained behaves as
+    /// before.
+    pub fn sent_welcome_awaits_commit(&self, id: &MessageId) -> Result<bool, EngineError> {
+        let record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(cgka_traits::storage::StorageError::NotFound) => return Ok(false),
+            Err(error) => return Err(EngineError::Storage(error)),
+        };
+        if record.state != MessageState::Sent {
+            return Ok(false);
+        }
+        // The caller is about to publish a Welcome under this id. A `Sent`
+        // row it cannot read may still be staged, so fail closed.
+        let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+            return Ok(true);
+        };
+        Ok(matches!(
+            payload,
+            StoredMessagePayload::StagedInviteWelcome { .. }
+        ))
+    }
+
     /// Return every retained outbound Welcome whose delivery policy has not
     /// yet been acknowledged.
     ///
@@ -3338,15 +3417,90 @@ impl<S: StorageProvider> Engine<S> {
     pub fn outstanding_sent_welcomes(
         &self,
     ) -> Result<Vec<(GroupId, TransportMessage)>, EngineError> {
-        let mut welcomes = Vec::new();
-        self.visit_welcome_records(&[MessageState::Sent], |group_id, _, _, payload| {
-            if let StoredMessagePayload::OutboundWelcome(message) = payload
-                && matches!(message.envelope, TransportEnvelope::Welcome { .. })
-            {
-                welcomes.push((group_id.clone(), message));
+        Ok(self.outbound_welcome_work()?.owed)
+    }
+
+    /// [`Self::outstanding_sent_welcomes`], plus the ids of Welcomes still
+    /// staged with their commits, from the same pass. A restart uses it to
+    /// deliver what is owed and to watch what may become owed.
+    pub fn outbound_welcome_work(&self) -> Result<OutboundWelcomeWork, EngineError> {
+        let mut work = OutboundWelcomeWork::default();
+        for group_id in self.storage.list_groups()? {
+            if self.ensure_group_live(&group_id).is_err() {
+                work.unread_groups.push(group_id);
+                continue;
             }
-        })?;
-        Ok(welcomes)
+            self.read_outbound_welcome_work(&group_id, &mut work)?;
+        }
+        Ok(work)
+    }
+
+    /// [`Self::outbound_welcome_work`] for one group, or `None` while the
+    /// group is not live.
+    pub fn outbound_welcome_work_in(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<OutboundWelcomeWork>, EngineError> {
+        if self.ensure_group_live(group_id).is_err() {
+            return Ok(None);
+        }
+        let mut work = OutboundWelcomeWork::default();
+        self.read_outbound_welcome_work(group_id, &mut work)?;
+        Ok(Some(work))
+    }
+
+    fn read_outbound_welcome_work(
+        &self,
+        group_id: &GroupId,
+        work: &mut OutboundWelcomeWork,
+    ) -> Result<(), EngineError> {
+        self.visit_group_welcome_records(group_id, &[MessageState::Sent], |id, _, payload| {
+            match payload {
+                StoredMessagePayload::OutboundWelcome(message)
+                    if matches!(message.envelope, TransportEnvelope::Welcome { .. }) =>
+                {
+                    work.owed.push((group_id.clone(), message));
+                }
+                StoredMessagePayload::StagedInviteWelcome { .. } => work.staged.push(id),
+                _ => {}
+            }
+        })
+    }
+
+    /// Where the retained outbound Welcome `id` stands for delivery. A
+    /// missing row is settled: there is nothing this engine owes under it.
+    pub fn outbound_welcome_status(
+        &self,
+        id: &MessageId,
+    ) -> Result<OutboundWelcomeStatus, EngineError> {
+        let record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(OutboundWelcomeStatus::Settled),
+            Err(error) => return Err(EngineError::Storage(error)),
+        };
+        if record.state != MessageState::Sent {
+            return Ok(OutboundWelcomeStatus::Settled);
+        }
+        // A quarantined group may recover, and an unhydrated one hydrates.
+        if self.ensure_group_live(&record.group_id).is_err() {
+            return Ok(OutboundWelcomeStatus::Waiting);
+        }
+        // A `Sent` row that cannot be read may still be staged: wait.
+        let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+            return Ok(OutboundWelcomeStatus::Waiting);
+        };
+        Ok(match payload {
+            StoredMessagePayload::StagedInviteWelcome { .. } => OutboundWelcomeStatus::Waiting,
+            StoredMessagePayload::OutboundWelcome(message)
+                if matches!(message.envelope, TransportEnvelope::Welcome { .. }) =>
+            {
+                OutboundWelcomeStatus::Owed {
+                    group_id: record.group_id,
+                    message,
+                }
+            }
+            _ => OutboundWelcomeStatus::Settled,
+        })
     }
 
     /// IDs of every delivery-aware or explicitly staged outbound Welcome
@@ -3400,15 +3554,27 @@ impl<S: StorageProvider> Engine<S> {
             if self.ensure_group_live(&group_id).is_err() {
                 continue;
             }
-            for record in self
-                .storage
-                .list_messages_in_states(&group_id, states, EpochId(0))?
-            {
-                let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
-                    continue;
-                };
-                visit(&group_id, record.id, record.state, payload);
-            }
+            self.visit_group_welcome_records(&group_id, states, |id, state, payload| {
+                visit(&group_id, id, state, payload)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn visit_group_welcome_records(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        mut visit: impl FnMut(MessageId, MessageState, StoredMessagePayload),
+    ) -> Result<(), EngineError> {
+        for record in self
+            .storage
+            .list_messages_in_states(group_id, states, EpochId(0))?
+        {
+            let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+                continue;
+            };
+            visit(record.id, record.state, payload);
         }
         Ok(())
     }
@@ -3422,6 +3588,83 @@ impl<S: StorageProvider> Engine<S> {
         self.update_stored_message_state(id, MessageState::Processed)
     }
 
+    /// Withdraw one retained outbound Welcome, owed or still staged with its
+    /// commit, so that nothing publishes it again: its row becomes `Failed`,
+    /// as a staged Welcome's does when its commit rolls back. A staged one is
+    /// then never promoted when its commit confirms. A publish already in
+    /// flight cannot be recalled; its later delivered mark fails, because
+    /// the row is no longer `Sent`.
+    ///
+    /// Only delivery-aware Welcomes (invite Welcomes, and a current-profile
+    /// create's founding Welcomes) can be withdrawn. A legacy-profile
+    /// create's Welcome is the create's own publication, carried on its
+    /// frozen fanout, so withdrawing it could not stop it.
+    ///
+    /// Withdrawal touches only the Welcome's own row, never group state, so
+    /// it works for a group not hydrated yet: a restart must be able to stop
+    /// a Welcome before hydration reaches its group.
+    pub fn withdraw_sent_welcome(&self, id: &MessageId) -> Result<WelcomeWithdrawal, EngineError> {
+        let record = self.storage.get_message(id)?;
+        let payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
+        let message = match &payload {
+            StoredMessagePayload::OutboundWelcome(message)
+            | StoredMessagePayload::StagedInviteWelcome { message, .. } => Some(message),
+            StoredMessagePayload::RawTransport(_)
+            | StoredMessagePayload::OpenMlsWire(_)
+            | StoredMessagePayload::SignedOpenMlsWire { .. }
+            | StoredMessagePayload::OwnCommitWire { .. } => None,
+        };
+        if !message
+            .is_some_and(|message| matches!(message.envelope, TransportEnvelope::Welcome { .. }))
+        {
+            return Err(EngineError::Backend(
+                "stored message is not a delivery-aware outbound Welcome".into(),
+            ));
+        }
+        match record.state {
+            MessageState::Sent => {
+                self.update_stored_message_state(id, MessageState::Failed)?;
+                Ok(WelcomeWithdrawal::Withdrawn)
+            }
+            MessageState::Processed => Ok(WelcomeWithdrawal::AlreadyDelivered),
+            MessageState::Failed => Ok(WelcomeWithdrawal::AlreadyWithdrawn),
+            _ => Err(EngineError::Backend(
+                "stored message is not an outbound sent record".into(),
+            )),
+        }
+    }
+
+    /// Whether `id` names a retained outbound Welcome that must never be
+    /// published again: withdrawn, or retired with its staged commit. A
+    /// missing row is not withdrawn, so a caller publishing an artifact this
+    /// engine never retained behaves as before.
+    pub fn sent_welcome_withdrawn(&self, id: &MessageId) -> Result<bool, EngineError> {
+        let record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(false),
+            Err(error) => return Err(EngineError::Storage(error)),
+        };
+        if record.state != MessageState::Failed {
+            return Ok(false);
+        }
+        // The caller is about to publish a Welcome under this id. A `Failed`
+        // row it cannot read still forbids that, so fail closed.
+        let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+            return Ok(true);
+        };
+        Ok(match &payload {
+            StoredMessagePayload::OutboundWelcome(message)
+            | StoredMessagePayload::StagedInviteWelcome { message, .. }
+            | StoredMessagePayload::RawTransport(message) => {
+                matches!(message.envelope, TransportEnvelope::Welcome { .. })
+            }
+            StoredMessagePayload::OpenMlsWire(_)
+            | StoredMessagePayload::SignedOpenMlsWire { .. }
+            | StoredMessagePayload::OwnCommitWire { .. } => false,
+        })
+    }
+
     /// Liveness-gated read-only access to the group's `MlsGroup`, served from
     /// the engine's group cache. A missing group maps to `UnknownGroup`.
     fn with_live_mls_group<R>(
@@ -3431,6 +3674,43 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<R, EngineError> {
         self.ensure_group_live(group_id)?;
         self.with_mls_group(group_id, f)
+    }
+
+    /// Which roster slot the leaf at `leaf_index` belongs to, read from its
+    /// device tag against `roster`, the device group's current roster
+    /// (device-tag-v1.md, "Reading tags").
+    ///
+    /// `None` when `epoch` is not the group's current epoch or no leaf sits
+    /// at that index, so a caller holding an older event never reads a leaf
+    /// that has since changed hands. A leaf of another account reads as
+    /// unclaimed: tags are read only on the reader's own account's leaves.
+    pub fn member_device_tag_claim(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> Result<Option<DeviceTagClaim>, EngineError> {
+        self.with_live_mls_group(group_id, |mls_group| {
+            if mls_group.epoch().as_u64() != epoch.0 {
+                return Ok(None);
+            }
+            let Some(leaf) = mls_group
+                .public_group()
+                .leaf(openmls::prelude::LeafNodeIndex::new(leaf_index))
+            else {
+                return Ok(None);
+            };
+            let own_account = openmls::prelude::BasicCredential::try_from(
+                leaf.credential().clone(),
+            )
+            .is_ok_and(|credential| credential.identity() == self.identity.self_id().as_slice());
+            Ok(Some(if own_account {
+                crate::device_tag::device_tag_claim(leaf, roster)
+            } else {
+                DeviceTagClaim::Unclaimed
+            }))
+        })
     }
 
     /// Return the current Marmot admin policy keys mirrored from signed MLS
@@ -3615,7 +3895,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &mut self,
         welcome_msg: TransportMessage,
     ) -> Result<GroupId, EngineError> {
-        self.do_join_welcome(welcome_msg).await
+        self.do_join_welcome(welcome_msg, None).await
     }
 
     fn feature_status(
@@ -3824,6 +4104,25 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
 
     fn self_id(&self) -> MemberId {
         self.identity.self_id().clone()
+    }
+
+    fn own_signature_key(&self) -> Vec<u8> {
+        self.identity.signer.to_public_vec()
+    }
+
+    fn expect_device_group_welcome(
+        &mut self,
+        expectation: &cgka_traits::storage::DeviceGroupWelcomeExpectation,
+    ) -> Result<(), EngineError> {
+        Ok(self
+            .storage
+            .put_device_group_welcome_expectation(expectation)?)
+    }
+
+    fn withdraw_device_group_welcome(&mut self, group_id: &GroupId) -> Result<bool, EngineError> {
+        Ok(self
+            .storage
+            .delete_device_group_welcome_expectation(group_id)?)
     }
 
     async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {

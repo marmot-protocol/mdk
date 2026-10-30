@@ -602,6 +602,63 @@ pub fn select_key_packages_from_records(
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
 ) -> Result<KeyPackageSelection, DirectoryError> {
+    let SlotCandidates {
+        mut candidates,
+        newest_error,
+        rejected_future,
+        legacy_slots,
+    } = slot_candidates(account_id_hex, records, freshness, requirements);
+    if candidates.is_empty()
+        && let Some(error) = newest_error
+    {
+        return Err(error);
+    }
+    candidates.sort_by(|a, b| {
+        a.last_resort
+            .cmp(&b.last_resort)
+            .then_with(|| b.fetched.created_at.cmp(&a.fetched.created_at))
+            .then_with(|| a.key_package_ref.cmp(&b.key_package_ref))
+    });
+    let has_fresh = candidates
+        .iter()
+        .any(|candidate| freshness.is_fresh_key_package(candidate.fetched.created_at));
+    let mut signature_keys = BTreeSet::new();
+    let value = candidates
+        .into_iter()
+        .filter(|candidate| {
+            !has_fresh || freshness.is_fresh_key_package(candidate.fetched.created_at)
+        })
+        .filter(|candidate| signature_keys.insert(candidate.signature_key.clone()))
+        .take(if has_fresh {
+            MAX_KEY_PACKAGES_PER_ACCOUNT
+        } else {
+            1
+        })
+        .map(|candidate| candidate.fetched)
+        .collect();
+    Ok(KeyPackageSelection {
+        value,
+        rejected_future,
+        legacy_slots,
+    })
+}
+
+/// Every slot's candidate, before ranking: its newest publication that is
+/// not deleted, valid, current profile and, with `requirements`, compatible.
+struct SlotCandidates {
+    candidates: Vec<RankedKeyPackage>,
+    /// The newest publication's rejection, of every slot rejected.
+    newest_error: Option<DirectoryError>,
+    rejected_future: bool,
+    legacy_slots: bool,
+}
+
+fn slot_candidates(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+) -> SlotCandidates {
     let deletions = verified_deletions(account_id_hex, records);
     let mut records = records
         .iter()
@@ -668,39 +725,94 @@ pub fn select_key_packages_from_records(
             key_package_ref,
         });
     }
-    if candidates.is_empty()
-        && let Some(error) = newest_error
-    {
-        return Err(error);
-    }
-    candidates.sort_by(|a, b| {
-        a.last_resort
-            .cmp(&b.last_resort)
-            .then_with(|| b.fetched.created_at.cmp(&a.fetched.created_at))
-            .then_with(|| a.key_package_ref.cmp(&b.key_package_ref))
-    });
-    let has_fresh = candidates
-        .iter()
-        .any(|candidate| freshness.is_fresh_key_package(candidate.fetched.created_at));
-    let mut signature_keys = BTreeSet::new();
-    let value = candidates
-        .into_iter()
-        .filter(|candidate| {
-            !has_fresh || freshness.is_fresh_key_package(candidate.fetched.created_at)
-        })
-        .filter(|candidate| signature_keys.insert(candidate.signature_key.clone()))
-        .take(if has_fresh {
-            MAX_KEY_PACKAGES_PER_ACCOUNT
-        } else {
-            1
-        })
-        .map(|candidate| candidate.fetched)
-        .collect();
-    Ok(KeyPackageSelection {
-        value,
+    SlotCandidates {
+        candidates,
+        newest_error,
         rejected_future,
         legacy_slots,
-    })
+    }
+}
+
+/// One read of every KeyPackage slot of one account, for its own devices'
+/// new-sign-in check (mdk#2628 item 3.2).
+#[derive(Clone, Debug)]
+pub struct AccountKeyPackageSlots {
+    /// Each slot's newest publication that is fresh and valid by the
+    /// inviter's rules ([`select_key_packages_from_records`]), with its
+    /// self-reported client name. Unlike an inviter's selection, every such
+    /// slot is here: none is capped, or dropped for sharing a signature key
+    /// with another.
+    pub key_packages: Vec<SlotKeyPackage>,
+    /// Every slot whose newest publication is a valid KeyPackage by the
+    /// inviter's rules, fresh or not: the slots still signed in. Freshness
+    /// is a publication time, so it never signs a slot out.
+    pub current_slots: BTreeSet<String>,
+    /// The `d` of every KeyPackage publication of the account the read
+    /// returned, whether or not it counts: which slots exist, whatever their
+    /// publications' times.
+    pub returned_slots: BTreeSet<String>,
+    /// Every relay reached its end of stored events and no page came back
+    /// full, so a slot missing here is not signed in.
+    pub complete: bool,
+    /// The read is complete or returned some of the account's publications.
+    /// A read that reached no relay proves nothing.
+    pub reached: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SlotKeyPackage {
+    pub fetched: FetchedKeyPackage,
+    /// The `client` tag, read as every MDK reader reads it.
+    pub client: Option<String>,
+}
+
+/// [`AccountKeyPackageSlots`] from one read of `account`'s KeyPackages and
+/// deletion requests. It drops whatever an inviter would: a deleted,
+/// invalid, legacy or future-dated publication, and every slot whose newest
+/// publication is one of those. Only fresh KeyPackages count.
+pub fn account_key_package_slots_from_records(
+    account: &str,
+    records: &[RelayEventRecord],
+    complete: bool,
+    freshness: DirectoryFreshness,
+) -> AccountKeyPackageSlots {
+    let complete = complete && !key_package_read_page_full(account, records);
+    let reached = complete || records.iter().any(|record| record.event.pubkey == account);
+    let candidates = slot_candidates(account, records, freshness, None).candidates;
+    let current_slots = candidates
+        .iter()
+        .map(|candidate| candidate.fetched.key_package_id.clone())
+        .filter(|slot| !slot.is_empty())
+        .collect();
+    let key_packages = candidates
+        .into_iter()
+        .map(|candidate| candidate.fetched)
+        .filter(|fetched| freshness.is_fresh_key_package(fetched.created_at))
+        .map(|fetched| {
+            let client = records
+                .iter()
+                .find(|record| record.event.id == fetched.key_package_event_id)
+                .and_then(|record| transport_nostr_adapter::key_package_client_name(&record.event))
+                .map(str::to_owned);
+            SlotKeyPackage { fetched, client }
+        })
+        .collect();
+    let returned_slots = records
+        .iter()
+        .filter(|record| {
+            record.event.kind == KIND_MARMOT_KEY_PACKAGE && record.event.pubkey == account
+        })
+        .filter_map(|record| record.event.tag_value("d"))
+        .filter(|slot| !slot.is_empty())
+        .map(str::to_owned)
+        .collect();
+    AccountKeyPackageSlots {
+        key_packages,
+        current_slots,
+        returned_slots,
+        complete,
+        reached,
+    }
 }
 
 /// The author's MLS KeyPackage with a legacy-profile account proof. Current

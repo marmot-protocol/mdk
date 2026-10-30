@@ -300,12 +300,29 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
+        let prepared = self
+            .peeler
+            .peel_welcome(msg)
+            .await
+            .map_err(EngineError::Peeler)
+            .and_then(|peeled| {
+                let content_id = group_lifecycle::welcome_content_dedup_id(&peeled)?;
+                Ok((peeled, content_id))
+            });
+        let content_id = prepared
+            .as_ref()
+            .ok()
+            .map(|(_, content_id)| content_id.clone());
         // Reuse the existing join_welcome machinery. Any classifiable failure
         // for this individual welcome is terminal input, not a failure of the
         // transport drain: persist an account-scoped marker even when no group
         // id could be recovered, then return a typed stale outcome. Storage and
         // truly internal transition failures still propagate.
-        match self.do_join_welcome(msg.clone()).await {
+        let joined = match prepared {
+            Ok(prepared) => self.do_join_welcome(msg.clone(), Some(prepared)).await,
+            Err(error) => Err(error),
+        };
+        match joined {
             Ok(gid) => {
                 self.persist_transport_message(msg, &gid, EpochId(0), MessageState::Processed)?;
                 Ok(IngestOutcome::Processed)
@@ -320,12 +337,7 @@ impl<S: StorageProvider> Engine<S> {
                 // The offer may have arrived under another transport wrapper.
                 // It owns the content but must remain eligible for ordinary
                 // trusted-removal reentry as well as explicit confirmation.
-                let peeled = self
-                    .peeler
-                    .peel_welcome(msg)
-                    .await
-                    .map_err(EngineError::Peeler)?;
-                let content_id = group_lifecycle::welcome_content_dedup_id(&peeled)?;
+                let content_id = content_id.ok_or(EngineError::InvalidWelcome)?;
                 if self.storage.list_welcomes()?.iter().any(|candidate| {
                     candidate
                         .rejoin
@@ -368,7 +380,8 @@ impl<S: StorageProvider> Engine<S> {
                     EngineError::MissingRequiredCapabilities { .. } => {
                         InputRejectionCategory::UnsupportedRequiredFeature
                     }
-                    EngineError::NotGroupAdmin { .. } => {
+                    EngineError::NotGroupAdmin { .. }
+                    | EngineError::UnexpectedDeviceGroupWelcome => {
                         InputRejectionCategory::AuthorizationFailed
                     }
                     _ => InputRejectionCategory::InvalidEncoding,
@@ -1639,6 +1652,19 @@ impl<S: StorageProvider> Engine<S> {
                     )?;
                 }
                 self.return_mls_group(&group_id, mls_group);
+                // A failed convergence batch reopens on new selection input
+                // when its pass is next loaded (mdk#2684), and a proposal at
+                // the current epoch is stored without loading it. Schedule
+                // that load; a pass that cannot be read gets one too.
+                if self
+                    .storage
+                    .convergence_pass(&group_id)
+                    .map_or(true, |pass| {
+                        pass.is_some_and(|pass| pass.is_active() && pass.retry.is_some())
+                    })
+                {
+                    self.schedule_pending_convergence_group(&group_id);
+                }
                 self.valid_proposal_groups.insert(group_id);
                 reported(IngestOutcome::Processed)
             }
@@ -1954,9 +1980,31 @@ impl<S: StorageProvider> Engine<S> {
             pending_commit_guard.set_stored_proposal_ref(stored_proposal_ref);
         }
         let pre_commit_ctx = group_lifecycle::build_group_context_snapshot(mls_group, &provider)?;
-        let (commit_out, _welcome_opt, _gi) = mls_group
-            .commit_to_pending_proposals(&provider, &self.identity.signer)
-            .map_err(|e| EngineError::Backend(format!("auto_commit: {e:?}")))?;
+        // OpenMLS's `commit_to_pending_proposals`, whose UpdatePath tags this
+        // device's leaf when the leaf needs a tag.
+        let leaf_node_parameters = self.own_commit_leaf_parameters(mls_group, &[])?;
+        let commit_out = mls_group
+            .commit_builder()
+            .consume_proposal_store(true)
+            .leaf_node_parameters(leaf_node_parameters)
+            .load_psks(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                    &provider,
+                ),
+            )
+            .map_err(|e| EngineError::Backend(format!("auto_commit load_psks: {e:?}")))?
+            .build(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::rand(&provider),
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(
+                    &provider,
+                ),
+                &self.identity.signer,
+                |_| true,
+            )
+            .map_err(|e| EngineError::Backend(format!("auto_commit build: {e:?}")))?
+            .stage_commit(&provider)
+            .map_err(|e| EngineError::Backend(format!("auto_commit stage: {e:?}")))?
+            .into_commit();
         let staged_commit = mls_group
             .pending_commit()
             .ok_or_else(|| EngineError::Backend("auto-commit produced no pending commit".into()))?;

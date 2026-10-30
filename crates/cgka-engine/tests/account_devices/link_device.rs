@@ -6,8 +6,8 @@
 
 use super::activation::{buffer_unsettled, queued_intents};
 use super::device_roster::{
-    entry, found_device_group, phone_and_laptop, roster, roster_device, roster_of, roster_update,
-    slot,
+    entry, expect_link_welcome, found_device_group, phone_and_laptop, roster, roster_device,
+    roster_of, roster_update, slot,
 };
 use super::send_intents::{pending_proposals, store_pending_add};
 use super::*;
@@ -90,6 +90,7 @@ async fn a_link_adds_the_device_and_writes_its_entry_in_one_commit() {
         CommitOrderingPriority::Privileged,
     )
     .await;
+    expect_link_welcome(&mut tablet, &gid, &phone);
     assert_joins(&mut tablet, &welcomes[0], &gid, &phone).await;
 
     let mut expected = roster(&[(1, "Phone"), (2, "Laptop")]);
@@ -405,6 +406,7 @@ fn reject_slot(n: u8) -> DeviceRosterOperationV1 {
         RejectedSlotV1 {
             reason: RejectedSlotReasonV1::NotMe,
             rejected_at: 1,
+            tag_signature_key: None,
         },
     )
 }

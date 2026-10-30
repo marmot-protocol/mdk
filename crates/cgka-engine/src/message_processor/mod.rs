@@ -56,6 +56,7 @@ use crate::convergence_input::{ClassifiedConvergenceInput, ConvergenceInputConte
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::engine_metrics::DeferredPeelCapacityResource;
 use crate::openmls_projection::decode_openmls_wire_projection;
+use crate::queued_intent_refusal::QueuedPreparationFailure;
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
@@ -908,6 +909,8 @@ impl<S: StorageProvider> Engine<S> {
             if matches!(&intent, SendIntent::EnableAccountDevices { .. }) {
                 self.check_account_devices_activation(&group_id)?;
             }
+            // So is a KeyPackage it carries; see `check_queued_key_packages`.
+            self.check_queued_key_packages(&intent)?;
             let queued = self.queue_outbound_intent(group_id, intent, 0)?;
             reason.trace();
             return Ok(queued);
@@ -1184,36 +1187,27 @@ impl<S: StorageProvider> Engine<S> {
             );
             let result = match prepared {
                 Ok(result) => result,
-                Err(error)
-                    if crate::account_devices_activation::is_refused_queued_activation(
-                        &record.intent,
-                        &error,
-                    ) =>
-                {
-                    // Nothing was staged. Retire the intent like a direct
-                    // send's refusal; the host reads the outcome back from
-                    // `account_devices_activation_refusal`.
-                    self.storage.delete_queued_outbound_intent(&record.id)?;
-                    tracing::info!(
-                        target: "cgka_engine::message_processor",
-                        method = "converge_and_drain_with_deadline",
-                        error_kind = error.privacy_safe_kind(),
-                        "queued account-devices activation refused on the settled state; retired"
-                    );
+                Err(error) => {
+                    // A refusal by the settled state retires the intent, as a
+                    // direct send's refusal leaves nothing behind; anything
+                    // else keeps it queued (mdk#2694, `queued_intent_refusal`).
+                    let refused = self.queued_preparation_failure(group_id, &error)
+                        == QueuedPreparationFailure::Refused;
+                    if refused {
+                        self.retire_refused_queued_intent(&record, &error)?;
+                    }
                     if reservation.is_available() {
+                        // The protocol grants one preparation attempt, not an
+                        // indefinite reservation. Consume the slot and let
+                        // retained inbound work proceed.
                         reservation.consume_attempt(self, group_id, false)?;
                         break;
                     }
-                    continue;
+                    if refused {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                Err(_) if reservation.is_available() => {
-                    // The protocol grants one preparation attempt, not an
-                    // indefinite reservation. Keep the durable intent queued,
-                    // consume the slot, and let retained inbound work proceed.
-                    reservation.consume_attempt(self, group_id, false)?;
-                    break;
-                }
-                Err(error) => return Err(error),
             };
             let pauses_for_pending_publish = matches!(result, SendResult::GroupEvolution { .. });
             // The queued path bypasses the public send entry point. Record
@@ -3107,6 +3101,18 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(None);
         }
+        // A failed batch runs before any sweep, so its retry time is the wake
+        // (mdk#2684). Reporting rows ready meanwhile would spin the host on an
+        // advance that waits for that batch. A deferred-peel generation still
+        // sweeps first and keeps its own readiness.
+        if self.storage.deferred_peel_generation(group_id)?.is_none()
+            && self
+                .storage
+                .convergence_pass(group_id)?
+                .is_some_and(|pass| pass.is_active() && pass.retry.is_some())
+        {
+            return Ok(None);
+        }
         let now = self.convergence_now();
         // Match the sweep's indexed state filter. Readiness must inspect all
         // deferred metadata, but neither payloads nor processed history are needed.
@@ -4128,6 +4134,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::Leave { group_id }
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
+        | SendIntent::ReplaceDeviceEntry { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. }
         | SendIntent::EnableDisbanding { group_id }
         | SendIntent::EnableAccountDevices { group_id }
@@ -4151,6 +4158,7 @@ pub(crate) fn is_fair_scheduled_intent(
         SendIntent::Invite { .. }
         | SendIntent::RemoveMembers { .. }
         | SendIntent::UpdateAppComponents { .. }
+        | SendIntent::ReplaceDeviceEntry { .. }
         | SendIntent::UpdateGroupData { .. }
         | SendIntent::EnableDisbanding { .. }
         | SendIntent::EnableAccountDevices { .. }

@@ -9,18 +9,43 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `MarmotGroupEventKind` adds `QueuedIntentRefused { intent_id_hex,
+  intent_kind, reason }` (mdk#2694), freed with its event. Handle the new tag
+  and use matching regenerated headers and libraries.
+
 - `marmot_deployment_set_key_package_client_preference` is removed
   (mdk#2628): the KeyPackage `client` tag no longer ranks invite candidates.
   Drop the call and use matching regenerated headers and libraries.
 
 ### Added
 
+- `MarmotClientOptions` gains a trailing `device_platform`: the platform this
+  device runs on, such as "iOS", which each device writes with its client
+  label into its own roster entry (mdk#2628 item 3.6). NULL leaves it out.
+  The struct layout changed: use matching regenerated headers and libraries.
+- `marmot_rename_linked_device` renames one of this account's devices, this
+  one included, by its `slot_id_hex`, with one roster commit in the device
+  group (mdk#2628 item 3.6). It fails with nothing sent while the device group
+  has an earlier change in flight, and in release builds until the roster's
+  spec lands. A rename whose commit loses a fork to one that also changes that
+  device's entry is not made again. Use matching regenerated headers and
+  libraries.
+- `MarmotAppGroupMlsState` gains a trailing `convergence_parked` field for a
+  group whose convergence pass spent its failure budget (mdk#2684). Show it as
+  stuck syncing; `marmot_retry_group_convergence` grants one more attempt.
+  The struct grows, so use matching regenerated headers and libraries.
 - `marmot_linked_devices` writes this account's own devices as a
   `MarmotLinkedDeviceList` (free with `marmot_linked_device_list_free`), from
   the roster of the device group this device trusts, this device first
   (mdk#2628 item 3.1). The new `MARMOT_EVENT_LINKED_DEVICES_CHANGED` event says
   to re-read it. The list is empty in release builds until the roster's spec
   lands. Use matching regenerated headers and libraries.
+- `marmot_key_package_refresh_overdue` writes whether this device's device
+  group has held its KeyPackage refresh back for a week (mdk#2628 item 3.4),
+  so the app can tell the user before inviters stop treating the device as
+  fresh at 30 days. The new `MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED`
+  event says to re-read it. It is false in release builds until the roster's
+  spec lands. Use matching regenerated headers and libraries.
 - `marmot_account_devices_activation` and `marmot_enable_account_devices` let
   an admin turn on account-devices in an existing group, only when the user
   asks (mdk#2628). The first writes a `MarmotAccountDevicesActivation` that

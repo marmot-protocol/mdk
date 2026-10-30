@@ -204,6 +204,9 @@ impl AppClient {
                 || self.settle_held_device_group(group_id)?)
         {
             self.linked_devices_changed = true;
+            // Its roster may now hold a slot this device rejected, or have
+            // lost a rejection it made (mdk#2628 3.2).
+            self.recheck_sign_in_rejections();
             return Ok(Some(self.ensure_device_group_route(group_id)?));
         }
         if batch_start_frontier.is_none() && self.state_group_record(group_id).is_some() {
@@ -629,6 +632,7 @@ impl AppClient {
     /// pipeline; eager clients call it before returning from open.
     pub(crate) fn reconcile_hydrated_account_state(&mut self) -> Result<(), AppError> {
         self.reconcile_device_groups()?;
+        self.sync_device_tag_group()?;
         if self.reconcile_live_engine_groups()? {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }

@@ -869,6 +869,39 @@ impl AppClient {
         self.pending_convergence_groups.drain().collect()
     }
 
+    /// Whether this group's convergence pass parked after repeated failures
+    /// (mdk#2684).
+    pub(crate) fn convergence_pass_parked(
+        &self,
+        group_id: &cgka_traits::GroupId,
+    ) -> Result<bool, AppError> {
+        Ok(self.runtime.convergence_pass_parked(group_id)?)
+    }
+
+    /// Record whether `group_id`'s convergence pass is parked, owing hosts a
+    /// group-state notice when that changed since they last heard (mdk#2684).
+    /// Every entry point that can spend the budget re-reads the schedule, so
+    /// the notice does not depend on which one parked it. A group hosts may
+    /// not see owes them nothing.
+    pub(crate) fn note_convergence_park(&mut self, group_id: &cgka_traits::GroupId, parked: bool) {
+        if !self.host_may_see_group(group_id) {
+            return;
+        }
+        let changed = if parked {
+            self.announced_convergence_parks.insert(group_id.clone())
+        } else {
+            self.announced_convergence_parks.remove(group_id)
+        };
+        if changed {
+            self.pending_convergence_park_notices
+                .insert(group_id.clone());
+        }
+    }
+
+    pub(crate) fn take_convergence_park_notices(&mut self) -> Vec<cgka_traits::GroupId> {
+        self.pending_convergence_park_notices.drain().collect()
+    }
+
     /// Engine-derived convergence scheduling state for one group.
     ///
     /// Errors propagate: a storage or engine failure must schedule a retry at
@@ -884,6 +917,8 @@ impl AppClient {
             return Ok(ConvergenceScheduleState::Idle);
         }
         let convergence_delay = self.runtime.prepare_convergence_cutoff_delay_ms(group_id)?;
+        let parked = self.runtime.convergence_pass_parked(group_id)?;
+        self.note_convergence_park(group_id, parked);
         match convergence_delay {
             Some(0) => Ok(ConvergenceScheduleState::Ready),
             Some(remaining_ms) => {
@@ -898,6 +933,21 @@ impl AppClient {
                 }
             }
             None => {
+                if parked {
+                    // A parked pass waits for new input or an explicit retry
+                    // and gates every other arm below (mdk#2684). Waking it
+                    // would only re-read the park; already-staged
+                    // publications keep their own retry wake.
+                    return Ok(if self.runtime.has_pending_outbound_fanouts(group_id)? {
+                        ConvergenceScheduleState::PendingOutbound {
+                            retry_after_ms: self
+                                .runtime
+                                .outbound_fanout_retry_delay_ms(group_id)?,
+                        }
+                    } else {
+                        ConvergenceScheduleState::Idle
+                    });
+                }
                 if self.runtime.has_pending_convergence_inputs(group_id)? {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
                 } else if self.runtime.has_queued_outbound_intents(group_id)?
@@ -1407,16 +1457,28 @@ impl AppClient {
             self.record_recovery_loss_imports(marked.into_iter().collect());
         }
         if overflow.notification_losses > 0 {
-            // The lag's REQ floors bound the loss from below. Each lag mints a
-            // fresh token, so a lower floor always imports as new loss with a
-            // new obligation revision rather than rewriting a frozen goal.
-            app.record_account_recovery_loss_bounded(
+            // The lag's REQ floors bound the loss from below, per route when
+            // every REQ that could have delivered it named its routes. Each
+            // lag mints a fresh token, so a lower floor always imports as new
+            // loss with a new obligation revision rather than rewriting a
+            // frozen goal.
+            let routes = self
+                .adapter
+                .notification_loss_routes(&overflow)
+                .map(|routes| {
+                    routes
+                        .into_iter()
+                        .map(|(route, since)| (crate::reconciliation_route(route), since))
+                        .collect::<Vec<_>>()
+                });
+            app.record_account_recovery_loss_routed(
                 &self.state.label,
                 storage_sqlite::RecoveryLossCause::NotificationConsumer,
                 overflow.notification_token,
                 0,
                 unix_now_seconds(),
                 overflow.notification_floor,
+                routes.as_deref(),
             )?;
             self.synchronize_recovery_loss(&app)?;
             self.adapter.notification_loss_persisted(overflow);
@@ -3866,33 +3928,8 @@ impl AppClient {
                     inventory_record: None,
                 });
             }
-            // Dismissals remain authoritative after unblock. With no current
-            // blocks the normal ingress peeler is sufficient.
-            if storage.has_blocked_users()? {
-                let account = client.app.account_home().account(&client.state.label)?;
-                let peeler = transport_nostr_peeler::NostrMlsPeeler::new().with_welcome_signer_arc(
-                    client
-                        .app
-                        .account_signer_for_summary(&account)?
-                        .as_nostr_signer(),
-                );
-                // The seal's authenticated sender is authoritative, never the outer gift-wrap key.
-                // A peel failure proceeds to normal admission, which rejects invalid envelopes.
-                if let Ok(peeled) =
-                    cgka_traits::peeler::TransportPeeler::peel_welcome(&peeler, &delivery.message)
-                        .await
-                    && let Some(sender) = peeled.sender
-                    && storage.is_user_blocked(&hex::encode(sender.as_slice()))?
-                {
-                    storage.dismiss_blocked_welcome(&source_message_id_hex)?;
-                    return Ok(DeliveryIngest {
-                        routes_dirty: false,
-                        must_stay_fetchable: false,
-                        refused_group: None,
-                        inventory_record: None,
-                    });
-                }
-            }
+            // Dismissals stay authoritative after unblock. The installed app
+            // peeler checks inviter policy after its one authenticated decode.
         }
         let rejoin_offers_before = if welcome {
             Some(client.rejoin_offer_snapshot()?)

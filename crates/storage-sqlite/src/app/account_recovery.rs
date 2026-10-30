@@ -13,7 +13,10 @@ mod plan;
 #[cfg(test)]
 mod replay_tests;
 mod stall;
-pub use loss::{MAX_LOSS_ROUTES, RecoveryLossCause, RecoveryLossSnapshot, RecoveryLossWatermark};
+pub use loss::{
+    MAX_LOSS_ROUTES, RecoveryLossCause, RecoveryLossReach, RecoveryLossSnapshot,
+    RecoveryLossWatermark,
+};
 pub use notice::ParkedRecoveryObligation;
 pub use observe::{
     RecoveryDemandTransition, RecoveryLossImport, RecoveryObligationState, RecoveryObligationStatus,
@@ -405,7 +408,10 @@ struct ChargedLoss {
 }
 
 impl ChargedLoss {
-    /// Charge what the generation lost; the caller un-covers it in the same
+    /// Charge what the generation lost, and stamp it with the loss revision
+    /// its join just left: above every revision a checkpoint captured before
+    /// this import holds, and at most the one the import ends at. Call after
+    /// the generation's join; the caller un-covers it in the same
     /// transaction.
     fn charge(
         &mut self,
@@ -414,6 +420,13 @@ impl ChargedLoss {
         cause: i64,
         token: i64,
     ) -> StorageResult<()> {
+        conn.execute_cached(
+            "UPDATE account_delivery_loss_evidence SET import_revision =
+                 (SELECT loss_revision FROM account_recovery_state WHERE singleton = 1)
+             WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
+            params![label, cause, token],
+        )
+        .storage()?;
         match loss::evidence_routes(conn, label, cause, token)? {
             Some(routes) => {
                 for (route, bound) in routes {
@@ -450,7 +463,7 @@ impl ChargedLoss {
                     // Its coverage went with the account-wide floor, but that
                     // widens only goals the ledger already holds, and this
                     // route may have left current routing.
-                    crate::app::recovery_coverage::widen_goal(conn, &route, floor)?
+                    crate::app::recovery_coverage::reopen_goal(conn, &route, floor)?
                 }
                 _ => {
                     crate::app::recovery_coverage::uncover_route_loss_tx(conn, &route, bound, now)?
@@ -875,9 +888,8 @@ impl SqliteAppStorage {
                         let before = observe::demand_row(&conn, &loss_demand_key(cause, label)?)?;
                         *slot = Some((before, 0, ChargedLoss::default()));
                     }
-                    if let Some((_, total, lost)) = slot {
+                    if let Some((_, total, _)) = slot {
                         *total = total.saturating_add(charged);
-                        lost.charge(&conn, label, cause, token)?;
                     }
                 }
                 join_loss_tx(&conn, label, cause, token, dropped, observed_at, true)?;
@@ -887,6 +899,12 @@ impl SqliteAppStorage {
                     params![label, token, dropped, cause],
                 )
                 .storage()?;
+                if let Some(Some((_, _, lost))) = usize::try_from(cause)
+                    .ok()
+                    .and_then(|cause| imports.get_mut(cause))
+                {
+                    lost.charge(&conn, label, cause, token)?;
+                }
             }
             let mut changes = Vec::new();
             for (cause, slot) in imports.into_iter().enumerate() {

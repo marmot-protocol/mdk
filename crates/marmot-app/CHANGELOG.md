@@ -4,8 +4,14 @@
 
 ### Breaking changes
 
+- `GroupEvent` adds `QueuedIntentRefused { group_id, intent_id, intent_kind,
+  reason }` (mdk#2694), forwarded to hosts as `MarmotAppEvent::GroupEvent`.
+  Exhaustive matches add an arm for it.
+
 - `MarmotAppEvent` adds `LinkedDevicesChanged { account_id_hex, account_label }`
   (mdk#2628). Exhaustive matches add an arm for it.
+- `MarmotAppEvent` adds `KeyPackageRefreshOverdueChanged { account_id_hex,
+  account_label }` (mdk#2628). Exhaustive matches add an arm for it.
 
 - `MarmotDeployment::key_package_client_preference` and
   `KeyPackageClientPreference` are removed (mdk#2628). The KeyPackage `client`
@@ -14,11 +20,42 @@
 
 ### Added
 
+- `MarmotAppConfig::device_platform` (`with_device_platform`) names the
+  platform this device runs on. Each device writes it and
+  `key_package_client_name` into its own roster entry with its next KeyPackage
+  announcement, so `linked_devices` shows every device's client and platform
+  (mdk#2628 item 3.6). Blank or over 64 bytes once trimmed is left out.
+- `MarmotAppRuntime::rename_linked_device` renames one of this account's
+  devices, this one included, with one roster commit in the device group
+  (mdk#2628 item 3.6). It goes through the runtime's one roster write path,
+  the one slot announcements use, and is refused with nothing sent
+  (`device_group_busy`) while an earlier change of this device's in the
+  device group is in flight. A rename whose commit loses a fork to one that
+  also changes that device's entry is not made again, and the winning label
+  stands. Refused in release builds until the roster's spec lands.
+- `AppGroupMlsState.convergence_parked` reports a group whose convergence
+  pass spent its failure budget (mdk#2684). Show it as stuck syncing until
+  new group activity arrives or the user retries;
+  `retry_group_convergence` grants the parked pass one more attempt, and a
+  `GroupStateUpdated` follows a scheduled pass that parks.
+- While this device trusts a device group, it tags its KeyPackages and leaves
+  from its own entry in that group's roster, the one at its KeyPackage slot
+  (mdk#2628 item 3.1d). The founder's entry carries its tag signature key
+  from the start; a device that joins sets its own on its next maintenance
+  pass or KeyPackage publication, before it stages a KeyPackage, and each
+  device then replaces its untagged KeyPackage with a tagged one. Maintenance
+  drops a removed device's roster record 30 days after it was recorded.
+  Release builds hold no device group and tag nothing.
 - `MarmotAppRuntime::linked_devices` lists this account's own devices as
   `LinkedDevice`s, from the roster of the device group this device trusts,
   this device first (mdk#2628 item 3.1). `LinkedDevicesChanged` says to
   re-read it, since the device group's own events never reach hosts. Both are
   empty and silent in release builds until the roster's spec lands.
+- `MarmotAppRuntime::key_package_refresh_overdue` says when this device's
+  device group has held its KeyPackage refresh back for a week (mdk#2628 item
+  3.4), so hosts can tell the user before inviters stop treating the device as
+  fresh at 30 days. `KeyPackageRefreshOverdueChanged` says to re-read it. Both
+  are false and silent in release builds until the roster's spec lands.
 - An admin can turn on `marmot.group.account-devices.v1` in an existing group
   (mdk#2628). `AppClient::enable_account_devices` and
   `MarmotAppRuntime::enable_account_devices` send one admin Commit, only when
@@ -301,6 +338,25 @@
 
 ### Fixed
 
+- A convergence pass that fails after its decision no longer replays its
+  batch on every scheduled advance, send and inbound commit (mdk#2684). Each
+  failed attempt waits 1 s, doubling to 5 min, before the next; after 12 in a
+  row the pass parks until a commit or proposal it can take in arrives or
+  the user retries. Count, delay and park survive a restart. Live application
+  traffic does not wake it, and other groups keep their turns meanwhile.
+- A send that waited for the group to settle and is then refused by the
+  settled state no longer blocks the group's queued sends (mdk#2694). An admin
+  change queued by an admin who was demoted before it went out used to fail
+  every later drain, holding back the messages queued behind it. It is now
+  dropped and announced as `GroupEvent::QueuedIntentRefused`, carrying the
+  `intent_id` its queued result returned; nothing retries it.
+
+- Incoming Welcomes use one authenticated unwrap for invitation policy and
+  MLS admission, including rejoin offers that need confirmation. Accounts
+  with blocked users no longer request the same external-signer decryption
+  twice. Blocked invitations remain durably dismissed after unblocking.
+- Rejoin confirmation and retries after trusted removal hold account block-list
+  updates until both MLS admission and the app projection have completed.
 - Account recovery no longer retries a native capture the pass cutoff always
   cuts every ~20 s forever (mdk#2660). A cut capture records no notification
   loss until its source is readmitted without it, counts nothing toward a

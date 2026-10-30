@@ -38,8 +38,9 @@ use zeroize::Zeroizing;
 
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{
-    GroupConfirmationProjection, add_group, fail_if_publish_failed, publish_failure_error,
-    send_summary_from_effects, validate_group_profile,
+    GroupConfirmationProjection, accept_disposition_from_effects, add_group,
+    fail_if_publish_failed, publish_failure_error, send_summary_from_effects,
+    validate_group_profile,
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
@@ -71,6 +72,7 @@ mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
 pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
+mod device_renames;
 pub(crate) mod epoch_stall;
 pub(crate) mod history_notices;
 mod invite_recovery;
@@ -79,7 +81,9 @@ mod push;
 mod receipts;
 pub(crate) mod recovery;
 mod recovery_coverage;
+mod recovery_runner;
 mod retention;
+pub(crate) mod sign_ins;
 mod sync;
 #[cfg(test)]
 mod upload_cleanup_tests;
@@ -89,6 +93,7 @@ pub(crate) use push::PushFetchClock;
 use push::notification_trigger_for_intent;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use push::{AcceptedPushAnnounce, PushAnnounceTiming};
+pub(crate) use recovery_coverage::LiveCoverage;
 #[cfg(test)]
 pub(crate) use sync::ScriptedComparisons;
 #[cfg(test)]
@@ -774,6 +779,11 @@ pub struct AppClient {
     pub(crate) pending_group_projection_updates: HashSet<String>,
     /// Recovery status has its own notification queue; saving a projection must not consume it.
     pub(crate) pending_recovery_status_updates: HashSet<GroupId>,
+    /// Groups whose convergence pass hosts were last told is parked (mdk#2684).
+    /// A park or an un-park against this set owes the host a group-state notice.
+    pub(crate) announced_convergence_parks: HashSet<GroupId>,
+    /// Groups owed that notice; the account worker publishes them each turn.
+    pub(crate) pending_convergence_park_notices: HashSet<GroupId>,
     /// The parked recovery set as last announced to hosts ("history may be
     /// incomplete"): one small entry per parked occurrence, compared at each
     /// publication seam so a change raises `HistoryNoticesChanged`.
@@ -783,6 +793,14 @@ pub struct AppClient {
     /// what hosts last read. The worker's account-level and applied-summary
     /// seams drain it into one `LinkedDevicesChanged`.
     pub(crate) linked_devices_changed: bool,
+    /// The last overdue-refresh answer a maintenance pass computed, and
+    /// whether hosts owe a `KeyPackageRefreshOverdueChanged`. The flag starts
+    /// set, since a fresh client cannot know what hosts last read.
+    pub(crate) key_package_refresh_overdue: Option<bool>,
+    pub(crate) key_package_refresh_overdue_changed: bool,
+    /// When this device next checks its account's KeyPackages for new
+    /// sign-ins (mdk#2628 3.2).
+    pub(crate) sign_in_schedule: sign_ins::SignInSchedule,
     /// Account-queue placement counts at this client's previous
     /// `transport_cursor_advanced` row (or its open), so each row reports
     /// what changed since.
@@ -849,6 +867,8 @@ pub struct AppClient {
     /// Whether the last in-place job's network cutoff skipped or timed out a
     /// route. A pass that finished early and was admitted late was not cut.
     pub(crate) recovery_job_network_cut: bool,
+    /// The coverage ledger's live-boundary recorder state (mdk#2660).
+    pub(crate) live_coverage: tokio::sync::Mutex<recovery_coverage::LiveCoverage>,
     /// Whether the last in-place job's admission stopped at the whole budget.
     pub(crate) recovery_job_admission_expired: bool,
     /// Epoch-stall escalations the detector has raised but no caller has been
@@ -970,6 +990,10 @@ pub struct AppClient {
     /// retirement, for the retry path its callers depend on.
     #[cfg(test)]
     pub(crate) fail_next_terminal_recovery_retire: bool,
+    /// One-shot failure of an explicit convergence retry's advance, after the
+    /// retry re-armed the pass and before any attempt could park it again.
+    #[cfg(test)]
+    pub(crate) fail_next_convergence_retry_advance: bool,
     /// Temporary history subscriptions, floored at each copy's Welcome. One
     /// lives while the group's post-join history fetch is owed, and while a
     /// post-join maintenance obligation waits for its first relay EOSE.
@@ -1322,9 +1346,9 @@ impl AppClient {
             // stable slot that has not promoted a current package yet. Resume
             // or prepare that replacement; republish_key_package deliberately
             // rejects pending rotations and requires a current package.
-            Ok(self.runtime.publish_fresh_key_package().await?)
+            self.publish_fresh_key_package_announced().await
         } else {
-            Ok(self.runtime.republish_key_package().await?)
+            self.republish_key_package_announced().await
         }
     }
 
@@ -1418,8 +1442,12 @@ impl AppClient {
             "sweep",
             crate::ProductUnit::Attempt,
         );
+        self.drive_sign_ins().await;
         let held = self.epoch_gap_held_groups()?;
+        self.sync_key_package_announcement_group()?;
+        self.sync_device_tag_group()?;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
+        self.note_key_package_refresh_overdue();
         let mut activity = self.runtime.take_maintenance_activity();
         activity.absorb(previous);
         // Timed executions replace their matching count-only sample, never add
@@ -1872,7 +1900,7 @@ impl AppClient {
         // SQLCipher lifecycle state is authoritative. On first rollout the
         // publisher imports only the legacy JSON `d` slot, then performs the
         // recorded upgrade replacement under that same slot.
-        Ok(self.runtime.publish_fresh_key_package().await?)
+        self.publish_fresh_key_package_announced().await
     }
 
     /// Ask the relays to stop serving this device's KeyPackage slot before it
@@ -2690,6 +2718,7 @@ impl AppClient {
             epoch: group.epoch.0,
             member_count: crate::groups::member_account_count(&group.members),
             unrecoverable: group.unrecoverable,
+            convergence_parked: self.runtime.convergence_pass_parked(group_id)?,
             required_app_components: group
                 .required_capabilities
                 .app_components
@@ -2894,7 +2923,11 @@ impl AppClient {
         let summary = self
             .invite_members_with_optional_telemetry(group_id, member_refs, &[], None)
             .await?;
-        self.drive_unpublished_welcome_delivery(None).await;
+        // As the account worker does: only a published commit has Welcomes
+        // to send now (mdk#2726).
+        if summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published {
+            self.drive_unpublished_welcome_delivery(None).await;
+        }
         Ok(summary)
     }
 
@@ -3180,6 +3213,14 @@ impl AppClient {
                 return Err(error);
             }
         };
+        // A commit the relays left unresolved is retained for exact retry,
+        // and its staged Welcomes wait for it to confirm. Drop the slot so
+        // whatever drives it next cannot send them early (mdk#2726).
+        if accept_disposition_from_effects(&effects)
+            != cgka_traits::SendAcceptDisposition::Published
+        {
+            self.unpublished_welcome_delivery = None;
+        }
         // The account worker sends the owed snapshot.
         self.push_registration_share_queued |= push_snapshot.is_some();
 
@@ -3510,6 +3551,8 @@ impl AppClient {
         self.pending_local_group_deletion_frontier_clears
             .remove(&group_hex);
         self.pending_recovery_status_updates.remove(group_id);
+        self.announced_convergence_parks.remove(group_id);
+        self.pending_convergence_park_notices.remove(group_id);
         self.pending_projection_updates
             .retain(|update| update.group_id_hex != group_hex);
         self.pending_welcome_delivery_events
@@ -6198,6 +6241,20 @@ impl AppClient {
         // pass re-syncs routes before checkpointing. Refuse it up front rather
         // than publish and then fail that checkpoint.
         self.sync_runtime_groups().await?;
+        // An explicit retry is the user's evidence: a parked or backing-off
+        // pass makes its next attempt now (mdk#2684). The worker's next
+        // schedule read re-arms the group whatever the attempt returns: an
+        // advance that errors before it re-parks the pass would otherwise
+        // leave it due with no wake.
+        if self.runtime.retry_failed_convergence_pass(group_id)? {
+            self.pending_convergence_groups.insert(group_id.clone());
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_convergence_retry_advance) {
+            return Err(AppError::Storage(cgka_traits::storage::StorageError::Busy(
+                "injected convergence retry advance failure".to_owned(),
+            )));
+        }
         let effects = self.runtime.advance_convergence(group_id).await?;
         self.observe_convergence_retry_effects(group_id, &effects)
             .await
@@ -7109,6 +7166,13 @@ impl AppClient {
         effects: &marmot_session::AccountDeviceEffects,
     ) {
         for report in &effects.superseded_intents {
+            // A roster update this device made may have carried a sign-in
+            // rejection (mdk#2628 3.2).
+            if report.kind == cgka_traits::engine::SupersededIntentKind::AppComponents
+                && self.is_device_group(&report.group_id).unwrap_or(true)
+            {
+                self.recheck_sign_in_rejections();
+            }
             if !self.host_may_see_group(&report.group_id) {
                 continue;
             }
@@ -7528,7 +7592,9 @@ impl AppClient {
     }
 
     /// Prepare one bounded startup retry for every engine-authoritative
-    /// outstanding Welcome.
+    /// outstanding Welcome. The same read lets the runtime watch the Welcomes
+    /// still staged with their commits, so maintenance delivers them once
+    /// those commits confirm.
     ///
     /// Only relay I/O moves into the returned task. Exact artifacts, endpoint
     /// snapshots, and attempt reservations are durable/owned by this client so
@@ -7537,35 +7603,12 @@ impl AppClient {
     pub(crate) fn prepare_pending_welcome_delivery_recovery_best_effort(
         &mut self,
     ) -> Option<PendingWelcomeDeliveryRecovery> {
-        let pending = match self.runtime.outstanding_welcome_deliveries() {
-            Ok(pending) => pending,
-            Err(error) => {
-                let error = AppError::from(error);
-                tracing::warn!(
-                    target: "marmot_app::client",
-                    method = "prepare_pending_welcome_delivery_recovery_best_effort",
-                    error_kind = error.privacy_safe_kind(),
-                    "could not enumerate retained Welcome obligations at startup"
-                );
-                return None;
-            }
-        };
-        if pending.is_empty() {
-            return None;
-        }
-        let welcome_ids = pending
-            .iter()
-            .map(|(_, welcome)| hex::encode(welcome.id.as_slice()))
-            .collect::<Vec<_>>();
-        let welcomes = pending
-            .into_iter()
-            .map(|(_, welcome)| welcome)
-            .collect::<Vec<_>>();
-        let publish = match self
+        let (welcome_ids, publish) = match self
             .runtime
-            .prepare_welcome_retry_task_with_audit_context(welcomes, AuditEventContext::default())
+            .prepare_owed_welcome_retry_task_with_audit_context(AuditEventContext::default())
         {
-            Ok(publish) => publish,
+            Ok(Some((welcome_ids, publish))) => (welcome_ids, publish),
+            Ok(None) => return None,
             Err(error) => {
                 tracing::warn!(
                     target: "marmot_app::client",
@@ -7576,6 +7619,10 @@ impl AppClient {
                 return None;
             }
         };
+        let welcome_ids = welcome_ids
+            .iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect::<Vec<_>>();
         let observation = if publish.message_ids().is_empty() {
             None
         } else {

@@ -486,6 +486,14 @@ pub(crate) enum AccountWorkerCommand {
     LinkedDevices {
         respond: oneshot::Sender<Result<Vec<crate::LinkedDevice>, AppError>>,
     },
+    KeyPackageRefreshOverdue {
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
+    RenameLinkedDevice {
+        slot_id_hex: String,
+        label: String,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     DismissHistoryNotice {
         notice_id: String,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -2125,6 +2133,16 @@ async fn run_app_runtime_account_worker(
         );
         schedule_push_work_after_turn(&mut client, &mut scheduled_push_retry, &command_tx);
         schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+        // Whichever seam parked or woke a convergence pass (mdk#2684), its
+        // schedule read above queued the notice.
+        for group_id in client.take_convergence_park_notices() {
+            publish_app_runtime_group_state_updated(
+                &events,
+                &account_id_hex,
+                &account_label,
+                &group_id,
+            );
+        }
         let ready_command =
             ready_command_index(&pending, &media_http, comparison_recovery.is_some());
         #[cfg(test)]
@@ -2507,6 +2525,12 @@ async fn run_app_runtime_account_worker(
                                             &account_label,
                                             account_error_message("scheduled convergence failed", &err),
                                         );
+                                        // A failure that spent the pass's budget
+                                        // parks it (mdk#2684); the next turn
+                                        // tells hosts to re-read the group.
+                                        if let Ok(parked) = client.convergence_pass_parked(&group_id) {
+                                            client.note_convergence_park(&group_id, parked);
+                                        }
                                     }
                                 }
                             }
@@ -5732,6 +5756,24 @@ fn account_worker_command_future<'a>(
             );
             true
         }),
+        AccountWorkerCommand::KeyPackageRefreshOverdue { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.key_package_refresh_overdue(),
+            );
+            true
+        }),
+        AccountWorkerCommand::RenameLinkedDevice {
+            slot_id_hex,
+            label,
+            respond,
+        } => Box::pin(async move {
+            let result = client.rename_linked_device(&slot_id_hex, &label).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::AcknowledgeGroupCatchingUp { group_id, respond } => {
             Box::pin(async move {
                 let _ = respond_diagnosed(
@@ -7856,7 +7898,7 @@ fn publish_client_pending_applied_summary(
     publish_app_runtime_summary_with_v5(client, events, account_id_hex, account_label, &summary);
     // Startup and reconnect reconcile device-group trust before reaching
     // here, and no account-level seam follows them until the next command.
-    publish_linked_device_changes(client, events, account_id_hex, account_label);
+    publish_device_group_changes(client, events, account_id_hex, account_label);
 }
 
 /// Announce account-level changes. A change in the parked recovery set
@@ -7865,7 +7907,7 @@ fn publish_client_pending_applied_summary(
 /// disappeared, so hosts re-read that group's `GroupRecoveryStatus`. Parking,
 /// un-parking by new evidence and dismissal all surface at the next seam that
 /// calls this; each call is one indexed read of the parked set. It also
-/// announces linked-device changes ([`publish_linked_device_changes`]).
+/// announces device-group changes ([`publish_device_group_changes`]).
 fn publish_account_level_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -7874,7 +7916,7 @@ fn publish_account_level_changes(
 ) {
     // Record queued subscription refusals off relay paths.
     client.record_subscription_refusals();
-    publish_linked_device_changes(client, events, account_id_hex, account_label);
+    publish_device_group_changes(client, events, account_id_hex, account_label);
     let Some(groups) = client.take_history_notice_changes() else {
         return;
     };
@@ -7888,10 +7930,12 @@ fn publish_account_level_changes(
 }
 
 /// One `LinkedDevicesChanged` for a hidden device-group event or a change of
-/// device-group trust since the last call. Both the account-level seam and
-/// the applied-summary seam drain it, so startup, reconnect and every command
-/// and delivery announce it.
-fn publish_linked_device_changes(
+/// device-group trust since the last call, and one
+/// `KeyPackageRefreshOverdueChanged` for a maintenance pass that changed the
+/// overdue-refresh answer. Both the account-level seam and the
+/// applied-summary seam drain them, so startup, reconnect, maintenance and
+/// every command and delivery announce them.
+fn publish_device_group_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -7899,6 +7943,12 @@ fn publish_linked_device_changes(
 ) {
     if client.take_linked_devices_changed() {
         let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+    if client.take_key_package_refresh_overdue_changed() {
+        let _ = events.send(MarmotAppEvent::KeyPackageRefreshOverdueChanged {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
         });
@@ -10672,6 +10722,47 @@ mod tests {
             .may_change_push_registration_work(),
             "unrelated convergence commands must not arm push maintenance"
         );
+    }
+
+    /// A frozen batch that failed reports its retry delay as a collecting wait
+    /// (mdk#2684). Other groups take the worker's turns meanwhile, and a parked
+    /// batch leaves no deadline at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_convergence_pass_waits_out_its_retry_behind_other_groups() {
+        let failing = test_group_id(43);
+        let other = test_group_id(44);
+        let retry_after = Duration::from_secs(16);
+        let mut scheduled = ScheduledConvergence::new(Duration::ZERO);
+
+        // The failed attempt arms the worker's error backoff; the wake it
+        // gives finds the batch still waiting and re-arms at its retry time.
+        scheduled.schedule_retry_groups([failing.clone()]);
+        tokio::time::advance(retry_delay_for_attempt(1)).await;
+        assert_eq!(scheduled.take_ready(), Some(failing.clone()));
+        scheduled.schedule_after_pass(
+            &failing,
+            ConvergenceScheduleState::Collecting {
+                remaining_ms: retry_after.as_millis() as u64,
+            },
+        );
+        for _ in 0..3 {
+            scheduled.schedule_after_pass(&other, ConvergenceScheduleState::Ready);
+            tokio::time::advance(MIN_CONVERGENCE_SETTLEMENT_DELAY).await;
+            assert!(scheduled.has_ready());
+            assert_eq!(scheduled.take_ready(), Some(other.clone()));
+        }
+        assert!(!scheduled.has_ready());
+        assert!(!scheduled.retry_attempts.contains_key(&failing));
+
+        tokio::time::advance(
+            retry_after + Duration::from_millis(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
+        )
+        .await;
+        assert_eq!(scheduled.take_ready(), Some(failing.clone()));
+        // Out of budget: the parked batch reports no work and keeps no timer.
+        scheduled.schedule_after_pass(&failing, ConvergenceScheduleState::Idle);
+        assert!(scheduled.deadlines.is_empty());
+        assert_eq!(scheduled.take_ready(), None);
     }
 
     /// A runnable retained replay wakes once; failures use bounded error

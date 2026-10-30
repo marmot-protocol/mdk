@@ -372,9 +372,11 @@ advance_convergence(group_id) -> Vec<SendResult>
 ```
 
 When convergence reaches `Settled`, the engine regenerates publishable messages from the selected canonical state and
-removes each queued intent after regeneration succeeds. If regeneration creates a commit, the engine returns that one
-`SendResult::GroupEvolution` and pauses further draining until the application reports `confirm_published` or
-`publish_failed`. Calling `advance_convergence` during that pending-publish window returns no publishable work.
+removes each queued intent after regeneration succeeds. An intent the settled state refuses is removed too, announced as
+`GroupEvent::QueuedIntentRefused`, and never regenerated; later queued work still drains. If regeneration creates a
+commit, the engine returns that one `SendResult::GroupEvolution` and pauses further draining until the application
+reports `confirm_published` or `publish_failed`. Calling `advance_convergence` during that pending-publish window
+returns no publishable work.
 
 ## Result
 

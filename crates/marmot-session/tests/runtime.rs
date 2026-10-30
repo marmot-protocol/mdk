@@ -40,7 +40,7 @@ use marmot_session::{
     KeyPackageSlotWithdrawal, MaintenanceRandom, MaintenanceTiming, MonotonicClock,
     NoopKeyPackagePublisher, PendingResolution, PublishWork, PublishedApplicationMessage,
     SessionConfig, SessionError, StaticTransportRouting, TransportRoutingError,
-    TransportRoutingPolicy, WallClock,
+    TransportRoutingPolicy, WallClock, WelcomeWithdrawal,
 };
 use nostr::prelude::FinalizeEvent;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
@@ -732,6 +732,9 @@ include!("runtime/multi_device_welcome.rs");
 include!("runtime/key_package_slot.rs");
 include!("runtime/key_package_slot_withdrawal.rs");
 include!("runtime/account_devices_advertising.rs");
+include!("runtime/welcome_withdrawal.rs");
+include!("runtime/staged_invite_welcome.rs");
+include!("runtime/welcome_delivery.rs");
 
 #[derive(Clone, Default)]
 struct RecordingKeyPackages {
@@ -1420,6 +1423,40 @@ async fn key_package_rotation_reuses_stable_slot_and_monotonically_advances_crea
         lifecycle.retained_private_material[0].key_package,
         publications[0].key_package
     );
+}
+
+#[tokio::test]
+async fn an_unannounced_key_package_never_reaches_the_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp announcement gate key").unwrap();
+    let publisher = RecordingKeyPackages::default();
+    let mut runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        publisher.clone(),
+    );
+    // A device group this device cannot read: nothing can announce there.
+    runtime.set_key_package_announcement_group(Some(GroupId::new(vec![7; 16])));
+    let error = runtime.publish_fresh_key_package().await.unwrap_err();
+    assert!(matches!(error, AccountError::KeyPackageAnnouncementPending));
+    assert!(publisher.publications().is_empty());
+    let staged = runtime
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap()
+        .pending_replacement
+        .unwrap();
+    // Maintenance makes no announcement it cannot, and publishes nothing.
+    runtime.run_due_maintenance().await.unwrap();
+    assert!(publisher.publications().is_empty());
+
+    // With no device group, the same staged KeyPackage goes out.
+    runtime.set_key_package_announcement_group(None);
+    let published = runtime.publish_fresh_key_package().await.unwrap();
+    assert_eq!(published, staged.key_package);
+    assert_eq!(publisher.publications().len(), 1);
 }
 
 #[tokio::test]

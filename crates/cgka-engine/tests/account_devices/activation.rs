@@ -357,6 +357,15 @@ async fn a_queued_activation_refused_on_the_settled_state_is_retired() {
         "the refused activation is retired"
     );
     assert!(
+        alice.engine.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::QueuedIntentRefused { intent_kind, reason, .. }
+                if intent_kind == "enable_account_devices"
+                    && reason == "account_devices_activation_refused"
+        )),
+        "the host learns the queued activation was dropped"
+    );
+    assert!(
         matches!(drained.as_slice(), [SendResult::GroupEvolution { .. }]),
         "the self-update queued after it still drains: {drained:?}"
     );

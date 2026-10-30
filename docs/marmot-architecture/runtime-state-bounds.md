@@ -81,6 +81,12 @@ only telemetry, a closed operation and timing metadata, never a client or storag
 | --- | --- | --- |
 | `Engine::authority_recovery_attempts`, `Engine::authority_recovery_seen` | At most one entry per durable unresolved moderation control encountered in the current or previous cursor pass; input-relative to retained source records, never ordinary chat history. Each maintenance call visits at most 32 requests. Fingerprints identify one named snapshot rather than the whole live group. | Resolved entries are removed immediately; each completed cursor pass removes entries whose requests disappeared. Source-byte pruning and group deletion remove durable requests atomically. Engine drop clears both caches; restart may retry once against unchanged evidence. No secret-derived fingerprint is logged or persisted. |
 
+### `cgka-engine` device-group Welcome expectations (`src/group_lifecycle.rs`, `marmot-app` `src/client/device_group.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `cgka_device_group_welcome_expectations` | One row per device group a confirmed link waits to join: a group id, the expected sender's signature key and a deadline. The app records one only alongside its `awaiting_welcome` row, and an account holds at most one such row, so at most one in practice. | The join it admits deletes it in the same transaction. The app deletes it before the row when the link is withdrawn or its 10-minute wait ends (`end_welcome_waits`, on every new link and every reconcile), which also drops a waiting row left without its expectation. |
+
 ### `storage-sqlite` durable moderation (`src/timeline/reports.rs`, `src/timeline.rs`)
 
 These are input-relative durable bounds, not fixed account-wide row or byte caps. Moderation evidence must remain
@@ -153,6 +159,7 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | `AppClient.linked_devices_changed` | One flag | Set at open and by a hidden device-group event or a change of device-group trust; cleared at the next account-level or applied-summary publication seam, which announces `LinkedDevicesChanged`; dropped with the client, whose replacement opens with it set. |
+| `AppClient.key_package_refresh_overdue` and `key_package_refresh_overdue_changed` | One `Option<bool>` and one flag | The answer is replaced after each maintenance pass; a change sets the flag, which the next account-level or applied-summary publication seam clears by announcing `KeyPackageRefreshOverdueChanged`. Both are dropped with the client, whose replacement opens with the flag set. |
 | `AppClient.history_notice_baseline` | One entry (16-byte obligation id, revision, optional group id) per parked recovery obligation; input-relative to the parked demand keys, not to history | Replaced wholesale from one indexed read at each publication seam; dropped with the client. Losing it costs at most one extra `HistoryNoticesChanged`. |
 | `AppClient.encrypted_media_not_required_epochs` | One `u64` per live projected group (mdk#1380) | Pruned to the live group set at the start of every warm pass; stale entries are evicted when the group epoch advances and an authoritative re-check finds the component required; the whole map is dropped with the client. Entries are only ever inserted after a successful authoritative negative, so map loss or eviction costs at most one `MlsGroup::load` re-check, never a wrong skip. |
 | Avatar acquisition | At most 2,048 jobs, each descriptor at most 16 KiB; at most four HTTP/results across foreground media and avatar work, with one permit kept free by background admission | Job rows cascade with asset eviction/removal. Selected source changes replace demand atomically. Interrupted work resumes after worker reconstruction; retry deadlines persist and 16 consecutive transient failures slow to one daily probe. Worker exit cancels active I/O. |

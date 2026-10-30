@@ -35,12 +35,14 @@ use transport_nostr_peeler::{
 use crate::network_proxy as process_proxy;
 use crate::sweep::hint_tap::{EoseHints, HintTransport};
 use crate::{
-    NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
-    NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
-    NostrAcquisitionScope, NostrAcquisitionStats, NostrEventPublishRequest, NostrNotificationLoss,
+    DeliveryRoute, MAX_DELIVERY_LOSS_ROUTES, NostrAcquisitionCancellation, NostrAcquisitionEnd,
+    NostrAcquisitionEndpoint, NostrAcquisitionError, NostrAcquisitionLimits,
+    NostrAcquisitionRequest, NostrAcquisitionResult, NostrAcquisitionScope, NostrAcquisitionStats,
+    NostrEventPublishRequest, NostrNotificationLoss, NostrNotificationLossBounds,
     NostrNotificationLossFloor, NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome,
     NostrRelayClient, NostrRelayEvent, NostrSubscribeReport, NostrSubscription,
-    NostrTransportAdapter, ReplayRestart, SubscriptionRefusal, SubscriptionRefusalDisposition,
+    NostrTransportAdapter, RelayConnection, ReplayRestart, SubscriptionRefusal,
+    SubscriptionRefusalDisposition,
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
@@ -662,8 +664,9 @@ pub struct RelayRegistrationOutcome {
     pub accepted: bool,
 }
 
-/// The `since` floors of the REQs one account context issued, which bound the
-/// events a lag on its notification receiver can lose.
+/// The `since` floors of the REQs one account context issued, and the routes
+/// each selects, which bound the events a lag on its notification receiver can
+/// lose.
 ///
 /// Deliveries are routed by message content, not by subscription id
 /// (`AdapterState::routes_for`), and the SDK does not verify subscription ids
@@ -673,46 +676,81 @@ pub struct RelayRegistrationOutcome {
 /// CLOSE. Neither has a deadline. A stalled consumer keeps them buffered, and
 /// a relay with a deep outbound backlog keeps sending them for as long as the
 /// backlog takes to drain. So a closed REQ's floor bounds the receiver's loss
-/// for the rest of the context's life. Only the lowest closed floor matters.
+/// for the rest of the context's life. Only the lowest closed floor matters,
+/// overall and on each route.
 #[derive(Debug, Default)]
 struct SubscriptionFloors {
-    /// Filter `since` of each live REQ, in Unix seconds; `None` is unfloored.
-    live: HashMap<SubscriptionId, Option<u64>>,
+    live: HashMap<SubscriptionId, RequestFloor>,
     /// The lowest floor among the REQs this context closed, replaced, or
     /// abandoned.
     retired: Option<NostrNotificationLossFloor>,
+    /// The lowest floor per route among those REQs, unless one of them was
+    /// unfloored, its routes were unknown, or they passed
+    /// [`MAX_DELIVERY_LOSS_ROUTES`], which empties the map.
+    retired_routes: BTreeMap<DeliveryRoute, u64>,
+    retired_routes_unknown: bool,
+}
+
+/// One REQ's filter `since` in Unix seconds (`None` is unfloored), and the
+/// routes it selects (`None` when they are unknown).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestFloor {
+    since: Option<u64>,
+    routes: Option<Vec<DeliveryRoute>>,
+}
+
+impl RequestFloor {
+    fn floor(&self) -> NostrNotificationLossFloor {
+        NostrNotificationLossFloor::from_since(self.since)
+    }
+}
+
+/// Lower `routes`' floor for each of `request`'s routes to its `since`.
+/// `false` when the request has no floor or no known routes, or the routes
+/// pass the cap.
+fn lower_route_floors(routes: &mut BTreeMap<DeliveryRoute, u64>, request: &RequestFloor) -> bool {
+    let (Some(since), Some(selected)) = (request.since, &request.routes) else {
+        return false;
+    };
+    for route in selected {
+        routes
+            .entry(*route)
+            .and_modify(|floor| *floor = (*floor).min(since))
+            .or_insert(since);
+    }
+    routes.len() <= MAX_DELIVERY_LOSS_ROUTES
 }
 
 impl SubscriptionFloors {
     /// Record a REQ before it goes out, returning the floor it replaces under
     /// the same id. A replaced filter's frames can still arrive, so its floor
     /// is retired rather than forgotten.
-    fn open(&mut self, id: &SubscriptionId, since: Option<u64>) -> Option<Option<u64>> {
-        let replaced = self.live.insert(id.clone(), since);
-        if let Some(previous) = replaced
-            && previous != since
+    fn open(&mut self, id: &SubscriptionId, request: RequestFloor) -> Option<RequestFloor> {
+        let replaced = self.live.insert(id.clone(), request.clone());
+        if let Some(previous) = &replaced
+            && *previous != request
         {
-            self.retire(NostrNotificationLossFloor::from_since(previous));
+            self.retire(previous.clone());
         }
         replaced
     }
 
     /// A REQ that failed may still have reached a relay: retire its floor, and
     /// restore the floor of the REQ it would have replaced.
-    fn abandon(&mut self, id: &SubscriptionId, replaced: Option<Option<u64>>) {
-        let since = match replaced {
+    fn abandon(&mut self, id: &SubscriptionId, replaced: Option<RequestFloor>) {
+        let request = match replaced {
             Some(previous) => self.live.insert(id.clone(), previous),
             None => self.live.remove(id),
         };
-        if let Some(since) = since {
-            self.retire(NostrNotificationLossFloor::from_since(since));
+        if let Some(request) = request {
+            self.retire(request);
         }
     }
 
     /// The REQ's CLOSE went out.
     fn close(&mut self, id: &SubscriptionId) {
-        if let Some(since) = self.live.remove(id) {
-            self.retire(NostrNotificationLossFloor::from_since(since));
+        if let Some(request) = self.live.remove(id) {
+            self.retire(request);
         }
     }
 
@@ -723,29 +761,51 @@ impl SubscriptionFloors {
         let closed = self
             .live
             .extract_if(|id, _| !still_live.contains(id))
-            .map(|(_, since)| NostrNotificationLossFloor::from_since(since))
+            .map(|(_, request)| request)
             .collect::<Vec<_>>();
-        for floor in closed {
-            self.retire(floor);
+        for request in closed {
+            self.retire(request);
         }
     }
 
-    fn retire(&mut self, floor: NostrNotificationLossFloor) {
+    fn retire(&mut self, request: RequestFloor) {
+        let floor = request.floor();
         self.retired = Some(self.retired.map_or(floor, |kept| kept.lowest(floor)));
+        if !self.retired_routes_unknown && !lower_route_floors(&mut self.retired_routes, &request) {
+            self.retired_routes.clear();
+            self.retired_routes_unknown = true;
+        }
     }
 
-    /// The lowest floor among live REQs and every REQ this context closed.
-    /// With neither, there is no REQ evidence at all. That reads as
-    /// unbounded, not as no loss: the lost notifications then came from a
-    /// REQ this record never saw.
-    fn loss_floor(&self) -> NostrNotificationLossFloor {
-        self.live
+    /// The lowest floor among live REQs and every REQ this context closed,
+    /// and each route's. With neither, there is no REQ evidence at all. That
+    /// reads as unbounded, not as no loss: the lost notifications then came
+    /// from a REQ this record never saw.
+    fn loss_bounds(&self) -> NostrNotificationLossBounds {
+        let floor = self
+            .live
             .values()
-            .copied()
-            .map(NostrNotificationLossFloor::from_since)
+            .map(RequestFloor::floor)
             .chain(self.retired)
             .reduce(NostrNotificationLossFloor::lowest)
-            .unwrap_or(NostrNotificationLossFloor::Unbounded)
+            .unwrap_or(NostrNotificationLossFloor::Unbounded);
+        NostrNotificationLossBounds {
+            floor,
+            routes: self.loss_routes(),
+        }
+    }
+
+    fn loss_routes(&self) -> Option<BTreeMap<DeliveryRoute, u64>> {
+        if self.retired_routes_unknown {
+            return None;
+        }
+        let mut routes = self.retired_routes.clone();
+        for request in self.live.values() {
+            if !lower_route_floors(&mut routes, request) {
+                return None;
+            }
+        }
+        (!routes.is_empty()).then_some(routes)
     }
 }
 
@@ -870,6 +930,17 @@ pub enum NostrSdkNotification {
         endpoint: TransportEndpoint,
         epoch: [u64; 2],
         reason: ReplayRestart,
+        /// The SDK's record of when this connection opened, taken before it
+        /// sent REQs on it; `None` when the frontier cannot tie that record
+        /// to this connection.
+        connected_at: Option<u64>,
+    },
+    /// The relay left `Connected`: its live REQs stopped streaming at this
+    /// point in the ordered stream, until the next connection's boundary.
+    Disconnected {
+        endpoint: TransportEndpoint,
+        /// The connection that ended.
+        epoch: [u64; 2],
     },
     /// An SDK payload and the replay generation captured beside it.
     Payload {
@@ -894,10 +965,61 @@ fn next_reader_epoch() -> u64 {
 }
 
 struct RelayFrontier {
+    /// The relay object this entry monitors, read for its connection now.
+    relay: Relay,
     monitor_id: u64,
     connection: u64,
     reason: ReplayRestart,
+    /// The relay's last observed status was `Connected`.
+    connected: bool,
+    /// The connections the SDK had counted for this relay before the monitor
+    /// subscribed, plus each `Connected` it has seen since: never more than
+    /// the latest connection it saw open.
+    connections_seen: usize,
+    /// [`connection_stamp`] for the latest connection it saw open.
+    connected_at: Option<u64>,
     monitor: JoinHandle<()>,
+}
+
+/// When the SDK recorded `relay`'s latest connection opening, if that is no
+/// later than the `seen`th connection it counted. The SDK counts a connection,
+/// records its time, and only then sends REQs on it; reading the time before
+/// the count never pairs a later connection's time with a count of `seen`.
+fn connection_stamp(relay: &Relay, seen: usize) -> Option<u64> {
+    let stats = relay.stats();
+    let connected_at = stats.connected_at().as_secs();
+    (connected_at > 0 && stats.success() <= seen).then_some(connected_at)
+}
+
+/// A relay's connection state, as the SDK keeps it.
+trait ConnectionProbe {
+    fn attempts(&self) -> usize;
+    fn status(&self) -> RelayStatus;
+}
+
+impl ConnectionProbe for Relay {
+    fn attempts(&self) -> usize {
+        self.stats().attempts()
+    }
+
+    fn status(&self) -> RelayStatus {
+        Relay::status(self)
+    }
+}
+
+/// The connection attempt `relay` is connected on now, if it is connected.
+///
+/// The SDK marks a relay `Connecting`, then counts the attempt, then marks it
+/// `Connected` once the socket opens, and only then counts the success and
+/// records its time (all sequentially consistent). So a `Connected` read
+/// between two equal attempt counts belongs to that attempt: a later attempt
+/// counts itself before its own `Connected`, and moves the second count. The
+/// success count would not do: a new connection reads `Connected` before
+/// its success is counted.
+fn current_connection(relay: &impl ConnectionProbe) -> Option<usize> {
+    let attempt = relay.attempts();
+    let connected = relay.status() == RelayStatus::Connected;
+    (connected && relay.attempts() == attempt).then_some(attempt)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -915,6 +1037,23 @@ struct FrontierState {
     shutdown_monitor: Option<JoinHandle<()>>,
     shutdown: bool,
     scope: NostrNotificationLossScope,
+}
+
+impl FrontierState {
+    /// A shutdown aborts the relay monitors, which would otherwise report each
+    /// relay leaving `Connected`; end every connection still open here first,
+    /// so no live REQ appears to stream past the client that carried it.
+    fn disconnect_all(&mut self, sender: &broadcast::Sender<NostrSdkNotification>) {
+        let reader = self.reader;
+        for (url, entry) in &mut self.relays {
+            if std::mem::take(&mut entry.connected) {
+                let _ = sender.send(NostrSdkNotification::Disconnected {
+                    endpoint: TransportEndpoint(url.to_string()),
+                    epoch: [reader, entry.connection],
+                });
+            }
+        }
+    }
 }
 
 struct SdkNotificationFrontier {
@@ -993,15 +1132,26 @@ impl SdkNotificationFrontier {
         self.cutover_locked(&mut state, skipped);
     }
 
-    fn cutover_relay(&self, url: &RelayUrl, monitor_id: u64, skipped: u64) -> bool {
+    /// `connections_seen` is the SDK's count read before resubscribing: the
+    /// skipped notifications may have held any number of `Connected`.
+    fn cutover_relay(
+        &self,
+        relay: &Relay,
+        url: &RelayUrl,
+        monitor_id: u64,
+        skipped: u64,
+        connections_seen: usize,
+    ) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if !state
+        let Some(entry) = state
             .relays
-            .get(url)
-            .is_some_and(|relay| relay.monitor_id == monitor_id)
-        {
+            .get_mut(url)
+            .filter(|entry| entry.monitor_id == monitor_id)
+        else {
             return false;
-        }
+        };
+        entry.connections_seen = connections_seen;
+        entry.connected_at = connection_stamp(relay, connections_seen);
         self.cutover_locked(&mut state, skipped);
         true
     }
@@ -1047,6 +1197,7 @@ impl SdkNotificationFrontier {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 state.shutdown = true;
+                state.disconnect_all(&frontier.sender);
                 for relay in state.relays.values() {
                     relay.monitor.abort();
                 }
@@ -1092,6 +1243,20 @@ impl SdkNotificationFrontier {
         tokio::spawn(async move { owed.resend(&relay).await });
     }
 
+    /// The connection `url` is on now, named by this frontier's monitor of
+    /// its relay object and the SDK's attempt count. A replaced relay object
+    /// gets a new monitor, so its fresh counts never match an old one; a
+    /// shut-down frontier names none.
+    fn connection(&self, url: &RelayUrl) -> Option<RelayConnection> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.shutdown {
+            return None;
+        }
+        let entry = state.relays.get(url)?;
+        let attempt = current_connection(&entry.relay)?;
+        Some(RelayConnection::new(entry.monitor_id, attempt))
+    }
+
     fn detach(&self, endpoint: &RelayUrl) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = state.relays.remove(endpoint) {
@@ -1114,8 +1279,16 @@ impl SdkNotificationFrontier {
         if let Some(entry) = state.relays.get(&url) {
             entry.monitor.abort();
         }
+        // Count before subscribing: every `Connected` received afterwards is
+        // a later connection.
+        let connections_seen = relay.stats().success();
         // Subscribe synchronously, before the caller can issue connect/REQ.
         let mut notifications = relay.notifications_with_gaps();
+        let connected = relay.status() == RelayStatus::Connected;
+        let connected_at = connected
+            .then(|| connection_stamp(relay, connections_seen))
+            .flatten();
+        let entry_relay = relay.clone();
         let relay = relay.clone();
         let weak = Arc::downgrade(self);
         let monitor_url = url.clone();
@@ -1130,8 +1303,15 @@ impl SdkNotificationFrontier {
                         // A skipped Connected boundary makes the retained
                         // native tail ambiguous. Subscribe at the new frontier
                         // instead of relabelling its old EOSE as fresh input.
+                        let connections_seen = relay.stats().success();
                         notifications = relay.notifications_with_gaps();
-                        if !frontier.cutover_relay(&monitor_url, monitor_id, skipped) {
+                        if !frontier.cutover_relay(
+                            &relay,
+                            &monitor_url,
+                            monitor_id,
+                            skipped,
+                            connections_seen,
+                        ) {
                             return;
                         }
                         // The skipped notifications may hold its `Connected`.
@@ -1161,14 +1341,30 @@ impl SdkNotificationFrontier {
                                 entry.connection =
                                     SDK_CONNECTION_EPOCH.fetch_add(1, Ordering::SeqCst);
                                 entry.reason = ReplayRestart::Connection;
+                                entry.connected = true;
+                                entry.connections_seen += 1;
+                                entry.connected_at =
+                                    connection_stamp(&relay, entry.connections_seen);
                                 let _ = frontier.sender.send(NostrSdkNotification::Replay {
                                     endpoint: TransportEndpoint(monitor_url.to_string()),
                                     epoch: [reader, entry.connection],
                                     reason: entry.reason,
+                                    connected_at: entry.connected_at,
                                 });
                                 // After the boundary, so the re-sent REQs'
                                 // replay belongs to this connection.
                                 frontier.resend_owed(&relay);
+                                continue;
+                            }
+                            // Leaving `Connected` stops every live REQ there.
+                            RelayNotification::RelayStatus { .. } => {
+                                if std::mem::take(&mut entry.connected) {
+                                    let _ =
+                                        frontier.sender.send(NostrSdkNotification::Disconnected {
+                                            endpoint: TransportEndpoint(monitor_url.to_string()),
+                                            epoch: [reader, entry.connection],
+                                        });
+                                }
                                 continue;
                             }
                             // AUTH only restores REQs the relay closed. Active
@@ -1201,9 +1397,13 @@ impl SdkNotificationFrontier {
         state.relays.insert(
             url,
             RelayFrontier {
+                relay: entry_relay,
                 monitor_id,
                 connection,
                 reason: ReplayRestart::Connection,
+                connected,
+                connections_seen,
+                connected_at,
                 monitor,
             },
         );
@@ -1259,6 +1459,7 @@ impl SdkFrontierReader {
                         endpoint: TransportEndpoint(url.to_string()),
                         epoch: [state.reader, relay.connection],
                         reason: relay.reason,
+                        connected_at: relay.connected_at,
                     },
                 ))
             }
@@ -1693,9 +1894,16 @@ pub async fn dispatch_sdk_replay(
             endpoint,
             epoch,
             reason,
+            connected_at,
         } => {
             adapter
-                .observe_replay_epoch(account_id, &endpoint, epoch, reason)
+                .observe_replay_boundary(account_id, &endpoint, epoch, reason, connected_at)
+                .await;
+            false
+        }
+        NostrSdkNotification::Disconnected { endpoint, epoch } => {
+            adapter
+                .observe_replay_disconnect(account_id, &endpoint, epoch)
                 .await;
             false
         }
@@ -1998,6 +2206,7 @@ impl NostrSdkRelayClient {
                     Ok(notification) => {
                         let epoch = match &notification {
                             NostrSdkNotification::Replay { epoch, .. }
+                            | NostrSdkNotification::Disconnected { epoch, .. }
                             | NostrSdkNotification::Payload { epoch, .. } => Some(*epoch),
                             NostrSdkNotification::Shutdown => None,
                         };
@@ -2092,6 +2301,7 @@ impl NostrSdkRelayClient {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             state.shutdown = true;
+            state.disconnect_all(&self.frontier.sender);
             let _ = self.frontier.sender.send(NostrSdkNotification::Shutdown);
             let mut monitors = std::mem::take(&mut state.relays)
                 .into_values()
@@ -2117,10 +2327,19 @@ impl NostrSdkRelayClient {
     /// reports [`NostrNotificationLossFloor::Unbounded`]: its receiver's loss
     /// cannot be attributed to one account's REQs.
     pub fn notification_loss_floor(&self) -> NostrNotificationLossFloor {
+        self.notification_loss_bounds().floor
+    }
+
+    /// [`Self::notification_loss_floor`], and each route's own: the lowest
+    /// `since` among the REQs that select it. Routes are known only when
+    /// every REQ names its routes and has a floor.
+    pub fn notification_loss_bounds(&self) -> NostrNotificationLossBounds {
         if self.account_id.is_none() {
-            return NostrNotificationLossFloor::Unbounded;
+            return NostrNotificationLossBounds::account_wide(
+                NostrNotificationLossFloor::Unbounded,
+            );
         }
-        self.subscription_floors().loss_floor()
+        self.subscription_floors().loss_bounds()
     }
 
     /// [`Self::notification_loss_floor`] of the account context a
@@ -3688,8 +3907,11 @@ impl NostrSdkRelayClient {
         // Record the floor before any relay can answer, as the adapter records
         // routes before the REQ: a lag can lose the very first reply.
         let id = plan.subscription_id.clone();
-        let since = plan.filter.since.map(|since| since.as_secs());
-        let replaced = self.subscription_floors().open(&id, since);
+        let request = RequestFloor {
+            since: plan.filter.since.map(|since| since.as_secs()),
+            routes: subscription.delivery_routes(),
+        };
+        let replaced = self.subscription_floors().open(&id, request);
         let result = self.subscribe_planned(plan).await;
         if result.is_err() {
             // The REQ may have reached a relay before the failure.
@@ -4735,6 +4957,25 @@ impl NostrSdkRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for NostrSdkRelayClient {
+    /// A multi-account root answers from the account's own context, which
+    /// carries its REQs; a removed or shut-down context, or one the map is
+    /// busy registering, names no connection.
+    fn relay_connection(
+        &self,
+        account: &MemberId,
+        endpoint: &TransportEndpoint,
+    ) -> Option<RelayConnection> {
+        let url = RelayUrl::parse(endpoint.as_str()).ok()?;
+        if self.require_account_context {
+            let clients = self.account_clients.try_read().ok()?;
+            return clients.get(account)?.frontier.connection(&url);
+        }
+        if self.account_id.as_ref().is_some_and(|id| id != account) {
+            return None;
+        }
+        self.frontier.connection(&url)
+    }
+
     fn notification_loss(
         &self,
     ) -> Result<watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError> {
@@ -5514,18 +5755,35 @@ pub(crate) fn sweep_eose_hints(client: &NostrSdkRelayClient) -> Option<Arc<EoseH
     client.eose_hints.clone()
 }
 
-/// A dry-run NIP-77 comparison against an empty local set: every id the
-/// relay holds for `filter`. Used by the time-sliced sweep for one second.
+/// What a dry-run NIP-77 comparison found.
+pub(crate) struct NegCompared {
+    /// Ids the relay holds for the filter that the local set lacks.
+    pub(crate) remote: HashSet<EventId>,
+    /// How many items the relay's set for the filter held, as far as the
+    /// filter's limit.
+    pub(crate) relay_set: usize,
+}
+
+/// A dry-run NIP-77 comparison of `filter` against `items`, the local set.
+/// The time-sliced sweep passes no items for one second, so every id the
+/// relay holds comes back; the recovery runner's comparisons pass what the
+/// account holds.
 pub(crate) async fn neg_sync_dry_run(
     relay: &Relay,
     filter: Filter,
+    items: Vec<(EventId, NostrTimestamp)>,
     options: SyncOptions,
     credits: Arc<Semaphore>,
     deadline: tokio::time::Instant,
-) -> Result<HashSet<EventId>, crate::sweep::NegFailure> {
+) -> Result<NegCompared, crate::sweep::NegFailure> {
     use crate::sweep::{ClosedReason, NegFailure, UnreachableKind};
-    match sync_watching_neg_cap(relay, filter, Vec::new(), options, credits, deadline).await {
-        Ok(summary) => Ok(summary.remote),
+    let local = items.len();
+    match sync_watching_neg_cap(relay, filter, items, options, credits, deadline).await {
+        // Every relay item matches a local one or is missing locally.
+        Ok(summary) => Ok(NegCompared {
+            relay_set: local.saturating_sub(summary.local.len()) + summary.remote.len(),
+            remote: summary.remote,
+        }),
         Err(NostrReconciliationFailure::NegErr(category)) => {
             Err(NegFailure::Closed(ClosedReason(category)))
         }
@@ -5540,6 +5798,7 @@ pub(crate) async fn neg_sync_dry_run(
         Err(NostrReconciliationFailure::NotOperational | NostrReconciliationFailure::NotInPool) => {
             Err(NegFailure::Unreachable(UnreachableKind::Disconnected))
         }
+        Err(NostrReconciliationFailure::LocalError) => Err(NegFailure::Local),
         Err(_) => Err(NegFailure::Unproven),
     }
 }
@@ -6096,61 +6355,164 @@ mod tests {
     fn notification_loss_floor_is_the_lowest_live_or_closed_since() {
         use NostrNotificationLossFloor::{Since, Unbounded};
         let id = |name: &str| SubscriptionId::new(name);
+        let req = |since| RequestFloor {
+            since,
+            routes: None,
+        };
         let mut floors = SubscriptionFloors::default();
         assert_eq!(
-            floors.loss_floor(),
+            floors.loss_bounds().floor,
             Unbounded,
             "no REQ evidence is not a bound"
         );
 
-        assert_eq!(floors.open(&id("inbox"), Some(500)), None);
-        floors.open(&id("group"), Some(300));
-        assert_eq!(floors.loss_floor(), Since(300));
+        assert_eq!(floors.open(&id("inbox"), req(Some(500))), None);
+        floors.open(&id("group"), req(Some(300)));
+        assert_eq!(floors.loss_bounds().floor, Since(300));
 
         // A closed REQ's frames can still arrive however long ago it closed,
         // so its floor stays after later REQs open above it.
         floors.close(&id("group"));
-        floors.open(&id("group"), Some(800));
-        floors.open(&id("other"), Some(900));
-        assert_eq!(floors.loss_floor(), Since(300), "a lower closed REQ");
+        floors.open(&id("group"), req(Some(800)));
+        floors.open(&id("other"), req(Some(900)));
+        assert_eq!(floors.loss_bounds().floor, Since(300), "a lower closed REQ");
 
         // A REQ replaced under its id keeps its earlier filter's floor too.
         let mut replaced = SubscriptionFloors::default();
-        replaced.open(&id("inbox"), Some(500));
-        assert_eq!(replaced.open(&id("inbox"), Some(900)), Some(Some(500)));
-        assert_eq!(replaced.loss_floor(), Since(500));
+        replaced.open(&id("inbox"), req(Some(500)));
+        assert_eq!(
+            replaced.open(&id("inbox"), req(Some(900))),
+            Some(req(Some(500)))
+        );
+        assert_eq!(replaced.loss_bounds().floor, Since(500));
 
         // A failed REQ may have reached a relay; the one it would have
         // replaced is still live.
         let mut failed = SubscriptionFloors::default();
-        failed.open(&id("inbox"), Some(900));
-        let previous = failed.open(&id("inbox"), Some(700));
+        failed.open(&id("inbox"), req(Some(900)));
+        let previous = failed.open(&id("inbox"), req(Some(700)));
         failed.abandon(&id("inbox"), previous);
-        assert_eq!(failed.live.get(&id("inbox")), Some(&Some(900)));
-        assert_eq!(failed.loss_floor(), Since(700));
+        assert_eq!(failed.live.get(&id("inbox")), Some(&req(Some(900))));
+        assert_eq!(failed.loss_bounds().floor, Since(700));
 
         // Account teardown retires everything but a REQ whose CLOSE failed.
         let mut teardown = SubscriptionFloors::default();
-        teardown.open(&id("kept"), Some(950));
-        teardown.open(&id("orphan"), Some(100));
+        teardown.open(&id("kept"), req(Some(950)));
+        teardown.open(&id("orphan"), req(Some(100)));
         teardown.close_all_except(&[id("kept")]);
         assert_eq!(teardown.live.keys().collect::<Vec<_>>(), [&id("kept")]);
         teardown.close(&id("kept"));
-        assert_eq!(teardown.loss_floor(), Since(100));
+        assert_eq!(teardown.loss_bounds().floor, Since(100));
 
         // An old unfloored REQ that closed while a floored one stays live
         // leaves every later lag on its context unbounded: however long ago
         // it closed, its frames may still be buffered or on their way.
         let mut unfloored = SubscriptionFloors::default();
-        unfloored.open(&id("maintenance"), None);
-        unfloored.open(&id("group"), Some(900));
+        unfloored.open(&id("maintenance"), req(None));
+        unfloored.open(&id("group"), req(Some(900)));
         unfloored.close(&id("maintenance"));
-        unfloored.open(&id("inbox"), Some(950));
-        assert_eq!(unfloored.loss_floor(), Unbounded);
-        let fresh = unfloored.open(&id("fresh"), Some(50));
+        unfloored.open(&id("inbox"), req(Some(950)));
+        assert_eq!(unfloored.loss_bounds().floor, Unbounded);
+        let fresh = unfloored.open(&id("fresh"), req(Some(50)));
         unfloored.abandon(&id("fresh"), fresh);
         assert!(!unfloored.live.contains_key(&id("fresh")));
         assert_eq!(unfloored.retired, Some(Unbounded), "no floor raises it");
+    }
+
+    #[test]
+    fn notification_loss_routes_are_each_routes_lowest_since() {
+        use NostrNotificationLossFloor::{Since, Unbounded};
+        let id = |name: &str| SubscriptionId::new(name);
+        let group = |byte: u8| DeliveryRoute::Group([byte; 32]);
+        let req = |since, routes: &[DeliveryRoute]| RequestFloor {
+            since,
+            routes: Some(routes.to_vec()),
+        };
+        let mut floors = SubscriptionFloors::default();
+        assert_eq!(floors.loss_bounds().routes, None, "no REQ evidence");
+        floors.open(&id("inbox"), req(Some(500), &[DeliveryRoute::Inbox]));
+        floors.open(&id("batch"), req(Some(300), &[group(1), group(2)]));
+        floors.open(&id("group"), req(Some(800), &[group(3)]));
+        assert_eq!(
+            floors.loss_bounds(),
+            NostrNotificationLossBounds {
+                floor: Since(300),
+                routes: Some(BTreeMap::from([
+                    (DeliveryRoute::Inbox, 500),
+                    (group(1), 300),
+                    (group(2), 300),
+                    (group(3), 800),
+                ])),
+            }
+        );
+
+        // A closed or replaced REQ keeps each of its routes' floors; a route
+        // only a later REQ selects starts at that REQ's.
+        floors.close(&id("group"));
+        floors.open(&id("group"), req(Some(950), &[group(3)]));
+        floors.open(&id("batch"), req(Some(900), &[group(2), group(4)]));
+        let routes = floors.loss_bounds().routes.unwrap();
+        assert_eq!(routes.get(&group(1)), Some(&300));
+        assert_eq!(routes.get(&group(2)), Some(&300));
+        assert_eq!(routes.get(&group(3)), Some(&800));
+        assert_eq!(routes.get(&group(4)), Some(&900));
+
+        // A failed REQ may have reached a relay: its routes keep its floor.
+        let previous = floors.open(&id("late"), req(Some(100), &[group(5)]));
+        floors.abandon(&id("late"), previous);
+        assert_eq!(
+            floors.loss_bounds().routes.unwrap().get(&group(5)),
+            Some(&100)
+        );
+
+        // A REQ with unknown routes, live or closed, leaves every route
+        // owing from the floor.
+        let mut unknown = SubscriptionFloors::default();
+        unknown.open(&id("inbox"), req(Some(500), &[DeliveryRoute::Inbox]));
+        unknown.open(
+            &id("odd"),
+            RequestFloor {
+                since: Some(700),
+                routes: None,
+            },
+        );
+        assert_eq!(unknown.loss_bounds().floor, Since(500));
+        assert_eq!(unknown.loss_bounds().routes, None);
+        unknown.close(&id("odd"));
+        unknown.open(&id("group"), req(Some(900), &[group(1)]));
+        assert_eq!(unknown.loss_bounds().routes, None, "for the context's life");
+
+        // An unfloored REQ bounds no route.
+        let mut unfloored = SubscriptionFloors::default();
+        unfloored.open(&id("maintenance"), req(None, &[group(1)]));
+        unfloored.open(&id("inbox"), req(Some(500), &[DeliveryRoute::Inbox]));
+        assert_eq!(
+            unfloored.loss_bounds(),
+            NostrNotificationLossBounds::account_wide(Unbounded)
+        );
+        unfloored.close(&id("maintenance"));
+        assert_eq!(unfloored.loss_bounds().routes, None);
+
+        // Past the route cap the routes are unknown, live or closed.
+        let many = (0..=MAX_DELIVERY_LOSS_ROUTES)
+            .map(|index| {
+                let mut route = [0_u8; 32];
+                route[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                DeliveryRoute::Group(route)
+            })
+            .collect::<Vec<_>>();
+        let mut wide = SubscriptionFloors::default();
+        wide.open(&id("all"), req(Some(500), &many));
+        assert_eq!(wide.loss_bounds().routes, None);
+        wide.close(&id("all"));
+        assert!(wide.retired_routes_unknown);
+        assert_eq!(wide.loss_bounds().routes, None);
+        let mut within = SubscriptionFloors::default();
+        within.open(&id("all"), req(Some(500), &many[1..]));
+        assert_eq!(
+            within.loss_bounds().routes.map(|routes| routes.len()),
+            Some(MAX_DELIVERY_LOSS_ROUTES)
+        );
     }
 
     #[tokio::test]
@@ -6187,6 +6549,14 @@ mod tests {
         .unwrap();
         root.subscribe(group(Some(Timestamp(1_000)))).await.unwrap();
         assert_eq!(account.notification_loss_floor(), Since(1_000));
+        let routes = BTreeMap::from([
+            (DeliveryRoute::Inbox, 2_000),
+            (DeliveryRoute::Group([0xD4; 32]), 1_000),
+        ]);
+        assert_eq!(
+            account.notification_loss_bounds().routes.as_ref(),
+            Some(&routes)
+        );
         assert_eq!(
             root.notification_loss_floor_for_account(&account_id).await,
             Since(1_000)
@@ -6213,6 +6583,10 @@ mod tests {
             Since(1_000),
             "closed REQs keep counting for the context's life"
         );
+        assert_eq!(
+            account.notification_loss_bounds().routes.as_ref(),
+            Some(&routes)
+        );
 
         // A subscribe that fails after its floor was recorded keeps it: the
         // REQ may have reached a relay.
@@ -6228,6 +6602,13 @@ mod tests {
         assert!(failed.is_err());
         assert!(account.subscription_floors().live.is_empty());
         assert_eq!(account.notification_loss_floor(), Since(50));
+        assert_eq!(
+            account
+                .notification_loss_bounds()
+                .routes
+                .and_then(|routes| routes.get(&DeliveryRoute::Inbox).copied()),
+            Some(50)
+        );
         root.shutdown_accounts().await;
     }
 
@@ -6870,17 +7251,34 @@ mod tests {
         .expect("the fixture really disconnects the websocket");
         // End the SDK's automatic backoff before requesting an immediate restart.
         relay.disconnect();
+        let reconnecting_at = crate::unix_now_seconds();
         relay.connect();
+        let mut disconnected = false;
         let replacement = timeout(Duration::from_secs(5), async {
             loop {
                 let NotificationUpdate::Notification(notification) = replay.updates.next().await.unwrap() else {
                     panic!("an ordinary reconnect does not lose the frontier");
                 };
+                if matches!(&notification, NostrSdkNotification::Disconnected { epoch, .. } if *epoch == initial_epoch) {
+                    disconnected = true;
+                }
                 if matches!(&notification, NostrSdkNotification::Replay { epoch, reason: ReplayRestart::Connection, .. } if epoch[1] > initial_epoch[1]) {
                     break notification;
                 }
             }
         }).await.expect("a real reconnect still creates a new connection epoch");
+        assert!(
+            disconnected,
+            "the old connection's end precedes the new connection's boundary"
+        );
+        let NostrSdkNotification::Replay { connected_at, .. } = &replacement else {
+            unreachable!("the loop breaks on a replay boundary");
+        };
+        assert!(
+            connected_at
+                .is_some_and(|at| (reconnecting_at..=crate::unix_now_seconds()).contains(&at)),
+            "the boundary carries the SDK's record of the new connection"
+        );
         dispatch_sdk_replay(replacement, &replay.adapter, None, &|reason| {
             replay.sdk.subscription_refusal(reason)
         })
@@ -7068,6 +7466,284 @@ mod tests {
             "reader startup must not revive a removed relay's replay boundary"
         );
         sdk.shutdown().await;
+    }
+
+    /// Shutting the client down aborts the relay monitors before they can
+    /// report their relays leaving `Connected`, so the frontier ends each open
+    /// connection itself, once, before the shutdown: otherwise the adapter
+    /// keeps a live count, and a tail, for REQs nothing streams any more.
+    #[tokio::test]
+    async fn shutdown_ends_open_connections_first() {
+        for through_client in [true, false] {
+            let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+            let url = relay.url().await;
+            let sdk = NostrSdkRelayClient::new(Client::default());
+            sdk.add_subscription_relay(url.clone(), &SubscriptionId::new("live"))
+                .await
+                .unwrap();
+            let mut notifications = sdk.notifications();
+            sdk.client()
+                .relay(url.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .connect();
+            let epoch = timeout(Duration::from_secs(5), async {
+                loop {
+                    if let NotificationUpdate::Notification(NostrSdkNotification::Replay {
+                        epoch,
+                        ..
+                    }) = notifications.next().await.unwrap()
+                    {
+                        let state = sdk.frontier.state.lock().unwrap();
+                        if state.relays.get(&url).is_some_and(|entry| entry.connected) {
+                            break epoch;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the relay connects");
+            if through_client {
+                sdk.client().shutdown().await;
+            } else {
+                sdk.shutdown().await;
+            }
+            let mut disconnects = Vec::new();
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    match notifications.next().await {
+                        Some(NotificationUpdate::Notification(
+                            NostrSdkNotification::Disconnected { endpoint, epoch },
+                        )) => disconnects.push((endpoint, epoch)),
+                        Some(NotificationUpdate::Notification(NostrSdkNotification::Shutdown))
+                        | None => break,
+                        Some(_) => {}
+                    }
+                }
+            })
+            .await
+            .expect("the shutdown is reported");
+            assert_eq!(
+                disconnects,
+                [(TransportEndpoint(url.to_string()), epoch)],
+                "through the client: {through_client}"
+            );
+            sdk.shutdown().await;
+            relay.shutdown();
+        }
+    }
+
+    /// A shutdown can cut short the `Disconnected` that ends a live count, so
+    /// the adapter reads the client's own state: once it has shut down, no
+    /// REQ streams.
+    #[tokio::test]
+    async fn a_shut_down_client_streams_nothing() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let account = MemberId::new(Keys::generate().public_key().to_bytes().to_vec());
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+        let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account.clone(),
+                inbox_endpoints: vec![endpoint],
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while streaming_counts(&adapter, &account).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the inbox REQ counts its EOSE");
+        // Nothing forwards the shutdown's `Disconnected` to the adapter.
+        forwarder.abort();
+        let _ = forwarder.await;
+        sdk.client().shutdown().await;
+        assert_eq!(streaming_counts(&adapter, &account).await, 0);
+        sdk.shutdown().await;
+        relay.shutdown();
+    }
+
+    /// A multi-account root answers for each account from its own context,
+    /// so removing that context ends its REQs' streaming at once, whatever
+    /// notifications the removal cut short.
+    #[tokio::test]
+    async fn a_removed_account_context_streams_nothing() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let account = root
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let adapter = NostrTransportAdapter::new(Arc::new(root.clone()));
+        let forwarder = account.spawn_notification_forwarder(adapter.clone());
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account_id.clone(),
+                inbox_endpoints: vec![endpoint],
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while streaming_counts(&adapter, &account_id).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the account's inbox REQ counts its EOSE");
+        forwarder.abort();
+        let _ = forwarder.await;
+        root.remove_account(&account_id).await;
+        assert_eq!(streaming_counts(&adapter, &account_id).await, 0);
+        root.shutdown().await;
+        relay.shutdown();
+    }
+
+    /// Live counts whose REQ the relay client still reports streaming.
+    async fn streaming_counts(adapter: &NostrTransportAdapter, account: &MemberId) -> usize {
+        let status = adapter.take_replay_status(account).await;
+        status
+            .sources()
+            .map(|source| {
+                source
+                    .endpoints()
+                    .filter(|endpoint| endpoint.live_count().is_some() && endpoint.streaming())
+                    .count()
+            })
+            .sum()
+    }
+
+    /// One step the SDK takes on a relay's connection state.
+    #[derive(Clone, Copy)]
+    enum SdkStep {
+        Status(RelayStatus),
+        Attempt,
+        /// Counts the success and records its time, after `Connected`.
+        Success,
+    }
+
+    /// A relay whose SDK steps run between the reads of
+    /// [`current_connection`], one batch before each read.
+    struct ScriptedRelay {
+        attempts: std::cell::Cell<usize>,
+        status: std::cell::Cell<RelayStatus>,
+        /// The attempt the current `Connected` belongs to.
+        connected_on: std::cell::Cell<Option<usize>>,
+        before_read: std::cell::RefCell<VecDeque<Vec<SdkStep>>>,
+        /// What `connected_on` was when the status was read.
+        seen: std::cell::Cell<Option<usize>>,
+    }
+
+    impl ScriptedRelay {
+        fn connected_on(attempt: usize, before_read: [&[SdkStep]; 3]) -> Self {
+            Self {
+                attempts: attempt.into(),
+                status: RelayStatus::Connected.into(),
+                connected_on: Some(attempt).into(),
+                before_read: before_read
+                    .map(<[SdkStep]>::to_vec)
+                    .into_iter()
+                    .collect::<VecDeque<_>>()
+                    .into(),
+                seen: None.into(),
+            }
+        }
+
+        fn run_steps(&self) {
+            for step in self
+                .before_read
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_default()
+            {
+                match step {
+                    SdkStep::Attempt => self.attempts.set(self.attempts.get() + 1),
+                    SdkStep::Success => {}
+                    SdkStep::Status(status) => {
+                        self.status.set(status);
+                        self.connected_on
+                            .set((status == RelayStatus::Connected).then(|| self.attempts.get()));
+                    }
+                }
+            }
+        }
+    }
+
+    impl ConnectionProbe for ScriptedRelay {
+        fn attempts(&self) -> usize {
+            self.run_steps();
+            self.attempts.get()
+        }
+
+        fn status(&self) -> RelayStatus {
+            self.run_steps();
+            self.seen.set(self.connected_on.get());
+            self.status.get()
+        }
+    }
+
+    /// The SDK marks a new connection `Connected` before it counts the
+    /// success, and a reader can interleave anywhere. However the reconnect's
+    /// steps fall between the three reads, the connection named is the one
+    /// whose `Connected` the status read saw, or none; so a REQ that started
+    /// on the old connection never reads as streaming once the status read
+    /// comes after that connection dropped.
+    #[test]
+    fn current_connection_names_only_the_connection_open_at_the_read() {
+        use RelayStatus::{Connected, Connecting, Disconnected};
+        use SdkStep::{Attempt, Status, Success};
+        let reconnects: [&[SdkStep]; 2] = [
+            &[
+                Status(Disconnected),
+                Status(Connecting),
+                Attempt,
+                Status(Connected),
+                Success,
+            ],
+            &[
+                Status(Disconnected),
+                Status(Connecting),
+                Attempt,
+                Status(Disconnected),
+                Status(Connecting),
+                Attempt,
+                Status(Connected),
+                Success,
+            ],
+        ];
+        for steps in reconnects {
+            let n = steps.len();
+            for a in 0..=n {
+                for b in a..=n {
+                    for c in b..=n {
+                        let relay = ScriptedRelay::connected_on(
+                            1,
+                            [&steps[..a], &steps[a..b], &steps[b..c]],
+                        );
+                        let named = current_connection(&relay);
+                        assert!(
+                            named.is_none() || named == relay.seen.get(),
+                            "steps split at {a}, {b}, {c}: named {named:?}, saw {:?}",
+                            relay.seen.get()
+                        );
+                        if b > 0 {
+                            assert_ne!(named, Some(1), "steps split at {a}, {b}, {c}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

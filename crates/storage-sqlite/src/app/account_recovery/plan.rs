@@ -3214,7 +3214,15 @@ mod tests {
                         .acknowledge_recovery_loss(&fence, id, &watermarks)
                 }
             };
+            let reach_after = |revision| {
+                store
+                    .app_storage()
+                    .recovery_loss_reach_after("alice", revision)
+                    .unwrap()
+            };
+            let before = fence.loss_revision - 1;
             assert!(!acknowledge().unwrap());
+            assert!(reach_after(before).is_some_and(|reach| reach.every_route_from.is_some()));
             qualify_loss(&store, &fence, attempt, id);
             assert!(acknowledge().unwrap());
             assert_eq!(
@@ -3230,6 +3238,12 @@ mod tests {
                     .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                     .unwrap()
                     .is_empty()
+            );
+            // The deleted rows said where that loss reached.
+            assert_eq!(reach_after(before), None);
+            assert_eq!(
+                reach_after(fence.loss_revision),
+                Some(RecoveryLossReach::default())
             );
             assert!(
                 store

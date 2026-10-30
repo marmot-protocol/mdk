@@ -16,8 +16,8 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::OutboundFanout;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
-    CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest, SendIntent,
-    SendResult,
+    CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest, GroupEvent,
+    SendIntent, SendResult,
 };
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group::{Group, Member};
@@ -27,10 +27,11 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePassStorage, ConvergencePolicyStorage, DisbandCandidate, DisbandCandidateStorage,
-    DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef,
-    GroupStorage, KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage,
-    MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
+    ConvergencePassStorage, ConvergencePolicyStorage, DeviceGroupWelcomeExpectation,
+    DeviceGroupWelcomeStorage, DisbandCandidate, DisbandCandidateStorage, DisbandRequest,
+    DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage,
+    KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MemberValidationCacheStorage,
+    MessageStorage, OpenMlsContentFilter, OutboundFanoutStorage, OutboundIntentStorage,
     QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
     WelcomeStorage,
 };
@@ -43,6 +44,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
+#[path = "record_write_atomicity/convergence_pass_retry.rs"]
+mod convergence_pass_retry;
 mod support;
 use support::proof_signer;
 
@@ -368,6 +371,8 @@ struct PreparationDelay {
     graph_ms: Arc<AtomicUsize>,
     metadata_calls: Arc<AtomicUsize>,
     graph_calls: Arc<AtomicUsize>,
+    /// `list_disband_candidates` calls, the first read of every reseed.
+    disband_candidate_reads: Arc<AtomicUsize>,
 }
 
 impl MessageStorage for FaultStorage {
@@ -400,6 +405,29 @@ impl MessageStorage for FaultStorage {
         }
         self.inner
             .list_messages_in_states(group_id, states, at_or_after_epoch)
+    }
+    /// A failed batch's input check reads through the backend's filter. Every
+    /// other listing keeps the trait default, so `graph_calls` still counts
+    /// each reseed's graph listing.
+    fn list_openmls_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+        filter: OpenMlsContentFilter,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        if matches!(
+            filter,
+            OpenMlsContentFilter::CommitsAndProposalsBetween { .. }
+        ) {
+            return self.inner.list_openmls_messages_in_states(
+                group_id,
+                states,
+                at_or_after_epoch,
+                filter,
+            );
+        }
+        self.list_messages_in_states(group_id, states, at_or_after_epoch)
     }
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
         if self.leave_write_fault.should_fail() {
@@ -641,6 +669,9 @@ impl DisbandCandidateStorage for FaultStorage {
         self.inner.disband_candidate(group_id, commit_id)
     }
     fn list_disband_candidates(&self, group_id: &GroupId) -> StorageResult<Vec<DisbandCandidate>> {
+        self.preparation_delay
+            .disband_candidate_reads
+            .fetch_add(1, Ordering::SeqCst);
         if self.post_commit_disband_read_fault.remaining() > 0
             && self.inner.get_group(group_id)?.removed
             && self.post_commit_disband_read_fault.should_fail()
@@ -732,6 +763,24 @@ impl AccountDeviceSignerStorage for FaultStorage {
         marmot_identity: &MemberId,
     ) -> StorageResult<Option<AccountDeviceSignerBinding>> {
         self.inner.account_device_signer(marmot_identity)
+    }
+}
+
+impl DeviceGroupWelcomeStorage for FaultStorage {
+    fn put_device_group_welcome_expectation(
+        &self,
+        expectation: &DeviceGroupWelcomeExpectation,
+    ) -> StorageResult<()> {
+        self.inner.put_device_group_welcome_expectation(expectation)
+    }
+    fn device_group_welcome_expectation(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<DeviceGroupWelcomeExpectation>> {
+        self.inner.device_group_welcome_expectation(group_id)
+    }
+    fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool> {
+        self.inner.delete_device_group_welcome_expectation(group_id)
     }
 }
 
@@ -2961,6 +3010,69 @@ async fn own_intent_record_failure_releases_the_unreturned_pending_commit() {
     assert!(engine.epoch(&group_id).unwrap() > epoch);
 }
 
+/// A queued intent whose preparation fails on storage is held, not refused
+/// (mdk#2694): the drain reports the failure, the record stays queued with no
+/// refusal announced, and the next drain prepares it.
+#[tokio::test]
+async fn a_queued_intent_held_by_a_storage_failure_stays_queued() {
+    let fault = LeaveWriteFault::default();
+    let (mut engine, storage, group_id) = setup_own_intent_fault_case(fault.clone()).await;
+    storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: MessageId::new(b"queued-held-edit".to_vec()),
+            group_id: group_id.clone(),
+            intent: SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("held edit".into()),
+                description: None,
+            },
+            created_at_ms: 0,
+            reissue_attempts: 0,
+        })
+        .unwrap();
+    engine.drain_events();
+
+    // The first intent-store write during preparation is the edit's own
+    // commit intent, recorded after staging.
+    fault.arm_on_write(1);
+    assert!(matches!(
+        engine
+            .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+            .await,
+        Err(EngineError::Storage(StorageError::Busy(_)))
+    ));
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "a storage failure keeps the intent queued"
+    );
+    assert!(
+        !engine
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::QueuedIntentRefused { .. }))
+    );
+
+    let drained = engine
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
+        .await
+        .expect("the held intent prepares once storage recovers");
+    let [SendResult::GroupEvolution { pending, .. }] = drained.as_slice() else {
+        panic!("the held edit stages on the next drain: {drained:?}")
+    };
+    engine.confirm_published(*pending).await.unwrap();
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(engine.group_record(&group_id).unwrap().name, "held edit");
+}
+
 #[tokio::test]
 async fn superseded_own_intent_transfer_is_atomic_on_each_storage_failure() {
     for fail_on_write in 1..=2 {
@@ -3250,8 +3362,11 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
         "nothing was released, so the account budget is still fully charged"
     );
 
-    // The terminal gate retries on the next advance and completes.
+    // The terminal gate retries on the next attempt and completes. A removal a
+    // convergence pass realized failed in that pass's apply, which now backs
+    // off before its next attempt (mdk#2684), so grant it that attempt now.
     failed_state_fault.disarm();
+    carol.retry_failed_convergence_pass(&group_a).unwrap();
     carol.advance_convergence(&group_a).await.unwrap();
     for row in &rows {
         assert_eq!(

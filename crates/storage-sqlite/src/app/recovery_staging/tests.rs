@@ -24,13 +24,18 @@ fn range(since: u64, until: u64) -> RecoveryCoverageRange {
 
 /// An event sent at second `id`.
 fn delivery(id: u8) -> TransportDelivery {
+    delivery_at(id, u64::from(id))
+}
+
+/// Event `id`, sent at second `at`.
+fn delivery_at(id: u8, at: u64) -> TransportDelivery {
     TransportDelivery {
         account_id: MemberId::new(vec![0xAA; 32]),
         group_id_hint: None,
         message: TransportMessage {
             id: MessageId::new(vec![id; 32]),
             payload: vec![id; 64],
-            timestamp: cgka_traits::transport::Timestamp(u64::from(id)),
+            timestamp: cgka_traits::transport::Timestamp(at),
             causal_deps: Vec::new(),
             source: TransportSource("nostr".to_owned()),
             envelope: TransportEnvelope::GroupMessage {
@@ -256,19 +261,21 @@ fn only_seen_rows_leave_staging() {
 }
 
 /// A row that no longer decodes is reported, and discarding it owes its
-/// second again on its route.
+/// second again on its route (inside the retention window; below it nothing
+/// is owed).
 #[test]
 fn an_undecodable_row_is_discarded_and_its_second_owed_again() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let app = storage.app_storage();
     let route = group(1);
+    let base = i64_to_u64(crate::base::codec::unix_now_seconds_i64()).unwrap() - 1_000;
     let mark = app.recovery_coverage_mark().unwrap();
     stage(
         &app,
         &route,
         RELAY,
-        &[delivery(5), delivery(6)],
-        range(0, 10),
+        &[delivery_at(5, base + 5), delivery_at(6, base + 6)],
+        range(base, base + 10),
         mark,
     );
     app.lock()
@@ -279,7 +286,7 @@ fn an_undecodable_row_is_discarded_and_its_second_owed_again() {
         )
         .unwrap();
     let read = app
-        .staged_recovery_events(std::slice::from_ref(&route), NOW, 10)
+        .staged_recovery_events(std::slice::from_ref(&route), base + 10, 10)
         .unwrap();
     assert_eq!(staged_ids(&read), vec![6]);
     assert_eq!(read.undecodable, vec![vec![5u8; 32]]);
@@ -292,14 +299,18 @@ fn an_undecodable_row_is_discarded_and_its_second_owed_again() {
             .unwrap()
     );
     let relays = [RELAY.to_owned()];
-    assert!(!app.recovery_coverage_covers(&route, &relays, 5, 5).unwrap());
     assert!(
-        app.recovery_coverage_covers(&route, &relays, 6, 10)
+        !app.recovery_coverage_covers(&route, &relays, base + 5, base + 5)
+            .unwrap()
+    );
+    assert!(
+        app.recovery_coverage_covers(&route, &relays, base + 6, base + 10)
             .unwrap()
     );
     assert_eq!(
-        app.recovery_unit_cursor(&route, RELAY, 0, 10).unwrap(),
-        Some(5)
+        app.recovery_unit_cursor(&route, RELAY, base, base + 10)
+            .unwrap(),
+        Some(base + 5)
     );
 }
 
@@ -319,6 +330,7 @@ fn staging_trims_the_units_parked_spans() {
         cooldown_cap_seconds: 3_600,
         max_attempts_per_hour: 720,
         max_event_bytes_per_hour: 256 << 20,
+        recheck_after_cooldown_seconds: 3_600,
     };
     app.widen_recovery_coverage_goals(std::slice::from_ref(&route), NOW - 100)
         .unwrap();
@@ -374,4 +386,56 @@ fn a_crash_between_staging_and_settling_refetches_nothing() {
     assert_eq!((unit.no_progress, unit.next_attempt_at_seconds), (0, 0));
     assert_eq!(unit.last_served_at_seconds, Some(NOW));
     assert_eq!(app.recovery_account_usage(NOW).unwrap().attempts, 1);
+}
+
+/// A comparison's held set includes what any relay staged on the route in
+/// its range, oldest first, and nothing from another route.
+#[test]
+fn staged_items_are_the_routes_from_every_relay_in_range() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    let mark = app.recovery_coverage_mark().unwrap();
+    stage(
+        &app,
+        &route,
+        RELAY,
+        &[delivery_at(1, 50), delivery_at(2, 10)],
+        range(0, 100),
+        mark,
+    );
+    stage(
+        &app,
+        &route,
+        OTHER,
+        &[delivery_at(3, 30)],
+        range(0, 100),
+        mark,
+    );
+    stage(
+        &app,
+        &route,
+        RELAY,
+        &[delivery_at(4, 200)],
+        range(101, 300),
+        mark,
+    );
+    stage(
+        &app,
+        &group(2),
+        RELAY,
+        &[delivery_at(5, 40)],
+        range(0, 100),
+        mark,
+    );
+
+    let items = app.staged_recovery_items(&route, 10, 50).unwrap();
+
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| (item.event_id[0], item.created_at))
+            .collect::<Vec<_>>(),
+        vec![(2, 10), (3, 30), (1, 50)]
+    );
 }
