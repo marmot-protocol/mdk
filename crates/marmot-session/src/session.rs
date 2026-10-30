@@ -818,6 +818,14 @@ impl AccountDeviceSession {
         Ok(self.engine.outbound_welcome_work()?)
     }
 
+    /// See `Engine::outbound_welcome_work_in`.
+    pub(crate) fn outbound_welcome_work_in(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Option<OutboundWelcomeWork>> {
+        Ok(self.engine.outbound_welcome_work_in(group_id)?)
+    }
+
     /// See `Engine::outbound_welcome_status`.
     pub(crate) fn outbound_welcome_status(
         &self,

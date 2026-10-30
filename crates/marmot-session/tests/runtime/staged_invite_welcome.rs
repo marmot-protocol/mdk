@@ -10,7 +10,7 @@ fn staged_welcome_publishes(adapter: &RecordingAdapter) -> Vec<TransportMessage>
 }
 
 type StagedInviteRuntime =
-    AccountDeviceRuntime<RecordingAdapter, StaticTransportRouting, RecordingKeyPackages>;
+    AccountDeviceRuntime<RecordingAdapter, SharedRouting, RecordingKeyPackages>;
 
 /// An invite of Carol made the app's way (stage the commit, take its
 /// Welcome, publish), whose commit the relay may or may not have seen, so it
@@ -18,7 +18,7 @@ type StagedInviteRuntime =
 struct RetainedInvite {
     runtime: StagedInviteRuntime,
     adapter: RecordingAdapter,
-    policy: StaticTransportRouting,
+    policy: SharedRouting,
     wall: Arc<TestWallClock>,
     group_id: GroupId,
     group_relay: TransportEndpoint,
@@ -69,15 +69,10 @@ async fn retained_invite_failing(
     let group_relay = TransportEndpoint("wss://group.example".into());
     let carol_inbox = TransportEndpoint("wss://carol-inbox.example".into());
     let adapter = RecordingAdapter::default();
-    let policy = StaticTransportRouting::new(vec![TransportEndpoint(
-        "wss://alice-inbox.example".into(),
-    )])
-    .with_group_route(
-        group_id.clone(),
-        group_id.as_slice().to_vec(),
-        vec![group_relay.clone()],
-    )
-    .with_inbox_route(carol_id.clone(), vec![carol_inbox.clone()]);
+    let policy = SharedRouting(Arc::new(Mutex::new(
+        staged_invite_routing(&group_id, &group_relay)
+            .with_inbox_route(carol_id.clone(), vec![carol_inbox.clone()]),
+    )));
     let wall = Arc::new(TestWallClock::new(300_000));
     let mut runtime = AccountDeviceRuntime::new(
         alice,
@@ -90,6 +85,8 @@ async fn retained_invite_failing(
         Arc::new(TestMonotonicClock::default()),
         Arc::new(TestRandom::new(0)),
     );
+    // A running app's runtime has read the store before it stages an invite.
+    runtime.run_due_maintenance().await.unwrap();
 
     let marmot_session::PreparedSessionSend::Commit(prepared) = runtime
         .confirm_commit_without_publish_with_audit_context(
@@ -128,7 +125,33 @@ async fn retained_invite_failing(
     }
 }
 
+/// Alice's routing for the invite's group, with no inbox routes.
+fn staged_invite_routing(
+    group_id: &GroupId,
+    group_relay: &TransportEndpoint,
+) -> StaticTransportRouting {
+    StaticTransportRouting::new(vec![TransportEndpoint(
+        "wss://alice-inbox.example".into(),
+    )])
+    .with_group_route(
+        group_id.clone(),
+        group_id.as_slice().to_vec(),
+        vec![group_relay.clone()],
+    )
+}
+
 impl RetainedInvite {
+    /// Give Carol's inbox a route again, or take it away.
+    fn route_carol(&self, routed: bool) {
+        let routing = staged_invite_routing(&self.group_id, &self.group_relay);
+        let routing = if routed {
+            routing.with_inbox_route(self.carol_id.clone(), vec![self.carol_inbox.clone()])
+        } else {
+            routing
+        };
+        self.policy.update(|_| routing);
+    }
+
     /// Let the relay take the retained commit once its retry is due, which
     /// confirms it and promotes its Welcome.
     async fn confirm_commit(&mut self) {
@@ -146,7 +169,20 @@ impl RetainedInvite {
     /// Stop the runtime and open it again over the same store, as an app
     /// restart does.
     fn restart(&mut self, dir: &std::path::Path) {
-        let reopened = session(
+        self.reopen(dir, session);
+    }
+
+    /// [`Self::restart`], leaving the group unhydrated.
+    fn restart_unhydrated(&mut self, dir: &std::path::Path) {
+        self.reopen(dir, deferred_session);
+    }
+
+    fn reopen(
+        &mut self,
+        dir: &std::path::Path,
+        open: fn(std::path::PathBuf, &SqlCipherKey, &[u8]) -> AccountDeviceSession,
+    ) {
+        let reopened = open(
             dir.join("alice.sqlite"),
             &SqlCipherKey::new(STAGED_INVITE_KEY).unwrap(),
             STAGED_INVITE_ALICE,
@@ -355,28 +391,39 @@ async fn staged_invite_welcome_never_goes_out_when_its_commit_rolls_back() {
     );
 }
 
+/// How a restarted runtime first reads the store for Welcomes.
+#[derive(Clone, Copy)]
+enum FirstRead {
+    StartupPass,
+    MaintenanceBeforeConfirm,
+    MaintenanceAfterConfirm,
+}
+
 /// A restart before the commit confirms loses nothing: the restarted runtime
-/// watches the still-staged Welcome, so maintenance delivers it once the
-/// resumed commit confirms. The startup pass reads it; without one, the
-/// first maintenance pass does.
-async fn staged_invite_welcome_goes_out_after_a_restart(startup_pass: bool) {
+/// reads the store for Welcomes still staged or already owed, so maintenance
+/// delivers the Welcome once the resumed commit confirms. The startup pass
+/// reads the store; without one, the first maintenance pass does, whether the
+/// commit confirmed before it or not.
+async fn staged_invite_welcome_goes_out_after_a_restart(first_read: FirstRead) {
     let dir = tempfile::tempdir().unwrap();
     let mut invite = retained_invite(dir.path()).await;
     let welcome_id = invite.welcome.id.clone();
     invite.restart(dir.path());
 
-    if startup_pass {
+    if matches!(first_read, FirstRead::StartupPass) {
         let startup = invite
             .runtime
             .prepare_owed_welcome_retry_task_with_audit_context(Default::default())
             .unwrap();
         assert!(startup.is_none(), "nothing is owed while the commit is staged");
     }
-    invite.runtime.run_due_maintenance().await.unwrap();
-    assert!(
-        staged_welcome_publishes(&invite.adapter).is_empty(),
-        "no Welcome may be published before its Add commit confirms"
-    );
+    if !matches!(first_read, FirstRead::MaintenanceAfterConfirm) {
+        invite.runtime.run_due_maintenance().await.unwrap();
+        assert!(
+            staged_welcome_publishes(&invite.adapter).is_empty(),
+            "no Welcome may be published before its Add commit confirms"
+        );
+    }
     invite.confirm_commit().await;
     invite.runtime.run_due_maintenance().await.unwrap();
 
@@ -394,10 +441,82 @@ async fn staged_invite_welcome_goes_out_after_a_restart(startup_pass: bool) {
 
 #[tokio::test]
 async fn staged_invite_welcome_goes_out_after_a_restart_with_a_startup_pass() {
-    staged_invite_welcome_goes_out_after_a_restart(true).await;
+    staged_invite_welcome_goes_out_after_a_restart(FirstRead::StartupPass).await;
 }
 
 #[tokio::test]
 async fn staged_invite_welcome_goes_out_after_a_restart_without_a_startup_pass() {
-    staged_invite_welcome_goes_out_after_a_restart(false).await;
+    staged_invite_welcome_goes_out_after_a_restart(FirstRead::MaintenanceBeforeConfirm).await;
+}
+
+#[tokio::test]
+async fn staged_invite_welcome_goes_out_when_its_commit_confirms_before_the_first_pass() {
+    staged_invite_welcome_goes_out_after_a_restart(FirstRead::MaintenanceAfterConfirm).await;
+}
+
+/// A group that is not live when the runtime first reads the store is read
+/// again on each pass until it is, so its Welcome still goes out when the
+/// group is hydrated and its commit confirms between two passes.
+#[tokio::test]
+async fn staged_invite_welcome_goes_out_once_its_group_is_hydrated() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut invite = retained_invite(dir.path()).await;
+    let welcome_id = invite.welcome.id.clone();
+    invite.restart_unhydrated(dir.path());
+    assert_eq!(
+        invite.runtime.unhydrated_group_ids(),
+        vec![invite.group_id.clone()]
+    );
+
+    invite.runtime.run_due_maintenance().await.unwrap();
+    assert!(staged_welcome_publishes(&invite.adapter).is_empty());
+    assert!(invite.runtime.ensure_group_hydrated(&invite.group_id).unwrap());
+    invite.confirm_commit().await;
+    invite.runtime.run_due_maintenance().await.unwrap();
+
+    let sent = staged_welcome_publishes(&invite.adapter);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].id, welcome_id);
+}
+
+/// A maintenance send that reaches no relay, here for want of a route, keeps
+/// the Welcome watched, so the next pass sends it once a route exists.
+#[tokio::test]
+async fn staged_invite_welcome_goes_out_after_a_send_that_found_no_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut invite = retained_invite(dir.path()).await;
+    let welcome_id = invite.welcome.id.clone();
+    invite.route_carol(false);
+    invite.confirm_commit().await;
+
+    let unrouted = invite.runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        unrouted
+            .failures
+            .iter()
+            .any(|failure| failure.message_id == welcome_id)
+    );
+    assert!(staged_welcome_publishes(&invite.adapter).is_empty());
+    assert!(
+        invite
+            .runtime
+            .session()
+            .transport_fanout(&welcome_id)
+            .unwrap()
+            .is_none(),
+        "a send that found no route leaves no retry record"
+    );
+
+    invite.route_carol(true);
+    invite.runtime.run_due_maintenance().await.unwrap();
+    let sent = staged_welcome_publishes(&invite.adapter);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].id, welcome_id);
+    assert!(
+        invite
+            .runtime
+            .outstanding_welcome_deliveries()
+            .unwrap()
+            .is_empty()
+    );
 }

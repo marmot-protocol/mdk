@@ -525,12 +525,16 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// Detached Welcomes withdrawn after their task was prepared. The task
     /// skips each one whose relay attempt has not started.
     detached_welcome_withdrawals: DetachedWelcomeWithdrawals,
-    /// Welcomes staged with an unconfirmed commit, in staging order, that
-    /// maintenance delivers once the commit confirms (see `welcome_delivery`).
-    staged_welcomes: Vec<cgka_traits::MessageId>,
-    /// Whether `staged_welcomes` holds the store's staged Welcomes yet: the
-    /// startup pass, or else the first maintenance pass, reads them once.
-    staged_welcomes_seeded: bool,
+    /// Outbound Welcomes, staged or owed, that no attempt record holds yet,
+    /// in the order this runtime met them. Maintenance publishes each once it
+    /// is owed (see `welcome_delivery`).
+    watched_welcomes: Vec<cgka_traits::MessageId>,
+    /// Whether the store has been read for `watched_welcomes`: the startup
+    /// pass reads it, or else the first maintenance pass.
+    welcome_store_read: bool,
+    /// Groups that read skipped because they were not live. Maintenance
+    /// reads each once it is.
+    unread_welcome_groups: Vec<GroupId>,
     /// Test-only fault injection: while armed, the finish stage of a prepared
     /// legacy publish for this message id fails with a transient storage
     /// error. Never set by production code.
@@ -597,8 +601,9 @@ where
             pending_leaf_reconciliations: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
             detached_welcome_withdrawals: DetachedWelcomeWithdrawals::default(),
-            staged_welcomes: Vec::new(),
-            staged_welcomes_seeded: false,
+            watched_welcomes: Vec::new(),
+            welcome_store_read: false,
+            unread_welcome_groups: Vec::new(),
             finish_stage_failure: None,
             publication_progress: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -2393,7 +2398,7 @@ where
             }
         }
         self.retry_confirmed_transport_fanouts(&mut output).await?;
-        self.deliver_promoted_welcomes(&mut output).await?;
+        self.deliver_watched_welcomes(&mut output).await?;
         // Roster housekeeping waits behind the KeyPackage steps' commits
         // (mdk#2628 3.1d).
         let expired = self.drop_expired_removed_slots_for_maintenance(held).await;
@@ -3382,7 +3387,7 @@ where
             .await?;
         let prepared = classify_prepared_session_send(session_effects)?;
         if let PreparedSessionSend::Commit(commit) = &prepared {
-            self.watch_staged_welcomes(commit.welcomes());
+            self.watch_welcomes(commit.welcomes().iter().map(|welcome| welcome.id.clone()));
         }
         Ok(prepared)
     }
