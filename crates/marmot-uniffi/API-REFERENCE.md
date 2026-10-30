@@ -3532,7 +3532,7 @@ Reads one cached pack without network I/O. Returns none when the coordinate is a
 pub async fn sync_sticker_packs( &self, account_ref: String, ) -> Result<StickerSyncResultFfi, MarmotKitError>
 ```
 
-Refreshes at most `MAX_DISCOVERY_PACKS` recent public packs and rebases the installed list. Uninstalled discovery above that bound is pruned; installed packs, pending operations, and message-referenced assets stay.
+Refreshes at most `MAX_DISCOVERY_PACKS` recent public packs and separately refreshes cached installed packs. Pending install changes are published only after a complete installed-list read. Uninstalled discovery above that bound is pruned; installed packs, pending operations, and message-referenced assets stay.
 
 [Source](src/commands/sticker.rs#L42)
 
@@ -3556,7 +3556,7 @@ Fetches one pack by coordinate or trusted Sonar link, querying the link's relay 
 pub async fn install_sticker_pack( &self, account_ref: String, input: String, ) -> Result<StickerPackFfi, MarmotKitError>
 ```
 
-Records local install intent, then publishes the installed list only after this call refreshed the account's remote list; otherwise the intent stays pending and `sync_sticker_packs` publishes it. This is the user action after previewing a pack; it does not upload sticker bytes.
+After a complete installed-list read, signs the proposed list before saving local install intent. A signing refusal does not queue this install. Without a complete read, intent stays pending for a later `sync_sticker_packs`. This is the user action after previewing a pack; it does not upload sticker bytes.
 
 [Source](src/commands/sticker.rs#L65)
 
@@ -3568,7 +3568,7 @@ Records local install intent, then publishes the installed list only after this 
 pub async fn uninstall_sticker_pack( &self, account_ref: String, input: String, ) -> Result<(), MarmotKitError>
 ```
 
-Records local uninstall intent, then publishes the installed list only after this call refreshed the account's remote list; otherwise the intent stays pending and `sync_sticker_packs` publishes it. Previously received messages can still resolve their exact historical asset.
+After a complete installed-list read, signs the proposed list before saving local uninstall intent. A signing refusal does not queue this uninstall. Without a complete read, intent stays pending for a later `sync_sticker_packs`. Previously received messages can still resolve their exact historical asset.
 
 [Source](src/commands/sticker.rs#L77)
 

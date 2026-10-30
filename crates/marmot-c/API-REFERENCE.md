@@ -2567,7 +2567,7 @@ Validates a canonical Signal pack link, then refuses before any network call. Th
 MarmotStatus marmot_install_sticker_pack(const struct MarmotClient *client, const char *account_ref, const char *input, struct MarmotStickerPack **out);
 ```
 
-Records install intent, then publishes the installed list only after this call refreshed the account's remote list; otherwise the intent stays pending and `marmot_sync_sticker_packs` publishes it. Free with `marmot_sticker_pack_free`.
+After a complete installed-list read, signs the proposed list before saving install intent. A signing refusal does not queue this install. Without a complete read, intent stays pending for a later `marmot_sync_sticker_packs`. Free with `marmot_sticker_pack_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotinstall_sticker_pack) · [Header contract](include/marmot.h#L10788)
 
@@ -4751,7 +4751,7 @@ Read a complete local snapshot of effective sender/emoji participants for one me
 MarmotStatus marmot_sync_sticker_packs(const struct MarmotClient *client, const char *account_ref, struct MarmotStickerSyncResult **out);
 ```
 
-Refreshes a bounded public discovery window and rebases the installed list. Free with `marmot_sticker_sync_result_free`.
+Refreshes public discovery and cached installed packs. Pending install changes are published only after a complete installed-list read; incomplete reads leave them pending. Free with `marmot_sticker_sync_result_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsync_sticker_packs) · [Header contract](include/marmot.h#L10759)
 
@@ -5208,7 +5208,7 @@ Free a value of this type returned by this library. NULL is a no-op.
 MarmotStatus marmot_uninstall_sticker_pack(const struct MarmotClient *client, const char *account_ref, const char *input);
 ```
 
-Records uninstall intent, then publishes the installed list only after this call refreshed the account's remote list; otherwise the intent stays pending and `marmot_sync_sticker_packs` publishes it. Historical message references remain resolvable.
+After a complete installed-list read, signs the proposed list before saving uninstall intent. A signing refusal does not queue this uninstall. Without a complete read, intent stays pending for a later `marmot_sync_sticker_packs`. Historical message references remain resolvable.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotuninstall_sticker_pack) · [Header contract](include/marmot.h#L10802)
 
