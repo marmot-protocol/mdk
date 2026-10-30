@@ -29,6 +29,16 @@
   new device in the commit that sets its tag signature key, and a device
   whose entry lacks it with its next KeyPackage announcement. Only behind
   `dev_device_groups`. Nothing sends history yet.
+- A chat's history moves between an account's devices as history bundles
+  (mdk#2628 item 4.2a). The sending device fills bundles of at most 8 MiB in
+  chat order, leaving out deleted and removed messages and everything that
+  targets them, and seals each under a fresh one-use key. The receiving device
+  refuses a whole bundle that does not open or decode or names another chat,
+  only adds messages it lacks, marks each with the device that sent it, takes
+  a sent moderation verdict, and never counts them as unread. Neither side
+  handles a device group. Only through the `test-policy-overrides` hooks
+  `dev_export_chat_history` and `dev_import_history_bundle` until the bundle's
+  transport lands.
 - `MarmotAppConfig::device_platform` (`with_device_platform`) names the
   platform this device runs on. Each device writes it and
   `key_package_client_name` into its own roster entry with its next KeyPackage

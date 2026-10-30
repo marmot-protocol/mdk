@@ -4,7 +4,7 @@ use crate::SqliteAccountStorage;
 use crate::base::test_support::sample_group;
 use crate::{
     SelfMembership, SqlCipherKey, StoredAccountGroup, StoredAccountGroupComponent,
-    StoredAccountState, StoredAppEvent,
+    StoredAccountState, StoredAppEvent, TimelineMessageChange, TimelineUpdateTrigger,
 };
 use cgka_traits::app_components::{
     GROUP_AVATAR_URL_COMPONENT, GROUP_AVATAR_URL_COMPONENT_ID, GroupAvatarUrlV1,
@@ -5404,4 +5404,184 @@ fn retention_scan_follows_pinned_expiry_not_timeline_age() {
     let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
     assert!(scan.expired_unread);
     assert!(scan.expired_rows);
+}
+
+// mdk#2628 4.2a: rows imported from a sibling's history.
+const SOURCE_SLOT: [u8; 32] = [7; 32];
+
+fn live(id: &str, epoch: u64, at: u64) -> StoredAppEvent {
+    StoredAppEvent {
+        source_epoch: Some(epoch),
+        ..chat(id, REMOTE, at, "live")
+    }
+}
+
+fn imported(
+    id: &str,
+    epoch: u64,
+    at: u64,
+    retention: Option<AppMessageRetentionDecision>,
+) -> crate::ImportedAppEvent {
+    crate::ImportedAppEvent {
+        message_id_hex: id.to_owned(),
+        source_epoch: epoch,
+        sender: REMOTE.to_owned(),
+        plaintext: "imported".to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_CHAT,
+        tags: Vec::new(),
+        created_at: at,
+        retention,
+        moderation_grant: None,
+    }
+}
+
+#[test]
+fn an_import_adds_only_the_rows_this_device_lacks() {
+    let app = setup_store().app_storage();
+    app.record_app_event(&live("held", 3, 30)).unwrap();
+
+    let outcome = app
+        .import_app_events(
+            GROUP,
+            &SOURCE_SLOT,
+            &[
+                imported("held", 3, 30, None),
+                imported(
+                    "old",
+                    1,
+                    10,
+                    Some(AppMessageRetentionDecision::new(10, 500)),
+                ),
+                imported("old", 1, 10, None),
+                imported(
+                    "expired",
+                    2,
+                    20,
+                    Some(AppMessageRetentionDecision::new(20, 5)),
+                ),
+            ],
+            100,
+        )
+        .unwrap();
+
+    assert_eq!(outcome.imported, 1);
+    let changed = outcome
+        .update
+        .changes
+        .iter()
+        .map(|change| match change {
+            TimelineMessageChange::Upsert { trigger, message } => {
+                (message.message_id_hex.as_str(), trigger.clone())
+            }
+            TimelineMessageChange::Remove { .. } => panic!("an import removes nothing"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(changed, [("old", TimelineUpdateTrigger::SnapshotRefresh)]);
+
+    let held = app.timeline_message(GROUP, "held").unwrap().unwrap();
+    assert_eq!(held.plaintext, "live");
+    assert_eq!(held.source_message_id_hex.as_deref(), Some("source-held"));
+    assert_eq!(app.app_event_import_source(GROUP, "held").unwrap(), None);
+
+    let old = app.timeline_message(GROUP, "old").unwrap().unwrap();
+    assert_eq!(old.plaintext, "imported");
+    assert_eq!(old.direction, "received");
+    assert_eq!(old.source_message_id_hex, None);
+    assert_eq!(old.source_epoch, Some(1));
+    assert_eq!(old.retention_expires_at, Some(510));
+    assert_eq!(
+        app.app_event_import_source(GROUP, "old").unwrap(),
+        Some(SOURCE_SLOT)
+    );
+    assert!(app.timeline_message(GROUP, "expired").unwrap().is_none());
+}
+
+#[test]
+fn imported_rows_never_count_as_unread() {
+    let app = setup_store().app_storage();
+    app.record_app_event(&live("seen", 2, 20)).unwrap();
+    app.mark_timeline_message_read(LOCAL, GROUP, "seen", &no_mentions)
+        .unwrap();
+
+    let outcome = app
+        .import_app_events(
+            GROUP,
+            &SOURCE_SLOT,
+            &[
+                imported("before", 1, 10, None),
+                imported("after", 3, 30, None),
+            ],
+            100,
+        )
+        .unwrap();
+    let ids = outcome
+        .update
+        .messages
+        .iter()
+        .map(|message| message.message_id_hex.clone())
+        .collect::<Vec<_>>();
+    let row = app
+        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &ids, &no_mentions)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.unread_count, 0);
+    assert_eq!(row.last_read_message_id_hex.as_deref(), Some("seen"));
+
+    app.record_app_event(&live("new", 4, 40)).unwrap();
+    for row in [
+        app.refresh_chat_list_row_for_messages(LOCAL, GROUP, &["new".to_owned()], &no_mentions),
+        app.refresh_chat_list_row(LOCAL, GROUP, &no_mentions),
+    ] {
+        let row = row.unwrap().unwrap();
+        assert_eq!(row.unread_count, 1);
+        assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("new"));
+        assert_eq!(row.last_read_message_id_hex.as_deref(), Some("seen"));
+    }
+}
+
+#[test]
+fn an_import_with_no_read_position_stays_read() {
+    let app = setup_store().app_storage();
+    app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    app.import_app_events(GROUP, &SOURCE_SLOT, &[imported("old", 1, 10, None)], 100)
+        .unwrap();
+    let row = app
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.unread_count, 0);
+    assert_eq!(row.last_read_message_id_hex, None);
+
+    // A live row still counts, as it does with no anchor.
+    app.record_app_event(&live("new", 2, 20)).unwrap();
+    let row = app
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.unread_count, 1);
+}
+
+#[test]
+fn retention_scan_lets_imported_rows_expire_on_time() {
+    let expiring = Some(AppMessageRetentionDecision::new(100, 50));
+    for marked in [false, true] {
+        let app = setup_store().app_storage();
+        if marked {
+            app.record_app_event(&live("seen", 0, 1)).unwrap();
+            app.mark_timeline_message_read(LOCAL, GROUP, "seen", &no_mentions)
+                .unwrap();
+        }
+        app.import_app_events(
+            GROUP,
+            &SOURCE_SLOT,
+            &[imported("old", 1, 100, expiring)],
+            120,
+        )
+        .unwrap();
+        let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
+        assert!(!scan.expired_unread, "marked read: {marked}");
+        assert!(scan.expired_rows, "marked read: {marked}");
+    }
 }

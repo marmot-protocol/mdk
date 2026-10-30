@@ -87,6 +87,19 @@
   does. `SqliteAppStorage` gains `record_device_removal`, which keeps a
   decision already recorded, `device_removals` and
   `set_device_removal_slot_withdrawn`. No rows are seeded.
+- Migration 0139 (mdk#2628 item 4.2a) runs on every account database that
+  lacks it, including one already at schema 146. It adds `app_event_imports`,
+  which marks each app event imported from a sibling's history with the roster
+  slot of the device that sent it. `SqliteAppStorage::import_app_events`
+  records only events the account does not hold, as received rows with their
+  epoch and no transport id, and `app_event_import_source` reads the mark. An
+  imported review label or admin removal takes the sender's verdict
+  (`ImportedAppEvent::moderation_grant`) and has no authority without one.
+  Unread counts and the retention sweep's unread check skip imported rows, so
+  they never count as unread and expire on time; the read marker never moves
+  for them. `history_export_page` reads a chat's app events in chat order
+  (epoch, `created_at`, id) for a history bundle, with no event for each row
+  that must stay out.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`

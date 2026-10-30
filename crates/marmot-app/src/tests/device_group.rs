@@ -21,6 +21,7 @@ use storage_sqlite::DeviceGroupTrust;
 
 mod chat_kinds;
 mod devices;
+mod history;
 mod private_key_packages;
 mod removal;
 

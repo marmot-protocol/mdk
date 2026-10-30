@@ -101,6 +101,7 @@ mod error;
 pub mod error_kind_table;
 mod external_signer;
 mod groups;
+mod history_bundle;
 mod history_notices;
 pub use history_notices::{HistoryNotice, HistoryNoticeCause};
 mod ids;
@@ -217,6 +218,9 @@ pub use cgka_traits::{
     PollProjection, PollType, PollVote, PollVotePage,
 };
 pub use client::AppClient;
+#[cfg(feature = "test-policy-overrides")]
+#[doc(hidden)]
+pub use client::DevSealedHistoryBundle;
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::device_group::ConfirmedDeviceLink;
@@ -7140,6 +7144,31 @@ impl MarmotApp {
             self.presentation_signals.wake();
         }
         Ok(update)
+    }
+
+    /// Import a sibling's history for one chat (mdk#2628 4.2a), with the
+    /// chat-list refresh in the same transaction. `None` when every event was
+    /// already held or skipped.
+    pub(crate) fn import_account_app_events(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        source_slot: &cgka_traits::app_components::DeviceSlotId,
+        events: &[storage_sqlite::ImportedAppEvent],
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            let import = storage.app_storage().import_app_events(
+                group_id_hex,
+                source_slot,
+                events,
+                unix_now_seconds(),
+            )?;
+            if import.update.changes.is_empty() {
+                return Ok(None);
+            }
+            self.app_projection_update(label, import.update).map(Some)
+        })
     }
 
     /// Reconcile a local publication with its engine-stamped source authority.

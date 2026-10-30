@@ -71,6 +71,9 @@ mod audit;
 mod audit_recovery;
 mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
+mod chat_history;
+#[cfg(feature = "test-policy-overrides")]
+pub use chat_history::DevSealedHistoryBundle;
 pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
 pub(crate) mod device_pairing;
