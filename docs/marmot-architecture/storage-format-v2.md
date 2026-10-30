@@ -216,14 +216,14 @@ Variant values are stable:
 | `3` | exact `TransportMessage`, OpenMLS `TransportMessage`, optional own-commit stamp, optional own-application stamp |
 | `4` | one `TransportMessage`, required own-commit stamp |
 | `5` | one `TransportMessage`, origin commit id, `StagedInviteWelcome` |
-| `6` | one `TransportMessage`, KeyPackage event id, `OutboundWelcome` |
-| `7` | one `TransportMessage`, origin commit id, KeyPackage event id, `StagedInviteWelcome` |
+| `6` | one `TransportMessage`, `KeyPackageRef`, `OutboundWelcome` |
+| `7` | one `TransportMessage`, origin commit id, `KeyPackageRef`, `StagedInviteWelcome` |
 
-A Welcome keeps the event id of the KeyPackage it answers, when that
-KeyPackage had one, so a device can find a Welcome by its KeyPackage after
-losing the Welcome's id (mdk#2628 item 3.3b). A Welcome with no such id is
-written as `1` or `5`, byte for byte as before; one with an id is written as
-`6` or `7`. Ids are length-prefixed opaque values.
+A Welcome keeps the `KeyPackageRef` of the KeyPackage it answers, so a
+device can find a Welcome by its KeyPackage after losing the Welcome's id
+(mdk#2628 item 3.3b). A Welcome stored before that has no ref and is written
+as `1` or `5`, byte for byte as before; one with a ref is written as `6` or
+`7`. Ids and refs are length-prefixed opaque values.
 
 A stored `TransportMessage` contains, in order:
 

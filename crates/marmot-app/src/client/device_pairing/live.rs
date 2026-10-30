@@ -31,7 +31,7 @@ use nostr::nips::nip59::UnwrappedGift;
 use nostr::prelude::PublicKey;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome, DeviceLinkRecord, LinkedKeyPackage};
+use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome, DeviceLinkRecord};
 use transport_nostr_adapter::pairing::{
     InboundPairingMessage, PairingEventError, read_pairing_rumor, wrap_pairing_message,
 };
@@ -1114,9 +1114,8 @@ impl AppClient {
         let leaf_signature_key = marmot_session::key_package_metadata(&key_package)
             .map_err(|_| AppError::DeviceGroupRefused("key_package_not_confirmed"))?
             .leaf_signature_key;
-        let key_package_event_id_hex = hex::encode(link.key_package_event_id.as_bytes());
         // Record the approval before its commit, so no crash can lose it,
-        // with the KeyPackage's event id, which names the link's Welcome, and
+        // with the KeyPackage's ref, which also finds the link's Welcome, and
         // the leaf it adds: the new device's first commit sets that key as
         // its tag key, and a failed link removes that leaf. One whose commit
         // never lands fails.
@@ -1126,11 +1125,8 @@ impl AppClient {
             .record_device_link(
                 &hex::encode(link.device_group_id.as_slice()),
                 &hex::encode(slot),
-                LinkedKeyPackage {
-                    key_package_ref_hex: &key_package_ref_hex,
-                    key_package_event_id_hex: &key_package_event_id_hex,
-                    leaf_signature_key_hex: &hex::encode(&leaf_signature_key),
-                },
+                &key_package_ref_hex,
+                &hex::encode(&leaf_signature_key),
                 now,
             )?;
         match roster_update {
@@ -1140,7 +1136,7 @@ impl AppClient {
             }
             None => {
                 let confirmed = ConfirmedDeviceLink {
-                    key_package_event_id_hex,
+                    key_package_event_id_hex: hex::encode(link.key_package_event_id.as_bytes()),
                     key_package_ref_hex,
                     device_group_id: link.device_group_id.clone(),
                     welcome_sender_key: link.welcome_sender_key.as_slice().to_vec(),
@@ -1151,11 +1147,10 @@ impl AppClient {
         // The commit is made, so a failed read here must not end the link as
         // though it were not: the link's gate never reads its Welcome, which
         // is published only to reach the new device. A link that fails finds
-        // its Welcome by the KeyPackage's event id again to withdraw it.
-        let event_id = MessageId::new(link.key_package_event_id.as_bytes().to_vec());
+        // its Welcome by the KeyPackage's ref again to withdraw it.
         let welcomes: HashSet<MessageId> = match self
             .runtime
-            .welcomes_for_key_package(&link.device_group_id, &event_id)
+            .welcomes_for_key_package(&link.device_group_id, link.key_package_ref.as_slice())
         {
             Ok(welcomes) => welcomes.into_iter().collect(),
             Err(error) => {
@@ -1513,18 +1508,18 @@ impl AppClient {
         }
     }
 
-    /// Withdraw a failed link's Welcome, found by its KeyPackage's event id,
-    /// and record it withdrawn. The lookup needs nothing written after the
+    /// Withdraw a failed link's Welcome, found by its KeyPackage's ref, and
+    /// record it withdrawn. The lookup needs nothing written after the
     /// commit, so a crash right after it still leaves the Welcome to find. A
     /// Welcome the engine no longer retains is withdrawn: nothing can publish
     /// it. Any other failure leaves it to withdraw on the next drive.
     fn withdraw_failed_link_welcome(&mut self, link: &DeviceLinkRecord, failed_now: bool) {
         let result = (|| -> Result<(), AppError> {
             let group_id = GroupId::new(hex::decode(&link.group_id_hex)?);
-            let event_id = MessageId::new(hex::decode(&link.key_package_event_id_hex)?);
+            let key_package_ref = hex::decode(&link.key_package_ref_hex)?;
             for welcome in self
                 .runtime
-                .welcomes_for_key_package(&group_id, &event_id)?
+                .welcomes_for_key_package(&group_id, &key_package_ref)?
             {
                 match self
                     .runtime

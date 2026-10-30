@@ -137,7 +137,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   override only test-policy builds read), or when that commit is still absent `LINK_DEADLINE_SECS` after the entry's
   `linked_at`. A decided link never changes, and a link whose approval still waits to be retried is not decided. A
   failed link ends its prompt as `LinkFailed` with a `CannotLink` cancel. On each drive it then withdraws its Welcome,
-  found by the KeyPackage event id recorded before the commit (`welcomes_for_key_package`), until that succeeds and
+  found by the `KeyPackageRef` recorded before the commit (`welcomes_for_key_package`), until that succeeds and
   marks it withdrawn; never rely on a Welcome id written after the commit, which a crash can lose. While the roster
   lists the device as this device's link, it also removes its entry, and its leaf if the engine's tree still has one, in
   one `SendIntent::UnlinkDevice` commit; never decide the leaf from the stored member list, which a staged removal has

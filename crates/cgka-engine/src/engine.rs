@@ -3518,18 +3518,19 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// The retained outbound Welcomes of `group_id` that answer the
-    /// KeyPackage published as `key_package_event_id`: staged, owed,
-    /// delivered or withdrawn. A caller that knows the KeyPackage but lost
-    /// the Welcome's id, say to a crash right after the commit, finds it here
-    /// to withdraw it (mdk#2628 item 3.3b, D40). Only Welcomes that recorded
-    /// their KeyPackage's event id are found.
+    /// KeyPackage whose `KeyPackageRef` is `key_package_ref`, in the order
+    /// stored: staged, owed, delivered or withdrawn. A caller that knows the
+    /// KeyPackage but lost the Welcome's id, say to a crash right after the
+    /// commit, finds it here to withdraw it (mdk#2628 item 3.3b, D40). A
+    /// KeyPackage added again after its commit rolled back has a Welcome per
+    /// attempt. Only Welcomes that recorded their KeyPackageRef are found.
     ///
     /// Like withdrawal, it reads only the Welcomes' own rows, so it works for
     /// a group not hydrated yet.
     pub fn sent_welcomes_for_key_package(
         &self,
         group_id: &GroupId,
-        key_package_event_id: &MessageId,
+        key_package_ref: &[u8],
     ) -> Result<Vec<MessageId>, EngineError> {
         let mut ids = Vec::new();
         for record in
@@ -3539,7 +3540,7 @@ impl<S: StorageProvider> Engine<S> {
             let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
                 continue;
             };
-            if payload.welcome_key_package_event_id() == Some(key_package_event_id) {
+            if payload.welcome_key_package_ref() == Some(key_package_ref) {
                 ids.push(record.id);
             }
         }

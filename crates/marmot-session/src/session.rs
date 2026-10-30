@@ -842,11 +842,11 @@ impl AccountDeviceSession {
     pub fn sent_welcomes_for_key_package(
         &self,
         group_id: &GroupId,
-        key_package_event_id: &MessageId,
+        key_package_ref: &[u8],
     ) -> SessionResult<Vec<MessageId>> {
         Ok(self
             .engine
-            .sent_welcomes_for_key_package(group_id, key_package_event_id)?)
+            .sent_welcomes_for_key_package(group_id, key_package_ref)?)
     }
 
     /// See `Engine::sent_welcome_withdrawn`.

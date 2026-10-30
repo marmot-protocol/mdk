@@ -15,7 +15,7 @@ fn representative_welcome() -> StoredMessagePayload {
                 recipient: MemberId::new(vec![0x22; 32]),
             },
         },
-        Some(MessageId::new(vec![0x33; 32])),
+        Some(vec![0x33; 32]),
     )
 }
 

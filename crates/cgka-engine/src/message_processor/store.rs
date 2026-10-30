@@ -113,7 +113,7 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
         }
         record.payload = StoredMessagePayload::outbound_welcome(
             message.clone(),
-            payload.welcome_key_package_event_id().cloned(),
+            payload.welcome_key_package_ref().map(<[u8]>::to_vec),
         )
         .encode()
         .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
@@ -310,7 +310,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         msg: &TransportMessage,
         origin_commit_id: &MessageId,
-        key_package_event_id: Option<MessageId>,
+        key_package_ref: Vec<u8>,
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), EngineError> {
@@ -323,7 +323,7 @@ impl<S: StorageProvider> Engine<S> {
             StoredMessagePayload::staged_invite_welcome(
                 msg.clone(),
                 origin_commit_id.clone(),
-                key_package_event_id,
+                Some(key_package_ref),
             ),
             None,
         )

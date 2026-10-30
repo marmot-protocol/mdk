@@ -80,10 +80,11 @@ pub struct OwnApplicationConvergenceStamp {
 ///   exact, not-yet-confirmed invite commit. This representation is deliberately
 ///   not deliverable until that commit is confirmed.
 ///
-///   Both Welcome flavors keep the event id of the KeyPackage they answer,
-///   when it had one, so a caller that knows the KeyPackage but lost the
-///   Welcome's id can still find the Welcome (mdk#2628 item 3.3b). Promotion
-///   from staged to outbound carries it across.
+///   Both Welcome flavors keep the `KeyPackageRef` of the KeyPackage they
+///   answer, so a caller that knows the KeyPackage but lost the Welcome's id
+///   can still find the Welcome (mdk#2628 item 3.3b). Promotion from staged to
+///   outbound carries it across. A Welcome stored before the ref was kept has
+///   none.
 /// - `OpenMlsWire`: transport metadata plus payload replaced with peeled MLS
 ///   wire bytes. This variant, `SignedOpenMlsWire`, and `OwnCommitWire` are
 ///   eligible for OpenMLS projection and convergence replay.
@@ -105,13 +106,13 @@ pub enum StoredMessagePayload {
         #[serde(flatten)]
         message: TransportMessage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        key_package_event_id: Option<MessageId>,
+        key_package_ref: Option<Vec<u8>>,
     },
     StagedInviteWelcome {
         message: TransportMessage,
         origin_commit_id: MessageId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        key_package_event_id: Option<MessageId>,
+        key_package_ref: Option<Vec<u8>>,
     },
     OpenMlsWire(TransportMessage),
     SignedOpenMlsWire {
@@ -133,25 +134,22 @@ impl StoredMessagePayload {
         Self::RawTransport(message)
     }
 
-    pub fn outbound_welcome(
-        message: TransportMessage,
-        key_package_event_id: Option<MessageId>,
-    ) -> Self {
+    pub fn outbound_welcome(message: TransportMessage, key_package_ref: Option<Vec<u8>>) -> Self {
         Self::OutboundWelcome {
             message,
-            key_package_event_id,
+            key_package_ref,
         }
     }
 
     pub fn staged_invite_welcome(
         message: TransportMessage,
         origin_commit_id: MessageId,
-        key_package_event_id: Option<MessageId>,
+        key_package_ref: Option<Vec<u8>>,
     ) -> Self {
         Self::StagedInviteWelcome {
             message,
             origin_commit_id,
-            key_package_event_id,
+            key_package_ref,
         }
     }
 
@@ -249,18 +247,16 @@ impl StoredMessagePayload {
         }
     }
 
-    /// The event id of the KeyPackage a retained outbound Welcome answers,
-    /// staged or not, when the Welcome recorded one.
-    pub fn welcome_key_package_event_id(&self) -> Option<&MessageId> {
+    /// The `KeyPackageRef` of the KeyPackage a retained outbound Welcome
+    /// answers, staged or not, when the Welcome recorded one.
+    pub fn welcome_key_package_ref(&self) -> Option<&[u8]> {
         match self {
             Self::OutboundWelcome {
-                key_package_event_id,
-                ..
+                key_package_ref, ..
             }
             | Self::StagedInviteWelcome {
-                key_package_event_id,
-                ..
-            } => key_package_event_id.as_ref(),
+                key_package_ref, ..
+            } => key_package_ref.as_deref(),
             Self::RawTransport(_)
             | Self::OpenMlsWire(_)
             | Self::SignedOpenMlsWire { .. }
@@ -369,32 +365,32 @@ fn encode_stored_message_payload_v2(
             out.push(0);
             encode_transport_message(message, &mut out)?;
         }
-        // A Welcome with no KeyPackage event id keeps its original variant,
-        // byte for byte; one with an id takes the variant that adds it.
+        // A Welcome with no KeyPackageRef keeps its original variant, byte
+        // for byte; one with a ref takes the variant that adds it.
         StoredMessagePayload::OutboundWelcome {
             message,
-            key_package_event_id,
+            key_package_ref,
         } => {
-            out.push(if key_package_event_id.is_some() { 6 } else { 1 });
+            out.push(if key_package_ref.is_some() { 6 } else { 1 });
             encode_transport_message(message, &mut out)?;
-            if let Some(id) = key_package_event_id {
-                encode_var_bytes(id.as_slice(), &mut out, "Welcome KeyPackage event id")?;
+            if let Some(key_package_ref) = key_package_ref {
+                encode_var_bytes(key_package_ref, &mut out, "Welcome KeyPackageRef")?;
             }
         }
         StoredMessagePayload::StagedInviteWelcome {
             message,
             origin_commit_id,
-            key_package_event_id,
+            key_package_ref,
         } => {
-            out.push(if key_package_event_id.is_some() { 7 } else { 5 });
+            out.push(if key_package_ref.is_some() { 7 } else { 5 });
             encode_transport_message(message, &mut out)?;
             encode_var_bytes(
                 origin_commit_id.as_slice(),
                 &mut out,
                 "staged Welcome origin commit id",
             )?;
-            if let Some(id) = key_package_event_id {
-                encode_var_bytes(id.as_slice(), &mut out, "Welcome KeyPackage event id")?;
+            if let Some(key_package_ref) = key_package_ref {
+                encode_var_bytes(key_package_ref, &mut out, "Welcome KeyPackageRef")?;
             }
         }
         StoredMessagePayload::OpenMlsWire(message) => {
@@ -441,7 +437,7 @@ fn decode_stored_message_payload_v2(
         0 => StoredMessagePayload::RawTransport(decoder.transport_message()?),
         1 => StoredMessagePayload::OutboundWelcome {
             message: decoder.transport_message()?,
-            key_package_event_id: None,
+            key_package_ref: None,
         },
         2 => StoredMessagePayload::OpenMlsWire(decoder.transport_message()?),
         3 => StoredMessagePayload::SignedOpenMlsWire {
@@ -459,20 +455,16 @@ fn decode_stored_message_payload_v2(
         5 => StoredMessagePayload::StagedInviteWelcome {
             message: decoder.transport_message()?,
             origin_commit_id: MessageId::new(decoder.var_bytes("staged Welcome origin commit id")?),
-            key_package_event_id: None,
+            key_package_ref: None,
         },
         6 => StoredMessagePayload::OutboundWelcome {
             message: decoder.transport_message()?,
-            key_package_event_id: Some(MessageId::new(
-                decoder.var_bytes("Welcome KeyPackage event id")?,
-            )),
+            key_package_ref: Some(decoder.var_bytes("Welcome KeyPackageRef")?),
         },
         7 => StoredMessagePayload::StagedInviteWelcome {
             message: decoder.transport_message()?,
             origin_commit_id: MessageId::new(decoder.var_bytes("staged Welcome origin commit id")?),
-            key_package_event_id: Some(MessageId::new(
-                decoder.var_bytes("Welcome KeyPackage event id")?,
-            )),
+            key_package_ref: Some(decoder.var_bytes("Welcome KeyPackageRef")?),
         },
         variant => {
             return Err(invalid(format!(
@@ -915,10 +907,7 @@ mod stored_payload_codec_tests {
         let values = [
             StoredMessagePayload::RawTransport(group_message.clone()),
             StoredMessagePayload::outbound_welcome(welcome.clone(), None),
-            StoredMessagePayload::outbound_welcome(
-                welcome.clone(),
-                Some(MessageId::new([0x57; 32])),
-            ),
+            StoredMessagePayload::outbound_welcome(welcome.clone(), Some(vec![0x57; 32])),
             StoredMessagePayload::staged_invite_welcome(
                 welcome.clone(),
                 MessageId::new([0x55, 0x56]),
@@ -927,7 +916,7 @@ mod stored_payload_codec_tests {
             StoredMessagePayload::staged_invite_welcome(
                 welcome,
                 MessageId::new([0x55, 0x56]),
-                Some(MessageId::new([0x58; 32])),
+                Some(vec![0x58; 32]),
             ),
             StoredMessagePayload::OpenMlsWire(group_message.clone()),
             StoredMessagePayload::SignedOpenMlsWire {
@@ -984,10 +973,10 @@ mod stored_payload_codec_tests {
     }
 
     /// A Welcome written as legacy JSON, whose content is the bare transport
-    /// message, still decodes, with no KeyPackage event id; one with an id
-    /// keeps it, and only a Welcome with an id changes its binary variant.
+    /// message, still decodes, with no KeyPackageRef; one with a ref keeps
+    /// it, and only a Welcome with a ref changes its binary variant.
     #[test]
-    fn welcomes_decode_from_legacy_json_and_keep_their_key_package_event_id() {
+    fn welcomes_decode_from_legacy_json_and_keep_their_key_package_ref() {
         let welcome = transport(TransportEnvelope::Welcome {
             recipient: MemberId::new([0x22; 32]),
         });
@@ -996,24 +985,24 @@ mod stored_payload_codec_tests {
             StoredMessagePayload::decode(&serde_json::to_vec(&legacy).unwrap()).unwrap(),
             StoredMessagePayload::outbound_welcome(welcome.clone(), None)
         );
-        let event_id = Some(MessageId::new([0x44; 32]));
+        let key_package_ref = Some(vec![0x44; 32]);
         for value in [
-            StoredMessagePayload::outbound_welcome(welcome.clone(), event_id.clone()),
+            StoredMessagePayload::outbound_welcome(welcome.clone(), key_package_ref.clone()),
             StoredMessagePayload::staged_invite_welcome(
                 welcome.clone(),
                 MessageId::new([0x55]),
-                event_id.clone(),
+                key_package_ref.clone(),
             ),
         ] {
             assert_eq!(
                 StoredMessagePayload::decode(&serde_json::to_vec(&value).unwrap()).unwrap(),
                 value
             );
-            assert_eq!(value.welcome_key_package_event_id(), event_id.as_ref());
+            assert_eq!(value.welcome_key_package_ref(), key_package_ref.as_deref());
         }
         let without = StoredMessagePayload::outbound_welcome(welcome.clone(), None);
         assert_eq!(without.encode().unwrap()[7], 1);
-        let with = StoredMessagePayload::outbound_welcome(welcome, event_id);
+        let with = StoredMessagePayload::outbound_welcome(welcome, key_package_ref);
         assert_eq!(with.encode().unwrap()[7], 6);
     }
 

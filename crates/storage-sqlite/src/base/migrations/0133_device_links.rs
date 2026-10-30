@@ -5,9 +5,9 @@
 //! `device_links` holds one row per device this device approved adding to
 //! the account's device group, keyed by the group and the device's
 //! KeyPackage slot. The row is written before the approving commit, so a
-//! crash cannot lose it, with the KeyPackage's event id and the signature
-//! key of the leaf the link adds. A failed link finds its Welcome by that
-//! event id, so no crash between the commit and a later write can leave it
+//! crash cannot lose it, with the KeyPackage's `KeyPackageRef` and the
+//! signature key of the leaf the link adds. A failed link finds its Welcome
+//! by that ref, so no crash between the commit and a later write can leave it
 //! without one. `outcome` is one of:
 //!
 //! - `pending`: the new device has not made its first commit in the device
@@ -37,7 +37,6 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             group_id_hex TEXT NOT NULL,
             slot_hex TEXT NOT NULL,
             key_package_ref_hex TEXT NOT NULL,
-            key_package_event_id_hex TEXT NOT NULL,
             leaf_signature_key_hex TEXT NOT NULL,
             linked_at INTEGER NOT NULL CHECK(linked_at >= 0),
             outcome TEXT NOT NULL CHECK(outcome IN ('pending', 'linked', 'failed')),
