@@ -8,6 +8,7 @@
 //! `DurableTransportFanout`, which maintenance retries.
 
 use super::*;
+use crate::session::OutboundWelcomeStatus;
 
 /// Why a Welcome is not published (see `welcome_hold`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,5 +389,104 @@ where
             group_id,
             reason,
         }
+    }
+
+    /// Startup pass: one read of the message store prepares a detached retry
+    /// of every owed Welcome, as [`Self::prepare_welcome_retry_task_with_audit_context`]
+    /// does, and watches every staged one so maintenance delivers it once its
+    /// commit confirms. Returns the owed Welcomes' ids beside the task, or
+    /// `None` when nothing is owed.
+    #[doc(hidden)]
+    pub fn prepare_owed_welcome_retry_task_with_audit_context(
+        &mut self,
+        context: AuditEventContext,
+    ) -> AccountResult<Option<(Vec<cgka_traits::MessageId>, PreparedWelcomePublishTask)>>
+    where
+        A: Clone + 'static,
+    {
+        let work = self.session.outbound_welcome_work()?;
+        self.watch_staged_welcome_ids(work.staged);
+        self.staged_welcomes_seeded = true;
+        if work.owed.is_empty() {
+            return Ok(None);
+        }
+        let welcomes = work
+            .owed
+            .into_iter()
+            .map(|(_, welcome)| welcome)
+            .collect::<Vec<_>>();
+        let ids = welcomes.iter().map(|welcome| welcome.id.clone()).collect();
+        let task = self.prepare_welcome_retry_task_with_audit_context(welcomes, context)?;
+        Ok(Some((ids, task)))
+    }
+
+    /// Watch Welcomes this runtime just staged with their commit. The caller
+    /// holds them, but publishes them only if the commit was published; a
+    /// commit left for retry confirms later, and maintenance then delivers
+    /// them.
+    pub(super) fn watch_staged_welcomes(&mut self, welcomes: &[TransportMessage]) {
+        self.watch_staged_welcome_ids(welcomes.iter().map(|welcome| welcome.id.clone()));
+    }
+
+    fn watch_staged_welcome_ids(&mut self, ids: impl IntoIterator<Item = cgka_traits::MessageId>) {
+        for id in ids {
+            if !self.staged_welcomes.contains(&id) {
+                self.staged_welcomes.push(id);
+            }
+        }
+    }
+
+    /// Deliver each watched Welcome whose commit has confirmed since it was
+    /// staged, and stop watching it and every Welcome that will never be
+    /// owed. One with a stored fanout already has a first attempt behind it,
+    /// and maintenance retries it from that record instead.
+    pub(super) async fn deliver_promoted_welcomes(
+        &mut self,
+        output: &mut AccountDeviceEffects,
+    ) -> AccountResult<()> {
+        if !self.staged_welcomes_seeded {
+            let staged = self.session.outbound_welcome_work()?.staged;
+            self.watch_staged_welcome_ids(staged);
+            self.staged_welcomes_seeded = true;
+        }
+        let mut due: Vec<(GroupId, Vec<TransportMessage>)> = Vec::new();
+        let mut watching = Vec::with_capacity(self.staged_welcomes.len());
+        for id in std::mem::take(&mut self.staged_welcomes) {
+            let status = self
+                .session
+                .outbound_welcome_status(&id)
+                .and_then(|status| {
+                    let attempted = matches!(status, OutboundWelcomeStatus::Owed { .. })
+                        && (self.detached_welcome_publishes.contains(&id)
+                            || self.session.transport_fanout(&id)?.is_some());
+                    Ok((status, attempted))
+                });
+            match status {
+                Ok((OutboundWelcomeStatus::Waiting, _)) => watching.push(id),
+                Ok((OutboundWelcomeStatus::Settled, _) | (_, true)) => {}
+                Ok((OutboundWelcomeStatus::Owed { group_id, message }, false)) => {
+                    match due.iter_mut().find(|(group, _)| *group == group_id) {
+                        Some((_, welcomes)) => welcomes.push(message),
+                        None => due.push((group_id, vec![message])),
+                    }
+                }
+                Err(error) => {
+                    // Keep watching: the next pass reads it again.
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        method = "deliver_promoted_welcomes",
+                        transient = error.is_transient(),
+                        "staged Welcome status unreadable"
+                    );
+                    watching.push(id);
+                }
+            }
+        }
+        self.staged_welcomes = watching;
+        for (group_id, welcomes) in due {
+            self.publish_welcome_fanout(welcomes, Some(group_id), output, None, false)
+                .await?;
+        }
+        Ok(())
     }
 }

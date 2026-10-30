@@ -525,6 +525,12 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// Detached Welcomes withdrawn after their task was prepared. The task
     /// skips each one whose relay attempt has not started.
     detached_welcome_withdrawals: DetachedWelcomeWithdrawals,
+    /// Welcomes staged with an unconfirmed commit, in staging order, that
+    /// maintenance delivers once the commit confirms (see `welcome_delivery`).
+    staged_welcomes: Vec<cgka_traits::MessageId>,
+    /// Whether `staged_welcomes` holds the store's staged Welcomes yet: the
+    /// startup pass, or else the first maintenance pass, reads them once.
+    staged_welcomes_seeded: bool,
     /// Test-only fault injection: while armed, the finish stage of a prepared
     /// legacy publish for this message id fails with a transient storage
     /// error. Never set by production code.
@@ -591,6 +597,8 @@ where
             pending_leaf_reconciliations: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
             detached_welcome_withdrawals: DetachedWelcomeWithdrawals::default(),
+            staged_welcomes: Vec::new(),
+            staged_welcomes_seeded: false,
             finish_stage_failure: None,
             publication_progress: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -2385,6 +2393,7 @@ where
             }
         }
         self.retry_confirmed_transport_fanouts(&mut output).await?;
+        self.deliver_promoted_welcomes(&mut output).await?;
         // Roster housekeeping waits behind the KeyPackage steps' commits
         // (mdk#2628 3.1d).
         let expired = self.drop_expired_removed_slots_for_maintenance(held).await;
@@ -3371,7 +3380,11 @@ where
             .session
             .send_with_audit_context(intent, context)
             .await?;
-        classify_prepared_session_send(session_effects)
+        let prepared = classify_prepared_session_send(session_effects)?;
+        if let PreparedSessionSend::Commit(commit) = &prepared {
+            self.watch_staged_welcomes(commit.welcomes());
+        }
+        Ok(prepared)
     }
 
     /// Roll back a prepared commit before that commit has any transport side

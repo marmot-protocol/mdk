@@ -7591,7 +7591,9 @@ impl AppClient {
     }
 
     /// Prepare one bounded startup retry for every engine-authoritative
-    /// outstanding Welcome.
+    /// outstanding Welcome. The same read lets the runtime watch the Welcomes
+    /// still staged with their commits, so maintenance delivers them once
+    /// those commits confirm.
     ///
     /// Only relay I/O moves into the returned task. Exact artifacts, endpoint
     /// snapshots, and attempt reservations are durable/owned by this client so
@@ -7600,35 +7602,12 @@ impl AppClient {
     pub(crate) fn prepare_pending_welcome_delivery_recovery_best_effort(
         &mut self,
     ) -> Option<PendingWelcomeDeliveryRecovery> {
-        let pending = match self.runtime.outstanding_welcome_deliveries() {
-            Ok(pending) => pending,
-            Err(error) => {
-                let error = AppError::from(error);
-                tracing::warn!(
-                    target: "marmot_app::client",
-                    method = "prepare_pending_welcome_delivery_recovery_best_effort",
-                    error_kind = error.privacy_safe_kind(),
-                    "could not enumerate retained Welcome obligations at startup"
-                );
-                return None;
-            }
-        };
-        if pending.is_empty() {
-            return None;
-        }
-        let welcome_ids = pending
-            .iter()
-            .map(|(_, welcome)| hex::encode(welcome.id.as_slice()))
-            .collect::<Vec<_>>();
-        let welcomes = pending
-            .into_iter()
-            .map(|(_, welcome)| welcome)
-            .collect::<Vec<_>>();
-        let publish = match self
+        let (welcome_ids, publish) = match self
             .runtime
-            .prepare_welcome_retry_task_with_audit_context(welcomes, AuditEventContext::default())
+            .prepare_owed_welcome_retry_task_with_audit_context(AuditEventContext::default())
         {
-            Ok(publish) => publish,
+            Ok(Some((welcome_ids, publish))) => (welcome_ids, publish),
+            Ok(None) => return None,
             Err(error) => {
                 tracing::warn!(
                     target: "marmot_app::client",
@@ -7639,6 +7618,10 @@ impl AppClient {
                 return None;
             }
         };
+        let welcome_ids = welcome_ids
+            .iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect::<Vec<_>>();
         let observation = if publish.message_ids().is_empty() {
             None
         } else {

@@ -67,6 +67,33 @@ pub struct WelcomeDeliveryIndex {
     pub tracked_ids: Vec<MessageId>,
 }
 
+/// Owed Welcomes and staged Welcome ids from one pass over the message store.
+#[derive(Debug, Default)]
+pub struct OutboundWelcomeWork {
+    /// Delivery-aware Welcomes still awaiting acknowledgement, as
+    /// [`Engine::outstanding_sent_welcomes`] lists them.
+    pub owed: Vec<(GroupId, TransportMessage)>,
+    /// Welcomes staged with an unconfirmed commit. Each becomes owed if its
+    /// commit confirms, or is retired if it rolls back.
+    pub staged: Vec<MessageId>,
+}
+
+/// Where one retained outbound Welcome stands for delivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutboundWelcomeStatus {
+    /// Not deliverable yet: staged with its unconfirmed commit, or owed in a
+    /// group that is not hydrated yet.
+    Waiting,
+    /// Owed and deliverable now.
+    Owed {
+        group_id: GroupId,
+        message: TransportMessage,
+    },
+    /// Nothing is left to send: delivered, withdrawn, retired with its
+    /// commit, not a delivery-aware Welcome, or in a quarantined group.
+    Settled,
+}
+
 /// What [`Engine::withdraw_sent_welcome`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WelcomeWithdrawal {
@@ -3386,15 +3413,64 @@ impl<S: StorageProvider> Engine<S> {
     pub fn outstanding_sent_welcomes(
         &self,
     ) -> Result<Vec<(GroupId, TransportMessage)>, EngineError> {
-        let mut welcomes = Vec::new();
-        self.visit_welcome_records(&[MessageState::Sent], |group_id, _, _, payload| {
-            if let StoredMessagePayload::OutboundWelcome(message) = payload
-                && matches!(message.envelope, TransportEnvelope::Welcome { .. })
+        Ok(self.outbound_welcome_work()?.owed)
+    }
+
+    /// [`Self::outstanding_sent_welcomes`], plus the ids of Welcomes still
+    /// staged with their commits, from the same pass. A restart uses it to
+    /// deliver what is owed and to watch what may become owed.
+    pub fn outbound_welcome_work(&self) -> Result<OutboundWelcomeWork, EngineError> {
+        let mut work = OutboundWelcomeWork::default();
+        self.visit_welcome_records(
+            &[MessageState::Sent],
+            |group_id, id, _, payload| match payload {
+                StoredMessagePayload::OutboundWelcome(message)
+                    if matches!(message.envelope, TransportEnvelope::Welcome { .. }) =>
+                {
+                    work.owed.push((group_id.clone(), message));
+                }
+                StoredMessagePayload::StagedInviteWelcome { .. } => work.staged.push(id),
+                _ => {}
+            },
+        )?;
+        Ok(work)
+    }
+
+    /// Where the retained outbound Welcome `id` stands for delivery. A
+    /// missing row is settled: there is nothing this engine owes under it.
+    pub fn outbound_welcome_status(
+        &self,
+        id: &MessageId,
+    ) -> Result<OutboundWelcomeStatus, EngineError> {
+        let record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(OutboundWelcomeStatus::Settled),
+            Err(error) => return Err(EngineError::Storage(error)),
+        };
+        if record.state != MessageState::Sent {
+            return Ok(OutboundWelcomeStatus::Settled);
+        }
+        match self.ensure_group_live(&record.group_id) {
+            Ok(()) => {}
+            Err(EngineError::GroupNotHydrated(_)) => return Ok(OutboundWelcomeStatus::Waiting),
+            Err(_) => return Ok(OutboundWelcomeStatus::Settled),
+        }
+        // A `Sent` row that cannot be read may still be staged: wait.
+        let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+            return Ok(OutboundWelcomeStatus::Waiting);
+        };
+        Ok(match payload {
+            StoredMessagePayload::StagedInviteWelcome { .. } => OutboundWelcomeStatus::Waiting,
+            StoredMessagePayload::OutboundWelcome(message)
+                if matches!(message.envelope, TransportEnvelope::Welcome { .. }) =>
             {
-                welcomes.push((group_id.clone(), message));
+                OutboundWelcomeStatus::Owed {
+                    group_id: record.group_id,
+                    message,
+                }
             }
-        })?;
-        Ok(welcomes)
+            _ => OutboundWelcomeStatus::Settled,
+        })
     }
 
     /// IDs of every delivery-aware or explicitly staged outbound Welcome
