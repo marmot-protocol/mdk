@@ -7498,8 +7498,8 @@ MarmotStatus marmot_key_package_refresh_overdue(const struct MarmotClient *clien
  * device group. The label is at most 64 bytes of UTF-8; an empty
  * string clears it. Fails while device groups are off, for an unknown
  * device, or while the device group has an earlier change in flight
- * (retry later). A rename whose commit loses a fork to one that also
- * changes that device's entry is not made again. Re-read on the
+ * (retry later). A rename whose commit loses a fork is made again later,
+ * unless another rename of that device won. Re-read on the
  * `LinkedDevicesChanged` event.
  *
  * # Safety

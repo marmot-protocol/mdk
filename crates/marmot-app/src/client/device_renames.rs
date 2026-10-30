@@ -8,7 +8,12 @@
 //!
 //! A rename is kept on disk before its commit is sent: the ids it wrote, and
 //! the ids the entry held where this device's renames of that device were
-//! built ([`DeviceRenameRecord`]). Its commit can lose a fork. Each
+//! built ([`DeviceRenameRecord`]). It is put back as it was only when nothing
+//! went out: the edit was refused, the commit rolled back, or, after an
+//! error, the roster lacks the rename and nothing of this device's is in
+//! flight. Otherwise the commit may still land from the runtime's retry, so
+//! the record stays and is judged like any other. Its commit can lose a fork.
+//! Each
 //! maintenance pass, while the device group can take a commit from this
 //! device (so each of its commits there has reached its outcome), reads the
 //! rename id the winning roster holds for every device this device renamed:
@@ -25,7 +30,7 @@
 
 use cgka_traits::GroupId;
 use cgka_traits::app_components::{DEVICE_ROSTER_TEXT_MAX_LEN, DeviceRenameId, DeviceSlotId};
-use marmot_session::{DeviceRosterEdit, DeviceRosterEditBlocked};
+use marmot_session::{AccountResult, DeviceRosterEdit, DeviceRosterEditBlocked, PendingResolution};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use storage_sqlite::DeviceRenameRecord;
@@ -74,6 +79,30 @@ fn bound(record: &mut DeviceRenameRecord) {
     record.replaced.drain(..from_replaced);
     let from_written = (excess - from_replaced).min(record.written.len().saturating_sub(1));
     record.written.drain(..from_written);
+}
+
+/// Whether a rename's edit sent nothing, so its record goes back as it was:
+/// the edit was refused, or its commit rolled back. A commit neither
+/// confirmed nor rolled back waits for the runtime's retry and may still land.
+/// An error carries no resolution, so `None`: it may come before the commit
+/// was staged or after it was published.
+fn nothing_went_out(edit: &AccountResult<DeviceRosterEdit>) -> Option<bool> {
+    Some(match edit {
+        Ok(DeviceRosterEdit::Committed(effects)) => {
+            // Only this commit was in flight: the gate let nothing else of
+            // this device's through.
+            effects
+                .pending
+                .iter()
+                .any(|resolution| matches!(resolution, PendingResolution::RolledBack { .. }))
+                && !effects
+                    .pending
+                    .iter()
+                    .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. }))
+        }
+        Ok(DeviceRosterEdit::Unchanged | DeviceRosterEdit::Blocked(_)) => true,
+        Err(_) => return None,
+    })
 }
 
 /// What one rename commit came to.
@@ -210,7 +239,7 @@ impl AppClient {
     /// Commit `record`'s rename of `slot` in `group_id`, through the
     /// runtime's roster write path, on the entry holding `expected`. The
     /// record is kept before the commit is sent, and put back as it was when
-    /// nothing went out.
+    /// nothing went out: the edit was refused, or the commit rolled back.
     async fn commit_device_rename(
         &mut self,
         group_id: &GroupId,
@@ -236,6 +265,10 @@ impl AppClient {
                 }
             })
             .await;
+        let nothing_sent = match nothing_went_out(&edit) {
+            Some(nothing_sent) => nothing_sent,
+            None => self.rename_never_went_out(group_id, &slot, rename_id, &held),
+        };
         let outcome = match edit {
             Ok(DeviceRosterEdit::Committed(effects)) => {
                 self.linked_devices_changed = true;
@@ -255,13 +288,38 @@ impl AppClient {
             }
             Err(error) => Err(error.into()),
         };
-        if !matches!(outcome, Ok(RenameCommit::Sent)) {
+        if nothing_sent {
             match &previous {
                 Some(previous) => storage.put_device_rename(previous)?,
                 None => storage.drop_device_rename(&record.slot_id_hex)?,
             }
         }
         outcome
+    }
+
+    /// After an error, whether the rename writing `rename_id` at `slot` never
+    /// went out, judged by what the device group holds now: the roster does
+    /// not carry it, and nothing of this device's is in flight there. Anything
+    /// unreadable or unsettled counts as possibly out, so the record stays.
+    fn rename_never_went_out(
+        &mut self,
+        group_id: &GroupId,
+        slot: &DeviceSlotId,
+        rename_id: DeviceRenameId,
+        held: &[GroupId],
+    ) -> bool {
+        let landed = match self.trusted_device_roster() {
+            Ok(Some((trusted, roster))) if trusted == *group_id => roster
+                .devices
+                .get(slot)
+                .is_some_and(|entry| entry.rename_id == Some(rename_id)),
+            _ => return false,
+        };
+        !landed
+            && self
+                .runtime
+                .device_group_takes_commit(group_id, held)
+                .unwrap_or(false)
     }
 }
 
@@ -289,6 +347,52 @@ mod tests {
         assert_eq!(
             standing(&record(&[3], &[Some(1)]), None),
             Standing::Replaced
+        );
+    }
+
+    #[test]
+    fn a_record_goes_back_only_when_nothing_went_out() {
+        use cgka_traits::{EngineError, PendingStateRef};
+        use marmot_session::{AccountDeviceEffects, AccountError};
+
+        let committed = |pending: Vec<PendingResolution>| {
+            Ok(DeviceRosterEdit::Committed(Box::new(
+                AccountDeviceEffects {
+                    pending,
+                    ..AccountDeviceEffects::default()
+                },
+            )))
+        };
+        let pending = PendingStateRef::new(1);
+        assert_eq!(
+            nothing_went_out(&Ok(DeviceRosterEdit::Unchanged)),
+            Some(true)
+        );
+        assert_eq!(
+            nothing_went_out(&Ok(DeviceRosterEdit::Blocked(
+                DeviceRosterEditBlocked::Busy
+            ))),
+            Some(true)
+        );
+        assert_eq!(
+            nothing_went_out(&committed(vec![PendingResolution::RolledBack { pending }])),
+            Some(true)
+        );
+        assert_eq!(
+            nothing_went_out(&committed(vec![PendingResolution::Confirmed { pending }])),
+            Some(false)
+        );
+        assert_eq!(
+            nothing_went_out(&committed(Vec::new())),
+            Some(false),
+            "a commit kept for a retry may still land"
+        );
+        assert_eq!(
+            nothing_went_out(&Err(AccountError::Engine(EngineError::Storage(
+                cgka_traits::storage::StorageError::Backend("after the publish".into())
+            )))),
+            None,
+            "an error is judged by what the device group holds"
         );
     }
 

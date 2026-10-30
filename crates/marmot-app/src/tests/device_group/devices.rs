@@ -156,13 +156,62 @@ async fn a_rename_is_refused_with_nothing_sent() {
         .rename_linked_device(&laptop_slot, &"é".repeat(32))
         .await
         .unwrap();
+    let kept = renames(&phone);
 
+    // The rejected commit rolls back, so its record goes back as it was.
     relay.reject_next_publish();
     phone
         .rename_linked_device(&laptop_slot, "Laptop")
         .await
         .unwrap_err();
     assert_eq!(label_of(&mut phone, &laptop_slot), "é".repeat(32));
+    assert_eq!(renames(&phone), kept);
+}
+
+/// A rename whose publish reaches no relay yet is kept by the runtime for a
+/// retry, and keeps its record: when the retry lands, the roster holds the
+/// id that record wrote, so a later fork is still judged by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_kept_for_a_retry_keeps_its_record() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let laptop_slot = own_slot(&laptop);
+
+    relay.fail_publishes_as_unavailable();
+    phone
+        .rename_linked_device(&laptop_slot, "Laptop")
+        .await
+        .unwrap();
+    assert_eq!(label_of(&mut phone, &laptop_slot), "", "not landed yet");
+    let kept = renames(&phone);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].label, "Laptop");
+
+    // The runtime retries the kept publish after its backoff.
+    relay.allow_publishes();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while label_of(&mut phone, &laptop_slot) != "Laptop" {
+            let effects = phone.runtime.advance_convergence(&group).await.unwrap();
+            phone
+                .observe_drained_session_events(&effects)
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the kept publish lands");
+    assert_eq!(label_of(&mut phone, &laptop_slot), "Laptop");
+    let landed = rename_id_of(&mut phone, &laptop_slot).unwrap();
+    assert_eq!(renames(&phone)[0].written, vec![landed]);
 }
 
 /// While a commit of this device in the device group is staged and not yet
