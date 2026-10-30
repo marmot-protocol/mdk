@@ -431,6 +431,8 @@ struct CurrentRoute {
     group_id: Option<Vec<u8>>,
     required: Vec<String>,
     best_effort: Vec<String>,
+    /// A retained prior route's goal end ([`crate::retained_route_goal_until`]).
+    goal_until: Option<u64>,
 }
 
 /// The ledger keys relays by one spelling: the adapter and the scope plans
@@ -531,26 +533,29 @@ impl AppClient {
     fn current_coverage_routes(&self) -> Vec<CurrentRoute> {
         let routing = self.routing.snapshot();
         let operated = &self.app.config.deployment.recovery_operated_relays;
-        let current = |route, group_id, endpoints: &[cgka_traits::TransportEndpoint]| {
-            let admitted = self.adapter.recovery_admitted_endpoints(endpoints);
-            let required = relays(&transport_nostr::recovery_required_endpoints(
-                &admitted, operated,
-            ));
-            let best_effort = relays(&admitted)
-                .into_iter()
-                .filter(|relay| !required.contains(relay))
-                .collect();
-            CurrentRoute {
-                route,
-                group_id,
-                required,
-                best_effort,
-            }
-        };
+        let current =
+            |route, group_id, endpoints: &[cgka_traits::TransportEndpoint], goal_until| {
+                let admitted = self.adapter.recovery_admitted_endpoints(endpoints);
+                let required = relays(&transport_nostr::recovery_required_endpoints(
+                    &admitted, operated,
+                ));
+                let best_effort = relays(&admitted)
+                    .into_iter()
+                    .filter(|relay| !required.contains(relay))
+                    .collect();
+                CurrentRoute {
+                    route,
+                    group_id,
+                    required,
+                    best_effort,
+                    goal_until,
+                }
+            };
         let mut routes = vec![current(
             TransportReconciliationRoute::Inbox,
             None,
             &routing.local_inbox_endpoints,
+            None,
         )];
         let mut seen = HashSet::new();
         for entry in &routing.group_routes {
@@ -562,6 +567,7 @@ impl AppClient {
                     TransportReconciliationRoute::Group(id),
                     Some(entry.group_id.as_slice().to_vec()),
                     &entry.endpoints,
+                    entry.retained_since.map(crate::retained_route_goal_until),
                 ));
             }
         }
@@ -582,6 +588,7 @@ impl AppClient {
                 group_id: current.group_id,
                 required: current.required,
                 best_effort: current.best_effort,
+                goal_until: current.goal_until,
             })
             .collect()
     }

@@ -8587,6 +8587,16 @@ pub(crate) fn history_floor(anchor_secs: u64) -> cgka_traits::transport::Timesta
     )
 }
 
+/// The last second a retained route owes recovered history: its switch plus
+/// [`HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE`], from its subscription floor
+/// ([`history_floor`] of that switch). Later traffic there comes from members
+/// that have not applied the switch, and its live subscription delivers it.
+pub(crate) fn retained_route_goal_until(retained_since: cgka_traits::transport::Timestamp) -> u64 {
+    retained_since
+        .0
+        .saturating_add(2 * HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE.as_secs())
+}
+
 fn sqlite_file_requires_key(path: &Path) -> bool {
     if !path.exists() {
         return false;

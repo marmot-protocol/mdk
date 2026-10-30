@@ -110,6 +110,11 @@ pub(crate) struct RunnerRoute {
     /// fetch would only fill the group's deferred input with ciphertext the
     /// copy cannot open.
     pub(crate) unrecoverable: bool,
+    /// A retained prior route's goal ends here: its switch plus the
+    /// clock-skew allowance. Members that had not applied the switch by then
+    /// still send there, and its live subscription delivers that; nothing
+    /// later is owed. `None` for a current route.
+    pub(crate) goal_until: Option<u64>,
 }
 
 impl RunnerRoute {
@@ -161,6 +166,23 @@ pub(crate) struct DebtTurn<'a> {
     pub(crate) tails: &'a dyn LiveTailRead,
     /// The open live REQs' counts, for the fence.
     pub(crate) live_counts: &'a [LiveCount],
+}
+
+impl DebtTurn<'_> {
+    /// The last second `relay` owes `route` this turn: the second before its
+    /// live tail, and never past a retained route's goal.
+    pub(super) fn owed_until(&self, route: &RunnerRoute, relay: &str) -> u64 {
+        self.checked_until(route)
+            .min(self.tails.owed_until(&route.route, relay, self.now))
+    }
+
+    /// The last second a re-check of `route` passes over: now, or a retained
+    /// route's goal end.
+    pub(super) fn checked_until(&self, route: &RunnerRoute) -> u64 {
+        route
+            .goal_until
+            .map_or(self.now, |until| until.min(self.now))
+    }
 }
 
 /// What one account gives its runner. Turns run on whoever owns the account's

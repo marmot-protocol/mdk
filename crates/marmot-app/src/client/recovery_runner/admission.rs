@@ -472,7 +472,7 @@ impl<'t> Admission<'t> {
         let mut members = Vec::new();
         for route in routes.iter().copied() {
             for relay in route.required.iter().collect::<BTreeSet<_>>() {
-                let owed_until = turn.tails.owed_until(&route.route, relay, turn.now);
+                let owed_until = turn.owed_until(route, relay);
                 let debt = turn
                     .app
                     .recovery_unit_debt(&route.route, relay, owed_until)?;

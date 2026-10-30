@@ -83,6 +83,7 @@ fn required(route: &Route, relays: &[&str]) -> RunnerRoute {
         required: relays.iter().map(|relay| (*relay).to_owned()).collect(),
         best_effort: Vec::new(),
         unrecoverable: false,
+        goal_until: None,
     }
 }
 
@@ -3844,4 +3845,44 @@ async fn recovery_runner_suspends_an_unrecoverable_groups_route() {
 
     host.routes.lock().unwrap()[0].unrecoverable = false;
     assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
+}
+
+/// A retained prior route owes history only through its goal's end: the sweep
+/// stops there, and once that is covered the route owes nothing more, though
+/// no live tail stands after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_owes_a_retained_route_nothing_past_its_goal() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let ceiling = t0 - HOUR / 2;
+    let relay = ModelRelay::new(RELAY, caps(500, false))
+        .with_events(every([1; 32], floor, t0, 60))
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![RunnerRoute {
+            goal_until: Some(ceiling),
+            ..required(&route, &[RELAY])
+        }],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    account.rechecked(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    let outcomes = run_until_idle(&mut runner, 10).await;
+    assert!(!outcomes.is_empty());
+    assert!(outcomes.iter().all(|outcome| *outcome == Outcome::Advanced));
+    assert_eq!(account.covered_through(&route, RELAY), ceiling);
+    assert!(relay.queries().iter().all(|query| query.until <= ceiling));
+    assert_eq!(account.debt(&route, RELAY, ceiling), []);
+
+    let requests = relay.requests();
+    clock.advance(60);
+    assert!(matches!(runner.step().await, Step::Idle { .. }));
+    assert_eq!(relay.requests(), requests);
 }

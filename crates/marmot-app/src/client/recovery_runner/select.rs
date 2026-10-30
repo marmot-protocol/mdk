@@ -250,7 +250,7 @@ pub(super) fn survey(
     let mut candidates = Vec::new();
     for route in sweepable(turn.routes) {
         for (relay, best_effort) in route.relays() {
-            let owed_until = turn.tails.owed_until(&route.route, relay, now);
+            let owed_until = turn.owed_until(route, relay);
             let debt = app.recovery_unit_debt(&route.route, relay, owed_until)?;
             let Some(first) = debt.first() else {
                 continue;
@@ -482,16 +482,15 @@ pub(super) fn begin(
     let TransportReconciliationRoute::Group(nostr_group_id) = key.route else {
         return Ok(None);
     };
-    let current = sweepable(turn.routes).any(|route| {
+    let Some(route) = sweepable(turn.routes).find(|route| {
         route.route == key.route
             && !suspended(route)
             && route
                 .relays()
                 .any(|(relay, effort)| relay == key.relay && effort == best_effort)
-    });
-    if !current {
+    }) else {
         return Ok(None);
-    }
+    };
     let planned: Option<RecoveryRelayCaps> = caps.map(recovery_caps);
     if planned.is_some() {
         app.record_recovery_relay_caps(&key.relay, planned, now)?;
@@ -516,7 +515,7 @@ pub(super) fn begin(
         return Ok(None);
     }
     let mark = app.recovery_coverage_mark()?;
-    let owed_until = turn.tails.owed_until(&key.route, &key.relay, now);
+    let owed_until = turn.owed_until(route, &key.relay);
     let mut ranges = Vec::new();
     for debt in app.recovery_unit_debt(&key.route, &key.relay, owed_until)? {
         if let Some(cursor) = app.recovery_unit_cursor(
