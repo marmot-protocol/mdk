@@ -135,11 +135,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   no pending convergence input. It fails when its group was never made, when the quiet roster has not listed it as
   this device's link for a whole settlement window (`MarmotApp::settlement_quiescence_ms`, in milliseconds, whose
   override only test-policy builds read), or when that commit is still absent `LINK_DEADLINE_SECS` after the entry's
-  `linked_at`. A decided link never changes. A failed link ends its prompt as `LinkFailed` with a `CannotLink` cancel,
-  withdraws its Welcome (`withdraw_welcome`, by the id stored after the commit), and, while the roster lists the
-  device as this device's link, removes its leaf and entry in one `SendIntent::UnlinkDevice` commit (a roster-only
-  update when no leaf is left), retried on each drive. Publish an undelivered Welcome again every few seconds until
-  the new device's Welcome wait ends; neither its publication nor its delivery decides a link.
+  `linked_at`. A decided link never changes, and a link whose approval still waits to be retried is not decided. A
+  failed link ends its prompt as `LinkFailed` with a `CannotLink` cancel. On each drive it then withdraws its Welcome
+  (`withdraw_welcome`, by the id stored after the commit) until that succeeds and clears the id, and, while the roster
+  lists the device as this device's link, removes its leaf and entry in one `SendIntent::UnlinkDevice` commit (a
+  roster-only update when no leaf is left); a withdrawal that fails never holds the removal back. A link refused as
+  `LinkDeviceUnsettled` made no commit, even while another commit resolves. Publish an undelivered Welcome again every
+  few seconds until the new device's Welcome wait ends; neither its publication nor its delivery decides a link.
   `drive_unpublished_welcome_delivery` returns a `#[must_use]` `WelcomeDelivery`; chat creation goes on either way, as
   the Welcome stays owed. Prompt ids are random, so an id a host kept from before a reopen names no prompt. The engine
   refuses a link or an unlink with `LinkDeviceUnsettled` rather than queue it; retry a link on each drive until a

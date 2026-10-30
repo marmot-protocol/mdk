@@ -17,7 +17,7 @@ use cgka_traits::app_components::{
     MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID, encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
-use cgka_traits::storage::MaintenanceStorage as _;
+use cgka_traits::storage::{MaintenanceStorage as _, StorageError};
 use cgka_traits::{
     EngineError, EpochState, GroupCapabilities, GroupId, KeyPackage, MemberId, MessageId,
 };
@@ -1226,9 +1226,19 @@ impl AppClient {
                 .map(|()| effects),
             Err(error) => Err(error),
         };
+        // Refused as unsettled, the link made no commit: a commit resolving
+        // in the device group is another one, and the approval waits.
+        if let Err(error) = &sent
+            && matches!(
+                error.as_engine_error(),
+                Some(EngineError::LinkDeviceUnsettled { .. })
+            )
+        {
+            return sent.map(drop);
+        }
         // The runtime rolled the commit back, or kept it to retry; only the
         // rollback ends the link. The engine never queues a link, so a
-        // commit resolving in the device group is this one.
+        // commit resolving in the device group now is this one.
         if self
             .runtime
             .epoch_state(group_id)
@@ -1357,6 +1367,12 @@ impl AppClient {
             }
             let key = (link.group_id_hex.clone(), link.slot_hex.clone());
             pending.push(key.clone());
+            if self.approval_waits(&link) {
+                // Its last attempt was refused before any commit; the retry
+                // re-records it, and decides nothing until it commits or ends.
+                self.device_pairing.quiet_since.remove(&key);
+                continue;
+            }
             let Some(outcome) = self.link_outcome(&link, &own_slot, &key, window, now) else {
                 continue;
             };
@@ -1380,6 +1396,21 @@ impl AppClient {
         self.device_pairing
             .quiet_since
             .retain(|key, _| pending.contains(key));
+    }
+
+    /// Whether `link`'s approval still waits to be retried: the engine refused
+    /// its commit as unsettled, which it also does for reasons the device
+    /// group's quiet state does not show, such as this device's own changes
+    /// queued there.
+    fn approval_waits(&self, link: &DeviceLinkRecord) -> bool {
+        self.device_pairing.prompts.iter().any(|prompt| {
+            prompt.approval.as_ref().is_some_and(|approval| {
+                hex::encode(approval.link.device_group_id.as_slice()) == link.group_id_hex
+            }) && prompt
+                .found
+                .as_ref()
+                .is_some_and(|found| hex::encode(found.slot) == link.slot_hex)
+        })
     }
 
     /// The outcome `link` has reached, if any. Its device group must be
@@ -1436,18 +1467,23 @@ impl AppClient {
         }
     }
 
-    /// Undo a failed link (D40): withdraw its Welcome, so no recovery
-    /// publishes it again, then, while the trusted roster still lists the
-    /// device as this device's link, remove its leaf and roster entry in one
-    /// commit. The withdrawal runs when the link fails and again with each
-    /// removal attempt; withdrawing twice changes nothing. A removal the
-    /// unsettled group refuses is tried again on the next drive.
+    /// Undo a failed link (D40) on every drive until it is undone: withdraw
+    /// its Welcome until that succeeds, so no recovery publishes it again,
+    /// and while the trusted roster still lists the device as this device's
+    /// link, remove its leaf and roster entry in one commit. A Welcome that
+    /// cannot be withdrawn yet does not hold the removal back: one published
+    /// later opens an epoch before the removal, and the new device's engine
+    /// joins none once its wait ended. A removal the unsettled group refuses
+    /// is tried again on the next drive.
     async fn unlink_failed_device(
         &mut self,
         link: &DeviceLinkRecord,
         own_slot: &DeviceSlotId,
         failed_now: bool,
     ) {
+        if let Some(welcome_id) = &link.welcome_id_hex {
+            self.withdraw_failed_link_welcome(link, welcome_id, failed_now);
+        }
         let result = async {
             let group_id = GroupId::new(hex::decode(&link.group_id_hex)?);
             let slot = device_slot(&link.slot_hex)?;
@@ -1458,13 +1494,6 @@ impl AppClient {
                     .is_some_and(|device| device.linked_by.as_ref() == Some(own_slot)),
                 _ => false,
             };
-            if !failed_now && !listed {
-                return Ok(());
-            }
-            if let Some(welcome_id) = &link.welcome_id_hex {
-                self.runtime
-                    .withdraw_welcome(&MessageId::new(hex::decode(welcome_id)?))?;
-            }
             if !listed {
                 return Ok(());
             }
@@ -1506,6 +1535,63 @@ impl AppClient {
                 error_kind = error.privacy_safe_kind(),
                 "could not remove a device whose link failed; retrying"
             ),
+        }
+    }
+
+    /// Withdraw a failed link's Welcome and forget it once withdrawn. A
+    /// Welcome the engine no longer retains is withdrawn: nothing can
+    /// publish it. Any other failure keeps it to withdraw on the next drive.
+    fn withdraw_failed_link_welcome(
+        &mut self,
+        link: &DeviceLinkRecord,
+        welcome_id: &str,
+        failed_now: bool,
+    ) {
+        let result = hex::decode(welcome_id)
+            .map_err(AppError::from)
+            .and_then(
+                |id| match self.runtime.withdraw_welcome(&MessageId::new(id)) {
+                    Ok(_) => Ok(()),
+                    Err(error) => match AppError::from(error) {
+                        error
+                            if matches!(
+                                error.as_engine_error(),
+                                Some(EngineError::Storage(StorageError::NotFound))
+                            ) =>
+                        {
+                            Ok(())
+                        }
+                        error => Err(error),
+                    },
+                },
+            )
+            .and_then(|()| {
+                self.app
+                    .account_storage(&self.state.label)?
+                    .app_storage()
+                    .clear_failed_device_link_welcome(
+                        &link.group_id_hex,
+                        &link.slot_hex,
+                        welcome_id,
+                    )?;
+                Ok(())
+            });
+        if let Err(error) = result {
+            if failed_now {
+                tracing::warn!(
+                    target: TARGET,
+                    method = "withdraw_failed_link_welcome",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not withdraw a failed link's Welcome; retrying"
+                );
+            } else {
+                tracing::debug!(
+                    target: TARGET,
+                    method = "withdraw_failed_link_welcome",
+                    error_kind = error.privacy_safe_kind(),
+                    "a failed link's Welcome is still not withdrawn; retrying"
+                );
+            }
         }
     }
 
