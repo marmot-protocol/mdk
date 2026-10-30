@@ -22,6 +22,13 @@
 //!   `request_owed` is 1 while it still has to ask its siblings to broadcast,
 //!   and `answer_owed` is 1 when a sibling asked it to since its last
 //!   broadcast.
+//! - `device_group_messages`: the kind of each device-group message this
+//!   device sent or read whose withdrawal a feature acts on, since the
+//!   engine's withdrawal names only its message id: an own send's transport
+//!   id, a received message's content id. One row per device group and app
+//!   event id; `message_id_hex` is NULL until an own send's transport id is
+//!   known. `recorded_at` is in seconds; rows
+//!   go after a week, and only the newest 4,096 stay.
 //!
 //! No rows are seeded.
 use crate::SqliteResultExt;
@@ -69,7 +76,19 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             request_owed INTEGER NOT NULL CHECK(request_owed IN (0, 1)),
             answer_owed INTEGER NOT NULL CHECK(answer_owed IN (0, 1)),
             CHECK((broadcast_at IS NULL) = (broadcast_tip IS NULL))
-        );",
+        );
+
+        CREATE TABLE device_group_messages (
+            group_id_hex TEXT NOT NULL,
+            app_event_id TEXT NOT NULL,
+            message_id_hex TEXT,
+            kind INTEGER NOT NULL CHECK(kind >= 0),
+            recorded_at INTEGER NOT NULL CHECK(recorded_at >= 0),
+            PRIMARY KEY (group_id_hex, app_event_id)
+        );
+
+        CREATE INDEX idx_device_group_messages_message
+            ON device_group_messages (group_id_hex, message_id_hex);",
     )
     .storage()
 }

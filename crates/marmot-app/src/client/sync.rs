@@ -2466,6 +2466,7 @@ impl AppClient {
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
         self.remember_published_reports(effects);
+        self.note_device_group_message_ids(effects);
         self.note_superseded_intent_reports(effects);
         self.settle_accepted_push_announces(effects);
         self.enqueue_effect_projection(effects, source_message_id_hex, received_at, drained);

@@ -1484,7 +1484,7 @@ async fn settled_linked_devices() -> (Devices, GroupId) {
     (devices, group)
 }
 
-async fn deliver_all(client: &mut AppClient, relay: &ScriptedPushRelayClient) {
+pub(super) async fn deliver_all(client: &mut AppClient, relay: &ScriptedPushRelayClient) {
     let mut cursor = 0;
     deliver_new(client, relay, &mut cursor).await;
     client.sync().await.unwrap();
@@ -1511,6 +1511,12 @@ async fn linked_devices() -> (Devices, GroupId) {
         trust(&devices.laptop_app, &group),
         Some(DeviceGroupTrust::Linked)
     );
+    // Each device starts small state (mdk#2628 4.3a), sending the broadcast
+    // request it owes at start, so a test's first maintenance pass publishes
+    // only what that test is about.
+    for client in [&mut devices.phone, &mut devices.laptop] {
+        client.drive_small_state().await;
+    }
     (devices, group)
 }
 

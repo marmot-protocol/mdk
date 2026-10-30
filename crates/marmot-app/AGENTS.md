@@ -121,10 +121,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   rejected KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's
   included, into a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7).
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
-  `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in
-  `observe_device_group_event` (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending
-  leaf's device tag (mdk#2628 D33). That read sees only the current tree, so a message from an earlier epoch has no
-  readable sender.
+  `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in `observe_device_group_event`
+  (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
+  D33). That read sees only the current tree, so a message from an earlier epoch has no readable sender. The engine
+  withdraws a message by message id alone (an own send's transport id, a received message's content id), so a kind whose
+  withdrawal a feature acts on is listed in `withdrawal_handled` and dispatched in `device_group_message_withdrawn`.
+  Each such message is recorded with its kind in `device_group_messages` when sent (before the send; its message id is
+  filled in from whichever drain's effects publish it, in `retain_effect_projection`) and when read.
 - Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
   Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
   roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
@@ -186,8 +189,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`tie_break`), its placement of a new pin (`new_pin_index`) and the broadcast schedule (`broadcast_due`) are each one
   function; change them nowhere else. Recovery is a broadcast of every held item, with no stopping condition and
   nothing tracked per sibling: at start, daily, when the device-group tip passes the app-payload window since the last
-  one, and an hour after the last when a sibling asked. A withdrawn update owes every held item again, whoever sent
-  it, and a withdrawn broadcast request owes a new one.
+  one, and an hour after the last when a sibling asked. Each maintenance pass then sends what is owed: updates split
+  to fit 32,768 bytes, each page's items marked sent only after it went out (a duplicate is harmless, a loss is not),
+  and a broadcast request when owed. Updates and requests are read from any member of the trusted device group, never
+  through `ensure_sent_by`. A withdrawn update owes every held item again, whoever sent it, and a withdrawn broadcast
+  request owes a new one.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

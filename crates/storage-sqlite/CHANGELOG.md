@@ -11,13 +11,20 @@
   and `small_state_sync`, which records that this device started, when and at
   which device-group tip it last broadcast every item, and whether it owes a
   broadcast request or an answer to one. Only chats whose MLS group id is at
-  most 256 bytes hold items. `SqliteAppStorage` gains `start_small_state`,
-  `small_state_started`, `small_state_schedule`, `begin_small_state_broadcast`,
-  `owe_small_state_broadcast_request`, `small_state_broadcast_request_sent`,
-  `owe_small_state_broadcast_answer`, `sync_small_state`, `small_state_items`,
-  `unsent_small_state_items`, `mark_small_state_sent` and
-  `owe_all_small_state_items`, with `SmallStateItem`, `SmallStateRule`,
-  `SmallStateSchedule`, `SmallStateBroadcast` and their value types.
+  most 256 bytes hold items. It also adds `device_group_messages`: the kind of
+  each device-group message this device sent or read whose withdrawal a
+  feature acts on, by app event id and, once known, the message id the engine
+  names it by (an own send's transport id, a received message's content id),
+  kept a week and capped at 4,096 rows; a local forget of the group removes
+  them. `SqliteAppStorage` gains `record_device_group_message`,
+  `note_device_group_message_ids`, `device_group_message_kind`,
+  `start_small_state`, `small_state_started`, `small_state_schedule`,
+  `begin_small_state_broadcast`, `owe_small_state_broadcast_request`,
+  `small_state_broadcast_request_sent`, `owe_small_state_broadcast_answer`,
+  `sync_small_state`, `small_state_items`, `unsent_small_state_items`,
+  `mark_small_state_sent` and `owe_all_small_state_items`, with
+  `SmallStateItem`, `SmallStateRule`, `SmallStateSchedule`,
+  `SmallStateBroadcast` and their value types.
 - Migration 0140 advances account storage to schema 140 (mdk#2628 item 3.4).
   It adds private KeyPackages, single-use KeyPackages a device hands to one
   sibling inside its device group: `cgka_private_key_packages` (one issuer

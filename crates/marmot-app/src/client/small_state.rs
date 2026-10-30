@@ -22,23 +22,30 @@ use storage_sqlite::{SmallStateItem, SmallStateItemName};
 
 use super::AppClient;
 use crate::small_state::{
-    KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE, SmallStateMergeRule,
-    broadcast_due, decode_broadcast_request, decode_small_state_update,
+    BROADCAST_REQUEST, KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE,
+    SmallStateMergeRule, broadcast_due, decode_broadcast_request, decode_small_state_update,
+    encode_small_state_update,
 };
 use crate::{AppError, AppProjectionUpdate, ChatListUpdateTrigger, MarmotApp, unix_now_seconds};
 
 const TRACE_TARGET: &str = "marmot_app::client::small_state";
 
 impl AppClient {
-    /// Maintenance's small-state pass. A pass that fails waits for the next.
+    /// Maintenance's small-state pass: record and apply, begin a broadcast
+    /// when one is due, then send what is owed. A pass that fails waits for
+    /// the next.
     pub(crate) async fn drive_small_state(&mut self) {
         if self.runtime.maintenance_is_paused() {
             return;
         }
-        if let Err(error) = self
+        let passed = self
             .sync_small_state(&[])
-            .and_then(|()| self.begin_small_state_broadcast_when_due(unix_now_seconds()))
-        {
+            .and_then(|()| self.begin_small_state_broadcast_when_due(unix_now_seconds()));
+        let result = match passed {
+            Ok(()) => self.send_owed_small_state().await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "drive_small_state",
@@ -46,6 +53,57 @@ impl AppClient {
                 "small state was not synced; retrying at the next maintenance pass"
             );
         }
+    }
+
+    /// Send the siblings every item this device owes them, in updates of at
+    /// most [`crate::small_state::MAX_SMALL_STATE_CONTENT_BYTES`] each, then a broadcast request
+    /// when one is owed. Each update's items are marked sent once it went
+    /// out, and only if they still hold the value it carried; an update that
+    /// reached no relay stops the pass, and its items stay owed. Sending one
+    /// twice does no harm: every device merges it to the same winner.
+    async fn send_owed_small_state(&mut self) -> Result<(), AppError> {
+        if !self.app.device_groups_enabled() {
+            return Ok(());
+        }
+        let Some(group_id) = self.trusted_device_group()? else {
+            return Ok(());
+        };
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let Some(schedule) = storage.small_state_schedule()? else {
+            return Ok(());
+        };
+        let mut sent = 0;
+        for (content, carried) in encode_small_state_update(&storage.unsent_small_state_items()?) {
+            if !self
+                .send_device_group_message(&group_id, KIND_SMALL_STATE_UPDATE, content)
+                .await?
+            {
+                return Ok(());
+            }
+            storage.mark_small_state_sent(&carried)?;
+            sent += 1;
+        }
+        let requested = schedule.request_owed
+            && self
+                .send_device_group_message(
+                    &group_id,
+                    KIND_SMALL_STATE_BROADCAST_REQUEST,
+                    BROADCAST_REQUEST.to_owned(),
+                )
+                .await?;
+        if requested {
+            storage.small_state_broadcast_request_sent()?;
+        }
+        if sent > 0 || requested {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                method = "send_owed_small_state",
+                updates = sent,
+                requested,
+                "small state sent"
+            );
+        }
+        Ok(())
     }
 
     /// Begin a broadcast when [`broadcast_due`] says one is owed at `now`:
@@ -158,7 +216,8 @@ impl AppClient {
         Ok(())
     }
 
-    /// Merge an update's items, from any device of the trusted device group.
+    /// Merge an update's items, from any device of the trusted device group:
+    /// membership is the authentication, so no sender is read.
     pub(crate) fn receive_small_state_update(
         &mut self,
         group_id: &GroupId,

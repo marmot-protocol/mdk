@@ -46,6 +46,18 @@
   device then replaces its untagged KeyPackage with a tagged one. Maintenance
   drops a removed device's roster record 30 days after it was recorded.
   Release builds hold no device group and tag nothing.
+- While this device trusts a device group, it keeps each chat's read
+  position, pin, mute and archive the same on the account's devices (mdk#2628
+  item 4.3a, `features/account-sync.md`). Each maintenance pass records what
+  the user changed on this device, sends it to the siblings in small-state
+  updates (kind 475, split to fit 32,768 bytes), and applies the values they
+  sent, with the usual chat-list updates. Every device broadcasts every item
+  it holds when it starts, at least daily, whenever the device group's tip
+  passes the app-payload window since its last broadcast, and at most hourly
+  when a sibling asks with a broadcast request (kind 476). An update or
+  request that branch selection withdraws is sent again. Pin order stays per
+  device, and drafts are not synced. Release builds hold no device group and
+  sync nothing.
 - `MarmotAppRuntime::linked_devices` lists this account's own devices as
   `LinkedDevice`s, from the roster of the device group this device trusts,
   this device first (mdk#2628 item 3.1). `LinkedDevicesChanged` says to

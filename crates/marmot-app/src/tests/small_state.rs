@@ -3,11 +3,12 @@
 //! its siblings sent, once that device trusts its account's device group.
 
 use super::canonical_membership::{app_at, deliver_new, published_key_package};
-use super::device_group::{Devices, phone_and_laptop};
+use super::device_group::{Devices, deliver_all, phone_and_laptop};
 use super::*;
 use crate::small_state::{
     BROADCAST_REQUEST, KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE,
 };
+use std::collections::BTreeMap;
 use storage_sqlite::{
     MuteSetting, SmallStateBroadcast, SmallStateItem, SmallStateValue, SmallStateVersion,
 };
@@ -220,4 +221,223 @@ async fn broadcasts_follow_their_schedule_and_withdrawals_owe_again() {
             .small_state_message_withdrawn(&elsewhere, KIND_SMALL_STATE_UPDATE)
             .is_err()
     );
+}
+
+/// The device-group messages `client` recorded, by app event id: the
+/// message id its own engine names it by, and its kind. A sender names its
+/// own message by its transport id, a reader by its content.
+fn recorded(client: &AppClient, group: &GroupId) -> BTreeMap<String, (MessageId, u64)> {
+    client
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .device_group_messages()
+        .unwrap()
+        .into_iter()
+        .filter(|(group_hex, ..)| *group_hex == hex::encode(group.as_slice()))
+        .map(|(_, event, message, kind)| {
+            let message = MessageId::new(hex::decode(message.expect("message id known")).unwrap());
+            (event, (message, kind))
+        })
+        .collect()
+}
+
+fn kinds(recorded: &BTreeMap<String, (MessageId, u64)>) -> Vec<u64> {
+    let mut kinds: Vec<_> = recorded.values().map(|(_, kind)| *kind).collect();
+    kinds.sort_unstable();
+    kinds
+}
+
+fn withdrawn(group: &GroupId, message_id: &MessageId) -> cgka_traits::engine::GroupEvent {
+    cgka_traits::engine::GroupEvent::AppMessageInvalidated {
+        group_id: group.clone(),
+        message_id: message_id.clone(),
+        epoch: cgka_traits::EpochId(0),
+        reason: cgka_traits::engine::AppMessageInvalidationReason::LosingBranch,
+        decrypted_payload_ref: None,
+    }
+}
+
+/// Siblings exchange small state through the device group. A device that
+/// starts broadcasts every item it holds, split into updates that each fit,
+/// and asks its siblings to broadcast; a sibling merges every item, whether
+/// or not it is in the chat, and owes an answer. A device that sent or read
+/// an update owes its items again when branch selection withdraws it, and a
+/// withdrawn request owes a new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn siblings_exchange_small_state_through_the_device_group() {
+    let mut devices = phone_and_laptop().await;
+    let (_bob_dir, chat) =
+        chat_with_bob(&devices.phone_app, &mut devices.phone, &devices.relay).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    devices
+        .phone_app
+        .set_chat_pinned("alice", &chat_hex, true)
+        .unwrap();
+    link(&mut devices).await;
+    let (group, _) = devices.phone.trusted_device_roster().unwrap().unwrap();
+    let phone_app = devices.phone_app.clone();
+    let laptop_app = devices.laptop_app.clone();
+    let phone_storage = || phone_app.account_storage("alice").unwrap().app_storage();
+    let laptop_storage = || laptop_app.account_storage("alice").unwrap().app_storage();
+
+    // Enough items held from elsewhere that one broadcast takes two updates.
+    let held: Vec<_> = (0u16..400)
+        .map(|index| {
+            let mut chat = [0x0b; 16];
+            chat[..2].copy_from_slice(&index.to_be_bytes());
+            sibling_value(&hex::encode(chat), SmallStateValue::Archive(true))
+        })
+        .collect();
+    devices.phone.sync_small_state(&held).unwrap();
+
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert!(
+        phone_storage()
+            .unsent_small_state_items()
+            .unwrap()
+            .is_empty()
+    );
+    let schedule = phone_storage().small_state_schedule().unwrap().unwrap();
+    assert!(schedule.last_broadcast.is_some());
+    assert!(!schedule.request_owed);
+    let sent = recorded(&devices.phone, &group);
+    assert_eq!(
+        kinds(&sent),
+        [
+            KIND_SMALL_STATE_UPDATE,
+            KIND_SMALL_STATE_UPDATE,
+            KIND_SMALL_STATE_BROADCAST_REQUEST
+        ]
+    );
+
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let phone_items = phone_storage().small_state_items().unwrap();
+    assert_eq!(phone_items.len(), 401);
+    assert_eq!(laptop_storage().small_state_items().unwrap(), phone_items);
+    let laptop_schedule = laptop_storage().small_state_schedule().unwrap().unwrap();
+    assert!(laptop_schedule.answer_owed);
+    // Merged items are not owed back: their sender has them.
+    assert!(
+        laptop_storage()
+            .unsent_small_state_items()
+            .unwrap()
+            .is_empty()
+    );
+    let read = recorded(&devices.laptop, &group);
+    let by_event = |recorded: &BTreeMap<String, (MessageId, u64)>| {
+        recorded
+            .iter()
+            .map(|(event, (_, kind))| (event.clone(), *kind))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(by_event(&read), by_event(&sent));
+
+    // The laptop starts too: it broadcasts what it holds and asks.
+    devices.laptop.run_due_maintenance().await.unwrap();
+    assert!(
+        laptop_storage()
+            .unsent_small_state_items()
+            .unwrap()
+            .is_empty()
+    );
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(phone_storage().small_state_items().unwrap(), phone_items);
+    assert!(
+        phone_storage()
+            .small_state_schedule()
+            .unwrap()
+            .unwrap()
+            .answer_owed
+    );
+
+    // A withdrawn update owes every item again, on the device that sent it
+    // and on the one that merged it, each naming it by its own id; a message
+    // no one recorded owes nothing.
+    let of_kind = |kind| {
+        sent.iter()
+            .find(|(_, (_, sent_kind))| *sent_kind == kind)
+            .map(|(event, _)| event.clone())
+            .unwrap()
+    };
+    let (update, request) = (
+        of_kind(KIND_SMALL_STATE_UPDATE),
+        of_kind(KIND_SMALL_STATE_BROADCAST_REQUEST),
+    );
+    devices
+        .phone
+        .observe_device_group_event(&withdrawn(&group, &MessageId::new(vec![0x77; 32])));
+    assert!(
+        phone_storage()
+            .unsent_small_state_items()
+            .unwrap()
+            .is_empty()
+    );
+    devices
+        .phone
+        .observe_device_group_event(&withdrawn(&group, &sent[&update].0));
+    devices
+        .laptop
+        .observe_device_group_event(&withdrawn(&group, &read[&update].0));
+    assert_eq!(
+        phone_storage().unsent_small_state_items().unwrap().len(),
+        401
+    );
+    assert_eq!(
+        laptop_storage().unsent_small_state_items().unwrap().len(),
+        401
+    );
+
+    // A withdrawn request owes a new one, on both.
+    devices
+        .phone
+        .observe_device_group_event(&withdrawn(&group, &sent[&request].0));
+    devices
+        .laptop
+        .observe_device_group_event(&withdrawn(&group, &read[&request].0));
+    for storage in [phone_storage(), laptop_storage()] {
+        assert!(
+            storage
+                .small_state_schedule()
+                .unwrap()
+                .unwrap()
+                .request_owed
+        );
+    }
+}
+
+/// An update that reaches no relay leaves its items owed, and the next pass
+/// sends them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_that_reached_no_one_is_sent_again() {
+    let mut devices = phone_and_laptop().await;
+    let (_bob_dir, chat) =
+        chat_with_bob(&devices.phone_app, &mut devices.phone, &devices.relay).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    link(&mut devices).await;
+    let phone_app = devices.phone_app.clone();
+    let storage = || phone_app.account_storage("alice").unwrap().app_storage();
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert!(storage().unsent_small_state_items().unwrap().is_empty());
+
+    phone_app.set_chat_pinned("alice", &chat_hex, true).unwrap();
+    devices.relay.reject_next_publish();
+    devices.phone.run_due_maintenance().await.unwrap();
+    let owed = storage().unsent_small_state_items().unwrap();
+    assert_eq!(owed.len(), 1);
+    assert_eq!(owed[0].value, SmallStateValue::Pin(true));
+
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert!(storage().unsent_small_state_items().unwrap().is_empty());
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let held = devices
+        .laptop
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .small_state_items()
+        .unwrap();
+    assert!(held.contains(&owed[0]));
 }
