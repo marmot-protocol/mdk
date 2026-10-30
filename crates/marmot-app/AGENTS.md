@@ -183,6 +183,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   its first commit landed, it shows `Ended { LinkFailed }`. Each drive ends by comparing linking as hosts read it with
   `DevicePairing::last_view` and sets `device_link_changed` when it differs; the client opens with that flag set, and
   the same two seams as `linked_devices_changed` drain it into `DeviceLinkChanged`.
+- Keep outbound Welcomes on the engine's Welcome rows (mdk#2628 3.5a). The invite slot of
+  `drive_unpublished_welcome_delivery` holds only Welcome ids, published through the runtime's
+  `deliver_owed_welcomes_with_audit_context`; the founding slot keeps the create's `SessionEffects`, because a legacy
+  create's `GroupCreated` work rides them. Note a Welcome a publish could not deliver in one place,
+  `note_welcome_delivery_failures`, called from `remember_published_reports` (every seam that applies runtime
+  effects) and from the device-link send; never write a pending Welcome row or queue `WelcomeDeliveryPending` from a
+  drive. It announces each Welcome once per process (`announced_welcome_failures`) and leaves a failure without a
+  group (the startup retry's) to `reconcile_pending_welcome_delivery_index`. The worker's projection drain
+  (`publish_client_pending_projection_updates`) broadcasts the queued events, so every worker seam does.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.
