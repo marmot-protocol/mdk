@@ -841,6 +841,46 @@ pub trait AccountDeviceSignerStorage {
     ) -> StorageResult<Option<AccountDeviceSignerBinding>>;
 }
 
+// ── AccountDeviceHistoryKeyStorage ─────────────────────────────────────────
+
+/// This device's history key (mdk#2628 4.1): an HPKE key pair under
+/// `ciphersuite`, whose public half the device writes into its own entry in
+/// its device group's roster so siblings can seal chat history to it. A
+/// device has one, kept for as long as its account-device storage lives.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountDeviceHistoryKey {
+    pub marmot_identity: MemberId,
+    /// The MLS ciphersuite whose HPKE the key pair belongs to.
+    pub ciphersuite: u16,
+    pub public_key: Vec<u8>,
+    pub private_key: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for AccountDeviceHistoryKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountDeviceHistoryKey")
+            .field("marmot_identity", &self.marmot_identity)
+            .field("ciphersuite", &self.ciphersuite)
+            .field("public_key", &self.public_key)
+            .field("private_key", &RedactedValue)
+            .finish()
+    }
+}
+
+pub trait AccountDeviceHistoryKeyStorage {
+    /// Store `key` unless a history key is already stored for its identity,
+    /// and return the one stored afterwards: `key`, or the earlier one.
+    fn put_account_device_history_key_if_absent(
+        &self,
+        key: &AccountDeviceHistoryKey,
+    ) -> StorageResult<AccountDeviceHistoryKey>;
+    fn account_device_history_key(
+        &self,
+        marmot_identity: &MemberId,
+    ) -> StorageResult<Option<AccountDeviceHistoryKey>>;
+}
+
 // ── DeviceGroupWelcomeStorage ──────────────────────────────────────────────
 
 /// The Welcome a new device waits for after a confirmed device link
@@ -1031,6 +1071,7 @@ pub trait StorageProvider:
     + DeferredPeelGenerationStorage
     + MemberValidationCacheStorage
     + AccountDeviceSignerStorage
+    + AccountDeviceHistoryKeyStorage
     + DeviceGroupWelcomeStorage
     + KeyPackageBundleStorage
     + Send

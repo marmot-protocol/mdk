@@ -16,6 +16,7 @@ use cgka_traits::app_components::{
     RejectedSlotV1, decode_device_roster_v1, encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
+use marmot_session::DeviceRosterEdit;
 use storage_sqlite::DeviceGroupTrust;
 
 mod devices;
@@ -1937,6 +1938,104 @@ async fn each_device_tags_from_the_device_group_it_trusts() {
         key_package_claim(&phone, &roster(&phone, &group)),
         DeviceTagClaim::Device(phone_slot)
     );
+}
+
+/// Each device's own roster entry carries its history key (mdk#2628 4.1),
+/// with no commit of its own: the founder's founding entry, and the new
+/// device's first commit, which sets its tag signature key. A sibling seals
+/// to the key the roster holds, and only that device opens it. A device whose
+/// entry lost the key writes it again with its next announcement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_device_keeps_its_history_key_in_its_own_entry() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let (phone_slot, laptop_slot) = (slot_of(&phone), slot_of(&laptop));
+    let phone_key = phone.runtime.history_public_key().unwrap();
+    let laptop_key = laptop.runtime.history_public_key().unwrap();
+    assert_ne!(phone_key, laptop_key);
+    let founding = roster(&laptop, &group);
+    assert_eq!(
+        founding.devices[&phone_slot].history_key,
+        Some(phone_key.clone())
+    );
+    assert_eq!(founding.devices[&laptop_slot].history_key, None);
+
+    let mut phone_cursor = relay.published_events.lock().unwrap().len();
+    let since = phone_cursor;
+    laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        published_kinds(&relay, since),
+        vec![
+            transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE,
+            transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE,
+            30443
+        ],
+        "the history key rides on the tag-key commit"
+    );
+    deliver_new(&mut phone, &relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    for reader in [&phone, &laptop] {
+        let entry = &roster(reader, &group).devices[&laptop_slot];
+        assert_eq!(
+            entry.tag_signature_key,
+            Some(laptop.runtime.own_signature_key())
+        );
+        assert_eq!(entry.history_key, Some(laptop_key.clone()));
+    }
+
+    let context = b"history for the laptop";
+    let sealed = phone
+        .runtime
+        .seal_history(
+            roster(&phone, &group).devices[&laptop_slot]
+                .history_key
+                .as_deref()
+                .unwrap(),
+            context,
+            b"bundle",
+        )
+        .unwrap();
+    assert_eq!(
+        laptop.runtime.open_history(context, &sealed).unwrap(),
+        Some(b"bundle".to_vec())
+    );
+    assert_eq!(phone.runtime.open_history(context, &sealed).unwrap(), None);
+
+    // The phone clears the laptop's key; the laptop's next announcement
+    // writes it back.
+    let mut laptop_cursor = relay.published_events.lock().unwrap().len();
+    let cleared = phone
+        .runtime
+        .edit_device_roster_entry(&group, &laptop_slot, &[], |entry| {
+            entry.history_key = None;
+        })
+        .await
+        .unwrap();
+    assert!(matches!(cleared, DeviceRosterEdit::Committed(_)));
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    assert_eq!(
+        roster(&laptop, &group).devices[&laptop_slot].history_key,
+        None
+    );
+    let mut phone_cursor = relay.published_events.lock().unwrap().len();
+    laptop.run_due_maintenance().await.unwrap();
+    deliver_new(&mut phone, &relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    for reader in [&phone, &laptop] {
+        assert_eq!(
+            roster(reader, &group).devices[&laptop_slot].history_key,
+            Some(laptop_key.clone())
+        );
+    }
 }
 
 /// A KeyPackage staged while this device's tag signature key is due would go

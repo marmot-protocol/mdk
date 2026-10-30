@@ -5,7 +5,8 @@
 //! (device-tag-v1.md, "Producing tags"). The founder writes its own key into
 //! the founding roster. Every other device sets its own once it has joined,
 //! in a roster update whose own UpdatePath the engine already tags under that
-//! key. Maintenance and every host KeyPackage publication make that update
+//! key. That update also writes the device's history key (4.1), so joining
+//! costs no commit for it. Maintenance and every host KeyPackage publication make that update
 //! first, through the roster write path ([`AccountDeviceRuntime::edit_device_roster_entry`]);
 //! the host names the group.
 //!
@@ -127,9 +128,12 @@ where
             }
         };
         let own_key = self.session.own_signature_key();
+        // The same commit carries this device's history key (4.1).
+        let history_key = self.session.history_public_key()?;
         match self
             .edit_device_roster_entry(&group_id, &slot, held, |entry| {
                 entry.tag_signature_key = Some(own_key);
+                entry.history_key = Some(history_key);
             })
             .await?
         {

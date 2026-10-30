@@ -21,7 +21,8 @@
 //! caller retries or reports it.
 //!
 //! A device keeps its own entry's `client` and `platform` current itself
-//! ([`DeviceSelfReport`]); each announcement of its KeyPackage writes them.
+//! ([`DeviceSelfReport`]), and its `history_key` (4.1, generated on first
+//! use); each announcement of its KeyPackage writes them.
 
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,

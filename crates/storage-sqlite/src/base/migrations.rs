@@ -282,6 +282,8 @@ mod migration_0132_loss_import_revision;
 mod migration_0133_device_links;
 #[path = "migrations/0134_recovery_recheck_revision.rs"]
 mod migration_0134_recovery_recheck_revision;
+#[path = "migrations/0138_account_device_history_keys.rs"]
+mod migration_0138_account_device_history_keys;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1106,6 +1108,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0134_recovery_recheck_revision",
         suspend_foreign_keys: &[],
         apply: migration_0134_recovery_recheck_revision::apply,
+    },
+    Migration {
+        version: 138,
+        name: "0138_account_device_history_keys",
+        suspend_foreign_keys: &[],
+        apply: migration_0138_account_device_history_keys::apply,
     },
 ];
 
