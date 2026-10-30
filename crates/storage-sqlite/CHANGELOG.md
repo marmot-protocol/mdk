@@ -57,6 +57,15 @@
   `AnnouncedKeyPackageStorage`. Rows survive a branch-selection rewind, go
   with their group, and are pruned after 30 days or past 16 per slot. Nothing
   writes them unless device groups are on.
+- Migration 0146 advances account storage to schema 146 (mdk#2628 item 3.6b).
+  It adds `device_removals`, one row per device this device's user removed
+  from the account's device group, written before anything is committed, with
+  when the user decided and when the removed device's slot deletion was
+  accepted. A row lasts as long as this device trusts the device group:
+  forgetting the group removes its rows, with its trust row, and nothing else
+  does. `SqliteAppStorage` gains `record_device_removal`, which keeps a
+  decision already recorded, `device_removals` and
+  `set_device_removal_slot_withdrawn`. No rows are seeded.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`

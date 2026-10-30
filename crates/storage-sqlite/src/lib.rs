@@ -100,6 +100,7 @@ pub use app::chat_presentation::{
 };
 pub use app::device_groups::{DeviceGroupRecord, DeviceGroupTrust};
 pub use app::device_links::{DeviceLinkOutcome, DeviceLinkRecord};
+pub use app::device_removals::DeviceRemovalRecord;
 pub use app::message_drafts::{
     ChatListDraftVersion, MessageDraftRevision, MessageDraftRevisionError, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent, StoredMessageDraft,

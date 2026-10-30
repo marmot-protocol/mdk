@@ -2567,6 +2567,39 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Remove another of this account's devices, by its `slot_id_hex` from
+    /// `linked_devices`, from the device group and every chat, and delete its
+    /// KeyPackage slot so inviters stop adding it (mdk#2628 item 3.6b). The
+    /// decision is recorded at once and carried out as the device group
+    /// allows, so a busy device group only delays it; `linked_devices` shows
+    /// the device with `removal_pending` until the device group takes it.
+    /// Chats that can't take a same-account removal keep the device's leaf;
+    /// `removed_device_leftover_chats` counts them. Refused with
+    /// `DeviceGroupRefused`: `roster_unsupported` (release builds),
+    /// `no_device_group`, `unknown_device`, `this_device` (sign out
+    /// instead), `device_link_pending` while the device's link may still
+    /// fail, or `roster_unavailable`. Refresh on `LinkedDevicesChanged`.
+    pub async fn remove_linked_device(
+        &self,
+        account_ref: &str,
+        slot_id_hex: String,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .remove_linked_device(account_ref, slot_id_hex)
+            .await
+    }
+
+    /// How many chats this device is in still hold a device this account
+    /// removed, because the chat doesn't take a same-account removal; a chat
+    /// admin can remove it. Zero until this device trusts a device group, and
+    /// always zero in release builds until the device group's spec lands.
+    /// Read it when showing the device list; it is not evented.
+    pub async fn removed_device_leftover_chats(&self, account_ref: &str) -> Result<u32, AppError> {
+        self.accounts
+            .removed_device_leftover_chats(account_ref)
+            .await
+    }
+
     /// Record that the user accepts the risk of changing a group that is still
     /// catching up, after a group change failed with
     /// [`AppError::GroupCatchingUp`] (mdk#2258). The device may be behind its
