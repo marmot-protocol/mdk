@@ -7885,6 +7885,9 @@ fn publish_client_pending_projection_updates(
     for group_id in client.pending_recovery_status_updates.drain() {
         publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
     }
+    // Welcomes a publish could not deliver ride the same drain, whichever
+    // path published them (mdk#2628 3.5a).
+    publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
     // Superseded own commits ride the same drain: every worker seam that can
     // observe convergence effects already flushes projection updates here.
     for report in client.take_pending_superseded_change_events() {
@@ -7993,9 +7996,9 @@ pub(crate) fn publish_app_runtime_group_state_updated(
     });
 }
 
-/// Broadcast a `WelcomeDeliveryPending` event for each welcome a just-completed
-/// create/invite queued for re-delivery (mdk#352), so subscribers learn a member
-/// is unjoinable without polling the durable queue.
+/// Broadcast a `WelcomeDeliveryPending` event for each Welcome a publish
+/// queued for re-delivery (mdk#352), so subscribers learn a member is
+/// unjoinable without polling the durable queue.
 fn publish_pending_welcome_delivery_events(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -8167,6 +8170,45 @@ mod tests {
             kind,
             phase,
         }
+    }
+
+    /// mdk#2628 3.5a: the drain every worker seam runs broadcasts the Welcome
+    /// failures its client noted, so one a maintenance or convergence pass
+    /// published reaches the host without waiting for the next create or
+    /// invite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn projection_drain_broadcasts_noted_welcome_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = GroupId::new(vec![1; 16]);
+        client
+            .pending_welcome_delivery_events
+            .push(crate::PendingWelcomeDelivery {
+                group_id_hex: hex::encode(group_id.as_slice()),
+                message_id_hex: "ab".repeat(32),
+                recipient_hex: "cd".repeat(32),
+                recorded_at: 1,
+            });
+        let (events, mut received) = broadcast::channel(16);
+        publish_client_pending_projection_updates(&mut client, &events, "alice-id", "alice");
+        let mut announced = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            if let MarmotAppEvent::WelcomeDeliveryPending {
+                group_id,
+                message_id_hex,
+                ..
+            } = event
+            {
+                announced.push((group_id, message_id_hex));
+            }
+        }
+        assert_eq!(announced, [(group_id, "ab".repeat(32))]);
+        assert!(client.take_pending_welcome_delivery_events().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

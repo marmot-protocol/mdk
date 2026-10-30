@@ -26,6 +26,9 @@ pub use catalogue::*;
 pub(crate) mod consent;
 #[cfg(feature = "product-analytics-export")]
 mod delivery;
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod fixtures;
 pub(crate) mod observed;
 pub(crate) mod recording;
 use consent::ReceiptRevisions;
@@ -1605,9 +1608,13 @@ impl ProductAnalytics {
     }
 }
 
-#[cfg(all(test, feature = "product-analytics-export"))]
+/// Test hooks for the collector's own tests and for `marmot-app`'s (#2627). The `_for_test`
+/// methods call the crate-private method of the same name; the readers return state the tests
+/// assert on.
+#[cfg(any(test, feature = "test-support"))]
 impl ProductAnalytics {
-    pub(crate) fn test_payloads(&self) -> Vec<serde_json::Value> {
+    #[cfg(feature = "product-analytics-export")]
+    pub fn test_payloads(&self) -> Vec<serde_json::Value> {
         self.seal_partial();
         self.lock()
             .queue
@@ -1615,17 +1622,40 @@ impl ProductAnalytics {
             .map(|row| row.payload.clone())
             .collect()
     }
-}
 
-#[cfg(test)]
-impl ProductAnalytics {
     /// Whether the collector holds a complete delivery configuration.
-    pub(crate) fn config_ready(&self) -> bool {
+    pub fn config_ready(&self) -> bool {
         self.lock().config.ready()
     }
-}
 
-#[cfg(all(test, feature = "product-analytics-export"))]
-pub(crate) fn test_product_collector() -> crate::observer::ProductRecorder {
-    tests::configured().0.into()
+    /// The runtime configuration the collector holds.
+    pub fn config_for_test(&self) -> ProductAnalyticsRuntimeConfig {
+        self.lock().config.clone()
+    }
+
+    /// Whether `payload` passes the collector's serialization check under its configuration.
+    pub fn valid_payload_for_test(&self, payload: &serde_json::Value) -> bool {
+        self.valid_payload(&self.lock().config, payload)
+    }
+
+    pub fn permit_for_test(&self) -> Option<DiagnosticsPermit> {
+        self.permit()
+    }
+
+    pub fn storage_failure_for_test(
+        &self,
+        permit: Option<&DiagnosticsPermit>,
+        failure: impl Into<Option<StorageFailureKind>>,
+    ) {
+        self.storage_failure(permit, failure);
+    }
+
+    pub fn observe_sync_for_test(
+        &self,
+        operation: &'static str,
+        duration: Duration,
+        failure: Option<crate::SyncFailureClassification>,
+    ) {
+        self.observe_sync(operation, duration, failure);
+    }
 }

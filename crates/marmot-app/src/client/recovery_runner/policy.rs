@@ -1,7 +1,7 @@
 //! The runner's starting values (decision 7 of mdk#2660's phase 4 plan),
 //! registered as convergence-ledger decision A19, and its re-check schedule
 //! (decision 5), registered as A20. They are tuned in the simulator once the
-//! runner admits what it fetches (PR 4b or PR 5).
+//! runner runs in the app (PR 5).
 
 use std::time::Duration;
 
@@ -36,11 +36,17 @@ pub(crate) const RUNNER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const RUNNER_LOCAL_FAILURE_BACKOFF_BASE_SECS: u64 = 1;
 pub(crate) const RUNNER_LOCAL_FAILURE_BACKOFF_CAP_SECS: u64 = 60;
 /// Staged events one relay may hold for a group before it waits for the
-/// group's laggard (PR 4b). One comparison quantum fetches at most these.
+/// group's laggard. One comparison quantum fetches at most these.
 pub(crate) const RUNNER_STAGED_GROUP_EVENTS: u64 = 2_048;
 pub(crate) const RUNNER_STAGED_GROUP_BYTES: u64 = 8 * 1024 * 1024;
-/// Staged bytes the whole account may hold (PR 4b).
+/// Staged bytes the whole account may hold.
 pub(crate) const RUNNER_STAGED_ACCOUNT_BYTES: u64 = 64 * 1024 * 1024;
+/// Staged events one admission turn ingests before it yields, as the
+/// comparison job's admission does (A13).
+pub(crate) const RUNNER_ADMISSION_PER_TURN: usize = 4;
+/// Capture ranges one unit keeps fenced across a restart. Past it the newest
+/// are joined into one, which can only fence more.
+pub(crate) const RUNNER_FENCES_PER_UNIT: usize = 8;
 /// A unit's next re-check pass falls due this long after its last full one
 /// (decision 5).
 pub(crate) const RUNNER_RECHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
@@ -48,7 +54,7 @@ pub(crate) const RUNNER_RECHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
 /// the relay's units due once the relay answers or reconnects.
 pub(crate) const RUNNER_RECHECK_AFTER_COOLDOWN_SECS: u64 = 60 * 60;
 
-/// How much fetched history may wait in staging (PR 4b reads these).
+/// How much fetched history may wait in staging.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RecoveryStagingBounds {
     pub(crate) group_events: u64,
@@ -66,6 +72,8 @@ pub(crate) struct RecoveryRunnerPolicy {
     pub(crate) local_failure_backoff_base_seconds: u64,
     pub(crate) local_failure_backoff_cap_seconds: u64,
     pub(crate) staging: RecoveryStagingBounds,
+    pub(crate) admission_per_turn: usize,
+    pub(crate) fences_per_unit: usize,
     pub(crate) sweep: SweepPolicy,
     pub(crate) recheck_interval_seconds: u64,
 }
@@ -94,6 +102,8 @@ impl Default for RecoveryRunnerPolicy {
                 group_bytes: RUNNER_STAGED_GROUP_BYTES,
                 account_bytes: RUNNER_STAGED_ACCOUNT_BYTES,
             },
+            admission_per_turn: RUNNER_ADMISSION_PER_TURN,
+            fences_per_unit: RUNNER_FENCES_PER_UNIT,
             sweep: SweepPolicy::default(),
             recheck_interval_seconds: RUNNER_RECHECK_INTERVAL_SECS,
         }

@@ -68,7 +68,7 @@ impl Deref for ProductRecorder {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl From<ProductAnalytics> for ProductRecorder {
     fn from(collector: ProductAnalytics) -> Self {
         Self(collector)

@@ -173,7 +173,7 @@ mod tests {
                 "MARMOT_PRODUCT_ANALYTICS_ENVIRONMENT" => Some(environment.into()),
                 _ => None,
             });
-            assert!(permit.valid());
+            assert!(crate::observer::permit_valid(&permit));
             assert_eq!(runtime.stored_usage_diagnostics_settings().unwrap(), before);
             assert!(!app.product_analytics.config_ready());
         }

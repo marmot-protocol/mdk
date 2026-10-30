@@ -122,6 +122,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   one the roster cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a
   rejected KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's
   included, into a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7).
+- The own-slot check (mdk#2628 3.4, `src/client/sign_ins.rs`) rides 3.2's read: `read_account_key_package_slots` also
+  reads this device's slot by `d` from every relay (`OwnSlotRead`), keeping each relay's current publication there by
+  NIP-01's rule, valid or not. One whose event id is none of this device's current, pending or retained events is
+  foreign (`OwnSlotForeign`); an older event of its own is a lagging relay, which fanout retry owns. `check_sign_ins`
+  hands foreign ones to `replace_foreign_slot_publications`, which publishes a newer KeyPackage or, for one dated past
+  the skew window, asks the relays to delete it by id (D63). An incomplete own-slot read is retried within the hour.
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
   `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in
   `observe_device_group_event` (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending
@@ -179,6 +185,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   its first commit landed, it shows `Ended { LinkFailed }`. Each drive ends by comparing linking as hosts read it with
   `DevicePairing::last_view` and sets `device_link_changed` when it differs; the client opens with that flag set, and
   the same two seams as `linked_devices_changed` drain it into `DeviceLinkChanged`.
+- Keep outbound Welcomes on the engine's Welcome rows (mdk#2628 3.5a). The invite slot of
+  `drive_unpublished_welcome_delivery` holds only Welcome ids, published through the runtime's
+  `deliver_owed_welcomes_with_audit_context`; the founding slot keeps the create's `SessionEffects`, because a legacy
+  create's `GroupCreated` work rides them. Note a Welcome a publish could not deliver in one place,
+  `note_welcome_delivery_failures`, called from `remember_published_reports` (every seam that applies runtime
+  effects) and from the device-link send; never write a pending Welcome row or queue `WelcomeDeliveryPending` from a
+  drive. It announces each Welcome once per process (`announced_welcome_failures`) and leaves a failure without a
+  group (the startup retry's) to `reconcile_pending_welcome_delivery_index`. The worker's projection drain
+  (`publish_client_pending_projection_updates`) broadcasts the queued events, so every worker seam does.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.
@@ -324,23 +339,28 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the window. That time is only a hint: never use it to retire, un-cover or drop debt. It logs aggregate counts only.
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
-- Keep the recovery runner in `src/client/recovery_runner.rs` and its `select`, `quantum`, `compare`, `recheck`,
-  `policy` and `tails` modules (mdk#2660 phase 4). It is built but not started: nothing outside its tests constructs,
-  wakes or reads it until the switch-over replaces the comparison owner, so do not wire it from `account_worker.rs` or
-  a host surface in passing. Every ledger and retry-state write happens in a worker turn; the credit wait, caps read and sweep run
-  off the worker, and nothing read before the credit wait is planned on. Live tails are a query read fresh in each
-  turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
+- Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
+  `recheck`, `policy` and `tails` modules (mdk#2660 phase 4). It is built but not started: nothing outside its tests
+  constructs, wakes or reads it until the switch-over replaces the comparison owner, so do not wire it from
+  `account_worker.rs` or a host surface in passing. Every ledger and retry-state write happens in a worker turn; the
+  credit wait, caps read and sweep run off the worker, and nothing read before the credit wait is planned on. Live
+  tails are a query read fresh in each turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
   covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
   reached right after a `rate-limited:` reply settles `RateLimited`. Every event byte a required relay sends is
   charged to the account's rolling hour, cut and discarded replies included; best-effort relays are never charged.
   A quantum cut by its deadline, shutdown or the pass deadline interrupts its request in flight rather than dropping
   it, so the reply it was reading is charged too (`SweepRelay::interrupt`); an interrupted request is no answer and
-  never clears a rate limit. Logs carry aggregates only.
+  never clears a rate limit.
   A comparison or re-check quantum settles through the same table: its end maps to a sweep end (`compare::verdict`).
   A re-check settles the relay and the account budget but never its unit's retry state, records pass progress only
   under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it
   runs only when no debt unit is eligible, on required relays whose recorded caps show NIP-77. Storage makes a relay's
   re-checks due in the same write that ends a cooldown longer than an hour; do not split that into a second write.
+  Admission releases a group's staged events oldest first below its admission frontier, never past an event the
+  engine kept no trace of. Nothing is swept, compared or re-checked for a group admission cannot drain (held, or
+  admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences; the fence is a query
+  (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own
+  `LiveCount`, never the coverage recorder's facts. Logs carry aggregates only.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown
@@ -574,7 +594,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
   every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. It builds every collector
   client through the `http_builder` that both `MarmotApp` constructors hand in (`hand_in_http_builder`); before that
-  it builds none, so nothing dials. Endpoint parsers and the exporters' resolved config live in `export_config.rs`;
+  it builds none, so nothing dials, tests included: a test that dials hands in a builder itself. Endpoint parsers and the exporters' resolved config live in `export_config.rs`;
   `config.rs` keeps the settings that resolve against `MarmotServiceEndpoints`. Explicit SOCKS5 routing
   must send the validated IP rather than delegate HTTP DNS to the proxy. Build every relay client with
   `network_proxy::nostr_builder()` (in `transport-nostr`, its own `nostr_builder()`, which calls the same adapter
@@ -591,6 +611,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and `AuditOtlpSender`, so do not make their crate-private methods `pub` and do not call them from outside the
   moving set; add the method to a view or to `wiring.rs`. Items the rest of the crate names from a private module
   in the set are `pub` there.
+- Tests in the moving set need nothing else from this crate. Tests that need a `MarmotApp`, its runtime or the
+  network-proxy policy live in `src/observability_tests/`, one module per set file, and reach the set as the rest of
+  the crate does, plus the fixtures in `observability_test_support.rs` and the `_for_test` hooks. Those are gated
+  `cfg(any(test, feature = "test-support"))` and reach state through methods, never fields.
+  `observability_crossings_tests` keeps the crossing list in `src/observability_crossings.txt` at zero.
 
 ## Code map (modules not covered above)
 
@@ -646,7 +671,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   build).
 - `product-analytics-export`: product analytics export path.
 - `media-benchmarks`: internal surface for the media transport benchmarks.
-- `test-support`: exposes `error_kind_table` to the host crates' tests. Enable it only as a dev-dependency.
+- `test-support`: exposes `error_kind_table` to the host crates' tests and compiles the diagnostics test fixtures
+  and hooks. Enable it only as a dev-dependency.
 
 ## Verification
 

@@ -44,6 +44,34 @@ where
         Ok(output)
     }
 
+    /// Publish now each of `welcome_ids` that the engine holds as owed: the
+    /// trigger a host fires once it has replied to an invite, naming the
+    /// Welcomes by id. One still staged with its commit is left for
+    /// maintenance to send once the commit confirms; a delivered, withdrawn
+    /// or expired one is skipped.
+    pub async fn deliver_owed_welcomes_with_audit_context(
+        &mut self,
+        welcome_ids: &[cgka_traits::MessageId],
+        group_id: GroupId,
+        context: AuditEventContext,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let now = self.wall_clock.now();
+        let mut owed = Vec::with_capacity(welcome_ids.len());
+        for id in welcome_ids {
+            if let OutboundWelcomeStatus::Owed { message, .. } =
+                self.session.outbound_welcome_status(id, now)?
+            {
+                owed.push(message);
+            }
+        }
+        let mut output = AccountDeviceEffects::default();
+        if !owed.is_empty() {
+            self.publish_welcome_fanout(owed, Some(group_id), &mut output, Some(context), false)
+                .await?;
+        }
+        Ok(output)
+    }
+
     /// Retry retained Welcome obligations immediately with the shared bounded
     /// fanout, bypassing the automatic backoff for this explicit startup pass.
     pub async fn retry_welcome_messages_with_audit_context(

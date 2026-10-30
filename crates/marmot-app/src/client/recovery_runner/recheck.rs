@@ -25,7 +25,9 @@
 //!   from its position, held back in memory while it moves nowhere.
 //! - What a re-check finds inside a range covered when planned arrived late:
 //!   it is staged as any fetched history is, and counted in the runner's
-//!   aggregate late-findings count.
+//!   aggregate late-findings count. So a re-check waits while its relay is at
+//!   a staging bound, with no exemption at the frontier it never moves, and
+//!   while admission cannot drain its group ([`super::admission`]).
 //!
 //! A re-check never touches the unit's retry state
 //! (`settle_recovery_recheck`): its ranges are not debt.
@@ -40,6 +42,7 @@ use storage_sqlite::{
 use transport_nostr_adapter::compare::CompareEnd;
 use transport_nostr_adapter::sweep::{RelayCaps, SweepRange};
 
+use super::admission::{Admission, Stalled};
 use super::compare::{CompareFacts, ComparePlan, PlannedRange, local_items, recorded_caps};
 use super::quantum::{QuantumReport, classify};
 use super::select::{Candidate, cooldown_until, suspended, sweepable};
@@ -84,10 +87,15 @@ fn due_at(pass: RecoveryRecheckPass, policy: &RecoveryRunnerPolicy) -> u64 {
 }
 
 /// Every re-check unit of the current routes, each with when its pass falls
-/// due. A due pass with nothing left to check is left out. Writes nothing.
+/// due. A due pass with nothing left to check is left out. A unit of a group
+/// admission cannot drain (`stalled`), or whose relay staging holds back, is
+/// blocked: what a re-check finds is staged like any fetched history.
+/// Writes nothing.
 pub(super) fn survey(
     turn: &DebtTurn<'_>,
     policy: &RecoveryRunnerPolicy,
+    stalled: &Stalled,
+    admission: &mut Admission<'_>,
 ) -> StorageResult<Vec<Candidate>> {
     let app = turn.app;
     let now = turn.now;
@@ -131,6 +139,8 @@ pub(super) fn survey(
                 0
             };
             let cooldown = cooldown_until(app, &mut cooldowns, relay, now)?;
+            let held_back =
+                stalled.holds(route) || admission.backpressured(&key, &policy.staging, false)?;
             candidates.push(Candidate {
                 key,
                 best_effort: false,
@@ -138,7 +148,7 @@ pub(super) fn survey(
                 position: start,
                 last_served_at: unit.as_ref().and_then(|unit| unit.last_served_at_seconds),
                 due_at: due.max(cooldown.unwrap_or(0)),
-                blocked: suspended(route),
+                blocked: suspended(route) || held_back,
                 recheck: true,
             });
         }
@@ -260,7 +270,9 @@ pub(super) fn begin(
     };
     let unit = app.recovery_unit(&key.route, &key.relay)?;
     let pass = unit.as_ref().map(|unit| unit.recheck).unwrap_or_default();
-    if due_at(pass, policy) > now {
+    if due_at(pass, policy) > now
+        || Admission::new(turn).backpressured(key, &policy.staging, false)?
+    {
         return Ok(None);
     }
     // Below the inventory's floor the account's held set is incomplete, so a

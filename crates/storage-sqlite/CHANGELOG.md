@@ -11,6 +11,16 @@
   device's renames of it were built. `SqliteAppStorage` gains
   `device_renames`, `device_rename`, `put_device_rename` and
   `drop_device_rename`, with `DeviceRenameRecord`.
+- Migration 0135 advances account storage to schema 135 (mdk#2660 phase 4).
+  It replaces `account_recovery_units.fencing`, which nothing set, with
+  `account_recovery_unit_fences`: each capture range a unit fences, one row
+  each, never overlapping. `RecoveryUnit::fencing` goes, and
+  `set_recovery_unit_fencing` becomes `set_recovery_unit_fences`, which
+  replaces a unit's ranges. `recovery_unit_fences` lists every fenced range,
+  `staged_recovery_routes` the routes with staged events, and
+  `reclaim_staged_recovery_routes` drops the rows of routes the runner no
+  longer lists, owing their seconds again. The retention prune drops fenced
+  ranges below its floor.
 - Migration 0140 advances account storage to schema 140 (mdk#2628 item 3.4).
   It adds private KeyPackages, single-use KeyPackages a device hands to one
   sibling inside its device group: `cgka_private_key_packages` (one issuer
