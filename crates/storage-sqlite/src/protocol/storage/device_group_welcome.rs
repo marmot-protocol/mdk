@@ -37,6 +37,23 @@ impl DeviceGroupWelcomeStorage for SqliteAccountStorage {
         record.as_deref().map(deserialize).transpose()
     }
 
+    fn device_group_welcome_expectations(
+        &self,
+    ) -> StorageResult<Vec<DeviceGroupWelcomeExpectation>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT record FROM cgka_device_group_welcome_expectations ORDER BY group_id",
+            )
+            .storage()?;
+        let records = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .storage()?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .storage()?;
+        records.iter().map(|record| deserialize(record)).collect()
+    }
+
     fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool> {
         let deleted = self
             .lock()?
@@ -63,6 +80,7 @@ mod tests {
         let expectation = DeviceGroupWelcomeExpectation {
             group_id: group_id.clone(),
             sender_signature_key: vec![9; 32],
+            key_package_ref: vec![5; 32],
             expires_at: 1_800_000_600,
         };
 
@@ -84,13 +102,17 @@ mod tests {
             reopened
                 .device_group_welcome_expectation(&group_id)
                 .unwrap(),
-            Some(expectation)
+            Some(expectation.clone())
         );
         assert_eq!(
             reopened
                 .device_group_welcome_expectation(&GroupId::new(vec![8; 16]))
                 .unwrap(),
             None
+        );
+        assert_eq!(
+            reopened.device_group_welcome_expectations().unwrap(),
+            vec![expectation.clone()]
         );
         assert!(
             reopened
@@ -107,6 +129,43 @@ mod tests {
                 .device_group_welcome_expectation(&group_id)
                 .unwrap(),
             None
+        );
+        assert!(
+            reopened
+                .device_group_welcome_expectations()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A record stored before expectations named their KeyPackage reads with
+    /// an empty `KeyPackageRef`, which matches no Welcome.
+    #[test]
+    fn an_expectation_stored_without_its_key_package_reads_with_an_empty_ref() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group_id = GroupId::new(vec![7; 16]);
+        let record = serde_json::json!({
+            "group_id": group_id,
+            "sender_signature_key": vec![9u8; 32],
+            "expires_at": 1_800_000_600u64,
+        });
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_device_group_welcome_expectations (group_id, record)
+                 VALUES (?1, ?2)",
+                params![group_id.as_slice(), serde_json::to_vec(&record).unwrap()],
+            )
+            .unwrap();
+        let read = store
+            .device_group_welcome_expectation(&group_id)
+            .unwrap()
+            .unwrap();
+        assert!(read.key_package_ref.is_empty());
+        assert_eq!(
+            store.device_group_welcome_expectations().unwrap(),
+            vec![read]
         );
     }
 }

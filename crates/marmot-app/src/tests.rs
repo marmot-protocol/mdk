@@ -18,6 +18,8 @@ mod key_package_selection;
 mod message_journeys;
 #[cfg(feature = "test-policy-overrides")]
 mod multi_device_members;
+#[cfg(feature = "product-analytics-export")]
+mod observed_operations;
 mod publication_progress;
 #[cfg(feature = "test-policy-overrides")]
 mod push_announce;
@@ -15273,6 +15275,12 @@ fn custom_intent_rejects_every_reserved_kind() {
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+        // Device-group kinds: heartbeat, private KeyPackage request and
+        // hand-off, anomaly alert.
+        457,
+        459,
+        460,
+        462,
     ] {
         assert!(crate::is_reserved_app_event_kind(kind));
         let result = build_inner_event(

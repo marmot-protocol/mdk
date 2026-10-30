@@ -1300,18 +1300,25 @@ impl<S: StorageProvider> Engine<S> {
     /// Create a group under `group_id`, chosen by the host before the group
     /// exists, as a device link needs. The id has 1 to 255 bytes and names no
     /// group this device holds in any state, removed or forgotten copies
-    /// included; otherwise this fails before anything is written. The
-    /// founding Welcomes are never published from `welcome_deliver_until`
-    /// on, the end of the new device's wait (mdk#2628 D40).
+    /// included. A device group founded with a member adds exactly one
+    /// KeyPackage, the linked device's, and its founding Add sets that
+    /// device's entry by `roster_update`: one `SetDevice` for a slot the
+    /// founding roster does not list, announcing that KeyPackage (mdk#2628
+    /// D41). No other create carries a roster update, and an ordinary create
+    /// founds a device group with no member. Otherwise this fails before
+    /// anything is written. The founding Welcomes are never published from
+    /// `welcome_deliver_until` on, the end of the new device's wait (D40).
     pub async fn create_group_with_chosen_id_and_audit_context(
         &mut self,
         req: CreateGroupRequest,
         group_id: GroupId,
+        roster_update: Option<Vec<u8>>,
         welcome_deliver_until: Timestamp,
         context: Option<AuditEventContext>,
     ) -> Result<(GroupId, SendResult), EngineError> {
         let chosen = crate::group_lifecycle::ChosenGroup {
             group_id,
+            roster_update,
             welcome_deliver_until,
         };
         self.create_group_audited(req, Vec::new(), Some(chosen), context)

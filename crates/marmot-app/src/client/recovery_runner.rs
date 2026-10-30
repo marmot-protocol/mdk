@@ -73,7 +73,7 @@ use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::compare::CompareRelay;
 use transport_nostr_adapter::sweep::{RelayCaps, SweepRelay};
 
-pub(crate) use admission::{Admitted, LiveCount};
+pub(crate) use admission::{Admitted, LiveCount, LiveFence};
 pub(crate) use policy::RecoveryRunnerPolicy;
 pub(crate) use tails::LiveTailRead;
 

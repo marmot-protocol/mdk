@@ -205,6 +205,12 @@
   goal the cap parked.
 - `apply_group_push_token_tombstone` takes an `AccountGroupPushTokenTombstone`
   instead of eight arguments, and stores its optional removal proof.
+- `SqliteAccountStorage` implements the new
+  `DeviceGroupWelcomeStorage::device_group_welcome_expectations`, which lists
+  every stored expectation, expired ones included (mdk#2628 item 3.3b, D41).
+  An expectation's record gains `key_package_ref`, the confirmed KeyPackage's
+  `KeyPackageRef`; a record stored before it reads with an empty ref. No
+  migration: the field lives in the stored record.
 
 ### Added
 
@@ -246,6 +252,12 @@
   `record_group_push_gossip_announce` now also takes the owed value the
   published announce was built under, and settles the debt only while it
   still holds that value; a new Welcome drops it.
+
+### Fixed
+
+- `delete_group` joins a caller's `with_transaction` instead of beginning its
+  own, which failed inside one, so the engine's cleanup of a failed group
+  creation now removes the group's MLS state.
 
 ## 0.14.0 - 2026-10-23
 

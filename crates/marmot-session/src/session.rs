@@ -1204,6 +1204,7 @@ impl AccountDeviceSession {
         &mut self,
         req: CreateGroupRequest,
         group_id: GroupId,
+        roster_update: Option<Vec<u8>>,
         welcome_deliver_until: Timestamp,
         context: AuditEventContext,
     ) -> SessionResult<CreateGroupEffects> {
@@ -1218,6 +1219,7 @@ impl AccountDeviceSession {
             .create_group_with_chosen_id_and_audit_context(
                 req,
                 group_id,
+                roster_update,
                 welcome_deliver_until,
                 Some(context),
             )
