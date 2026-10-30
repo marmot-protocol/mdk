@@ -645,8 +645,9 @@ fn a_v0_14_0_database_converts_every_row_kind() {
             (RecoveryCause::SubscriptionReplay, counted(1, 0, 0, 0)),
         ]
     );
+    let converted_loss_before = app.converted_recovery_loss().unwrap();
     assert!(
-        report.loss
+        converted_loss_before
             == vec![
                 // The retired and legacy-retired generations go with the live
                 // one: acknowledgment reclaims a cause's evidence whole.
@@ -661,6 +662,10 @@ fn a_v0_14_0_database_converts_every_row_kind() {
     app.acknowledge_recovery_conversion_notices().unwrap();
     assert!(app.recovery_conversion_report().unwrap().is_none());
     assert!(!app.recovery_conversion_notices_changed().unwrap());
+    assert!(
+        app.converted_recovery_loss().unwrap() == converted_loss_before,
+        "the converted loss waits for its reclaim, not the report"
+    );
 
     // Nothing became coverage.
     for route in [TransportReconciliationRoute::Inbox, group(A), group(B)] {
@@ -819,7 +824,7 @@ fn a_nightly_database_quarantines_the_shadow_ledger_and_converts_every_row_kind(
         ]
     );
     assert!(
-        report.loss
+        app.converted_recovery_loss().unwrap()
             == vec![
                 // Queue loss was all retired: the plane guards none of it.
                 converted_loss(RecoveryLossCause::NotificationConsumer, &[(20, 3), (21, 2)]),
@@ -1128,11 +1133,11 @@ fn a_converted_park_rearms_once_on_known_caps_and_parks_again_without_progress()
     );
 }
 
-/// Converted loss evidence stays until the worker reclaims it at exactly the
-/// watermarks the report gave, and never while the conversion runs or after
-/// new loss of that cause arrived.
+/// Converted loss evidence stays until the worker reclaims its entry, never
+/// while the conversion runs, and the reclaim deletes only the generations
+/// still at the converted count: newer loss stays for the import.
 #[test]
-fn converted_loss_is_reclaimed_only_at_its_exact_watermarks() {
+fn converted_loss_is_reclaimed_only_as_converted() {
     let directory = tempfile::tempdir().unwrap();
     let store = v0_14_0(&directory);
     let app = store.app_storage();
@@ -1141,12 +1146,14 @@ fn converted_loss_is_reclaimed_only_at_its_exact_watermarks() {
     let routes = routes();
     // Through the loss step only.
     app.convert_recovery_steps(&input(&routes), 3).unwrap();
+    assert!(app.converted_recovery_loss().unwrap() == vec![queue.clone(), notification.clone()]);
     assert!(!app.reclaim_converted_recovery_loss(&notification).unwrap());
     convert(&store).unwrap();
-    let report = app.recovery_conversion_report().unwrap().unwrap();
-    assert!(report.loss == vec![queue.clone(), notification.clone()]);
+    let mut stale = notification.clone();
+    stale.watermarks[0].observed_count = 1;
+    assert!(!app.reclaim_converted_recovery_loss(&stale).unwrap());
 
-    // New queue loss after the conversion changes that cause's set.
+    // New queue loss, and growth of the converted notification generation.
     app.record_account_recovery_loss_bounded(
         "alice",
         RecoveryLossCause::Queue,
@@ -1156,24 +1163,203 @@ fn converted_loss_is_reclaimed_only_at_its_exact_watermarks() {
         Some(NOW - 5),
     )
     .unwrap();
-    assert!(!app.reclaim_converted_recovery_loss(&queue).unwrap());
-    let mut stale = notification.clone();
-    stale.watermarks[0].observed_count = 1;
-    assert!(!app.reclaim_converted_recovery_loss(&stale).unwrap());
-
+    app.record_account_recovery_loss_bounded(
+        "alice",
+        RecoveryLossCause::NotificationConsumer,
+        9,
+        4,
+        NOW,
+        Some(NOW - 5),
+    )
+    .unwrap();
+    assert!(app.reclaim_converted_recovery_loss(&queue).unwrap());
     assert!(app.reclaim_converted_recovery_loss(&notification).unwrap());
-    let causes = evidence(&store)
+    assert!(app.converted_recovery_loss().unwrap().is_empty());
+    let left = evidence(&store)
         .into_iter()
-        .map(|row| (row[0].clone(), row[1].clone()))
+        .map(|row| (row[0].clone(), row[1].clone(), row[2].clone()))
         .collect::<Vec<_>>();
     assert_eq!(
-        causes,
-        [3, 5, 7, 8]
-            .map(|token| (Value::Integer(0), Value::Integer(token)))
-            .to_vec(),
-        "queue evidence, with the new generation, stays"
+        left,
+        vec![
+            (Value::Integer(0), Value::Integer(8), Value::Integer(1)),
+            (Value::Integer(1), Value::Integer(9), Value::Integer(4)),
+        ],
+        "the new generation and the grown one stay"
     );
-    assert!(!app.reclaim_converted_recovery_loss(&notification).unwrap());
+    assert!(!app.reclaim_converted_recovery_loss(&queue).unwrap());
+}
+
+/// A generation no import charged yet is charged by the conversion as an
+/// import would: under a new loss revision it is stamped with, so a reclaim
+/// keeps how recent it was. Already imported generations keep their stamp.
+#[test]
+fn unimported_loss_is_stamped_with_a_new_loss_revision() {
+    let rows = format!(
+        "{}UPDATE account_delivery_loss_evidence SET imported_count = NULL
+             WHERE cause = 0 AND marker_token = 7;",
+        v0_14_0_rows()
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let store = fixture(&directory, 116, &rows);
+    let app = store.app_storage();
+    let read = |store: &SqliteAccountStorage| {
+        let conn = store.lock().unwrap();
+        let state: (i64, i64) = conn
+            .query_row(
+                "SELECT loss_revision, acknowledged_import_revision FROM account_recovery_state",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let stamp = |token: i64| -> Option<i64> {
+            use rusqlite::OptionalExtension;
+            conn.query_row(
+                "SELECT import_revision FROM account_delivery_loss_evidence
+                 WHERE marker_token = ?1",
+                [token],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten()
+        };
+        (state, stamp(7), stamp(9))
+    };
+    let ((revision, _), _, notification) = read(&store);
+    convert(&store).unwrap();
+    let ((after, _), queue, notification_after) = read(&store);
+    assert_eq!(after, revision + 1);
+    assert_eq!(queue, Some(after));
+    assert_eq!(notification_after, notification);
+
+    let queue = app
+        .converted_recovery_loss()
+        .unwrap()
+        .into_iter()
+        .find(|loss| loss.cause == RecoveryLossCause::Queue)
+        .unwrap();
+    assert!(app.reclaim_converted_recovery_loss(&queue).unwrap());
+    let ((_, acknowledged), ..) = read(&store);
+    assert!(acknowledged >= after);
+}
+
+/// Loss that named its routes reaches only them, as an import charges it: a
+/// dismissed window on another route retires whole, and other routes keep
+/// their coverage.
+#[test]
+fn routed_loss_reaches_only_its_routes() {
+    let rows = format!(
+        "{}UPDATE account_delivery_loss_evidence
+             SET imported_count = dropped_count, retired_count = dropped_count
+             WHERE cause = 1 AND marker_token = 21;
+         INSERT INTO account_recovery_obligations (id, demand_key, cause, account_label,
+             marker_token, pending_since, dropped_count, predicate, created_at_ms,
+             updated_at_ms, state, eligibility, parked_at_ms, incomplete_reason)
+         VALUES ({id}, 'notification:bob', 6, 'bob', 1, 100, 1, 0, 1000, 3000, 2, 4, 2000, 0);
+         {scope}",
+        nightly_rows(),
+        id = id(7),
+        scope = scope(
+            7,
+            0,
+            Some((B, 0x0B)),
+            (W + 1000, NOW - 500),
+            &payload(&[PLAN_R2], &[], false)
+        ),
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let store = fixture(&directory, i64::MAX, &rows);
+    let app = store.app_storage();
+    convert(&store).unwrap();
+
+    // Group A's loss from W + 70,000 leaves group B's dismissal whole; the
+    // parked native replay parks the rest of group B.
+    assert_eq!(
+        app.recovery_unit_spans(&group(B), R2).unwrap(),
+        vec![
+            crate::RecoveryUnitSpan {
+                range: range(W + 1000, NOW - 500),
+                retired: Some(RecoverySpanRetirement::Dismissed),
+            },
+            crate::RecoveryUnitSpan {
+                range: range(NOW - 499, NOW),
+                retired: None,
+            },
+        ]
+    );
+    let ledger = |route: &TransportReconciliationRoute, relay: &str| {
+        app.recovery_coverage_ranges(route, relay)
+            .unwrap()
+            .into_iter()
+            .map(|proved| (proved.range, proved.proof))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ledger(&TransportReconciliationRoute::Inbox, R1),
+        vec![(
+            range(W, NOW - 1000),
+            crate::RecoveryCoverageProof::Comparison
+        )]
+    );
+    assert_eq!(
+        ledger(&group(B), R2),
+        vec![(
+            range(W - 500, W + 50),
+            crate::RecoveryCoverageProof::SweepSlice
+        )]
+    );
+    assert!(app.recovery_coverage_remainders().unwrap().is_empty());
+    for route in [TransportReconciliationRoute::Inbox, group(A)] {
+        assert_eq!(goal(&store, &route), Some(W));
+    }
+    // No loss reached group B: its goal starts at its standing floor.
+    assert_eq!(goal(&store, &group(B)), Some(W + 20_000));
+}
+
+/// A routed generation bounded below an unrouted one reaches its own route
+/// from its own bound, below the window too, and only that route parks.
+#[test]
+fn a_routed_bound_below_the_unrouted_floor_reaches_only_its_route() {
+    let rows = format!(
+        "{}UPDATE account_delivery_loss_evidence SET bound_state = 1, bound_seconds = {every}
+             WHERE cause = 1 AND marker_token = 21;
+         UPDATE account_delivery_loss_evidence SET bound_seconds = {own}
+             WHERE cause = 1 AND marker_token = 20;
+         UPDATE account_delivery_loss_evidence_routes SET route_id = {b}, bound_seconds = {own}
+             WHERE marker_token = 20;",
+        nightly_rows(),
+        every = W + 500,
+        own = W - 300,
+        b = hex32(B),
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let store = fixture(&directory, i64::MAX, &rows);
+    let app = store.app_storage();
+    convert(&store).unwrap();
+
+    let ledger = |route: &TransportReconciliationRoute, relay: &str| {
+        app.recovery_coverage_ranges(route, relay)
+            .unwrap()
+            .into_iter()
+            .map(|proved| proved.range)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ledger(&TransportReconciliationRoute::Inbox, R1),
+        vec![range(W, W + 499)]
+    );
+    assert_eq!(ledger(&group(B), R2), vec![range(W - 500, W - 301)]);
+    let remainders = app
+        .recovery_coverage_remainders()
+        .unwrap()
+        .into_iter()
+        .map(|remainder| (remainder.route, remainder.range))
+        .collect::<Vec<_>>();
+    assert_eq!(remainders, vec![(group(B), range(W - 300, W - 1))]);
+    for route in [TransportReconciliationRoute::Inbox, group(A), group(B)] {
+        assert_eq!(goal(&store, &route), Some(W));
+    }
 }
 
 /// Loss bounded below the window parks the whole strip from its bound up to

@@ -16,11 +16,13 @@
   `SqliteAppStorage` gains `convert_recovery_obligations`, which takes a
   `RecoveryConversionInput` of `RecoveryConversionRoute`s,
   `recovery_conversion_pending`, `recovery_conversion_report` (a
-  `RecoveryConversionReport` of `RecoveryConvertedObligations` by cause and
-  `RecoveryConvertedLoss` watermarks), `acknowledge_recovery_conversion_report`,
-  `reclaim_converted_recovery_loss` (deletes converted loss evidence only at
-  exactly those watermarks), `recovery_conversion_notices_changed` and
-  `acknowledge_recovery_conversion_notices`. Nothing calls the conversion yet.
+  `RecoveryConversionReport` of `RecoveryConvertedObligations` by cause),
+  `acknowledge_recovery_conversion_report`, `converted_recovery_loss` (each
+  account and cause's converted `RecoveryConvertedLoss` watermarks, until
+  reclaimed), `reclaim_converted_recovery_loss` (deletes each converted
+  generation still at its converted count), `recovery_conversion_notices_changed`
+  and `acknowledge_recovery_conversion_notices`. Nothing calls the conversion
+  yet.
 - Migration 0135 advances account storage to schema 135 (mdk#2660 phase 4).
   It replaces `account_recovery_units.fencing`, which nothing set, with
   `account_recovery_unit_fences`: each capture range a unit fences, one row

@@ -18,15 +18,16 @@
 //!
 //! Converted loss evidence is neither orphaned nor deleted here. Its rows stay,
 //! counted as imported and with no obligation, as the watermark that keeps a
-//! delayed duplicate observation from counting as new loss, until the worker
-//! has finished the relay plane's overflow recovery for them and reclaims them
-//! with [`SqliteAppStorage::reclaim_converted_recovery_loss`]. Until then they
-//! are a state the worker resolves, not a leak.
+//! delayed duplicate observation from counting as new loss, and
+//! [`SqliteAppStorage::converted_recovery_loss`] keeps their set until the
+//! worker has finished the relay plane's overflow recovery for them and
+//! reclaims them with [`SqliteAppStorage::reclaim_converted_recovery_loss`].
+//! Until then they are a state the worker resolves, not a leak.
 use super::*;
 use crate::TransportReconciliationRoute;
 use crate::app::recovery_coverage::{
     RecoveryCoverageProof, RecoveryCoverageRange, reopen_goal, settle_goals_tx, uncover_loss_tx,
-    widen_goal,
+    uncover_route_loss_tx, widen_goal,
 };
 use crate::app::recovery_units::{
     break_converted_route_tx, park_overtaken_tx, rearm_all_units_tx, retire_converted_ranges_tx,
@@ -82,23 +83,16 @@ pub struct RecoveryConvertedLoss {
     pub cause: RecoveryLossCause,
     /// Every generation of this account and cause as the conversion found
     /// it, in marker-token order: the live ones it un-covered and any the
-    /// user retired, which acknowledgment reclaims with them. This is the
-    /// exact set [`SqliteAppStorage::reclaim_converted_recovery_loss`]
-    /// compares.
+    /// user retired, which acknowledgment reclaims with them.
     pub watermarks: Vec<RecoveryLossWatermark>,
 }
 
 /// What the conversion converted, kept until the worker has written its audit
-/// summary and finished the plane's overflow recovery for the converted loss.
-/// Not `Debug`: it names loss marker identities.
-#[derive(Clone, Default, PartialEq, Eq)]
+/// summary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryConversionReport {
     /// By cause, in cause order. A cause with no obligations is left out.
     pub obligations: Vec<(RecoveryCause, RecoveryConvertedObligations)>,
-    /// The loss un-covered, by account label and cause. An account and cause
-    /// whose every generation was retired is left out: the plane holds no
-    /// guard over it.
-    pub loss: Vec<RecoveryConvertedLoss>,
     /// Live-boundary ranges the shadow quarantine dropped.
     pub shadow_ranges: u64,
     /// Shadow-era parked remainders the quarantine dropped.
@@ -118,7 +112,7 @@ enum Step {
     Quarantine,
     /// Dismissed obligations become retired spans.
     Dismissed,
-    /// Live loss generations un-cover every route once.
+    /// Live loss un-covers what it reached once.
     Loss,
     /// Parked obligations break their routes' required relays.
     Parked,
@@ -303,22 +297,47 @@ fn quarantine_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> Stor
     add_count_tx(conn, "shadow_remainders", remainders as u64)
 }
 
-/// The lowest `created_at` live loss may have lost, zero when any live
-/// generation's bound is unknown, or `None` without live loss. Old generations
-/// may name routes, but loss that reached a route still owes it on every
-/// relay, so the conversion un-covers every route from here.
-fn live_loss_floor_tx(conn: &Connection) -> StorageResult<Option<u64>> {
-    let floor: Option<i64> = conn
-        .query_row_cached(
-            &format!(
-                "SELECT MIN(CASE WHEN bound_state = 1 THEN COALESCE(bound_seconds, 0) ELSE 0 END)
-                 FROM account_delivery_loss_evidence WHERE {LIVE_LOSS}"
-            ),
-            [],
-            |row| row.get(0),
-        )
+/// Where live loss may have lost events, as imports charge it: a generation
+/// that named its routes (with a known bound) reaches each of them from its
+/// own bound, and any other reaches every route from its floor, or from zero
+/// when its bound is unknown. `None` without live loss.
+fn live_loss_reach_tx(conn: &Connection) -> StorageResult<Option<RecoveryLossReach>> {
+    let live = conn
+        .prepare_cached(&format!(
+            "SELECT DISTINCT account_label, cause FROM account_delivery_loss_evidence
+             WHERE {LIVE_LOSS} ORDER BY account_label, cause"
+        ))
+        .storage()?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
         .storage()?;
-    floor.map(i64_to_u64).transpose()
+    if live.is_empty() {
+        return Ok(None);
+    }
+    let mut merged = RecoveryLossReach::default();
+    for (label, cause) in live {
+        let reach = loss::reach(conn, &label, loss::ReachOf::Cause(loss_cause(cause)?))?;
+        merged.every_route_from = match (merged.every_route_from, reach.every_route_from) {
+            (Some(merged), Some(floor)) => Some(merged.min(floor)),
+            (merged, floor) => merged.or(floor),
+        };
+        for (route, bound) in reach.routes {
+            let lowest = merged.routes.entry(route).or_insert(bound);
+            *lowest = (*lowest).min(bound);
+        }
+    }
+    Ok(Some(merged))
+}
+
+fn loss_cause(cause: i64) -> StorageResult<RecoveryLossCause> {
+    match cause {
+        0 => Ok(RecoveryLossCause::Queue),
+        1 => Ok(RecoveryLossCause::NotificationConsumer),
+        _ => Err(invalid_conversion()),
+    }
 }
 
 fn obligations_tx(conn: &Connection, filter: &str) -> StorageResult<Vec<Converted>> {
@@ -457,15 +476,15 @@ fn delete_converted_tx(
 /// runner does not raise its notice again: each frozen scope it could not
 /// certify retires its window inside the retained window on each relay it
 /// recorded, on routes that are still current. Live loss is newer debt than
-/// any dismissal of the same range can answer, so the range it un-covers
-/// stays owed.
+/// any dismissal of the same range can answer, so the range it un-covers on
+/// the scope's route stays owed.
 fn dismissed_tx(
     conn: &Connection,
     input: &RecoveryConversionInput<'_>,
     current: &BTreeMap<&TransportReconciliationRoute, &RecoveryConversionRoute>,
 ) -> StorageResult<()> {
     let floor = input.retention_floor_seconds;
-    let loss_from = live_loss_floor_tx(conn)?.map(|lowest| lowest.max(floor));
+    let reach = live_loss_reach_tx(conn)?.unwrap_or_default();
     for obligation in obligations_tx(conn, "state = 2")? {
         for scope in frozen_scopes_tx(conn, &obligation)? {
             let ScopeProof::Open(relays) = scope.proof else {
@@ -475,7 +494,7 @@ fn dismissed_tx(
                 continue;
             }
             let since = scope.since_seconds.unwrap_or(0).max(floor);
-            let until = match loss_from {
+            let until = match reach.floor(&scope.route).map(|lowest| lowest.max(floor)) {
                 Some(0) => continue,
                 Some(from) => scope.until_seconds.min(from - 1),
                 None => scope.until_seconds,
@@ -498,26 +517,46 @@ fn dismissed_tx(
     delete_converted_tx(conn, "state = 2", Disposition::Dismissed).map(|_| ())
 }
 
-/// Every live loss generation un-covers every route once, from its bound, as
-/// a live import does: the part inside the window is owed again, and what
-/// lies below the window, where the bound is unknown or older, parks in each
-/// current route's remainder, whatever coverage proved it before the loss. The generations then count as imported, so a later import does
-/// not un-cover them again; their rows stay as the watermark that keeps a
-/// delayed duplicate observation from counting as new loss. The report lists
-/// each account and cause with live loss, with every generation of it, so the
-/// worker can finish the plane's overflow recovery and reclaim them.
+/// Live loss un-covers what it reached once, as an import charges it: every
+/// route from the floor of the generations that named no routes, and each
+/// named route from its own bound. The part inside the window is owed again,
+/// and what lies below it, where a bound is unknown or older, parks in each
+/// current route's remainder, whatever coverage proved it before the loss.
+/// Generations no import charged yet are charged now, under a new loss
+/// revision they are stamped with, and every live generation then counts as
+/// imported, so a later import does not un-cover it again; their rows stay as
+/// the watermark that keeps a delayed duplicate observation from counting as
+/// new loss. Each account and cause with live loss is recorded with every
+/// generation of it, so the worker can finish the plane's overflow recovery
+/// and reclaim them.
 fn loss_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> StorageResult<()> {
-    let Some(lowest) = live_loss_floor_tx(conn)? else {
+    let Some(reach) = live_loss_reach_tx(conn)? else {
         return Ok(());
     };
     let (floor, now) = (input.retention_floor_seconds, input.now_seconds);
-    uncover_loss_tx(conn, lowest, now)?;
-    // The un-cover widened the goals the ledger holds; a current route
-    // without one owes from the same bound.
-    for current in input.routes {
-        reopen_goal(conn, &current.route, lowest)?;
+    if let Some(every) = reach.every_route_from {
+        uncover_loss_tx(conn, every, now)?;
     }
-    if lowest < floor {
+    for (route, &bound) in &reach.routes {
+        match reach.every_route_from {
+            // Its coverage went with the account-wide floor.
+            Some(every) if bound >= every => reopen_goal(conn, route, every)?,
+            _ => uncover_route_loss_tx(conn, route, bound, now)?,
+        }
+    }
+    // The un-covers widened the goals the ledger holds; a current route
+    // without one owes from the same floor.
+    for current in input.routes {
+        if let Some(lowest) = reach.floor(&current.route) {
+            reopen_goal(conn, &current.route, lowest)?;
+        }
+    }
+    if reach
+        .every_route_from
+        .into_iter()
+        .chain(reach.routes.values().copied())
+        .any(|lowest| lowest < floor)
+    {
         let certifying = input
             .routes
             .iter()
@@ -535,6 +574,32 @@ fn loss_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> StorageRes
         if parked > 0 {
             notices_changed_tx(conn)?;
         }
+    }
+    let uncharged =
+        format!("{LIVE_LOSS} AND (imported_count IS NULL OR imported_count < dropped_count)");
+    let newly: i64 = conn
+        .query_row_cached(
+            &format!("SELECT COUNT(*) FROM account_delivery_loss_evidence WHERE {uncharged}"),
+            [],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if newly > 0 {
+        conn.execute_cached(
+            "UPDATE account_recovery_state SET loss_revision = loss_revision + 1
+             WHERE singleton = 1",
+            [],
+        )
+        .storage()?;
+        conn.execute_cached(
+            &format!(
+                "UPDATE account_delivery_loss_evidence SET import_revision =
+                     (SELECT loss_revision FROM account_recovery_state WHERE singleton = 1)
+                 WHERE {uncharged}"
+            ),
+            [],
+        )
+        .storage()?;
     }
     conn.execute_cached(
         &format!(
@@ -632,21 +697,8 @@ fn pending_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> Storage
     delete_converted_tx(conn, filter, Disposition::Pending).map(|_| ())
 }
 
-fn report_tx(conn: &Connection) -> StorageResult<RecoveryConversionReport> {
-    let (shadow_ranges, shadow_remainders, units_broken) = conn
-        .query_row_cached(
-            "SELECT shadow_ranges, shadow_remainders, units_broken
-             FROM account_recovery_conversion WHERE singleton = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .storage()?;
+/// The converted loss not reclaimed yet, by account label and cause.
+fn converted_loss_tx(conn: &Connection) -> StorageResult<Vec<RecoveryConvertedLoss>> {
     let rows = conn
         .prepare_cached(
             "SELECT account_label, cause, marker_token, observed_count
@@ -666,11 +718,7 @@ fn report_tx(conn: &Connection) -> StorageResult<RecoveryConversionReport> {
         .storage()?;
     let mut loss: Vec<RecoveryConvertedLoss> = Vec::new();
     for (account_label, cause, marker_token, observed_count) in rows {
-        let cause = match cause {
-            0 => RecoveryLossCause::Queue,
-            1 => RecoveryLossCause::NotificationConsumer,
-            _ => return Err(invalid_conversion()),
-        };
+        let cause = loss_cause(cause)?;
         if loss
             .last()
             .is_none_or(|last| last.account_label != account_label || last.cause != cause)
@@ -689,6 +737,24 @@ fn report_tx(conn: &Connection) -> StorageResult<RecoveryConversionReport> {
                 observed_count: i64_to_u64(observed_count)?,
             });
     }
+    Ok(loss)
+}
+
+fn report_tx(conn: &Connection) -> StorageResult<RecoveryConversionReport> {
+    let (shadow_ranges, shadow_remainders, units_broken) = conn
+        .query_row_cached(
+            "SELECT shadow_ranges, shadow_remainders, units_broken
+             FROM account_recovery_conversion WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .storage()?;
     let rows = conn
         .prepare_cached(
             "SELECT cause, disposition, obligations FROM account_recovery_conversion_counts
@@ -723,7 +789,6 @@ fn report_tx(conn: &Connection) -> StorageResult<RecoveryConversionReport> {
     }
     Ok(RecoveryConversionReport {
         obligations,
-        loss,
         shadow_ranges: i64_to_u64(shadow_ranges)?,
         shadow_remainders: i64_to_u64(shadow_remainders)?,
         units_broken: i64_to_u64(units_broken)?,
@@ -795,8 +860,8 @@ impl SqliteAppStorage {
         pending.then(|| report_tx(&conn)).transpose()
     }
 
-    /// The worker wrote the conversion's audit summary and finished the
-    /// plane's overflow recovery for every converted loss generation.
+    /// The worker wrote the conversion's audit summary. The converted loss
+    /// stays until it is reclaimed.
     pub fn acknowledge_recovery_conversion_report(&self) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
@@ -807,32 +872,68 @@ impl SqliteAppStorage {
             .storage()?;
             conn.execute_cached("DELETE FROM account_recovery_conversion_counts", [])
                 .storage()?;
-            conn.execute_cached("DELETE FROM account_recovery_conversion_loss", [])
-                .storage()?;
             Ok(())
         })
     }
 
-    /// Reclaim converted loss evidence once the plane's matching generations
-    /// are acknowledged and every writer for their tokens has finished; SQL
-    /// cannot prove that prerequisite. Deletes the account's evidence of that
-    /// cause only while it is exactly `loss.watermarks`, and returns whether
-    /// it did: new evidence, or a conversion still running, refuses it.
+    /// The loss the conversion turned into ledger debt and the worker has not
+    /// reclaimed yet, by account label and cause: the plane still guards each
+    /// until the worker finishes its overflow recovery. Durable, and empty
+    /// before the conversion's loss step has run.
+    pub fn converted_recovery_loss(&self) -> StorageResult<Vec<RecoveryConvertedLoss>> {
+        converted_loss_tx(&*self.lock()?)
+    }
+
+    /// Reclaim one entry of [`Self::converted_recovery_loss`] once the plane's
+    /// matching generations are acknowledged and every writer for their
+    /// tokens has finished; SQL cannot prove that prerequisite. Deletes each
+    /// of its generations still at the count the conversion found, keeping
+    /// how recent the deleted loss was, and ends the entry. A generation whose
+    /// count grew since is new loss and stays for the import, and so does any
+    /// newer generation. Returns `false`, changing nothing, unless `loss` is a
+    /// current entry of a finished conversion.
     pub fn reclaim_converted_recovery_loss(
         &self,
         loss: &RecoveryConvertedLoss,
     ) -> StorageResult<bool> {
-        if loss.watermarks.is_empty() {
-            return Ok(false);
-        }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            if step_tx(&conn)? < DONE
-                || loss::watermarks(&conn, &loss.account_label, loss.cause)? != loss.watermarks
-            {
+            if step_tx(&conn)? < DONE || !converted_loss_tx(&conn)?.contains(loss) {
                 return Ok(false);
             }
-            loss::reclaim_evidence_tx(&conn, &loss.account_label, loss.cause)?;
+            let (label, cause) = (loss.account_label.as_str(), loss.cause as i64);
+            for watermark in &loss.watermarks {
+                let generation = params![
+                    label,
+                    cause,
+                    sqlite_integer(watermark.marker_token)?,
+                    sqlite_integer(watermark.observed_count)?
+                ];
+                conn.execute_cached(
+                    "UPDATE account_recovery_state SET acknowledged_import_revision =
+                        MAX(acknowledged_import_revision, COALESCE(
+                            (SELECT import_revision FROM account_delivery_loss_evidence
+                             WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
+                                 AND dropped_count = ?4 AND imported_count = dropped_count),
+                            0))
+                     WHERE singleton = 1",
+                    generation,
+                )
+                .storage()?;
+                conn.execute_cached(
+                    "DELETE FROM account_delivery_loss_evidence
+                     WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
+                         AND dropped_count = ?4 AND imported_count = dropped_count",
+                    generation,
+                )
+                .storage()?;
+            }
+            conn.execute_cached(
+                "DELETE FROM account_recovery_conversion_loss
+                 WHERE account_label = ?1 AND cause = ?2",
+                params![label, cause],
+            )
+            .storage()?;
             Ok(true)
         })
     }

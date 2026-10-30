@@ -307,16 +307,18 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   gone, the next call resumes, and a finished conversion does nothing. In order: phase 2's live-boundary ranges and
   shadow remainders are dropped (comparison, sweep and re-check ranges stay), goals settle at the window floor and
   every current route's standing goal starts; dismissed rows retire their uncertified scopes' windows on the relays
-  they recorded, below where live loss reaches; each live loss generation un-covers every route once from its
-  bound, parks what lies below the window and counts as imported; parked rows break their routes' required relays
-  that still owe history, under one revision per route (one notice), keeping the earliest park time; a pending
-  explicit repair re-arms every unit; satisfied rows go. Converted rows are deleted with their scopes, with no third
-  state, and nothing becomes coverage. `recovery_conversion_report` keeps the counts by cause and disposition and,
-  per account and cause with live loss, the exact loss watermarks until `acknowledge_recovery_conversion_report`;
-  `recovery_conversion_notices_changed` asks for one announcement of the changed "history may be incomplete"
-  notices. Converted loss evidence stays, imported and with no obligation, until the worker has finished the relay
-  plane's overflow recovery and calls `reclaim_converted_recovery_loss`, which deletes it only at exactly those
-  watermarks. Nothing calls the conversion yet.
+  they recorded, below where live loss reaches that route; live loss un-covers what it reached once, as an import
+  charges it (a generation that named its routes reaches only those, from their bounds; any other reaches every route
+  from its floor), parks what lies below the window, and counts as imported, generations no import charged yet under
+  a new loss revision they are stamped with; parked rows break their routes' required relays that still owe history,
+  under one revision per route (one notice), keeping the earliest park time; a pending explicit repair re-arms every
+  unit; satisfied rows go. Converted rows are deleted with their scopes, with no third state, and nothing becomes
+  coverage. `recovery_conversion_report` keeps the counts by cause and disposition until
+  `acknowledge_recovery_conversion_report`, and `recovery_conversion_notices_changed` asks for one announcement of
+  the changed "history may be incomplete" notices. Converted loss evidence stays, imported and with no obligation;
+  `converted_recovery_loss` lists it by account and cause until the worker has finished the relay plane's overflow
+  recovery and calls `reclaim_converted_recovery_loss`, which deletes each generation still at its converted count
+  (newer or grown loss stays for the import). Nothing calls the conversion yet.
 
 ## Tests and benchmarks
 

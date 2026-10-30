@@ -65,7 +65,7 @@ fn snapshot(
     })
 }
 
-pub(super) fn watermarks(
+fn watermarks(
     conn: &Connection,
     label: &str,
     cause: RecoveryLossCause,
@@ -218,7 +218,7 @@ impl RecoveryLossReach {
 
 /// Which generations a reach read counts.
 #[derive(Clone, Copy)]
-enum ReachOf {
+pub(super) enum ReachOf {
     /// One cause's generations that still carry debt.
     Cause(RecoveryLossCause),
     /// Every generation an import charged after this loss revision, retired
@@ -226,7 +226,11 @@ enum ReachOf {
     ImportedAfter(i64),
 }
 
-fn reach(conn: &Connection, label: &str, of: ReachOf) -> StorageResult<RecoveryLossReach> {
+pub(super) fn reach(
+    conn: &Connection,
+    label: &str,
+    of: ReachOf,
+) -> StorageResult<RecoveryLossReach> {
     let (filter, value) = match of {
         ReachOf::Cause(cause) => (
             "cause = ?2
@@ -632,35 +636,24 @@ impl SqliteAppStorage {
             if !matches(&conn, &label, cause)? {
                 return Ok(false);
             }
-            reclaim_evidence_tx(&conn, &label, cause)?;
+            // The rows say where this loss reached; keep how recent it was.
+            conn.execute_cached(
+                "UPDATE account_recovery_state SET acknowledged_import_revision =
+                    MAX(acknowledged_import_revision, COALESCE(
+                        (SELECT MAX(import_revision) FROM account_delivery_loss_evidence
+                         WHERE account_label=?1 AND cause=?2), 0))
+                 WHERE singleton=1",
+                params![label, cause as i64],
+            )
+            .storage()?;
+            conn.execute_cached(
+                "DELETE FROM account_delivery_loss_evidence WHERE account_label=?1 AND cause=?2",
+                params![label, cause as i64],
+            )
+            .storage()?;
             Ok(true)
         })
     }
-}
-
-/// Delete one cause's loss evidence once its exact watermarks were
-/// acknowledged, keeping how recent the deleted loss was.
-pub(super) fn reclaim_evidence_tx(
-    conn: &Connection,
-    label: &str,
-    cause: RecoveryLossCause,
-) -> StorageResult<()> {
-    // The rows say where this loss reached; keep how recent it was.
-    conn.execute_cached(
-        "UPDATE account_recovery_state SET acknowledged_import_revision =
-            MAX(acknowledged_import_revision, COALESCE(
-                (SELECT MAX(import_revision) FROM account_delivery_loss_evidence
-                 WHERE account_label=?1 AND cause=?2), 0))
-         WHERE singleton=1",
-        params![label, cause as i64],
-    )
-    .storage()?;
-    conn.execute_cached(
-        "DELETE FROM account_delivery_loss_evidence WHERE account_label=?1 AND cause=?2",
-        params![label, cause as i64],
-    )
-    .storage()?;
-    Ok(())
 }
 
 #[cfg(test)]
