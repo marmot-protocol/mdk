@@ -269,8 +269,10 @@ async fn a_rename_while_a_commit_is_in_flight_is_refused() {
 }
 
 /// Deliver everything new to both devices and let each settle the device
-/// group, twice, so each has seen the other's answer to what it got. The
-/// device group is hidden, so convergence runs through the runtime.
+/// group, until a round sends nothing new and both take a commit there
+/// again: each has seen the other's answer to what it got. The device group
+/// is hidden, so convergence runs through the runtime. A pass can take more
+/// than one advance on a loaded machine, so the rounds are not counted.
 async fn exchange(
     phone: &mut AppClient,
     laptop: &mut AppClient,
@@ -278,19 +280,34 @@ async fn exchange(
     group: &GroupId,
     cursors: &mut (usize, usize),
 ) {
-    for _ in 0..2 {
-        for (device, cursor) in [
-            (&mut *phone, &mut cursors.0),
-            (&mut *laptop, &mut cursors.1),
-        ] {
-            deliver_new(device, relay, cursor).await;
-            let effects = device.runtime.advance_convergence(group).await.unwrap();
-            device
-                .observe_drained_session_events(&effects)
-                .await
-                .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let sent = published_count(relay);
+            for (device, cursor) in [
+                (&mut *phone, &mut cursors.0),
+                (&mut *laptop, &mut cursors.1),
+            ] {
+                deliver_new(device, relay, cursor).await;
+                let effects = device.runtime.advance_convergence(group).await.unwrap();
+                device
+                    .observe_drained_session_events(&effects)
+                    .await
+                    .unwrap();
+            }
+            if published_count(relay) == sent
+                && phone.runtime.device_group_takes_commit(group, &[]).unwrap()
+                && laptop
+                    .runtime
+                    .device_group_takes_commit(group, &[])
+                    .unwrap()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-    }
+    })
+    .await
+    .expect("the device group settles");
 }
 
 /// The phone and the laptop both rename the laptop from the same epoch. The
