@@ -149,12 +149,14 @@ where
             return Ok(AccountDeviceEffects::default());
         };
         let report = self.device_self_report.clone();
-        let history_key = self.session.history_public_key()?;
+        let history_key = self.own_history_key("announce_key_package");
         match self
             .edit_device_roster_entry(&group_id, &slot, held, |entry| {
                 entry.announced_key_package = Some(key_package_ref);
                 report.apply(entry);
-                entry.history_key = Some(history_key);
+                if let Some(history_key) = history_key {
+                    entry.history_key = Some(history_key);
+                }
             })
             .await?
         {

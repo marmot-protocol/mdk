@@ -315,7 +315,7 @@ impl AppClient {
                 },
                 announced_key_package: own_lifecycle.current_key_package_ref,
                 tag_signature_key: Some(self.runtime.own_signature_key()),
-                history_key: Some(self.runtime.history_public_key()?),
+                history_key: self.runtime.history_public_key().ok(),
                 ..DeviceEntryV1::default()
             },
         );

@@ -32,7 +32,7 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::SendIntent;
 use cgka_traits::{EngineError, EpochState, FanoutMlsState, GroupId, TransportAdapter};
 
-use super::{AccountDeviceEffects, AccountDeviceRuntime};
+use super::{AccountDeviceEffects, AccountDeviceRuntime, TRACE_TARGET};
 use crate::error::{AccountError, AccountResult};
 use crate::key_package::KeyPackagePublisher;
 use crate::routing::TransportRoutingPolicy;
@@ -146,6 +146,24 @@ where
         Ok(DeviceRosterEdit::Committed(Box::new(
             self.publish_session_effects(staged).await?,
         )))
+    }
+
+    /// The public half of this device's history key, for its own roster
+    /// entry, or `None` when it cannot be read or stored now. A history key
+    /// never holds back the roster edit it rides on; a later edit of this
+    /// device's own entry writes it.
+    pub(super) fn own_history_key(&self, method: &'static str) -> Option<Vec<u8>> {
+        self.session
+            .history_public_key()
+            .inspect_err(|_| {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = method,
+                    error_kind = "history_key",
+                    "could not read this device's history key; a later roster edit writes it"
+                );
+            })
+            .ok()
     }
 
     /// Whether this device may commit in the device group `group_id` now:
