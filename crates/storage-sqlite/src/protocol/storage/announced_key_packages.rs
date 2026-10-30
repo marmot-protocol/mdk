@@ -19,9 +19,11 @@ impl AnnouncedKeyPackageStorage for SqliteAccountStorage {
         let conn = self.lock()?;
         for announcement in announced {
             conn.execute_cached(
-                "INSERT OR IGNORE INTO cgka_announced_key_packages
-                     (group_id, slot, key_package_ref, first_seen_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO cgka_announced_key_packages
+                     (group_id, slot, key_package_ref, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (group_id, slot, key_package_ref) DO UPDATE
+                     SET last_seen_at = max(last_seen_at, excluded.last_seen_at)",
                 params![
                     group_id.as_slice(),
                     announcement.slot.as_slice(),
@@ -37,7 +39,7 @@ impl AnnouncedKeyPackageStorage for SqliteAccountStorage {
     fn prune_announced_key_packages(&self, before: u64, per_slot: usize) -> StorageResult<()> {
         let conn = self.lock()?;
         conn.execute_cached(
-            "DELETE FROM cgka_announced_key_packages WHERE first_seen_at < ?1",
+            "DELETE FROM cgka_announced_key_packages WHERE last_seen_at < ?1",
             params![u64_to_i64(before)?],
         )
         .storage()?;
@@ -46,7 +48,7 @@ impl AnnouncedKeyPackageStorage for SqliteAccountStorage {
                  SELECT rowid FROM (
                      SELECT rowid, ROW_NUMBER() OVER (
                          PARTITION BY group_id, slot
-                         ORDER BY first_seen_at DESC, rowid DESC
+                         ORDER BY last_seen_at DESC, rowid DESC
                      ) AS newest
                      FROM cgka_announced_key_packages
                  ) WHERE newest > ?1
@@ -66,7 +68,7 @@ impl AnnouncedKeyPackageStorage for SqliteAccountStorage {
         let mut stmt = conn
             .prepare_cached(
                 "SELECT slot, key_package_ref FROM cgka_announced_key_packages
-                 WHERE group_id = ?1 AND first_seen_at >= ?2
+                 WHERE group_id = ?1 AND last_seen_at >= ?2
                  ORDER BY slot, key_package_ref",
             )
             .storage()?;
@@ -104,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn announcements_keep_their_first_sighting_and_survive_reopen() {
+    fn announcements_keep_their_latest_sighting_and_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
         let key = SqlCipherKey::new("local identity key").unwrap();
@@ -127,10 +129,20 @@ mod tests {
             store.announced_key_packages(&gid(1), 0).unwrap(),
             vec![announced(1, 1), announced(1, 2)]
         );
-        // The first sighting counts: a repeat at 200 does not renew it.
+        // The latest sighting counts: the repeat at 200 renewed (1, 1), and
+        // an earlier one never takes it back.
+        store
+            .record_announced_key_packages(&gid(1), &[announced(1, 1)], 50)
+            .unwrap();
         assert_eq!(
             store.announced_key_packages(&gid(1), 150).unwrap(),
-            vec![announced(1, 2)]
+            vec![announced(1, 1), announced(1, 2)]
+        );
+        assert!(
+            store
+                .announced_key_packages(&gid(1), 201)
+                .unwrap()
+                .is_empty()
         );
         assert_eq!(
             store.announced_key_packages(&gid(2), 0).unwrap(),

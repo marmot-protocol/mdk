@@ -91,7 +91,7 @@ only telemetry, a closed operation and timing metadata, never a client or storag
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
-| `cgka_announced_key_packages` | One row per (group, slot, KeyPackageRef) a device-group roster this device applied announced, so it grows only with commits that change an announcement; at most 16 per group slot (`ANNOUNCED_KEY_PACKAGES_PER_SLOT`). | Every write prunes rows first seen more than 30 days ago (`ANNOUNCED_KEY_PACKAGE_RETENTION_SECS`) and each slot's rows past its newest 16. Deleting the group cascades. A branch-selection rewind keeps them: they sit outside snapshots on purpose. |
+| `cgka_announced_key_packages` | One row per (group, slot, KeyPackageRef) a device-group roster this device applied announced, so it grows only with commits that change an announcement; at most 16 per group slot (`ANNOUNCED_KEY_PACKAGES_PER_SLOT`). | A repeat sighting renews a row. Every write prunes rows last seen more than 30 days ago (`ANNOUNCED_KEY_PACKAGE_RETENTION_SECS`) and each slot's rows past its 16 most recently seen. Deleting the group cascades. A branch-selection rewind keeps them: they sit outside snapshots on purpose. |
 
 ### `storage-sqlite` durable moderation (`src/timeline/reports.rs`, `src/timeline.rs`)
 

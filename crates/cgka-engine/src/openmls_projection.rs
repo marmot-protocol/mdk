@@ -2665,6 +2665,8 @@ fn probe_candidate_path<S: StorageProvider>(
 
 /// Apply the selected stored branch with rollback protection and retain replay anchors.
 /// Returns the stable public replay observations; engine presentation deltas stay internal.
+/// The announced KeyPackages the apply collects are dropped too: only the engine's
+/// convergence pass records them (`announced_key_packages.rs`).
 pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,

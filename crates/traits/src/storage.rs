@@ -983,8 +983,10 @@ pub struct AnnouncedKeyPackage {
     pub key_package_ref: Vec<u8>,
 }
 
-/// How long an announcement is kept after this device first saw it: a
-/// KeyPackage's lifetime, so a slot can serve nothing older.
+/// How long an announcement is kept after the last roster state this device
+/// applied that announced it: as long as a KeyPackage publication stays
+/// fresh, so a relay still serving it after a newer announcement is covered.
+/// A slot whose roster entry still announces it needs no record.
 pub const ANNOUNCED_KEY_PACKAGE_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// How many announcements each slot of a group keeps, newest first.
@@ -995,17 +997,17 @@ pub const ANNOUNCED_KEY_PACKAGES_PER_SLOT: usize = 16;
 /// state it applies; nothing in the engine reads them back.
 pub trait AnnouncedKeyPackageStorage {
     /// Record `announced` as seen in `group_id`'s roster at `seen_at`. A pair
-    /// already recorded keeps the time it was first seen.
+    /// already recorded keeps the later of the two times.
     fn record_announced_key_packages(
         &self,
         group_id: &GroupId,
         announced: &[AnnouncedKeyPackage],
         seen_at: u64,
     ) -> StorageResult<()>;
-    /// Drop every record first seen before `before`, and each group slot's
-    /// records beyond its newest `per_slot`.
+    /// Drop every record last seen before `before`, and each group slot's
+    /// records beyond its `per_slot` most recently seen.
     fn prune_announced_key_packages(&self, before: u64, per_slot: usize) -> StorageResult<()>;
-    /// What `group_id`'s rosters announced, first seen at or after `since`.
+    /// What `group_id`'s rosters announced, last seen at or after `since`.
     fn announced_key_packages(
         &self,
         group_id: &GroupId,
