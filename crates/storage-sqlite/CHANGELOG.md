@@ -4,12 +4,6 @@
 
 ### Breaking changes
 
-- `SqliteAccountStorage` implements the new
-  `DeviceGroupWelcomeStorage::device_group_welcome_expectations`, which lists
-  every stored expectation, expired ones included (mdk#2628 item 3.3b, D41).
-  An expectation's record gains `key_package_ref`, the confirmed KeyPackage's
-  `KeyPackageRef`; a record stored before it reads with an empty ref. No
-  migration: the field lives in the stored record.
 - Migration 0135 advances account storage to schema 135 (mdk#2660 phase 4).
   It replaces `account_recovery_units.fencing`, which nothing set, with
   `account_recovery_unit_fences`: each capture range a unit fences, one row
@@ -183,6 +177,12 @@
   goal the cap parked.
 - `apply_group_push_token_tombstone` takes an `AccountGroupPushTokenTombstone`
   instead of eight arguments, and stores its optional removal proof.
+- `SqliteAccountStorage` implements the new
+  `DeviceGroupWelcomeStorage::device_group_welcome_expectations`, which lists
+  every stored expectation, expired ones included (mdk#2628 item 3.3b, D41).
+  An expectation's record gains `key_package_ref`, the confirmed KeyPackage's
+  `KeyPackageRef`; a record stored before it reads with an empty ref. No
+  migration: the field lives in the stored record.
 
 ### Added
 
