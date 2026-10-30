@@ -7140,8 +7140,8 @@ impl AdapterState {
 /// from the last-seen transport timestamp would therefore permanently skip any
 /// welcome published while this device was offline whose tweak landed before
 /// the cursor. Widen the inbox window by the full tweak range; re-delivered
-/// wraps are deduplicated by seen-event ids downstream, and only welcomes
-/// travel as gift wraps so the re-fetch volume stays small.
+/// wraps are deduplicated by seen-event ids downstream. Private recovery
+/// control shares this account inbox and the same widened replay window.
 pub const NIP59_TIMESTAMP_TWEAK_SECS: u64 = 172_800;
 
 fn inbox_since(since: Option<Timestamp>) -> Option<Timestamp> {

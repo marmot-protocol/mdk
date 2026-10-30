@@ -3872,6 +3872,104 @@ async fn signed_welcome_event_becomes_account_inbox_delivery() {
 }
 
 #[tokio::test]
+async fn recovery_account_inbox() {
+    use cgka_traits::{GroupId, GroupRecoveryBody, GroupRecoveryMessage, TransportPeeler};
+    use transport_nostr_peeler::NostrMlsPeeler;
+
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let sender = nostr::prelude::Keys::generate();
+    let receiver = nostr::prelude::Keys::generate();
+    let sender_id = MemberId::new(sender.public_key().to_bytes().to_vec());
+    let receiver_id = MemberId::new(receiver.public_key().to_bytes().to_vec());
+    let endpoint = TransportEndpoint("wss://inbox.example".into());
+    for account_id in [&sender_id, &receiver_id] {
+        adapter
+            .activate_account(TransportAccountActivation {
+                account_id: account_id.clone(),
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: vec![],
+                since: None,
+            })
+            .await
+            .unwrap();
+    }
+    assert!(
+        relay
+            .subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|subscription| matches!(subscription, NostrSubscription::AccountInbox { .. }))
+    );
+    let body = GroupRecoveryMessage {
+        group_id: GroupId::new(vec![7; 16]),
+        request_id: [8; 32],
+        expires_at: 2_000_000_000,
+        body: GroupRecoveryBody::Request {
+            device_key_hash: [9; 32],
+        },
+    };
+    let message = NostrMlsPeeler::new()
+        .with_welcome_signer(sender.clone())
+        .wrap_group_recovery(&body, &receiver_id)
+        .await
+        .unwrap();
+    let event = NostrTransportEvent::from_transport_message(&message).unwrap();
+    let report = adapter
+        .publish(TransportPublishRequest {
+            account_id: sender_id.clone(),
+            message: message.clone(),
+            target: TransportPublishTarget::Inbox {
+                recipient: receiver_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            },
+            required_acks: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.message_id, message.id);
+    assert_eq!(
+        relay.published.lock().unwrap()[0],
+        (vec![endpoint.clone()], event.clone(), 1)
+    );
+    assert_eq!(
+        adapter
+            .handle_relay_event(NostrRelayEvent {
+                endpoint,
+                subscription_id: Some("ordinary-inbox".into()),
+                event,
+            })
+            .await
+            .unwrap(),
+        1
+    );
+    let delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(delivery.account_id, receiver_id);
+    assert_eq!(delivery.group_id_hint, None);
+    assert_eq!(delivery.source.plane, TransportDeliveryPlane::AccountInbox);
+    assert_eq!(
+        delivery.message.envelope,
+        TransportEnvelope::Welcome {
+            recipient: receiver_id
+        }
+    );
+    let peeled = NostrMlsPeeler::new()
+        .with_welcome_signer(receiver)
+        .peel_welcome(&delivery.message)
+        .await
+        .unwrap();
+    let cgka_traits::PeeledContent::GroupRecovery {
+        recovery: authenticated,
+    } = peeled.content
+    else {
+        panic!("recovery must be classified from authenticated inner content");
+    };
+    assert_eq!(authenticated.sender, sender_id);
+    assert_eq!(authenticated.message, body);
+}
+
+#[tokio::test]
 async fn inbox_subscription_since_is_widened_by_the_nip59_tweak_window() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());

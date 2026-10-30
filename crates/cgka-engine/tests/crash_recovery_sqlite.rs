@@ -77,6 +77,16 @@ struct MockPeeler;
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -149,6 +159,16 @@ struct UnreadablePeeler;
 
 #[async_trait]
 impl TransportPeeler for UnreadablePeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         _msg: &TransportMessage,

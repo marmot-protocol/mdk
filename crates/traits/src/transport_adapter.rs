@@ -1547,6 +1547,25 @@ mod tests {
     }
 
     #[test]
+    fn recovery_inbox_match() {
+        let recipient = MemberId::new(vec![0xE5; 32]);
+        let mut request = fanout_request();
+        request.message.envelope = TransportEnvelope::Welcome {
+            recipient: recipient.clone(),
+        };
+        assert!(request.validate_envelope_matches_target().is_err());
+        request.target = TransportPublishTarget::Inbox {
+            recipient,
+            endpoints: vec![TransportEndpoint("wss://one.example".into())],
+        };
+        assert!(request.validate_envelope_matches_target().is_ok());
+        if let TransportPublishTarget::Inbox { recipient, .. } = &mut request.target {
+            *recipient = MemberId::new(vec![0xE6; 32]);
+        }
+        assert!(request.validate_envelope_matches_target().is_err());
+    }
+
+    #[test]
     fn post_confirmation_welcome_release_is_durable_and_cannot_reopen() {
         let recipient = MemberId::new(vec![0xE5; 32]);
         let welcome = TransportMessage {

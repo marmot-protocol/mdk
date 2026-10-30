@@ -1212,6 +1212,16 @@ mod tests {
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl TransportPeeler for UnreachablePeeler {
+        async fn wrap_group_recovery(
+            &self,
+            _message: &cgka_traits::GroupRecoveryMessage,
+            _recipient: &cgka_traits::MemberId,
+        ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+            Err(cgka_traits::PeelerError::Malformed(
+                "pass-through fixture has no authenticated account channel".into(),
+            ))
+        }
+
         async fn peel_group_message(
             &self,
             _msg: &TransportMessage,

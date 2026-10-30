@@ -120,3 +120,4 @@ A21|crates/storage-sqlite/src/protocol/storage/group_recovery.rs|MAX_GROUP_RECOV
 A21|crates/traits/src/group_recovery.rs|MAX_GROUP_RECOVERY_BODY_BYTES
 A21|crates/traits/src/group_recovery.rs|MAX_GROUP_RECOVERY_GROUP_ID_BYTES
 A21|crates/traits/src/group_recovery.rs|MAX_GROUP_RECOVERY_KEY_PACKAGE_BYTES
+A21|crates/transport-nostr-peeler/src/lib.rs|MAX_GROUP_RECOVERY_EVENT_BYTES
