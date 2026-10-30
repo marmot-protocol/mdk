@@ -345,12 +345,15 @@ impl AppClient {
     /// Check now, for the host, and restart the schedule from this check as
     /// a scheduled check would. Returns the sign-ins listed after it. A read
     /// that reached no relay is `key_packages_unreachable` and leaves the
-    /// schedule alone.
+    /// schedule alone, and so does a check while maintenance is paused, which
+    /// cannot replace a foreign publication in this device's slot.
     pub(crate) async fn check_sign_ins_now(&mut self) -> Result<Vec<UnrecognizedSignIn>, AppError> {
         let now = Instant::now();
         let report = self.check_sign_ins().await?;
-        self.sign_in_schedule.last = Some(now);
-        self.sign_in_schedule.due = Some(now + next_check_after(&report));
+        if !self.runtime.maintenance_is_paused() {
+            self.sign_in_schedule.last = Some(now);
+            self.sign_in_schedule.due = Some(now + next_check_after(&report));
+        }
         self.unrecognized_sign_ins()
     }
 

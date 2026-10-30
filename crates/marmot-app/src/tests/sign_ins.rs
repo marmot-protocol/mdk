@@ -1194,6 +1194,25 @@ async fn a_foreign_publication_in_its_own_slot_is_replaced() {
     assert_eq!(account.relay.published_events.lock().unwrap().len(), before);
 }
 
+/// A host's check while maintenance is paused cannot replace a foreign
+/// publication in this device's slot, so it leaves the schedule alone: the
+/// first pass after resume checks again and replaces it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_now_while_paused_leaves_the_own_slot_repair_due() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let forged_at = published_at(&phone) + 2;
+    publish_into_slot(&account, &slot, "not a key package", forged_at);
+
+    phone.pause_maintenance();
+    phone.check_sign_ins_now().await.unwrap();
+    phone.resume_maintenance();
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > forged_at);
+}
+
 /// A foreign publication dated further ahead than this device would sign
 /// cannot be outranked. The device asks the relays to delete that event by
 /// id (D63), publishes again to fill the slot, and its refreshes go on.
