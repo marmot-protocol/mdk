@@ -72,6 +72,7 @@ mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
 pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
+pub(crate) mod device_pairing;
 mod device_renames;
 pub(crate) mod epoch_stall;
 pub(crate) mod history_notices;
@@ -801,6 +802,10 @@ pub struct AppClient {
     /// When this device next checks its account's KeyPackages for new
     /// sign-ins (mdk#2628 3.2).
     pub(crate) sign_in_schedule: sign_ins::SignInSchedule,
+    /// Linking a new device may have changed as hosts would read it, or the
+    /// client just opened, ending any link in progress. The same seams drain
+    /// it into one `DeviceLinkChanged`.
+    pub(crate) device_link_changed: bool,
     /// Account-queue placement counts at this client's previous
     /// `transport_cursor_advanced` row (or its open), so each row reports
     /// what changed since.
@@ -1017,6 +1022,12 @@ pub struct AppClient {
     /// per-sync `refresh_group_routes` because no delivery or drained effect
     /// could have changed routing since the sync-start pass).
     pub(crate) checkpoint_route_refresh_recomputes: u64,
+    /// Linking a new device of this account (mdk#2628 item 3.3b). In memory
+    /// only: a restart ends every pairing session. Boxed: the client is held
+    /// by value in deep async call chains, whose debug-build frames copy it,
+    /// and linking is rarely in progress.
+    #[cfg(feature = "unreleased-device-pairing")]
+    pub(crate) device_pairing: Box<device_pairing::DevicePairing>,
 }
 
 #[cfg(test)]
@@ -1026,6 +1037,28 @@ pub(crate) struct TestRecoverySelection {
     pub(crate) attempt_serial: u64,
     pub(crate) comparison_revision: Option<u64>,
     pub(crate) obligation_count: usize,
+}
+
+/// Whether the Welcomes a create or invite stashed reached the relays. One
+/// that did not stays an engine obligation, recorded as a pending Welcome
+/// delivery, that the startup retry and `redeliver_welcome` publish again.
+#[must_use = "a Welcome may not have reached the relays"]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WelcomeDelivery {
+    /// Nothing waited, or every Welcome reached the relays.
+    Delivered,
+    /// The publish failed, or a Welcome did not reach the relays.
+    Undelivered,
+}
+
+impl WelcomeDelivery {
+    fn of(published: bool, effects: &marmot_session::AccountDeviceEffects) -> Self {
+        if published && effects.welcome_failures.is_empty() {
+            Self::Delivered
+        } else {
+            Self::Undelivered
+        }
+    }
 }
 
 /// Cross the point-of-no-return for a current-profile group mutation without
@@ -2102,7 +2135,8 @@ impl AppClient {
         let created = self
             .create_group_with_options_and_optional_telemetry(name, member_refs, options, None)
             .await?;
-        self.drive_unpublished_welcome_delivery(None).await;
+        // The chat stands either way: an undelivered Welcome stays owed.
+        let _ = self.drive_unpublished_welcome_delivery(None).await;
         Ok(created.group_id)
     }
 
@@ -2925,9 +2959,10 @@ impl AppClient {
             .invite_members_with_optional_telemetry(group_id, member_refs, &[], None)
             .await?;
         // As the account worker does: only a published commit has Welcomes
-        // to send now (mdk#2726).
+        // to send now (mdk#2726). The invite stands either way: an
+        // undelivered Welcome stays owed.
         if summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published {
-            self.drive_unpublished_welcome_delivery(None).await;
+            let _ = self.drive_unpublished_welcome_delivery(None).await;
         }
         Ok(summary)
     }
@@ -7448,9 +7483,9 @@ impl AppClient {
     pub(crate) async fn drive_unpublished_welcome_delivery(
         &mut self,
         telemetry: Option<&PerformanceRecorder>,
-    ) {
+    ) -> WelcomeDelivery {
         let Some(work) = self.unpublished_welcome_delivery.take() else {
-            return;
+            return WelcomeDelivery::Delivered;
         };
         match work.kind {
             UnpublishedWelcomeKind::Founding {
@@ -7502,6 +7537,7 @@ impl AppClient {
                     result
                 };
                 let (publish_result, registered) = tokio::join!(publish, register);
+                let published = publish_result.is_ok();
                 self.pending_runtime_group_subscription_refresh = registered.is_err();
                 match registered {
                     Ok(()) => self.warm_encrypted_media_epoch_secrets("post_subscription_sync"),
@@ -7516,6 +7552,7 @@ impl AppClient {
                     "publish_prepared_founding_group",
                     publish_result,
                 );
+                let delivery = WelcomeDelivery::of(published, &effects);
                 recover_post_canonical_result(
                     "clear_delivered_founding_welcome_intents",
                     self.clear_delivered_founding_welcome_intents(&welcome_intents, &effects),
@@ -7537,6 +7574,7 @@ impl AppClient {
                 );
                 self.record_human_action_succeeded(&work.group_id, &work.audit_context, &effects);
                 self.remember_published_reports(&effects);
+                delivery
             }
             UnpublishedWelcomeKind::Invite {
                 welcomes,
@@ -7567,7 +7605,7 @@ impl AppClient {
                             error_kind = error.privacy_safe_kind(),
                             "confirmed invite outpaced Welcome fanout; pending obligations remain retryable"
                         );
-                        return;
+                        return WelcomeDelivery::Undelivered;
                     }
                 };
                 let _ = self.clear_delivered_founding_welcome_intents(&welcome_intents, &effects);
@@ -7576,6 +7614,7 @@ impl AppClient {
                     &effects,
                 );
                 self.remember_published_reports(&effects);
+                WelcomeDelivery::of(true, &effects)
             }
         }
     }
@@ -7593,7 +7632,9 @@ impl AppClient {
     }
 
     /// Prepare one bounded startup retry for every engine-authoritative
-    /// outstanding Welcome.
+    /// outstanding Welcome. The same read lets the runtime watch the Welcomes
+    /// still staged with their commits, so maintenance delivers them once
+    /// those commits confirm.
     ///
     /// Only relay I/O moves into the returned task. Exact artifacts, endpoint
     /// snapshots, and attempt reservations are durable/owned by this client so
@@ -7602,35 +7643,12 @@ impl AppClient {
     pub(crate) fn prepare_pending_welcome_delivery_recovery_best_effort(
         &mut self,
     ) -> Option<PendingWelcomeDeliveryRecovery> {
-        let pending = match self.runtime.outstanding_welcome_deliveries() {
-            Ok(pending) => pending,
-            Err(error) => {
-                let error = AppError::from(error);
-                tracing::warn!(
-                    target: "marmot_app::client",
-                    method = "prepare_pending_welcome_delivery_recovery_best_effort",
-                    error_kind = error.privacy_safe_kind(),
-                    "could not enumerate retained Welcome obligations at startup"
-                );
-                return None;
-            }
-        };
-        if pending.is_empty() {
-            return None;
-        }
-        let welcome_ids = pending
-            .iter()
-            .map(|(_, welcome)| hex::encode(welcome.id.as_slice()))
-            .collect::<Vec<_>>();
-        let welcomes = pending
-            .into_iter()
-            .map(|(_, welcome)| welcome)
-            .collect::<Vec<_>>();
-        let publish = match self
+        let (welcome_ids, publish) = match self
             .runtime
-            .prepare_welcome_retry_task_with_audit_context(welcomes, AuditEventContext::default())
+            .prepare_owed_welcome_retry_task_with_audit_context(AuditEventContext::default())
         {
-            Ok(publish) => publish,
+            Ok(Some((welcome_ids, publish))) => (welcome_ids, publish),
+            Ok(None) => return None,
             Err(error) => {
                 tracing::warn!(
                     target: "marmot_app::client",
@@ -7641,6 +7659,10 @@ impl AppClient {
                 return None;
             }
         };
+        let welcome_ids = welcome_ids
+            .iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect::<Vec<_>>();
         let observation = if publish.message_ids().is_empty() {
             None
         } else {

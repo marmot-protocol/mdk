@@ -220,6 +220,10 @@ pub struct LimitStats {
     pub req_log: Vec<ReqRecord>,
     /// Flush markers (`FLUSH_PREFIX`) the proxy has handled.
     pub flushes: BTreeSet<String>,
+    /// EVENT frames forwarded since `stall_after_events`, and the EVENT, EOSE
+    /// and CLOSED frames held back once it stalled.
+    pub events_before_stall: usize,
+    pub stalled_frames: usize,
 }
 
 impl LimitStats {
@@ -338,7 +342,7 @@ struct HintedReq {
 /// What the proxy does with one upstream frame.
 enum RelayVerdict {
     Forward,
-    /// Hold back an event past a hinted REQ's limit.
+    /// Hold back an event past a hinted REQ's limit, or a stalled frame.
     Drop,
     /// Send this frame instead (a hinted EOSE).
     Rewrite(String),
@@ -354,6 +358,9 @@ struct Shared {
     /// Delay before each client frame is handled, so a refusal or an upstream
     /// answer costs about one simulated round trip.
     client_delay: Duration,
+    /// Upstream EVENT frames to forward before every later EVENT, EOSE and
+    /// CLOSED is held back.
+    stall_after_events: Option<usize>,
 }
 
 impl Shared {
@@ -559,6 +566,17 @@ impl LimitRelay {
     /// Refuse the next `count` otherwise-valid REQs with `reason::RATE_LIMITED`.
     pub fn rate_limit_next_reqs(&self, count: usize) {
         self.shared.lock().unwrap().rate_limit_next_reqs = count;
+    }
+
+    /// Forward the next `events` upstream EVENT frames, across connections,
+    /// then hold back every later EVENT, EOSE and CLOSED (the local relay
+    /// closes an `ids` REQ it served): replies cut off mid-stream, left
+    /// waiting for an end that never comes.
+    pub fn stall_after_events(&self, events: usize) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.stall_after_events = Some(events);
+        shared.stats.events_before_stall = 0;
+        shared.stats.stalled_frames = 0;
     }
 
     /// Switch the injected NEG behaviour for every connection.
@@ -928,6 +946,17 @@ fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) ->
         return RelayVerdict::Forward;
     };
     let mut shared = shared.lock().unwrap();
+    if let Some(budget) = shared.stall_after_events
+        && matches!(verb, "EVENT" | "EOSE" | "CLOSED")
+    {
+        if shared.stats.events_before_stall >= budget {
+            shared.stats.stalled_frames += 1;
+            return RelayVerdict::Drop;
+        }
+        if verb == "EVENT" {
+            shared.stats.events_before_stall += 1;
+        }
+    }
     match verb {
         "EVENT" => {
             if let Some(req) = shared.states[connection].hinted.get_mut(id) {

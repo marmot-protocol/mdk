@@ -3,8 +3,8 @@
 //! devices trust it, and neither ever projects it as a chat. The new device
 //! joins it only through the Welcome its link waits for, from the leaf the
 //! link names (D28, D30); every other Welcome into the id is refused before
-//! the join. Pairing does not reach the app yet, so the test-policy hooks
-//! stand in for a confirmed link.
+//! the join. The test-policy hooks stand in for a confirmed link here;
+//! `device_pairing.rs` runs pairing itself.
 
 use super::canonical_membership::{deliver_new, published_key_package};
 use super::*;
@@ -1051,14 +1051,17 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         linked_at,
         linked_by_slot_id_hex: None,
         status: LinkedDeviceStatus::Active,
-        add_to_all_chats: false,
-        bring_history: false,
+        add_to_all_chats: true,
+        bring_history: true,
         keep_while_inactive: false,
     };
+    // The dev hook links the new device with both settings off.
     let new_device = |this| LinkedDevice {
         slot_id_hex: laptop_slot.clone(),
         is_this_device: this,
         linked_by_slot_id_hex: Some(phone_slot.clone()),
+        add_to_all_chats: false,
+        bring_history: false,
         ..founder(this)
     };
     assert_eq!(founding, vec![founder(true), new_device(false)]);

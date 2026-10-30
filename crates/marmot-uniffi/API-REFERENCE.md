@@ -1195,6 +1195,83 @@ Read only the requested local attachment, rejecting a changed selected draft.
 </details>
 
 <details>
+<summary>commands/device_link.rs</summary>
+
+### `Marmot::cancel_device_link`
+
+**Current.**
+
+```rust
+pub async fn cancel_device_link( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
+```
+
+On the new device, cancel the link and tell the other device. `new_device` becomes `Ended { reason: Cancelled }`. Cancelling while `Joining` first stops this device waiting for its Welcome, so none joins it after; if that fails, the call returns the error, the link stays `Joining`, and the worker retries until it ends. Refused with `no_link_in_progress` when no link is in progress.
+
+[Source](src/commands/device_link.rs#L35)
+
+### `Marmot::confirm_device_link_match`
+
+**Current.**
+
+```rust
+pub async fn confirm_device_link_match( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
+```
+
+On the new device, record that the user says both screens show the same emoji. `new_device` moves to `WaitingForOtherDevice` until the other device's user chooses Link device, then `Joining` while that device adds this one, then `Linked` once its Welcome arrives. This device joins only through a Welcome into the device group the other device's verified confirmation named, sent by the leaf that confirmation named, and only while the link waits for it. A mismatch is the user's to report: cancel instead. Refused with `no_link_in_progress` when there is no link to confirm, and ends the link with a reason when the exchange fails a check or time ran out.
+
+[Source](src/commands/device_link.rs#L23)
+
+### `Marmot::decline_device_link`
+
+**Current.**
+
+```rust
+pub async fn decline_device_link( &self, account_ref: String, prompt_id: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
+```
+
+On a device already signed in, Not now for the prompt `prompt_id`: the prompt goes and the new device's link ends with `CancelledElsewhere`. Refused with `unknown_prompt` for a stale prompt.
+
+[Source](src/commands/device_link.rs#L67)
+
+### `Marmot::device_link_snapshot`
+
+**Current.**
+
+```rust
+pub async fn device_link_snapshot( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
+```
+
+Linking as this device shows it now, changing nothing: `new_device` while this device asked to be linked, and `prompts` for the sign-ins it can link, newest last. Each prompt's state says what to show: `Preparing` while the sign-in's KeyPackage is checked, `Comparing` with the code, `CompetingRequests`, `RateLimited` until `retry_at`, `CannotLink` with what its client lacks, `TooManyDevices`, `Linking`, `Linked`, `AddedElsewhere` ("<device_label> was added by <added_by_label>") or `Ended` with a reason. Re-read on `MarmotEventFfi::DeviceLinkChanged`, which also fires each time the account's worker opens or reconnects; that ends any link in progress, since pairing keeps its secrets only in memory. Always refused in release builds (`pairing_unsupported`) until the pairing and device-group specs land. Runs on the account worker and sends what linking owes.
+
+[Source](src/commands/device_link.rs#L82)
+
+### `Marmot::link_device`
+
+**Current.**
+
+```rust
+pub async fn link_device( &self, account_ref: String, prompt_id: String, label: String, add_to_all_chats: bool, bring_history: bool, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
+```
+
+On a device already signed in, Link device for the prompt `prompt_id`, offered while its state is `Comparing`. `label` is the name the user gave the new device: not blank, at most 64 bytes (`label_invalid`). Offer `add_to_all_chats` and `bring_history` as toggles, both on by default. The prompt moves to `Linking` until the new device's confirmation verifies; then this device creates the account's device group on a first link, or adds the new device to the one it trusts, in one commit that also writes its roster entry. That commit is the approval. Its Welcome goes out only once relays confirm the commit, and the prompt moves to `Linked` only once relays have confirmed it and taken the Welcome; a Welcome they have not taken is published again while the new device waits for it. A commit whose publish is retried keeps the prompt `Linking`. A device group that is still settling makes this device retry while the new device waits for its Welcome. A commit that rolls back, or a link not confirmed before the new device stops waiting, ends the prompt with `LinkFailed`. Refused with `unknown_prompt` for a stale prompt, including one from before the client reopened, `link_unavailable` while more than one sign-in competes or the code is not shown, `device_already_linked`, or `too_many_devices` at 20 devices (remove one first).
+
+[Source](src/commands/device_link.rs#L46)
+
+### `Marmot::start_device_link`
+
+**Current.**
+
+```rust
+pub async fn start_device_link( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
+```
+
+On a new device, ask a device of this account already signed in to link this one, and return linking as this device now shows it. The request names this device's published KeyPackage, so publish one first (`key_package_not_published`). `new_device` starts at `WaitingForAnswer`: ask the user to open the app on a device already signed in. Once one answers it moves to `Comparing` with the seven emoji both screens show, each with an English `description` for screen readers; offer "They match" (`confirm_device_link_match`) and cancel (`cancel_device_link`). Refresh on `MarmotEventFfi::DeviceLinkChanged`. Refused with `DeviceGroupRefused` when this device already trusts a device group (`device_group_exists`) or a link is in progress (`pairing_in_progress`), and always in release builds (`pairing_unsupported`) until the pairing and device-group specs land. Runs on the account worker and sends one gift-wrapped request to the account's relays.
+
+[Source](src/commands/device_link.rs#L15)
+
+</details>
+
+<details>
 <summary>commands/directory.rs</summary>
 
 ### `Marmot::display_name`

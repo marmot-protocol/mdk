@@ -21,7 +21,7 @@ mod signer;
 pub use error::NostrPeelerError;
 pub use event::NostrTransportEvent;
 pub use nip59::gift_wrap_rumor;
-pub use peeler::{NostrMlsPeeler, WelcomePeelProvenance};
+pub use peeler::{AccountGiftWrap, NostrMlsPeeler, WelcomePeelProvenance};
 pub use signer::{MarmotNostrSigner, MarmotSignerError, SdkSigner, SignerFuture};
 
 /// Nostr kind used by Marmot group messages.

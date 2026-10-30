@@ -35,7 +35,7 @@ for reconnect/backoff and relay status mechanics.
 | `tests/acquisition_contract.rs` | Request validation and optional-boundary shape tests. |
 | `tests/publish_accounting.rs` | `sdk`-gated direct-adapter publish admission, classification, and cancellation tests. |
 | `tests/selective_history_acquisition_tests.rs` | `sdk`-gated bounded history acquisition and reconciliation-cursor tests. |
-| `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp, NIP-77 saturated second, resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing. |
+| `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp, NIP-77 saturated second, resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing; replies cut mid-stream (the proxy's stall) report every byte read, a comparison's fetch included. |
 | `tests/relay_limit_subscriptions.rs` | `sdk`-gated subscription behavior against `tests/support/limit_relay.rs`, a proxy enforcing strfry 1.1.3's per-connection limits (REQ and NEG caps, filter shape, 500 limit clamp). |
 
 ## Invariants
@@ -202,6 +202,12 @@ for reconnect/backoff and relay status mechanics.
   withholds; do not sweep a restricted-read kind without another proof. Admit before saving the cursor,
   and never count a refusal, rate limit or unreachable relay as an empty page. `SdkSweepRelay` gives every NIP-77
   comparison and ids REQ an explicit `limit`, and a comparison that fills it proves nothing. `SdkSweepRelay` dials nothing: its endpoint must already be in the client's pool.
+- Never drop a request its relay can end itself (mdk#2719). Both drivers run each request through `ask_until_cut`: on
+  its deadline or cancellation it calls the relay's `interrupt`, and when that returns `true` awaits the request for
+  up to `INTERRUPT_GRACE` before dropping it, and never uses its reply. `SdkSweepRelay` cancels its acquisition
+  through the SDK's `AcquisitionCanceller` (dropping the handle would discard the report), so the partial reply still
+  meters its `received_event_bytes`, and once interrupted it starts no further request, a second's next id chunk
+  included. Its NIP-77 exchanges carry ids, not events, and are dropped.
 - Keep the comparison driver (`src/compare/`) a mechanism like the sweep. A window certifies only when the relay's
   set for it stayed under `COMPARE_SET_LIMIT` and every id the relay holds there was fetched or already held; a
   withheld id, a filled set or a cut leaves its window unproven, and a window that cannot shrink below one second

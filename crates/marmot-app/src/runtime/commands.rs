@@ -2165,6 +2165,20 @@ impl AccountManager {
         Ok(summary)
     }
 
+    pub(crate) async fn device_link(
+        &self,
+        account_ref: &str,
+        op: crate::DeviceLinkOp,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DeviceLink { op, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn publish_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();

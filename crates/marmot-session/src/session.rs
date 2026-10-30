@@ -15,6 +15,7 @@ pub use cgka_engine::account_identity_proof::{
 };
 pub use cgka_engine::application_message_len;
 pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
+pub(crate) use cgka_engine::engine::{OutboundWelcomeStatus, OutboundWelcomeWork};
 pub use cgka_engine::engine::{WelcomeDeliveryIndex, WelcomeWithdrawal};
 pub use cgka_engine::feature_registry::FeatureRegistry;
 pub use cgka_engine::group_authority::{CanonicalGroupMembership, GroupAuthoritySnapshot};
@@ -812,6 +813,27 @@ impl AccountDeviceSession {
         Ok(self.engine.outstanding_sent_welcomes()?)
     }
 
+    /// See `Engine::outbound_welcome_work`.
+    pub(crate) fn outbound_welcome_work(&self) -> SessionResult<OutboundWelcomeWork> {
+        Ok(self.engine.outbound_welcome_work()?)
+    }
+
+    /// See `Engine::outbound_welcome_work_in`.
+    pub(crate) fn outbound_welcome_work_in(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Option<OutboundWelcomeWork>> {
+        Ok(self.engine.outbound_welcome_work_in(group_id)?)
+    }
+
+    /// See `Engine::outbound_welcome_status`.
+    pub(crate) fn outbound_welcome_status(
+        &self,
+        id: &MessageId,
+    ) -> SessionResult<OutboundWelcomeStatus> {
+        Ok(self.engine.outbound_welcome_status(id)?)
+    }
+
     /// See `Engine::sent_welcome_awaits_commit`.
     pub fn sent_welcome_awaits_commit(&self, id: &MessageId) -> SessionResult<bool> {
         Ok(self.engine.sent_welcome_awaits_commit(id)?)
@@ -836,6 +858,17 @@ impl AccountDeviceSession {
     /// See `Engine::withdraw_sent_welcome`.
     pub fn withdraw_sent_welcome(&self, id: &MessageId) -> SessionResult<WelcomeWithdrawal> {
         Ok(self.engine.withdraw_sent_welcome(id)?)
+    }
+
+    /// See `Engine::sent_welcomes_for_key_package`.
+    pub fn sent_welcomes_for_key_package(
+        &self,
+        group_id: &GroupId,
+        key_package_ref: &[u8],
+    ) -> SessionResult<Vec<MessageId>> {
+        Ok(self
+            .engine
+            .sent_welcomes_for_key_package(group_id, key_package_ref)?)
     }
 
     /// See `Engine::sent_welcome_withdrawn`.
@@ -1785,6 +1818,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
         SendIntent::LinkDevice { .. } => "link_device",
+        SendIntent::UnlinkDevice { .. } => "unlink_device",
         SendIntent::Disband { .. } => "disband",
     }
 }

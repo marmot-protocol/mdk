@@ -3627,6 +3627,7 @@ dependencies = [
  "marmot-account",
  "marmot-forensics",
  "marmot-markdown",
+ "marmot-pairing",
  "marmot-session",
  "media-store",
  "nostr 0.45.5",

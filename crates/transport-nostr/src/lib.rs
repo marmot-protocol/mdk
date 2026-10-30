@@ -3929,6 +3929,37 @@ impl MarmotRelayPlaneAccountAdapter {
         })
     }
 
+    /// The routes `observed`'s dropped deliveries arrived on, each with the
+    /// earliest `created_at` dropped there, or `None` when some drop in its
+    /// generation had no route or time, or they touched more than
+    /// [`MAX_DELIVERY_LOSS_ROUTES`]. The worker passes them with an
+    /// observation past the durable marker count, whose extra drops no marker
+    /// write has named yet. As for [`Self::notification_loss_routes`], reading
+    /// after the snapshot still bounds every drop it counted, and another
+    /// generation's or token's routes say nothing about these.
+    #[doc(hidden)]
+    pub fn delivery_loss_routes(
+        &self,
+        observed: &AccountDeliveryOverflow,
+    ) -> Option<Vec<(DeliveryRoute, u64)>> {
+        let state = self
+            .delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        (state.generation == observed.generation
+            && state.marker_token == observed.marker_token
+            && !state.dropped_routes_unknown
+            && !state.dropped_routes.is_empty())
+        .then(|| {
+            state
+                .dropped_routes
+                .iter()
+                .map(|(route, earliest)| (*route, *earliest))
+                .collect()
+        })
+    }
+
     /// Whether a queued or deferred control record will still report the
     /// pending loss generation to this account's consumer.
     #[doc(hidden)]
