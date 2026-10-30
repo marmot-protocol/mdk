@@ -185,8 +185,10 @@ async fn blocked_inbox_demux() {
             .is_blocked_welcome_dismissed(&hex::encode(wrapped.id.as_slice()))
             .unwrap()
     );
+    let (is_recovery, completion) = peeler.slot.lock().unwrap().take();
+    assert!(is_recovery);
     assert!(
-        peeler.slot.lock().unwrap().take().is_none(),
+        completion.is_none(),
         "control has no Welcome provenance or unwrap row"
     );
 }
@@ -2026,14 +2028,20 @@ async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
         peeler.peel_welcome(&message).await,
         Err(PeelerError::DecryptFailed)
     ));
-    let completion = slot.lock().unwrap().take().unwrap();
+    let (is_recovery, completion) = slot.lock().unwrap().take();
+    assert!(!is_recovery);
+    let completion = completion.unwrap();
     assert_eq!(completion.result, UnwrapResult::Failed);
     assert_eq!(completion.reason, Some(UnwrapReason::UnwrapFailed));
     assert!(completion.provenance.is_none());
     let mut capture = probe();
     capture.unwrapped(completion);
     assert_eq!(capture.invalid, 0);
-    let Event::WelcomeUnwrapped(row) = &capture.rows[0].fields().event else {
+    assert!(matches!(
+        capture.rows[0].fields().event,
+        Event::WelcomeObserved(_)
+    ));
+    let Event::WelcomeUnwrapped(row) = &capture.rows[1].fields().event else {
         panic!("expected unwrap row")
     };
     assert!(row.rumor_event_ref.is_none());
