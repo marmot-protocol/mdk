@@ -3916,7 +3916,6 @@ impl AppClient {
         } else {
             None
         };
-        client.flush_live_v5_events();
         // Hold the same account policy lock through admission and projection, so a
         // block cannot commit between authenticating the inviter and creating state.
         let policy_lock = client.app.block_update_lock(&client.state.label).await;
@@ -3957,8 +3956,12 @@ impl AppClient {
         );
         let telemetry = client.runtime_telemetry.clone();
         let ingest_observation = telemetry.as_ref().map(|t| t.observe(RuntimeOp::Ingest));
-        if let (Some(slot), Some(receive)) = (&client.audit_v5_peel_slot, probe_receive.clone()) {
-            slot.lock().unwrap().arm(&delivery.message, receive);
+        if let Some(slot) = &client.audit_v5_peel_slot {
+            let mut slot = slot.lock().unwrap();
+            let _ = slot.take();
+            if let Some(receive) = probe_receive.clone() {
+                slot.arm(&delivery.message, receive);
+            }
         }
         let ingest = client
             .runtime
@@ -3982,11 +3985,15 @@ impl AppClient {
                 }
             })
             .await;
-        if let (Some(probe), Some(slot)) = (&mut client.audit_v5_probe, &client.audit_v5_peel_slot)
-            && let Some(completion) = slot.lock().unwrap().take()
-        {
-            probe.unwrapped(completion);
-        }
+        let recovery_control = if let Some(slot) = &client.audit_v5_peel_slot {
+            let (recovery, completion) = slot.lock().unwrap().take();
+            if let (Some(probe), Some(completion)) = (&mut client.audit_v5_probe, completion) {
+                probe.unwrapped(completion);
+            }
+            recovery
+        } else {
+            false
+        };
         if let (Some(probe), Some(receive), Ok(effects)) =
             (&mut client.audit_v5_probe, probe_receive, &ingest)
             && matches!(effects.outcome, IngestOutcome::Processed)
@@ -4054,6 +4061,7 @@ impl AppClient {
                     | IngestOutcome::Stale { .. }
                     | IngestOutcome::Rejected { .. } => Some("rejected"),
                 },
+                Err(_) if recovery_control => None,
                 Err(_) => Some("failure"),
             };
             if let Some(outcome) = outcome {
