@@ -113,3 +113,9 @@ A20|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_RECHECK_INTERV
 A20|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_RECHECK_AFTER_COOLDOWN_SECS
 A20|crates/transport-nostr-adapter/src/compare/mod.rs|COMPARE_SET_LIMIT
 A20|crates/transport-nostr-adapter/src/compare/mod.rs|COMPARE_IDS_PER_REQUEST
+# A21 bounds authenticated recovery control and durable job admission.
+A21|crates/storage-sqlite/src/protocol/storage/group_recovery.rs|MAX_GROUP_RECOVERY_COORDINATOR_JOBS
+A21|crates/storage-sqlite/src/protocol/storage/group_recovery.rs|MAX_GROUP_RECOVERY_COORDINATOR_JOBS_PER_GROUP
+A21|crates/traits/src/group_recovery.rs|MAX_GROUP_RECOVERY_BODY_BYTES
+A21|crates/traits/src/group_recovery.rs|MAX_GROUP_RECOVERY_GROUP_ID_BYTES
+A21|crates/traits/src/group_recovery.rs|MAX_GROUP_RECOVERY_KEY_PACKAGE_BYTES

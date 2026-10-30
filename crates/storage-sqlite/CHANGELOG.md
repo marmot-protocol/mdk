@@ -20,6 +20,14 @@
   would, so the generation stays routed, and lowers the generation's floor to
   the lowest bound they list; `None` makes it account-wide, as every such
   observation did before.
+- Migration 0141 advances account storage to schema 141 after migration 0140.
+  It adds the protocol-owned `cgka_group_rejoin` journal, with one recipient
+  job per group and bounded coordinator jobs. Capacity refusals preserve
+  existing work. A retained nonce cannot change its peer or recipient local
+  state token; refused writes leave the exact outbound artifact and retry
+  evidence intact. Same-job phase, retry and source refreshes remain writable.
+  Group deletion cascades to its recovery jobs. Older binaries reject the
+  upgraded database.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it

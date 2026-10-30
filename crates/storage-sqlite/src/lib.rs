@@ -152,6 +152,10 @@ pub use protocol::handle::SqliteAccountStorage;
 #[allow(deprecated)]
 pub use protocol::handle::SqliteStorage;
 pub use protocol::openmls_storage::SqliteOpenMlsStorageError;
+pub use protocol::storage::group_recovery::{
+    GroupRecoveryPhase, GroupRecoveryRecord, GroupRecoveryRole,
+    MAX_GROUP_RECOVERY_COORDINATOR_JOBS, MAX_GROUP_RECOVERY_COORDINATOR_JOBS_PER_GROUP,
+};
 pub use protocol::storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]
 pub use protocol::storage::messages::StorageFormatBenchSizes;

@@ -24,6 +24,7 @@ Map for Marmot engine-side SQLite tables (the `cgka_traits` storage traits). App
 | `leave_requests.rs`, `disband_requests.rs` | Durable leave and disband requests (plus disband candidates/tombstones). |
 | `maintenance.rs` | `MaintenanceStorage`: maintenance and publication-recovery records. |
 | `private_key_packages.rs` | `PrivateKeyPackageStorage`: one issuer record per private KeyPackage handed to a sibling (mdk#2628 item 3.4b); the key itself stays in the OpenMLS bundle store. |
+| `group_recovery.rs` | Bounded authenticated recovery jobs in `cgka_group_rejoin`, including exact outbound artifacts and retry evidence. |
 
 ## Rules
 
