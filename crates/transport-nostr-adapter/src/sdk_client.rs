@@ -5755,18 +5755,35 @@ pub(crate) fn sweep_eose_hints(client: &NostrSdkRelayClient) -> Option<Arc<EoseH
     client.eose_hints.clone()
 }
 
-/// A dry-run NIP-77 comparison against an empty local set: every id the
-/// relay holds for `filter`. Used by the time-sliced sweep for one second.
+/// What a dry-run NIP-77 comparison found.
+pub(crate) struct NegCompared {
+    /// Ids the relay holds for the filter that the local set lacks.
+    pub(crate) remote: HashSet<EventId>,
+    /// How many items the relay's set for the filter held, as far as the
+    /// filter's limit.
+    pub(crate) relay_set: usize,
+}
+
+/// A dry-run NIP-77 comparison of `filter` against `items`, the local set.
+/// The time-sliced sweep passes no items for one second, so every id the
+/// relay holds comes back; the recovery runner's comparisons pass what the
+/// account holds.
 pub(crate) async fn neg_sync_dry_run(
     relay: &Relay,
     filter: Filter,
+    items: Vec<(EventId, NostrTimestamp)>,
     options: SyncOptions,
     credits: Arc<Semaphore>,
     deadline: tokio::time::Instant,
-) -> Result<HashSet<EventId>, crate::sweep::NegFailure> {
+) -> Result<NegCompared, crate::sweep::NegFailure> {
     use crate::sweep::{ClosedReason, NegFailure, UnreachableKind};
-    match sync_watching_neg_cap(relay, filter, Vec::new(), options, credits, deadline).await {
-        Ok(summary) => Ok(summary.remote),
+    let local = items.len();
+    match sync_watching_neg_cap(relay, filter, items, options, credits, deadline).await {
+        // Every relay item matches a local one or is missing locally.
+        Ok(summary) => Ok(NegCompared {
+            relay_set: local.saturating_sub(summary.local.len()) + summary.remote.len(),
+            remote: summary.remote,
+        }),
         Err(NostrReconciliationFailure::NegErr(category)) => {
             Err(NegFailure::Closed(ClosedReason(category)))
         }
@@ -5781,6 +5798,7 @@ pub(crate) async fn neg_sync_dry_run(
         Err(NostrReconciliationFailure::NotOperational | NostrReconciliationFailure::NotInPool) => {
             Err(NegFailure::Unreachable(UnreachableKind::Disconnected))
         }
+        Err(NostrReconciliationFailure::LocalError) => Err(NegFailure::Local),
         Err(_) => Err(NegFailure::Unproven),
     }
 }

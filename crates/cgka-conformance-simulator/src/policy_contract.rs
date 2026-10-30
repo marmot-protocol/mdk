@@ -40,7 +40,7 @@ pub struct ConstantDecision {
     pub versioning: VersioningRule,
 }
 
-pub const CONSTANT_DECISIONS: [ConstantDecision; 42] = [
+pub const CONSTANT_DECISIONS: [ConstantDecision; 43] = [
     decision(
         "P1",
         ConstantInfluence::SelectedStateSemantic,
@@ -259,6 +259,14 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 42] = [
     // history it fetches and when; they certify nothing a fetch did not prove.
     decision(
         "A19",
+        ConstantInfluence::InputAcquisition,
+        VersioningRule::OperationalNonInterference,
+    ),
+    // Comparison windows and the re-check schedule pace which history the
+    // runner fetches; a window certifies only once every id the relay holds
+    // in it is fetched or already held.
+    decision(
+        "A20",
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),

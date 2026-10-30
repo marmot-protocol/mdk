@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use crate::capabilities::{
     capabilities_of_key_package, extension_from_group_capabilities, leaf_capabilities,
 };
-use crate::device_tag::OwnDeviceTag;
+use crate::device_tag::{OwnDeviceTag, own_device_slot};
 use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
@@ -470,11 +470,14 @@ impl<S: StorageProvider> Engine<S> {
             .app_components
             .contains(DEVICE_ROSTER_COMPONENT_ID)
         {
+            let own_slot = own_device_slot(&self.storage).ok().flatten();
             req.app_components
                 .iter()
                 .find(|component| component.component_id == DEVICE_ROSTER_COMPONENT_ID)
                 .and_then(|component| decode_device_roster_v1(&component.data).ok())
-                .and_then(|roster| OwnDeviceTag::find(roster, self.identity.signer.public()))
+                .and_then(|roster| {
+                    OwnDeviceTag::find(roster, own_slot, self.identity.signer.public())
+                })
         } else {
             self.own_device_tag(&self.storage).ok().flatten()
         };

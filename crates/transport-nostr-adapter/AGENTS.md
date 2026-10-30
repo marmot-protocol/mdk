@@ -28,6 +28,7 @@ for reconnect/backoff and relay status mechanics.
 | `src/pairing.rs` | Device-pairing messages as rumors gift-wrapped to the account's own key. Built only with `unreleased-device-pairing` and in this crate's tests. |
 | `src/relay_list.rs` | NIP-65 kind `10002` and Marmot inbox kind `10050` relay-list event building. |
 | `src/sweep/` | Time-sliced resumable history sweep (#2660 phase 3): engine over `SweepRelay`, caller-owned sink and cursor store; `sdk.rs` is the SDK-backed relay, `hint_tap.rs` reads NIP-67 `more` off the wire for it. Not yet scheduled by anything. |
+| `src/compare/` | NIP-77 comparison of one (route, relay, range) against the caller's held ids (#2660 phase 4): windows under the relay's set limit, differences fetched by id oldest first, each window certified once every id the relay holds there is fetched or held. `SdkSweepRelay` implements its `CompareRelay`. Not yet scheduled by anything. |
 | `src/sdk_client.rs` | Optional `nostr-sdk` relay client implementation and SDK planning tests. |
 | `src/telemetry.rs` | Relay delivery telemetry: cross-relay arrival spread (phase 1) and subscription sync timing / initial-sync gate (phase 2); local-time, aggregate, privacy-safe. |
 | `tests/inbound_routing.rs` | Public behavior tests for group delivery, welcome delivery, group sync, and publish. |
@@ -201,6 +202,11 @@ for reconnect/backoff and relay status mechanics.
   withholds; do not sweep a restricted-read kind without another proof. Admit before saving the cursor,
   and never count a refusal, rate limit or unreachable relay as an empty page. `SdkSweepRelay` gives every NIP-77
   comparison and ids REQ an explicit `limit`, and a comparison that fills it proves nothing. `SdkSweepRelay` dials nothing: its endpoint must already be in the client's pool.
+- Keep the comparison driver (`src/compare/`) a mechanism like the sweep. A window certifies only when the relay's
+  set for it stayed under `COMPARE_SET_LIMIT` and every id the relay holds there was fetched or already held; a
+  withheld id, a filled set or a cut leaves its window unproven, and a window that cannot shrink below one second
+  ends `SaturatedWindow`. Certify oldest first, so a cut proves the prefix below the oldest unfetched difference.
+  A relay without NIP-77 or a refused comparison proves nothing and ends the call; never read it as an empty set.
 - No NIP-67 hint proves a slice; only counting does. `more` splits, and `finish` is never read: hints reach the sweep
   only off the wire, where a misread `finish` would skip history while a misread `more` only costs requests. Do not
   add a hint-based `SliceProof` until nostr-sdk surfaces hints itself.

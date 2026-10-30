@@ -24,18 +24,23 @@ use storage_sqlite::{
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
+use transport_nostr_adapter::compare::{CompareRelay, CompareReply, IdsReply, LocalItem};
 use transport_nostr_adapter::sweep::{
     ClosedReason, RelayCaps, SecondReply, SliceQuery, SliceReply, SweepEnd, SweepPolicy,
-    SweepRelay, SweepRoute, UnreachableKind,
+    SweepRange, SweepRelay, SweepRoute, UnreachableKind,
 };
 
-use super::policy::{RUNNER_BACKOFF_BASE_SECS, RUNNER_QUANTUM, RUNNER_REQUEST_TIMEOUT};
+use super::policy::{
+    RUNNER_BACKOFF_BASE_SECS, RUNNER_QUANTUM, RUNNER_RECHECK_INTERVAL_SECS, RUNNER_REQUEST_TIMEOUT,
+};
 use super::quantum::{SinkStop, classify};
 use super::*;
 use crate::client::AppClient;
 use crate::runtime::account_worker::recovery_credits::{
     self, RecoveryCreditPool, available_credits, hold_all_credits_for_test,
 };
+
+mod comparison;
 
 const RELAY: &str = "wss://a.example";
 const OTHER_RELAY: &str = "wss://b.example";
@@ -126,6 +131,22 @@ impl Account {
                 until,
             )
             .unwrap();
+    }
+
+    /// The unit's last re-check pass finished at `at`, so none falls due for
+    /// six hours: for tests about debt alone. An idle runner still wakes for
+    /// it then.
+    fn rechecked(&self, route: &Route, relay: &str, at: u64) {
+        let revision = self
+            .app
+            .recovery_unit(route, relay)
+            .unwrap()
+            .map_or(0, |unit| unit.recheck.revision);
+        assert!(
+            self.app
+                .record_recovery_recheck(route, relay, revision, 0, true, at)
+                .unwrap()
+        );
     }
 
     fn debt(&self, route: &Route, relay: &str, until: u64) -> Vec<RecoveryCoverageRange> {
@@ -405,6 +426,10 @@ struct ModelRelay {
     /// inside a range this relay already proved is a refetch.
     ledger: Option<SqliteAppStorage>,
     refetches: Mutex<Vec<u64>>,
+    /// Every NIP-77 comparison's window, in order.
+    comparisons: Mutex<Vec<SweepRange>>,
+    /// Every id fetched by id, in order.
+    fetched_ids: Mutex<Vec<EventId>>,
 }
 
 impl ModelRelay {
@@ -427,6 +452,8 @@ impl ModelRelay {
             in_flight: Arc::default(),
             ledger: None,
             refetches: Mutex::new(Vec::new()),
+            comparisons: Mutex::new(Vec::new()),
+            fetched_ids: Mutex::new(Vec::new()),
         }
     }
 
@@ -491,6 +518,14 @@ impl ModelRelay {
 
     fn refetches(&self) -> Vec<u64> {
         self.refetches.lock().unwrap().clone()
+    }
+
+    fn comparisons(&self) -> Vec<SweepRange> {
+        self.comparisons.lock().unwrap().clone()
+    }
+
+    fn fetched_ids(&self) -> Vec<EventId> {
+        self.fetched_ids.lock().unwrap().clone()
     }
 
     fn matching(&self, route: SweepRoute, since: u64, until: u64) -> Vec<Event> {
@@ -584,6 +619,62 @@ impl ModelRelay {
             SecondReply::Unproven
         }
     }
+
+    /// A NIP-77 comparison as strfry answers it: its set for the window is
+    /// every matching event, newest first, as far as the limit.
+    async fn compare(
+        &self,
+        route: SweepRoute,
+        window: SweepRange,
+        local: &[LocalItem],
+        limit: usize,
+    ) -> CompareReply {
+        let _flight = self.in_flight.enter();
+        self.comparisons.lock().unwrap().push(window);
+        match self.arrive().await {
+            Some(ClosedOrUnreachable::Unreachable) => {
+                return CompareReply::Unreachable(UnreachableKind::TimedOut);
+            }
+            Some(ClosedOrUnreachable::RateLimited) => return CompareReply::Closed(rate_limited()),
+            None => {}
+        }
+        if !self.negentropy {
+            return CompareReply::Unsupported;
+        }
+        let held = local.iter().map(|item| item.id).collect::<BTreeSet<_>>();
+        let set = self
+            .matching(route, window.since, window.until)
+            .into_iter()
+            .take(limit)
+            .collect::<Vec<_>>();
+        CompareReply::Compared {
+            relay_set: set.len(),
+            missing: set
+                .iter()
+                .map(|event| event.id)
+                .filter(|id| !held.contains(id))
+                .collect(),
+        }
+    }
+
+    async fn fetch_ids(&self, route: SweepRoute, window: SweepRange, ids: &[EventId]) -> IdsReply {
+        let _flight = self.in_flight.enter();
+        self.fetched_ids.lock().unwrap().extend_from_slice(ids);
+        match self.arrive().await {
+            Some(ClosedOrUnreachable::Unreachable) => {
+                return IdsReply::Unreachable(UnreachableKind::TimedOut);
+            }
+            Some(ClosedOrUnreachable::RateLimited) => return IdsReply::Closed(rate_limited()),
+            None => {}
+        }
+        let asked = ids.iter().collect::<BTreeSet<_>>();
+        IdsReply::Answered(
+            self.matching(route, window.since, window.until)
+                .into_iter()
+                .filter(|event| asked.contains(&event.id))
+                .collect(),
+        )
+    }
 }
 
 enum ClosedOrUnreachable {
@@ -613,6 +704,37 @@ impl SweepRelay for Swept {
 
     async fn fetch_second(&self, route: SweepRoute, second: u64, _cap: Option<u32>) -> SecondReply {
         self.relay.fetch_second(route, second).await
+    }
+
+    fn take_fetched_bytes(&self) -> u64 {
+        self.relay.unreported.swap(0, Ordering::SeqCst)
+    }
+}
+
+/// The comparison's view of a model relay.
+struct Compared {
+    relay: Arc<ModelRelay>,
+    caps: RelayCaps,
+}
+
+#[async_trait]
+impl CompareRelay for Compared {
+    fn caps(&self) -> RelayCaps {
+        self.caps
+    }
+
+    async fn compare(
+        &self,
+        route: SweepRoute,
+        window: SweepRange,
+        local: &[LocalItem],
+        limit: usize,
+    ) -> CompareReply {
+        self.relay.compare(route, window, local, limit).await
+    }
+
+    async fn fetch_ids(&self, route: SweepRoute, window: SweepRange, ids: &[EventId]) -> IdsReply {
+        self.relay.fetch_ids(route, window, ids).await
     }
 
     fn take_fetched_bytes(&self) -> u64 {
@@ -758,6 +880,16 @@ impl RunnerHost for TestHost {
     ) -> Option<Box<dyn SweepRelay>> {
         let relay = self.relays.get(relay)?.clone();
         Some(Box::new(Swept { relay, caps }))
+    }
+
+    fn compare_relay(
+        &self,
+        relay: &str,
+        caps: RelayCaps,
+        _request_timeout: Duration,
+    ) -> Option<Box<dyn CompareRelay>> {
+        let relay = self.relays.get(relay)?.clone();
+        Some(Box::new(Compared { relay, caps }))
     }
 
     async fn deliveries(&self, _relay: &str, event: Event) -> Vec<TransportDelivery> {
@@ -958,6 +1090,7 @@ async fn recovery_runner_owes_a_broken_generation_tail_until_a_reconnect_or_a_pr
     );
     let opened = t0 - HOUR;
     account.goal(&route, t0 - DAY);
+    account.rechecked(&route, RELAY, t0);
     account.live_boundary(&route, RELAY, t0 - DAY, opened - 1);
     host.tails.stand(&route, RELAY, opened);
     let (mut runner, handle) = runner(&host, test_policy());
@@ -974,7 +1107,10 @@ async fn recovery_runner_owes_a_broken_generation_tail_until_a_reconnect_or_a_pr
 
     // The next generation's tail stands from there, so nothing is owed.
     host.tails.stand(&route, RELAY, proved + 1);
-    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(
+        idle(runner.step().await),
+        Some(t0 + RUNNER_RECHECK_INTERVAL_SECS)
+    );
 
     // It breaks too, and the relay reconnects half an hour later. The new
     // tail starts at the reconnect's EOSE, so only the downtime is owed.
@@ -996,7 +1132,10 @@ async fn recovery_runner_owes_a_broken_generation_tail_until_a_reconnect_or_a_pr
         downtime.iter().map(|query| query.until).max(),
         Some(reconnected - 1)
     );
-    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(
+        idle(runner.step().await),
+        Some(t0 + RUNNER_RECHECK_INTERVAL_SECS)
+    );
     assert!(relay.refetches().is_empty());
 }
 
@@ -1050,6 +1189,7 @@ async fn recovery_runner_cancelled_or_crashed_mid_sweep_requests_no_slice_twice(
         .checking(&account)
         .build();
     account.goal(&route, floor);
+    account.rechecked(&route, RELAY, t0);
     let credits = recovery_credits::private_recovery_credit_pool_for_test();
     let host = || {
         let host = TestHost::new(
@@ -1473,6 +1613,7 @@ async fn recovery_runner_tries_a_best_effort_relay_once_per_new_debt() {
     }];
     let host = TestHost::new(&account, &clock, routes, &[&relay, &other]);
     account.goal(&route, t0 - HOUR);
+    account.rechecked(&route, RELAY, t0);
     host.tails.stand(&route, RELAY, t0);
     host.tails.stand(&route, OTHER_RELAY, t0);
     let (mut runner, handle) = runner(&host, test_policy());
@@ -1491,7 +1632,11 @@ async fn recovery_runner_tries_a_best_effort_relay_once_per_new_debt() {
         ),
         (OTHER_RELAY, true, Outcome::Unreachable)
     );
-    assert_eq!(idle(runner.step().await), None, "one attempt per debt");
+    assert_eq!(
+        idle(runner.step().await),
+        Some(t0 + RUNNER_RECHECK_INTERVAL_SECS),
+        "one attempt per debt"
+    );
     assert!(
         account
             .app
@@ -1519,7 +1664,10 @@ async fn recovery_runner_tries_a_best_effort_relay_once_per_new_debt() {
         (third.key.relay.as_str(), third.outcome),
         (OTHER_RELAY, Outcome::Unreachable)
     );
-    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(
+        idle(runner.step().await),
+        Some(t0 + RUNNER_RECHECK_INTERVAL_SECS)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1541,6 +1689,7 @@ async fn recovery_runner_explicit_pass_serves_each_due_unit_once() {
     // reaches the classes below it.
     for route in &groups {
         account.goal(route, t0 - HOUR);
+        account.rechecked(route, RELAY, t0);
     }
     let (mut runner, handle) = runner(&host, test_policy());
     handle.set_hints(PriorityHints {
@@ -1786,6 +1935,7 @@ async fn recovery_runner_counts_a_best_effort_attempt_only_when_it_reached_the_r
     }];
     let host = TestHost::new(&account, &clock, routes, &[&relay, &other]);
     account.goal(&route, floor);
+    account.rechecked(&route, RELAY, t0);
     host.tails.stand(&route, RELAY, t0);
     host.tails.stand(&route, OTHER_RELAY, t0);
     let (mut runner, _handle) = runner(&host, test_policy());
@@ -1807,7 +1957,11 @@ async fn recovery_runner_counts_a_best_effort_attempt_only_when_it_reached_the_r
         (tried.key.relay.as_str(), tried.outcome),
         (OTHER_RELAY, Outcome::Unreachable)
     );
-    assert_eq!(idle(runner.step().await), None, "one attempt per debt");
+    assert_eq!(
+        idle(runner.step().await),
+        Some(t0 + RUNNER_RECHECK_INTERVAL_SECS),
+        "one attempt per debt"
+    );
 
     // A loss on another route moves the account's un-cover mark but changes
     // nothing this relay owes.
@@ -1819,7 +1973,10 @@ async fn recovery_runner_counts_a_best_effort_attempt_only_when_it_reached_the_r
         .uncover_recovery_coverage(std::slice::from_ref(&unrelated), floor)
         .unwrap();
     assert_ne!(account.app.recovery_coverage_mark().unwrap(), mark);
-    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(
+        idle(runner.step().await),
+        Some(t0 + RUNNER_RECHECK_INTERVAL_SECS)
+    );
 
     // Debt before its first owed second is new evidence. The required relay
     // owes it too, and its class goes first.
@@ -1841,6 +1998,7 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
         last_served_at: None,
         due_at: 0,
         blocked: false,
+        recheck: false,
     };
     let mut memory = select::Memory::default();
     let policy = test_policy();
@@ -1870,6 +2028,7 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
     // no rate yet.
     let survey = select::Survey {
         candidates: vec![candidate(&quiet, 30 * DAY), candidate(&busy, 60)],
+        rechecks: Vec::new(),
         paused_until: None,
     };
     let select::Pick::Unit(first) =

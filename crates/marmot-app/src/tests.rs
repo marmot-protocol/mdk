@@ -22577,6 +22577,200 @@ async fn unavailable_group_invite_retries_the_exact_commit_after_transport_recov
     runtime.shutdown().await;
 }
 
+/// Alice's client with a group ready to invite Bob into, and a relay that
+/// fails every group-message publish with an untyped error, so the invite's
+/// commit is retained with its acknowledgement unknown (mdk#2726).
+struct UnresolvedInvite {
+    _dir: tempfile::TempDir,
+    _plane: MarmotRelayPlane,
+    _bob_client: AppClient,
+    relay: Arc<ScriptedPushRelayClient>,
+    alice: AppClient,
+    group: GroupId,
+    bob_id_hex: String,
+    attempted_before: usize,
+}
+
+async fn unresolved_invite() -> UnresolvedInvite {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group = alice.create_group("unresolved invite", &[]).await.unwrap();
+    let attempted_before = relay.attempted_events().len();
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE);
+    UnresolvedInvite {
+        _dir: dir,
+        _plane: plane,
+        _bob_client: bob_client,
+        relay,
+        alice,
+        group,
+        bob_id_hex: bob.account_id_hex,
+        attempted_before,
+    }
+}
+
+/// Kinds of the events attempted since `before`.
+fn attempted_kinds_since(relay: &ScriptedPushRelayClient, before: usize) -> Vec<u64> {
+    relay.attempted_events()[before..]
+        .iter()
+        .map(|event| event.kind)
+        .collect()
+}
+
+/// mdk#2726: the public invite call publishes no Welcome while its Add
+/// commit's acknowledgement is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_with_unresolved_commit_holds_its_welcome() {
+    let mut invite = unresolved_invite().await;
+    let summary = invite
+        .alice
+        .invite_members(&invite.group, &[invite.bob_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+
+    let attempted = attempted_kinds_since(&invite.relay, invite.attempted_before);
+    assert!(
+        attempted.contains(&transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE),
+        "the invite attempted its commit"
+    );
+    assert!(
+        !attempted.contains(&transport_nostr_peeler::KIND_NIP59_GIFT_WRAP),
+        "no Welcome may be published before its Add commit confirms"
+    );
+}
+
+/// mdk#2726: an invite whose commit is retained leaves no Welcome slot for a
+/// later caller to drive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_with_unresolved_commit_leaves_no_welcome_slot() {
+    let mut invite = unresolved_invite().await;
+    let telemetry = crate::observer::PerformanceRecorder::default();
+    let summary = invite
+        .alice
+        .invite_members_with_telemetry(
+            &invite.group,
+            &[invite.bob_id_hex.as_str()],
+            &[],
+            &telemetry,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    assert!(invite.alice.unpublished_welcome_delivery.is_none());
+}
+
+/// mdk#2726: the account worker drives an invite's Welcomes only when its
+/// commit is published, but a retained invite used to leave its slot behind.
+/// A later create that only returns an existing group, as a retried
+/// prepared-image create does, then drove that slot and published the
+/// invite's Welcome before its commit confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_invite_leaves_no_welcome_for_a_later_create_to_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("sender").unwrap();
+    let invited = home.create_account("invited").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://retained-invite.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(
+        &app,
+        &invited.account_id_hex,
+        "wss://retained-invite.example",
+    );
+    // A group already created from a prepared image, so creating from that
+    // image again returns it without creating anything.
+    let (upload_id, image_group) = {
+        let mut client = app.client("sender").await.unwrap();
+        let staged = client
+            .stage_prepared_initial_group_image(&one_pixel_png(), "image/png")
+            .unwrap();
+        client
+            .finish_initial_group_image_upload(&staged.upload_id, &Ok(()))
+            .unwrap();
+        let created = client
+            .create_group_with_prepared_initial_image_and_telemetry(
+                "image group",
+                &[],
+                AppCreateGroupOptions::default(),
+                &staged.upload_id,
+                &crate::observer::PerformanceRecorder::default(),
+            )
+            .await
+            .unwrap();
+        (staged.upload_id, created.group_id)
+    };
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("sender", "retained invite", &[], None)
+        .await
+        .unwrap();
+
+    let attempted_before = relay.attempted_events().len();
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE);
+    let summary = runtime
+        .invite_members("sender", &group_id, &[invited.account_id_hex])
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    let again = runtime
+        .create_group_with_prepared_initial_image(
+            "sender",
+            "retried image group",
+            &[],
+            None,
+            upload_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(again, image_group);
+    // Worker mutations run in order, so this one starts only after the
+    // create's post-reply Welcome delivery has finished.
+    runtime
+        .create_group("sender", "after the retry", &[], None)
+        .await
+        .unwrap();
+
+    let attempted = attempted_kinds_since(&relay, attempted_before);
+    assert!(
+        attempted.contains(&transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE),
+        "the invite attempted its commit"
+    );
+    assert!(
+        !attempted.contains(&transport_nostr_peeler::KIND_NIP59_GIFT_WRAP),
+        "no Welcome may be published before its Add commit confirms"
+    );
+    runtime.shutdown().await;
+}
+
 // ---- mdk#1380: steady-state reconciliation passes must not rescan full state ----
 
 #[test]

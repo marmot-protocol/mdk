@@ -330,6 +330,7 @@ fn staging_trims_the_units_parked_spans() {
         cooldown_cap_seconds: 3_600,
         max_attempts_per_hour: 720,
         max_event_bytes_per_hour: 256 << 20,
+        recheck_after_cooldown_seconds: 3_600,
     };
     app.widen_recovery_coverage_goals(std::slice::from_ref(&route), NOW - 100)
         .unwrap();
@@ -385,4 +386,56 @@ fn a_crash_between_staging_and_settling_refetches_nothing() {
     assert_eq!((unit.no_progress, unit.next_attempt_at_seconds), (0, 0));
     assert_eq!(unit.last_served_at_seconds, Some(NOW));
     assert_eq!(app.recovery_account_usage(NOW).unwrap().attempts, 1);
+}
+
+/// A comparison's held set includes what any relay staged on the route in
+/// its range, oldest first, and nothing from another route.
+#[test]
+fn staged_items_are_the_routes_from_every_relay_in_range() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    let mark = app.recovery_coverage_mark().unwrap();
+    stage(
+        &app,
+        &route,
+        RELAY,
+        &[delivery_at(1, 50), delivery_at(2, 10)],
+        range(0, 100),
+        mark,
+    );
+    stage(
+        &app,
+        &route,
+        OTHER,
+        &[delivery_at(3, 30)],
+        range(0, 100),
+        mark,
+    );
+    stage(
+        &app,
+        &route,
+        RELAY,
+        &[delivery_at(4, 200)],
+        range(101, 300),
+        mark,
+    );
+    stage(
+        &app,
+        &group(2),
+        RELAY,
+        &[delivery_at(5, 40)],
+        range(0, 100),
+        mark,
+    );
+
+    let items = app.staged_recovery_items(&route, 10, 50).unwrap();
+
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| (item.event_id[0], item.created_at))
+            .collect::<Vec<_>>(),
+        vec![(2, 10), (3, 30), (1, 50)]
+    );
 }

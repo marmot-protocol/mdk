@@ -113,6 +113,9 @@ pub struct RecoveryUnitPolicy {
     pub max_attempts_per_hour: u64,
     /// Fetched event bytes per rolling hour before the account breaker pauses.
     pub max_event_bytes_per_hour: u64,
+    /// A relay cooldown spell longer than this makes every re-check on the
+    /// relay due when the spell ends.
+    pub recheck_after_cooldown_seconds: u64,
 }
 
 /// A broken unit's park. Its revision identifies the occurrence: a failed
@@ -130,6 +133,10 @@ pub struct RecoveryRecheckPass {
     pub position_seconds: Option<u64>,
     /// When the last full pass completed; `None` means one is due.
     pub completed_at_seconds: Option<u64>,
+    /// Bumped by every request that makes the pass due. Progress is recorded
+    /// only under the revision its quantum began on
+    /// ([`SqliteAppStorage::record_recovery_recheck`]).
+    pub revision: u64,
 }
 
 /// One (route, relay) unit's durable state. Not `Debug`: it carries the route
@@ -273,7 +280,8 @@ fn caps_columns(caps: Option<RecoveryRelayCaps>) -> (i64, Option<i64>, i64) {
 const UNIT_COLUMNS: &str = "route_kind, route_id, relay, state, broken_reason, probe, no_progress,
     backoff_step, next_attempt_at_seconds, fencing, slice_width_seconds, observed_cap,
     planned_caps_known, planned_max_limit, planned_negentropy, park_revision, parked_at_seconds,
-    recheck_position_seconds, recheck_completed_at_seconds, last_served_at_seconds";
+    recheck_position_seconds, recheck_completed_at_seconds, last_served_at_seconds,
+    recheck_revision";
 
 fn unit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UnitRow> {
     Ok(UnitRow {
@@ -297,6 +305,7 @@ fn unit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UnitRow> {
         recheck_position: row.get(17)?,
         recheck_completed_at: row.get(18)?,
         last_served_at: row.get(19)?,
+        recheck_revision: row.get(20)?,
     })
 }
 
@@ -321,6 +330,7 @@ struct UnitRow {
     recheck_position: Option<i64>,
     recheck_completed_at: Option<i64>,
     last_served_at: Option<i64>,
+    recheck_revision: i64,
 }
 
 impl UnitRow {
@@ -363,6 +373,7 @@ impl UnitRow {
             recheck: RecoveryRecheckPass {
                 position_seconds: optional(self.recheck_position)?,
                 completed_at_seconds: optional(self.recheck_completed_at)?,
+                revision: i64_to_u64(self.recheck_revision)?,
             },
             last_served_at_seconds: optional(self.last_served_at)?,
         })
@@ -740,11 +751,77 @@ fn budget_rows_tx(conn: &Connection, now_seconds: u64) -> StorageResult<Vec<(u64
     .collect()
 }
 
-fn relay_answered_tx(conn: &Connection, relay: &str) -> StorageResult<()> {
+fn relay_answered_tx(
+    conn: &Connection,
+    relay: &str,
+    policy: &RecoveryUnitPolicy,
+    now_seconds: u64,
+) -> StorageResult<()> {
+    let since = cooldown_since_tx(conn, relay)?;
     conn.execute_cached(
         "UPDATE account_recovery_relays SET unreachable_streak = 0, cooldown_step = 0,
          cooldown_since_seconds = NULL, cooldown_until_seconds = NULL WHERE relay = ?1",
         [relay],
+    )
+    .storage()?;
+    cooldown_ended_tx(conn, relay, since, policy, now_seconds)
+}
+
+/// When the relay's cooldown spell began, if one has not ended yet.
+fn cooldown_since_tx(conn: &Connection, relay: &str) -> StorageResult<Option<u64>> {
+    let since: Option<Option<i64>> = conn
+        .query_row_cached(
+            "SELECT cooldown_since_seconds FROM account_recovery_relays WHERE relay = ?1",
+            [relay],
+            |row| row.get(0),
+        )
+        .optional()
+        .storage()?;
+    optional(since.flatten())
+}
+
+/// The relay's cooldown spell that began at `since` just ended, in the same
+/// transaction. One longer than the policy's bound makes every re-check on
+/// the relay due from the window floor: the relay may have accepted history
+/// while the device could not reach it.
+fn cooldown_ended_tx(
+    conn: &Connection,
+    relay: &str,
+    since: Option<u64>,
+    policy: &RecoveryUnitPolicy,
+    now_seconds: u64,
+) -> StorageResult<()> {
+    if since.is_some_and(|since| {
+        now_seconds.saturating_sub(since) > policy.recheck_after_cooldown_seconds
+    }) {
+        recheck_due_tx(conn, None, Some(relay), None)?;
+    }
+    Ok(())
+}
+
+/// Make re-checks due now, on `route` (every route when `None`) and `relay`
+/// (every relay when `None`), from `from_seconds` when given and from the
+/// window floor otherwise. A pass already due or running keeps whatever it
+/// would check below `from_seconds`.
+fn recheck_due_tx(
+    conn: &Connection,
+    route: Option<&TransportReconciliationRoute>,
+    relay: Option<&str>,
+    from_seconds: Option<u64>,
+) -> StorageResult<()> {
+    let (kind, id) = match route.map(TransportReconciliationRoute::storage_key) {
+        Some((kind, id)) => (Some(kind), Some(id)),
+        None => (None, None),
+    };
+    conn.execute_cached(
+        "UPDATE account_recovery_units SET recheck_position_seconds = CASE
+          WHEN ?4 IS NULL THEN NULL
+          WHEN recheck_position_seconds IS NOT NULL THEN MIN(recheck_position_seconds, ?4)
+          WHEN recheck_completed_at_seconds IS NOT NULL THEN ?4
+          ELSE NULL END,
+         recheck_completed_at_seconds = NULL, recheck_revision = recheck_revision + 1
+         WHERE (?1 IS NULL OR (route_kind = ?1 AND route_id = ?2)) AND (?3 IS NULL OR relay = ?3)",
+        params![kind, id, relay, from_seconds.map(integer).transpose()?],
     )
     .storage()?;
     Ok(())
@@ -1148,7 +1225,7 @@ impl SqliteAppStorage {
             match outcome {
                 Outcome::Advanced => {
                     rearm_tx(&conn, route, relay)?;
-                    relay_answered_tx(&conn, relay)?;
+                    relay_answered_tx(&conn, relay, policy, now_seconds)?;
                 }
                 Outcome::NothingOwed => match unit.state {
                     // A broken unit's debt leaves its park out, so only a
@@ -1167,7 +1244,7 @@ impl SqliteAppStorage {
                     _ => rearm_tx(&conn, route, relay)?,
                 },
                 Outcome::NoProgress => {
-                    relay_answered_tx(&conn, relay)?;
+                    relay_answered_tx(&conn, relay, policy, now_seconds)?;
                     match unit.state {
                         RecoveryUnitState::Broken(reason) if unit.probe => {
                             park_tx(&conn, &unit, reason, unit.park, now_seconds)?;
@@ -1236,6 +1313,69 @@ impl SqliteAppStorage {
         })
     }
 
+    /// Apply one re-check quantum's outcome to the relay and the account, in
+    /// one transaction. A re-check reads covered and retired ranges, which
+    /// the unit does not owe, so it never touches the unit's retry state: its
+    /// backoff, budget, break and park stay as its debt left them. The pass's
+    /// own progress is [`Self::record_recovery_recheck`]'s.
+    pub fn settle_recovery_recheck(
+        &self,
+        route: &TransportReconciliationRoute,
+        relay: &str,
+        outcome: RecoveryUnitOutcome,
+        policy: &RecoveryUnitPolicy,
+        now_seconds: u64,
+    ) -> StorageResult<()> {
+        use RecoveryUnitOutcome as Outcome;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            ensure_unit_tx(&conn, route, relay)?;
+            ensure_relay_tx(&conn, relay)?;
+            let (kind, id) = route.storage_key();
+            let attempt_minute: Option<i64> = conn
+                .query_row_cached(
+                    "SELECT attempt_minute FROM account_recovery_units
+                     WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3",
+                    params![kind, id, relay],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            conn.execute_cached(
+                "UPDATE account_recovery_units SET attempt_minute = NULL
+                 WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3",
+                params![kind, id, relay],
+            )
+            .storage()?;
+            if let (Some(minute), Outcome::NothingOwed | Outcome::Unanswered | Outcome::LocalFailure) =
+                (attempt_minute, outcome)
+            {
+                budget_add_tx(&conn, i64_to_u64(minute)?, -1, 0)?;
+            }
+            match outcome {
+                Outcome::Advanced | Outcome::NoProgress => relay_answered_tx(&conn, relay, policy, now_seconds)?,
+                Outcome::Unreachable => {
+                    let streak: i64 = conn
+                        .query_row_cached(
+                            "UPDATE account_recovery_relays SET unreachable_streak = unreachable_streak + 1
+                             WHERE relay = ?1 RETURNING unreachable_streak",
+                            [relay],
+                            |row| row.get(0),
+                        )
+                        .storage()?;
+                    if count(streak)? >= policy.cooldown_after_unreachable {
+                        relay_cool_down_tx(&conn, relay, policy, now_seconds)?;
+                    }
+                }
+                Outcome::RateLimited => relay_cool_down_tx(&conn, relay, policy, now_seconds)?,
+                Outcome::NothingOwed
+                | Outcome::Refused
+                | Outcome::Unanswered
+                | Outcome::LocalFailure => {}
+            }
+            Ok(())
+        })
+    }
+
     /// Re-arm one unit fully: a relay was added to its route. A unit that is
     /// not broken is left as it is. Returns whether it was broken.
     pub fn rearm_recovery_unit(
@@ -1272,7 +1412,7 @@ impl SqliteAppStorage {
                 .storage()?;
             conn.execute_cached(
                 "UPDATE account_recovery_units SET recheck_position_seconds = NULL,
-                 recheck_completed_at_seconds = NULL",
+                 recheck_completed_at_seconds = NULL, recheck_revision = recheck_revision + 1",
                 [],
             )
             .storage()?;
@@ -1314,26 +1454,27 @@ impl SqliteAppStorage {
         })
     }
 
-    /// The relay reconnected: its cooldown and unreachable streak end.
-    /// Returns when the cooldown spell it ended began, if one was running.
-    pub fn record_recovery_relay_reconnected(&self, relay: &str) -> StorageResult<Option<u64>> {
+    /// The relay reconnected: its cooldown and unreachable streak end, and a
+    /// spell longer than the policy's bound makes its re-checks due in the
+    /// same transaction. Returns when the cooldown spell it ended began, if
+    /// one was running.
+    pub fn record_recovery_relay_reconnected(
+        &self,
+        relay: &str,
+        policy: &RecoveryUnitPolicy,
+        now_seconds: u64,
+    ) -> StorageResult<Option<u64>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let since: Option<Option<i64>> = conn
-                .query_row_cached(
-                    "SELECT cooldown_since_seconds FROM account_recovery_relays WHERE relay = ?1",
-                    [relay],
-                    |row| row.get(0),
-                )
-                .optional()
-                .storage()?;
+            let since = cooldown_since_tx(&conn, relay)?;
             conn.execute_cached(
                 "UPDATE account_recovery_relays SET unreachable_streak = 0,
                  cooldown_since_seconds = NULL, cooldown_until_seconds = NULL WHERE relay = ?1",
                 [relay],
             )
             .storage()?;
-            optional(since.flatten())
+            cooldown_ended_tx(&conn, relay, since, policy, now_seconds)?;
+            Ok(since)
         })
     }
 
@@ -1448,16 +1589,20 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Record a re-check pass's progress. A complete pass records its time and
+    /// Record a re-check pass's progress, if its revision is still
+    /// `revision`: a request that made the pass due since the quantum began
+    /// wins, and the pass runs again. A complete pass records its time and
     /// clears the position; a failed or truncated one keeps where it got to.
+    /// Returns whether it recorded anything.
     pub fn record_recovery_recheck(
         &self,
         route: &TransportReconciliationRoute,
         relay: &str,
+        revision: u64,
         position_seconds: u64,
         complete: bool,
         now_seconds: u64,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             ensure_unit_tx(&conn, route, relay)?;
@@ -1467,36 +1612,31 @@ impl SqliteAppStorage {
             } else {
                 (Some(integer(position_seconds)?), None)
             };
-            conn.execute_cached(
-                "UPDATE account_recovery_units SET recheck_position_seconds = ?4,
-                 recheck_completed_at_seconds = COALESCE(?5, recheck_completed_at_seconds)
-                 WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3",
-                params![kind, id, relay, position, completed],
-            )
-            .storage()?;
-            Ok(())
+            let recorded = conn
+                .execute_cached(
+                    "UPDATE account_recovery_units SET recheck_position_seconds = ?4,
+                     recheck_completed_at_seconds = COALESCE(?5, recheck_completed_at_seconds)
+                     WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3
+                     AND recheck_revision = ?6",
+                    params![kind, id, relay, position, completed, integer(revision)?],
+                )
+                .storage()?;
+            Ok(recorded > 0)
         })
     }
 
     /// Make the route's re-checks due now, from `from_seconds` when given (an
     /// epoch gap's bound) and from the window floor otherwise. `relay` limits
-    /// it to one relay's unit.
+    /// it to one relay's unit. A pass already due or running keeps whatever
+    /// it would check below `from_seconds`. Each pass's revision is bumped, so
+    /// a quantum already running records nothing over the request.
     pub fn make_recovery_recheck_due(
         &self,
         route: &TransportReconciliationRoute,
         relay: Option<&str>,
         from_seconds: Option<u64>,
     ) -> StorageResult<()> {
-        let (kind, id) = route.storage_key();
-        self.lock()?
-            .execute_cached(
-                "UPDATE account_recovery_units SET recheck_position_seconds = ?4,
-                 recheck_completed_at_seconds = NULL
-                 WHERE route_kind = ?1 AND route_id = ?2 AND (?3 IS NULL OR relay = ?3)",
-                params![kind, id, relay, from_seconds.map(integer).transpose()?],
-            )
-            .storage()?;
-        Ok(())
+        recheck_due_tx(&*self.lock()?, Some(route), relay, from_seconds)
     }
 
     /// One unit's state, if the runner has touched it.

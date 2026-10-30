@@ -19,16 +19,21 @@
 //!    owed ranges from its ledger cursor, read the un-cover mark and record the
 //!    attempt. Nothing read before the credit wait is planned on.
 //! 4. **Quantum** (off the worker): `run_sweep` on that (route, relay) for
-//!    each owed range, oldest first, under one deadline ([`quantum`]).
-//! 5. **Stage** (one worker turn per proven slice): its events to staging and
-//!    its coverage to the ledger in one transaction, through the mark.
+//!    each owed range, oldest first, under one deadline ([`quantum`]), or a
+//!    NIP-77 comparison of those ranges ([`compare`]).
+//! 5. **Stage** (one worker turn per proven slice or compared window): its
+//!    events to staging and its coverage to the ledger in one transaction,
+//!    through the mark.
 //! 6. **Settle** (worker turn): map the quantum's end to the outcome table and
 //!    apply it; then the credit is released.
 //!
-//! Units are sweeps of group routes, one per (route, required relay) (decision
-//! 3), plus one attempt per new debt on each best-effort relay. Comparison and
-//! re-check units (PR 4c) and admission from staging (PR 4b) plug into the
-//! same select and settle seams.
+//! Debt units are one per (group route, required relay) (decision 3), plus
+//! one attempt per new debt on each best-effort relay. A unit compares instead
+//! of sweeping when its relay compares and the account already holds events
+//! in the owed ranges. Once no debt unit is eligible, re-check units
+//! ([`recheck`]) compare each required NIP-77 relay's covered and retired
+//! ranges again, on their own schedule. Admission from staging (PR 4b) plugs
+//! into the same select and settle seams.
 //!
 //! Live tails are a query, never a stored value ([`tails`]): the select and
 //! begin turns each read them fresh, and nothing keeps an answer across an
@@ -37,14 +42,17 @@
 //! Logs carry aggregates only: no route, relay, group or account identity.
 #![cfg_attr(not(test), allow(dead_code))]
 
+mod compare;
 mod policy;
 mod quantum;
+mod recheck;
 mod select;
 mod tails;
 #[cfg(test)]
 mod tests;
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,6 +65,7 @@ use storage_sqlite::{
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use transport_nostr_adapter::compare::CompareRelay;
 use transport_nostr_adapter::sweep::{RelayCaps, SweepRelay};
 
 pub(crate) use policy::RecoveryRunnerPolicy;
@@ -161,6 +170,15 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
         request_timeout: Duration,
     ) -> Option<Box<dyn SweepRelay>>;
 
+    /// A comparison relay over the account's relay client (`SdkSweepRelay`
+    /// too), for an endpoint already in its pool; `None` when it is not there.
+    fn compare_relay(
+        &self,
+        relay: &str,
+        caps: RelayCaps,
+        request_timeout: Duration,
+    ) -> Option<Box<dyn CompareRelay>>;
+
     /// Route one fetched event to this account (the adapter's
     /// `reconciled_deliveries`); nothing when it routes nowhere or is invalid.
     async fn deliveries(&self, relay: &str, event: Event) -> Vec<TransportDelivery>;
@@ -174,6 +192,8 @@ pub(crate) struct QuantumSummary {
     pub(crate) key: UnitKey,
     pub(crate) best_effort: bool,
     pub(crate) outcome: RecoveryUnitOutcome,
+    /// A re-check quantum rather than debt.
+    pub(crate) recheck: bool,
 }
 
 /// What one step did. Not `Debug`.
@@ -197,11 +217,14 @@ pub(crate) struct PassReport {
     pub(crate) advanced: u32,
 }
 
-/// Wake signals other than the coalescing watch.
+/// Wake signals other than the coalescing watch, and the runner's aggregate
+/// counts.
 #[derive(Default)]
 struct Signals {
     /// Relays that reconnected since the runner last looked.
     reconnected: Mutex<BTreeSet<String>>,
+    /// Events re-checks found inside ranges already covered (PR 5 exports it).
+    late_findings: AtomicU64,
 }
 
 /// The caller's side of a runner: wake it, steer it, stop it.
@@ -240,6 +263,12 @@ impl RecoveryRunnerHandle {
     /// preempted.
     pub(crate) fn shutdown(&self) {
         self.cancel.cancel();
+    }
+
+    /// Events re-checks have found inside ranges already covered, since the
+    /// runner was built. An aggregate count, privacy-safe.
+    pub(crate) fn late_findings(&self) -> u64 {
+        self.signals.late_findings.load(Ordering::Relaxed)
     }
 }
 
@@ -396,6 +425,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     /// Begin, run, stage and settle one quantum on `candidate`, holding a
     /// credit.
     async fn quantum(&mut self, candidate: Candidate, pass_deadline: Option<Instant>) -> Step {
+        if candidate.recheck {
+            return self.recheck(candidate, pass_deadline).await;
+        }
         let policy = self.policy;
         let caps = match self
             .bounded(pass_deadline, self.host.relay_caps(&candidate.key.relay))
@@ -406,9 +438,10 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         };
         let key = candidate.key.clone();
         let best_effort = candidate.best_effort;
+        let compares = self.memory.compares(&key.relay);
         let plan = match self
             .host
-            .debt_turn(move |turn| select::begin(turn, &key, best_effort, caps, &policy))
+            .debt_turn(move |turn| select::begin(turn, &key, best_effort, caps, compares, &policy))
             .await
         {
             None => return Step::Stopped,
@@ -424,6 +457,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                     key: candidate.key,
                     best_effort,
                     outcome,
+                    recheck: false,
                 });
             }
         };
@@ -433,24 +467,35 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         // own deadline stays the quantum's, so a cut pass reads as a
         // preemption, never as the relay's verdict.
         let preempt = self.cancel.child_token();
-        let report = {
-            let run = quantum::run(
-                &*self.host,
-                &plan,
-                caps.unwrap_or_default(),
-                deadline,
-                &preempt,
-                &policy,
-            );
+        let (report, facts) = {
+            let host = &*self.host;
+            let run = async {
+                match &plan.compare {
+                    Some(compared) => {
+                        let (report, facts) =
+                            compare::run(host, compared, deadline, &preempt, &policy).await;
+                        (report, Some(facts))
+                    }
+                    None => {
+                        let caps = caps.unwrap_or_default();
+                        let report =
+                            quantum::run(host, &plan, caps, deadline, &preempt, &policy).await;
+                        (report, None)
+                    }
+                }
+            };
             tokio::pin!(run);
             tokio::select! {
-                report = &mut run => report,
+                ran = &mut run => ran,
                 () = sleep_until(pass_deadline) => {
                     preempt.cancel();
                     run.await
                 }
             }
         };
+        if facts.is_some_and(|facts| compare::would_not_compare(facts.end)) {
+            self.memory.would_not_compare(&candidate.key.relay);
+        }
         let outcome = match self
             .host
             .turn(move |turn| quantum::settle(turn, &plan, &report, &policy))
@@ -470,7 +515,8 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             target: TARGET,
             method = "quantum",
             outcome = outcome_label(outcome),
-            end = quantum::end_label(report.end),
+            end = facts.map_or(quantum::end_label(report.end), |facts| facts.end.label()),
+            compared = facts.is_some(),
             best_effort,
             ranges,
             requests = report.requests,
@@ -482,6 +528,105 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             key: candidate.key,
             best_effort,
             outcome,
+            recheck: false,
+        })
+    }
+
+    /// Begin, run, stage and settle one re-check quantum on `candidate`,
+    /// holding a credit.
+    async fn recheck(&mut self, candidate: Candidate, pass_deadline: Option<Instant>) -> Step {
+        let policy = self.policy;
+        let caps = match self
+            .bounded(pass_deadline, self.host.relay_caps(&candidate.key.relay))
+            .await
+        {
+            Ok(caps) => caps,
+            Err(step) => return step,
+        };
+        let key = candidate.key.clone();
+        let plan = match self
+            .host
+            .debt_turn(move |turn| recheck::begin(turn, &key, caps, &policy))
+            .await
+        {
+            None => return Step::Stopped,
+            Some(Ok(Some(plan))) => plan,
+            Some(Ok(None)) => return Step::Raced,
+            Some(Err(error)) => {
+                log_failure("recheck_begin", error);
+                let outcome = RecoveryUnitOutcome::LocalFailure;
+                let now = self.host.now_seconds();
+                self.memory
+                    .recheck_settled(&candidate.key, false, outcome, now, &self.policy);
+                return Step::Ran(QuantumSummary {
+                    key: candidate.key,
+                    best_effort: false,
+                    outcome,
+                    recheck: true,
+                });
+            }
+        };
+        let deadline = Instant::now() + policy.quantum;
+        let ranges = plan.compare.ranges.len();
+        let preempt = self.cancel.child_token();
+        let (report, facts) = {
+            let run = compare::run(&*self.host, &plan.compare, deadline, &preempt, &policy);
+            tokio::pin!(run);
+            tokio::select! {
+                ran = &mut run => ran,
+                () = sleep_until(pass_deadline) => {
+                    preempt.cancel();
+                    run.await
+                }
+            }
+        };
+        if compare::would_not_compare(facts.end) {
+            self.memory.would_not_compare(&candidate.key.relay);
+        }
+        let settled = match self
+            .host
+            .turn(move |turn| recheck::settle(turn, &plan, &report, &facts, &policy))
+            .await
+        {
+            None => return Step::Stopped,
+            Some(Ok(settled)) => settled,
+            Some(Err(error)) => {
+                log_failure("recheck_settle", error);
+                recheck::RecheckSettled {
+                    outcome: RecoveryUnitOutcome::LocalFailure,
+                    complete: false,
+                    moved: false,
+                }
+            }
+        };
+        let now = self.host.now_seconds();
+        self.memory.recheck_settled(
+            &candidate.key,
+            settled.moved,
+            settled.outcome,
+            now,
+            &self.policy,
+        );
+        self.signals
+            .late_findings
+            .fetch_add(facts.late, Ordering::Relaxed);
+        tracing::debug!(
+            target: TARGET,
+            method = "recheck",
+            outcome = outcome_label(settled.outcome),
+            end = facts.end.label(),
+            complete = settled.complete,
+            ranges,
+            requests = report.requests,
+            answers = report.answers,
+            proved_seconds = report.proved_seconds,
+            late_findings = facts.late,
+        );
+        Step::Ran(QuantumSummary {
+            key: candidate.key,
+            best_effort: false,
+            outcome: settled.outcome,
+            recheck: true,
         })
     }
 
@@ -506,10 +651,12 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 }
             };
             let written = relay.clone();
+            let policy = self.policy;
             let recorded = self
                 .host
                 .turn(move |turn| {
-                    turn.app.record_recovery_relay_reconnected(&written)?;
+                    turn.app
+                        .record_recovery_relay_reconnected(&written, &policy.unit, turn.now)?;
                     if caps.is_some() {
                         turn.app
                             .record_recovery_relay_caps(&written, caps, turn.now)?;

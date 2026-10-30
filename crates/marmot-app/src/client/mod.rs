@@ -38,8 +38,9 @@ use zeroize::Zeroizing;
 
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{
-    GroupConfirmationProjection, add_group, fail_if_publish_failed, publish_failure_error,
-    send_summary_from_effects, validate_group_profile,
+    GroupConfirmationProjection, accept_disposition_from_effects, add_group,
+    fail_if_publish_failed, publish_failure_error, send_summary_from_effects,
+    validate_group_profile,
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
@@ -2922,7 +2923,11 @@ impl AppClient {
         let summary = self
             .invite_members_with_optional_telemetry(group_id, member_refs, &[], None)
             .await?;
-        self.drive_unpublished_welcome_delivery(None).await;
+        // As the account worker does: only a published commit has Welcomes
+        // to send now (mdk#2726).
+        if summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published {
+            self.drive_unpublished_welcome_delivery(None).await;
+        }
         Ok(summary)
     }
 
@@ -3208,6 +3213,14 @@ impl AppClient {
                 return Err(error);
             }
         };
+        // A commit the relays left unresolved is retained for exact retry,
+        // and its staged Welcomes wait for it to confirm. Drop the slot so
+        // whatever drives it next cannot send them early (mdk#2726).
+        if accept_disposition_from_effects(&effects)
+            != cgka_traits::SendAcceptDisposition::Published
+        {
+            self.unpublished_welcome_delivery = None;
+        }
         // The account worker sends the owed snapshot.
         self.push_registration_share_queued |= push_snapshot.is_some();
 
