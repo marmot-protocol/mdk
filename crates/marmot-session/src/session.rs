@@ -838,6 +838,17 @@ impl AccountDeviceSession {
         Ok(self.engine.withdraw_sent_welcome(id)?)
     }
 
+    /// See `Engine::sent_welcomes_for_key_package`.
+    pub fn sent_welcomes_for_key_package(
+        &self,
+        group_id: &GroupId,
+        key_package_event_id: &MessageId,
+    ) -> SessionResult<Vec<MessageId>> {
+        Ok(self
+            .engine
+            .sent_welcomes_for_key_package(group_id, key_package_event_id)?)
+    }
+
     /// See `Engine::sent_welcome_withdrawn`.
     pub fn sent_welcome_withdrawn(&self, id: &MessageId) -> SessionResult<bool> {
         Ok(self.engine.sent_welcome_withdrawn(id)?)

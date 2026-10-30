@@ -7,8 +7,8 @@
 
 use super::activation::{buffer_unsettled, queued_intents};
 use super::device_roster::{
-    entry, expect_link_welcome, found_device_group, phone_and_laptop, roster, roster_device,
-    roster_of, roster_update, slot,
+    create_under, entry, expect_link_welcome, found_device_group, phone_and_laptop, roster,
+    roster_device, roster_of, roster_update, slot,
 };
 use super::send_intents::{pending_proposals, store_pending_add};
 use super::*;
@@ -16,6 +16,7 @@ use cgka_traits::app_components::{
     DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1, MAX_LEAVES_PER_ACCOUNT,
     RejectedSlotReasonV1, RejectedSlotV1, encode_device_roster_update_v1,
 };
+use cgka_traits::engine::KeyPackageSource;
 use openmls::prelude::ProposalOrRefType;
 
 /// The sender rule's refusal of an Add without its roster entry.
@@ -518,6 +519,85 @@ async fn a_device_group_commit_takes_no_add_from_the_proposal_store() {
         &gid,
     )
     .await;
+}
+
+/// `device`'s fresh KeyPackage, as published under `event_id`.
+async fn published_key_package(device: &mut Device, event_id: &MessageId) -> KeyPackage {
+    let mut key_package = device.engine.fresh_key_package().await.unwrap();
+    key_package.source = Some(KeyPackageSource {
+        event_id: event_id.clone(),
+    });
+    key_package
+}
+
+/// A link's Welcome keeps the event id of the KeyPackage it answers while
+/// staged, once owed and once withdrawn, and so does a device group's
+/// founding Welcome, so a device that lost a Welcome's id after the commit
+/// still finds it by that KeyPackage (D40).
+#[tokio::test]
+async fn a_welcome_is_found_by_its_key_package_event_id() {
+    let mut first = roster_device(b"alice");
+    let founding_event = MessageId::new(vec![0x61; 32]);
+    let laptop_key_package =
+        published_key_package(&mut roster_device(b"alice"), &founding_event).await;
+    let (founded, created) = create_under(
+        &mut first,
+        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        vec![laptop_key_package],
+        &GroupId::new(vec![0x42; 16]),
+    )
+    .await
+    .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
+        panic!("current-profile founding group")
+    };
+    assert_eq!(
+        first
+            .engine
+            .sent_welcomes_for_key_package(&founded, &founding_event)
+            .unwrap(),
+        vec![welcomes[0].id.clone()]
+    );
+
+    let (mut phone, _laptop, gid) = phone_and_laptop().await;
+    let link_event = MessageId::new(vec![0x62; 32]);
+    let key_package = published_key_package(&mut roster_device(b"alice"), &link_event).await;
+    let SendResult::GroupEvolution {
+        welcomes, pending, ..
+    } = phone
+        .engine
+        .send(link(
+            &gid,
+            &key_package,
+            vec![DeviceRosterOperationV1::SetDevice(
+                slot(3),
+                linked_entry("Tablet", &key_package),
+            )],
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("expected GroupEvolution")
+    };
+    let found = |phone: &Device| {
+        phone
+            .engine
+            .sent_welcomes_for_key_package(&gid, &link_event)
+            .unwrap()
+    };
+    let welcome = vec![welcomes[0].id.clone()];
+    assert_eq!(found(&phone), welcome, "staged");
+    phone.engine.confirm_published(pending).await.unwrap();
+    assert_eq!(found(&phone), welcome, "owed");
+    phone.engine.withdraw_sent_welcome(&welcome[0]).unwrap();
+    assert_eq!(found(&phone), welcome, "withdrawn");
+    assert!(
+        phone
+            .engine
+            .sent_welcomes_for_key_package(&gid, &founding_event)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn unlink(

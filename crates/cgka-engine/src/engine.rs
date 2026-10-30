@@ -3324,7 +3324,7 @@ impl<S: StorageProvider> Engine<S> {
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
         let message = match &payload {
-            StoredMessagePayload::OutboundWelcome(message) => Some(message),
+            StoredMessagePayload::OutboundWelcome { message, .. } => Some(message),
             // `RawTransport` is the explicit legacy representation used before
             // delivery-aware and staged Welcome variants existed. New invite
             // paths never use it while a commit is unconfirmed.
@@ -3388,7 +3388,7 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<Vec<(GroupId, TransportMessage)>, EngineError> {
         let mut welcomes = Vec::new();
         self.visit_welcome_records(&[MessageState::Sent], |group_id, _, _, payload| {
-            if let StoredMessagePayload::OutboundWelcome(message) = payload
+            if let StoredMessagePayload::OutboundWelcome { message, .. } = payload
                 && matches!(message.envelope, TransportEnvelope::Welcome { .. })
             {
                 welcomes.push((group_id.clone(), message));
@@ -3410,7 +3410,7 @@ impl<S: StorageProvider> Engine<S> {
         self.visit_welcome_records(TRACKED_WELCOME_STATES, |_, id, _, payload| {
             if matches!(
                 payload,
-                StoredMessagePayload::OutboundWelcome(_)
+                StoredMessagePayload::OutboundWelcome { .. }
                     | StoredMessagePayload::StagedInviteWelcome { .. }
             ) {
                 ids.push(id);
@@ -3424,7 +3424,7 @@ impl<S: StorageProvider> Engine<S> {
         let mut index = WelcomeDeliveryIndex::default();
         self.visit_welcome_records(TRACKED_WELCOME_STATES, |group_id, id, state, payload| {
             match payload {
-                StoredMessagePayload::OutboundWelcome(message) => {
+                StoredMessagePayload::OutboundWelcome { message, .. } => {
                     index.tracked_ids.push(id);
                     if state == MessageState::Sent
                         && matches!(message.envelope, TransportEnvelope::Welcome { .. })
@@ -3490,7 +3490,7 @@ impl<S: StorageProvider> Engine<S> {
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
         let message = match &payload {
-            StoredMessagePayload::OutboundWelcome(message)
+            StoredMessagePayload::OutboundWelcome { message, .. }
             | StoredMessagePayload::StagedInviteWelcome { message, .. } => Some(message),
             StoredMessagePayload::RawTransport(_)
             | StoredMessagePayload::OpenMlsWire(_)
@@ -3517,6 +3517,35 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    /// The retained outbound Welcomes of `group_id` that answer the
+    /// KeyPackage published as `key_package_event_id`: staged, owed,
+    /// delivered or withdrawn. A caller that knows the KeyPackage but lost
+    /// the Welcome's id, say to a crash right after the commit, finds it here
+    /// to withdraw it (mdk#2628 item 3.3b, D40). Only Welcomes that recorded
+    /// their KeyPackage's event id are found.
+    ///
+    /// Like withdrawal, it reads only the Welcomes' own rows, so it works for
+    /// a group not hydrated yet.
+    pub fn sent_welcomes_for_key_package(
+        &self,
+        group_id: &GroupId,
+        key_package_event_id: &MessageId,
+    ) -> Result<Vec<MessageId>, EngineError> {
+        let mut ids = Vec::new();
+        for record in
+            self.storage
+                .list_messages_in_states(group_id, TRACKED_WELCOME_STATES, EpochId(0))?
+        {
+            let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+                continue;
+            };
+            if payload.welcome_key_package_event_id() == Some(key_package_event_id) {
+                ids.push(record.id);
+            }
+        }
+        Ok(ids)
+    }
+
     /// Whether `id` names a retained outbound Welcome that must never be
     /// published again: withdrawn, or retired with its staged commit. A
     /// missing row is not withdrawn, so a caller publishing an artifact this
@@ -3536,7 +3565,7 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(true);
         };
         Ok(match &payload {
-            StoredMessagePayload::OutboundWelcome(message)
+            StoredMessagePayload::OutboundWelcome { message, .. }
             | StoredMessagePayload::StagedInviteWelcome { message, .. }
             | StoredMessagePayload::RawTransport(message) => {
                 matches!(message.envelope, TransportEnvelope::Welcome { .. })

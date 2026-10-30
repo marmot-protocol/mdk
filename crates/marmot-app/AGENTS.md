@@ -138,8 +138,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `linked_at`. A decided link never changes, and a link whose approval still waits to be retried is not decided. A
   failed link ends its prompt as `LinkFailed` with a `CannotLink` cancel. On each drive it then withdraws its Welcome
   (`withdraw_welcome`, by the id stored after the commit) until that succeeds and clears the id, and, while the roster
-  lists the device as this device's link, removes its leaf and entry in one `SendIntent::UnlinkDevice` commit (a
-  roster-only update when no leaf is left); a withdrawal that fails never holds the removal back. A link refused as
+  lists the device as this device's link, removes its entry, and its leaf if the engine's tree still has one, in one
+  `SendIntent::UnlinkDevice` commit; never decide the leaf from the stored member list, which a staged removal has
+  already changed. A withdrawal that fails never holds the removal back. A link refused as
   `LinkDeviceUnsettled` made no commit, even while another commit resolves. Publish an undelivered Welcome again every
   few seconds until the new device's Welcome wait ends; neither its publication nor its delivery decides a link.
   `drive_unpublished_welcome_delivery` returns a `#[must_use]` `WelcomeDelivery`; chat creation goes on either way, as

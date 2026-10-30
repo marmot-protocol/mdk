@@ -46,16 +46,27 @@ pub struct DeviceLinkRecord {
     pub slot_hex: String,
     /// The `KeyPackageRef` both users confirmed.
     pub key_package_ref_hex: String,
+    /// That KeyPackage's event id, which names the link's Welcome.
+    pub key_package_event_id_hex: String,
     /// The signature key of that KeyPackage's leaf: the leaf the link adds,
     /// and the tag signature key the new device sets with its first commit.
     pub leaf_signature_key_hex: String,
-    /// The link's Welcome, once the approving commit made it.
-    pub welcome_id_hex: Option<String>,
     /// When this device approved the link, just before its commit.
     pub linked_at: u64,
     pub outcome: DeviceLinkOutcome,
     /// When the outcome was decided; `None` while pending.
     pub decided_at: Option<u64>,
+    /// Whether a failed link's Welcome is withdrawn.
+    pub welcome_withdrawn: bool,
+}
+
+/// The KeyPackage a link adds, as [`SqliteAppStorage::record_device_link`]
+/// records it.
+#[derive(Clone, Copy, Debug)]
+pub struct LinkedKeyPackage<'a> {
+    pub key_package_ref_hex: &'a str,
+    pub key_package_event_id_hex: &'a str,
+    pub leaf_signature_key_hex: &'a str,
 }
 
 impl SqliteAppStorage {
@@ -65,28 +76,29 @@ impl SqliteAppStorage {
         &self,
         group_id_hex: &str,
         slot_hex: &str,
-        key_package_ref_hex: &str,
-        leaf_signature_key_hex: &str,
+        key_package: LinkedKeyPackage<'_>,
         linked_at: u64,
     ) -> StorageResult<()> {
         self.lock()?
             .execute_cached(
                 "INSERT INTO device_links
-                     (group_id_hex, slot_hex, key_package_ref_hex, leaf_signature_key_hex,
-                      welcome_id_hex, linked_at, outcome, decided_at)
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'pending', NULL)
+                     (group_id_hex, slot_hex, key_package_ref_hex, key_package_event_id_hex,
+                      leaf_signature_key_hex, linked_at, outcome, decided_at, welcome_withdrawn)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, 0)
                  ON CONFLICT (group_id_hex, slot_hex) DO UPDATE SET
                      key_package_ref_hex = excluded.key_package_ref_hex,
+                     key_package_event_id_hex = excluded.key_package_event_id_hex,
                      leaf_signature_key_hex = excluded.leaf_signature_key_hex,
-                     welcome_id_hex = NULL,
                      linked_at = excluded.linked_at,
                      outcome = 'pending',
-                     decided_at = NULL",
+                     decided_at = NULL,
+                     welcome_withdrawn = 0",
                 params![
                     group_id_hex,
                     slot_hex,
-                    key_package_ref_hex,
-                    leaf_signature_key_hex,
+                    key_package.key_package_ref_hex,
+                    key_package.key_package_event_id_hex,
+                    key_package.leaf_signature_key_hex,
                     u64_to_i64(linked_at)?
                 ],
             )
@@ -94,41 +106,21 @@ impl SqliteAppStorage {
         Ok(())
     }
 
-    /// Record the Welcome a pending link's approving commit made. Returns
-    /// whether the link was pending.
-    pub fn record_device_link_welcome(
+    /// Record that a failed link's Welcome is withdrawn, so nothing withdraws
+    /// it again. Returns whether the link had failed with its Welcome not yet
+    /// withdrawn.
+    pub fn mark_device_link_welcome_withdrawn(
         &self,
         group_id_hex: &str,
         slot_hex: &str,
-        welcome_id_hex: &str,
     ) -> StorageResult<bool> {
         let changed = self
             .lock()?
             .execute_cached(
-                "UPDATE device_links SET welcome_id_hex = ?3
-                 WHERE group_id_hex = ?1 AND slot_hex = ?2 AND outcome = 'pending'",
-                params![group_id_hex, slot_hex, welcome_id_hex],
-            )
-            .storage()?;
-        Ok(changed != 0)
-    }
-
-    /// Forget a failed link's Welcome once it is withdrawn, so nothing
-    /// withdraws it again. Returns whether the link failed with that
-    /// Welcome recorded.
-    pub fn clear_failed_device_link_welcome(
-        &self,
-        group_id_hex: &str,
-        slot_hex: &str,
-        welcome_id_hex: &str,
-    ) -> StorageResult<bool> {
-        let changed = self
-            .lock()?
-            .execute_cached(
-                "UPDATE device_links SET welcome_id_hex = NULL
+                "UPDATE device_links SET welcome_withdrawn = 1
                  WHERE group_id_hex = ?1 AND slot_hex = ?2 AND outcome = 'failed'
-                     AND welcome_id_hex = ?3",
-                params![group_id_hex, slot_hex, welcome_id_hex],
+                     AND welcome_withdrawn = 0",
+                params![group_id_hex, slot_hex],
             )
             .storage()?;
         Ok(changed != 0)
@@ -249,7 +241,8 @@ impl SqliteAppStorage {
 }
 
 const SELECT_LINK: &str = "SELECT group_id_hex, slot_hex, key_package_ref_hex,
-         leaf_signature_key_hex, welcome_id_hex, linked_at, outcome, decided_at
+         key_package_event_id_hex, leaf_signature_key_hex, linked_at, outcome, decided_at,
+         welcome_withdrawn
      FROM device_links";
 
 type DeviceLinkRow = (
@@ -257,10 +250,11 @@ type DeviceLinkRow = (
     String,
     String,
     String,
-    Option<String>,
+    String,
     i64,
     String,
     Option<i64>,
+    bool,
 );
 
 fn device_link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceLinkRow> {
@@ -273,6 +267,7 @@ fn device_link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceLinkRow> {
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
     ))
 }
 
@@ -281,22 +276,24 @@ fn device_link_record(
         group_id_hex,
         slot_hex,
         key_package_ref_hex,
+        key_package_event_id_hex,
         leaf_signature_key_hex,
-        welcome_id_hex,
         linked_at,
         outcome,
         decided_at,
+        welcome_withdrawn,
     ): DeviceLinkRow,
 ) -> StorageResult<DeviceLinkRecord> {
     Ok(DeviceLinkRecord {
         group_id_hex,
         slot_hex,
         key_package_ref_hex,
+        key_package_event_id_hex,
         leaf_signature_key_hex,
-        welcome_id_hex,
         linked_at: i64_to_u64(linked_at)?,
         outcome: DeviceLinkOutcome::parse(&outcome)?,
         decided_at: decided_at.map(i64_to_u64).transpose()?,
+        welcome_withdrawn,
     })
 }
 
@@ -306,19 +303,31 @@ mod tests {
     use crate::SqliteAccountStorage;
     use DeviceLinkOutcome::*;
 
+    fn key_package<'a>(
+        ref_hex: &'a str,
+        event_id_hex: &'a str,
+        leaf_hex: &'a str,
+    ) -> LinkedKeyPackage<'a> {
+        LinkedKeyPackage {
+            key_package_ref_hex: ref_hex,
+            key_package_event_id_hex: event_id_hex,
+            leaf_signature_key_hex: leaf_hex,
+        }
+    }
+
     #[test]
     fn a_link_is_decided_once_and_a_new_link_starts_pending_again() {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-        store.record_device_link("aa", "01", "ab", "11", 5).unwrap();
-        assert!(store.record_device_link_welcome("aa", "01", "w1").unwrap());
+        store
+            .record_device_link("aa", "01", key_package("ab", "e1", "11"), 5)
+            .unwrap();
         assert!(store.decide_device_link("aa", "01", Linked, 7).unwrap());
         assert!(!store.decide_device_link("aa", "01", Failed, 8).unwrap());
-        assert!(!store.record_device_link_welcome("aa", "01", "w2").unwrap());
         assert!(store.decide_device_link("aa", "01", Pending, 8).is_err());
-        // Only a failed link's Welcome is forgotten.
+        // Only a failed link's Welcome is withdrawn.
         assert!(
             !store
-                .clear_failed_device_link_welcome("aa", "01", "w1")
+                .mark_device_link_welcome_withdrawn("aa", "01")
                 .unwrap()
         );
         assert_eq!(
@@ -327,16 +336,21 @@ mod tests {
                 group_id_hex: "aa".into(),
                 slot_hex: "01".into(),
                 key_package_ref_hex: "ab".into(),
+                key_package_event_id_hex: "e1".into(),
                 leaf_signature_key_hex: "11".into(),
-                welcome_id_hex: Some("w1".into()),
                 linked_at: 5,
                 outcome: Linked,
                 decided_at: Some(7),
+                welcome_withdrawn: false,
             }
         );
 
-        store.record_device_link("aa", "01", "cd", "22", 9).unwrap();
-        store.record_device_link("aa", "02", "ef", "33", 6).unwrap();
+        store
+            .record_device_link("aa", "01", key_package("cd", "e2", "22"), 9)
+            .unwrap();
+        store
+            .record_device_link("aa", "02", key_package("ef", "e3", "33"), 6)
+            .unwrap();
         let links = store.device_links().unwrap();
         assert_eq!(
             links
@@ -346,29 +360,38 @@ mod tests {
             vec![("02", Pending, None), ("01", Pending, None)]
         );
         assert_eq!(links[1].key_package_ref_hex, "cd");
+        assert_eq!(links[1].key_package_event_id_hex, "e2");
         assert_eq!(links[1].leaf_signature_key_hex, "22");
-        assert_eq!(links[1].welcome_id_hex, None);
         assert!(store.device_link("bb", "01").unwrap().is_none());
 
-        assert!(store.record_device_link_welcome("aa", "02", "w3").unwrap());
         assert!(store.decide_device_link("aa", "02", Failed, 10).unwrap());
         assert!(
-            !store
-                .clear_failed_device_link_welcome("aa", "02", "w4")
+            store
+                .mark_device_link_welcome_withdrawn("aa", "02")
                 .unwrap()
         );
         assert!(
-            store
-                .clear_failed_device_link_welcome("aa", "02", "w3")
+            !store
+                .mark_device_link_welcome_withdrawn("aa", "02")
                 .unwrap()
         );
-        assert_eq!(
+        assert!(
             store
                 .device_link("aa", "02")
                 .unwrap()
                 .unwrap()
-                .welcome_id_hex,
-            None
+                .welcome_withdrawn
+        );
+        // Linking the slot again starts with nothing withdrawn.
+        store
+            .record_device_link("aa", "02", key_package("ef", "e4", "33"), 11)
+            .unwrap();
+        assert!(
+            !store
+                .device_link("aa", "02")
+                .unwrap()
+                .unwrap()
+                .welcome_withdrawn
         );
     }
 
