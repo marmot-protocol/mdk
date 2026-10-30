@@ -1094,6 +1094,31 @@ async fn a_foreign_publication_dated_far_ahead_is_deleted_by_id() {
     );
 }
 
+/// A device with no slot yet, as a Welcome join records it before the
+/// device first publishes, still checks its account's sign-ins: it just has
+/// no slot of its own to read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_with_no_slot_yet_still_checks_sign_ins() {
+    let account = Account::new(2, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let mut laptop = account.open(1).await;
+    laptop
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            String::new(),
+        ))
+        .unwrap();
+
+    let report = laptop.check_sign_ins().await.unwrap();
+    assert!(report.complete);
+    assert!(report.own_slot_complete);
+    assert_eq!(report.foreign, Default::default());
+    assert!(report.slots.contains_key(&own_slot(&phone)));
+}
+
 /// With device groups off, nothing is checked, listed or answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sign_ins_stay_off_without_device_groups() {

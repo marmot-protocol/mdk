@@ -582,7 +582,9 @@ impl AppClient {
             .map(|event_id| hex::encode(event_id.as_slice()))
             .collect();
         Ok(OwnKeyPackages {
-            slot: Some(lifecycle.stable_slot_id),
+            // A Welcome join before this device's first publication records
+            // its slot empty: there is no slot of its own to read yet.
+            slot: Some(lifecycle.stable_slot_id).filter(|slot| !slot.is_empty()),
             events,
         })
     }
