@@ -36,18 +36,22 @@
 //!   when its relays are valid and its KeyPackage is one this device issued
 //!   to its sender. The dispatch that reads it cannot wait for a join, so an
 //!   admitted one is stashed (migration 0160) and each maintenance pass joins
-//!   from the stash, before upkeep tops the sender's stock up again. A
-//!   refused one is dropped like a refused hand-off; one admitted but not
-//!   stashed fails the event's projection, which is retried, so a failed
-//!   write never loses it.
+//!   from the stash, before upkeep tops the sender's stock up again, while
+//!   its carrier is still delivered. A refused one is dropped like a refused
+//!   hand-off, and so is one whose carrier a branch switch withdrew; one
+//!   admitted but not stashed fails the event's projection, which is retried,
+//!   so a failed write never loses it.
 
 use base64::Engine as _;
 use cgka_traits::app_components::{
     DeviceRosterV1, DeviceSlotId, DeviceTagClaim, NOSTR_ROUTING_MAX_RELAYS,
     validate_nostr_relay_url,
 };
-use cgka_traits::storage::{IssuedPrivateKeyPackage, MaintenanceStorage as _};
-use cgka_traits::{EpochId, GroupId, IngestOutcome, KeyPackage, MemberId, MessageId, Timestamp};
+use cgka_traits::storage::{IssuedPrivateKeyPackage, MaintenanceStorage as _, MessageStorage as _};
+use cgka_traits::{
+    EpochId, GroupId, IngestOutcome, KeyPackage, MemberId, MessageId, MessageState, StorageError,
+    Timestamp,
+};
 use marmot_session::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,
     MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW, PRIVATE_KEY_PACKAGE_STOCK_TARGET,
@@ -300,8 +304,9 @@ impl AppClient {
 
     /// Join a chat from every stashed sibling Welcome, oldest first, and
     /// project the joins. A Welcome leaves the stash once its join settles,
-    /// whether it joined or was refused; one whose join failed stays for the
-    /// next pass. A failure waits for the next pass.
+    /// whether it joined or was refused, and unjoined once its carrier is no
+    /// longer delivered; one whose join failed stays for the next pass. A
+    /// failure waits for the next pass.
     pub(crate) async fn join_stashed_sibling_welcomes(&mut self) {
         if !self.app.device_groups_enabled() || self.runtime.maintenance_is_paused() {
             return;
@@ -317,7 +322,8 @@ impl AppClient {
     }
 
     async fn try_join_stashed_sibling_welcomes(&mut self) -> Result<(), AppError> {
-        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let account = self.app.account_storage(&self.state.label)?;
+        let storage = account.app_storage();
         let stashed = storage.stashed_sibling_welcomes()?;
         if stashed.is_empty() {
             return Ok(());
@@ -326,14 +332,32 @@ impl AppClient {
         // their projection have settled.
         let policy_lock = self.app.block_update_lock(&self.state.label).await;
         let _policy_guard = policy_lock.lock().await;
-        let (mut joined, mut refused, mut failed) = (0usize, 0usize, 0usize);
+        let (mut joined, mut refused, mut withdrawn, mut failed) = (0usize, 0usize, 0usize, 0usize);
         for record in stashed {
-            let Ok(welcome) = SiblingWelcome::decode(&record.content) else {
+            let (Ok(welcome), Ok(message_id)) = (
+                SiblingWelcome::decode(&record.content),
+                hex::decode(&record.message_id_hex).map(MessageId::new),
+            ) else {
                 storage.delete_stashed_sibling_welcome(&record.message_id_hex)?;
                 refused += 1;
                 continue;
             };
-            let message_id = MessageId::new(hex::decode(&record.message_id_hex)?);
+            // Join only while the carrier is still delivered: a branch
+            // switch that withdraws it (or rolls it back) withdraws the
+            // Welcome too. Should the carrier be selected again, its replay
+            // stashes the Welcome again.
+            match account.get_message(&message_id) {
+                Ok(carrier) if carrier.state == MessageState::Processed => {}
+                Ok(_) | Err(StorageError::NotFound) => {
+                    storage.delete_stashed_sibling_welcome(&record.message_id_hex)?;
+                    withdrawn += 1;
+                    continue;
+                }
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            }
             match self
                 .runtime
                 .join_sibling_welcome(&message_id, &welcome, Some(Timestamp(record.created_at)))
@@ -355,6 +379,7 @@ impl AppClient {
             method = "join_stashed_sibling_welcomes",
             joined,
             refused,
+            withdrawn,
             failed,
             "joined from stashed sibling Welcomes"
         );
@@ -624,11 +649,14 @@ impl AppClient {
 }
 
 /// Whether `relays` is a sibling Welcome's valid relay list: one to
-/// [`NOSTR_ROUTING_MAX_RELAYS`] Nostr relay URLs, none repeated.
+/// [`NOSTR_ROUTING_MAX_RELAYS`] Nostr relay URLs, none repeated once parsed.
+/// Parsing folds host case, a default port and an empty path, so two
+/// spellings of one relay count as a repeat.
 fn valid_sibling_welcome_relays(relays: &[String]) -> bool {
+    let mut parsed = BTreeSet::new();
     (1..=NOSTR_ROUTING_MAX_RELAYS).contains(&relays.len())
-        && relays.iter().collect::<BTreeSet<_>>().len() == relays.len()
-        && relays
-            .iter()
-            .all(|relay| validate_nostr_relay_url(relay).is_ok())
+        && relays.iter().all(|relay| {
+            validate_nostr_relay_url(relay).is_ok()
+                && url::Url::parse(relay).is_ok_and(|url| parsed.insert(url))
+        })
 }

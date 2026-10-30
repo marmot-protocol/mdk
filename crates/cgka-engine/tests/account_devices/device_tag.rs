@@ -167,9 +167,31 @@ async fn a_member_leaf_reads_as_the_device_its_tag_names() {
         Some(DeviceTagClaim::Unclaimed)
     );
 
-    // Once later commits have pruned that epoch's anchor, it reads nothing,
+    // After a later commit, the tagged epoch still reads as the laptop, from
+    // its own anchor, again writing nothing.
+    send_commit(
+        &mut phone,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    let state = phone.storage.group_replay_state_fingerprint(&gid).unwrap();
+    let snapshots = phone.storage.list_group_snapshots(&gid).unwrap();
+    assert_eq!(
+        claim(&phone, &gid, after, laptop_leaf, &tagged),
+        Some(DeviceTagClaim::Device(slot(2)))
+    );
+    assert_eq!(
+        phone.storage.group_replay_state_fingerprint(&gid).unwrap(),
+        state
+    );
+    assert_eq!(phone.storage.list_group_snapshots(&gid).unwrap(), snapshots);
+
+    // Once later commits have pruned an epoch's anchor, it reads nothing,
     // never the current tree's tag.
-    for _ in 0..6 {
+    for _ in 0..5 {
         send_commit(
             &mut phone,
             SendIntent::SelfUpdate {

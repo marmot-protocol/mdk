@@ -228,9 +228,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `account_devices/device_tag.rs` (test-policy builds only)
   - **Owns:** `marmot.member.device-tag.v1` (0x800f, mdk#2628 item 3.1d) through the engine: a member leaf whose tag
-    verifies under a roster device's key reads as that device, against the current tree only; a tag that doesn't open
-    never invalidates a Commit; another account's leaf is unclaimed; a Commit, standalone proposal or Welcome that
-    requires 0x800f is rejected; a GroupContext entry under it is unknown data the engine never writes. Producing them:
+    verifies under a roster device's key reads as that device, in the tree of the epoch asked for (a past one from its
+    own retained anchor, writing nothing; one with no anchor reads nothing); a tag that doesn't open never invalidates
+    a Commit; another account's leaf is unclaimed; a Commit, standalone proposal or Welcome that requires 0x800f is
+    rejected; a GroupContext entry under it is unknown data the engine never writes. Producing them:
     a device that sets its own key in a roster update tags that Commit's UpdatePath; every KeyPackage it then builds
     carries a fresh tag, and an untagged or no longer matching one is stale; only the entry at its own slot tags, so
     another entry carrying its key tags nothing and an entry moved off its slot stops it tagging; a founder tags its

@@ -17,7 +17,7 @@ use marmot_session::{
     MAX_HAND_OFF_KEY_PACKAGES, PrivateKeyPackageHandOff, PrivateKeyPackageRequest, PublishWork,
     SiblingWelcome,
 };
-use storage_sqlite::ReceivedPrivateKeyPackage;
+use storage_sqlite::{ReceivedPrivateKeyPackage, StashedSiblingWelcome};
 
 fn slot(client: &AppClient) -> DeviceSlotId {
     hex::decode(own_slot(client)).unwrap().try_into().unwrap()
@@ -630,7 +630,8 @@ async fn a_device_stashes_only_a_sibling_welcome_it_can_trust() {
             key_package_ref: vec![5; 32],
             ..welcome.clone()
         },
-        // No relay, one off the relay URL profile, one repeated, too many.
+        // No relay, one off the relay URL profile, one repeated (as
+        // spelled, or once parsed), too many.
         SiblingWelcome {
             relays: Vec::new(),
             ..welcome.clone()
@@ -641,6 +642,21 @@ async fn a_device_stashes_only_a_sibling_welcome_it_can_trust() {
         },
         SiblingWelcome {
             relays: vec!["wss://relay.example".into(); 2],
+            ..welcome.clone()
+        },
+        SiblingWelcome {
+            relays: vec!["wss://relay.example".into(), "wss://relay.example/".into()],
+            ..welcome.clone()
+        },
+        SiblingWelcome {
+            relays: vec!["wss://Relay.Example".into(), "wss://relay.example".into()],
+            ..welcome.clone()
+        },
+        SiblingWelcome {
+            relays: vec![
+                "wss://relay.example:443".into(),
+                "wss://relay.example".into(),
+            ],
             ..welcome.clone()
         },
         SiblingWelcome {
@@ -660,6 +676,63 @@ async fn a_device_stashes_only_a_sibling_welcome_it_can_trust() {
     send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
     deliver_all(&mut devices.phone, &devices.relay).await;
     assert_eq!(stashed(&devices.phone), 1);
+}
+
+/// A sibling Welcome whose carrier is withdrawn before the phone's next
+/// maintenance pass, by a branch switch or a rollback that drops it, joins
+/// nothing and leaves its KeyPackage issued. The same Welcome sent again, and
+/// still delivered, joins, even behind a stash row whose id is corrupt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawn_sibling_welcome_joins_nothing() {
+    use cgka_traits::storage::MessageStorage as _;
+    let (mut devices, group) = tagging_devices().await;
+    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
+    let issued_before = issued(&devices.phone);
+    fn invalidate(client: &AppClient, carrier: &MessageId) {
+        let storage = client.app.account_storage("alice").unwrap();
+        storage
+            .update_message_state(carrier, cgka_traits::MessageState::EpochInvalidated)
+            .unwrap();
+    }
+    fn drop_carrier(client: &AppClient, carrier: &MessageId) {
+        let storage = client.app.account_storage("alice").unwrap();
+        storage.delete_message(carrier).unwrap();
+    }
+    for withdraw in [invalidate, drop_carrier] {
+        send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
+        deliver_all(&mut devices.phone, &devices.relay).await;
+        let [record] = <[_; 1]>::try_from(
+            devices_storage(&devices.phone)
+                .stashed_sibling_welcomes()
+                .unwrap(),
+        )
+        .unwrap();
+        withdraw(
+            &devices.phone,
+            &MessageId::new(hex::decode(&record.message_id_hex).unwrap()),
+        );
+        devices.phone.run_due_maintenance().await.unwrap();
+        assert_eq!(stashed(&devices.phone), 0);
+        assert!(devices.phone.state_group_record(&chat).is_none());
+        assert_eq!(issued(&devices.phone), issued_before);
+    }
+
+    assert!(
+        devices_storage(&devices.phone)
+            .stash_sibling_welcome(&StashedSiblingWelcome {
+                message_id_hex: "not hex".into(),
+                content: welcome.encode().unwrap(),
+                created_at: 0,
+                received_at: 0,
+            })
+            .unwrap()
+    );
+    send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 2);
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert_eq!(stashed(&devices.phone), 0);
+    assert!(devices.phone.state_group_record(&chat).is_some());
 }
 
 /// Deliver every group message on `relay` to `client`, whatever projecting
