@@ -151,8 +151,9 @@ where
 
     /// Whether this device may commit in the device group `group_id` now:
     /// it is stable and not held, quarantined or settling, and nothing of
-    /// this device's is queued or unconfirmed there.
-    pub(super) fn device_group_takes_commit(
+    /// this device's is queued or unconfirmed there. Every commit this device
+    /// made there has then reached its outcome.
+    pub fn device_group_takes_commit(
         &mut self,
         group_id: &GroupId,
         held: &[GroupId],

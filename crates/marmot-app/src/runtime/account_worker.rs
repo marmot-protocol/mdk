@@ -5,7 +5,7 @@ mod attachments;
 pub(crate) mod recovery_credits;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
-use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
+use marmot_observability::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -33,7 +33,6 @@ use super::{
     RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
     runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
-use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 use crate::client::recovery::AttemptGrant;
 use crate::client::{
     CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
@@ -54,6 +53,9 @@ use crate::{
     RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
+use marmot_observability::app_telemetry::{
+    AppPerformanceOperation, SyncFailureClassification, SyncFailureStage,
+};
 
 enum ComparisonRecoveryOrigin {
     PeriodicMaintenance,
@@ -76,7 +78,7 @@ struct ComparisonRecoveryJob {
     /// The process credit the network task released, held through admission
     /// and checkpoint.
     credit: Option<Arc<OwnedSemaphorePermit>>,
-    observation: Option<crate::product_analytics::ProductObservation>,
+    observation: Option<marmot_observability::product_analytics::ProductObservation>,
     backfill_armed: bool,
     phase: Option<Observation>,
     origin: ComparisonRecoveryOrigin,
@@ -91,7 +93,7 @@ impl ComparisonRecoveryJob {
         grant: AttemptGrant,
         execution: ComparisonExecution,
         network: ComparisonNetworkJob,
-        observation: Option<crate::product_analytics::ProductObservation>,
+        observation: Option<marmot_observability::product_analytics::ProductObservation>,
         backfill_armed: bool,
         phase: Option<Observation>,
         origin: ComparisonRecoveryOrigin,
@@ -241,7 +243,7 @@ impl AccountStartupStage {
 /// worker keeps its stage in flight until the open itself moves on.
 #[derive(Clone, Debug)]
 pub(crate) struct AccountStartupProgress {
-    telemetry: crate::observer::PerformanceRecorder,
+    telemetry: marmot_observability::observer::PerformanceRecorder,
     state: Arc<Mutex<StartupStageState>>,
 }
 
@@ -279,7 +281,7 @@ impl Drop for StageSpan {
 
 impl AccountStartupProgress {
     /// Open the `Spawned` span of a worker about to be spawned.
-    pub(crate) fn new(telemetry: crate::observer::PerformanceRecorder) -> Self {
+    pub(crate) fn new(telemetry: marmot_observability::observer::PerformanceRecorder) -> Self {
         let stage = AccountStartupStage::Spawned;
         let span = StageSpan {
             observation: Some(telemetry.observe(stage.operation())),
@@ -978,7 +980,10 @@ impl Drop for WelcomeRecoveryTask {
     }
 }
 
-fn install_storage_telemetry(client: &AppClient, telemetry: &crate::observer::PerformanceRecorder) {
+fn install_storage_telemetry(
+    client: &AppClient,
+    telemetry: &marmot_observability::observer::PerformanceRecorder,
+) {
     if let Ok(storage) = client.app.account_storage(&client.state.label) {
         let telemetry = telemetry.clone();
         storage.set_timing_observer(Some(Arc::new(move |operation, duration, success| {
@@ -3385,7 +3390,7 @@ async fn finish_periodic_maintenance_after_recovery(
     account_id_hex: &str,
     account_label: &str,
     shared: &RuntimeSharedServices,
-    product_backlog: &crate::observer::ProductBacklogSource,
+    product_backlog: &marmot_observability::observer::ProductBacklogSource,
     scheduled_convergence: &mut ScheduledConvergence,
 ) {
     if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
@@ -4181,7 +4186,7 @@ async fn handle_startup_hydration_command(
 const MEDIA_HTTP_IN_FLIGHT_LIMIT: usize = 4;
 
 struct MediaHttpContext {
-    product: crate::observer::ProductRecorder,
+    product: marmot_observability::observer::ProductRecorder,
     tx: mpsc::UnboundedSender<MediaHttpDone>,
     permits: Arc<Semaphore>,
     /// Prevent concurrent host retries from uploading the same durable blob
@@ -4199,7 +4204,7 @@ struct MediaHttpDone {
     /// bounded by `MEDIA_HTTP_IN_FLIGHT_LIMIT`.
     permit: OwnedSemaphorePermit,
     completion: MediaHttpCompletion,
-    cancellation: Option<crate::observer::ProductOperation>,
+    cancellation: Option<marmot_observability::observer::ProductOperation>,
 }
 
 /// Stores a fetched avatar image as a cache file and settles its attempt.
@@ -7637,7 +7642,7 @@ async fn report_pending_epoch_backfill_result(
     client: &mut AppClient,
     backfill_result: Result<EpochBackfillRunOutcome, AppError>,
     backfill_armed: bool,
-    observation: Option<crate::product_analytics::ProductObservation>,
+    observation: Option<marmot_observability::product_analytics::ProductObservation>,
     context: EpochBackfillReportContext<'_>,
 ) -> Result<(), AccountCatchUpFailure> {
     let EpochBackfillReportContext {

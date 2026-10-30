@@ -17,7 +17,6 @@ use super::{
     local_account_worker_response, long_account_worker_catch_up_response,
     long_account_worker_response, publish_app_runtime_group_state_updated,
 };
-use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
 use crate::{
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
@@ -29,6 +28,7 @@ use crate::{
     PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
     PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
 };
+use marmot_observability::app_telemetry::AppPerformanceOperation;
 
 impl AccountManager {
     #[cfg(test)]

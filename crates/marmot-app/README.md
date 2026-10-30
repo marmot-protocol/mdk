@@ -89,7 +89,8 @@ database and releases file locks; `shutdown` alone does not. See
 reaches live subscriptions only after the write behind it has committed, so an update a host received that way is
 still stored after `shutdown_and_close`.
 
-For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on; the user directory is the [`nostr-directory`](../nostr-directory) crate) see
+For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on; the user directory is the [`nostr-directory`](../nostr-directory) crate
+and the diagnostics exporters are the [`marmot-observability`](../marmot-observability) crate) see
 [`AGENTS.md`](AGENTS.md).
 
 ## SOCKS5 routing
@@ -415,11 +416,11 @@ writes them with its next KeyPackage announcement in the device group.
 
 `MarmotAppRuntime::rename_linked_device(account_ref, slot_id_hex, label)` renames any of the account's devices, this one
 included: one roster commit in the device group, through the same roster write path as slot announcements, that changes
-only that entry's label. The label is at most 64 bytes of UTF-8; empty clears it. While the device group has an earlier
-change of this device's in flight, the rename is refused as `DeviceGroupRefused("device_group_busy")` with nothing
-sent, since a commit then could build on a roster that is about to change; retry later. A rename whose commit loses a
-fork to one that also changes that device's entry is not made again, and the winning label stands. Show the label the
-next list returns after `LinkedDevicesChanged`, not the one the user typed.
+only that entry's label and rename id. The label is at most 64 bytes of UTF-8; empty clears it. While the device group
+has an earlier change of this device's in flight, the rename is refused as `DeviceGroupRefused("device_group_busy")`
+with nothing sent, since a commit then could build on a roster that is about to change; retry later. A rename whose
+commit loses a fork is made again on a later maintenance pass, unless another rename of that device won; that one
+stands. Show the label the next list returns after `LinkedDevicesChanged`, not the one the user typed.
 
 ### Overdue KeyPackage refresh
 

@@ -32,9 +32,9 @@
   (mdk#2628 item 3.6). It goes through the runtime's one roster write path,
   the one slot announcements use, and is refused with nothing sent
   (`device_group_busy`) while an earlier change of this device's in the
-  device group is in flight. A rename whose commit loses a fork to one that
-  also changes that device's entry is not made again, and the winning label
-  stands. Refused in release builds until the roster's spec lands.
+  device group is in flight. A rename whose commit loses a fork
+  is made again on a later maintenance pass, unless another rename of that
+  device won; that one stands (D37). Refused in release builds until the roster's spec lands.
 - `AppGroupMlsState.convergence_parked` reports a group whose convergence
   pass spent its failure budget (mdk#2684). Show it as stuck syncing until
   new group activity arrives or the user retries;
@@ -344,6 +344,13 @@
   left from `departed_members` and `GroupStateChanged`, and that this device
   was removed from `LocalGroupCopyTerminated`. MarmotKit and the C ABI
   already left the leaves out.
+- The diagnostics exporters move to the new `marmot-observability` crate
+  (mdk#2627): relay-telemetry export, product analytics and its consent
+  state, the app-performance recorder, the audit OTLP sender and the v4
+  audit upload's HTTP half. `marmot-app` re-exports every type at its old
+  `marmot_app::` path, the `product_analytics` and `audit_otlp_sender`
+  modules included, and its `otlp-export` and `product-analytics-export`
+  features forward to the crate, so hosts change nothing.
 - `marmot_app::product_analytics::configure_product_analytics_from_environment`
   no longer resolves (mdk#2627). Hosts call the same function as
   `marmot_app::configure_product_analytics_from_environment`, as before.

@@ -215,7 +215,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     instead of a queued link while convergence is unsettled or an own Commit is in flight. Its undo, `UnlinkDevice`
     (D40): one privileged Commit removing the linked leaf and its entry, which the removed device sees as its removal;
     refused for another leaf than one other leaf of the account, an update that doesn't remove exactly one listed
-    entry, or while an own Commit is in flight.
+    entry, or while an own Commit is in flight. A device it removed that forgot its copy joins again through the next
+    link's Welcome, which no forget cutoff dates.
 
 - **File:** `account_devices/device_group_welcome.rs` (test-policy builds only)
   - **Owns:** Which Welcome a new device joins its device group through (mdk#2628 D28, D30): only the one a stored

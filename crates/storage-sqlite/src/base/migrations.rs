@@ -286,6 +286,8 @@ mod migration_0134_recovery_recheck_revision;
 mod migration_0135_recovery_unit_fences;
 #[path = "migrations/0136_recovery_conversion.rs"]
 mod migration_0136_recovery_conversion;
+#[path = "migrations/0137_device_renames.rs"]
+mod migration_0137_device_renames;
 #[path = "migrations/0140_private_key_packages.rs"]
 mod migration_0140_private_key_packages;
 #[path = "migrations/0141_sonar_stickers.rs"]
@@ -1128,6 +1130,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0136_recovery_conversion",
         suspend_foreign_keys: &[],
         apply: migration_0136_recovery_conversion::apply,
+    },
+    Migration {
+        version: 137,
+        name: "0137_device_renames",
+        suspend_foreign_keys: &[],
+        apply: migration_0137_device_renames::apply,
     },
     Migration {
         version: 140,

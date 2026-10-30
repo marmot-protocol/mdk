@@ -71,8 +71,8 @@
   group (mdk#2628 item 3.6). It is refused with nothing sent while the device
   group has an earlier change in flight (`device_group_busy`; retry later),
   and in release builds until the roster's spec lands. A rename whose commit
-  loses a fork to one that also changes that device's entry is not made
-  again.
+  loses a fork is made again later, unless another rename of that device
+  won.
 
 - `AppGroupMlsStateFfi.convergence_parked` (default `false`) reports a group
   whose convergence pass spent its failure budget (mdk#2684). Show it as stuck

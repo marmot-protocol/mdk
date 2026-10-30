@@ -182,7 +182,7 @@ started/completed counters, five outcomes, histogram and live gauges. Hosts repo
 the actual outcome; merely leaving a scope does not establish success. These
 completed-duration reports have no live observation, so their live gauges are zero.
 Hosts should record every stage they can observe, and only those. Nested stages overlap and
-must not be summed. See the [operation definitions](../marmot-app/src/app_telemetry.rs) and
+must not be summed. See the [operation definitions](../marmot-observability/src/app_telemetry.rs) and
 [metric catalog](../../docs/marmot-architecture/telemetry.md#registered-host-stage-metrics).
 
 Use typed presentation, capability, deletion and group-system fields rather than parsing English
@@ -1009,8 +1009,8 @@ one roster commit in the device group:
   device group, for a slot the roster doesn't list, and while the device group has an earlier change of this device's
   in flight (`device_group_busy`). Retry that last one later; a commit then could build on a roster that is about to
   change.
-- A rename whose commit loses a fork to one that also changes that device's entry is not made again, and the winning
-  label stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`, not the one the user typed.
+- A rename whose commit loses a fork is made again on a later maintenance pass, unless another rename of that device
+  won; that one stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`, not the one the user typed.
 
 ### Overdue KeyPackage refresh
 

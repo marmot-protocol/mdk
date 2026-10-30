@@ -3863,7 +3863,7 @@ Remove an account and its local state from this device.
 MarmotStatus marmot_rename_linked_device(const struct MarmotClient *client, const char *account_ref, const char *slot_id_hex, const char *label);
 ```
 
-Rename one of this account's devices, this one included, by its `slot_id_hex` from `marmot_linked_devices`: one roster commit in the device group that sets only that device's label (at most 64 bytes of UTF-8; empty clears it). Refused with nothing sent in release builds, for a label that is too long, without a device group, for an unknown slot, and while an earlier change of this device's is still in flight there (retry later). A rename whose commit loses a fork to one that also changes that device's entry is not made again; show the label `marmot_linked_devices` returns after `MARMOT_EVENT_LINKED_DEVICES_CHANGED`.
+Rename one of this account's devices, this one included, by its `slot_id_hex` from `marmot_linked_devices`: one roster commit in the device group that sets only that device's label (at most 64 bytes of UTF-8; empty clears it). Refused with nothing sent in release builds, for a label that is too long, without a device group, for an unknown slot, and while an earlier change of this device's is still in flight there (retry later). A rename whose commit loses a fork is made again later, unless another rename of that device won; show the label `marmot_linked_devices` returns after `MARMOT_EVENT_LINKED_DEVICES_CHANGED`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotrename_linked_device) · [Header contract](include/marmot.h#L7947)
 
