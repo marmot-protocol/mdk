@@ -3304,7 +3304,9 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_engine() -> crate::Engine<storage_sqlite::SqliteAccountStorage> {
-        test_engine_with_storage(storage_sqlite::SqliteAccountStorage::in_memory().unwrap())
+        test_engine_with_storage(
+            storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap(),
+        )
     }
 
     pub(crate) fn test_engine_with_storage(

@@ -158,7 +158,7 @@ fn transport_message(payload: &[u8], envelope: TransportEnvelope) -> TransportMe
 }
 
 fn build_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     (build_client_with_storage(seed, storage.clone()), storage)
 }
 
@@ -452,13 +452,13 @@ async fn encrypted_replay_graph_fixture_with_apps(
             .build()
             .unwrap()
     };
-    let alice_store = SqliteAccountStorage::in_memory().unwrap();
+    let alice_store = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build(b"transaction-alice", alice_store.clone());
     let mut joiners = vec![build(b"transaction-observer", storage.clone())];
     for i in 2..size {
         joiners.push(build(
             format!("transaction-member-{i}").as_bytes(),
-            SqliteAccountStorage::in_memory().unwrap(),
+            SqliteAccountStorage::in_memory_for_test().unwrap(),
         ));
     }
     let mut packages = Vec::new();

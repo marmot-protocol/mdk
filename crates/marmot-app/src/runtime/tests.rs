@@ -934,7 +934,7 @@ async fn message_subscription_recv_ends_when_runtime_shutdown_begins() {
     let lifecycle = RuntimeLifecycle::new();
     let (updates_tx, updates) = mpsc::channel(1);
     let mut subscription = RuntimeMessagesSubscription {
-        policy_storage: storage_sqlite::SqliteAccountStorage::in_memory().unwrap(),
+        policy_storage: storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap(),
         snapshot: Vec::new(),
         updates,
         stopping: lifecycle.subscribe_shutdown(),
@@ -1155,7 +1155,7 @@ fn timeline_subscription_with(
 ) -> RuntimeTimelineMessagesSubscription {
     RuntimeTimelineMessagesSubscription {
         policy_window_size: window.messages.len().max(1),
-        policy_storage: storage_sqlite::SqliteAccountStorage::in_memory().unwrap(),
+        policy_storage: storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap(),
         window: timeline_window_handle(store, window, window_limit),
         updates,
         stopping,
