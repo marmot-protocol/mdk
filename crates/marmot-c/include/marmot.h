@@ -2749,6 +2749,8 @@ typedef struct MarmotHistoryNoticeList {
  * characters) is the handle actions on the device take. `label`,
  * `client` and `platform` are empty until set. `linked_at` is in Unix
  * seconds. `linked_by_slot_id_hex` is NULL for the founder.
+ * `removal_pending` is set while a removal decided on this device waits
+ * for the device group.
  */
 typedef struct MarmotLinkedDevice {
   char *slot_id_hex;
@@ -2762,6 +2764,7 @@ typedef struct MarmotLinkedDevice {
   bool add_to_all_chats;
   bool bring_history;
   bool keep_while_inactive;
+  bool removal_pending;
 } MarmotLinkedDevice;
 
 /**
@@ -7865,6 +7868,42 @@ MarmotStatus marmot_rename_linked_device(const struct MarmotClient *client,
                                          const char *account_ref,
                                          const char *slot_id_hex,
                                          const char *label);
+
+/**
+ * Remove another of this account's devices, by its `slot_id_hex` from
+ * `marmot_linked_devices`, from the device group and every chat, and
+ * delete its KeyPackage slot. The removal is recorded at once and
+ * carried out as the device group allows; the device shows
+ * `removal_pending` until then. Fails while device groups are off, for
+ * an unknown device, for this device (sign out instead), or for a
+ * device whose link is not made yet. Re-read on the
+ * `LinkedDevicesChanged` event.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_remove_linked_device(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *slot_id_hex);
+
+/**
+ * How many chats this device is in still hold a device this account
+ * removed, because the chat doesn't take a same-account removal; a chat
+ * admin can remove it. Zero while device groups are off. Not evented:
+ * read it when showing the device list.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_removed_device_leftover_chats(const struct MarmotClient *client,
+                                                  const char *account_ref,
+                                                  uint32_t *out);
 
 /**
  * On a new device: ask a device of this account already signed in to

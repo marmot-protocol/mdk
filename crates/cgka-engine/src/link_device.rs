@@ -34,15 +34,17 @@
 //! Commit, under the same rules: never queued, built from those two
 //! proposals only, and checked as every own device-group Commit is. The
 //! engine reads its own tree for the leaf: the Commit removes it only if the
-//! tree still has it, and removes the roster entry either way.
+//! tree still has it, and removes the roster entry either way. Removing a
+//! linked device (3.6b) is the same Commit, whose update also records the
+//! slot as `removed` with the tag signature key its entry had.
 
 use crate::engine::Engine;
 use crate::message_processor::route_wrapped_group_message;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
-    DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1, decode_device_roster_update_v1,
-    decode_device_roster_v1,
+    DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1, RejectedSlotReasonV1,
+    decode_device_roster_update_v1, decode_device_roster_v1,
 };
 use cgka_traits::engine::{KeyPackage, SendResult};
 use cgka_traits::engine_state::{
@@ -450,7 +452,9 @@ fn validate_link_roster_update(roster_update: &[u8]) -> Result<(), EngineError> 
 }
 
 /// The unlink's roster update removes exactly one device entry, of a slot the
-/// roster lists.
+/// roster lists. A removal (3.6b) also records that slot as `removed`,
+/// keeping the `tag_signature_key` its entry had so the removed device's tags
+/// still read as its slot; a failed link removes the entry alone.
 fn validate_unlink_roster_update(
     mls_group: &MlsGroup,
     roster_update: &[u8],
@@ -458,10 +462,19 @@ fn validate_unlink_roster_update(
     let update = decode_device_roster_update_v1(roster_update).map_err(|error| {
         EngineError::Serialize(format!("invalid device roster update: {error}"))
     })?;
-    let [DeviceRosterOperationV1::RemoveDevice(slot)] = update.operations() else {
-        return Err(EngineError::Other(
-            "invalid unlink roster update: it must remove exactly one device entry".into(),
-        ));
+    let (slot, record) = match update.operations() {
+        [DeviceRosterOperationV1::RemoveDevice(slot)] => (slot, None),
+        [
+            DeviceRosterOperationV1::RemoveDevice(slot),
+            DeviceRosterOperationV1::SetRejectedSlot(rejected, record),
+        ] if rejected == slot => (slot, Some(record)),
+        _ => {
+            return Err(EngineError::Other(
+                "invalid unlink roster update: it must remove exactly one device entry, and may \
+                 only record that slot as removed"
+                    .into(),
+            ));
+        }
     };
     let roster =
         crate::app_components::app_component_data_of_group(mls_group, DEVICE_ROSTER_COMPONENT_ID)
@@ -472,9 +485,23 @@ fn validate_unlink_roster_update(
         })?;
     let roster = decode_device_roster_v1(&roster)
         .map_err(|error| EngineError::Serialize(format!("invalid device roster state: {error}")))?;
-    if !roster.devices.contains_key(slot) {
+    let Some(entry) = roster.devices.get(slot) else {
         return Err(EngineError::Other(
             "invalid unlink roster update: the roster lists no such device".into(),
+        ));
+    };
+    // A removal names a device whose link is made: its entry has a tag
+    // signature key, which the record keeps so the device's tags still read
+    // as its slot. Undoing a failed link removes the entry alone.
+    if let Some(record) = record
+        && (record.reason != RejectedSlotReasonV1::Removed
+            || entry.tag_signature_key.is_none()
+            || record.tag_signature_key != entry.tag_signature_key)
+    {
+        return Err(EngineError::Other(
+            "invalid unlink roster update: the slot's record has reason removed and keeps the \
+             entry's tag signature key"
+                .into(),
         ));
     }
     Ok(())

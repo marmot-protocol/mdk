@@ -2396,6 +2396,30 @@ Rename one of this account's devices, this one included, by its `slot_id_hex` fr
 
 [Source](src/commands/linked_device.rs#L55)
 
+### `Marmot::remove_linked_device`
+
+**Current.**
+
+```rust
+pub async fn remove_linked_device( &self, account_ref: String, slot_id_hex: String, ) -> Result<(), MarmotKitError>
+```
+
+Remove another of this account's devices, by its `slot_id_hex` from `linked_devices`: from the device group and from every chat, and delete its KeyPackage slot so inviters stop adding it. The decision is recorded at once and carried out as the device group allows, so a busy device group only delays it; `linked_devices` lists the device with `removal_pending` until the device group takes the removal, then no longer lists it. Chats that can't take a same-account removal keep the device; `removed_device_leftover_chats` counts them. It is refused with `DeviceGroupRefused` and nothing recorded in release builds until the roster's spec lands (`roster_unsupported`), without a device group (`no_device_group`), for a slot the roster doesn't list (`unknown_device`), for this device (`this_device`: sign out instead), and for a device whose link may still fail (`device_link_pending`). Refresh on `LinkedDevicesChanged`. Runs on the account worker.
+
+[Source](src/commands/linked_device.rs#L77)
+
+### `Marmot::removed_device_leftover_chats`
+
+**Current.**
+
+```rust
+pub async fn removed_device_leftover_chats( &self, account_ref: String, ) -> Result<u32, MarmotKitError>
+```
+
+How many chats this device is in still hold a device this account removed, because the chat does not take a same-account removal. A chat admin can remove that device; show the count beside the device list so the user knows to ask. Zero until this device trusts a device group, and always zero in release builds until the device group's spec lands. It is not evented: read it when showing the device list. Runs on the account worker.
+
+[Source](src/commands/linked_device.rs#L93)
+
 </details>
 
 <details>
@@ -5017,3 +5041,4 @@ White Noise's deployment: its recovery relays, discovery indexers, media and ima
 [Source](src/deployment.rs#L90)
 
 </details>
+

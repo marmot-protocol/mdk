@@ -466,7 +466,7 @@ impl AppClient {
                 }
             }
         }
-        if operations.is_empty() || !self.device_group_quiet(&group_id)? {
+        if operations.is_empty() || !self.group_quiet(&group_id)? {
             return Ok(());
         }
         self.commit_device_roster_update(group_id, operations, "reject_sign_in")
@@ -534,14 +534,20 @@ impl AppClient {
         Ok(())
     }
 
-    /// Whether this device may commit in the device group now: it is stable
-    /// and readable, and nothing of this device's is queued or unconfirmed
+    /// Whether this device may commit in `group_id` now, the device group or
+    /// a chat: it is stable and readable, this device is not leaving or
+    /// disbanding it, and nothing of this device's is queued or unconfirmed
     /// there. A later pass retries.
-    fn device_group_quiet(&self, group_id: &GroupId) -> Result<bool, AppError> {
+    pub(crate) fn group_quiet(&self, group_id: &GroupId) -> Result<bool, AppError> {
         if !matches!(
             self.runtime.epoch_state(group_id),
             Some(EpochState::Stable { .. })
         ) || self.skips_quarantined_group_reads(group_id)
+            || self
+                .runtime
+                .leave_in_progress(group_id)
+                .map_err(marmot_session::SessionError::from)?
+            || self.runtime.disbanding_in_progress(group_id)?
             || self.epoch_gap_held_groups()?.contains(group_id)
             || self.runtime.has_pending_convergence_inputs(group_id)?
             || self.runtime.has_queued_outbound_intents(group_id)?

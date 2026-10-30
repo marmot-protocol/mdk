@@ -205,18 +205,22 @@ pub enum SendIntent {
         roster_update: Vec<u8>,
         deliver_until: Timestamp,
     },
-    /// Remove a device whose link failed from the account's device group,
-    /// with its roster entry, in one admin Commit (mdk#2628 item 3.3b, D40).
-    /// Only the device that approved the link sends it, once the new device
-    /// made no Commit in the device group by the link's deadline.
+    /// Remove a device from the account's device group, with its roster
+    /// entry, in one admin Commit: a device whose link failed (mdk#2628 item
+    /// 3.3b, D40), or a linked device the user removed or that signed out
+    /// (3.6b). For a failed link, only the device that approved it sends it,
+    /// once the new device made no Commit in the device group by the link's
+    /// deadline.
     ///
-    /// `leaf_signature_key` names the leaf the link added, as
+    /// `leaf_signature_key` names the device's leaf, as
     /// [`Member::credential`](crate::group::Member) reports it: another leaf
     /// of this device's account. The Commit removes that leaf only if the
     /// group's tree still has it, so an entry whose leaf is already gone is
     /// still removed. `roster_update` is a `marmot.account.device-roster.v1`
-    /// update with exactly one operation, removing the device entry of a slot
-    /// the roster lists. Like a link, it is never queued.
+    /// update that removes the device entry of a slot the roster lists. A
+    /// removal also sets that slot's rejected-slot record with reason
+    /// `removed` and the `tag_signature_key` the entry had; a failed link
+    /// removes the entry alone. Like a link, it is never queued.
     UnlinkDevice {
         group_id: GroupId,
         leaf_signature_key: Vec<u8>,

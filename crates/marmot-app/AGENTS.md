@@ -108,7 +108,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   still signed in, and a slot holding a valid publication that is merely stale (`current_slots`) stays signed in. A
   read of the configured directory relays, when the account lists none, is never complete. Rejections are recorded
   locally first, then committed to the trusted roster only while the device group is quiet
-  (`device_group_quiet`); a device with no device group keeps them until `create_device_group` founds the roster with
+  (`group_quiet`); a device with no device group keeps them until `create_device_group` founds the roster with
   them or it trusts a group it joined. A rejection is committed only while the roster has no entry for the slot, and
   never replaces one; a slot the roster holds as a device ends it, since the user confirmed that link. A rejection stays
   pending until the roster shows it. A sign-in this device dismissed is listed again once the roster has no entry for
