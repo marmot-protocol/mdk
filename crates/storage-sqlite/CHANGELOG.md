@@ -4,6 +4,12 @@
 
 ### Breaking changes
 
+- `mark_account_delivery_recovery_observed` takes the routes the relay plane
+  holds for the generation it observes (mdk#2660 phase 4). An observation past
+  the durable count merges them as `record_account_recovery_loss_routed`
+  would, so the generation stays routed, and lowers the generation's floor to
+  the lowest bound they list; `None` makes it account-wide, as every such
+  observation did before.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it

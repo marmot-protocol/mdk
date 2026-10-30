@@ -1390,7 +1390,7 @@ mod tests {
         // The worker's own observation of a generation imports the same way;
         // an unknown floor un-covers everything.
         assert!(
-            app.mark_account_delivery_recovery_observed("alice", 42, 1, None)
+            app.mark_account_delivery_recovery_observed("alice", 42, 1, None, None)
                 .unwrap()
                 .is_some()
         );
@@ -1723,8 +1723,9 @@ mod tests {
     }
 
     /// A worker observation past the durable count imports drops whose routes
-    /// no marker write has named, so it un-covers every route; the delayed
-    /// write that names them later leaves nothing covered.
+    /// no marker write has named. Without the relay plane's route map it
+    /// un-covers every route; the delayed write that names them later leaves
+    /// nothing covered.
     #[test]
     fn an_observation_past_the_durable_count_uncovers_every_route() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
@@ -1737,7 +1738,7 @@ mod tests {
         prove(&app, &[&first], 2);
 
         let observed = app
-            .mark_account_delivery_recovery_observed("alice", 41, 2, Some(500))
+            .mark_account_delivery_recovery_observed("alice", 41, 2, Some(500), None)
             .unwrap()
             .unwrap();
         assert!(observed.every_route);
@@ -1758,6 +1759,85 @@ mod tests {
         assert_eq!(
             ranges(&app, &second, RELAY_A),
             vec![(100, 499, RecoveryCoverageProof::Comparison)]
+        );
+    }
+
+    /// With the relay plane's route map, an observation past the durable
+    /// count merges it as a marker write would: the generation keeps its
+    /// routes, each at its lowest bound, and a route no drop reached keeps its
+    /// coverage. The map is read after the worker's snapshot, so it can name
+    /// a drop older than the snapshot's floor; the floor recovery fetches
+    /// from drops to it. A generation no marker write has reached yet starts
+    /// routed.
+    #[test]
+    fn an_observation_past_the_durable_count_keeps_the_routes_it_names() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let (first, second, kept) = (group(1), group(2), group(3));
+        prove(&app, &[&first, &second, &kept], 1);
+        lose(&app, 41, 1, 700, Some(&[(first.clone(), 700)]));
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        prove(&app, &[&first], 2);
+
+        let observed = app
+            .mark_account_delivery_recovery_observed(
+                "alice",
+                41,
+                2,
+                Some(550),
+                Some(&[(first.clone(), 600), (second.clone(), 500)]),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!observed.every_route);
+        assert_eq!(observed.goal_floor, Some(500));
+        assert_eq!(
+            app.recovery_loss_goal_floor("alice", crate::RecoveryLossCause::Queue)
+                .unwrap(),
+            Some(500)
+        );
+        assert_eq!(
+            ranges(&app, &first, RELAY_A),
+            vec![(100, 599, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(
+            ranges(&app, &second, RELAY_A),
+            vec![(100, 499, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(
+            ranges(&app, &kept, RELAY_A),
+            vec![(100, 900, RecoveryCoverageProof::Comparison)]
+        );
+        let reach = app
+            .recovery_loss_reach("alice", crate::RecoveryLossCause::Queue)
+            .unwrap();
+        assert_eq!(reach.every_route_from, None);
+        assert_eq!(
+            reach.routes,
+            [(first.clone(), 600), (second.clone(), 500)].into()
+        );
+
+        let observed = app
+            .mark_account_delivery_recovery_observed(
+                "alice",
+                42,
+                1,
+                Some(800),
+                Some(&[(kept.clone(), 800)]),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!observed.every_route);
+        assert_eq!(
+            ranges(&app, &kept, RELAY_A),
+            vec![(100, 799, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(
+            app.recovery_loss_reach("alice", crate::RecoveryLossCause::Queue)
+                .unwrap()
+                .routes,
+            [(first, 600), (second, 500), (kept, 800)].into()
         );
     }
 

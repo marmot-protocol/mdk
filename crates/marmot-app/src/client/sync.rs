@@ -1448,11 +1448,21 @@ impl AppClient {
         let app = storage.app_storage();
         self.synchronize_recovery_loss(&app)?;
         if overflow.dropped > 0 {
+            // The marker writer may not have named every drop counted here
+            // yet, so the router's routes for them come along; storage merges
+            // them only for drops past the durable count.
+            let routes = self.adapter.delivery_loss_routes(&overflow).map(|routes| {
+                routes
+                    .into_iter()
+                    .map(|(route, earliest)| (crate::reconciliation_route(route), earliest))
+                    .collect::<Vec<_>>()
+            });
             let marked = app.mark_account_delivery_recovery_observed(
                 &self.state.label,
                 overflow.marker_token,
                 overflow.dropped,
                 overflow.earliest_dropped,
+                routes.as_deref(),
             )?;
             self.record_recovery_loss_imports(marked.into_iter().collect());
         }
@@ -10352,6 +10362,93 @@ mod retired_loss_observation_tests {
                 .marker_token,
             77,
             "new loss reopens the retired obligation as pending debt"
+        );
+    }
+}
+
+#[cfg(test)]
+mod routed_loss_observation_tests {
+    use std::sync::Arc;
+
+    use storage_sqlite::{RecoveryLossCause, TransportReconciliationRoute};
+
+    use crate::client::recovery_coverage::scenario_tests::{fixture, relay, routes};
+
+    /// Under an overflow storm the marker writer is usually mid-write when
+    /// the worker observes a generation, so the observation runs past the
+    /// durable count. It carries the router's routes, so the generation stays
+    /// routed: only the route that lost deliveries loses coverage, from the
+    /// earliest one dropped there, and the inbox keeps its live boundary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_observation_past_the_durable_count_keeps_the_routers_routes() {
+        let mut fixture = fixture().await;
+        let app = fixture.storage.app_storage();
+        let group = routes(&fixture.client)
+            .into_iter()
+            .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
+            .unwrap();
+        let TransportReconciliationRoute::Group(group_id) = group else {
+            unreachable!()
+        };
+        let inbox = TransportReconciliationRoute::Inbox;
+        let dropped_at = crate::unix_now_seconds() - 20;
+        for route in [&inbox, &group] {
+            assert!(
+                app.recovery_coverage_covers(route, &[relay()], dropped_at, dropped_at)
+                    .unwrap(),
+                "a live boundary covers each route"
+            );
+        }
+        let inbox_before = app.recovery_coverage_ranges(&inbox, &relay()).unwrap();
+
+        // No marker write ever lands, so the whole generation is past the
+        // durable count.
+        let relay_plane = fixture.client.app.relay_plane.clone();
+        let account = fixture.client.adapter.account_id().clone();
+        assert!(relay_plane.disable_account_delivery_spill_for_test(&account));
+        assert!(relay_plane.set_account_delivery_recovery_marker_for_test(
+            &account,
+            Arc::new(|_, _, _, _| {
+                Err(transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable)
+            }),
+        ));
+        for index in 0..=transport_nostr::ACCOUNT_DELIVERY_BUFFER {
+            let delivery = fixture
+                .client
+                .adapter
+                .recovered_deliveries(transport_nostr_adapter::NostrRelayEvent {
+                    endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+                    subscription_id: None,
+                    event: crate::tests::epoch_gap_probe(
+                        &hex::encode(group_id),
+                        dropped_at,
+                        &format!("storm-{index}"),
+                    ),
+                })
+                .await
+                .unwrap()
+                .pop()
+                .expect("the group route receives the probe");
+            relay_plane.route_account_delivery_for_test(delivery);
+        }
+        let observed = fixture.client.adapter.pending_delivery_overflow().unwrap();
+        assert!(observed.dropped > 0);
+        fixture.client.observe_delivery_overflow(observed).unwrap();
+
+        let reach = app
+            .recovery_loss_reach("alice", RecoveryLossCause::Queue)
+            .unwrap();
+        assert_eq!(reach.every_route_from, None, "the generation stays routed");
+        assert_eq!(reach.routes, [(group.clone(), dropped_at)].into());
+        assert_eq!(
+            app.recovery_coverage_ranges(&inbox, &relay()).unwrap(),
+            inbox_before,
+            "the inbox lost nothing"
+        );
+        assert!(
+            !app.recovery_coverage_covers(&group, &[relay()], dropped_at, dropped_at)
+                .unwrap(),
+            "the group owes from its earliest drop"
         );
     }
 }
