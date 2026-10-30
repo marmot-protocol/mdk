@@ -1,7 +1,7 @@
 ---
 title: "Storage Format v2"
 created: 2026-08-13
-updated: 2026-10-27
+updated: 2026-10-30
 tags: [marmot, storage, sqlite, migration, encoding]
 status: current
 ---
@@ -215,6 +215,15 @@ Variant values are stable:
 | `2` | one `TransportMessage`, `OpenMlsWire` |
 | `3` | exact `TransportMessage`, OpenMLS `TransportMessage`, optional own-commit stamp, optional own-application stamp |
 | `4` | one `TransportMessage`, required own-commit stamp |
+| `5` | one `TransportMessage`, origin commit id, `StagedInviteWelcome` |
+| `6` | one `TransportMessage`, KeyPackage event id, `OutboundWelcome` |
+| `7` | one `TransportMessage`, origin commit id, KeyPackage event id, `StagedInviteWelcome` |
+
+A Welcome keeps the event id of the KeyPackage it answers, when that
+KeyPackage had one, so a device can find a Welcome by its KeyPackage after
+losing the Welcome's id (mdk#2628 item 3.3b). A Welcome with no such id is
+written as `1` or `5`, byte for byte as before; one with an id is written as
+`6` or `7`. Ids are length-prefixed opaque values.
 
 A stored `TransportMessage` contains, in order:
 
