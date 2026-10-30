@@ -1164,6 +1164,8 @@ const MIGRATIONS: &[Migration] = &[
         name: "0144_announced_key_packages",
         suspend_foreign_keys: &[],
         apply: migration_0144_announced_key_packages::apply,
+    },
+    Migration {
         version: 146,
         name: "0146_device_removals",
         suspend_foreign_keys: &[],
