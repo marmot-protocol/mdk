@@ -229,7 +229,7 @@ fn insert_marmot_group_without_openmls_state(
 
 #[tokio::test]
 async fn seeded_group_is_listed_but_gated_until_hydrated() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial, false).await;
     let stored_epoch = storage.get_group(&group_id).unwrap().epoch;
@@ -264,7 +264,7 @@ async fn seeded_group_is_listed_but_gated_until_hydrated() {
 
 #[tokio::test]
 async fn ensure_hydrated_failure_quarantines_with_open_time_parity() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let broken_group = GroupId::new(b"missing-openmls-state".to_vec());
     insert_marmot_group_without_openmls_state(&storage, &broken_group, 7);
 
@@ -311,7 +311,7 @@ async fn ensure_hydrated_failure_quarantines_with_open_time_parity() {
 
 #[tokio::test]
 async fn cheap_pass_is_idempotent_and_never_demotes_a_live_group() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial, false).await;
     drop(initial);
@@ -332,7 +332,7 @@ async fn cheap_pass_is_idempotent_and_never_demotes_a_live_group() {
 
 #[tokio::test]
 async fn ingest_hydrates_seeded_group_resolved_through_durable_route() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_routed_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial, true).await;
     drop(initial);
@@ -373,7 +373,7 @@ async fn ingest_hydrates_seeded_group_resolved_through_durable_route() {
 
 #[tokio::test]
 async fn ingest_backfills_route_for_record_predating_route_table() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_routed_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial, true).await;
     drop(initial);
@@ -485,7 +485,7 @@ fn inbound(route: [u8; 32], id: &[u8]) -> TransportMessage {
 
 #[tokio::test]
 async fn hydrate_all_fully_hydrates_unrecoverable_groups() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_routed_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial, true).await;
     drop(initial);
@@ -530,7 +530,7 @@ async fn hydrate_all_fully_hydrates_unrecoverable_groups() {
 #[tokio::test]
 async fn stale_route_stamp_triggers_backfill_repair_after_restart() {
     const ROTATED: [u8; 32] = [0x42; 32];
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_routed_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial, true).await;
     rotate_route(&mut initial, &group_id, ROTATED).await;
@@ -565,7 +565,7 @@ async fn stale_route_stamp_triggers_backfill_repair_after_restart() {
 #[tokio::test]
 async fn rotated_route_is_retired_once_retention_window_passes() {
     const ROTATED: [u8; 32] = [0x42; 32];
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut engine = build_routed_engine(storage.clone());
     let group_id = create_confirmed_group(&mut engine, true).await;
     rotate_route(&mut engine, &group_id, ROTATED).await;
@@ -606,7 +606,7 @@ async fn rotated_route_is_retired_once_retention_window_passes() {
 
 #[tokio::test]
 async fn failed_promotion_in_convergence_buffer_persists_no_row() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let broken_group = GroupId::new(b"missing-openmls-state".to_vec());
     insert_marmot_group_without_openmls_state(&storage, &broken_group, 7);
 
@@ -654,7 +654,7 @@ async fn failed_promotion_in_convergence_buffer_persists_no_row() {
 
 #[tokio::test]
 async fn failed_promotion_in_convergence_advance_propagates() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let broken_group = GroupId::new(b"missing-openmls-state".to_vec());
     insert_marmot_group_without_openmls_state(&storage, &broken_group, 7);
 

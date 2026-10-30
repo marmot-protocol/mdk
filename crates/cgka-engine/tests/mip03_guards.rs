@@ -165,7 +165,7 @@ fn registry() -> FeatureRegistry {
 }
 
 fn build(id: &[u8]) -> impl CgkaEngine {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -176,7 +176,7 @@ fn build(id: &[u8]) -> impl CgkaEngine {
 }
 
 fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -189,7 +189,7 @@ fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccount
 }
 
 fn build_current_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -902,7 +902,7 @@ async fn standalone_proposal_gate_distinguishes_authorization_encoding_support_a
     let audit_dir = tempfile::TempDir::new().unwrap();
     let audit_path = audit_dir.path().join("proposal-rejections.jsonl");
     let recorder = JsonlRecorder::open(&audit_path, "proposal-gate-test".to_string()).unwrap();
-    let alice_storage = SqliteAccountStorage::in_memory().unwrap();
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = EngineBuilder::new(alice_storage.clone())
         .identity(pad32(b"alice-proposal-gate"))
         .account_identity_proof_signer(proof_signer(b"alice-proposal-gate"))

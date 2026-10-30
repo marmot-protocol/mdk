@@ -3345,7 +3345,7 @@ mod tests {
     }
 
     fn fixture() -> (SqliteAccountStorage, AccountRecoveryOwner, Instant) {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let app = storage.app_storage();
         app.ensure_account_projection("alice").unwrap();
         app.mark_account_delivery_recovery("alice", 1, 1).unwrap();
@@ -3399,7 +3399,7 @@ mod tests {
 
     #[test]
     fn native_drain_spends_no_retry() {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let app = storage.app_storage();
         app.ensure_account_projection("alice").unwrap();
         let ticket = app
@@ -3472,7 +3472,7 @@ mod tests {
 
     #[test]
     fn narrow_capture_keeps_debt() {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let app = storage.app_storage();
         let ticket = app
             .request_recovery(
@@ -6321,7 +6321,7 @@ mod tests {
 
     #[test]
     fn comparison_only_grant_preserves_cooldown_cancellation_and_scoped_admission() {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let app = storage.app_storage();
         let now = Instant::now();
         let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();

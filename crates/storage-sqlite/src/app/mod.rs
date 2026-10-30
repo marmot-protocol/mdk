@@ -10,6 +10,7 @@ pub(crate) mod chat_presentation;
 pub(crate) mod compromise_warning;
 pub(crate) mod device_groups;
 pub(crate) mod device_links;
+pub(crate) mod device_removals;
 pub(crate) mod device_renames;
 pub(crate) mod encrypted_media_secrets;
 pub(crate) mod group_system;

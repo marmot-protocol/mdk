@@ -28,7 +28,7 @@ use cgka_traits::storage::{DeviceGroupWelcomeExpectation, GroupStorage as _};
 /// A device of `account` that advertises the device roster beside
 /// account-devices.
 pub(super) fn roster_device(account: &[u8]) -> Device {
-    roster_device_on(SqliteAccountStorage::in_memory().unwrap(), account)
+    roster_device_on(SqliteAccountStorage::in_memory_for_test().unwrap(), account)
 }
 
 /// [`roster_device`] over `storage`, as a reopened session builds it. The
@@ -40,7 +40,7 @@ pub(super) fn roster_device_on(storage: SqliteAccountStorage, account: &[u8]) ->
 /// [`roster_device`] on a manual convergence clock.
 fn clocked_roster_device(account: &[u8], clock: &ManualConvergenceClock) -> Device {
     build_roster_device(
-        SqliteAccountStorage::in_memory().unwrap(),
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
         account,
         Some(clock),
     )

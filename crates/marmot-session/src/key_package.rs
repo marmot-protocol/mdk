@@ -21,7 +21,8 @@ pub struct KeyPackagePublication {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyPackageSlotWithdrawal {
     pub account_id: MemberId,
-    /// This device's slot, the only one the request may name.
+    /// The one slot the request names: this device's own, or a sibling's
+    /// that the device group removed (mdk#2628 3.6b, D22).
     pub slot_id: String,
     /// Every publication in the slot up to this time is withdrawn.
     pub created_at: Timestamp,

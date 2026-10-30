@@ -519,6 +519,13 @@ pub(crate) enum AccountWorkerCommand {
         label: String,
         respond: oneshot::Sender<Result<(), AppError>>,
     },
+    RemoveLinkedDevice {
+        slot_id_hex: String,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    RemovedDeviceLeftoverChats {
+        respond: oneshot::Sender<Result<u32, AppError>>,
+    },
     DismissHistoryNotice {
         notice_id: String,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -5873,6 +5880,23 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
+        AccountWorkerCommand::RemoveLinkedDevice {
+            slot_id_hex,
+            respond,
+        } => Box::pin(async move {
+            let result = client.remove_linked_device(&slot_id_hex).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::RemovedDeviceLeftoverChats { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.removed_device_leftover_chats(),
+            );
+            true
+        }),
         AccountWorkerCommand::AcknowledgeGroupCatchingUp { group_id, respond } => {
             Box::pin(async move {
                 let _ = respond_diagnosed(
@@ -9011,7 +9035,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn avatar_dispatch_shares_media_capacity_and_holds_it_through_publication() {
-        let store = storage_sqlite::SqliteAccountStorage::in_memory()
+        let store = storage_sqlite::SqliteAccountStorage::in_memory_for_test()
             .unwrap()
             .app_storage();
         for n in 0..5 {
@@ -9073,7 +9097,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn avatar_shutdown_cancels_io_and_leaves_resumable_intent() {
-        let store = storage_sqlite::SqliteAccountStorage::in_memory()
+        let store = storage_sqlite::SqliteAccountStorage::in_memory_for_test()
             .unwrap()
             .app_storage();
         let reference = store

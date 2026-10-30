@@ -87,6 +87,12 @@ only telemetry, a closed operation and timing metadata, never a client or storag
 | --- | --- | --- |
 | `cgka_device_group_welcome_expectations` | One row per device group a confirmed link waits to join: a group id, the expected sender's signature key and a deadline. The app records one only alongside its `awaiting_welcome` row, and an account holds at most one such row, so at most one in practice. | The join it admits deletes it in the same transaction. The app deletes it before the row when the link is withdrawn or its 10-minute wait ends (`end_welcome_waits`, on every new link and every reconcile), which also drops a waiting row left without its expectation. |
 
+### `cgka-engine` announced KeyPackages (`src/announced_key_packages.rs`, `storage-sqlite` `src/protocol/storage/announced_key_packages.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `cgka_announced_key_packages` | One row per (group, slot, KeyPackageRef) a device-group roster this device applied announced, so it grows only with commits that change an announcement; at most 16 per group slot (`ANNOUNCED_KEY_PACKAGES_PER_SLOT`). | A repeat sighting renews a row. Every write prunes rows last seen more than 30 days ago (`ANNOUNCED_KEY_PACKAGE_RETENTION_SECS`) and each slot's rows past its 16 most recently seen. Deleting the group cascades. A branch-selection rewind keeps them: they sit outside snapshots on purpose. |
+
 ### `storage-sqlite` compromise warning (`src/app/compromise_warning.rs`)
 
 | Structure | Bound | Reclamation |

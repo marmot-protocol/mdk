@@ -2414,6 +2414,12 @@ impl<S: StorageProvider> Engine<S> {
                     None
                 };
                 storage.put_convergence_pass(&completed_pass)?;
+                crate::announced_key_packages::record_announcements(
+                    storage,
+                    group_id,
+                    &output.announced_key_packages,
+                    self.wall_clock.now(),
+                )?;
                 let application_events =
                     Self::application_replay_events(group_id, &output.observations)?;
                 for event in &application_events {
@@ -3298,7 +3304,9 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_engine() -> crate::Engine<storage_sqlite::SqliteAccountStorage> {
-        test_engine_with_storage(storage_sqlite::SqliteAccountStorage::in_memory().unwrap())
+        test_engine_with_storage(
+            storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap(),
+        )
     }
 
     pub(crate) fn test_engine_with_storage(
