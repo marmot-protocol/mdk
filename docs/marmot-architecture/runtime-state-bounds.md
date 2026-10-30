@@ -169,6 +169,12 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 | Avatar upgrade ledger | At most one key per chat present at migration 0078 | Consumed in transactions of at most 64 rows; never recreated on restart. |
 | `app_prepared_group_image_upload` SQLCipher rows | 16 active staged/uploaded/failed artifacts and 128 consumed idempotency markers per account | Active artifacts expire after 7 days and consumed markers after 30 days; staging prunes expired rows, consumption evicts the oldest marker at the cap, and consumed rows erase their retained ciphertext/upload-secret copies. The founding MLS component remains authoritative after consumption. |
 
+### `marmot-session` own-slot check (`src/runtime/own_slot.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `AccountDeviceRuntime.slot_superseded_through` | One `Option<Timestamp>` | Raised by the own-slot check to the newest foreign publication found in this device's slot and its current publication's time. Cleared when a publication of its own newer than it becomes current, or when the clock went back so far that no publication could outrank it. Dropped with the runtime; the host reads the slot again at open. |
+
 ### `marmot-app` device pairing (`src/client/device_pairing/live.rs`)
 
 Built only with `unreleased-device-pairing`, and empty unless `dev_device_groups` is on. Pairing keeps its secrets
@@ -325,5 +331,6 @@ loss-generation watermark exception.
 | `account_recovery_unit_spans` | Parked spans are the unit's debt at its last park, so no more ranges than its coverage gaps; retired spans add only dismissed debt. Both kinds stay inside the route's goal window, so retention bounds them as it bounds goals | Coverage trims what it proves; a re-arm drops parked spans and explicit repair drops both kinds; dismissal turns parked into retired; the retention prune drops both kinds below its floor |
 | `account_recovery_relays` | One row per relay the runner has served | Updated in place |
 | `account_recovery_budget` | At most 61 per-minute rows | Rows older than the rolling hour are deleted on every charge and read |
-| `account_recovery_staged` | Nothing writes it yet; its writer must bound it per group and per account with `staged_recovery_usage` before each fetch | A row leaves once its event is seen, or when it no longer decodes |
+| `account_recovery_unit_fences` | Only the runner writes it. At most 8 ranges per unit, past which it joins the newest into one; each is capture debt the unit still owes | Admission drops a range once nothing in it is owed, and every range of a relay its route no longer requires; the retention prune drops ranges below its floor |
+| `account_recovery_staged` | Only the runner writes it, and no production path runs the runner before the switch-over. A relay that has staged 2,048 events or 8 MiB for a group, or any relay once the account holds 64 MiB, waits while another relay holds that group's admission frontier; a debt unit at the frontier is never held back, and a re-check, which never moves the frontier, waits at the bound like any other. Nothing is fetched for a group admission cannot drain: one held behind an event the engine kept no trace of, or every group while admission waits after local failures. So while admission can drain the group, each relay can pass a bound by at most one quantum; a stalled group is not swept | Admission removes a row once its event is seen; a row that no longer decodes, or whose route the runner no longer lists, is discarded and its second owed again |
 

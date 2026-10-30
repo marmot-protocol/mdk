@@ -2682,6 +2682,42 @@ async fn strict_cutover_retires_all_legacy_key_package_bundles_idempotently() {
     assert_eq!(storage.stored_key_package_bundles().unwrap().len(), 1);
 }
 
+/// mdk#2628 D40: a legacy create holds its Welcomes with its pending commit,
+/// which keeps no delivery deadline, so a legacy engine never creates under a
+/// chosen id, and the refusal writes nothing.
+#[tokio::test]
+async fn a_legacy_engine_refuses_a_chosen_group_id() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut legacy =
+        build_profile_client_on_storage(b"legacy-chosen", storage.clone(), ProtocolProfile::Legacy);
+    let chosen = GroupId::new(vec![0x42; 16]);
+    let refused = legacy
+        .create_group_with_chosen_id_and_audit_context(
+            CreateGroupRequest {
+                name: String::new(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            },
+            chosen.clone(),
+            Timestamp(u64::MAX),
+            None,
+        )
+        .await;
+    assert!(
+        refused
+            .expect_err("a legacy engine refuses a chosen id")
+            .to_string()
+            .contains("only a current-profile group is created under a chosen id")
+    );
+    assert!(matches!(
+        storage.get_group(&chosen),
+        Err(cgka_traits::storage::StorageError::NotFound)
+    ));
+}
+
 #[tokio::test]
 async fn missing_welcome_key_package() {
     use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory};

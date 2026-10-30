@@ -118,7 +118,11 @@ async fn recovery_runner_compares_a_large_difference_in_prefixes_over_several_qu
     let fetched = relay.fetched_ids();
     assert_eq!(fetched.len(), missing.len(), "an id was fetched twice");
     assert_eq!(fetched.into_iter().collect::<BTreeSet<_>>(), ids(&missing));
-    assert_eq!(account.staged_events(&route), missing.len() as u64);
+    // Admission releases what lies below the relay's position as it goes.
+    assert_eq!(
+        account.staged_events(&route) + account.admitted_events(),
+        missing.len() as u64
+    );
 }
 
 /// A unit compares only where the account already holds events in the owed
@@ -512,5 +516,57 @@ async fn recovery_runner_charges_the_fetch_a_cut_comparison_was_reading() {
             .unwrap()
             .event_bytes,
         READ
+    );
+}
+
+/// What a re-check finds is staged like any fetched history, so a full
+/// relay's re-check waits even where its own debt holds the group's frontier:
+/// the debt moves the frontier, the re-check never does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_holds_a_full_relays_recheck_back_but_not_its_frontier_debt() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let mid = t0 - HOUR / 2;
+    let events = every([1; 32], floor, mid, 60);
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    let other = ModelRelay::new(OTHER_RELAY, caps(500, false)).build();
+    // A swept and staged the older half hour and owes the newer one, so it
+    // holds the frontier; B owes nothing.
+    account.goal(&route, floor);
+    account.swept(&route, RELAY, &events, floor, mid);
+    account.live_boundary(&route, OTHER_RELAY, floor, t0 - 1);
+    account.record_caps(RELAY, caps(500, true), t0);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY, OTHER_RELAY])],
+        &[&relay, &other],
+    );
+    host.tails.stand(&route, RELAY, t0);
+    host.tails.stand(&route, OTHER_RELAY, t0);
+    let mut policy = test_policy();
+    // Whether A's debt and A's re-check are held back.
+    let held_back = |survey: Survey| {
+        let of = |candidates: Vec<Candidate>| {
+            candidates
+                .into_iter()
+                .find(|candidate| candidate.key.relay == RELAY)
+                .map(|candidate| candidate.blocked)
+        };
+        (of(survey.candidates), of(survey.rechecks))
+    };
+    assert_eq!(
+        held_back(host.survey(policy).await),
+        (Some(false), Some(false))
+    );
+
+    // A's share of the group is full.
+    policy.staging.group_events = events.len() as u64;
+    assert_eq!(
+        held_back(host.survey(policy).await),
+        (Some(false), Some(true))
     );
 }

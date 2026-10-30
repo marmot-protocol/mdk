@@ -349,9 +349,24 @@
   `MarmotApp` the process builds (mdk#2627). Before one exists they build no
   HTTP client, so an `AuditOtlpSender::send` made that early returns
   `Unknown` without dialing. Every send through a runtime is unchanged.
+- The `test-support` feature also compiles the diagnostics collectors' test
+  fixtures and `_for_test` hooks, including methods on `ProductAnalytics`
+  (mdk#2627). Enable it only as a dev-dependency, as before. Builds without
+  it are unchanged.
 
 ### Fixed
 
+- External-signer sticker installs and uninstalls prepare event IDs and
+  finish signing before changing local intent. Refused signatures leave
+  existing pending changes untouched.
+- Public sticker-pack fetches no longer require a registered signer.
+- Sticker sync continues public pack refreshes when the installed-list read
+  is incomplete. Publishing that list still requires a complete read from
+  every account relay.
+- Sticker downloads check nested WebP bitstream dimensions against each
+  animation frame before returning bytes to the host decoder.
+- Sticker sync refreshes cached installed packs even when their replacements
+  fall outside the recent public-pack discovery window.
 - A convergence pass that fails after its decision no longer replays its
   batch on every scheduled advance, send and inbound commit (mdk#2684). Each
   failed attempt waits 1 s, doubling to 5 min, before the next; after 12 in a

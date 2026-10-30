@@ -104,6 +104,7 @@ pub use app::message_drafts::{
     StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary, StoredMessageDraftSummary,
 };
 pub use app::pending_welcome_delivery::PendingWelcomeDeliveryRecord;
+pub use app::private_key_packages::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage};
 pub use app::recovery_coverage::{
     RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageProved, RecoveryCoverageRange,
     RecoveryCoverageSlice,
@@ -115,10 +116,14 @@ pub use app::recovery_staging::{
 pub use app::recovery_units::{
     RecoveryAccountUsage, RecoveryParkedRoute, RecoveryRecheckPass, RecoveryRelayCaps,
     RecoveryRelayHealth, RecoveryRouteRemainder, RecoverySpanRetirement, RecoveryUnit,
-    RecoveryUnitBreak, RecoveryUnitOutcome, RecoveryUnitPark, RecoveryUnitPolicy, RecoveryUnitSpan,
-    RecoveryUnitState,
+    RecoveryUnitBreak, RecoveryUnitFence, RecoveryUnitOutcome, RecoveryUnitPark,
+    RecoveryUnitPolicy, RecoveryUnitSpan, RecoveryUnitState,
 };
 pub use app::sign_ins::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord};
+pub use app::stickers::{
+    StoredInstalledStickerState, StoredSticker, StoredStickerInstallOperation,
+    StoredStickerOutboxEvent, StoredStickerPack, StoredStickerPackVersion,
+};
 pub use app::timeline::{
     BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
     ConversationAccountSnapshot, ConversationAnchor, ConversationOpenAnchorOutcome,

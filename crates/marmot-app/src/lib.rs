@@ -49,8 +49,8 @@ use cgka_traits::{
 };
 use marmot_account::{AccountHome, AccountHomeError, AccountSetupKind, AccountSummary};
 use marmot_session::{
-    AccountDeviceRuntime, CanonicalizationPolicy, FeatureRegistry, KeyPackagePublication,
-    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
+    AccountDeviceRuntime, CanonicalizationPolicy, FeatureRegistry, KeyPackageEventDeletion,
+    KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
     KeyPackageSlotWithdrawal, SessionConfig, TransportRoutingError, TransportRoutingPolicy,
     key_package_metadata,
 };
@@ -133,6 +133,11 @@ mod nostr_verification;
 mod notifications;
 #[cfg(test)]
 mod observability_crossings_tests;
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+mod observability_test_support;
+#[cfg(test)]
+mod observability_tests;
 mod observer;
 mod profile_publication;
 mod projection;
@@ -147,6 +152,7 @@ mod startup_diagnostics;
 pub use startup_diagnostics::{
     NativeStartupObservation, NativeStartupOutcome, NativeStartupSnapshot, NativeStartupStage,
 };
+mod stickers;
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
 mod wiring;
@@ -199,6 +205,11 @@ pub use runtime::{
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
+pub use stickers::{
+    AppSticker, AppStickerAsset, AppStickerImportResult, AppStickerPack, AppStickerRef,
+    AppStickerSyncResult, parse_sticker_pack_input, sticker_ref_from_message,
+    sticker_ref_from_tags,
+};
 pub use storage_sqlite::{
     CHAT_LIST_DRAFT_PREVIEW_CHARS, ChatListDraftPreview, ChatListRowActions, ChatPinState,
     ChatPresentationVersion, ConversationOpenError, ConversationPresentation,
@@ -615,6 +626,10 @@ pub struct MarmotApp {
     /// In-memory view of the persisted per-kind authoring floors; see
     /// `sign_replaceable_identity_event`.
     replaceable_identity_created_at: Arc<Mutex<HashMap<(String, u64), u64>>>,
+    /// Per-account serialization for public sticker-pack/install mutations.
+    /// The mutex values are lifecycle-only; protocol truth and pending intent
+    /// remain in the account SQLCipher database.
+    sticker_mutation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1690,6 +1705,7 @@ impl MarmotApp {
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
+            sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1792,6 +1808,7 @@ impl MarmotApp {
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
+            sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2133,6 +2150,7 @@ impl MarmotApp {
             #[cfg(test)]
             test_fail_push_announce_owed_write: false,
             pending_welcome_delivery_events: Vec::new(),
+            announced_welcome_failures: HashSet::new(),
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
             unpublished_welcome_delivery: None,
@@ -2183,11 +2201,6 @@ impl MarmotApp {
         // it repairs a crash-lost branch-selection announcement on every open,
         // deferred ones included.
         client.reconcile_branch_selection_withdrawals();
-        // Same rule again: it reads stored links, and withdrawal reads no group
-        // state. A failed or expired device link's Welcome is withdrawn before
-        // the client exists for anything to publish it: startup recovery, a
-        // maintenance pass, or a stored fanout's retry (mdk#2628 D40).
-        client.withdraw_expired_link_welcomes();
         if !defer_group_hydration {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
@@ -5629,21 +5642,25 @@ impl MarmotApp {
 
     /// Read every KeyPackage slot of the account for new sign-ins (mdk#2628
     /// 3.2), from the relays its KeyPackages are listed from, under the
-    /// inviter's rules. A read of the configured directory relays, when the
-    /// account lists none, is never complete: they need not be where its
-    /// KeyPackages are.
+    /// inviter's rules, and `own_slot` on its own (3.4). A read of the
+    /// configured directory relays, when the account lists none, is never
+    /// complete: they need not be where its KeyPackages are.
     pub(crate) async fn read_account_key_package_slots(
         &self,
         label: &str,
+        own_slot: Option<&str>,
     ) -> Result<nostr_directory::AccountKeyPackageSlots, AppError> {
         let (account_id_hex, source_relays, listed) = self
             .account_key_package_source_relays(label, Vec::new())
             .await?;
         let mut slots = self
             .directory()
-            .read_account_key_package_slots(&account_id_hex, &source_relays)
+            .read_account_key_package_slots(&account_id_hex, &source_relays, own_slot)
             .await?;
         slots.complete &= listed;
+        if let Some(own_slot) = slots.own_slot.as_mut() {
+            own_slot.complete &= listed;
+        }
         Ok(slots)
     }
 
@@ -8367,16 +8384,54 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             &withdrawal.slot_id,
             withdrawal.created_at.0,
         );
-        // One request per relay, each checked on its own: an unusable endpoint
-        // must not stop the deletion at the others, and one relay's
-        // acknowledgement must not cancel the send to the rest.
+        Ok(self
+            .publish_deletion_request(
+                &withdrawal.account_id,
+                event,
+                &withdrawal.endpoints,
+                "key package slot withdrawal",
+            )
+            .await)
+    }
+
+    async fn delete_key_package_event(
+        &self,
+        deletion: &KeyPackageEventDeletion,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        let event = transport_nostr_adapter::key_package_event_deletion_event(
+            &deletion.account_id,
+            &hex::encode(deletion.event_id.as_slice()),
+            deletion.created_at.0,
+        );
+        Ok(self
+            .publish_deletion_request(
+                &deletion.account_id,
+                event,
+                &deletion.endpoints,
+                "key package event deletion",
+            )
+            .await)
+    }
+}
+
+impl AppKeyPackagePublisher {
+    /// Send one deletion request to each of `endpoints`, each checked on its
+    /// own: an unusable endpoint must not stop the deletion at the others,
+    /// and one relay's acknowledgement must not cancel the send to the rest.
+    async fn publish_deletion_request(
+        &self,
+        account_id: &MemberId,
+        event: transport_nostr_peeler::NostrTransportEvent,
+        endpoints: &[TransportEndpoint],
+        purpose: &'static str,
+    ) -> KeyPackagePublishReceipt {
         let mut failed = Vec::new();
         let mut requests: Vec<NostrEventPublishRequest> = Vec::new();
-        for endpoint in &withdrawal.endpoints {
+        for endpoint in endpoints {
             match self
                 .app
                 .relay_plane
-                .sanitize_relay_endpoints(vec![endpoint.clone()], "key package slot withdrawal")
+                .sanitize_relay_endpoints(vec![endpoint.clone()], purpose)
             {
                 Ok(endpoints) => {
                     if !requests
@@ -8394,11 +8449,11 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             }
         }
         let relay_client = self.app.relay_client_for_account_id(
-            &hex::encode(withdrawal.account_id.as_slice()),
+            &hex::encode(account_id.as_slice()),
             self.signer.as_nostr_signer(),
         );
         let mut outcomes = relay_client
-            .publish_events_for_account(&withdrawal.account_id, &requests)
+            .publish_events_for_account(account_id, &requests)
             .await
             .into_iter();
         let mut accepted = Vec::new();
@@ -8410,7 +8465,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                 _ => failed.extend(request.endpoints),
             }
         }
-        Ok(KeyPackagePublishReceipt { accepted, failed })
+        KeyPackagePublishReceipt { accepted, failed }
     }
 }
 

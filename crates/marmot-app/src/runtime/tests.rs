@@ -458,7 +458,7 @@ async fn missing_diagnostics_executor_keeps_exporters_stopped() {
             }),
             ..RelayTelemetryExportConfig::enabled("https://collector.example/v1/metrics")
         };
-        assert!(config.export_allowed());
+        assert!(transport_nostr::RelayExportGate::export_allowed(&config));
         runtime.shared.configure_relay_telemetry_exporter(config);
         assert!(
             runtime
@@ -1929,6 +1929,7 @@ fn chat_list_fingerprint_preserves_serialized_deduplication_semantics() {
         sender: "sender".to_owned(),
         sender_display_name: None,
         plaintext: "hello".to_owned(),
+        tags: Vec::new(),
         kind: 9,
         timeline_at: 1,
         deleted: false,
@@ -4184,6 +4185,7 @@ async fn deletion_provenance_only_change_wakes_chat_list_subscribers() {
         sender: "author".into(),
         sender_display_name: None,
         plaintext: String::new(),
+        tags: Vec::new(),
         kind: 9,
         timeline_at: 1,
         deleted: true,
@@ -4230,6 +4232,7 @@ async fn chat_preview_retention_only_change_wakes_subscribers() {
         sender: "author".to_owned(),
         sender_display_name: None,
         plaintext: "hello".to_owned(),
+        tags: Vec::new(),
         kind: 9,
         timeline_at: 10,
         retention_seconds: None,

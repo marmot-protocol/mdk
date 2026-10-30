@@ -3,8 +3,9 @@
 //! The engine's Welcome row is the obligation: staged with its commit, owed
 //! once the commit confirms (or at a founding create), delivered, or
 //! withdrawn. Every publish reads that row first (`welcome_hold`), so a
-//! withdrawn Welcome never goes out again and a staged one waits for its
-//! commit. Per-endpoint attempts and backoff live on the Welcome's
+//! withdrawn Welcome never goes out again, a staged one waits for its
+//! commit, and a device link's Welcome never goes out once its delivery
+//! deadline passes. Per-endpoint attempts and backoff live on the Welcome's
 //! `DurableTransportFanout`, which maintenance retries.
 
 use super::*;
@@ -19,6 +20,9 @@ pub(super) enum WelcomeHold {
     /// Staged with its unconfirmed invite commit: held until the commit
     /// confirms and promotes it (mdk#2726).
     AwaitsCommit,
+    /// A device link's Welcome whose new device stopped waiting for it: never
+    /// published again, and nothing is owed (mdk#2628 D40).
+    Expired,
 }
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
@@ -37,6 +41,34 @@ where
         let mut output = AccountDeviceEffects::default();
         self.publish_welcome_fanout(welcomes, group_id, &mut output, Some(context), false)
             .await?;
+        Ok(output)
+    }
+
+    /// Publish now each of `welcome_ids` that the engine holds as owed: the
+    /// trigger a host fires once it has replied to an invite, naming the
+    /// Welcomes by id. One still staged with its commit is left for
+    /// maintenance to send once the commit confirms; a delivered, withdrawn
+    /// or expired one is skipped.
+    pub async fn deliver_owed_welcomes_with_audit_context(
+        &mut self,
+        welcome_ids: &[cgka_traits::MessageId],
+        group_id: GroupId,
+        context: AuditEventContext,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let now = self.wall_clock.now();
+        let mut owed = Vec::with_capacity(welcome_ids.len());
+        for id in welcome_ids {
+            if let OutboundWelcomeStatus::Owed { message, .. } =
+                self.session.outbound_welcome_status(id, now)?
+            {
+                owed.push(message);
+            }
+        }
+        let mut output = AccountDeviceEffects::default();
+        if !owed.is_empty() {
+            self.publish_welcome_fanout(owed, Some(group_id), &mut output, Some(context), false)
+                .await?;
+        }
         Ok(output)
     }
 
@@ -76,6 +108,7 @@ where
             .extend(message_ids.iter().cloned());
         Ok(PreparedWelcomePublishTask {
             adapter: Arc::new(self.adapter.clone()),
+            wall_clock: self.wall_clock.clone(),
             prepared,
             message_ids,
             withdrawals: self.detached_welcome_withdrawals.clone(),
@@ -124,7 +157,9 @@ where
         force_retry: bool,
     ) -> AccountResult<()> {
         let prepared = self.prepare_welcome_publish(welcomes, group_id, context, force_retry)?;
-        let completed = prepared.publish(&self.adapter, None).await;
+        let completed = prepared
+            .publish(&self.adapter, self.wall_clock.as_ref(), None)
+            .await;
         self.finish_welcome_publish(completed, output).await
     }
 
@@ -235,7 +270,10 @@ where
 
     /// Why a Welcome must not reach a relay now, checked by both places that
     /// publish one: the publish preparation step and maintenance's retry of a
-    /// stored fanout.
+    /// stored fanout. A row it cannot read holds the Welcome, so nothing that
+    /// fails here publishes it. A Welcome it clears may still carry a
+    /// delivery deadline, which a batch checks again before it starts each
+    /// relay attempt.
     pub(super) fn welcome_hold(
         &self,
         message_id: &cgka_traits::MessageId,
@@ -249,6 +287,13 @@ where
         }
         if self.session.sent_welcome_awaits_commit(message_id)? {
             return Ok(Some(WelcomeHold::AwaitsCommit));
+        }
+        if self
+            .session
+            .sent_welcome_deliver_until(message_id)?
+            .is_some_and(|deliver_until| self.wall_clock.now() >= deliver_until)
+        {
+            return Ok(Some(WelcomeHold::Expired));
         }
         Ok(None)
     }
@@ -496,7 +541,7 @@ where
         for id in std::mem::take(&mut self.watched_welcomes) {
             let status = self
                 .session
-                .outbound_welcome_status(&id)
+                .outbound_welcome_status(&id, self.wall_clock.now())
                 .and_then(|status| {
                     let held = matches!(status, OutboundWelcomeStatus::Owed { .. })
                         && (self.detached_welcome_publishes.contains(&id)

@@ -7423,7 +7423,7 @@ async fn local_ready_result_does_not_report_an_unrequested_key_package_publicati
     #[cfg(feature = "product-analytics-export")]
     let app = {
         let mut app = app;
-        app.product_analytics = crate::product_analytics::test_product_collector();
+        app.product_analytics = crate::observability_test_support::test_product_collector();
         app.set_usage_diagnostics_consent(true).unwrap();
         app
     };
@@ -11558,6 +11558,7 @@ fn group_system_chat_preview_does_not_hydrate_its_optional_actor_as_a_nostr_send
         sender: String::new(),
         sender_display_name: None,
         plaintext: r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#.to_owned(),
+        tags: Vec::new(),
         kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         timeline_at: 1,
         retention_seconds: None,
@@ -11576,6 +11577,7 @@ fn group_system_chat_preview_does_not_hydrate_its_optional_actor_as_a_nostr_send
     );
 
     let ordinary = ChatListMessagePreview {
+        tags: Vec::new(),
         kind: MARMOT_APP_EVENT_KIND_CHAT,
         sender: "22".repeat(32),
         ..preview
@@ -14815,6 +14817,30 @@ fn chat_intent_builds_kind_nine_with_no_tags() {
     assert_eq!(event.content, "hello");
     assert!(event.tags.is_empty());
     assert_eq!(event.pubkey, SENDER_HEX);
+}
+
+#[test]
+fn sticker_intent_builds_sonar_kind_nine_tag() {
+    let coordinate = format!("30031:{}:cats", "ab".repeat(32));
+    let hash = "11".repeat(32);
+    let event = build(AppMessageIntent::Sticker {
+        sticker_ref: AppStickerRef {
+            pack_coordinate: coordinate.clone(),
+            shortcode: "wave".to_owned(),
+            plaintext_sha256: hash.clone(),
+        },
+    });
+    assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
+    assert!(event.content.is_empty());
+    assert_eq!(
+        event.tags,
+        vec![vec![
+            "sticker".to_owned(),
+            coordinate,
+            "wave".to_owned(),
+            hash,
+        ]]
+    );
 }
 
 #[test]
@@ -19526,7 +19552,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     #[cfg(feature = "product-analytics-export")]
     let app = {
         let mut app = app;
-        app.product_analytics = crate::product_analytics::test_product_collector();
+        app.product_analytics = crate::observability_test_support::test_product_collector();
         app
     };
     #[cfg(feature = "product-analytics-export")]

@@ -654,3 +654,109 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
     runtime.run_due_maintenance().await.unwrap();
     assert_eq!(welcome_publishes(&adapter).len(), 1);
 }
+
+/// mdk#2628 D40: a device link's Welcome is never published from its delivery
+/// deadline on, by any path that still holds its bytes: a detached startup
+/// retry prepared before the deadline but run after it, the app's deferred
+/// publish, the startup retry, maintenance's watch and fanout retry, and
+/// explicit redelivery. Its watch and its retry record are dropped, and
+/// nothing reports a delivery failure.
+#[tokio::test]
+async fn a_link_welcome_is_never_published_from_its_deadline_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot link welcome deadline key").unwrap();
+    let mut alice = current_session(dir.path().join("alice.sqlite"), &key, b"alice-deadline");
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob-deadline");
+    let bob_id = bob.self_id();
+    let chosen = GroupId::new(vec![0x42; 16]);
+    let created = alice
+        .create_group_with_chosen_id_and_audit_context(
+            CreateGroupRequest {
+                name: String::new(),
+                description: String::new(),
+                members: vec![bob.fresh_key_package().await.unwrap()],
+                required_features: Vec::new(),
+                app_components: Vec::new(),
+                initial_admins: Vec::new(),
+            },
+            chosen.clone(),
+            Timestamp(300_100),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let welcome = match &created.effects.publish[0] {
+        PublishWork::FoundingGroupCreated { welcomes } => welcomes[0].clone(),
+        other => panic!("expected FoundingGroupCreated publish work, got {other:?}"),
+    };
+
+    let adapter = RecordingAdapter::default();
+    adapter.accept_only_endpoints(vec![TransportEndpoint("wss://bob-inbox.example".into())]);
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint(
+        "wss://alice-inbox.example".into(),
+    )])
+    .with_group_route(
+        chosen.clone(),
+        chosen.as_slice().to_vec(),
+        vec![TransportEndpoint("wss://group.example".into())],
+    )
+    .with_inbox_route(
+        bob_id,
+        vec![TransportEndpoint("wss://bob-inbox.example".into())],
+    );
+    let wall = Arc::new(TestWallClock::new(300_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    // Prepared before the deadline, the detached retry reserves the Welcome
+    // but does not start its attempt once the deadline passes.
+    let task = runtime
+        .prepare_welcome_retry_task_with_audit_context(vec![welcome.clone()], Default::default())
+        .unwrap();
+    assert_eq!(task.message_ids(), std::slice::from_ref(&welcome.id));
+    wall.set(300_100);
+    let finished = runtime
+        .finish_welcome_publish_task(task.run().await)
+        .await
+        .unwrap();
+    assert!(finished.welcome_failures.is_empty());
+    assert!(finished.failures.is_empty());
+
+    let deferred = runtime
+        .publish_welcome_messages_with_audit_context(
+            vec![welcome.clone()],
+            Some(chosen),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert!(deferred.welcome_failures.is_empty());
+    let startup = runtime
+        .retry_welcome_messages_with_audit_context(vec![welcome.clone()], Default::default())
+        .await
+        .unwrap();
+    assert!(startup.welcome_failures.is_empty());
+    wall.set(300_200);
+    runtime.run_due_maintenance().await.unwrap();
+    let redelivered = runtime.redeliver_welcome(&welcome.id).await.unwrap();
+    assert!(redelivered.welcome_failures.is_empty());
+
+    assert!(welcome_publishes(&adapter).is_empty());
+    assert!(
+        runtime
+            .session()
+            .transport_fanout(&welcome.id)
+            .unwrap()
+            .is_none(),
+        "maintenance drops the expired Welcome's retry record"
+    );
+}

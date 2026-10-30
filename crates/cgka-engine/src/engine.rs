@@ -31,7 +31,7 @@ use cgka_traits::maintenance::{MaintenanceRandom, WallClock};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
-use cgka_traits::transport::{TransportEnvelope, TransportMessage};
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use marmot_forensics::{
@@ -94,7 +94,7 @@ pub enum OutboundWelcomeStatus {
         message: TransportMessage,
     },
     /// Nothing is left to send: delivered, withdrawn, retired with its
-    /// commit, or not a delivery-aware Welcome.
+    /// commit, past its delivery deadline, or not a delivery-aware Welcome.
     Settled,
 }
 
@@ -1300,14 +1300,21 @@ impl<S: StorageProvider> Engine<S> {
     /// Create a group under `group_id`, chosen by the host before the group
     /// exists, as a device link needs. The id has 1 to 255 bytes and names no
     /// group this device holds in any state, removed or forgotten copies
-    /// included; otherwise this fails before anything is written.
+    /// included; otherwise this fails before anything is written. The
+    /// founding Welcomes are never published from `welcome_deliver_until`
+    /// on, the end of the new device's wait (mdk#2628 D40).
     pub async fn create_group_with_chosen_id_and_audit_context(
         &mut self,
         req: CreateGroupRequest,
         group_id: GroupId,
+        welcome_deliver_until: Timestamp,
         context: Option<AuditEventContext>,
     ) -> Result<(GroupId, SendResult), EngineError> {
-        self.create_group_audited(req, Vec::new(), Some(group_id), context)
+        let chosen = crate::group_lifecycle::ChosenGroup {
+            group_id,
+            welcome_deliver_until,
+        };
+        self.create_group_audited(req, Vec::new(), Some(chosen), context)
             .await
     }
 
@@ -1315,7 +1322,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         req: CreateGroupRequest,
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
-        chosen_group_id: Option<GroupId>,
+        chosen: Option<crate::group_lifecycle::ChosenGroup>,
         context: Option<AuditEventContext>,
     ) -> Result<(GroupId, SendResult), EngineError> {
         let operation_id = self.next_audit_operation_id();
@@ -1337,7 +1344,7 @@ impl<S: StorageProvider> Engine<S> {
         // `group_context` row carries no context of its own and inherits it.
         let mut engine = OperationAuditScope::enter(self, context.clone());
         let result = engine
-            .do_create_group(req, optional_app_components, chosen_group_id)
+            .do_create_group(req, optional_app_components, chosen)
             .await;
         match &result {
             Ok((group_id, send_result)) => {
@@ -3467,11 +3474,14 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
-    /// Where the retained outbound Welcome `id` stands for delivery. A
-    /// missing row is settled: there is nothing this engine owes under it.
+    /// Where the retained outbound Welcome `id` stands for delivery at `now`.
+    /// A missing row is settled: there is nothing this engine owes under it.
+    /// So is one whose delivery deadline is not after `now`: it is never
+    /// published again (mdk#2628 D40).
     pub fn outbound_welcome_status(
         &self,
         id: &MessageId,
+        now: Timestamp,
     ) -> Result<OutboundWelcomeStatus, EngineError> {
         let record = match self.storage.get_message(id) {
             Ok(record) => record,
@@ -3489,6 +3499,12 @@ impl<S: StorageProvider> Engine<S> {
         let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
             return Ok(OutboundWelcomeStatus::Waiting);
         };
+        if payload
+            .welcome_deliver_until()
+            .is_some_and(|deliver_until| now >= deliver_until)
+        {
+            return Ok(OutboundWelcomeStatus::Settled);
+        }
         Ok(match payload {
             StoredMessagePayload::StagedInviteWelcome { .. } => OutboundWelcomeStatus::Waiting,
             StoredMessagePayload::OutboundWelcome { message, .. }
@@ -3663,6 +3679,25 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(ids)
+    }
+
+    /// When the retained outbound Welcome `id`, staged or owed, stops being
+    /// deliverable, if it has a delivery deadline, as a device link's
+    /// Welcome does (mdk#2628 D40). A missing row, or any other row, has
+    /// none. A `Sent` row that cannot be read has none either: the publish
+    /// check reads it as staged first ([`Self::sent_welcome_awaits_commit`]).
+    pub fn sent_welcome_deliver_until(
+        &self,
+        id: &MessageId,
+    ) -> Result<Option<Timestamp>, EngineError> {
+        let record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(None),
+            Err(error) => return Err(EngineError::Storage(error)),
+        };
+        Ok(StoredMessagePayload::decode(&record.payload)
+            .ok()
+            .and_then(|payload| payload.welcome_deliver_until()))
     }
 
     /// Whether `id` names a retained outbound Welcome that must never be

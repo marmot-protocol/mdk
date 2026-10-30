@@ -154,6 +154,7 @@ cgka-traits = { path = "crates/traits" }
 cgka-engine = { path = "crates/cgka-engine" }
 marmot-session = { path = "crates/marmot-session" }
 storage-sqlite = { path = "crates/storage-sqlite" }
+sonar-stickers = { version = "0.1.0", features = ["nostr"] }
 cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
 transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }
 transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }

@@ -1,8 +1,13 @@
-use super::*;
+//! The collector helper's proxy tests. They check the process proxy policy, `network_proxy`'s
+//! `http_builder` and the relay builder, so they stay with it; each hands the policy in, as a
+//! `MarmotApp` constructor does. The helper's other tests stay with it.
+
+use std::net::IpAddr;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -10,6 +15,17 @@ use tokio::{
 use tokio_tungstenite::tungstenite::handshake::server::{
     Callback, ErrorResponse, Request, Response,
 };
+use url::Url;
+
+use crate::collector_host_safety::{
+    CONNECT_TIMEOUT, CollectorRequestError, PinnedCollector, REQUEST_TIMEOUT, hand_in_http_builder,
+    resolve_with_for_test,
+};
+
+async fn resolve(endpoint: &str, ips: &[&str]) -> Result<PinnedCollector, CollectorRequestError> {
+    let ips: Vec<IpAddr> = ips.iter().map(|ip| ip.parse().unwrap()).collect();
+    resolve_with_for_test(endpoint, |_, _| async { Ok(ips) }).await
+}
 
 struct CaptureHeaders<'a>(&'a mut Vec<Vec<(String, String)>>);
 
@@ -58,6 +74,7 @@ async fn socks5_pins_dns_fail_closed() {
         DirectoryEventQuery, DirectoryFetchRequest, DirectoryRelayFetcher,
         NostrSdkDirectoryRelayFetcher,
     };
+    hand_in_http_builder(crate::network_proxy::http_builder);
 
     const CHILD: &str = "WN_PROXY_ROUTING_TEST_CHILD";
     const MODE: &str = "WN_PROXY_ROUTING_TEST_MODE";
@@ -83,15 +100,15 @@ async fn socks5_pins_dns_fail_closed() {
         let calls = Arc::new(AtomicUsize::new(0));
         // Builder fixture only: production resolution rejects loopback answers
         // for ordinary hostnames. An unresolvable name proves use of the pin.
-        let pin = PinnedCollector {
-            url: Url::parse(&format!("http://pin-only.invalid:{origin}/metrics")).unwrap(),
-            addrs: vec![format!("127.0.0.1:{origin}").parse().unwrap()],
-        };
+        let pin = PinnedCollector::new_for_test(
+            Url::parse(&format!("http://pin-only.invalid:{origin}/metrics")).unwrap(),
+            vec![format!("127.0.0.1:{origin}").parse().unwrap()],
+        );
         if mode == "partial" || mode == "orphan" {
-            assert!(pin.build_client().is_err());
+            assert!(pin.build_client_for_test().is_err());
             clear_proxy_environment();
             assert!(
-                pin.build_client().is_err(),
+                pin.build_client_for_test().is_err(),
                 "invalid snapshot must stay blocked"
             );
             let relays = crate::network_proxy::nostr_builder().build();
@@ -108,13 +125,13 @@ async fn socks5_pins_dns_fail_closed() {
             return;
         }
         let client = pin
-            .build_client_from(
+            .build_client_from_for_test(
                 reqwest::Client::builder().dns_resolver(Arc::new(ForbiddenDns(calls.clone()))),
                 CONNECT_TIMEOUT,
                 REQUEST_TIMEOUT,
             )
             .unwrap();
-        let response = client.post(pin.url.clone()).send().await;
+        let response = client.post(pin.url().clone()).send().await;
         if mode == "rejected" {
             assert!(response.is_err());
         } else {
@@ -145,8 +162,8 @@ async fn socks5_pins_dns_fail_closed() {
         clear_proxy_environment();
         // The proxy has closed. Later clients must retain its policy despite
         // cleared variables, a reachable origin, and NO_PROXY matching everything.
-        let client = pin.build_client().unwrap();
-        assert!(client.post(pin.url).send().await.is_err());
+        let client = pin.build_client_for_test().unwrap();
+        assert!(client.post(pin.url().clone()).send().await.is_err());
         let relay = format!("ws://127.0.0.1:{origin}");
         let relays = crate::network_proxy::nostr_builder().build();
         relays.add_relay(&relay).await.unwrap();
@@ -308,7 +325,7 @@ async fn socks5_pins_dns_fail_closed() {
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "collector_host_safety::proxy_tests::socks5_pins_dns_fail_closed",
+                    "observability_tests::collector_host_safety::socks5_pins_dns_fail_closed",
                     "--nocapture",
                 ])
                 .env(CHILD, origin_port.to_string())
@@ -383,4 +400,71 @@ async fn socks5_pins_dns_fail_closed() {
             "explicit proxy failure must not dial the origin directly"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::disallowed_methods)]
+async fn reqwest_uses_only_pinned_addresses_and_ignores_proxies() {
+    hand_in_http_builder(crate::network_proxy::http_builder);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let pin = resolve(
+        &format!("http://localhost:{}/metrics?exact=one%2Ftwo", addr.port()),
+        &["127.0.0.1"],
+    )
+    .await
+    .unwrap();
+    let client = pin
+        .build_client_from_for_test(
+            reqwest::Client::builder()
+                .dns_resolver(Arc::new(ForbiddenDns(calls.clone())))
+                .proxy(
+                    reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap(),
+                ),
+            CONNECT_TIMEOUT,
+            REQUEST_TIMEOUT,
+        )
+        .unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let mut buf = [0; 1024];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&buf[..n]);
+            if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let headers = String::from_utf8(bytes).unwrap().to_lowercase();
+        assert!(headers.starts_with("post /metrics?exact=one%2ftwo http/1.1\r\n"));
+        assert!(headers.contains(&format!("host: localhost:{}\r\n", addr.port())));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    assert!(
+        client
+            .post(pin.url().clone())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    server.await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "reqwest must not resolve again"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), proxy.accept())
+            .await
+            .is_err()
+    );
 }

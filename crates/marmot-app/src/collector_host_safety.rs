@@ -14,8 +14,8 @@ use url::{Host, Url};
 
 use crate::export_config::{endpoint_host_is_loopback, parse_relay_telemetry_endpoint};
 
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Applies the process network proxy policy to an HTTP client builder.
 pub type HttpClientBuilder =
@@ -31,21 +31,16 @@ pub fn hand_in_http_builder(builder: HttpClientBuilder) {
     let _ = HTTP_BUILDER.set(builder);
 }
 
-#[cfg(not(test))]
 fn http_builder() -> Option<HttpClientBuilder> {
     HTTP_BUILDER.get().copied()
 }
 
-/// Unit tests build collectors without a `MarmotApp`, so they fall back to the builder it hands
-/// in.
+/// For this set's own tests that dial a loopback collector without a `MarmotApp`: a builder that
+/// only drops environment proxies, as the process policy does with no SOCKS5 proxy configured.
+/// The tests of the policy itself live in `marmot-app` and hand in its builder.
 #[cfg(test)]
-fn http_builder() -> Option<HttpClientBuilder> {
-    Some(
-        HTTP_BUILDER
-            .get()
-            .copied()
-            .unwrap_or(crate::network_proxy::http_builder),
-    )
+pub(crate) fn hand_in_direct_http_builder() {
+    hand_in_http_builder(|builder| Ok(builder.no_proxy()));
 }
 
 /// Context-free failure from collector resolution or client construction.
@@ -54,7 +49,7 @@ fn http_builder() -> Option<HttpClientBuilder> {
 /// helper can be used from default-build upload paths without a feature-gated
 /// public error variant.
 #[derive(Debug)]
-pub(crate) struct CollectorRequestError;
+pub struct CollectorRequestError;
 
 impl std::fmt::Display for CollectorRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -179,8 +174,42 @@ where
     })
 }
 
-#[cfg(test)]
-mod tests;
+/// Test hooks for the proxy tests in `marmot-app` (#2627). Each calls the crate-private item of
+/// the same name; `new_for_test` builds a pin without resolution, so a fixture can pin an
+/// unresolvable name to a loopback address.
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
+impl PinnedCollector {
+    pub fn new_for_test(url: Url, addrs: Vec<SocketAddr>) -> Self {
+        Self { url, addrs }
+    }
+
+    pub fn build_client_for_test(&self) -> Result<reqwest::Client, CollectorRequestError> {
+        self.build_client()
+    }
+
+    pub fn build_client_from_for_test(
+        &self,
+        builder: reqwest::ClientBuilder,
+        connect: Duration,
+        request: Duration,
+    ) -> Result<reqwest::Client, CollectorRequestError> {
+        self.build_client_from(builder, connect, request)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn resolve_with_for_test<F, Fut>(
+    endpoint: &str,
+    resolver: F,
+) -> Result<PinnedCollector, CollectorRequestError>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: Future<Output = std::io::Result<Vec<IpAddr>>>,
+{
+    resolve_with(endpoint, resolver).await
+}
 
 #[cfg(test)]
-mod proxy_tests;
+mod tests;

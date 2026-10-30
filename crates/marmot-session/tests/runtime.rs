@@ -35,12 +35,12 @@ use cgka_traits::{
     TransportPublishTarget,
 };
 use marmot_session::{
-    AccountDeviceRuntime, AccountDeviceSession, AccountError, KeyPackagePublication,
-    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
-    KeyPackageSlotWithdrawal, MaintenanceRandom, MaintenanceTiming, MonotonicClock,
-    NoopKeyPackagePublisher, PendingResolution, PublishWork, PublishedApplicationMessage,
-    SessionConfig, SessionError, StaticTransportRouting, TransportRoutingError,
-    TransportRoutingPolicy, WallClock, WelcomeWithdrawal,
+    AccountDeviceRuntime, AccountDeviceSession, AccountError, ForeignSlotOutcome,
+    ForeignSlotPublication, KeyPackageEventDeletion, KeyPackagePublication, KeyPackagePublishError,
+    KeyPackagePublishReceipt, KeyPackagePublisher, KeyPackageSlotWithdrawal, MaintenanceRandom,
+    MaintenanceTiming, MonotonicClock, NoopKeyPackagePublisher, PendingResolution, PublishWork,
+    PublishedApplicationMessage, SessionConfig, SessionError, StaticTransportRouting,
+    TransportRoutingError, TransportRoutingPolicy, WallClock, WelcomeWithdrawal,
 };
 use nostr::prelude::FinalizeEvent;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
@@ -731,6 +731,7 @@ include!("runtime/component_migration.rs");
 include!("runtime/multi_device_welcome.rs");
 include!("runtime/key_package_slot.rs");
 include!("runtime/key_package_slot_withdrawal.rs");
+include!("runtime/own_slot.rs");
 include!("runtime/account_devices_advertising.rs");
 include!("runtime/welcome_withdrawal.rs");
 include!("runtime/staged_invite_welcome.rs");

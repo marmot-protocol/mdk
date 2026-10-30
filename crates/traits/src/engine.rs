@@ -25,7 +25,7 @@ use crate::error::EngineError;
 use crate::group::{Member, ProtocolProfile};
 use crate::group_context::{GroupContext, SecretBytes};
 use crate::ingest::IngestOutcome;
-use crate::transport::TransportMessage;
+use crate::transport::{Timestamp, TransportMessage};
 use crate::transport_adapter::TransportEndpoint;
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
 use async_trait::async_trait;
@@ -196,11 +196,14 @@ pub enum SendIntent {
     /// update with exactly one operation, setting the device entry of a slot
     /// the roster does not list yet, whose announced KeyPackage is
     /// `key_package`'s `KeyPackageRef`. The group must require the roster.
-    /// The added device gets its Welcome as an [`Self::Invite`]'s devices do.
+    /// The added device gets its Welcome as an [`Self::Invite`]'s devices do,
+    /// except that it is never published from `deliver_until` on, in Unix
+    /// seconds: the end of the new device's wait for it (D40).
     LinkDevice {
         group_id: GroupId,
         key_package: KeyPackage,
         roster_update: Vec<u8>,
+        deliver_until: Timestamp,
     },
     /// Remove a device whose link failed from the account's device group,
     /// with its roster entry, in one admin Commit (mdk#2628 item 3.3b, D40).

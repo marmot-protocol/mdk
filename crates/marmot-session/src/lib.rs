@@ -17,17 +17,19 @@ mod time;
 
 pub use error::{AccountError, AccountResult};
 pub use key_package::{
-    KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
-    KeyPackageSlotWithdrawal, NoopKeyPackagePublisher,
+    KeyPackageEventDeletion, KeyPackagePublication, KeyPackagePublishError,
+    KeyPackagePublishReceipt, KeyPackagePublisher, KeyPackageSlotWithdrawal,
+    NoopKeyPackagePublisher,
 };
 pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy};
 pub use runtime::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, AccountIngestPhase,
     CompletedWelcomePublishTask, DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport,
-    FailedApplicationMessage, MaintenanceActivity, MaintenanceAttemptDuration, MaintenanceTiming,
-    PendingResolution, PreparedSessionCommit, PreparedSessionSend, PreparedWelcomePublishTask,
-    PublishFailure, PublishedApplicationMessage, UndeliveredCommit, UnresolvedApplicationMessage,
-    UnresolvedPublish, UnresolvedPublishReason, WelcomeDeliveryFailure,
+    FailedApplicationMessage, ForeignSlotOutcome, ForeignSlotPublication, MaintenanceActivity,
+    MaintenanceAttemptDuration, MaintenanceTiming, PendingResolution, PreparedSessionCommit,
+    PreparedSessionSend, PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage,
+    UndeliveredCommit, UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
+    WelcomeDeliveryFailure,
 };
 pub use session::{
     CreateGroupEffects, GroupAuthorityView, HydrationProgress, PublishWork, QueuedIntentRef,
@@ -44,6 +46,12 @@ pub use session::{
     CanonicalizationPolicy, FeatureRegistry, GroupAuthoritySnapshot, KeyPackageMetadata,
     KeyPackageRequirements, V1_SETTLEMENT_QUIESCENCE_MS, WelcomeDeliveryIndex, WelcomeWithdrawal,
     application_message_len, durably_owned_key_packages, key_package_metadata,
+};
+pub use session::{
+    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,
+    MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW, PRIVATE_KEY_PACKAGE_STOCK_TARGET,
+    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, private_key_package_stock,
+    validate_received_private_key_package,
 };
 pub use time::{
     MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,

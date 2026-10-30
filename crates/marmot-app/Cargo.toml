@@ -26,7 +26,8 @@ otlp-export = ["dep:opentelemetry-proto", "dep:prost"]
 # Internal-only surface used by the repeatable media transport benchmark.
 media-benchmarks = []
 # The lower-stack error table that host crates check their classifiers
-# against. Enable only as a dev-dependency.
+# against, and the diagnostics test fixtures and hooks. Enable only as a
+# dev-dependency.
 test-support = []
 
 [dependencies]
@@ -64,6 +65,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 media-store.workspace = true
+sonar-stickers.workspace = true
+nostr044 = { package = "nostr", version = "0.44", default-features = false, features = ["std"] }
 storage-sqlite.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true

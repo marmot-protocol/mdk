@@ -19,7 +19,7 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::SendIntent;
 use cgka_traits::storage::{MaintenanceStorage as _, StorageError};
 use cgka_traits::{
-    EngineError, EpochState, GroupCapabilities, GroupId, KeyPackage, MemberId, MessageId,
+    EngineError, EpochState, GroupCapabilities, GroupId, KeyPackage, MemberId, MessageId, Timestamp,
 };
 use marmot_pairing::{
     AccountKey, CancelReason, ConfirmedLink, EndReason, ExistingDeviceEvent, ExistingDevicePairing,
@@ -43,7 +43,7 @@ use super::{
 use crate::client::device_group::{
     ConfirmedDeviceLink, LINK_DEADLINE_SECS, WELCOME_WAIT_SECS, device_slot,
 };
-use crate::client::{AppClient, WelcomeDelivery, recover_post_canonical_result};
+use crate::client::{AppClient, WelcomeDelivery};
 use crate::{AccountRelayListStatus, AppError, unix_now_seconds};
 
 const TARGET: &str = "marmot_app::client::device_pairing";
@@ -1024,8 +1024,15 @@ impl AppClient {
         // Past the new device's Welcome wait, a link would add a device that
         // no longer waits for it.
         let result = if now < approval.retry_until {
-            self.add_linked_device(&approval.link, slot, key_package, &choices, now)
-                .await
+            self.add_linked_device(
+                &approval.link,
+                slot,
+                key_package,
+                &choices,
+                now,
+                approval.wait_ends,
+            )
+            .await
         } else {
             Err(AppError::DeviceGroupRefused("link_expired"))
         };
@@ -1082,6 +1089,9 @@ impl AppClient {
         }
     }
 
+    /// Add the confirmed device by the link commit, or by creating the device
+    /// group on a first link. Its Welcome is never published from
+    /// `wait_ends` on, when the new device stops waiting for it (D40).
     async fn add_linked_device(
         &mut self,
         link: &ConfirmedLink,
@@ -1089,6 +1099,7 @@ impl AppClient {
         key_package: KeyPackage,
         choices: &DeviceLinkChoices,
         now: u64,
+        wait_ends: u64,
     ) -> Result<(GroupId, HashSet<MessageId>), AppError> {
         let key_package_ref_hex = hex::encode(link.key_package_ref.as_slice());
         let roster_update = if self.trusted_device_group()?.as_ref() == Some(&link.device_group_id)
@@ -1131,7 +1142,7 @@ impl AppClient {
             )?;
         match roster_update {
             Some(update) => {
-                self.link_device_into_group(&link.device_group_id, key_package, update)
+                self.link_device_into_group(&link.device_group_id, key_package, update, wait_ends)
                     .await?;
             }
             None => {
@@ -1141,7 +1152,8 @@ impl AppClient {
                     device_group_id: link.device_group_id.clone(),
                     welcome_sender_key: link.welcome_sender_key.as_slice().to_vec(),
                 };
-                self.create_device_group(&confirmed, choices).await?;
+                self.create_device_group(&confirmed, choices, wait_ends)
+                    .await?;
             }
         }
         // The commit is made, so a failed read here must not end the link as
@@ -1170,12 +1182,14 @@ impl AppClient {
     /// also writes its roster entry. The runtime publishes it as a group
     /// evolution, releasing its Welcome only once the commit is confirmed,
     /// now or on a later retry, so the new device never joins an epoch that
-    /// rolls back. Only a commit the runtime rolled back is an error.
+    /// rolls back, and never once the new device stopped waiting at
+    /// `wait_ends`. Only a commit the runtime rolled back is an error.
     async fn link_device_into_group(
         &mut self,
         group_id: &GroupId,
         key_package: KeyPackage,
         roster_update: Vec<u8>,
+        wait_ends: u64,
     ) -> Result<(), AppError> {
         let account = self.app.account_home().account(&self.state.label)?;
         self.refresh_member_inbox_routes(std::iter::once(account.account_id_hex.as_str()))?;
@@ -1192,6 +1206,7 @@ impl AppClient {
                     group_id: group_id.clone(),
                     key_package,
                     roster_update,
+                    deliver_until: Timestamp(wait_ends),
                 },
                 audit_context,
             )
@@ -1225,10 +1240,7 @@ impl AppClient {
             return Ok(());
         }
         let effects = sent?;
-        recover_post_canonical_result(
-            "link_device_welcome_failures",
-            self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects),
-        );
+        self.note_welcome_delivery_failures(&effects);
         Ok(())
     }
 
@@ -1354,20 +1366,27 @@ impl AppClient {
             let Some(outcome) = self.link_outcome(&link, &own_slot, &key, window, now) else {
                 continue;
             };
-            self.device_pairing.quiet_since.remove(&key);
             // Withdraw a failing link's Welcome before recording the failure,
-            // so no crash between the two leaves a failed link with its
-            // Welcome still publishable. The failure path retries it.
+            // so no failed link ever has its Welcome still publishable. While
+            // the Welcome's own deadline may be ahead, a withdrawal that fails
+            // records nothing: the link stays pending and the next drive
+            // decides it again. That deadline is never after `linked_at` plus
+            // the new device's wait, and from then on the runtime refuses the
+            // Welcome, so the failure is recorded and the removal does not
+            // wait for the withdrawal.
             if outcome == DeviceLinkOutcome::Failed
                 && let Err(error) = self.withdraw_link_welcomes(&link)
+                && now < link.linked_at.saturating_add(WELCOME_WAIT_SECS)
             {
-                tracing::debug!(
+                tracing::warn!(
                     target: TARGET,
                     method = "decide_device_links",
                     error_kind = error.privacy_safe_kind(),
-                    "could not withdraw a failing link's Welcome yet"
+                    "could not withdraw a failing link's Welcome; deciding it again"
                 );
+                continue;
             }
+            self.device_pairing.quiet_since.remove(&key);
             if let Err(error) =
                 storage.decide_device_link(&link.group_id_hex, &link.slot_hex, outcome, now)
             {
@@ -1578,53 +1597,6 @@ impl AppClient {
             }
         }
         Ok(())
-    }
-
-    /// Withdraw, before anything publishes, the Welcome of every link that
-    /// failed and of every pending link past its deadline (D40). Welcome
-    /// publishers run before the gate can decide a link, which waits for its
-    /// device group to be hydrated and quiet, and a crash can fall between a
-    /// failure and its withdrawal. A link past its deadline whose first commit
-    /// already landed loses nothing: its Welcome reached the new device. It
-    /// runs with device groups off too: the publishers do, and an earlier run
-    /// with them on may have left links.
-    pub(super) fn withdraw_expired_link_welcomes_at(&mut self, now: u64) {
-        let links = match self
-            .app
-            .account_storage(&self.state.label)
-            .and_then(|storage| Ok(storage.app_storage().device_links()?))
-        {
-            Ok(links) => links,
-            Err(error) => {
-                tracing::warn!(
-                    target: TARGET,
-                    method = "withdraw_expired_link_welcomes",
-                    error_kind = error.privacy_safe_kind(),
-                    "could not read this device's links at startup"
-                );
-                return;
-            }
-        };
-        for link in links {
-            match link.outcome {
-                DeviceLinkOutcome::Failed if !link.welcome_withdrawn => {
-                    self.withdraw_failed_link_welcome(&link, true);
-                }
-                DeviceLinkOutcome::Pending
-                    if now >= link.linked_at.saturating_add(LINK_DEADLINE_SECS) =>
-                {
-                    if let Err(error) = self.withdraw_link_welcomes(&link) {
-                        tracing::warn!(
-                            target: TARGET,
-                            method = "withdraw_expired_link_welcomes",
-                            error_kind = error.privacy_safe_kind(),
-                            "could not withdraw an expired link's Welcome at startup"
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
     }
 
     /// Remove the leaf `leaf_signature_key` from the device group and its
