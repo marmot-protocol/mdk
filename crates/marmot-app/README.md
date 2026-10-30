@@ -33,6 +33,12 @@ and the shared agent stream watch manager. The relay plane also owns shared dire
 profiles, follow lists, and KeyPackages, including endpoint safety and in-flight coalescing. The daemon path is
 runtime-owned subscriptions plus typed events; explicit catch-up remains available for repair and tests.
 
+Account workers start authenticated rejoin for durably and natively `Unrecoverable` copies without
+restarting healthy peers or requiring a host Repair command. The existing Repair action can rearm an eligible
+parked episode; restarting alone does not reset its budget. Usable forks retain explicit replacement consent.
+See the [automatic rejoin contract](../../docs/marmot-architecture/invitation-recovery.md#automatic-rejoin-of-an-unrecoverable-copy)
+for device authorization, durable retries and the limits of history recovery.
+
 The runtime exposes account status, group listing/showing, message listing, and snapshot-plus-live subscription APIs,
 so CLI, TUI, and native surfaces never open the databases directly.
 

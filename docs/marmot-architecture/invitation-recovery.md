@@ -171,7 +171,7 @@ legacy group. A recipient whose fresh KeyPackages use a different profile skips 
 Quarantined group records retire their stale recipient jobs without blocking recovery in other groups.
 Restored coordinators hydrate their group before advancing a retained Challenge or Grant.
 
-Rust hosts drive `prepare_group_recovery`, resolve only
+`MarmotAppRuntime` drives this automatically. Lower-level Rust hosts drive `prepare_group_recovery`, resolve only
 the returned members' safe inbox routes, then call `advance_group_recovery` in their existing account loop. Both
 methods belong to the same runtime owner; preparation durably reserves each turn before cancellable lookup work.
 Pass the host-held group IDs and a caller-owned `AccountDeviceEffects` buffer. Apply appended effects before
@@ -180,7 +180,7 @@ Name the trusted device group through `set_key_package_announcement_group` and `
 advancing. Recovery settles this device's tag signature key and announces the exact replacement KeyPackage before
 publishing it. A held device group defers those roster writes without replacing the retained Challenge or Grant.
 Hosts can read `group_rejoin_status` as `Inactive`, `Pending { attempts }` or `Parked { attempts }`. A parked episode
-lets a host ask the user to retry or request an admin re-add.
+raises the existing app recovery-failure signal so a host can ask the user to retry or request an admin re-add.
 `retry_group_rejoin` explicitly starts a new budget only for an eligible Unrecoverable copy; it grants no authority
 to overwrite a usable copy. It clears the remote epoch high-water mark and restores the one-shot permission, so a
 dishonest coordinator cannot poison every later user-authorized episode. An unexpired grant retains its nonce,

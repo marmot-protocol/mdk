@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-10-22
+updated: 2026-10-27
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -133,6 +133,12 @@ pending/failed inviter recovery, and an `automatic_recovery_failed` warning from
 with qualified history evidence while the engine remains stalled. EOSE or repeated replay alone cannot mint that evidence. Local self-updates cannot clear a latched warning. Rust runtime, UniFFI, and C expose query, confirm, and decline commands. Hosts must display the
 Welcome author and request explicit consent; these commands do not infer consent from ordinary invite acceptance.
 See [invitation recovery](../invitation-recovery.md) for persistence, retry, and integration contracts.
+
+Durably and natively `Unrecoverable` copies now request automatic rejoin over a private account-inbox handshake.
+A healthy current admin verifies a nonce-bound MLS device proof before atomically replacing the exact stale leaf;
+the confirmed Commit releases a fresh Welcome to the running recipient. History is retained, retries survive
+reopen, and usable forks still require explicit consent. See the
+[automatic rejoin contract](../invitation-recovery.md#automatic-rejoin-of-an-unrecoverable-copy).
 
 The C3 row completion adds bounded selected draft/message/invitation/empty previews and local
 row-action availability to presented rows. Draft invalidations refresh both list APIs without

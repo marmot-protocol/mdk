@@ -103,7 +103,11 @@ impl AppClient {
             failed_reinvites,
             group_id_hex: hex::encode(group_id.as_slice()),
             automatic_recovery_failed: !group.is_terminal()
-                && storage.app_storage().automatic_recovery_failed(group_id)?,
+                && (storage.app_storage().automatic_recovery_failed(group_id)?
+                    || matches!(
+                        self.runtime.group_rejoin_status(group_id)?,
+                        marmot_session::GroupRejoinStatus::Parked { .. }
+                    )),
             rejoin_invitations,
             history_may_be_incomplete: !history_notice_ids.is_empty(),
             history_notice_ids,
@@ -186,7 +190,8 @@ impl AppClient {
         Ok(())
     }
 
-    /// Retry durable invitation work without replacing an already-observed result.
+    /// Retry durable invitation and halted-copy work without replacing an
+    /// already-observed maintenance or convergence result.
     pub(crate) async fn recover_superseded_invites_best_effort(&mut self) {
         if self.recover_superseded_invites().await.is_err() {
             tracing::warn!(
@@ -195,6 +200,109 @@ impl AppClient {
                 "invitation recovery failed; durable work remains pending"
             );
         }
+        if self.advance_auto_recovery().await.is_err() {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "advance_auto_recovery",
+                "automatic group recovery deferred; durable work remains pending"
+            );
+        }
+    }
+
+    /// Run one durable recovery turn under the ordinary account-worker owner.
+    /// The runtime reserves bounded lookup work before any cancellable I/O and
+    /// owns authentication, retry pacing, membership checks and publication.
+    async fn advance_auto_recovery(&mut self) -> Result<(), AppError> {
+        if self.runtime.maintenance_is_paused()
+            || self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+        {
+            return Ok(());
+        }
+        self.app.ensure_storage_open("automatic group recovery")?;
+        let mut before = Vec::new();
+        for group_id in self.runtime.live_group_ids()? {
+            if matches!(
+                self.runtime.epoch_state(&group_id),
+                Some(cgka_traits::EpochState::Unrecoverable { .. })
+            ) {
+                let parked = matches!(
+                    self.runtime.group_rejoin_status(&group_id)?,
+                    marmot_session::GroupRejoinStatus::Parked { .. }
+                );
+                before.push((group_id, parked));
+            }
+        }
+        let peers = self.runtime.prepare_group_recovery()?;
+        for (group_id, parked) in before {
+            if parked
+                != matches!(
+                    self.runtime.group_rejoin_status(&group_id)?,
+                    marmot_session::GroupRejoinStatus::Parked { .. }
+                )
+            {
+                self.mark_recovery_status_changed(&group_id);
+            }
+        }
+        let directory = self.app.directory();
+        for peer in peers {
+            let member = hex::encode(peer.as_slice());
+            // This resolver follows advertised outboxes and applies the same
+            // host-safety policy as ordinary member discovery. A failed lookup
+            // is not success: advance retains and paces the durable job.
+            if directory
+                .resolve_account_relay_list_status_for_account_id(
+                    &member,
+                    self.app.relay_endpoints(),
+                )
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            self.refresh_member_inbox_routes(std::iter::once(member.as_str()))?;
+        }
+        if self.runtime.maintenance_is_paused()
+            || self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+        {
+            return Ok(());
+        }
+        self.app.ensure_storage_open("automatic group recovery")?;
+        self.sync_key_package_announcement_group()?;
+        self.sync_device_tag_group()?;
+        let held = self.epoch_gap_held_groups()?;
+        let mut effects = marmot_session::AccountDeviceEffects::default();
+        let result = self
+            .runtime
+            .advance_group_recovery(&held, &mut effects)
+            .await;
+        if effects.events.is_empty()
+            && effects.failed_app_messages.is_empty()
+            && effects.published_app_messages.is_empty()
+        {
+            self.remember_published_reports(&effects);
+            return result.map_err(AppError::from);
+        }
+        // Reuse native maintenance projection, group-route refresh and buffered
+        // summaries; control envelopes themselves never become chat entries.
+        self.observe_native_membership_effects(&effects).await?;
+        result?;
+        Ok(())
+    }
+
+    pub(crate) fn retry_parked_rejoins(&mut self) -> Result<(), AppError> {
+        for group_id in self.runtime.live_group_ids()? {
+            if matches!(
+                self.runtime.epoch_state(&group_id),
+                Some(cgka_traits::EpochState::Unrecoverable { .. })
+            ) && matches!(
+                self.runtime.group_rejoin_status(&group_id)?,
+                marmot_session::GroupRejoinStatus::Parked { .. }
+            ) {
+                self.runtime.retry_group_rejoin(&group_id)?;
+                self.mark_recovery_status_changed(&group_id);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn recover_superseded_invites(&mut self) -> Result<(), AppError> {
