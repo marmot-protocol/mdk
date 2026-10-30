@@ -32,7 +32,7 @@ use transport_nostr_adapter::sweep::{
     SweepRange, SweepRelay, SweepRoute, UnreachableKind,
 };
 
-use super::admission::{LiveFence, Stalled, live_fences};
+use super::admission::{Drained, LiveFence, Stalled, live_fences};
 use super::policy::{
     RUNNER_BACKOFF_BASE_SECS, RUNNER_QUANTUM, RUNNER_RECHECK_INTERVAL_SECS, RUNNER_REQUEST_TIMEOUT,
     RUNNER_UNREACHABLE_RETRY_SECS,
@@ -824,6 +824,10 @@ struct TestHost {
     no_trace: Mutex<BTreeSet<Vec<u8>>>,
     /// Events whose ingest fails locally.
     failing_ingests: Mutex<BTreeSet<Vec<u8>>>,
+    /// How many seconds of the host's clock each ingest and each debt turn
+    /// takes.
+    ingest_seconds: AtomicU64,
+    debt_turn_seconds: AtomicU64,
     /// A laggard every admission is checked against: each admitted event's
     /// second, with the first second the laggard owed then.
     laggard: Mutex<Option<UnitKey>>,
@@ -891,6 +895,8 @@ impl TestHost {
             admitted: admitted.clone(),
             no_trace: Mutex::default(),
             failing_ingests: Mutex::default(),
+            ingest_seconds: AtomicU64::new(0),
+            debt_turn_seconds: AtomicU64::new(0),
             laggard: Mutex::default(),
             behind: Mutex::default(),
             client,
@@ -990,6 +996,8 @@ impl RunnerHost for TestHost {
             live_counts: &counts,
         });
         self.debt_turns.fetch_add(1, Ordering::SeqCst);
+        self.clock
+            .advance(self.debt_turn_seconds.load(Ordering::SeqCst));
         Some(answer)
     }
 
@@ -1029,6 +1037,8 @@ impl RunnerHost for TestHost {
         &self,
         delivery: TransportDelivery,
     ) -> Option<Result<Admitted, &'static str>> {
+        self.clock
+            .advance(self.ingest_seconds.load(Ordering::SeqCst));
         let at = delivery.message.timestamp.0;
         let event_id = delivery.message.id.as_slice().to_vec();
         if self.no_trace.lock().unwrap().contains(&event_id) {
@@ -2743,7 +2753,10 @@ async fn recovery_runner_fences_live_frames_below_a_non_empty_count_alone() {
     // An admission turn keeps B's capture, so a restart, which forgets the
     // counts, still holds the frames.
     let (mut runner, _handle) = runner(&host, test_policy());
-    assert!(matches!(runner.admit(None).await, Ok(None)));
+    assert!(matches!(
+        runner.admit(None).await,
+        Ok(Drained { due: None, .. })
+    ));
     assert_eq!(
         account.fences(),
         vec![(fenced.clone(), OTHER_RELAY.to_owned(), range(since, oldest))]
@@ -2839,7 +2852,10 @@ impl TwoCaptures {
     async fn admit_both_then_restart(&self, runner: &mut RecoveryRunner<TestHost>) {
         for capture in [self.first, self.second] {
             self.host.set_counts(vec![self.count(capture)]);
-            assert!(matches!(runner.admit(None).await, Ok(None)));
+            assert!(matches!(
+                runner.admit(None).await,
+                Ok(Drained { due: None, .. })
+            ));
         }
         self.host.set_counts(Vec::new());
     }
@@ -2878,7 +2894,10 @@ async fn recovery_runner_keeps_every_owed_capture_across_a_restart() {
         Some(case.between)
     );
     assert_eq!(case.host.fences().await, held(case.second.since_seconds));
-    assert!(matches!(runner.admit(None).await, Ok(None)));
+    assert!(matches!(
+        runner.admit(None).await,
+        Ok(Drained { due: None, .. })
+    ));
     assert_eq!(case.account.fences(), case.kept(&[case.second]));
 }
 
@@ -3222,7 +3241,10 @@ async fn recovery_runner_gives_back_what_an_unlisted_route_staged() {
     // Admission gives them back, owed again on their route, so they hold
     // nothing.
     let (mut runner, _handle) = runner(&host, policy);
-    assert!(matches!(runner.admit(None).await, Ok(None)));
+    assert!(matches!(
+        runner.admit(None).await,
+        Ok(Drained { due: None, .. })
+    ));
     assert!(account.admitted().is_empty());
     assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
     assert!(!account.debt(&gone, RELAY, t0 - 1).is_empty());
@@ -3318,19 +3340,26 @@ async fn recovery_runner_fetches_nothing_for_a_group_held_behind_an_untraced_eve
 
     // The next step admits the first event and holds the group behind the
     // second. Nothing more is fetched for it while it cannot drain, though
-    // its relay holds the frontier and owes the rest of the hour.
-    let due = idle(runner.step().await).expect("the held group is retried");
-    assert_eq!(account.admitted_events(), 1);
+    // its relay holds the frontier and owes the rest of the hour: not at the
+    // hold's end, when admission retries first, and not when admission's own
+    // turns outlast the hold, which then still stands for the step's survey.
     let queries = relay.queries().len();
+    let due = idle(runner.step().await).expect("the held group is retried");
     clock.advance_to(due - 1);
     assert_eq!(idle(runner.step().await), Some(due));
+    host.debt_turn_seconds.store(5, Ordering::SeqCst);
+    for _ in 0..3 {
+        let due = idle(runner.step().await).expect("the held group is retried");
+        clock.advance_to(due);
+    }
+    host.debt_turn_seconds.store(0, Ordering::SeqCst);
     assert_eq!(relay.queries().len(), queries);
+    assert_eq!(account.admitted_events(), 1);
     assert_eq!(account.staged_from(&routes, RELAY), staged - 1);
     assert_eq!(account.covered_through(&route, RELAY), reached);
 
     // Once the engine takes it, the group drains and the sweep goes on.
     host.no_trace.lock().unwrap().clear();
-    clock.advance_to(due);
     let resumed = ran(runner.step().await);
     assert_eq!(
         (resumed.key.relay.as_str(), resumed.outcome),
@@ -3377,16 +3406,19 @@ async fn recovery_runner_fetches_nothing_while_admission_waits_after_a_local_fai
     );
     host.tails.stand(&failing, RELAY, t0);
     host.tails.stand(&other, RELAY, t0);
-    // For now the failing group's first event fails to go in.
+    // For now the failing group's first event fails to go in, after longer
+    // than the first wait it arms.
     host.failing_ingests
         .lock()
         .unwrap()
         .insert(failing_events[0].id.to_bytes().to_vec());
+    host.ingest_seconds.store(5, Ordering::SeqCst);
     let (mut runner, _handle) = runner(&host, test_policy());
 
     // Admission waits after the failure, and nothing is fetched for any group
     // meanwhile: not the other group's debt, nor its re-check.
     let due = idle(runner.step().await).expect("admission is retried");
+    assert!(due > clock.now(), "the wait was born expired");
     assert!(account.admitted().is_empty());
     assert!(relay.queries().is_empty());
     assert!(relay.comparisons().is_empty());

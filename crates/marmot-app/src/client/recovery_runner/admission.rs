@@ -131,7 +131,7 @@ fn group_key(route: &RunnerRoute) -> GroupKey {
         .map_or_else(|| GroupKey::Route(route.route.clone()), GroupKey::Group)
 }
 
-/// The groups admission cannot drain now: every group while admission waits
+/// The groups admission cannot drain: every group while admission waits
 /// after local failures, else those held behind a staged event the engine
 /// kept no trace of. Not `Debug`: it carries group ids.
 #[derive(Clone, Default)]
@@ -620,6 +620,16 @@ fn plan(
     admission.releasable(policy.admission_per_turn, held)
 }
 
+/// How an admission pass ended: when admission next has something to retry,
+/// and what it could not drain. The step's survey takes this stall as it is,
+/// never re-reading it against a later clock, so a hold or wait that ran out
+/// while admission awaited the worker still holds its units back this step;
+/// the next step's admission retries first.
+pub(super) struct Drained {
+    pub(super) due: Option<u64>,
+    pub(super) stalled: Stalled,
+}
+
 /// What admission keeps in memory between turns. A restart forgets it, which
 /// costs at most an early retry per held group.
 #[derive(Default)]
@@ -652,11 +662,16 @@ impl Memory {
             .collect()
     }
 
-    /// What admission cannot drain at `now`.
-    pub(super) fn stalled(&self, now: u64) -> Stalled {
-        Stalled {
-            all: self.paused_until > now,
-            groups: self.held_at(now),
+    /// How a pass ends at `now`, with `groups` the held groups its last plan
+    /// left out. A due time already past means a hold ran out mid-pass: the
+    /// next step retries at once.
+    fn end(&self, now: u64, groups: BTreeSet<GroupKey>) -> Drained {
+        Drained {
+            due: self.next_due(now),
+            stalled: Stalled {
+                all: self.paused_until > now,
+                groups,
+            },
         }
     }
 
@@ -676,7 +691,7 @@ impl Memory {
         error_kind: &'static str,
         now: u64,
         policy: &RecoveryRunnerPolicy,
-    ) -> Option<u64> {
+    ) -> Drained {
         self.failures = self.failures.saturating_add(1);
         self.paused_until = now.saturating_add(policy.local_failure_backoff_seconds(self.failures));
         tracing::warn!(
@@ -685,18 +700,16 @@ impl Memory {
             error_kind = error_kind,
             "recovery runner admission failed"
         );
-        self.next_due(now)
+        self.end(now, BTreeSet::new())
     }
 }
 
 impl<H: RunnerHost> RecoveryRunner<H> {
     /// Admit what staging may release, one turn after another, until a turn
-    /// finds nothing. Returns when admission next has something to retry, or
-    /// the step to end with.
-    pub(super) async fn admit(
-        &mut self,
-        pass_deadline: Option<Instant>,
-    ) -> Result<Option<u64>, Step> {
+    /// finds nothing. Returns how the pass ended, or the step to end with.
+    /// Holds and waits are armed from the clock as read after the awaits
+    /// that led to them, so none is born expired.
+    pub(super) async fn admit(&mut self, pass_deadline: Option<Instant>) -> Result<Drained, Step> {
         loop {
             if self.cancel.is_cancelled() {
                 return Err(Step::Stopped);
@@ -706,19 +719,21 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             }
             let now = self.host.now_seconds();
             if self.admission.paused_until > now {
-                return Ok(self.admission.next_due(now));
+                return Ok(self.admission.end(now, BTreeSet::new()));
             }
             let held = self.admission.held_at(now);
+            let planned = held.clone();
             let policy = self.policy;
             let batch = match self
                 .host
-                .debt_turn(move |turn| plan(turn, &policy, &held))
+                .debt_turn(move |turn| plan(turn, &policy, &planned))
                 .await
             {
                 None => return Err(Step::Stopped),
                 Some(Ok(batch)) => batch,
                 Some(Err(error)) => {
                     let kind = AppError::from(error).privacy_safe_kind();
+                    let now = self.host.now_seconds();
                     return Ok(self
                         .admission
                         .failed("admission_plan", kind, now, &self.policy));
@@ -729,7 +744,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             }
             if batch.events.is_empty() {
                 self.admission.failures = 0;
-                return Ok(self.admission.next_due(now));
+                return Ok(self.admission.end(now, held));
             }
             // In order; an event the engine kept no trace of, or a failure,
             // ends the turn, so nothing newer of its group goes ahead of it.
@@ -770,11 +785,13 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 Some(Ok(removed)) => removed,
                 Some(Err(error)) => {
                     let kind = AppError::from(error).privacy_safe_kind();
+                    let now = self.host.now_seconds();
                     return Ok(self
                         .admission
                         .failed("admission_settle", kind, now, &self.policy));
                 }
             };
+            let now = self.host.now_seconds();
             // A row whose event is not in the seen index after its ingest
             // stays staged, and its group waits behind it.
             let mut kept_back = BTreeSet::new();

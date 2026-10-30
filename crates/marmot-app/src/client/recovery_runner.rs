@@ -406,12 +406,14 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         if let Some(step) = self.take_reconnects(pass_deadline).await {
             return step;
         }
-        let admission_due = match self.admit(pass_deadline).await {
-            Ok(due) => due,
+        let admission::Drained {
+            due: admission_due,
+            stalled,
+        } = match self.admit(pass_deadline).await {
+            Ok(drained) => drained,
             Err(step) => return step,
         };
         let policy = self.policy;
-        let stalled = self.admission.stalled(self.host.now_seconds());
         let mut survey = match self
             .host
             .debt_turn(move |turn| select::survey(turn, &policy, &stalled))
