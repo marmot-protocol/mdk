@@ -20,8 +20,8 @@ use super::host_safety::{
     reject_non_public_ip, validate_blossom_fetch_url,
 };
 use crate::{AppError, unix_now_seconds};
-use marmot_observability::app_telemetry::AppPerformanceOperation;
-use marmot_observability::observer::PerformanceRecorder;
+use marmot_observability::AppPerformanceOperation;
+use marmot_observability::PerformanceRecorder;
 
 #[cfg(test)]
 use cgka_traits::app_components::ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN;

@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 use transport_nostr_peeler::MarmotNostrSigner;
 
 use crate::{AppError, ChatListAttachmentKind, SendSummary};
-use marmot_observability::app_telemetry::AppPerformanceOperation;
-use marmot_observability::observer::PerformanceRecorder;
+use marmot_observability::AppPerformanceOperation;
+use marmot_observability::PerformanceRecorder;
 
 mod blossom;
 mod crypto;

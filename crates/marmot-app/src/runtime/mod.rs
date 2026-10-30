@@ -1,7 +1,7 @@
 use zeroize::Zeroizing;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
-use marmot_observability::app_telemetry::runtime::Outcome as TelemetryOutcome;
+use marmot_observability::Outcome as TelemetryOutcome;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -56,7 +56,7 @@ use crate::{
     TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
     unix_now_seconds,
 };
-use marmot_observability::app_telemetry::{
+use marmot_observability::{
     AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
     SyncFailureStage, bounded_advisory_step,
 };
@@ -377,7 +377,7 @@ pub struct RuntimeSharedServices {
     attachment_permissions: attachment_permission::Permissions,
     /// The recording handle: the app's product collector, shared, and this runtime's own
     /// performance recorder.
-    observer: marmot_observability::observer::Observer,
+    observer: marmot_observability::Observer,
     product_worker: Arc<StdMutex<Option<JoinHandle<()>>>>,
     diagnostics_executor: Arc<StdMutex<Option<tokio::runtime::Handle>>>,
     relay_plane: MarmotRelayPlane,
@@ -386,8 +386,7 @@ pub struct RuntimeSharedServices {
     relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
     relay_telemetry_runtime_config: Arc<StdMutex<RelayTelemetryRuntimeConfig>>,
     audit_log_tracker_config: Arc<StdMutex<AuditLogTrackerConfig>>,
-    audit_otlp_sender:
-        Arc<StdMutex<Option<Arc<marmot_observability::audit_otlp_sender::AuditOtlpSender>>>>,
+    audit_otlp_sender: Arc<StdMutex<Option<Arc<marmot_observability::AuditOtlpSender>>>>,
     service_endpoints: MarmotServiceEndpoints,
     audit_log_tracker_uploader: Option<AuditLogTrackerUploader>,
     audit_retention: Option<crate::audit_log::AuditRetentionWorker>,
@@ -494,7 +493,7 @@ impl Default for RuntimeSharedServices {
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
-            observer: marmot_observability::observer::Observer::default(),
+            observer: marmot_observability::Observer::default(),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),
@@ -594,7 +593,7 @@ impl RuntimeSharedServices {
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: app.relay_plane.clone(),
-            observer: marmot_observability::observer::Observer::sharing(&app.product_analytics),
+            observer: marmot_observability::Observer::sharing(&app.product_analytics),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),
@@ -783,9 +782,7 @@ impl RuntimeSharedServices {
             .clone()
     }
 
-    fn audit_otlp_sender(
-        &self,
-    ) -> Option<Arc<marmot_observability::audit_otlp_sender::AuditOtlpSender>> {
+    fn audit_otlp_sender(&self) -> Option<Arc<marmot_observability::AuditOtlpSender>> {
         self.audit_otlp_sender
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1876,7 +1873,7 @@ impl MarmotAppRuntime {
         );
         let work = async move { self.accounts.repair_full_history(account_ref).await };
         observed
-            .run_async(work, marmot_observability::observer::success_or_failure)
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -3436,7 +3433,7 @@ impl MarmotAppRuntime {
     /// acknowledge a prepared range under the previous destination.
     pub fn set_audit_otlp_sender(
         &self,
-        sender: Option<marmot_observability::audit_otlp_sender::AuditOtlpSender>,
+        sender: Option<marmot_observability::AuditOtlpSender>,
     ) -> Result<(), AppError> {
         self.shared.lifecycle.ensure_running()?;
         let _mutation = self.accounts.app.audit_export_lifecycle.mutate_all();
@@ -3508,7 +3505,7 @@ impl MarmotAppRuntime {
                 .app
                 .set_local_notifications_enabled(account_ref, enabled)
         };
-        observed.run(work, marmot_observability::observer::success_or_failure)
+        observed.run(work, marmot_observability::success_or_failure)
     }
 
     pub fn set_chat_muted(
@@ -3541,7 +3538,7 @@ impl MarmotAppRuntime {
             );
             Ok(settings)
         };
-        observed.run(work, marmot_observability::observer::success_or_failure)
+        observed.run(work, marmot_observability::success_or_failure)
     }
 
     pub fn clear_chat_muted(
@@ -3573,7 +3570,7 @@ impl MarmotAppRuntime {
             );
             Ok(settings)
         };
-        observed.run(work, marmot_observability::observer::success_or_failure)
+        observed.run(work, marmot_observability::success_or_failure)
     }
 
     pub async fn set_native_push_enabled(
@@ -3596,7 +3593,7 @@ impl MarmotAppRuntime {
                 .await
         };
         observed
-            .run_async(work, marmot_observability::observer::success_or_failure)
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -4283,7 +4280,7 @@ impl MarmotAppRuntime {
                 .await
         };
         observed
-            .run_async(work, marmot_observability::observer::success_or_failure)
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -4410,7 +4407,7 @@ impl MarmotAppRuntime {
             Ok(outcome)
         };
         observed
-            .run_async(work, marmot_observability::observer::success_or_failure)
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -4860,7 +4857,7 @@ impl MarmotAppRuntime {
                 .await
         };
         observed
-            .run_async(work, marmot_observability::observer::success_or_failure)
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -4881,7 +4878,7 @@ impl MarmotAppRuntime {
                 .await
         };
         observed
-            .run_async(work, marmot_observability::observer::success_or_failure)
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -5934,7 +5931,7 @@ impl MarmotAppRuntime {
             })
         };
         observed
-            .run_async(work, marmot_observability::observer::success_or_failure)
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -6976,7 +6973,7 @@ impl AccountManager {
             })
         };
         observed
-            .run_async(work, marmot_observability::observer::success_or_failure)
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -7961,7 +7958,7 @@ impl AccountManager {
             result
         };
         observed
-            .run_async(work, marmot_observability::observer::success_or_failure)
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -8170,7 +8167,7 @@ impl AccountManager {
             result
         };
         observed
-            .run_async(work, marmot_observability::observer::success_or_failure)
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 

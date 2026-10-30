@@ -64,8 +64,8 @@ use crate::{
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
     SelfMembership, SendSummary, unix_now_seconds,
 };
-use marmot_observability::app_telemetry::AppPerformanceOperation;
-use marmot_observability::observer::PerformanceRecorder;
+use marmot_observability::AppPerformanceOperation;
+use marmot_observability::PerformanceRecorder;
 
 mod audit;
 mod audit_recovery;
@@ -1355,10 +1355,7 @@ impl AppClient {
             self.publish_key_package_from_lifecycle().await
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -1453,7 +1450,7 @@ impl AppClient {
         if !self
             .maintenance_observation_generation
             .as_ref()
-            .is_some_and(marmot_observability::observer::permit_valid)
+            .is_some_and(marmot_observability::permit_valid)
         {
             previous = Default::default();
         }
@@ -1466,7 +1463,7 @@ impl AppClient {
                 "self_update",
                 crate::ProductUnit::Attempt,
             )
-            .map(marmot_observability::observer::ProductOperation::counts_only);
+            .map(marmot_observability::ProductOperation::counts_only);
         let key_package_observation = self
             .app
             .product_analytics
@@ -1475,7 +1472,7 @@ impl AppClient {
                 "key_package",
                 crate::ProductUnit::Attempt,
             )
-            .map(marmot_observability::observer::ProductOperation::counts_only);
+            .map(marmot_observability::ProductOperation::counts_only);
         let sweep = self.app.product_analytics.begin(
             crate::ProductFamily::Maintenance,
             "sweep",
@@ -1571,13 +1568,13 @@ impl AppClient {
                 "retire",
                 crate::ProductUnit::Transition,
             )
-            .map(marmot_observability::observer::ProductOperation::counts_only)
+            .map(marmot_observability::ProductOperation::counts_only)
         {
             // Use the sweep's generation, not a grant made while it was awaiting I/O.
             if self
                 .maintenance_observation_generation
                 .as_ref()
-                .is_some_and(marmot_observability::observer::permit_valid)
+                .is_some_and(marmot_observability::permit_valid)
             {
                 observation.count(
                     "success",
@@ -1933,10 +1930,7 @@ impl AppClient {
             self.publish_fresh_key_package_announced().await
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -2818,7 +2812,7 @@ impl AppClient {
     /// `AccountGroupReadSnapshot`, mdk#1161).
     pub(crate) fn group_read_snapshot_with_stage_telemetry(
         &self,
-        telemetry: &marmot_observability::observer::PerformanceRecorder,
+        telemetry: &marmot_observability::PerformanceRecorder,
     ) -> Result<GroupReadSnapshot, AppError> {
         self.group_read_snapshot_inner(Some(telemetry))
     }
@@ -2829,7 +2823,7 @@ impl AppClient {
 
     fn group_read_snapshot_inner(
         &self,
-        telemetry: Option<&marmot_observability::observer::PerformanceRecorder>,
+        telemetry: Option<&marmot_observability::PerformanceRecorder>,
     ) -> Result<GroupReadSnapshot, AppError> {
         if cfg!(feature = "test-policy-overrides")
             && self.app.config.dev_force_group_read_snapshot_failure
@@ -2846,7 +2840,7 @@ impl AppClient {
         let profiles = self.app.profiles_by_id();
         if let Some(telemetry) = telemetry {
             telemetry.record(
-                marmot_observability::app_telemetry::AppPerformanceOperation::AccountProfileLoad,
+                marmot_observability::AppPerformanceOperation::AccountProfileLoad,
                 profile_load_started.elapsed(),
                 profiles.is_ok(),
             );
@@ -2912,7 +2906,7 @@ impl AppClient {
         let work = || -> Result<bool, AppError> {
             Ok(self.runtime.retry_hydrate_quarantined_group(group_id)?)
         };
-        observed.run(work, marmot_observability::observer::success_or_failure)
+        observed.run(work, marmot_observability::success_or_failure)
     }
 
     pub fn safe_export_secret(
@@ -3306,10 +3300,7 @@ impl AppClient {
             Ok(send_summary_from_effects(&effects))
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -3330,10 +3321,7 @@ impl AppClient {
                 .await
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -3486,10 +3474,7 @@ impl AppClient {
                 .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -3683,10 +3668,7 @@ impl AppClient {
             Ok(was_live || result)
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -4007,10 +3989,7 @@ impl AppClient {
             Ok(GroupInviteDeclineResult { group, summary })
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -4040,10 +4019,7 @@ impl AppClient {
                 .await
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -4074,10 +4050,7 @@ impl AppClient {
                 .await
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -4108,10 +4081,7 @@ impl AppClient {
             .await
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -4262,10 +4232,7 @@ impl AppClient {
             Ok(send_summary_from_effects(&effects))
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -4986,7 +4953,7 @@ impl AppClient {
         };
         observed
             .run_async(Box::pin(work), |result| {
-                marmot_observability::observer::send_outcome(result, |(_, summary)| {
+                marmot_observability::send_outcome(result, |(_, summary)| {
                     summary.accept_disposition
                 })
             })
@@ -5874,10 +5841,7 @@ impl AppClient {
             Ok(summary)
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -6135,10 +6099,7 @@ impl AppClient {
                 .await
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -6226,10 +6187,7 @@ impl AppClient {
             Ok(send_summary_from_effects(&effects))
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 
@@ -6525,7 +6483,7 @@ impl AppClient {
             }
             Ok(group)
         };
-        observed.run(work, marmot_observability::observer::success_or_failure)
+        observed.run(work, marmot_observability::success_or_failure)
     }
 
     fn set_group_invite_confirmation(
@@ -7187,7 +7145,7 @@ impl AppClient {
                 "publish",
                 crate::ProductUnit::Transition,
             )
-            .map(marmot_observability::observer::ProductOperation::counts_only);
+            .map(marmot_observability::ProductOperation::counts_only);
         if storage.take_pending_welcome_delivery(message_id_hex)?
             && let Some(observation) = observation
         {
@@ -7594,10 +7552,7 @@ impl AppClient {
             Ok(send_summary_from_effects(&effects))
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::confirmed_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::confirmed_or_failure)
             .await
     }
 }

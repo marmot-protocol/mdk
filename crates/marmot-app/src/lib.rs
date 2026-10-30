@@ -606,7 +606,7 @@ pub struct MarmotApp {
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     audit_recorders: Arc<Mutex<HashMap<String, audit_log::AuditRecorderSlot>>>,
-    product_analytics: marmot_observability::observer::ProductRecorder,
+    product_analytics: marmot_observability::ProductRecorder,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
@@ -941,29 +941,27 @@ impl From<AppError> for SyncFailure {
 pub(crate) struct ClassifiedSyncFailure {
     pub(crate) partial_summary: SyncSummary,
     pub(crate) source: AppError,
-    classification: marmot_observability::app_telemetry::SyncFailureClassification,
+    classification: marmot_observability::SyncFailureClassification,
 }
 
 impl ClassifiedSyncFailure {
     pub(crate) fn at_stage(
         partial_summary: SyncSummary,
         source: AppError,
-        failure_stage: marmot_observability::app_telemetry::SyncFailureStage,
+        failure_stage: marmot_observability::SyncFailureStage,
     ) -> Self {
         let error_class = source.sync_error_class();
         Self {
             partial_summary,
             source,
-            classification: marmot_observability::app_telemetry::SyncFailureClassification::new(
+            classification: marmot_observability::SyncFailureClassification::new(
                 failure_stage,
                 error_class,
             ),
         }
     }
 
-    pub(crate) const fn classification(
-        &self,
-    ) -> marmot_observability::app_telemetry::SyncFailureClassification {
+    pub(crate) const fn classification(&self) -> marmot_observability::SyncFailureClassification {
         self.classification
     }
 }
@@ -1525,7 +1523,7 @@ impl MarmotApp {
         Ok(self
             .relay_telemetry_settings()?
             .export_config_with_runtime_and_endpoints(
-                marmot_observability::export_config::RelayTelemetryRuntimeConfig::default(),
+                marmot_observability::RelayTelemetryRuntimeConfig::default(),
                 self.service_endpoints(),
             ))
     }
@@ -1639,10 +1637,8 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
-        marmot_observability::collector_host_safety::hand_in_http_builder(
-            network_proxy::http_builder,
-        );
-        let product_analytics = marmot_observability::observer::ProductRecorder::default();
+        marmot_observability::hand_in_http_builder(network_proxy::http_builder);
+        let product_analytics = marmot_observability::ProductRecorder::default();
         marmot_observability::wiring::silence(
             &product_analytics,
             config.usage_diagnostics_silent
@@ -1747,10 +1743,8 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
-        marmot_observability::collector_host_safety::hand_in_http_builder(
-            network_proxy::http_builder,
-        );
-        let product_analytics = marmot_observability::observer::ProductRecorder::default();
+        marmot_observability::hand_in_http_builder(network_proxy::http_builder);
+        let product_analytics = marmot_observability::ProductRecorder::default();
         marmot_observability::wiring::silence(
             &product_analytics,
             config.usage_diagnostics_silent
@@ -7156,7 +7150,7 @@ impl MarmotApp {
                 "publication",
                 ProductUnit::Transition,
             )
-            .map(marmot_observability::observer::ProductOperation::counts_only);
+            .map(marmot_observability::ProductOperation::counts_only);
         let storage = self.account_storage(label)?;
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let authority_update = storage.app_storage().finalize_app_event_authority(

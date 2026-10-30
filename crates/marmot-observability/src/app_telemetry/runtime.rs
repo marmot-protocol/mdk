@@ -169,7 +169,7 @@ pub enum Outcome {
 impl Outcome {
     /// What a finished result records: success, or the outcome its error converts into.
     /// `marmot-app` converts its own errors (`app_outcome`); recording never names them.
-    pub fn of<T, E>(result: &Result<T, E>) -> Self
+    pub(crate) fn of<T, E>(result: &Result<T, E>) -> Self
     where
         for<'e> Self: From<&'e E>,
     {
@@ -177,6 +177,17 @@ impl Outcome {
             Ok(_) => Self::Success,
             Err(error) => Self::from(error),
         }
+    }
+}
+
+/// Test hook for `marmot-app`'s outcome table (#2627): [`Outcome::of`].
+#[cfg(any(test, feature = "test-support"))]
+impl Outcome {
+    pub fn of_for_test<T, E>(result: &Result<T, E>) -> Self
+    where
+        for<'e> Self: From<&'e E>,
+    {
+        Self::of(result)
     }
 }
 

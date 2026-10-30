@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use marmot_forensics::local_delivery::{DeliveryStep, LocalAuditDelivery, Preparation};
 
 use crate::{AppError, MarmotApp};
-use marmot_observability::audit_otlp_sender::{AuditOtlpSendResult, AuditOtlpSender};
+use marmot_observability::{AuditOtlpSendResult, AuditOtlpSender};
 
 use super::{MarmotAppRuntime, RuntimeLifecycle, blocking_app_task};
 
