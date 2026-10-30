@@ -73,8 +73,13 @@ fn fresh_rename_id() -> DeviceRenameId {
 }
 
 /// Keep at most [`MAX_KEPT_RENAME_IDS`] ids, the oldest replaced ones going
-/// first, and always the newest of each.
-fn bound(record: &mut DeviceRenameRecord) {
+/// first. The newest written id always stays, and so does `base`, the id the
+/// entry held where the rename was built or made again, kept as the newest
+/// replaced: while the rename is lost and nothing renamed the device since,
+/// the roster holds it.
+fn bound(record: &mut DeviceRenameRecord, base: Option<DeviceRenameId>) {
+    record.replaced.retain(|id| *id != base);
+    record.replaced.push(base);
     let excess = (record.written.len() + record.replaced.len()).saturating_sub(MAX_KEPT_RENAME_IDS);
     let from_replaced = excess.min(record.replaced.len().saturating_sub(1));
     record.replaced.drain(..from_replaced);
@@ -256,7 +261,7 @@ impl AppClient {
         expected: Option<DeviceRenameId>,
         mut record: DeviceRenameRecord,
     ) -> Result<RenameCommit, AppError> {
-        bound(&mut record);
+        bound(&mut record, expected);
         let held = self.epoch_gap_held_groups()?;
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let previous = storage.device_rename(&record.slot_id_hex)?;
@@ -409,7 +414,7 @@ mod tests {
     fn a_kept_rename_forgets_its_oldest_replaced_ids_first() {
         let replaced: Vec<Option<u8>> = (0..40).map(Some).collect();
         let mut kept = record(&[100, 101], &replaced);
-        bound(&mut kept);
+        bound(&mut kept, Some([39; 16]));
         assert_eq!(
             kept.written.len() + kept.replaced.len(),
             MAX_KEPT_RENAME_IDS
@@ -420,9 +425,25 @@ mod tests {
 
         let written: Vec<u8> = (0..40).collect();
         let mut redone = record(&written, &[None]);
-        bound(&mut redone);
+        bound(&mut redone, None);
         assert_eq!(redone.replaced, vec![None]);
         assert_eq!(redone.written.len(), MAX_KEPT_RENAME_IDS - 1);
         assert_eq!(redone.written.last(), Some(&[39; 16]));
+    }
+
+    /// A rename of a never-renamed device lost, and a later one carried its
+    /// ids: the roster still holds none, the id the later one was built on,
+    /// so bounding keeps that one however old it is.
+    #[test]
+    fn a_kept_rename_never_forgets_the_id_it_was_built_on() {
+        let replaced: Vec<Option<u8>> = std::iter::once(None).chain((0..40).map(Some)).collect();
+        let mut kept = record(&[100], &replaced);
+        bound(&mut kept, None);
+        assert_eq!(
+            kept.written.len() + kept.replaced.len(),
+            MAX_KEPT_RENAME_IDS
+        );
+        assert_eq!(kept.replaced.last(), Some(&None));
+        assert_eq!(standing(&kept, None), Standing::Lost);
     }
 }
