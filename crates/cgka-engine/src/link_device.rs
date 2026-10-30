@@ -50,7 +50,7 @@ use cgka_traits::engine_state::{
 };
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
-use cgka_traits::transport::EncryptedPayload;
+use cgka_traits::transport::{EncryptedPayload, Timestamp};
 use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
@@ -66,6 +66,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: GroupId,
         key_package: KeyPackage,
         roster_update: Vec<u8>,
+        deliver_until: Timestamp,
     ) -> Result<SendResult, EngineError> {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mut mls_group = MlsGroup::load(
@@ -183,6 +184,7 @@ impl<S: StorageProvider> Engine<S> {
                 &welcome_bytes,
                 &key_packages,
                 &parsed_kps,
+                Some(deliver_until),
             )
             .await?;
 

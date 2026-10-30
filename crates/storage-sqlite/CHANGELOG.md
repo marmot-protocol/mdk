@@ -14,6 +14,16 @@
   `reclaim_staged_recovery_routes` drops the rows of routes the runner no
   longer lists, owing their seconds again. The retention prune drops fenced
   ranges below its floor.
+- Migration 0140 advances account storage to schema 140 (mdk#2628 item 3.4).
+  It adds private KeyPackages, single-use KeyPackages a device hands to one
+  sibling inside its device group: `cgka_private_key_packages` (one issuer
+  record per KeyPackage, its key in the OpenMLS bundle store),
+  `private_key_packages_received` (what siblings handed this device, by
+  issuer slot; one this device used keeps its ref until it expires, so it
+  is not kept again if handed over again) and `private_key_package_requests`
+  (what this device still wants from each issuer). `SqliteAccountStorage` implements the new
+  `PrivateKeyPackageStorage`; `SqliteAppStorage` gains the received-KeyPackage
+  and need reads and writes. Nothing writes them unless device groups are on.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`

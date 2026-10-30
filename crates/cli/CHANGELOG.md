@@ -123,6 +123,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   (`create_group_with_chosen_id_and_audit_context`), as a device link needs (mdk#2628). The id has 1 to 255 bytes.
   An id that names any group this device holds, a removed or forgotten copy included, is refused before anything is
   written.
+- A device link's Welcome now carries a delivery deadline, the end of the new device's wait for it, and is never
+  published from then on (mdk#2628 item 3.3b, D40). `SendIntent::LinkDevice` takes `deliver_until`, and
+  `create_group_with_chosen_id_and_audit_context` takes `welcome_deliver_until` for the founding Welcome, in the
+  engine, the session and the runtime (`prepare_create_group_with_chosen_id_and_audit_context`). The stored Welcome
+  keeps it through promotion, in two new stored-payload variants; every other Welcome keeps its bytes.
+  `Engine::sent_welcome_deliver_until` reads it, and `Engine::outbound_welcome_status` now takes the current time
+  and reports an expired Welcome as settled. The runtime's publish check refuses an expired Welcome on every path,
+  and a batch checks the deadline again before each relay attempt. With that, a failed link whose Welcome may still be
+  deliverable is recorded only after its Welcome is withdrawn, and opening a client no longer withdraws link Welcomes
+  first. A chosen-id create is refused on the legacy profile, which keeps no delivery deadline. Reachable only in
+  test-policy builds.
 - The conformance simulator models `marmot.group.account-devices.v1` (0x800d) support per client (mdk#2628). Scenario
   IR v3 gains `set_account_devices_support`, `require_account_devices` and `expect_require_account_devices_error`, and
   vectors gain an `account_devices_state` expectation that checks the component's state rules on a client's exact
