@@ -1042,11 +1042,17 @@ pub(crate) fn spawn_app_runtime_account_worker(
 
 /// Stop the worker's recovery runner, if it runs one, while `client` is
 /// still the account's: a quantum in flight settles on it
-/// ([`SpawnedRunner::stop`]).
-async fn stop_recovery_runner(runner: &mut Option<SpawnedRunner>, client: &mut AppClient) {
-    if let Some(runner) = runner.take() {
-        runner.stop(client).await;
-    }
+/// ([`SpawnedRunner::stop`]). Boxed like a command's future, so each of the
+/// loop's exits adds a pointer to its stack, not the stop.
+fn stop_recovery_runner<'a>(
+    runner: &'a mut Option<SpawnedRunner>,
+    client: &'a mut AppClient,
+) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        if let Some(runner) = runner.take() {
+            runner.stop(client).await;
+        }
+    })
 }
 
 async fn run_app_runtime_account_worker(

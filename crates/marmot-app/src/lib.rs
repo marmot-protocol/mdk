@@ -1914,11 +1914,8 @@ impl MarmotApp {
         let relay_plane = MarmotRelayPlane::full_history_with_loopback(
             self.config.allow_loopback_relay_endpoints,
         );
-        let mut client = self
-            .client_with_relay_plane(label, &relay_plane, None)
-            .await?;
-        client.seat_recovery_runner_in_place().await;
-        Ok(client)
+        self.client_with_relay_plane(label, &relay_plane, None)
+            .await
     }
 
     async fn runtime_local_client(
@@ -1956,6 +1953,10 @@ impl MarmotApp {
         }
         self.finish_client_open_network_maintenance(&mut client)
             .await;
+        // Seated here, where the client is already held: in `client()` the
+        // extra await would copy the client through its stack, gate off or
+        // not.
+        client.seat_recovery_runner_in_place().await;
         Ok(client)
     }
 
@@ -8049,7 +8050,12 @@ fn app_feature_registry() -> FeatureRegistry {
 
 #[derive(Clone)]
 struct AppTransportRouting {
-    inner: Arc<RwLock<AppRoutingState>>,
+    inner: Arc<SharedAppRouting>,
+}
+
+/// One pointer per clone: every client and session carries the routing.
+struct SharedAppRouting {
+    state: RwLock<AppRoutingState>,
     /// Bumped when the account's routes change, and from the client's other
     /// recovery chokepoints. The account's recovery runner, if one runs,
     /// reads its debt again (mdk#2660 phase 4).
@@ -8068,19 +8074,22 @@ struct AppRoutingState {
 impl AppTransportRouting {
     fn new(state: AppRoutingState) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(state)),
-            recovery_runner_wake: tokio::sync::watch::channel(0).0,
+            inner: Arc::new(SharedAppRouting {
+                state: RwLock::new(state),
+                recovery_runner_wake: tokio::sync::watch::channel(0).0,
+            }),
         }
     }
 
     /// The sender a recovery runner wakes on.
     fn recovery_runner_wake(&self) -> tokio::sync::watch::Sender<u64> {
-        self.recovery_runner_wake.clone()
+        self.inner.recovery_runner_wake.clone()
     }
 
     /// Wake the account's recovery runner, if one runs. Coalesces.
     fn wake_recovery_runner(&self) {
-        self.recovery_runner_wake
+        self.inner
+            .recovery_runner_wake
             .send_modify(|count| *count = count.wrapping_add(1));
     }
 
@@ -8153,12 +8162,14 @@ impl AppTransportRouting {
 
     fn read(&self) -> RwLockReadGuard<'_, AppRoutingState> {
         self.inner
+            .state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn write(&self) -> RwLockWriteGuard<'_, AppRoutingState> {
         self.inner
+            .state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }

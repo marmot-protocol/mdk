@@ -14654,7 +14654,7 @@ fn app_transport_routing_recovers_from_poisoned_lock() {
         required_acks: 1,
     });
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = routing.inner.write().unwrap();
+        let _guard = routing.inner.state.write().unwrap();
         panic!("poison app routing lock");
     }));
 

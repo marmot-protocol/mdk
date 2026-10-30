@@ -95,8 +95,8 @@ fn group_routes(client: &AppClient) -> Vec<TransportReconciliationRoute> {
 
 fn passes(client: &AppClient) -> u32 {
     match &client.recovery_runner {
-        RunnerSeat::InPlace(Some(seat)) => seat.passes,
-        RunnerSeat::InPlace(None) | RunnerSeat::Absent => 0,
+        RunnerSeat::InPlace(seat) => seat.as_ref().as_ref().map_or(0, |seat| seat.passes),
+        RunnerSeat::Absent => 0,
     }
 }
 
@@ -416,7 +416,7 @@ async fn a_dropped_in_place_pass_refunds_its_attempt() {
 
     drop(pass);
     assert_eq!(charged(&storage), before, "the dropped pass refunded it");
-    assert!(matches!(client.recovery_runner, RunnerSeat::InPlace(None)));
+    assert!(matches!(&client.recovery_runner, RunnerSeat::InPlace(seat) if seat.is_none()));
     hold.release.notify_waiters();
 }
 

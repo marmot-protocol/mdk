@@ -1981,6 +1981,19 @@ impl AppClient {
         // Behind the internal `runner_owns_debt` gate, a directly owned client
         // also runs its recovery runner in place for one pass (mdk#2660).
         if explicit && self.has_in_place_recovery_runner() {
+            summary = self.run_in_place_recovery_pass(summary).await?;
+        }
+        self.finish_prepared_sync_summary(summary).await
+    }
+
+    /// The in-place runner's pass after an explicit sync, behind `summary`.
+    /// Boxed like the pass itself, so its awaits add nothing to every sync's
+    /// stack.
+    fn run_in_place_recovery_pass(
+        &mut self,
+        mut summary: SyncSummary,
+    ) -> futures::future::BoxFuture<'_, Result<SyncSummary, ClassifiedSyncFailure>> {
+        Box::pin(async move {
             self.pending_applied_sync_summary
                 .merge(std::mem::take(&mut summary));
             self.run_recovery_runner_pass().await;
@@ -1988,8 +2001,8 @@ impl AppClient {
             if self.pending_runtime_group_subscription_refresh {
                 summary = self.refresh_live_group_subscriptions(summary).await?;
             }
-        }
-        self.finish_prepared_sync_summary(summary).await
+            Ok(summary)
+        })
     }
 
     /// Bring the live group subscriptions up to the current routes. Nothing

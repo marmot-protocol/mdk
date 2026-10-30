@@ -405,7 +405,7 @@ impl AppClient {
     }
 
     async fn seat_in_place(&mut self) {
-        self.recovery_runner = RunnerSeat::InPlace(Some(Box::new(InPlaceRunner::from(
+        self.recovery_runner = RunnerSeat::InPlace(Box::new(Some(InPlaceRunner::from(
             self.build_recovery_runner().await,
         ))));
     }
@@ -414,34 +414,40 @@ impl AppClient {
     /// explicit job's budget: each unit due now runs once, and its turns run
     /// on this client while the pass waits for them. `None` without an
     /// in-place runner.
-    pub(crate) async fn run_recovery_runner_pass(&mut self) -> Option<PassReport> {
-        let mut seat = match &mut self.recovery_runner {
-            RunnerSeat::Absent => return None,
-            RunnerSeat::InPlace(seat) => match seat.take() {
-                Some(seat) => seat,
-                // A pass dropped mid-way took its runner with it, and refunded
-                // the attempt it left open.
-                None => Box::new(InPlaceRunner::from(self.build_recovery_runner().await)),
-            },
-        };
-        #[cfg(test)]
-        {
-            seat.passes += 1;
-        }
-        let report = {
-            let InPlaceRunner { runner, turns, .. } = &mut *seat;
-            let pass = runner.run_pass(TRANSPORT_RECONCILIATION_QUANTUM);
-            tokio::pin!(pass);
-            loop {
-                tokio::select! {
-                    biased;
-                    report = &mut pass => break report,
-                    Some(turn) = turns.recv() => turn.serve(self).await,
-                }
+    ///
+    /// A plain function boxes the pass: an unoptimized build gives every
+    /// await of an inline pass its own stack slot, so a sync that never runs
+    /// one, gate off, would still pay for it.
+    pub(crate) fn run_recovery_runner_pass(&mut self) -> ClientFuture<'_, Option<PassReport>> {
+        Box::pin(async move {
+            let mut seat = match &mut self.recovery_runner {
+                RunnerSeat::Absent => return None,
+                RunnerSeat::InPlace(seat) => match seat.take() {
+                    Some(seat) => seat,
+                    // A pass dropped mid-way took its runner with it, and
+                    // refunded the attempt it left open.
+                    None => InPlaceRunner::from(self.build_recovery_runner().await),
+                },
+            };
+            #[cfg(test)]
+            {
+                seat.passes += 1;
             }
-        };
-        self.recovery_runner = RunnerSeat::InPlace(Some(seat));
-        Some(report)
+            let report = {
+                let InPlaceRunner { runner, turns, .. } = &mut seat;
+                let pass = runner.run_pass(TRANSPORT_RECONCILIATION_QUANTUM);
+                tokio::pin!(pass);
+                loop {
+                    tokio::select! {
+                        biased;
+                        report = &mut pass => break report,
+                        Some(turn) = turns.recv() => turn.serve(self).await,
+                    }
+                }
+            };
+            self.recovery_runner = RunnerSeat::InPlace(Box::new(Some(seat)));
+            Some(report)
+        })
     }
 
     /// Whether this directly owned client runs a recovery runner in place.
@@ -464,8 +470,8 @@ pub(crate) enum RunnerSeat {
     #[default]
     Absent,
     /// A directly owned client's runner, run one pass at a time. Empty while
-    /// a pass runs.
-    InPlace(Option<Box<InPlaceRunner>>),
+    /// a pass runs. Boxed, so every client carries one pointer for it.
+    InPlace(Box<Option<InPlaceRunner>>),
 }
 
 /// A directly owned client's runner. Not `Debug`. Dropped mid-pass, it
