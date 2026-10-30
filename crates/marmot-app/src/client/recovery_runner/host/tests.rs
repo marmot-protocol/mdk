@@ -54,7 +54,7 @@ async fn direct_client_on(
 
 /// Holds every bounded history request (a sweep's slice carries `until`, a
 /// live REQ does not) until released, and says when one arrives.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 struct HeldSweeps {
     reached: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,

@@ -2420,17 +2420,19 @@ async fn recovery_runner_leaves_a_slice_owed_while_its_events_route_nowhere() {
     let (mut runner, _handle) = runner(&host, test_policy());
     let usage = || account.app.recovery_account_usage(clock.now()).unwrap();
 
-    assert_eq!(ran(runner.step().await).outcome, Outcome::Unanswered);
+    // A local failure: the relay is not blamed, and the unit waits out a
+    // local hold rather than fetching the same slice again at once.
+    assert_eq!(ran(runner.step().await).outcome, Outcome::LocalFailure);
     assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
     assert!(
         !account.debt(&route, RELAY, t0 - 1).is_empty(),
         "nothing it fetched covers the hour"
     );
     assert!(usage().event_bytes > 0, "its bytes are charged");
+    let due = idle(runner.step().await).expect("the unit is retried");
 
     // Once the subscriptions catch up, the retry stages and covers it.
     host.unrouted.lock().unwrap().clear();
-    let due = idle(runner.step().await).expect("the unit is retried");
     clock.advance_to(due);
     assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
     assert_eq!(
@@ -2770,13 +2772,14 @@ fn recovery_runner_classifies_every_sweep_end() {
             (End::SinkFailed, true, false, 0, gone, true),
             Outcome::Unanswered,
         ),
+        // An event no installed subscription routes yet is local too.
         (
             (End::SinkFailed, true, false, 0, unrouted, true),
-            Outcome::Unanswered,
+            Outcome::LocalFailure,
         ),
         (
             (End::SinkFailed, true, false, 9, unrouted, true),
-            Outcome::Advanced,
+            Outcome::LocalFailure,
         ),
         (
             (End::StoreFailed, true, false, 0, None, true),

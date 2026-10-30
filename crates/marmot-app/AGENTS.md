@@ -360,9 +360,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, off; proofs turn it on with the hidden
   `MarmotApp::with_recovery_runner_owning_debt`), never a host setting or cargo feature, until the switch-over flips it.
   With the gate off nothing constructs it and the comparison owner keeps every behavior. `host` is its only seat:
-  the account worker spawns it with the worker, serves its turns in one select arm and stops it in every exit
-  (`SpawnedRunner::stop`), and a directly owned client from `MarmotApp::client()` runs one pass in place from
-  `sync()` and from `next_event()`'s loss branch. The worker never awaits a pass, the network or a credit. Wake it
+  the account worker spawns it with the worker, serves one of its turns each pass of its loop (as comparison
+  admission gets one) and waits for the next in one select arm, and stops it on the client at every exit that still
+  holds one (`SpawnedRunner::stop`), so a preempted quantum settles there but nothing is ingested on the way out. A
+  directly owned client from `MarmotApp::client()` runs one pass in place from `sync()` and from `next_event()`'s
+  loss branch. The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
+  adapter's installed subscriptions, which trail the routes a debt turn reads: a valid event that routes nowhere yet
+  stops its slice uncovered as a local failure (`SinkStop::Unrouted`), and only an invalid one is dropped. Wake it
   through `AppTransportRouting`'s sender at the chokepoint that changes debt or routes (loss import, goal widening,
   route replacement, a released receipt, a dismissal, a group lifecycle effect), never per call site; it re-reads
   the ledger on every wake. Every ledger and retry-state write happens in a worker turn; the

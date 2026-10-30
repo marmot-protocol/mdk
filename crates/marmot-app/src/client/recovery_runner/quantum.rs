@@ -59,8 +59,8 @@ pub(super) enum SinkStop {
     /// The worker is gone.
     WorkerGone,
     /// A valid event routed to nothing: the account's installed
-    /// subscriptions lag its routes. Not the relay's fault: the slice stays
-    /// owed until they catch up.
+    /// subscriptions lag its routes. Local, as a failed write is: the slice
+    /// stays owed and the unit waits out a local hold until they catch up.
     Unrouted,
 }
 
@@ -428,10 +428,7 @@ pub(super) fn classify(
 ) -> RecoveryUnitOutcome {
     use RecoveryUnitOutcome as Outcome;
     let local = match end {
-        SweepEnd::SinkFailed => !matches!(
-            stop,
-            Some(SinkStop::StaleMark | SinkStop::WorkerGone | SinkStop::Unrouted)
-        ),
+        SweepEnd::SinkFailed => !matches!(stop, Some(SinkStop::StaleMark | SinkStop::WorkerGone)),
         SweepEnd::StoreFailed => true,
         _ => false,
     };
@@ -445,8 +442,7 @@ pub(super) fn classify(
         return Outcome::Advanced;
     }
     match end {
-        // A stale mark, a gone worker or an unrouted event; a store failure
-        // is local, above.
+        // A stale mark or a gone worker; a store failure is local, above.
         SweepEnd::SinkFailed | SweepEnd::StoreFailed => Outcome::Unanswered,
         // Every slice was proven, but none newly covered: someone else proved
         // them first, or a loss during the fetch took them back.
