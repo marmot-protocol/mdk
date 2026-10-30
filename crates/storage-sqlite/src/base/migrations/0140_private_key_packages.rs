@@ -1,4 +1,4 @@
-//! Migration 0135: private KeyPackages (mdk#2628 item 3.4b).
+//! Migration 0140: private KeyPackages (mdk#2628 item 3.4b).
 //!
 //! A private KeyPackage is single-use, issued by one device to one sibling in
 //! its device group, handed over inside the device group and never published.

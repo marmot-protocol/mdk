@@ -1,5 +1,5 @@
 //! The private KeyPackages this device's siblings handed it, and what it still
-//! needs from each (mdk#2628 item 3.4b). See migration 0135.
+//! needs from each (mdk#2628 item 3.4b). See migration 0140.
 
 use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};

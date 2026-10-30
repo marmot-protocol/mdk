@@ -4,7 +4,7 @@
 
 ### Breaking changes
 
-- Migration 0135 advances account storage to schema 135 (mdk#2628 item 3.4).
+- Migration 0140 advances account storage to schema 140 (mdk#2628 item 3.4).
   It adds private KeyPackages, single-use KeyPackages a device hands to one
   sibling inside its device group: `cgka_private_key_packages` (one issuer
   record per KeyPackage, its key in the OpenMLS bundle store),

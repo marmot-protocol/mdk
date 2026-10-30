@@ -1,5 +1,5 @@
 //! The private KeyPackages this device issued to its siblings (mdk#2628 item
-//! 3.4b). See migration 0135. The engine keeps each row in step with its
+//! 3.4b). See migration 0140. The engine keeps each row in step with its
 //! OpenMLS private bundle.
 
 use crate::base::connection::CachedSql;
