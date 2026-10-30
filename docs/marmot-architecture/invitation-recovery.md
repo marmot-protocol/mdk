@@ -137,7 +137,7 @@ it from a Welcome. They use the account inbox, not the broken group's encryption
 Kind `1159` is proposed, not allocated; the wire contract and older-client rollout questions are tracked in
 [marmot#451](https://github.com/marmot-protocol/marmot/issues/451).
 
-Migration 0135 advances account storage to schema 135 after migration 0134. It adds the
+Migration 0141 advances account storage to schema 141 after migration 0140. It adds the
 protocol-owned `cgka_group_rejoin` journal and gates older writers. These rejoin bounds belong to ledger policy A21,
 separate from A18's history-recovery parking budgets. Retry reservations precede directory and network work. One recipient episode
 permits 32 reservations across nonce rotation, request expiry, phase changes, cancellation and reopen. A newer
