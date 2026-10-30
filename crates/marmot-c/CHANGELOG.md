@@ -68,6 +68,22 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `MARMOT_STATUS_INVALID_MEDIA_REFERENCE`. Existing status values are
   unchanged. Use matching regenerated headers and libraries (#2158).
 
+- Sonar-compatible stickers: `marmot_sticker_packs`, `marmot_sticker_pack`,
+  `marmot_sync_sticker_packs`, `marmot_fetch_sticker_pack`, `marmot_install_sticker_pack`,
+  `marmot_uninstall_sticker_pack`, `marmot_fetch_sticker_asset`, `marmot_send_sticker` and
+  `marmot_import_signal_sticker_pack` (validates the link, then refuses before any network
+  call), with records `MarmotStickerRef`, `MarmotSticker`, `MarmotStickerPack`,
+  `MarmotStickerAsset`, `MarmotStickerSyncResult` and `MarmotStickerImportResult` and their
+  `*_free` functions. `MarmotSticker.plaintext_sha256` is the exact hash the fetch and send
+  calls take; `MarmotStickerImportResult.skipped_signal_sticker_ids` is a `uint32_t` array,
+  `(NULL, 0)` when empty. `MarmotAppMessageRecord`, `MarmotReceivedMessage`,
+  `MarmotNotificationUpdate`, `MarmotChatListMessagePreview`, `MarmotTimelineMessageRecord`
+  and `MarmotTimelineReplyPreview` add a nullable `sticker` at the position of the
+  matching UniFFI field, so those layouts change. New status codes `MARMOT_STATUS_INVALID_STICKER` (111),
+  `MARMOT_STATUS_STICKER_NOT_FOUND` (112), `MARMOT_STATUS_STICKER_NETWORK` (113),
+  `MARMOT_STATUS_STICKER_IMPORT` (114) and `MARMOT_STATUS_STICKER_IMPORT_UNSUPPORTED` (115).
+  Use matching regenerated headers and libraries.
+
 ### Changed
 
 - Creating a group or inviting adds every device of each recipient account

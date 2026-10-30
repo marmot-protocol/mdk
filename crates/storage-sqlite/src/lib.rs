@@ -21,13 +21,14 @@ pub use app::handle::SqliteAppStorage;
 pub use app::account_recovery::{
     MAX_LOSS_ROUTES, ParkedRecoveryObligation, QualifiedRecoveryStallSample,
     RECOVERY_PARK_AFTER_ATTEMPTS, RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryCause,
-    RecoveryComparison, RecoveryComparisonOutcome, RecoveryComparisonPlan, RecoveryDemand,
-    RecoveryDemandTicket, RecoveryDemandTransition, RecoveryEligibility,
-    RecoveryEndpointCheckpoint, RecoveryLossCause, RecoveryLossImport, RecoveryLossReach,
-    RecoveryLossSnapshot, RecoveryLossWatermark, RecoveryObligationState, RecoveryObligationStatus,
-    RecoveryPassProgress, RecoveryPredicate, RecoveryReplayPlacement, RecoveryRequest,
-    RecoveryRetryState, RecoveryRevisionFence, RecoveryScopeCheckpoint, RecoveryScopeOutcome,
-    RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
+    RecoveryComparison, RecoveryComparisonOutcome, RecoveryComparisonPlan, RecoveryConversionInput,
+    RecoveryConversionReport, RecoveryConversionRoute, RecoveryConvertedLoss,
+    RecoveryConvertedObligations, RecoveryDemand, RecoveryDemandTicket, RecoveryDemandTransition,
+    RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryLossCause, RecoveryLossImport,
+    RecoveryLossReach, RecoveryLossSnapshot, RecoveryLossWatermark, RecoveryObligationState,
+    RecoveryObligationStatus, RecoveryPassProgress, RecoveryPredicate, RecoveryReplayPlacement,
+    RecoveryRequest, RecoveryRetryState, RecoveryRevisionFence, RecoveryScopeCheckpoint,
+    RecoveryScopeOutcome, RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
 };
 pub use app::local_submissions::LocalSubmission;
 pub use app::media_catalog::{SlotPublication, SqliteMediaCatalog, media_storage_error};
@@ -121,6 +122,10 @@ pub use app::recovery_units::{
     RecoveryUnitPolicy, RecoveryUnitSpan, RecoveryUnitState,
 };
 pub use app::sign_ins::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord};
+pub use app::stickers::{
+    StoredInstalledStickerState, StoredSticker, StoredStickerInstallOperation,
+    StoredStickerOutboxEvent, StoredStickerPack, StoredStickerPackVersion,
+};
 pub use app::timeline::{
     BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
     ConversationAccountSnapshot, ConversationAnchor, ConversationOpenAnchorOutcome,

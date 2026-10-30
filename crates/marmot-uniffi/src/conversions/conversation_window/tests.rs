@@ -268,7 +268,17 @@ fn bench_prepared_conversation_conversion() {
                                 ),
                             );
                         }
-                        black_box(presented_timeline_with_tokens(row, false, cached.2.clone()));
+                        black_box(presented_timeline_with_tokens(
+                            row,
+                            false,
+                            cached.2.clone(),
+                            if row.deleted {
+                                None
+                            } else {
+                                marmot_app::sticker_ref_from_tags(row.kind, &row.tags)
+                                    .map(Into::into)
+                            },
+                        ));
                     }
                 }
                 let token_only = started.elapsed();
@@ -344,6 +354,57 @@ fn custom_tags_and_deletion_provenance_invalidate_prepared_conversion() {
     );
     assert_eq!(wire(admin), wire(presented_timeline(&row, false)));
     assert_eq!(cache.conversions, 4);
+}
+
+#[test]
+fn sticker_only_tag_change_invalidates_prepared_conversion() {
+    let mut cache = ConversationConversionCache::default();
+    let mut row = record(0);
+    let coordinate = format!("30031:{}:pack", "aa".repeat(32));
+    let digest = "bb".repeat(32);
+    let sticker = |shortcode: &str| {
+        vec![
+            "sticker".to_owned(),
+            coordinate.clone(),
+            shortcode.to_owned(),
+            digest.clone(),
+        ]
+    };
+    row.tags = vec![sticker("wave")];
+    let first = cache.row(&row, false);
+    assert_eq!(
+        first
+            .sticker
+            .as_ref()
+            .map(|sticker| sticker.shortcode.as_str()),
+        Some("wave")
+    );
+    assert_eq!(cache.conversions, 1);
+    row.tags = vec![sticker("nod")];
+    let second = cache.row(&row, false);
+    assert_eq!(
+        second
+            .sticker
+            .as_ref()
+            .map(|sticker| sticker.shortcode.as_str()),
+        Some("nod")
+    );
+    assert_eq!(
+        wire(second),
+        wire(presented_timeline(&row, false)),
+        "a sticker-only tag change must not reuse the cached conversion"
+    );
+    assert_eq!(cache.conversions, 2);
+    assert_eq!(cache.parses, 1);
+    row.tags.clear();
+    let cleared = cache.row(&row, false);
+    assert!(cleared.sticker.is_none());
+    assert_eq!(
+        wire(cleared),
+        wire(presented_timeline(&row, false)),
+        "removing the sticker must not reuse the cached sticker row"
+    );
+    assert_eq!(cache.conversions, 3);
 }
 
 #[test]

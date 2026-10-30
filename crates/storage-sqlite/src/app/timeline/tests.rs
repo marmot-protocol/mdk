@@ -4465,3 +4465,23 @@ fn system_reactions_survive_replay_reopen_and_retract_without_replacing_target()
     assert_eq!(list(&store.app_storage()), [baseline]);
     store.close().unwrap();
 }
+
+/// Reply previews serialized before sticker tags were carried have no `tags`
+/// key; they must still decode, with no tags.
+#[test]
+fn reply_preview_without_tags_still_deserializes() {
+    let legacy = serde_json::json!({
+        "message_id_hex": "aa",
+        "sender": "bb",
+        "plaintext": "hello",
+        "kind": 9,
+        "source_epoch": null,
+        "media": null,
+        "agent_text_stream": null,
+        "deleted": false,
+        "invalidation_status": null,
+    });
+    let preview: TimelineReplyPreview = serde_json::from_value(legacy).unwrap();
+    assert!(preview.tags.is_empty());
+    assert_eq!(preview.deletion_source, DeletionSource::default());
+}

@@ -2540,6 +2540,18 @@ Send `send_text` content plus application tags on the same kind-9, e.g. NIP-30 `
 
 [Source](src/commands/message.rs#L39)
 
+### `Marmot::send_sticker`
+
+**Current.**
+
+```rust
+pub async fn send_sticker( &self, account_ref: String, group_id_hex: String, sticker_ref: StickerRefFfi, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+Sends a kind-9 message carrying one exact sticker reference. The account must already have that reference in its projection, so a host cannot send an arbitrary URL.
+
+[Source](src/commands/message.rs#L57)
+
 ### `Marmot::retry_group_convergence`
 
 **Current.**
@@ -2550,7 +2562,7 @@ pub async fn retry_group_convergence( &self, account_ref: String, group_id_hex: 
 
 Re-attempt publishing a group's pending (committed-but-undelivered) commit(s) without minting a new event.
 
-[Source](src/commands/message.rs#L73)
+[Source](src/commands/message.rs#L90)
 
 ### `Marmot::react_to_message`
 
@@ -2562,7 +2574,7 @@ pub async fn react_to_message( &self, account_ref: String, group_id_hex: String,
 
 React to `target_message_id` with `emoji` (an "add" reaction).
 
-[Source](src/commands/message.rs#L87)
+[Source](src/commands/message.rs#L104)
 
 ### `Marmot::react_with_media`
 
@@ -2586,7 +2598,7 @@ pub async fn unreact_from_message( &self, account_ref: String, group_id_hex: Str
 
 Remove all of this account's active reactions from `target_message_id`.
 
-[Source](src/commands/message.rs#L103)
+[Source](src/commands/message.rs#L120)
 
 ### `Marmot::reply_to_message`
 
@@ -2598,7 +2610,7 @@ pub async fn reply_to_message( &self, account_ref: String, group_id_hex: String,
 
 Send `text` as a reply that quotes `target_message_id`.
 
-[Source](src/commands/message.rs#L118)
+[Source](src/commands/message.rs#L135)
 
 ### `Marmot::delete_message`
 
@@ -2610,7 +2622,7 @@ pub async fn delete_message( &self, account_ref: String, group_id_hex: String, t
 
 Mark `target_message_id` deleted for the whole group. This is a tombstone — the original stays in everyone's store; clients render a "message deleted" placeholder.
 
-[Source](src/commands/message.rs#L136)
+[Source](src/commands/message.rs#L153)
 
 ### `Marmot::secure_delete_expired`
 
@@ -2622,7 +2634,7 @@ pub async fn secure_delete_expired( &self, account_ref: String, group_id_hex: St
 
 Securely scrub and prune expired disappearing-message plaintext for a group according to its active retention component. The media hash list identifies pruned encrypted-media blobs so host apps can purge their own decrypted-media disk caches keyed by ciphertext hash.
 
-[Source](src/commands/message.rs#L154)
+[Source](src/commands/message.rs#L171)
 
 ### `Marmot::sweep_expired_retention`
 
@@ -2634,7 +2646,7 @@ pub async fn sweep_expired_retention( &self, account_ref: String, now_ms: u64, )
 
 Run the engine-owned disappearing-message sweep for one account using the supplied Unix wall-clock time in milliseconds. Each group reports pruning, a fail-closed deferral, or a privacy-safe failure category.
 
-[Source](src/commands/message.rs#L170)
+[Source](src/commands/message.rs#L187)
 
 ### `Marmot::edit_message`
 
@@ -2646,7 +2658,7 @@ pub async fn edit_message( &self, account_ref: String, group_id_hex: String, tar
 
 Edit `target_message_id` by publishing a kind-1009 event that references it and carries the replacement plaintext in `content`. Recipients honour the edit only when its authenticated author matches the target's author; MDK ignores mismatched edits. It returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Competing edits resolve by `created_at`, then the larger event id.
 
-[Source](src/commands/message.rs#L194)
+[Source](src/commands/message.rs#L211)
 
 ### `Marmot::send_custom_event`
 
@@ -2658,7 +2670,7 @@ pub async fn send_custom_event( &self, account_ref: String, group_id_hex: String
 
 Send an app-defined event with an arbitrary non-reserved kind. `tags` and `content` pass through verbatim; kinds MDK owns (chat, reaction, edit, delete, agent, group system, push token) are rejected so an app cannot forge protocol events. Custom events appear in the timeline as standalone rows and can be fetched via `Marmot::messages` with a `kinds` filter.
 
-[Source](src/commands/message.rs#L215)
+[Source](src/commands/message.rs#L232)
 
 ### `Marmot::create_poll`
 
@@ -2674,7 +2686,7 @@ poll projection. Creation follows MDK's canonical conversation classification: n
 groups, while unnamed two-member conversations are direct. Polls are neither anonymous nor election-grade. See
 [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L233)
+[Source](src/commands/message.rs#L250)
 
 ### `Marmot::cast_poll_vote`
 
@@ -2689,7 +2701,7 @@ or one through ten unique ids for multiple choice; use the ids from `TimelineMes
 This is a replacement, not a delta or unvote. MDK revalidates the poll against the response event's actual timestamp at
 send time, and an accepted open poll remains votable after conversation reclassification. See [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L258)
+[Source](src/commands/message.rs#L275)
 
 ### `Marmot::message_reactions`
 
@@ -2730,7 +2742,7 @@ pub fn messages( &self, account_ref: String, group_id_hex: Option<String>, limit
 
 Initial history fetch for a group (or, when `group_id_hex` is None, the account-wide tail). Used to populate the conversation view before the subscription stream takes over.
 
-[Source](src/commands/message.rs#L279)
+[Source](src/commands/message.rs#L296)
 
 </details>
 
@@ -3486,6 +3498,107 @@ Deprecated consent control. Use `set_usage_diagnostics_consent` instead. Enable 
 </details>
 
 <details>
+<summary>commands/sticker.rs</summary>
+
+### `Marmot::sticker_packs`
+
+**Current.**
+
+```rust
+pub fn sticker_packs( &self, account_ref: String, installed_only: bool, search: Option<String>, limit: Option<u32>, ) -> Result<Vec<StickerPackFfi>, MarmotKitError>
+```
+
+Reads the encrypted sticker projection off the UI thread. `installed_only` selects the installed list; search matches public title and description only.
+
+[Source](src/commands/sticker.rs#L13)
+
+### `Marmot::sticker_pack`
+
+**Current.**
+
+```rust
+pub fn sticker_pack( &self, account_ref: String, input: String, ) -> Result<Option<StickerPackFfi>, MarmotKitError>
+```
+
+Reads one cached pack without network I/O. Returns none when the coordinate is absent; use `fetch_sticker_pack` for an explicit network fetch.
+
+[Source](src/commands/sticker.rs#L31)
+
+### `Marmot::sync_sticker_packs`
+
+**Current.**
+
+```rust
+pub async fn sync_sticker_packs( &self, account_ref: String, ) -> Result<StickerSyncResultFfi, MarmotKitError>
+```
+
+Refreshes at most `MAX_DISCOVERY_PACKS` recent public packs and separately refreshes cached installed packs. Pending install changes are published only after a complete installed-list read. Uninstalled discovery above that bound is pruned; installed packs, pending operations, and message-referenced assets stay.
+
+[Source](src/commands/sticker.rs#L42)
+
+### `Marmot::fetch_sticker_pack`
+
+**Current.**
+
+```rust
+pub async fn fetch_sticker_pack( &self, account_ref: String, input: String, ) -> Result<StickerPackFfi, MarmotKitError>
+```
+
+Fetches one pack by coordinate or trusted Sonar link, querying the link's relay hints and the account relays; the newest version wins NIP-01 ordering, so a hint cannot hide a newer pack. The requested coordinate is protected from discovery eviction. Call this when the user opens a shared pack, not from a background crawl.
+
+[Source](src/commands/sticker.rs#L53)
+
+### `Marmot::install_sticker_pack`
+
+**Current.**
+
+```rust
+pub async fn install_sticker_pack( &self, account_ref: String, input: String, ) -> Result<StickerPackFfi, MarmotKitError>
+```
+
+After a complete installed-list read, signs the proposed list before saving local install intent. A signing refusal does not queue this install. Without a complete read, intent stays pending for a later `sync_sticker_packs`. This is the user action after previewing a pack; it does not upload sticker bytes.
+
+[Source](src/commands/sticker.rs#L65)
+
+### `Marmot::uninstall_sticker_pack`
+
+**Current.**
+
+```rust
+pub async fn uninstall_sticker_pack( &self, account_ref: String, input: String, ) -> Result<(), MarmotKitError>
+```
+
+After a complete installed-list read, signs the proposed list before saving local uninstall intent. A signing refusal does not queue this uninstall. Without a complete read, intent stays pending for a later `sync_sticker_packs`. Previously received messages can still resolve their exact historical asset.
+
+[Source](src/commands/sticker.rs#L77)
+
+### `Marmot::import_signal_sticker_pack`
+
+**Current.**
+
+```rust
+pub async fn import_signal_sticker_pack( &self, account_ref: String, signal_link: String, blossom_server: Option<String>, ) -> Result<StickerImportResultFfi, MarmotKitError>
+```
+
+Validates a canonical HTTPS Signal pack link, then refuses before any network call. The pinned importer dials Signal's CDN without address pinning, so this command does not download, upload, or publish until that fetch can be injected. The Signal key stays in memory only and is not persisted.
+
+[Source](src/commands/sticker.rs#L92)
+
+### `Marmot::fetch_sticker_asset`
+
+**Current.**
+
+```rust
+pub async fn fetch_sticker_asset( &self, account_ref: String, sticker_ref: StickerRefFfi, ) -> Result<StickerAssetFfi, MarmotKitError>
+```
+
+Downloads one exact sticker after the account has its `(coordinate, shortcode, hash)` mapping. Hosts pass the typed reference from a timeline row; MDK never asks the host to parse tags. A missing mapping returns `StickerNotFound` rather than fetching an unvalidated URL.
+
+[Source](src/commands/sticker.rs#L105)
+
+</details>
+
+<details>
 <summary>commands/subscription.rs</summary>
 
 ### `Marmot::subscribe_events`
@@ -3920,7 +4033,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L290)
+[Source](src/lib.rs#L291)
 
 ### `Marmot::new_with_options`
 
@@ -3932,7 +4045,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L306)
+[Source](src/lib.rs#L307)
 
 ### `Marmot::new`
 
@@ -3944,7 +4057,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L335)
+[Source](src/lib.rs#L336)
 
 ### `Marmot::new_with_secret_store`
 
@@ -3956,7 +4069,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L361)
+[Source](src/lib.rs#L362)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -3968,7 +4081,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L392)
+[Source](src/lib.rs#L393)
 
 ### `Marmot::new_with_client_name`
 
@@ -3980,7 +4093,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L413)
+[Source](src/lib.rs#L414)
 
 ### `Marmot::start`
 
@@ -3992,7 +4105,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L451)
+[Source](src/lib.rs#L452)
 
 ### `Marmot::shutdown`
 
@@ -4004,7 +4117,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L463)
+[Source](src/lib.rs#L464)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4016,7 +4129,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L499)
+[Source](src/lib.rs#L500)
 
 ### `Marmot::storage_is_closed`
 
@@ -4028,7 +4141,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L507)
+[Source](src/lib.rs#L508)
 
 ### `Marmot::is_stopping`
 
@@ -4040,7 +4153,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L514)
+[Source](src/lib.rs#L515)
 
 </details>
 

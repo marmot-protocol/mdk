@@ -23,6 +23,7 @@ pub(crate) mod recovery_health;
 pub(crate) mod recovery_staging;
 pub(crate) mod recovery_units;
 pub(crate) mod sign_ins;
+pub(crate) mod stickers;
 pub(crate) mod storage_compaction;
 pub(crate) mod timeline;
 pub(crate) mod transport;
