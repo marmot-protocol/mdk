@@ -1477,6 +1477,7 @@ impl AppClient {
             crate::ProductUnit::Attempt,
         );
         self.drive_sign_ins().await;
+        self.device_rename_upkeep().await;
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;

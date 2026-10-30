@@ -1009,8 +1009,8 @@ one roster commit in the device group:
   device group, for a slot the roster doesn't list, and while the device group has an earlier change of this device's
   in flight (`device_group_busy`). Retry that last one later; a commit then could build on a roster that is about to
   change.
-- A rename whose commit loses a fork to one that also changes that device's entry is not made again, and the winning
-  label stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`, not the one the user typed.
+- A rename whose commit loses a fork is made again on a later maintenance pass, unless another rename of that device
+  won; that one stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`, not the one the user typed.
 
 ### Overdue KeyPackage refresh
 

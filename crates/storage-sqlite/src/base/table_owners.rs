@@ -140,6 +140,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("device_group_joins", Side::App),
     ("device_groups", Side::App),
     ("device_links", Side::App),
+    ("device_renames", Side::App),
     ("direct_conversation_members", Side::App),
     ("encrypted_media_epoch_secret_references", Side::App),
     (

@@ -30,9 +30,9 @@
   (mdk#2628 item 3.6). It goes through the runtime's one roster write path,
   the one slot announcements use, and is refused with nothing sent
   (`device_group_busy`) while an earlier change of this device's in the
-  device group is in flight. A rename whose commit loses a fork to one that
-  also changes that device's entry is not made again, and the winning label
-  stands. Refused in release builds until the roster's spec lands.
+  device group is in flight. A rename whose commit loses a fork
+  is made again on a later maintenance pass, unless another rename of that
+  device won; that one stands (D37). Refused in release builds until the roster's spec lands.
 - `AppGroupMlsState.convergence_parked` reports a group whose convergence
   pass spent its failure budget (mdk#2684). Show it as stuck syncing until
   new group activity arrives or the user retries;

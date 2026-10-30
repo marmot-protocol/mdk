@@ -2503,8 +2503,8 @@ impl MarmotAppRuntime {
     /// `label_too_long`, `no_device_group`, `unknown_device`,
     /// `roster_unavailable`, or `device_group_busy` while the device group
     /// has an earlier change in flight (retry later). A rename whose commit
-    /// loses a fork to one that also changes that device's entry is not made
-    /// again; refresh on `LinkedDevicesChanged`.
+    /// loses a fork is made again on a later maintenance pass, unless another
+    /// rename of that device won; refresh on `LinkedDevicesChanged`.
     pub async fn rename_linked_device(
         &self,
         account_ref: &str,

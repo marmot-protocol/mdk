@@ -98,9 +98,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Write a device entry of the roster only through the runtime's `edit_device_roster_entry` (renaming, announcements).
   It refuses while the device group has anything of this device's in flight; surface that as `device_group_busy`.
   The engine stages a `ReplaceDeviceEntry` only while the entry is still the one the edit read, so a whole-entry
-  replacement never undoes a change that lands in between. A rename (`client/device_renames.rs`) whose commit loses a
-  fork to one that also changes that device's entry is not made again; the engine re-issues it only when the winner
-  left that entry alone. Rejected slots (3.2's sign-in rejections, below) are written by `commit_device_roster_update`
+  replacement never undoes a change that lands in between. A rename (`client/device_renames.rs`) writes a fresh rename
+  id next to the label and is kept on disk before its commit is sent. Maintenance reads only the rename id the winning
+  roster holds (D37): one the rename wrote means applied, one its renames replaced means lost with nothing renamed
+  since (made again with a fresh id), any other means another rename stands. Never infer a rename's fate from labels
+  or commit ids. Rejected slots (3.2's sign-in rejections, below) are written by `commit_device_roster_update`
   instead, never as device entries.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription only brings a check forward (`SignInNudges`). The
