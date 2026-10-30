@@ -3440,14 +3440,27 @@ async fn router_drops_record_the_earliest_created_at_they_lost() {
     wait_for(3).await;
     let earliest_fill = 1_700_100_000 - (ACCOUNT_DELIVERY_BUFFER as u64 + 2);
     // They all arrived on the fill's group route.
+    let routes = vec![(DeliveryRoute::Group([0xD3; 32]), earliest_fill)];
     assert_eq!(
         marked.lock().unwrap().last().cloned(),
-        Some((
-            3,
-            Some(earliest_fill),
-            Some(vec![(DeliveryRoute::Group([0xD3; 32]), earliest_fill)])
-        ))
+        Some((3, Some(earliest_fill), Some(routes.clone())))
     );
+    // The worker reads the same routes for the generation it observed, and
+    // none for another generation or token.
+    let observed = adapter.pending_delivery_overflow().unwrap();
+    assert_eq!(adapter.delivery_loss_routes(&observed), Some(routes));
+    for other in [
+        AccountDeliveryOverflow {
+            generation: observed.generation.wrapping_sub(1),
+            ..observed
+        },
+        AccountDeliveryOverflow {
+            marker_token: observed.marker_token.wrapping_add(1),
+            ..observed
+        },
+    ] {
+        assert_eq!(adapter.delivery_loss_routes(&other), None);
+    }
 
     // A dropped delivery recovery cannot place loses the generation's routes.
     let mut event = group_event("unplaced", &[0xD3; 32]);
@@ -3461,6 +3474,7 @@ async fn router_drops_record_the_earliest_created_at_they_lost() {
         marked.lock().unwrap().last().cloned(),
         Some((4, Some(earliest_fill), None))
     );
+    assert_eq!(adapter.delivery_loss_routes(&observed), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

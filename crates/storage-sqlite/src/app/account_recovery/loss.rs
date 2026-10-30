@@ -296,6 +296,54 @@ pub(super) fn unroute_tx(
     drop_unrouted_routes_tx(conn, label, cause, token)
 }
 
+/// The routes one write may list: `None` for none, or for more than
+/// [`MAX_LOSS_ROUTES`], since either makes its generation account-wide.
+pub(super) fn listed_routes(
+    routes: Option<&[(TransportReconciliationRoute, u64)]>,
+) -> Option<&[(TransportReconciliationRoute, u64)]> {
+    routes.filter(|routes| !routes.is_empty() && routes.len() <= MAX_LOSS_ROUTES)
+}
+
+/// Merge one write's routes into its generation, once its evidence row
+/// holds the write's `route_state`: each route at its lowest bound, while the
+/// generation still lists its routes. A generation that lists more than
+/// [`MAX_LOSS_ROUTES`] becomes account-wide.
+pub(super) fn merge_routes_tx(
+    conn: &Connection,
+    label: &str,
+    cause: i64,
+    token: i64,
+    routes: Option<&[(TransportReconciliationRoute, u64)]>,
+) -> StorageResult<()> {
+    for (route, bound) in routes.unwrap_or_default() {
+        let (kind, id) = route.storage_key();
+        conn.execute_cached(
+            "INSERT INTO account_delivery_loss_evidence_routes
+             (account_label, cause, marker_token, route_kind, route_id, bound_seconds)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6 FROM account_delivery_loss_evidence
+             WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
+               AND route_state = 1
+             ON CONFLICT DO UPDATE SET
+                 bound_seconds = MIN(bound_seconds, excluded.bound_seconds)",
+            params![label, cause, token, kind, id, sqlite_integer(*bound)?],
+        )
+        .storage()?;
+    }
+    let listed: i64 = conn
+        .query_row_cached(
+            "SELECT COUNT(*) FROM account_delivery_loss_evidence_routes
+             WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
+            params![label, cause, token],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if usize::try_from(listed).map_or(true, |listed| listed > MAX_LOSS_ROUTES) {
+        unroute_tx(conn, label, cause, token)
+    } else {
+        drop_unrouted_routes_tx(conn, label, cause, token)
+    }
+}
+
 /// An account-wide generation needs no route rows.
 fn drop_unrouted_routes_tx(
     conn: &Connection,
@@ -377,7 +425,7 @@ impl SqliteAppStorage {
         let (bound_state, bound_seconds) =
             crate::app::account_recovery::loss_bound_values(earliest_created_at)?;
         let token = sqlite_integer(marker_token)?;
-        let routes = routes.filter(|routes| !routes.is_empty() && routes.len() <= MAX_LOSS_ROUTES);
+        let routes = listed_routes(routes);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             conn.execute_cached(
@@ -404,40 +452,7 @@ impl SqliteAppStorage {
                 ],
             )
             .storage()?;
-            for (route, bound) in routes.unwrap_or_default() {
-                let (kind, id) = route.storage_key();
-                conn.execute_cached(
-                    "INSERT INTO account_delivery_loss_evidence_routes
-                     (account_label, cause, marker_token, route_kind, route_id, bound_seconds)
-                     SELECT ?1, ?2, ?3, ?4, ?5, ?6 FROM account_delivery_loss_evidence
-                     WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
-                       AND route_state = 1
-                     ON CONFLICT DO UPDATE SET
-                         bound_seconds = MIN(bound_seconds, excluded.bound_seconds)",
-                    params![
-                        label,
-                        cause as i64,
-                        token,
-                        kind,
-                        id,
-                        sqlite_integer(*bound)?
-                    ],
-                )
-                .storage()?;
-            }
-            let listed: i64 = conn
-                .query_row_cached(
-                    "SELECT COUNT(*) FROM account_delivery_loss_evidence_routes
-                     WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
-                    params![label, cause as i64, token],
-                    |row| row.get(0),
-                )
-                .storage()?;
-            if usize::try_from(listed).map_or(true, |listed| listed > MAX_LOSS_ROUTES) {
-                unroute_tx(&conn, label, cause as i64, token)
-            } else {
-                drop_unrouted_routes_tx(&conn, label, cause as i64, token)
-            }
+            merge_routes_tx(&conn, label, cause as i64, token, routes)
         })
     }
 

@@ -319,6 +319,7 @@ pub(crate) fn arm_overflow_tx(
     dropped: i64,
     now: i64,
     earliest_created_at: Option<u64>,
+    routes: Option<&[(crate::TransportReconciliationRoute, u64)]>,
 ) -> StorageResult<()> {
     // Import may have joined this generation before its queued control record
     // reaches the worker. Changing the represented identity must fence old
@@ -348,8 +349,9 @@ pub(crate) fn arm_overflow_tx(
     // Preserve what the worker already observed, even when this token's marker
     // callback has not committed yet. A delayed duplicate cannot rearm debt.
     // Drops past the durable count have no marker write naming their routes
-    // yet, and the import below covers their count, so they un-cover every
-    // route; an absent row starts account-wide.
+    // yet, and the import below covers their count, so the relay plane's
+    // routes for what the worker saw merge in as a marker write's would.
+    // Without them every route lost coverage; an absent row starts from them.
     let durable: Option<i64> = conn
         .query_row_cached(
             "SELECT dropped_count FROM account_delivery_loss_evidence
@@ -359,24 +361,37 @@ pub(crate) fn arm_overflow_tx(
         )
         .optional()
         .storage()?;
-    if durable.is_some_and(|durable| durable < dropped) {
-        loss::unroute_tx(conn, label, 0, token)?;
-    }
+    let past_durable = durable.is_none_or(|durable| durable < dropped);
+    let routes = loss::listed_routes(routes);
     let (bound_state, bound_seconds) = loss_bound_values(earliest_created_at)?;
     conn.execute_cached(
         &format!(
             "INSERT INTO account_delivery_loss_evidence
              (account_label, cause, marker_token, pending_since, dropped_count, imported_count,
-              bound_state, bound_seconds)
-             VALUES (?1, 0, ?2, ?3, ?4, ?4, ?5, ?6)
+              bound_state, bound_seconds, route_state)
+             VALUES (?1, 0, ?2, ?3, ?4, ?4, ?5, ?6, ?7)
              ON CONFLICT(account_label, cause, marker_token) DO UPDATE SET
                  dropped_count = MAX(dropped_count, excluded.dropped_count),
                  imported_count = MAX(COALESCE(imported_count, 0), excluded.imported_count),
+                 route_state = CASE WHEN ?8 THEN MIN(route_state, excluded.route_state)
+                     ELSE route_state END,
                  {LOSS_BOUND_MERGE}"
         ),
-        params![label, token, now, dropped, bound_state, bound_seconds],
+        params![
+            label,
+            token,
+            now,
+            dropped,
+            bound_state,
+            bound_seconds,
+            i64::from(routes.is_some()),
+            past_durable
+        ],
     )
     .storage()?;
+    if past_durable {
+        loss::merge_routes_tx(conn, label, 0, token, routes)?;
+    }
     Ok(())
 }
 
@@ -947,14 +962,17 @@ impl SqliteAppStorage {
     /// worker's observation changed the queue-loss obligation, when it did or
     /// when it un-covered every route. The marker writer usually imported the
     /// generation first, so this is most often `None`. It un-covers the
-    /// generation when it imported count, and an observation past the durable
-    /// count un-covers every route.
+    /// generation when it imported count. An observation past the durable
+    /// count merges `routes` into its generation as
+    /// [`Self::record_account_recovery_loss_routed`] would: the relay plane's
+    /// route map for every drop it counted, or `None` to un-cover every route.
     pub fn mark_account_delivery_recovery_observed(
         &self,
         label: &str,
         marker_token: u64,
         dropped_count: u64,
         earliest_created_at: Option<u64>,
+        routes: Option<&[(crate::TransportReconciliationRoute, u64)]>,
     ) -> StorageResult<Option<RecoveryLossImport>> {
         let token = i64::try_from(marker_token).unwrap_or(i64::MAX);
         let dropped = i64::try_from(dropped_count).unwrap_or(i64::MAX);
@@ -979,6 +997,7 @@ impl SqliteAppStorage {
                 dropped,
                 crate::base::codec::unix_now_seconds_i64(),
                 earliest_created_at,
+                routes,
             )?;
             let charged: bool = conn
                 .query_row_cached(

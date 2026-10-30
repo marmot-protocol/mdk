@@ -259,8 +259,9 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   `record_account_recovery_loss_routed` with its routes (migration 0128, at most `MAX_LOSS_ROUTES`) un-covers only
   those routes, each from its own bound, and widens their goals; any other generation un-covers every route the ledger
   holds from its floor upward (all of it when a floor is unknown) and widens their goals to it. Imports stay
-  count-driven, since the relay plane gives an adopted marker's new drops a fresh token, and a worker observation past
-  the durable count makes its generation account-wide. Each import stamps every generation it charges with the loss
+  count-driven, since the relay plane gives an adopted marker's new drops a fresh token. A worker observation past the
+  durable count (`mark_account_delivery_recovery_observed`) merges the relay plane's routes for its generation as a
+  marker write would, and makes the generation account-wide when it passes none. Each import stamps every generation it charges with the loss
   revision its join left (`import_revision`, migration 0132). `recovery_loss_reach` reads where one cause's unresolved loss
   may have lost events, by route, and `recovery_loss_reach_after` reads the same for loss imported after a loss
   revision: what a checkpoint captured at that revision has not seen. Acknowledgment deletes the generations it
