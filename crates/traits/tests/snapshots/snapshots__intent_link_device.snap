@@ -1,6 +1,6 @@
 ---
 source: crates/traits/tests/snapshots.rs
-expression: "SendIntent::LinkDevice\n{\n    group_id: gid(), key_package: KeyPackage::new(vec![0xEF; 4]),\n    roster_update: vec![0x5C; 4],\n}"
+expression: "SendIntent::LinkDevice\n{\n    group_id: gid(), key_package: KeyPackage::new(vec![0xEF; 4]),\n    roster_update: vec![0x5C; 4], deliver_until: Timestamp(1_700_000_600),\n}"
 ---
 {
   "LinkDevice": {
@@ -24,6 +24,7 @@ expression: "SendIntent::LinkDevice\n{\n    group_id: gid(), key_package: KeyPac
       92,
       92,
       92
-    ]
+    ],
+    "deliver_until": 1700000600
   }
 }

@@ -74,6 +74,7 @@ pub mod openmls_projection;
 mod own_account_devices;
 pub mod own_commit_intent;
 pub mod pending_commit_guard;
+pub mod private_key_packages;
 pub mod provider;
 pub mod publish;
 mod queued_intent_refusal;

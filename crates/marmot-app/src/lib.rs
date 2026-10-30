@@ -2184,11 +2184,6 @@ impl MarmotApp {
         // it repairs a crash-lost branch-selection announcement on every open,
         // deferred ones included.
         client.reconcile_branch_selection_withdrawals();
-        // Same rule again: it reads stored links, and withdrawal reads no group
-        // state. A failed or expired device link's Welcome is withdrawn before
-        // the client exists for anything to publish it: startup recovery, a
-        // maintenance pass, or a stored fanout's retry (mdk#2628 D40).
-        client.withdraw_expired_link_welcomes();
         if !defer_group_hydration {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
