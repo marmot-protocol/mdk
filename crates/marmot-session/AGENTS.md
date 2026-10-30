@@ -32,8 +32,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     no KeyPackage reaches this device's slot until this device's own roster entry there names it. Maintenance
     announces first.
   - `runtime/device_roster.rs` — this device's reads and writes of its device group's roster: its slot, the merged
-    roster, the gate its roster commits wait behind (not stable, held, quarantined, settling, or a change of this
-    device's still queued or unconfirmed), and the sends. The runtime's roster-writing steps use these rather than
+    roster, the gate its roster commits wait behind (`device_group_takes_commit`: not stable, held, quarantined,
+    settling, or a change of this device's still queued or unconfirmed; public, so the host judges a lost rename only
+    once its commits there have an outcome), and the sends. The runtime's roster-writing steps use these rather than
     their own copies. Device entries have one write path (`edit_device_roster_entry`, mdk#2628 3.4, 3.6): one
     `SetDevice` commit replacing one device entry with an edit applied to the roster as read now, sent as
     `SendIntent::ReplaceDeviceEntry` naming the entry it read. The engine stages it only while the slot still holds

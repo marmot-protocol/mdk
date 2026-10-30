@@ -280,6 +280,8 @@ mod migration_0131_account_sign_ins;
 mod migration_0132_loss_import_revision;
 #[path = "migrations/0134_recovery_recheck_revision.rs"]
 mod migration_0134_recovery_recheck_revision;
+#[path = "migrations/0137_device_renames.rs"]
+mod migration_0137_device_renames;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1098,6 +1100,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0134_recovery_recheck_revision",
         suspend_foreign_keys: &[],
         apply: migration_0134_recovery_recheck_revision::apply,
+    },
+    Migration {
+        version: 137,
+        name: "0137_device_renames",
+        suspend_foreign_keys: &[],
+        apply: migration_0137_device_renames::apply,
     },
 ];
 
