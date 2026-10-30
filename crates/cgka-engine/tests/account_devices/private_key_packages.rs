@@ -144,18 +144,17 @@ async fn a_request_stops_earlier_records_counting_and_is_answered_once() {
     }
     assert_eq!(stock(&phone, &OTHER_SLOT), 1);
 
-    // Past halfway, a counted record no longer counts.
-    let record = &phone.engine.issued_private_key_packages().unwrap()[0];
-    let halfway =
-        cgka_traits::storage::private_key_package_halfway(record.not_before, record.not_after);
-    assert_eq!(
-        private_key_package_stock(
-            &phone.engine.issued_private_key_packages().unwrap(),
-            &SLOT,
-            halfway
-        ),
-        0
-    );
+    // Past halfway, a counted record no longer counts. Lifetimes come from
+    // the wall clock, so take the latest halfway.
+    let issued = phone.engine.issued_private_key_packages().unwrap();
+    let halfway = issued
+        .iter()
+        .map(|record| {
+            cgka_traits::storage::private_key_package_halfway(record.not_before, record.not_after)
+        })
+        .max()
+        .unwrap();
+    assert_eq!(private_key_package_stock(&issued, &SLOT, halfway), 0);
 
     // Removing a sibling discards what was issued to it, keys included.
     assert_eq!(
@@ -376,9 +375,10 @@ async fn a_hand_off_round_trips_and_takes_no_untagged_key_package() {
 #[tokio::test]
 async fn a_hand_off_takes_key_packages_tagged_as_its_sender() {
     use super::device_roster::{phone_and_laptop, roster_of, slot};
-    use super::device_tag::set_own_key;
+    use super::device_tag::{hold_slot, set_own_key};
 
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    hold_slot(&laptop, slot(2));
     laptop
         .engine
         .set_device_tag_group(Some(gid.clone()))

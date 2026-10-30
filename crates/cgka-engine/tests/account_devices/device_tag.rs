@@ -298,7 +298,7 @@ async fn a_group_context_device_tag_entry_is_unknown_data() {
 
 /// Gives `device` the KeyPackage publication slot `slot`, which makes the
 /// roster entry there its own.
-fn hold_slot(device: &Device, slot: DeviceSlotId) {
+pub(super) fn hold_slot(device: &Device, slot: DeviceSlotId) {
     device
         .storage
         .put_key_package_lifecycle(&KeyPackageLifecycleState::slot_only(hex::encode(slot)))

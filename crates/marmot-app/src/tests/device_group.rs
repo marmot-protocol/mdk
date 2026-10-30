@@ -2206,7 +2206,7 @@ async fn a_removed_device_record_is_dropped_after_30_days() {
             ..
         },
         group,
-    ) = tagging_devices().await;
+    ) = settled_linked_devices().await;
     let now = unix_now_seconds();
     let rejected = |reason, days_ago: u64, tag_signature_key| RejectedSlotV1 {
         reason,
