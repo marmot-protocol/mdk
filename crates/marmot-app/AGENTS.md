@@ -364,8 +364,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   admission gets one) and waits for the next in one select arm, and stops it on the client at every exit that still
   holds one (`SpawnedRunner::stop`), so a preempted quantum settles there but nothing is ingested on the way out.
   Whoever lets go of a runner, by a stop, an abort or a dropped in-place pass, refunds the attempts it began and never
-  settled as `Unanswered` (`OpenAttempts`), through storage that is still open; after `shutdown_and_close` or a crash
-  the charge stays until it ages out of the hour. A
+  settled as `Unanswered` (`OpenAttempts`), through storage that is still open, and a settle whose write failed stays
+  open for that refund. `shutdown_and_close` refunds only if storage is still open as the runner stops; otherwise,
+  and after a crash, the charge stays until it ages out of the hour. A
   directly owned client from `MarmotApp::client()` runs one pass in place from `sync()` and from `next_event()`'s
   loss branch. The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
   adapter's installed subscriptions, which trail the routes a debt turn reads: a valid event that routes nowhere yet

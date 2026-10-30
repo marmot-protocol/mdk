@@ -237,6 +237,62 @@ async fn a_stopped_runner_settles_the_quantum_it_preempted() {
     hold.release.notify_waiters();
 }
 
+/// A second connection to the account's database, only to inject write
+/// faults.
+fn fault_connection(client: &AppClient) -> rusqlite::Connection {
+    let app = &client.app;
+    let label = &client.state.label;
+    let path = app.account_storage_path(label);
+    let keys = app.account_home().load_signing_keys(label).unwrap();
+    let key = app
+        .sqlcipher_key(label, &keys, &path, crate::SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+}
+
+/// A settle the stop serves whose write fails leaves its attempt open, so the
+/// stop still refunds it once the runner can send no more turns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_refunds_an_attempt_whose_settle_failed() {
+    let hold = HeldSweeps::default();
+    let (_dir, _relay, mut client, storage) = held_client(&hold).await;
+    let before = charged(&storage);
+    let mut runner = client.spawn_recovery_runner().await.unwrap();
+    serve_until_held(&mut runner, &mut client, &hold).await;
+    assert_eq!(charged(&storage), before + 1, "the quantum began");
+
+    // The stop's first part, by hand: the preempted quantum's settle is
+    // served and fails.
+    let faults = fault_connection(&client);
+    faults
+        .execute_batch(
+            "CREATE TRIGGER fail_settle BEFORE UPDATE OF attempt_minute ON account_recovery_units
+             WHEN NEW.attempt_minute IS NULL BEGIN SELECT RAISE(ABORT, 'settle fault'); END;",
+        )
+        .unwrap();
+    runner.handle.shutdown();
+    while !runner.task.is_finished() {
+        tokio::select! {
+            turn = runner.next_turn() => SpawnedRunner::serve_stopping(turn, &mut client).await,
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    assert_eq!(charged(&storage), before + 1, "the failed settle kept it");
+    assert!(!runner._refund.open.is_empty(), "its attempt stays open");
+
+    faults.execute_batch("DROP TRIGGER fail_settle;").unwrap();
+    runner.stop(&mut client).await;
+    assert_eq!(charged(&storage), before, "the stop refunded it");
+    hold.release.notify_waiters();
+}
+
 /// The account's runner, never spawned, with one attempt on `key` begun as
 /// its begin turn begins one, owned as the worker owns a runner whose task
 /// still waits on its relay. Returns it with the runner, which holds the

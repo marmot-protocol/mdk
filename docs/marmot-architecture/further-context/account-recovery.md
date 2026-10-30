@@ -718,8 +718,9 @@ its next attempt time. Each quantum's outcome is one transaction:
 
 An attempt is charged when it begins, so a process that dies mid-quantum still counts it.
 A runner stopped mid-quantum while storage is open, by a reconnect or a dropped pass, refunds
-the attempt as unanswered instead, unless the quantum's own settle came in time. A crash, or a
-stop once `shutdown_and_close` has closed storage, keeps the charge until it leaves the hour,
+the attempt as unanswered instead, unless the quantum's own settle came in time. A full
+shutdown (`shutdown_and_close`) refunds the same way if storage is still open as the runner
+stops, and otherwise keeps the charge until it leaves the hour. A crash keeps the charge too,
 which caps a reply that crashes the process.
 Newer loss over a parked span earns one probe under the same park. Newer loss inside a
 retired span reopens that part whatever the unit's state: an active unit owes it as ordinary

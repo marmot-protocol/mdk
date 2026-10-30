@@ -308,8 +308,8 @@ fn unix_now() -> u64 {
 /// Refunds the attempts a runner left unsettled when its owner lets go of
 /// it: after a stop, an abort, or a dropped in-place pass. Its owner serves no
 /// more of the runner's turns by then, so what is left will never settle. It
-/// writes only to storage already open, so after `shutdown_and_close` it
-/// refunds nothing.
+/// writes only to storage already open, so once `shutdown_and_close` has
+/// closed storage it refunds nothing.
 struct OpenAttemptRefund {
     open: OpenAttempts,
     app: MarmotApp,
@@ -533,8 +533,9 @@ impl SpawnedRunner {
     /// a slow cancel loses only the relay's verdict and the bytes it read
     /// meanwhile. An admission is refused, so nothing is ingested after the
     /// worker's last publication; its event stays staged for the next runner.
-    /// Once storage is closed (`shutdown_and_close`) nothing settles or is
-    /// refunded: the attempt stays charged until it ages out of the hour.
+    /// A full shutdown (`shutdown_and_close`) refunds only if storage is still
+    /// open when the runner stops; once it is closed nothing settles or is
+    /// refunded, and the attempt stays charged until it ages out of the hour.
     pub(crate) async fn stop(self, client: &mut AppClient) {
         self.stop_by(client, tokio::time::Instant::now() + STOP_WAIT)
             .await;

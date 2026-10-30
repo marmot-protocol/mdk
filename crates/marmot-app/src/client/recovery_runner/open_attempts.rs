@@ -5,9 +5,15 @@
 //! runner stopped between the two never sends its settle, so its owner
 //! refunds what is left as `Unanswered` once the runner can send no more
 //! turns ([`OpenAttempts::refund`]): the charge goes back and the relay gets
-//! no verdict. A process crash refunds nothing, and neither does a stop after
-//! `shutdown_and_close` has closed storage: that charge stays until it ages
-//! out of the hour, which caps a reply that crashes the process.
+//! no verdict. A settle whose write fails stays open, so a stop refunds it
+//! too. Outside a stop, the unit's next begin replaces that attempt and its
+//! charge ages out of the hour.
+//!
+//! The refund needs storage still open. A full shutdown
+//! (`shutdown_and_close`) refunds when storage is still open as the runner
+//! stops; otherwise the charge ages out within the hour. A process crash
+//! refunds nothing: that charge is what caps a reply that crashes the
+//! process.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -41,8 +47,9 @@ impl OpenAttempts {
         self.lock().insert(key.clone(), kind);
     }
 
-    /// `key`'s settle turn runs: its outcome, not a refund, decides the
-    /// charge, even when its write fails.
+    /// `key`'s settle committed: its outcome, not a refund, decides the
+    /// charge. A settle that fails leaves `key` open, and a refund of an
+    /// attempt that did settle changes nothing.
     pub(super) fn settled(&self, key: &UnitKey) {
         self.lock().remove(key);
     }

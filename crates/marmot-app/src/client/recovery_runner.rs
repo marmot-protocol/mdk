@@ -614,8 +614,12 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let outcome = match self
             .host
             .turn(move |turn| {
-                open.settled(&plan.key);
-                quantum::settle(turn, &plan, &report, &policy)
+                let outcome = quantum::settle(turn, &plan, &report, &policy);
+                // A settle that failed left its charge for a stop to refund.
+                if outcome.is_ok() {
+                    open.settled(&plan.key);
+                }
+                outcome
             })
             .await
         {
@@ -712,8 +716,14 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let settled = match self
             .host
             .turn(move |turn| {
-                open.settled(&plan.compare.key);
-                recheck::settle(turn, &plan, &report, &facts, &policy)
+                let settled = recheck::settle(turn, &plan, &report, &facts, &policy);
+                // A failed progress write after a committed settle leaves the
+                // key open too; its refund finds the attempt settled and
+                // changes nothing.
+                if settled.is_ok() {
+                    open.settled(&plan.compare.key);
+                }
+                settled
             })
             .await
         {

@@ -112,13 +112,18 @@ struct Account {
     admitted: AdmittedLog,
 }
 
-fn account() -> Account {
-    let dir = tempfile::tempdir().unwrap();
+const ACCOUNT_DB: &str = "account.db";
+
+fn account_key() -> SqlCipherKey {
     // A raw key skips SQLCipher's passphrase derivation, which dominates a
     // test's run time in debug builds.
-    let key = SqlCipherKey::raw([7; 32]);
+    SqlCipherKey::raw([7; 32])
+}
+
+fn account() -> Account {
+    let dir = tempfile::tempdir().unwrap();
     let storage =
-        SqliteAccountStorage::open_encrypted(dir.path().join("account.db"), &key).unwrap();
+        SqliteAccountStorage::open_encrypted(dir.path().join(ACCOUNT_DB), &account_key()).unwrap();
     let app = storage.app_storage();
     Account {
         _dir: dir,
@@ -129,6 +134,18 @@ fn account() -> Account {
 }
 
 impl Account {
+    /// A second connection to the database, only to inject write faults.
+    fn fault_connection(&self) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open(self._dir.path().join(ACCOUNT_DB)).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &account_key(),
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection
+    }
+
     fn goal(&self, route: &Route, since: u64) {
         self.app
             .widen_recovery_coverage_goals(std::slice::from_ref(route), since)
