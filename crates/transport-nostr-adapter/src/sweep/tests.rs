@@ -1029,3 +1029,161 @@ async fn large_groups_finish_over_cut_attempts_without_refetching() {
         );
     }
 }
+
+/// A relay whose every request reads until it is interrupted. It then ends
+/// after `ends_after`, metering `read` bytes, or never does.
+struct HangingRelay {
+    /// What [`SweepRelay::interrupt`] answers.
+    can_interrupt: bool,
+    ends_after: Option<Duration>,
+    read: u64,
+    interrupted: CancellationToken,
+    metered: std::sync::atomic::AtomicU64,
+    ended: std::sync::atomic::AtomicU32,
+}
+
+impl HangingRelay {
+    fn new(can_interrupt: bool, ends_after: Option<Duration>) -> Self {
+        Self {
+            can_interrupt,
+            ends_after,
+            read: 4_096,
+            interrupted: CancellationToken::new(),
+            metered: Default::default(),
+            ended: Default::default(),
+        }
+    }
+
+    async fn read_until_interrupted(&self) {
+        self.interrupted.cancelled().await;
+        match self.ends_after {
+            Some(after) => tokio::time::sleep(after).await,
+            None => std::future::pending().await,
+        }
+        self.metered
+            .fetch_add(self.read, std::sync::atomic::Ordering::SeqCst);
+        self.ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn ended(&self) -> u32 {
+        self.ended.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl SweepRelay for HangingRelay {
+    fn caps(&self) -> RelayCaps {
+        RelayCaps {
+            max_limit: Some(500),
+            negentropy: true,
+        }
+    }
+
+    async fn fetch_slice(&self, _query: SliceQuery) -> SliceReply {
+        self.read_until_interrupted().await;
+        // An empty answer would prove the slice: it must never be used.
+        SliceReply::Answered {
+            events: Vec::new(),
+            received: 0,
+            more: false,
+        }
+    }
+
+    async fn fetch_second(
+        &self,
+        _route: SweepRoute,
+        _second: u64,
+        _cap: Option<u32>,
+    ) -> SecondReply {
+        self.read_until_interrupted().await;
+        SecondReply::Complete(Vec::new())
+    }
+
+    fn take_fetched_bytes(&self) -> u64 {
+        self.metered.swap(0, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn interrupt(&self) -> bool {
+        self.interrupted.cancel();
+        self.can_interrupt
+    }
+}
+
+/// A request the deadline cuts is interrupted and awaited, so its relay
+/// meters what it read; its reply is never used.
+#[tokio::test(start_paused = true)]
+async fn a_cut_request_is_interrupted_and_reports_what_it_read() {
+    let relay = HangingRelay::new(true, Some(Duration::from_millis(100)));
+    let started = Instant::now();
+    let mut sweep = request(month());
+    sweep.deadline = Some(started + Duration::from_secs(2));
+    let mut sink = RecordingSink::default();
+    let report = run_sweep(
+        sweep,
+        &relay,
+        &mut sink,
+        &MemoryStore::default(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.end, SweepEnd::DeadlineReached);
+    assert_eq!(report.outcome(), SweepOutcomeKind::Unanswered);
+    assert!(report.covered.is_empty() && sink.slices.is_empty());
+    assert_eq!((report.stats.requests, report.stats.answers), (1, 0));
+    assert_eq!(relay.ended(), 1, "the request ran to its end");
+    assert_eq!(relay.take_fetched_bytes(), relay.read);
+    assert_eq!(started.elapsed(), Duration::from_millis(2_100));
+
+    // Cancellation (shutdown, a pass preemption) interrupts it the same way.
+    let relay = HangingRelay::new(true, Some(Duration::from_millis(100)));
+    let cancel = CancellationToken::new();
+    let started = Instant::now();
+    let cancelling = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            cancel.cancel();
+        })
+    };
+    let report = run_sweep(
+        request(month()),
+        &relay,
+        &mut RecordingSink::default(),
+        &MemoryStore::default(),
+        &cancel,
+    )
+    .await;
+    cancelling.await.unwrap();
+    assert_eq!(report.end, SweepEnd::Cancelled);
+    assert!(report.covered.is_empty());
+    assert_eq!(relay.take_fetched_bytes(), relay.read);
+    assert_eq!(started.elapsed(), Duration::from_millis(2_100));
+}
+
+/// The grace bounds the wait for a relay that does not end its request, and
+/// a relay that cannot interrupt has its request dropped at once.
+#[tokio::test(start_paused = true)]
+async fn a_cut_request_is_dropped_after_the_grace_or_at_once() {
+    for (can_interrupt, wait) in [(true, INTERRUPT_GRACE), (false, Duration::ZERO)] {
+        let relay = HangingRelay::new(can_interrupt, None);
+        let started = Instant::now();
+        let mut sweep = request(month());
+        sweep.deadline = Some(started + Duration::from_secs(2));
+        let report = run_sweep(
+            sweep,
+            &relay,
+            &mut RecordingSink::default(),
+            &MemoryStore::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(report.end, SweepEnd::DeadlineReached);
+        assert_eq!(relay.ended(), 0, "the request was dropped");
+        assert_eq!(relay.take_fetched_bytes(), 0);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(2) + wait,
+            "can interrupt: {can_interrupt}"
+        );
+    }
+}

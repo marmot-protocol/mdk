@@ -752,7 +752,11 @@ stages each proven slice with its coverage through that mark, and applies the ou
 above. Progress is newly covered seconds on the unit's own relay, so live traffic, other routes
 and reconnects reset nothing. Every event byte a required relay sends counts toward the
 account's rolling-hour budget, including replies a budget cut short and replies a halving
-discards. The one exception is the reply still in flight when a quantum is cut (mdk#2719).
+discards. A quantum cut by its deadline, shutdown or a pass's budget interrupts its request in
+flight instead of dropping it: the relay cancels the request, which still reports the bytes it
+read, and is dropped only if it has not ended within a 1 s grace. So the reply being read when
+the quantum was cut counts too, and a pass or shutdown can run up to that grace past its
+deadline.
 
 Debt subtracts the healthy live tails. They are a process-local query that every debt turn
 asks again and nothing keeps across an await, since a tail can lapse with no event when its
