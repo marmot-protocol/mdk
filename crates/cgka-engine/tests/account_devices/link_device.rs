@@ -670,6 +670,19 @@ fn unlink(
 /// Link a tablet into the phone and laptop's device group, and let it join.
 async fn link_tablet(phone: &mut Device, laptop: &mut Device, gid: &GroupId) -> Device {
     let mut tablet = roster_device(b"alice");
+    let welcome = link_welcome(phone, laptop, &mut tablet, gid).await;
+    assert_joins(&mut tablet, &welcome, gid, phone).await;
+    tablet
+}
+
+/// Link `tablet` at slot 3 by a fresh KeyPackage, the laptop accepting the
+/// Commit, and return the Welcome the tablet now waits for.
+async fn link_welcome(
+    phone: &mut Device,
+    laptop: &mut Device,
+    tablet: &mut Device,
+    gid: &GroupId,
+) -> TransportMessage {
     let key_package = tablet.engine.fresh_key_package().await.unwrap();
     let intent = link(
         gid,
@@ -689,9 +702,38 @@ async fn link_tablet(phone: &mut Device, laptop: &mut Device, gid: &GroupId) -> 
     };
     phone.engine.confirm_published(pending).await.unwrap();
     assert_accepted(laptop, &route_to_group(&msg, gid), gid).await;
-    expect_link_welcome(&mut tablet, gid, phone, &key_package);
-    assert_joins(&mut tablet, &welcomes[0], gid, phone).await;
-    tablet
+    expect_link_welcome(tablet, gid, phone, &key_package);
+    welcomes.into_iter().next().expect("one Welcome")
+}
+
+/// A device an unlink removed forgets its copy of the device group (D40), so
+/// the next link's Welcome into that group joins as a first join, though no
+/// clock says it was made after the forget.
+#[tokio::test]
+async fn a_device_that_forgot_its_device_group_joins_it_through_the_next_link() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let mut tablet = roster_device(b"alice");
+    let installed = link_welcome(&mut phone, &mut laptop, &mut tablet, &gid).await;
+    assert_joins(&mut tablet, &installed, &gid, &phone).await;
+    let removal = send_commit(
+        &mut phone,
+        unlink(
+            &gid,
+            signature_key(&tablet, &gid),
+            vec![DeviceRosterOperationV1::RemoveDevice(slot(3))],
+        ),
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut laptop, &removal, &gid).await;
+    assert_accepted(&mut tablet, &removal, &gid).await;
+    assert!(tablet.engine.forget_group_local(&gid).unwrap());
+
+    assert!(tablet.engine.group_record(&gid).is_err());
+
+    let next = link_welcome(&mut phone, &mut laptop, &mut tablet, &gid).await;
+    assert_joins(&mut tablet, &next, &gid, &phone).await;
+    assert!(!tablet.engine.group_record(&gid).unwrap().removed);
 }
 
 /// The unlink removes the device's leaf and writes its roster entry away in

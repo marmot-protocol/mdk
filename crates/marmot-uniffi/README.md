@@ -182,7 +182,7 @@ started/completed counters, five outcomes, histogram and live gauges. Hosts repo
 the actual outcome; merely leaving a scope does not establish success. These
 completed-duration reports have no live observation, so their live gauges are zero.
 Hosts should record every stage they can observe, and only those. Nested stages overlap and
-must not be summed. See the [operation definitions](../marmot-app/src/app_telemetry.rs) and
+must not be summed. See the [operation definitions](../marmot-observability/src/app_telemetry.rs) and
 [metric catalog](../../docs/marmot-architecture/telemetry.md#registered-host-stage-metrics).
 
 Use typed presentation, capability, deletion and group-system fields rather than parsing English
@@ -1009,8 +1009,8 @@ one roster commit in the device group:
   device group, for a slot the roster doesn't list, and while the device group has an earlier change of this device's
   in flight (`device_group_busy`). Retry that last one later; a commit then could build on a roster that is about to
   change.
-- A rename whose commit loses a fork to one that also changes that device's entry is not made again, and the winning
-  label stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`, not the one the user typed.
+- A rename whose commit loses a fork is made again on a later maintenance pass, unless another rename of that device
+  won; that one stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`, not the one the user typed.
 
 ### Overdue KeyPackage refresh
 
@@ -1021,6 +1021,29 @@ Inviters stop treating the device as fresh at 30 days, so tell the user. A routi
 does one that is announced but failing at the relays. Re-read on `MarmotEventFfi::KeyPackageRefreshOverdueChanged`,
 which carries no device or group identities and also fires once each time the account's worker opens or reconnects.
 It is false in every release build until the roster's spec lands.
+
+## Unrecognized sign-ins
+
+`unrecognized_sign_ins(account_ref)` returns sign-ins of this account that this device does not recognize as
+`UnrecognizedSignInFfi` records, for a "Was this you?" prompt:
+
+- Each is a fresh, valid KeyPackage of the account in a slot that neither this device nor its device group's roster
+  knows. The earliest to appear comes first.
+- `before_this_device` means this device's first check found it, so it was signed in before this device: ask whether
+  the user still has it, with `last_seen_at`. For any other, ask whether it was them, with `client` and
+  `appeared_at`. `client` is display only.
+- `state` is `Prompt`, `NotNow`, or `LinkedElsewhere`/`RejectedElsewhere` when another device answered while the
+  prompt waited here. `linked_by_slot_id_hex` names the linking device for `LinkedElsewhere`.
+- `answer_sign_in(account_ref, slot_id_hex, response)` takes `NotNow`, `Reject` or `Dismiss`. `Reject` drops the sign-in
+  from this device's list and records its slot as rejected in the device group's roster; with no device group yet, it
+  waits on this device. On another device, a new sign-in whose prompt still waits there turns `RejectedElsewhere` and
+  stays until `Dismiss`; one put off with `NotNow`, or found before that device, leaves its list. `Dismiss` only ends a
+  prompt another device answered. Linking one is device pairing's.
+- The account checks at open, every six hours, and soon after one of its KeyPackages arrives live.
+  `check_sign_ins(account_ref)` checks now and returns the list after the check.
+- Re-read on `MarmotEventFfi::UnrecognizedSignInsChanged`, which carries no slots. It also fires once each time the
+  account's worker opens or reconnects, so it may fire with no visible change.
+- The list is empty in every release build until the roster's spec lands.
 
 ## Linking a new device
 

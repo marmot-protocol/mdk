@@ -41,6 +41,7 @@ on:
       - crates/marmot-app/**
       - crates/marmot-forensics/**
       - crates/marmot-markdown/**
+      - crates/marmot-observability/**
       - crates/marmot-session/**
       - crates/media-store/**
       - crates/nostr-directory/**

@@ -1078,6 +1078,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
     let phone_slot_bytes: [u8; 32] = hex::decode(&phone_slot).unwrap().try_into().unwrap();
     let entry = |label: &str, linked_at, status, settings| DeviceEntryV1 {
         label: label.into(),
+        rename_id: Some([6; 16]),
         client: format!("{label} client"),
         platform: format!("{label} platform"),
         linked_at,

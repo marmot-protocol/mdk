@@ -21,6 +21,10 @@
   (mdk#2628 item 3.3b). Update exhaustive Swift/Kotlin handling and regenerate
   bindings with the matching native library.
 
+- `MarmotEventFfi` adds `UnrecognizedSignInsChanged { account_id_hex,
+  account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
+  regenerate bindings with the matching native library.
+
 - `MarmotKitError` adds `AccountDevicesActivationRefused { group_id_hex, reason }`
   for an `enable_account_devices` call the group cannot take now (mdk#2628).
   Update exhaustive Swift/Kotlin handling and regenerate bindings with the
@@ -67,8 +71,8 @@
   group (mdk#2628 item 3.6). It is refused with nothing sent while the device
   group has an earlier change in flight (`device_group_busy`; retry later),
   and in release builds until the roster's spec lands. A rename whose commit
-  loses a fork to one that also changes that device's entry is not made
-  again.
+  loses a fork is made again later, unless another rename of that device
+  won.
 
 - `AppGroupMlsStateFfi.convergence_parked` (default `false`) reports a group
   whose convergence pass spent its failure budget (mdk#2684). Show it as stuck
@@ -92,6 +96,13 @@
   so the app can tell the user before inviters stop treating the device as
   fresh at 30 days. Re-read it on `KeyPackageRefreshOverdueChanged`. It is
   false in release builds until the roster's spec lands.
+
+- `unrecognized_sign_ins(account_ref)` returns sign-ins of this account that
+  this device does not recognize as `UnrecognizedSignInFfi` records (mdk#2628
+  item 3.2). `answer_sign_in(account_ref, slot_id_hex, response)` answers one
+  with a `SignInResponseFfi`, and `check_sign_ins(account_ref)` checks now.
+  Re-read the list on `UnrecognizedSignInsChanged`. It is empty in release
+  builds until the roster's spec lands.
 
 - An admin can turn on account-devices in an existing group (mdk#2628):
   `enable_account_devices(account_ref, group_id_hex)` sends one admin Commit,

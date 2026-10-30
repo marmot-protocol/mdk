@@ -76,6 +76,7 @@ pub use own_slot::{ForeignSlotOutcome, ForeignSlotPublication};
 mod private_key_packages;
 mod removed_device_slot;
 mod removed_slot_expiry;
+mod sign_in_rejection;
 mod slot_announcement;
 mod welcome_delivery;
 

@@ -1,7 +1,7 @@
 use zeroize::Zeroizing;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
-use crate::app_telemetry::runtime::Outcome as TelemetryOutcome;
+use marmot_observability::app_telemetry::runtime::Outcome as TelemetryOutcome;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -29,10 +29,6 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
 use crate::agent_streams::AgentStreamWatchManager;
-use crate::app_telemetry::{
-    AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
-    SyncFailureStage, bounded_advisory_step,
-};
 use crate::directory_resources::directory_account;
 use crate::ids::{account_id_hex_from_ref, normalize_group_id_hex_app};
 use crate::messages::AppMessageIntent;
@@ -59,6 +55,10 @@ use crate::{
     SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelineMessageRecord,
     TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
     unix_now_seconds,
+};
+use marmot_observability::app_telemetry::{
+    AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
+    SyncFailureStage, bounded_advisory_step,
 };
 use nostr_directory::DirectorySyncHandle;
 
@@ -377,7 +377,7 @@ pub struct RuntimeSharedServices {
     attachment_permissions: attachment_permission::Permissions,
     /// The recording handle: the app's product collector, shared, and this runtime's own
     /// performance recorder.
-    observer: crate::observer::Observer,
+    observer: marmot_observability::observer::Observer,
     product_worker: Arc<StdMutex<Option<JoinHandle<()>>>>,
     diagnostics_executor: Arc<StdMutex<Option<tokio::runtime::Handle>>>,
     relay_plane: MarmotRelayPlane,
@@ -386,7 +386,8 @@ pub struct RuntimeSharedServices {
     relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
     relay_telemetry_runtime_config: Arc<StdMutex<RelayTelemetryRuntimeConfig>>,
     audit_log_tracker_config: Arc<StdMutex<AuditLogTrackerConfig>>,
-    audit_otlp_sender: Arc<StdMutex<Option<Arc<crate::audit_otlp_sender::AuditOtlpSender>>>>,
+    audit_otlp_sender:
+        Arc<StdMutex<Option<Arc<marmot_observability::audit_otlp_sender::AuditOtlpSender>>>>,
     service_endpoints: MarmotServiceEndpoints,
     audit_log_tracker_uploader: Option<AuditLogTrackerUploader>,
     audit_retention: Option<crate::audit_log::AuditRetentionWorker>,
@@ -493,7 +494,7 @@ impl Default for RuntimeSharedServices {
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
-            observer: crate::observer::Observer::default(),
+            observer: marmot_observability::observer::Observer::default(),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),
@@ -550,13 +551,13 @@ impl RuntimeSharedServices {
     }
 
     fn for_app(app: &MarmotApp) -> Self {
-        crate::wiring::telemetry_origin(
+        marmot_observability::wiring::telemetry_origin(
             &app.product_analytics,
             app.service_endpoints()
                 .relay_telemetry_otlp_endpoint
                 .as_deref(),
         );
-        crate::wiring::silence(
+        marmot_observability::wiring::silence(
             &app.product_analytics,
             app.config.usage_diagnostics_silent
                 || app.config.cursor_persistence == crate::CursorPersistence::Frozen,
@@ -593,7 +594,7 @@ impl RuntimeSharedServices {
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: app.relay_plane.clone(),
-            observer: crate::observer::Observer::sharing(&app.product_analytics),
+            observer: marmot_observability::observer::Observer::sharing(&app.product_analytics),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),
@@ -782,7 +783,9 @@ impl RuntimeSharedServices {
             .clone()
     }
 
-    fn audit_otlp_sender(&self) -> Option<Arc<crate::audit_otlp_sender::AuditOtlpSender>> {
+    fn audit_otlp_sender(
+        &self,
+    ) -> Option<Arc<marmot_observability::audit_otlp_sender::AuditOtlpSender>> {
         self.audit_otlp_sender
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1557,6 +1560,15 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's unrecognized sign-ins may have changed: re-read
+    /// `unrecognized_sign_ins`. Fires when a check finds a new sign-in or a
+    /// change in one, after an answer, when the device group's roster
+    /// changes, and once each time the account's worker opens or reconnects.
+    /// Carries no slots, and may fire with no visible change.
+    UnrecognizedSignInsChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
     /// Linking a new device may have changed as this device shows it:
     /// re-read `device_link_snapshot`. Also fires once each time the
     /// account's worker opens or reconnects, which ends any link in
@@ -1742,7 +1754,7 @@ impl MarmotAppRuntime {
             self.shared.lifecycle().ensure_running()?;
             let app = self.accounts.app.clone();
             blocking_app_task(move || app.warm_directory_storage()).await?;
-            crate::wiring::telemetry_origin(
+            marmot_observability::wiring::telemetry_origin(
                 self.shared.observer.product(),
                 self.shared
                     .relay_telemetry_runtime_config()
@@ -1864,7 +1876,7 @@ impl MarmotAppRuntime {
         );
         let work = async move { self.accounts.repair_full_history(account_ref).await };
         observed
-            .run_async(work, crate::observer::success_or_failure)
+            .run_async(work, marmot_observability::observer::success_or_failure)
             .await
     }
 
@@ -2492,6 +2504,48 @@ impl MarmotAppRuntime {
         self.accounts.key_package_refresh_overdue(account_ref).await
     }
 
+    /// Sign-ins of this account that this device does not recognize, the
+    /// earliest to appear first (mdk#2628 3.2). Each is a fresh, valid
+    /// KeyPackage in a slot neither this device nor its device group's roster
+    /// knows. One that `before_this_device` was signed in before this device
+    /// was; ask whether the user still has it. Any other is new; ask whether
+    /// it was them. Always empty in release builds until the roster's spec
+    /// lands. Refresh on `UnrecognizedSignInsChanged`.
+    pub async fn unrecognized_sign_ins(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
+        self.accounts.unrecognized_sign_ins(account_ref).await
+    }
+
+    /// Answer the unrecognized sign-in in `slot_id_hex`. `NotNow` keeps it
+    /// listed without a prompt; `Reject` records it as not the user's in the
+    /// device group's roster, now or once that is possible; `Dismiss` ends a
+    /// prompt another device already answered. Linking one is device
+    /// pairing's. Refusals are `DeviceGroupRefused` with `sign_in_unknown`,
+    /// `sign_in_answered`, `sign_in_answered_elsewhere`, `sign_in_unanswered`
+    /// (Dismiss before any device answered), or `roster_unsupported`.
+    pub async fn answer_sign_in(
+        &self,
+        account_ref: &str,
+        slot_id_hex: &str,
+        response: crate::SignInResponse,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .answer_sign_in(account_ref, slot_id_hex, response)
+            .await
+    }
+
+    /// Check the account's KeyPackage slots for new sign-ins now, rather than
+    /// at the next scheduled check, and return the list after it. A read that
+    /// reached no relay is `DeviceGroupRefused("key_packages_unreachable")`.
+    pub async fn check_sign_ins(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
+        self.accounts.check_sign_ins(account_ref).await
+    }
+
     /// Rename one of this account's devices, this one included, by its
     /// `slot_id_hex` from `linked_devices`: one roster commit in the device
     /// group. Any device may rename any device. The label is at most 64
@@ -2500,8 +2554,8 @@ impl MarmotAppRuntime {
     /// `label_too_long`, `no_device_group`, `unknown_device`,
     /// `roster_unavailable`, or `device_group_busy` while the device group
     /// has an earlier change in flight (retry later). A rename whose commit
-    /// loses a fork to one that also changes that device's entry is not made
-    /// again; refresh on `LinkedDevicesChanged`.
+    /// loses a fork is made again on a later maintenance pass, unless another
+    /// rename of that device won; refresh on `LinkedDevicesChanged`.
     pub async fn rename_linked_device(
         &self,
         account_ref: &str,
@@ -3119,7 +3173,7 @@ impl MarmotAppRuntime {
         let mut status = self.shared.observer.product().status();
         status.telemetry = if self.shared.observer.product().permit().is_none() {
             crate::DiagnosticsExporterStatus::Disabled
-        } else if crate::wiring::telemetry_rejected(self.shared.observer.product()) {
+        } else if marmot_observability::wiring::telemetry_rejected(self.shared.observer.product()) {
             crate::DiagnosticsExporterStatus::ConfigurationRejected
         } else if !cfg!(feature = "otlp-export") {
             crate::DiagnosticsExporterStatus::UnsupportedBuild
@@ -3157,10 +3211,12 @@ impl MarmotAppRuntime {
             let Some(executor) = self.shared.diagnostics_executor() else {
                 return;
             };
-            *worker = Some(executor.spawn(crate::wiring::delivery_worker(
-                self.shared.observer.product(),
-                self.shared.relay_plane().clone(),
-            )));
+            *worker = Some(
+                executor.spawn(marmot_observability::wiring::delivery_worker(
+                    self.shared.observer.product(),
+                    self.shared.relay_plane().clone(),
+                )),
+            );
         }
     }
 
@@ -3205,7 +3261,7 @@ impl MarmotAppRuntime {
             .and_then(|v| url::Url::parse(v).ok())
             .map(|v| v.origin().ascii_serialization())
             .unwrap_or_default();
-        crate::wiring::configure(self.shared.observer.product(), config, origin)?;
+        marmot_observability::wiring::configure(self.shared.observer.product(), config, origin)?;
         if self.shared.lifecycle().is_running() {
             self.accounts.app.restore_usage_diagnostics()?;
         }
@@ -3280,7 +3336,7 @@ impl MarmotAppRuntime {
         if self.is_stopping() {
             return;
         }
-        crate::wiring::seal_partial(self.shared.observer.product());
+        marmot_observability::wiring::seal_partial(self.shared.observer.product());
         self.shared.observer.product().flush().await;
     }
 
@@ -3346,11 +3402,11 @@ impl MarmotAppRuntime {
             resource.service_instance_id =
                 self.accounts.app.telemetry_install_id().unwrap_or_default();
         }
-        let config = crate::wiring::normalize_runtime_config(config)
+        let config = marmot_observability::wiring::normalize_runtime_config(config)
             .map_err(AppError::InvalidRelayTelemetrySettings)?;
         self.shared
             .set_relay_telemetry_runtime_config(config.clone());
-        crate::wiring::telemetry_origin(
+        marmot_observability::wiring::telemetry_origin(
             self.shared.observer.product(),
             config.otlp_endpoint.as_deref().or(self
                 .shared
@@ -3361,7 +3417,7 @@ impl MarmotAppRuntime {
         if self.shared.lifecycle().is_running() {
             self.accounts.app.restore_usage_diagnostics()?;
         }
-        crate::wiring::clear_telemetry_rejection(self.shared.observer.product());
+        marmot_observability::wiring::clear_telemetry_rejection(self.shared.observer.product());
         self.refresh_diagnostics_exporters()?;
         Ok(self.shared.relay_telemetry_runtime_config())
     }
@@ -3413,7 +3469,7 @@ impl MarmotAppRuntime {
     /// acknowledge a prepared range under the previous destination.
     pub fn set_audit_otlp_sender(
         &self,
-        sender: Option<crate::audit_otlp_sender::AuditOtlpSender>,
+        sender: Option<marmot_observability::audit_otlp_sender::AuditOtlpSender>,
     ) -> Result<(), AppError> {
         self.shared.lifecycle.ensure_running()?;
         let _mutation = self.accounts.app.audit_export_lifecycle.mutate_all();
@@ -3485,7 +3541,7 @@ impl MarmotAppRuntime {
                 .app
                 .set_local_notifications_enabled(account_ref, enabled)
         };
-        observed.run(work, crate::observer::success_or_failure)
+        observed.run(work, marmot_observability::observer::success_or_failure)
     }
 
     pub fn set_chat_muted(
@@ -3518,7 +3574,7 @@ impl MarmotAppRuntime {
             );
             Ok(settings)
         };
-        observed.run(work, crate::observer::success_or_failure)
+        observed.run(work, marmot_observability::observer::success_or_failure)
     }
 
     pub fn clear_chat_muted(
@@ -3550,7 +3606,7 @@ impl MarmotAppRuntime {
             );
             Ok(settings)
         };
-        observed.run(work, crate::observer::success_or_failure)
+        observed.run(work, marmot_observability::observer::success_or_failure)
     }
 
     pub async fn set_native_push_enabled(
@@ -3573,7 +3629,7 @@ impl MarmotAppRuntime {
                 .await
         };
         observed
-            .run_async(work, crate::observer::success_or_failure)
+            .run_async(work, marmot_observability::observer::success_or_failure)
             .await
     }
 
@@ -4260,7 +4316,7 @@ impl MarmotAppRuntime {
                 .await
         };
         observed
-            .run_async(work, crate::observer::success_or_failure)
+            .run_async(work, marmot_observability::observer::success_or_failure)
             .await
     }
 
@@ -4387,7 +4443,7 @@ impl MarmotAppRuntime {
             Ok(outcome)
         };
         observed
-            .run_async(work, crate::observer::success_or_failure)
+            .run_async(work, marmot_observability::observer::success_or_failure)
             .await
     }
 
@@ -4837,7 +4893,7 @@ impl MarmotAppRuntime {
                 .await
         };
         observed
-            .run_async(work, crate::observer::success_or_failure)
+            .run_async(work, marmot_observability::observer::success_or_failure)
             .await
     }
 
@@ -4858,7 +4914,7 @@ impl MarmotAppRuntime {
                 .await
         };
         observed
-            .run_async(work, crate::observer::success_or_failure)
+            .run_async(work, marmot_observability::observer::success_or_failure)
             .await
     }
 
@@ -5911,7 +5967,7 @@ impl MarmotAppRuntime {
             })
         };
         observed
-            .run_async(work, crate::observer::success_or_failure)
+            .run_async(work, marmot_observability::observer::success_or_failure)
             .await
     }
 
@@ -6171,9 +6227,9 @@ impl MarmotAppRuntime {
             crate::ProductUnit::Attempt,
             Some(started_at.elapsed()),
         );
-        crate::wiring::seal_partial(self.shared.observer.product());
+        marmot_observability::wiring::seal_partial(self.shared.observer.product());
         self.shared.observer.product().flush().await;
-        crate::wiring::revoke_memory(self.shared.observer.product());
+        marmot_observability::wiring::revoke_memory(self.shared.observer.product());
         self.restart_product_worker();
         tracing::debug!(
             target: "marmot_app::runtime",
@@ -6265,9 +6321,9 @@ impl MarmotAppRuntime {
             });
         }
 
-        crate::wiring::seal_partial(self.shared.observer.product());
+        marmot_observability::wiring::seal_partial(self.shared.observer.product());
         self.shared.observer.product().flush().await;
-        crate::wiring::revoke_memory(self.shared.observer.product());
+        marmot_observability::wiring::revoke_memory(self.shared.observer.product());
         self.restart_product_worker();
         let graceful_wait = self.shutdown_grace_wait();
         if timeout(graceful_wait, self.shutdown()).await.is_err() {
@@ -6953,7 +7009,7 @@ impl AccountManager {
             })
         };
         observed
-            .run_async(work, crate::observer::success_or_failure)
+            .run_async(work, marmot_observability::observer::success_or_failure)
             .await
     }
 
@@ -7938,7 +7994,7 @@ impl AccountManager {
             result
         };
         observed
-            .run_async(work, crate::observer::success_or_failure)
+            .run_async(work, marmot_observability::observer::success_or_failure)
             .await
     }
 
@@ -8147,7 +8203,7 @@ impl AccountManager {
             result
         };
         observed
-            .run_async(work, crate::observer::success_or_failure)
+            .run_async(work, marmot_observability::observer::success_or_failure)
             .await
     }
 

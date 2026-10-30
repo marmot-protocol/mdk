@@ -11,13 +11,13 @@ use tokio::task::JoinHandle;
 use super::{AuditOtlpAttemptOutcome, send_audit_otlp_once_for_app};
 use super::{RuntimeLifecycle, runtime_shutdown_requested, wait_for_runtime_shutdown};
 use crate::audit_log::{AuditOtlpTrackerResult, AuditUploadAttempt};
-use crate::audit_otlp_sender::AuditOtlpSendResult;
-use crate::audit_otlp_sender::AuditOtlpSender;
-use crate::audit_upload::{AUDIT_LOG_UPLOAD_MAX_BYTES, AuditUploadOutcome};
 use crate::{
     AppError, AuditLogFile, AuditLogTrackerConfig, AuditLogTrackerUpdateResult, MarmotApp,
 };
 use marmot_forensics::local_delivery::DeliveryStep;
+use marmot_observability::audit_otlp_sender::AuditOtlpSendResult;
+use marmot_observability::audit_otlp_sender::AuditOtlpSender;
+use marmot_observability::audit_upload::{AUDIT_LOG_UPLOAD_MAX_BYTES, AuditUploadOutcome};
 
 /// Only one follow-up batch is queued while a pass is in flight.
 const APP_RUNTIME_AUDIT_TRACKER_QUEUE: usize = 1;

@@ -137,6 +137,14 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's unrecognized sign-ins may have changed: re-read
+    /// `unrecognized_sign_ins`. Also fires once each time the account's
+    /// worker opens or reconnects. Carries no slots, and may fire with no
+    /// visible change.
+    UnrecognizedSignInsChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
     /// Linking a new device may have changed as this device shows it:
     /// re-read `device_link_snapshot`. Also fires once each time the
     /// account's worker opens or reconnects, which ends any link in
@@ -513,6 +521,13 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_id_hex,
                 account_label,
             } => Self::KeyPackageRefreshOverdueChanged {
+                account_id_hex,
+                account_label,
+            },
+            MarmotAppEvent::UnrecognizedSignInsChanged {
+                account_id_hex,
+                account_label,
+            } => Self::UnrecognizedSignInsChanged {
                 account_id_hex,
                 account_label,
             },

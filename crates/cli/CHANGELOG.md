@@ -78,13 +78,15 @@ versioning through the workspace version in the root `Cargo.toml`.
   say. Malformed input and client tags never raise one. Rejecting a sign-in records its slot as rejected in the device
   group's roster in one commit, or keeps it on the device until it has a device group; a device that later creates one
   founds the roster with it. Each device keeps its rejections until the roster holds the slot as a device, a link the
-  user confirmed, and commits one again whenever the roster has no entry for the slot; it never replaces an entry. A
-  rejection names the slot alone, never its KeyPackage, which may be a copy of a real device's, and a rejected
+  user confirmed, and commits one again whenever the roster has no entry for the slot; it never replaces an entry. The
+  runtime writes them (`AccountDeviceRuntime::reject_device_slots`) behind the gate its other roster updates wait
+  behind. A rejection names the slot alone, never its KeyPackage, which may be a copy of a real device's, and a rejected
   KeyPackage never makes another slot rejected. A sign-in another device answered keeps its prompt, saying so, until
   dismissed, and is listed again if the roster loses that answer; one whose slot a complete check finds empty stays
   listed as no longer signed in. A publication that is only stale never signs a slot out, and a check of fallback
-  relays, when the account lists none, is never complete. Hosts can't reach it yet, and only test-policy builds run
-  it.
+  relays, when the account lists none, is never complete. Hosts list sign-ins with `unrecognized_sign_ins`, answer one
+  with `answer_sign_in`, and check now with `check_sign_ins`, in `marmot-app`, UniFFI and C, and re-read on the
+  `UnrecognizedSignInsChanged` event. Only test-policy builds run any of it.
 - Hosts can link a new device of the account through pairing (mdk#2628 item 3.3b): `start_device_link`,
   `confirm_device_link_match` and `cancel_device_link` on the new device, `link_device` and `decline_device_link` on a
   device already signed in, and `device_link_snapshot`, in `marmot-app`, UniFFI and C, with a `DeviceLinkChanged`
@@ -240,6 +242,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 - SQLite `delete_group` now joins a caller's transaction instead of failing inside one. A current-profile group
   creation that failed after writing its MLS state used to leave that state behind, because its cleanup ran
   `delete_group` inside a transaction and only logged the failure; the group id stayed taken.
+- A device whose link failed can link again into the same device group (mdk#2628 item 3.3b). It forgets its removed
+  copy, and the engine refused the next link's Welcome into a forgotten group unless the existing device's clock dated
+  it after the forget. A Welcome a device link waits for is now held to that link alone: the existing device's leaf key
+  and the confirmed `KeyPackageRef`. A new device no longer starts a link by a KeyPackage it already joined by; it
+  waits for the replacement's publication. Only test-policy builds reach device groups.
 - `groups management` and the TUI group detail screen offer no member actions on a device that was removed while another
   device of its account stays in the group (mdk#2628). Both used to read that account's roster entry as this device, so
   the TUI could mark it "(you)" and refuse to leave as the group's only admin.

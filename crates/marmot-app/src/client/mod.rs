@@ -36,7 +36,6 @@ use storage_sqlite::{PreparedGroupImageUploadRecord, PreparedGroupImageUploadSta
 use transport_nostr_peeler::MarmotNostrSigner;
 use zeroize::Zeroizing;
 
-use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{
     GroupConfirmationProjection, accept_disposition_from_effects, add_group,
     fail_if_publish_failed, publish_failure_error, send_summary_from_effects,
@@ -63,8 +62,10 @@ use crate::{
     AppTransportRouting, CanonicalCreatedGroup, GroupInviteDeclineResult, MarmotApp,
     MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
-    SelfMembership, SendSummary, observer::PerformanceRecorder, unix_now_seconds,
+    SelfMembership, SendSummary, unix_now_seconds,
 };
+use marmot_observability::app_telemetry::AppPerformanceOperation;
+use marmot_observability::observer::PerformanceRecorder;
 
 mod audit;
 mod audit_recovery;
@@ -803,6 +804,11 @@ pub struct AppClient {
     /// When this device next checks its account's KeyPackages for new
     /// sign-ins (mdk#2628 3.2).
     pub(crate) sign_in_schedule: sign_ins::SignInSchedule,
+    /// The unrecognized sign-ins may have changed since hosts last heard: a
+    /// check that found something new, an answer, a roster change, or an
+    /// open. The same seams as `linked_devices_changed` drain it into one
+    /// `UnrecognizedSignInsChanged`.
+    pub(crate) unrecognized_sign_ins_changed: bool,
     /// Linking a new device may have changed as hosts would read it, or the
     /// client just opened, ending any link in progress. The same seams drain
     /// it into one `DeviceLinkChanged`.
@@ -1350,7 +1356,10 @@ impl AppClient {
             self.publish_key_package_from_lifecycle().await
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -1445,7 +1454,7 @@ impl AppClient {
         if !self
             .maintenance_observation_generation
             .as_ref()
-            .is_some_and(crate::observer::permit_valid)
+            .is_some_and(marmot_observability::observer::permit_valid)
         {
             previous = Default::default();
         }
@@ -1458,7 +1467,7 @@ impl AppClient {
                 "self_update",
                 crate::ProductUnit::Attempt,
             )
-            .map(crate::observer::ProductOperation::counts_only);
+            .map(marmot_observability::observer::ProductOperation::counts_only);
         let key_package_observation = self
             .app
             .product_analytics
@@ -1467,7 +1476,7 @@ impl AppClient {
                 "key_package",
                 crate::ProductUnit::Attempt,
             )
-            .map(crate::observer::ProductOperation::counts_only);
+            .map(marmot_observability::observer::ProductOperation::counts_only);
         let sweep = self.app.product_analytics.begin(
             crate::ProductFamily::Maintenance,
             "sweep",
@@ -1475,6 +1484,7 @@ impl AppClient {
         );
         self.drive_sign_ins().await;
         self.drive_device_removals().await;
+        self.device_rename_upkeep().await;
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;
@@ -1563,13 +1573,13 @@ impl AppClient {
                 "retire",
                 crate::ProductUnit::Transition,
             )
-            .map(crate::observer::ProductOperation::counts_only)
+            .map(marmot_observability::observer::ProductOperation::counts_only)
         {
             // Use the sweep's generation, not a grant made while it was awaiting I/O.
             if self
                 .maintenance_observation_generation
                 .as_ref()
-                .is_some_and(crate::observer::permit_valid)
+                .is_some_and(marmot_observability::observer::permit_valid)
             {
                 observation.count(
                     "success",
@@ -1925,7 +1935,10 @@ impl AppClient {
             self.publish_fresh_key_package_announced().await
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -2807,7 +2820,7 @@ impl AppClient {
     /// `AccountGroupReadSnapshot`, mdk#1161).
     pub(crate) fn group_read_snapshot_with_stage_telemetry(
         &self,
-        telemetry: &crate::observer::PerformanceRecorder,
+        telemetry: &marmot_observability::observer::PerformanceRecorder,
     ) -> Result<GroupReadSnapshot, AppError> {
         self.group_read_snapshot_inner(Some(telemetry))
     }
@@ -2818,7 +2831,7 @@ impl AppClient {
 
     fn group_read_snapshot_inner(
         &self,
-        telemetry: Option<&crate::observer::PerformanceRecorder>,
+        telemetry: Option<&marmot_observability::observer::PerformanceRecorder>,
     ) -> Result<GroupReadSnapshot, AppError> {
         if cfg!(feature = "test-policy-overrides")
             && self.app.config.dev_force_group_read_snapshot_failure
@@ -2835,7 +2848,7 @@ impl AppClient {
         let profiles = self.app.profiles_by_id();
         if let Some(telemetry) = telemetry {
             telemetry.record(
-                crate::app_telemetry::AppPerformanceOperation::AccountProfileLoad,
+                marmot_observability::app_telemetry::AppPerformanceOperation::AccountProfileLoad,
                 profile_load_started.elapsed(),
                 profiles.is_ok(),
             );
@@ -2901,7 +2914,7 @@ impl AppClient {
         let work = || -> Result<bool, AppError> {
             Ok(self.runtime.retry_hydrate_quarantined_group(group_id)?)
         };
-        observed.run(work, crate::observer::success_or_failure)
+        observed.run(work, marmot_observability::observer::success_or_failure)
     }
 
     pub fn safe_export_secret(
@@ -3295,7 +3308,10 @@ impl AppClient {
             Ok(send_summary_from_effects(&effects))
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -3316,7 +3332,10 @@ impl AppClient {
                 .await
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -3469,7 +3488,10 @@ impl AppClient {
                 .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -3663,7 +3685,10 @@ impl AppClient {
             Ok(was_live || result)
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -3984,7 +4009,10 @@ impl AppClient {
             Ok(GroupInviteDeclineResult { group, summary })
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -4014,7 +4042,10 @@ impl AppClient {
                 .await
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -4045,7 +4076,10 @@ impl AppClient {
                 .await
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -4076,7 +4110,10 @@ impl AppClient {
             .await
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -4227,7 +4264,10 @@ impl AppClient {
             Ok(send_summary_from_effects(&effects))
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -4948,7 +4988,9 @@ impl AppClient {
         };
         observed
             .run_async(Box::pin(work), |result| {
-                crate::observer::send_outcome(result, |(_, summary)| summary.accept_disposition)
+                marmot_observability::observer::send_outcome(result, |(_, summary)| {
+                    summary.accept_disposition
+                })
             })
             .await
     }
@@ -5834,7 +5876,10 @@ impl AppClient {
             Ok(summary)
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -6092,7 +6137,10 @@ impl AppClient {
                 .await
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -6180,7 +6228,10 @@ impl AppClient {
             Ok(send_summary_from_effects(&effects))
         };
         observed
-            .run_async(Box::pin(work), crate::observer::success_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::success_or_failure,
+            )
             .await
     }
 
@@ -6476,7 +6527,7 @@ impl AppClient {
             }
             Ok(group)
         };
-        observed.run(work, crate::observer::success_or_failure)
+        observed.run(work, marmot_observability::observer::success_or_failure)
     }
 
     fn set_group_invite_confirmation(
@@ -6980,11 +7031,13 @@ impl AppClient {
         effects: &marmot_session::AccountDeviceEffects,
     ) {
         for report in &effects.superseded_intents {
-            // A roster update this device made may have carried a sign-in
-            // rejection (mdk#2628 3.2).
+            // A roster update this device made lost to another branch, whose
+            // roster the devices and sign-ins now read; the update may have
+            // carried a sign-in rejection (mdk#2628 3.2).
             if report.kind == cgka_traits::engine::SupersededIntentKind::AppComponents
                 && self.is_device_group(&report.group_id).unwrap_or(true)
             {
+                self.note_device_roster_changed();
                 self.recheck_sign_in_rejections();
             }
             if !self.host_may_see_group(&report.group_id) {
@@ -7136,7 +7189,7 @@ impl AppClient {
                 "publish",
                 crate::ProductUnit::Transition,
             )
-            .map(crate::observer::ProductOperation::counts_only);
+            .map(marmot_observability::observer::ProductOperation::counts_only);
         if storage.take_pending_welcome_delivery(message_id_hex)?
             && let Some(observation) = observation
         {
@@ -7543,7 +7596,10 @@ impl AppClient {
             Ok(send_summary_from_effects(&effects))
         };
         observed
-            .run_async(Box::pin(work), crate::observer::confirmed_or_failure)
+            .run_async(
+                Box::pin(work),
+                marmot_observability::observer::confirmed_or_failure,
+            )
             .await
     }
 }

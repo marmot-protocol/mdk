@@ -8,12 +8,12 @@ use cgka_traits::TransportAdapterError;
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageError;
 
-use crate::app_telemetry::AppPerformanceOperation;
-use crate::observer::PerformanceRecorder;
 use crate::{
     AccountCatchUpFailure, AppError, ClassifiedSyncFailure, SyncErrorClass,
     SyncFailureClassification, SyncFailureStage, SyncSummary,
 };
+use marmot_observability::app_telemetry::AppPerformanceOperation;
+use marmot_observability::observer::PerformanceRecorder;
 
 mod runtime;
 
