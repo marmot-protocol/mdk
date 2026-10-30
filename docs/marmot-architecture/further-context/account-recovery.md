@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-10-28
+updated: 2026-10-30
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -523,7 +523,7 @@ in `marmot-app` fills it from facts the owner already has:
 | --- | --- |
 | A live REQ's endpoint admitted and placed its whole original window, and counted the stored events its relay sent before EOSE | Live boundary on every route the filter carries, from the second after the oldest event counted (never before the REQ's `since`) through the second before the REQ went out (below); a count with no event proves nothing. Written once per generation, while it is healthy (input placed, no loss or spill hand-off pending). A generation that loss may have reached proves nothing. Released seconds stay out (below). The time since the request is a provisional tail, never written (below) |
 | A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route, less every range un-covered after the grant was selected |
-| A loss import charged a generation, including a notification lag that charges no count, or a legacy clear restored one | In the import's own transaction, a generation whose every charge named its routes un-covers only those routes, each from its own bound, and widens their goals: for queue loss, every dropped delivery the relay plane placed on a route, from the earliest `created_at` dropped there; for a notification lag on the account's own SDK context, every REQ it issued with a floor and known routes, from the lowest `since` among the REQs that select the route. Any other generation un-covers every route the ledger holds from its floor up (all of it when a floor is unknown) and widens their goals to it; the recorder then widens the other current routes' goals. A generation that touches more than 256 routes, or that a worker observed past its durable count, counts as one that named none. After a restart the relay plane counts new drops under a fresh token, so new loss always raises a count |
+| A loss import charged a generation, including a notification lag that charges no count, or a legacy clear restored one | In the import's own transaction, a generation whose every charge named its routes un-covers only those routes, each from its own bound, and widens their goals: for queue loss, every dropped delivery the relay plane placed on a route, from the earliest `created_at` dropped there; for a notification lag on the account's own SDK context, every REQ it issued with a floor and known routes, from the lowest `since` among the REQs that select the route. Any other generation un-covers every route the ledger holds from its floor up (all of it when a floor is unknown) and widens their goals to it; the recorder then widens the other current routes' goals. A generation that touches more than 256 routes counts as one that named none. A worker that observes a generation past its durable count passes the relay plane's routes for it, merged as a marker write's are; if the plane holds none, the generation names none. After a restart the relay plane counts new drops under a fresh token, so new loss always raises a count |
 | A receipt was released for replay | In the release's transaction, its event's second is un-covered on each route its inventory row placed it on, and that route's goal widens to it. A second below the retained window is owed nowhere, so that release changes nothing in the ledger: its coverage stays until pruning drops it. The REQ that delivered the event will not deliver it again, so only a comparison on a relay covers that second there again; live boundaries never cover it, until retention pruning passes it. A release with no inventory row changes nothing here; the epoch gap it arms keeps that debt |
 | A pending queue or notification loss | Each scope's route goal widens to the scope's floor, restoring a goal the best-effort write lost |
 | A startup incremental history request | Every current route's goal widens to its standing floor: the retained window's floor, or for a group route whose copy has a Welcome time, that time less the 15-minute allowance when it is later |
@@ -752,7 +752,11 @@ stages each proven slice with its coverage through that mark, and applies the ou
 above. Progress is newly covered seconds on the unit's own relay, so live traffic, other routes
 and reconnects reset nothing. Every event byte a required relay sends counts toward the
 account's rolling-hour budget, including replies a budget cut short and replies a halving
-discards. The one exception is the reply still in flight when a quantum is cut (mdk#2719).
+discards. A quantum cut by its deadline, shutdown or a pass's budget interrupts its request in
+flight instead of dropping it: the relay cancels the request, which still reports the bytes it
+read, and is dropped only if it has not ended within a 1 s grace. So the reply being read when
+the quantum was cut counts too, and a pass or shutdown can run up to that grace past its
+deadline.
 
 Debt subtracts the healthy live tails. They are a process-local query that every debt turn
 asks again and nothing keeps across an await, since a tail can lapse with no event when its

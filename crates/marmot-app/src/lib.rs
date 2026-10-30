@@ -230,6 +230,10 @@ pub use client::AppClient;
 #[doc(hidden)]
 pub use client::device_group::ConfirmedDeviceLink;
 pub use client::device_group::{LinkedDevice, LinkedDeviceStatus};
+pub use client::device_pairing::{
+    DeviceLinkChoices, DeviceLinkEmoji, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPrompt,
+    DeviceLinkPromptState, DeviceLinkSnapshot, NewDeviceLinkState,
+};
 pub use client::sign_ins::{SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
 pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
@@ -1398,6 +1402,10 @@ struct OpenAppAccount {
     /// promotion. Declared before the session guard, like the runtime.
     engine_storage: SqliteAccountStorage,
     audit_v5_peel_slot: Arc<Mutex<client::audit_v5_probe::PeelSlot>>,
+    /// Where the Welcome peeler puts the pairing messages it opens; `None`
+    /// unless device groups are on.
+    #[cfg(feature = "unreleased-device-pairing")]
+    pairing_inbox: Option<client::device_pairing::PairingInbox>,
     session_guard: AppAccountSessionGuard,
     adapter: MarmotRelayPlaneAccountAdapter,
     routing: AppTransportRouting,
@@ -2070,6 +2078,7 @@ impl MarmotApp {
             key_package_refresh_overdue_changed: true,
             sign_in_schedule: Default::default(),
             unrecognized_sign_ins_changed: true,
+            device_link_changed: true,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
@@ -2143,6 +2152,10 @@ impl MarmotApp {
             post_join_history_sessions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
+            #[cfg(feature = "unreleased-device-pairing")]
+            device_pairing: Box::new(client::device_pairing::DevicePairing::new(
+                open.pairing_inbox,
+            )),
         };
         // Loss the open imported, and the startup history request, become
         // audit rows once the client that records them exists.
@@ -2171,6 +2184,11 @@ impl MarmotApp {
         // it repairs a crash-lost branch-selection announcement on every open,
         // deferred ones included.
         client.reconcile_branch_selection_withdrawals();
+        // Same rule again: it reads stored links, and withdrawal reads no group
+        // state. A failed or expired device link's Welcome is withdrawn before
+        // the client exists for anything to publish it: startup recovery, a
+        // maintenance pass, or a stored fanout's retry (mdk#2628 D40).
+        client.withdraw_expired_link_welcomes();
         if !defer_group_hydration {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
@@ -4903,11 +4921,22 @@ impl MarmotApp {
             .unwrap_or_else(|| Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default())));
         #[cfg(not(test))]
         let audit_v5_peel_slot = Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default()));
+        #[cfg(feature = "unreleased-device-pairing")]
+        let pairing_inbox = if self.device_groups_enabled() {
+            Some(client::device_pairing::PairingInbox::new(
+                PublicKey::from_hex(&account.account_id_hex)
+                    .map_err(|_| AppError::InvalidPublicKey)?,
+            ))
+        } else {
+            None
+        };
         let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> =
             Box::new(client::audit_v5_probe::ProbePeeler {
                 inner: peeler,
                 slot: audit_v5_peel_slot.clone(),
                 storage: self.account_storage(label)?.app_storage(),
+                #[cfg(feature = "unreleased-device-pairing")]
+                pairing: pairing_inbox.clone(),
             });
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
         // The engine gets its own connection to `session.sqlite`, which no
@@ -5076,6 +5105,8 @@ impl MarmotApp {
             runtime,
             engine_storage,
             audit_v5_peel_slot,
+            #[cfg(feature = "unreleased-device-pairing")]
+            pairing_inbox,
             session_guard,
             adapter,
             routing,
@@ -7825,6 +7856,19 @@ impl MarmotApp {
     /// the roster's spec merges (mdk#2628 item 3.1).
     pub(crate) fn device_groups_enabled(&self) -> bool {
         cfg!(feature = "test-policy-overrides") && self.config.dev_device_groups
+    }
+
+    /// The convergence settlement window the engine runs under, in
+    /// milliseconds: the pinned v1 window, or a test-policy build's
+    /// override, read as `open_account` reads it (mdk#970).
+    pub(crate) fn settlement_quiescence_ms(&self) -> u64 {
+        if cfg!(feature = "test-policy-overrides") {
+            self.config
+                .dev_settlement_quiescence_ms
+                .unwrap_or(marmot_session::V1_SETTLEMENT_QUIESCENCE_MS)
+        } else {
+            marmot_session::V1_SETTLEMENT_QUIESCENCE_MS
+        }
     }
 
     fn key_package_metadata_matches_current_support(

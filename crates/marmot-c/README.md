@@ -469,6 +469,18 @@ its `slot_id_hex` handle, `client` (empty when none), `appeared_at`, `last_seen_
 `MARMOT_STATUS_INVALID_ARGUMENT`. The list is empty in every release build until the roster's spec lands. Re-read it on
 `MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED`. See the [shared contract](../marmot-uniffi/README.md#unrecognized-sign-ins).
 
+## Linking a new device
+
+`marmot_start_device_link`, `marmot_confirm_device_link_match` and `marmot_cancel_device_link` (on the new device),
+`marmot_link_device` and `marmot_decline_device_link` (on a device already signed in) and
+`marmot_device_link_snapshot` each block on the account worker and write an owned `MarmotDeviceLinkSnapshot`; free it
+with `marmot_device_link_snapshot_free`. `new_device` is NULL unless this device asked to be linked. Both
+`MarmotNewDeviceLinkState` and each prompt's `MarmotDeviceLinkPromptState` are tagged unions: `Comparing` carries
+`code`/`code_len` emoji with screen-reader descriptions, `CannotLink` carries `missing`/`missing_len`, and
+`AddedElsewhere` carries both labels. `marmot_link_device` takes the label and two `uint8_t` setting flags. Every call
+is refused in release builds until the pairing and device-group specs land. Re-read on
+`MARMOT_EVENT_DEVICE_LINK_CHANGED`. See the [shared contract](../marmot-uniffi/README.md#linking-a-new-device).
+
 ## History may be incomplete notices
 
 `marmot_history_notices` blocks on the account worker, reads local durable state only, and writes an owned

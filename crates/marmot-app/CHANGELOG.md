@@ -65,6 +65,20 @@
   Reject or Dismiss), and `check_sign_ins` checks now instead of at the next
   scheduled check. `UnrecognizedSignInsChanged` says to re-read the list. All
   are empty and silent in release builds until the roster's spec lands.
+- Device pairing links a new device of the account through the account runtime (mdk#2628 item 3.3b), behind the
+  unreleased `unreleased-device-pairing` feature and `dev_device_groups`. The new device starts a link naming its
+  published KeyPackage (`MarmotAppRuntime::start_device_link`), both devices show the same seven emoji with their
+  descriptions, and its user confirms (`confirm_device_link_match`) or cancels (`cancel_device_link`). A device
+  already signed in shows a prompt once it found and checked that KeyPackage; its user chooses Link device with a
+  label and two settings, both on by default (`link_device`), or Not now (`decline_device_link`).
+  `device_link_snapshot` reads both sides as `DeviceLinkSnapshot`. A first link creates the device group; a later one
+  adds the device in one commit, retried while the device group settles until the new device stops waiting. The
+  prompt shows the device linked only once its first change in the device group arrives, which the new device makes
+  as soon as it joins; one that makes none within an hour is removed again, and both sides show `LinkFailed`. The
+  prompt says why a client can't be linked, refuses a 21st device, and on other
+  devices changes to who added it. `MarmotAppEvent::DeviceLinkChanged` says to re-read linking; it also fires once
+  each time the account's worker opens or reconnects, which ends any link in progress. Nothing reaches a release
+  build.
 - An admin can turn on `marmot.group.account-devices.v1` in an existing group
   (mdk#2628). `AppClient::enable_account_devices` and
   `MarmotAppRuntime::enable_account_devices` send one admin Commit, only when

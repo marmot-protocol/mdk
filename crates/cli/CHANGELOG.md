@@ -12,10 +12,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 ### Added
 
 - A new `marmot-pairing` crate implements device pairing's code exchange (mdk#2628): Matrix's `m.sas.v1`
-  verification in Marmot encodings, with seven emoji or three numbers to compare, a commitment to the new device's
-  key, and confirmations that cover the new device's exact `KeyPackageRef`, the device group's id, and the MLS
-  signature key of the existing device's leaf in it, the only sender whose Welcome the new device accepts. It ends in
-  a verified link and does no I/O. `transport-nostr-adapter` gift-wraps its messages to the account's own key behind
+  verification in Marmot encodings, with seven emoji to compare, a commitment to the new device's key, and
+  confirmations that cover the new device's exact `KeyPackageRef`, the device group's id, and the MLS signature key of
+  the existing device's leaf in it, the only sender whose Welcome the new device accepts. It ends in a verified link
+  and does no I/O. `transport-nostr-adapter` gift-wraps its messages to the account's own key behind
   the `unreleased-device-pairing` feature. Nothing enables that feature, so no release sends pairing messages until
   the pairing spec merges.
 - `wn-agent doctor` checks a standalone connector setup without changing anything (mdk#2570). It prints one line per
@@ -87,6 +87,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   relays, when the account lists none, is never complete. Hosts list sign-ins with `unrecognized_sign_ins`, answer one
   with `answer_sign_in`, and check now with `check_sign_ins`, in `marmot-app`, UniFFI and C, and re-read on the
   `UnrecognizedSignInsChanged` event. Only test-policy builds run any of it.
+- Hosts can link a new device of the account through pairing (mdk#2628 item 3.3b): `start_device_link`,
+  `confirm_device_link_match` and `cancel_device_link` on the new device, `link_device` and `decline_device_link` on a
+  device already signed in, and `device_link_snapshot`, in `marmot-app`, UniFFI and C, with a `DeviceLinkChanged`
+  event to re-read it. A link shows as made only once the new device's first change in the device group arrives; one
+  with none within an hour is removed again. Every call is refused in release builds until the pairing and
+  device-group specs land.
 - `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
   one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
   pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster
@@ -103,6 +109,18 @@ versioning through the workspace version in the root `Cargo.toml`.
   retired with `QueuedIntentRefused`. A lost edit is re-issued when the winner left that entry alone, even if it
   changed others. The device roster's write path uses it, so an entry read before a sibling's change never
   overwrites it.
+- `SendIntent::UnlinkDevice` removes a device whose link failed, with its roster entry, in one admin Commit
+  (mdk#2628 item 3.3b): the new device made no commit in the device group by the link's deadline. It takes the
+  device's leaf signature key and a roster update that removes exactly one listed slot, adds no member and makes no
+  Welcome. It removes the leaf only if the group's tree still has it, and the roster entry either way. Like a link,
+  it is never queued: while the device group is settling it is refused with `EngineError::LinkDeviceUnsettled`, and
+  the caller retries. It is reachable only in test-policy builds.
+- A retained outbound Welcome now keeps the `KeyPackageRef` of the KeyPackage it answers, staged, owed and after
+  withdrawal (mdk#2628 item 3.3b). `Engine::sent_welcomes_for_key_package`, forwarded as the runtime's
+  `welcomes_for_key_package`, finds a group's Welcomes by it, so a device link that failed can withdraw its Welcome
+  even when a crash lost the Welcome's id. `StoredMessagePayload::OutboundWelcome` becomes a struct variant carrying
+  `key_package_ref`, as `StagedInviteWelcome` now also does; two new stored-payload variants hold it, a Welcome
+  stored without one keeps its original bytes, and legacy JSON rows still decode.
 - The engine can create a group under a group id the host chose before the group exists
   (`create_group_with_chosen_id_and_audit_context`), as a device link needs (mdk#2628). The id has 1 to 255 bytes.
   An id that names any group this device holds, a removed or forgotten copy included, is refused before anything is

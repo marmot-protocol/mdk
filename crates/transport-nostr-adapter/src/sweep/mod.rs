@@ -256,13 +256,27 @@ pub trait SweepRelay: Send + Sync {
     async fn fetch_second(&self, route: SweepRoute, second: u64, cap: Option<u32>) -> SecondReply;
 
     /// Event JSON bytes the relay sent since the last call, whether a reply
-    /// kept them or not: duplicates, a reply a budget cut short and the chunks
-    /// of a second that failed included. Zero for a relay that does not meter
-    /// what it reads; a caller budgeting bytes then counts the events it gets.
+    /// kept them or not: duplicates, a reply a budget cut short, the chunks
+    /// of a second that failed and an interrupted request included. Zero for
+    /// a relay that does not meter what it reads; a caller budgeting bytes
+    /// then counts the events it gets.
     fn take_fetched_bytes(&self) -> u64 {
         0
     }
+
+    /// End the request in flight early, and every later one at once, so it
+    /// returns and meters what it read instead of being dropped. `true` when
+    /// the relay can: a sweep cut by its deadline or cancellation then waits
+    /// up to [`INTERRUPT_GRACE`] for the request before dropping it. The
+    /// default, `false`, has the request dropped at once.
+    fn interrupt(&self) -> bool {
+        false
+    }
 }
+
+/// How long a cut request whose relay can end it ([`SweepRelay::interrupt`])
+/// has to return before it is dropped anyway.
+pub const INTERRUPT_GRACE: Duration = Duration::from_secs(1);
 
 /// How a covered slice was proven complete.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -476,10 +490,34 @@ impl SweepReport {
     }
 }
 
-/// Why a wait stopped early.
-enum Interrupt {
+/// Why a wait or a request stopped early.
+pub(crate) enum Interrupt {
     Cancelled,
     Deadline,
+}
+
+/// Run one relay request under a call's cancellation and deadline. A request
+/// either cuts is interrupted rather than dropped when its relay can end it
+/// (`interrupt` returns `true`): it then has [`INTERRUPT_GRACE`] to return,
+/// so the relay meters the reply it was reading, and is dropped after that,
+/// which closes its REQ. A cut request's reply is never used.
+pub(crate) async fn ask_until_cut<T>(
+    request: impl Future<Output = T>,
+    cancel: &CancellationToken,
+    deadline: Option<Instant>,
+    interrupt: impl FnOnce() -> bool,
+) -> Result<T, Interrupt> {
+    let mut request = std::pin::pin!(request);
+    let cut = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Interrupt::Cancelled,
+        () = sleep_until_deadline(deadline) => Interrupt::Deadline,
+        reply = &mut request => return Ok(reply),
+    };
+    if interrupt() {
+        let _ = tokio::time::timeout(INTERRUPT_GRACE, request).await;
+    }
+    Err(cut)
 }
 
 impl From<Interrupt> for SweepEnd {
@@ -850,7 +888,7 @@ where
     }
 
     /// Pace, then run one relay request under the call's cancellation and
-    /// deadline. A request cut by either is dropped, which closes its REQ.
+    /// deadline ([`ask_until_cut`]).
     async fn ask<T>(&mut self, request: impl Future<Output = T>) -> Result<T, Interrupt> {
         if let Some(last) = self.last_request {
             self.wait_until(last + self.request.policy.min_request_interval)
@@ -858,13 +896,11 @@ where
         }
         self.last_request = Some(Instant::now());
         self.stats.requests += 1;
-        let deadline = self.request.deadline;
-        tokio::select! {
-            biased;
-            () = self.cancel.cancelled() => Err(Interrupt::Cancelled),
-            () = sleep_until_deadline(deadline) => Err(Interrupt::Deadline),
-            reply = request => Ok(reply),
-        }
+        let relay = self.relay;
+        ask_until_cut(request, self.cancel, self.request.deadline, || {
+            relay.interrupt()
+        })
+        .await
     }
 
     async fn wait_until(&self, at: Instant) -> Result<(), Interrupt> {

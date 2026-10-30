@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-10-28
+updated: 2026-10-30
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -158,6 +158,7 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
+| `AppClient.device_link_changed` | One flag | Set at open and when a pairing drive changes linking as hosts read it; cleared at the same seams, which announce `DeviceLinkChanged`; dropped with the client, whose replacement opens with it set. |
 | `AppClient.linked_devices_changed` | One flag | Set at open and by a hidden device-group event or a change of device-group trust; cleared at the next account-level or applied-summary publication seam, which announces `LinkedDevicesChanged`; dropped with the client, whose replacement opens with it set. |
 | `AppClient.key_package_refresh_overdue` and `key_package_refresh_overdue_changed` | One `Option<bool>` and one flag | The answer is replaced after each maintenance pass; a change sets the flag, which the next account-level or applied-summary publication seam clears by announcing `KeyPackageRefreshOverdueChanged`. Both are dropped with the client, whose replacement opens with the flag set. |
 | `AppClient.unrecognized_sign_ins_changed` | One flag | Set at open, by a sign-in check or answer that changed what hosts see, and with every roster change that sets `linked_devices_changed`; cleared at the same seams, which announce `UnrecognizedSignInsChanged`; dropped with the client, whose replacement opens with it set. |
@@ -168,6 +169,22 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 | Avatar identity demand | 2,048 explicit registrations; 64 inspected per batch after directory version changes | Eviction removes registration; group deletion/account cache clear removes demand. Placeholder registrations remain eligible for later profile updates. No historical-roster crawl. |
 | Avatar upgrade ledger | At most one key per chat present at migration 0078 | Consumed in transactions of at most 64 rows; never recreated on restart. |
 | `app_prepared_group_image_upload` SQLCipher rows | 16 active staged/uploaded/failed artifacts and 128 consumed idempotency markers per account | Active artifacts expire after 7 days and consumed markers after 30 days; staging prunes expired rows, consumption evicts the oldest marker at the cap, and consumed rows erase their retained ciphertext/upload-secret copies. The founding MLS component remains authoritative after consumption. |
+
+### `marmot-app` device pairing (`src/client/device_pairing/live.rs`)
+
+Built only with `unreleased-device-pairing`, and empty unless `dev_device_groups` is on. Pairing keeps its secrets
+only in memory, so every structure here is dropped with the client, ending any link in progress.
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `PairingInbox` | 64 pairing messages (`INBOX_CAPACITY`) | Drained at each drive; the oldest is dropped at the cap. |
+| `ExistingDevicePairing` sessions (`marmot-pairing`) | 32 tracked requests (`MAX_TRACKED_REQUESTS`); owed cancels capped at the same | A session is kept until its request's 10-minute TTL ends, and expired at each drive. A request past the cap is not tracked, but still counts as competing. |
+| `DevicePairing.prompts` | One per tracked request: at most 32 live, plus ended ones | An ended prompt goes 10 minutes after its last change; one never ended ends 20 minutes after its request. Not now removes it at once. An approval retries while the device group is unsettled, until `LINK_RETRY_SECS` after the new device sent its confirmation, then ends as `LinkFailed`. A committed link's prompt stays until `decide_device_links` decides the link: linked once the new device's first commit arrives, or `LinkFailed` `LINK_DEADLINE_SECS` (an hour) after it was linked. A restart drops it; the link is decided without it. |
+| `DevicePairing.new_device` | One link | Replaced by the next start. A wait that ended keeps its link until the engine's expectation is withdrawn, retried each drive. |
+| `DevicePairing.outbox` | The messages owed to live sessions | Each goes once a relay accepts it, or 10 minutes after it was stamped. |
+| `DevicePairing.quiet_since` | One `Instant` per pending link in `device_links` | Removed when its link is decided, when its device group stops being quiet or its roster lists the link, and when the link is no longer pending. |
+| `DevicePairing.removed_after_join` | One flag | Set when this device is removed from a device group it joined before its first commit there landed; cleared by the next start, and dropped with the client. |
+| `DevicePairing.last_view` | One `DeviceLinkSnapshot` of the link and prompts above | Replaced at the end of a drive whose view differs, which raises `DeviceLinkChanged`. |
 
 ### `storage-sqlite` attachment acquisition (`src/attachment_acquisition.rs`)
 

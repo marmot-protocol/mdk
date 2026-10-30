@@ -37,13 +37,14 @@
 //!   through the runtime's rejected-slot write (`reject_device_slots`). The
 //!   app keeps no roster write of its own.
 //!
-//! A confirmed link comes from device pairing. Until pairing reaches the app,
-//! only the test-policy hook supplies one.
+//! A confirmed link comes from device pairing (`device_pairing`). The
+//! test-policy hooks still supply one directly, for tests.
 
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
-    DeviceRosterV1, DeviceSlotId, DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID,
-    decode_device_roster_v1, encode_device_roster_v1, encode_nostr_routing_v1,
+    DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1, DeviceSettingsV1, DeviceSlotId,
+    DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID, decode_device_roster_v1,
+    encode_device_roster_update_v1, encode_device_roster_v1, encode_nostr_routing_v1,
 };
 use cgka_traits::engine::CreateGroupRequest;
 use cgka_traits::storage::{
@@ -56,11 +57,12 @@ use rand::RngCore as _;
 use rand::rngs::OsRng;
 use storage_sqlite::{DeviceGroupRecord, DeviceGroupTrust};
 
+use super::device_pairing::DeviceLinkChoices;
 use super::{AppClient, UnpublishedWelcomeDelivery, UnpublishedWelcomeKind, group_is_terminal};
 use crate::{AppError, unix_now_seconds};
 
 /// A link both devices confirmed, as device pairing produces it.
-#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+#[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfirmedDeviceLink {
     /// The new device's published KeyPackage event.
@@ -81,6 +83,13 @@ pub struct ConfirmedDeviceLink {
 /// confirmed link, in seconds: the pairing session's lifetime (D27). The
 /// engine joins no Welcome under the link after it.
 pub(crate) const WELCOME_WAIT_SECS: u64 = 600;
+
+/// How long, in seconds after its roster entry's `linked_at`, a device this
+/// device linked has to make its first commit in the device group before the
+/// link fails and this device removes it (D40). It outlasts the new
+/// device's Welcome wait, the epoch-gap holds and a short suspend.
+pub(crate) const LINK_DEADLINE_SECS: u64 = 3_600;
+const _: () = assert!(LINK_DEADLINE_SECS > WELCOME_WAIT_SECS);
 
 /// One of this account's devices, as the roster of the device group this
 /// device trusts lists it. Every entry is this account's own device: the
@@ -146,7 +155,7 @@ impl AppClient {
     /// The engine's durable record of `group_id`. Every device-group decision
     /// reads it rather than the live group, which a deferred open has not
     /// hydrated yet and a quarantine hides, so neither changes a verdict.
-    fn stored_group(&self, group_id: &GroupId) -> Result<Option<Group>, AppError> {
+    pub(super) fn stored_group(&self, group_id: &GroupId) -> Result<Option<Group>, AppError> {
         match self
             .app
             .account_storage(&self.state.label)?
@@ -228,14 +237,16 @@ impl AppClient {
 
     /// The existing device's side of a confirmed link: create the device group
     /// under the id the link chose, adding the new device's KeyPackage, the
-    /// one with the confirmed `KeyPackageRef` and no other.
+    /// one with the confirmed `KeyPackageRef` and no other, with the label
+    /// and settings its user chose.
     ///
     /// Refused unless this device advertises the roster, has no device group
     /// of its own yet, and finds that KeyPackage published by this account.
-    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+    #[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
     pub(crate) async fn create_device_group(
         &mut self,
         link: &ConfirmedDeviceLink,
+        choices: &DeviceLinkChoices,
     ) -> Result<GroupId, AppError> {
         if !self.app.device_groups_enabled() {
             return Err(AppError::DeviceGroupRefused("roster_unsupported"));
@@ -290,11 +301,18 @@ impl AppClient {
         // (3.4), so neither device owes a roster commit before it publishes.
         // This device's entry also carries its tag signature key, so the
         // engine tags its founding leaf (3.1d); the new device sets its own
-        // once it joins.
+        // once it joins. Nobody chose settings for the founder, so it takes the
+        // defaults a new device starts with: siblings add it to chats it is
+        // missing, with their history.
         roster.devices.insert(
             own_slot,
             DeviceEntryV1 {
                 linked_at: now,
+                settings: DeviceSettingsV1 {
+                    add_to_all_chats: true,
+                    bring_history: true,
+                    keep_while_inactive: false,
+                },
                 announced_key_package: own_lifecycle.current_key_package_ref,
                 tag_signature_key: Some(self.runtime.own_signature_key()),
                 ..DeviceEntryV1::default()
@@ -303,8 +321,14 @@ impl AppClient {
         roster.devices.insert(
             sibling_slot,
             DeviceEntryV1 {
+                label: choices.label.clone(),
                 linked_at: now,
                 linked_by: Some(own_slot),
+                settings: DeviceSettingsV1 {
+                    add_to_all_chats: choices.add_to_all_chats,
+                    bring_history: choices.bring_history,
+                    keep_while_inactive: false,
+                },
                 announced_key_package: Some(hex::decode(&link.key_package_ref_hex)?),
                 ..DeviceEntryV1::default()
             },
@@ -415,7 +439,7 @@ impl AppClient {
     /// first and removed again if the engine cannot record the expectation.
     /// A crash between the two writes leaves a row with no expectation
     /// behind it, which admits nothing and which the next sweep drops.
-    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+    #[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
     pub(crate) fn record_confirmed_device_link(
         &mut self,
         link: &ConfirmedDeviceLink,
@@ -537,6 +561,15 @@ impl AppClient {
             return Ok(storage.device_group(&group_id_hex)?.is_some());
         }
         let now = unix_now_seconds();
+        if storage
+            .device_group(&group_id_hex)?
+            .is_some_and(|record| record.trust == DeviceGroupTrust::AwaitingWelcome)
+        {
+            // Recorded first, so a crash before the trust changes leaves the
+            // join to be recorded again: the pairing drive makes this
+            // device's first commit there as soon as it can (D40).
+            storage.record_device_group_join(&group_id_hex, now)?;
+        }
         if storage.set_device_group_trust(
             &group_id_hex,
             DeviceGroupTrust::AwaitingWelcome,
@@ -599,16 +632,22 @@ impl AppClient {
     }
 
     /// Test-policy hook: act on `link` as the existing device, as if pairing
-    /// had confirmed it, and deliver the founding Welcome. Pairing does not
-    /// reach the app yet, so this is the only way to create a device group.
+    /// had confirmed it, and deliver the founding Welcome. The new device's
+    /// roster entry has no label and both settings off.
     #[cfg(feature = "test-policy-overrides")]
     #[doc(hidden)]
     pub async fn dev_create_device_group(
         &mut self,
         link: ConfirmedDeviceLink,
     ) -> Result<GroupId, AppError> {
-        let group_id = self.create_device_group(&link).await?;
-        self.drive_unpublished_welcome_delivery(None).await;
+        let choices = DeviceLinkChoices {
+            label: String::new(),
+            add_to_all_chats: false,
+            bring_history: false,
+        };
+        let group_id = self.create_device_group(&link, &choices).await?;
+        // The device group stands either way: an undelivered Welcome stays owed.
+        let _ = self.drive_unpublished_welcome_delivery(None).await;
         Ok(group_id)
     }
 
@@ -757,7 +796,7 @@ impl AppClient {
     /// before a KeyPackage publication: the runtime stages none while it is
     /// due (mdk#2628 3.1d). A failed update leaves that gate to refuse the
     /// publication.
-    async fn set_device_tag_key(&mut self) -> Result<(), AppError> {
+    pub(crate) async fn set_device_tag_key(&mut self) -> Result<(), AppError> {
         self.sync_device_tag_group()?;
         if self.runtime.device_tag_group().is_none() {
             return Ok(());

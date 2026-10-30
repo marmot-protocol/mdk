@@ -97,6 +97,7 @@ pub use app::chat_presentation::{
     PresentedChatRow, SelectedAvatar, SelectedChatPreview, StoredChatPresentation,
 };
 pub use app::device_groups::{DeviceGroupRecord, DeviceGroupTrust};
+pub use app::device_links::{DeviceLinkOutcome, DeviceLinkRecord};
 pub use app::message_drafts::{
     ChatListDraftVersion, MessageDraftRevision, MessageDraftRevisionError, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent, StoredMessageDraft,

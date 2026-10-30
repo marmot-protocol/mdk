@@ -43,6 +43,7 @@ use crate::types::chat_list::{
     MarmotExistingDirectConversation,
 };
 use crate::types::common::{MarmotMessageTag, MarmotStringArray, MarmotStringList};
+use crate::types::device_link::MarmotDeviceLinkSnapshot;
 use crate::types::directory::MarmotCachedIdentityProjectionList;
 use crate::types::directory::MarmotUserDirectorySearchResultList;
 use crate::types::draft::MarmotMessageDraftAttachmentInput;
@@ -805,6 +806,37 @@ c_cmd! {
     /// the list after the check. A read that reached no relay fails. Free
     /// with `marmot_unrecognized_sign_in_list_free`.
     async fn marmot_check_sign_ins(account_ref: str) -> rec(MarmotUnrecognizedSignInList) = check_sign_ins;
+
+    /// On a new device: ask a device of this account already signed in to
+    /// link this one. Refused in release builds until the pairing and
+    /// device-group specs land. Re-read on the `DeviceLinkChanged` event.
+    /// Free with `marmot_device_link_snapshot_free`.
+    async fn marmot_start_device_link(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = start_device_link;
+
+    /// On the new device: the user says both screens show the same emoji.
+    /// Free with `marmot_device_link_snapshot_free`.
+    async fn marmot_confirm_device_link_match(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = confirm_device_link_match;
+
+    /// On the new device: cancel the link. Free with
+    /// `marmot_device_link_snapshot_free`.
+    async fn marmot_cancel_device_link(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = cancel_device_link;
+
+    /// On a device already signed in: Link device. `label` is the name the
+    /// user gave the new device, at most 64 bytes. Offer both settings on
+    /// by default: `add_to_all_chats` adds it to the chats this account's
+    /// devices are in, and `bring_history` brings it those chats' history.
+    /// Free with `marmot_device_link_snapshot_free`.
+    async fn marmot_link_device(account_ref: str, prompt_id: str, label: str, add_to_all_chats: flag, bring_history: flag) -> rec(MarmotDeviceLinkSnapshot) = link_device;
+
+    /// On a device already signed in: Not now. Free with
+    /// `marmot_device_link_snapshot_free`.
+    async fn marmot_decline_device_link(account_ref: str, prompt_id: str) -> rec(MarmotDeviceLinkSnapshot) = decline_device_link;
+
+    /// Linking as this device shows it now: its own new-device link, if
+    /// any, and the prompts for sign-ins it can link. Re-read on the
+    /// `DeviceLinkChanged` event. Free with
+    /// `marmot_device_link_snapshot_free`.
+    async fn marmot_device_link_snapshot(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = device_link_snapshot;
 
     /// Accept a pending group invite; writes the now-confirmed group
     /// record. Free with `marmot_app_group_record_free`.

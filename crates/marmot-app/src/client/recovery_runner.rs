@@ -357,7 +357,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     /// One explicit pass in place, as a directly owned client's `sync()` and
     /// `next_event()` will run it after the switch-over: each unit due now runs
     /// once, in the runner's order, until every one has run or `budget` is
-    /// spent. A unit it does not reach keeps its debt.
+    /// spent. A unit it does not reach keeps its debt. A quantum the budget
+    /// cuts gives its request in flight up to the sweep's interrupt grace
+    /// (`INTERRUPT_GRACE`) to report what it read.
     pub(crate) async fn run_pass(&mut self, budget: Duration) -> PassReport {
         let deadline = Instant::now() + budget;
         self.memory.new_round();

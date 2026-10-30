@@ -34,6 +34,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   group whose convergence pass spent its failure budget (mdk#2684). Show it as
   stuck syncing; `marmot_retry_group_convergence` grants one more attempt.
   The struct grows, so use matching regenerated headers and libraries.
+- Device linking (mdk#2628 item 3.3b): `marmot_start_device_link`,
+  `marmot_confirm_device_link_match`, `marmot_cancel_device_link`,
+  `marmot_link_device`, `marmot_decline_device_link` and
+  `marmot_device_link_snapshot` write a `MarmotDeviceLinkSnapshot` (free with
+  `marmot_device_link_snapshot_free`). The new
+  `MARMOT_EVENT_DEVICE_LINK_CHANGED` event says to re-read it. Every call is
+  refused in release builds until the pairing and device-group specs land. Use
+  matching regenerated headers and libraries.
 - `marmot_linked_devices` writes this account's own devices as a
   `MarmotLinkedDeviceList` (free with `marmot_linked_device_list_free`), from
   the roster of the device group this device trusts, this device first

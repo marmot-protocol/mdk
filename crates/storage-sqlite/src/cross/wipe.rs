@@ -205,6 +205,8 @@ impl SqliteAccountStorage {
                     for table in [
                         "local_group_deletion_frontiers",
                         "device_groups",
+                        "device_links",
+                        "device_group_joins",
                         "app_pending_welcome_delivery",
                         "pending_push_registration_removals",
                         "app_prepared_group_image_upload",

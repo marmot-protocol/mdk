@@ -366,6 +366,15 @@ pub enum MarmotEvent {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
+    /// Linking a new device may have changed as this device shows it;
+    /// re-read `marmot_device_link_snapshot`. Also fires once each time the
+    /// account's worker opens or reconnects, which ends any link in
+    /// progress. Carries no device, session or group identities, and may
+    /// fire with no visible change.
+    DeviceLinkChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
 }
 
 impl From<MarmotEventFfi> for MarmotEvent {
@@ -494,6 +503,13 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 account_id_hex: owned_c_string(account_id_hex),
                 account_label: owned_c_string(account_label),
             },
+            F::DeviceLinkChanged {
+                account_id_hex,
+                account_label,
+            } => Self::DeviceLinkChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
         }
     }
 }
@@ -555,6 +571,10 @@ impl CFree for MarmotEvent {
                     account_label,
                 }
                 | Self::UnrecognizedSignInsChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::DeviceLinkChanged {
                     account_id_hex,
                     account_label,
                 } => {
@@ -738,6 +758,35 @@ mod tests {
             assert_eq!(
                 std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
                 "dana"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn device_link_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(MarmotEventFfi::DeviceLinkChanged {
+            account_id_hex: "ad".repeat(32),
+            account_label: "carol".to_owned(),
+        }));
+        unsafe {
+            let MarmotEvent::DeviceLinkChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "ad".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "carol"
             );
             marmot_event_free(event);
         }
