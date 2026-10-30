@@ -844,17 +844,23 @@ pub trait AccountDeviceSignerStorage {
 // ── DeviceGroupWelcomeStorage ──────────────────────────────────────────────
 
 /// The Welcome a new device waits for after a confirmed device link
-/// (mdk#2628 D28, D30): into `group_id`, a group that requires the device
-/// roster, sent by the leaf whose MLS signature key is
-/// `sender_signature_key`, before `expires_at` (Unix seconds).
+/// (mdk#2628 D28, D30, D41): into `group_id`, a group that requires the
+/// device roster, sent by the leaf whose MLS signature key is
+/// `sender_signature_key`, adding this device by the KeyPackage whose
+/// `KeyPackageRef` is `key_package_ref`, before `expires_at` (Unix seconds).
 ///
-/// While it is stored, it reserves `group_id`: the engine joins no other
-/// Welcome into that group. The join that matches it consumes it in the
-/// join's own transaction.
+/// While it is stored and unexpired, it reserves both: the engine joins no
+/// other Welcome into `group_id`, and no Welcome into another group that
+/// adds this device by `key_package_ref`. The join that matches it consumes
+/// it in the join's own transaction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceGroupWelcomeExpectation {
     pub group_id: GroupId,
     pub sender_signature_key: Vec<u8>,
+    /// A record stored before the link named its KeyPackage reads as empty,
+    /// which matches no Welcome.
+    #[serde(default)]
+    pub key_package_ref: Vec<u8>,
     pub expires_at: u64,
 }
 
@@ -868,6 +874,11 @@ pub trait DeviceGroupWelcomeStorage {
         &self,
         group_id: &GroupId,
     ) -> StorageResult<Option<DeviceGroupWelcomeExpectation>>;
+    /// Every stored expectation, expired ones included. One stands for each
+    /// link this device waits on, so there are few.
+    fn device_group_welcome_expectations(
+        &self,
+    ) -> StorageResult<Vec<DeviceGroupWelcomeExpectation>>;
     /// Whether an expectation for `group_id` was there to delete.
     fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool>;
 }
