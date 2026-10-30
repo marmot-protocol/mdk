@@ -25,6 +25,10 @@
   account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
   regenerate bindings with the matching native library.
 
+- `MarmotEventFfi` adds `CompromiseWarningChanged { account_id_hex,
+  account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
+  regenerate bindings with the matching native library.
+
 - `MarmotKitError` adds `AccountDevicesActivationRefused { group_id_hex, reason }`
   for an `enable_account_devices` call the group cannot take now (mdk#2628).
   Update exhaustive Swift/Kotlin handling and regenerate bindings with the
@@ -103,6 +107,15 @@
   with a `SignInResponseFfi`, and `check_sign_ins(account_ref)` checks now.
   Re-read the list on `UnrecognizedSignInsChanged`. It is empty in release
   builds until the roster's spec lands.
+
+- `compromise_warning(account_ref)` returns the account's open compromise
+  warning on this device as `CompromiseWarningItemFfi` records (mdk#2628 item
+  3.7a), and `dismiss_compromise_warning(account_ref)` closes it on this
+  device. Re-read it on `CompromiseWarningChanged`. `start_fresh(account_ref)`
+  answers every sign-in from before this device Not now without rejecting
+  any, and `started_fresh(account_ref)` says whether the device did so and
+  still has no device group. All are empty or false in release builds until
+  the roster's spec lands.
 
 - An admin can turn on account-devices in an existing group (mdk#2628):
   `enable_account_devices(account_ref, group_id_hex)` sends one admin Commit,

@@ -1044,6 +1044,32 @@ It is false in every release build until the roster's spec lands.
 - Re-read on `MarmotEventFfi::UnrecognizedSignInsChanged`, which carries no slots. It also fires once each time the
   account's worker opens or reconnects, so it may fire with no visible change.
 - The list is empty in every release build until the roster's spec lands.
+- `start_fresh(account_ref)` is "No, start fresh" when the user no longer has the devices the first check found: every
+  sign-in from before this device is answered `NotNow`, now and when one is listed later. It rejects nothing and
+  raises no compromise warning, so one of those devices can still link this one. It is refused before the first check
+  (`sign_ins_unchecked`) and once this device trusts a device group (`device_group_exists`). `started_fresh` says
+  whether the device did so and still has no device group: say that only chats it is invited to from now on are here.
+  Re-read it after `start_fresh` and on `LinkedDevicesChanged`.
+
+## Compromise warning
+
+`compromise_warning(account_ref)` returns the account's open compromise warning on this device as
+`CompromiseWarningItemFfi` records, the earliest gathered first. An empty list means no warning is open:
+
+- Each item is a rejection, which means someone holding the account's signing key, or a session with its remote
+  signer, published where the account's devices did not. `RejectedSignIn` is a sign-in answered This wasn't me, on
+  this device or another; `RejectedKeyPackage` is a KeyPackage one of the account's devices found where they had not
+  published, with its `key_package_ref_hex`. `slot_id_hex` and `occurred_at` say where and when.
+- Later releases add reasons. Show one the app does not know as a generic one.
+- The warning gathers this device's rejections and those in its device group's roster, so a rejection made on another
+  device warns here too. Rejections already in the first roster this device trusts count as seen: the user saw them on
+  the devices that were there. A rejected sign-in leaves the warning once its slot is linked as a device.
+- `dismiss_compromise_warning(account_ref)` marks everything the warning gathers as seen, on this device only. It stays
+  closed until a new rejection arrives, and a rejection that branch selection drops and brings back stays seen.
+- The app writes the wording, and never says the account's devices stopped them.
+- Re-read on `MarmotEventFfi::CompromiseWarningChanged`, which carries no slots. It also fires once each time the
+  account's worker opens, so it may fire with no visible change.
+- The list is empty in every release build until the roster's spec lands.
 
 ## Linking a new device
 

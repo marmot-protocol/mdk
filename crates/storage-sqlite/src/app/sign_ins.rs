@@ -283,6 +283,50 @@ impl SqliteAppStorage {
         Ok(changed != 0)
     }
 
+    /// Start this device without the devices its first check found (D54):
+    /// answer Not now for every one of them still unanswered, and for any
+    /// slot that check returned once it is listed later. Rejects nothing.
+    /// Returns `None` before the first check, otherwise whether any answer
+    /// moved.
+    pub fn start_fresh(&self, now: u64) -> StorageResult<Option<bool>> {
+        let now = u64_to_i64(now)?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let baseline = tx
+            .execute_cached(
+                "UPDATE account_sign_in_baseline
+                 SET started_fresh_at = COALESCE(started_fresh_at, ?1) WHERE id = 1",
+                params![now],
+            )
+            .storage()?;
+        if baseline == 0 {
+            return Ok(None);
+        }
+        let changed = tx
+            .execute_cached(
+                "UPDATE account_sign_ins SET answer = 'not_now', answered_at = ?1
+                 WHERE before_this_device = 1 AND answer = 'none'",
+                params![now],
+            )
+            .storage()?;
+        tx.commit().storage()?;
+        Ok(Some(changed != 0))
+    }
+
+    /// Whether this device started fresh ([`Self::start_fresh`]).
+    pub fn started_fresh(&self) -> StorageResult<bool> {
+        Ok(self
+            .lock()?
+            .query_row_cached(
+                "SELECT started_fresh_at IS NOT NULL FROM account_sign_in_baseline WHERE id = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .storage()?
+            .unwrap_or(false))
+    }
+
     /// Check every rejection against the roster again: the device group
     /// changed, and its roster may have lost one. Returns how many it
     /// re-armed.
@@ -300,7 +344,8 @@ impl SqliteAppStorage {
 /// Add a slot, or refresh it when anything shown changes. A later
 /// publication, or an equally recent one with the lower event id (the one
 /// NIP-01 keeps), replaces the slot's client and KeyPackage. `appeared_at`
-/// is never later than the check that first found the slot.
+/// is never later than the check that first found the slot. A baseline slot
+/// first listed after this device started fresh is answered Not now.
 const UPSERT_SIGN_IN: &str = "INSERT INTO account_sign_ins (
          slot_id_hex, before_this_device, client, appeared_at, last_published_at,
          key_package_event_id_hex, key_package_ref_hex, signed_in, answer, answered_at,
@@ -308,7 +353,16 @@ const UPSERT_SIGN_IN: &str = "INSERT INTO account_sign_ins (
      VALUES (
          ?1,
          ?2 OR EXISTS(SELECT 1 FROM account_sign_in_baseline_slots WHERE slot_id_hex = ?1),
-         ?3, MIN(?4, ?5), ?4, ?6, ?7, 1, 'none', NULL, 0)
+         ?3, MIN(?4, ?5), ?4, ?6, ?7, 1,
+         CASE WHEN (EXISTS(SELECT 1 FROM account_sign_in_baseline_slots WHERE slot_id_hex = ?1)
+                 AND EXISTS(SELECT 1 FROM account_sign_in_baseline
+                            WHERE started_fresh_at IS NOT NULL))
+             THEN 'not_now' ELSE 'none' END,
+         CASE WHEN (EXISTS(SELECT 1 FROM account_sign_in_baseline_slots WHERE slot_id_hex = ?1)
+                 AND EXISTS(SELECT 1 FROM account_sign_in_baseline
+                            WHERE started_fresh_at IS NOT NULL))
+             THEN ?5 ELSE NULL END,
+         0)
      ON CONFLICT(slot_id_hex) DO UPDATE SET
          appeared_at = MIN(appeared_at, excluded.appeared_at),
          client = CASE WHEN (excluded.last_published_at > last_published_at
@@ -613,5 +667,48 @@ mod tests {
                 .answer_sign_in("bb", &[Unanswered], Dismissed, 500)
                 .unwrap()
         );
+    }
+
+    /// Starting fresh answers Not now for every device the first check
+    /// found, and for one of its slots first listed later; never for a new
+    /// sign-in, and never a rejection.
+    #[test]
+    fn starting_fresh_puts_off_every_device_here_first() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        assert_eq!(store.start_fresh(50).unwrap(), None);
+        assert!(!store.started_fresh().unwrap());
+        assert!(
+            store
+                .record_sign_in_check(&SignInCheck {
+                    unrecognized: &[observed("aa", 90, "e1")],
+                    present_slots: &BTreeSet::from(["aa".to_owned()]),
+                    returned_slots: &BTreeSet::from(["aa".to_owned(), "bb".to_owned()]),
+                    complete: true,
+                    now: 100,
+                })
+                .unwrap()
+        );
+        assert_eq!(store.start_fresh(150).unwrap(), Some(true));
+        assert!(store.started_fresh().unwrap());
+        let row = store.sign_in("aa").unwrap().unwrap();
+        assert_eq!((row.answer, row.answered_at), (NotNow, Some(150)));
+        assert!(!row.roster_pending);
+        // Again changes nothing, and keeps the first time.
+        assert_eq!(store.start_fresh(160).unwrap(), Some(false));
+
+        // `bb`, which the first check returned but did not count, is put off
+        // once it is listed; `cc`, a new sign-in, still asks.
+        assert!(check(
+            &store,
+            &[observed("bb", 180, "e2"), observed("cc", 180, "e3")],
+            true,
+            200
+        ));
+        let bb = store.sign_in("bb").unwrap().unwrap();
+        assert!(bb.before_this_device);
+        assert_eq!((bb.answer, bb.answered_at), (NotNow, Some(200)));
+        let cc = store.sign_in("cc").unwrap().unwrap();
+        assert!(!cc.before_this_device);
+        assert_eq!((cc.answer, cc.answered_at), (Unanswered, None));
     }
 }
