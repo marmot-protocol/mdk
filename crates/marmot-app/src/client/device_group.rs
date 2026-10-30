@@ -45,6 +45,8 @@
 
 mod messages;
 
+pub(crate) use messages::is_device_group_kind;
+
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
     DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1, DeviceSettingsV1, DeviceSlotId,
