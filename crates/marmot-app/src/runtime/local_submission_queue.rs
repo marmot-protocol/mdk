@@ -8,8 +8,8 @@
 //! includes the inactive interval before a later sign-in executes it.
 
 use super::*;
-use crate::app_telemetry::runtime::Observation;
-use crate::observer::PerformanceRecorder;
+use marmot_observability::app_telemetry::runtime::Observation;
+use marmot_observability::observer::PerformanceRecorder;
 
 const OBSERVATION_LIMIT: usize = 1024;
 

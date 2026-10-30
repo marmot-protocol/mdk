@@ -17,9 +17,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use transport_nostr_peeler::MarmotNostrSigner;
 
-use crate::app_telemetry::AppPerformanceOperation;
-use crate::observer::PerformanceRecorder;
 use crate::{AppError, ChatListAttachmentKind, SendSummary};
+use marmot_observability::app_telemetry::AppPerformanceOperation;
+use marmot_observability::observer::PerformanceRecorder;
 
 mod blossom;
 mod crypto;

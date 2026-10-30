@@ -58,7 +58,7 @@ Each peer's scan receives at most 16,384 raw events and 4 MiB of validated event
 pages and at most three seconds within the shared pass deadline. Held-only traversal is not recovery progress;
 the existing durable unserved-pass count and backoff survive client reconstruction unchanged.
 
-### `marmot-app` runtime performance observations (`src/app_telemetry/runtime.rs`)
+### `marmot-observability` runtime performance observations (`src/app_telemetry/runtime.rs`)
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
