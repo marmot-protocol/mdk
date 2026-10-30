@@ -12,6 +12,8 @@
   (mdk#2628). Exhaustive matches add an arm for it.
 - `MarmotAppEvent` adds `KeyPackageRefreshOverdueChanged { account_id_hex,
   account_label }` (mdk#2628). Exhaustive matches add an arm for it.
+- `MarmotAppEvent` adds `UnrecognizedSignInsChanged { account_id_hex,
+  account_label }` (mdk#2628). Exhaustive matches add an arm for it.
 
 - `MarmotDeployment::key_package_client_preference` and
   `KeyPackageClientPreference` are removed (mdk#2628). The KeyPackage `client`
@@ -42,6 +44,13 @@
   3.4), so hosts can tell the user before inviters stop treating the device as
   fresh at 30 days. `KeyPackageRefreshOverdueChanged` says to re-read it. Both
   are false and silent in release builds until the roster's spec lands.
+- `MarmotAppRuntime::unrecognized_sign_ins` lists sign-ins of this account
+  that this device does not recognize as `UnrecognizedSignIn`s (mdk#2628 item
+  3.2): a fresh, valid KeyPackage in a slot neither this device nor its device
+  group's roster knows. `answer_sign_in` takes a `SignInResponse` (Not now,
+  Reject or Dismiss), and `check_sign_ins` checks now instead of at the next
+  scheduled check. `UnrecognizedSignInsChanged` says to re-read the list. All
+  are empty and silent in release builds until the roster's spec lands.
 - An admin can turn on `marmot.group.account-devices.v1` in an existing group
   (mdk#2628). `AppClient::enable_account_devices` and
   `MarmotAppRuntime::enable_account_devices` send one admin Commit, only when

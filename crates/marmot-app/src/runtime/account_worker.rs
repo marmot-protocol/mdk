@@ -489,6 +489,17 @@ pub(crate) enum AccountWorkerCommand {
     KeyPackageRefreshOverdue {
         respond: oneshot::Sender<Result<bool, AppError>>,
     },
+    UnrecognizedSignIns {
+        respond: oneshot::Sender<Result<Vec<crate::UnrecognizedSignIn>, AppError>>,
+    },
+    AnswerSignIn {
+        slot_id_hex: String,
+        response: crate::SignInResponse,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    CheckSignIns {
+        respond: oneshot::Sender<Result<Vec<crate::UnrecognizedSignIn>, AppError>>,
+    },
     DismissHistoryNotice {
         notice_id: String,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -5760,6 +5771,32 @@ fn account_worker_command_future<'a>(
             );
             true
         }),
+        AccountWorkerCommand::UnrecognizedSignIns { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.unrecognized_sign_ins(),
+            );
+            true
+        }),
+        AccountWorkerCommand::AnswerSignIn {
+            slot_id_hex,
+            response,
+            respond,
+        } => Box::pin(async move {
+            let result = client.answer_sign_in(&slot_id_hex, response).await;
+            // Announce the answer before the caller re-reads the list.
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::CheckSignIns { respond } => Box::pin(async move {
+            let result = client.check_sign_ins_now().await;
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::AcknowledgeGroupCatchingUp { group_id, respond } => {
             Box::pin(async move {
                 let _ = respond_diagnosed(
@@ -7885,6 +7922,7 @@ fn publish_client_pending_applied_summary(
     // Startup and reconnect reconcile device-group trust before reaching
     // here, and no account-level seam follows them until the next command.
     publish_device_group_changes(client, events, account_id_hex, account_label);
+    publish_sign_in_changes(client, events, account_id_hex, account_label);
 }
 
 /// Announce account-level changes. A change in the parked recovery set
@@ -7893,7 +7931,8 @@ fn publish_client_pending_applied_summary(
 /// disappeared, so hosts re-read that group's `GroupRecoveryStatus`. Parking,
 /// un-parking by new evidence and dismissal all surface at the next seam that
 /// calls this; each call is one indexed read of the parked set. It also
-/// announces device-group changes ([`publish_device_group_changes`]).
+/// announces device-group and sign-in changes
+/// ([`publish_device_group_changes`], [`publish_sign_in_changes`]).
 fn publish_account_level_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -7903,6 +7942,7 @@ fn publish_account_level_changes(
     // Record queued subscription refusals off relay paths.
     client.record_subscription_refusals();
     publish_device_group_changes(client, events, account_id_hex, account_label);
+    publish_sign_in_changes(client, events, account_id_hex, account_label);
     let Some(groups) = client.take_history_notice_changes() else {
         return;
     };
@@ -7935,6 +7975,23 @@ fn publish_device_group_changes(
     }
     if client.take_key_package_refresh_overdue_changed() {
         let _ = events.send(MarmotAppEvent::KeyPackageRefreshOverdueChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+}
+
+/// One `UnrecognizedSignInsChanged` for a check or answer that changed the
+/// unrecognized sign-ins, or a roster change, since the last call. Drained
+/// at the same seams as [`publish_device_group_changes`].
+fn publish_sign_in_changes(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    if client.take_unrecognized_sign_ins_changed() {
+        let _ = events.send(MarmotAppEvent::UnrecognizedSignInsChanged {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
         });

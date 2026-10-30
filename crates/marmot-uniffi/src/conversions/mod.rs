@@ -40,6 +40,7 @@ mod notification;
 mod onboarding;
 mod push;
 mod relay;
+mod sign_in;
 mod telemetry;
 mod timeline;
 
@@ -65,6 +66,7 @@ pub use notification::*;
 pub use onboarding::*;
 pub use push::*;
 pub use relay::*;
+pub use sign_in::*;
 pub use telemetry::*;
 pub use timeline::*;
 

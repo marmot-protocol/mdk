@@ -171,6 +171,7 @@ where
         self.send_device_roster_update(
             group_id,
             vec![DeviceRosterOperationV1::SetDevice(slot, entry)],
+            None,
         )
         .await
     }

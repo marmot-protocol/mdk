@@ -47,10 +47,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use cgka_traits::app_components::{
-    DeviceRosterOperationV1, DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1,
+    DEVICE_ROSTER_COMPONENT_ID, DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1,
 };
 use cgka_traits::storage::MaintenanceStorage as _;
-use cgka_traits::{EpochState, FanoutMlsState, GroupId};
 use storage_sqlite::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord, SqliteAppStorage};
 
 use super::AppClient;
@@ -284,13 +283,15 @@ impl AppClient {
             }
             report.slots.insert(slot_hex, outcome);
         }
-        storage.record_sign_in_check(&SignInCheck {
+        if storage.record_sign_in_check(&SignInCheck {
             unrecognized: &unrecognized,
             present_slots: &read.current_slots,
             returned_slots: &read.returned_slots,
             complete: read.complete,
             now: unix_now_seconds(),
-        })?;
+        })? {
+            self.unrecognized_sign_ins_changed = true;
+        }
         tracing::debug!(
             target: "marmot_app::client::sign_ins",
             method = "check_sign_ins",
@@ -301,9 +302,19 @@ impl AppClient {
         Ok(report)
     }
 
+    /// Check now, for the host, and restart the six-hour clock from this
+    /// check. Returns the sign-ins listed after it. A read that reached no
+    /// relay is `key_packages_unreachable` and leaves the schedule alone.
+    pub(crate) async fn check_sign_ins_now(&mut self) -> Result<Vec<UnrecognizedSignIn>, AppError> {
+        let now = Instant::now();
+        self.check_sign_ins().await?;
+        self.sign_in_schedule.last = Some(now);
+        self.sign_in_schedule.due = Some(now + SIGN_IN_CHECK_INTERVAL);
+        self.unrecognized_sign_ins()
+    }
+
     /// The sign-ins this device does not recognize, the earliest to appear
     /// first. Empty while device groups are off.
-    #[cfg_attr(not(all(test, feature = "test-policy-overrides")), allow(dead_code))]
     pub(crate) fn unrecognized_sign_ins(&mut self) -> Result<Vec<UnrecognizedSignIn>, AppError> {
         if !self.app.device_groups_enabled() {
             return Ok(Vec::new());
@@ -332,7 +343,6 @@ impl AppClient {
     /// Answer the unrecognized sign-in in `slot_id_hex`. A rejection is
     /// recorded here first, then committed to the device group's roster when
     /// one is trusted and quiet; maintenance retries what this call could not.
-    #[cfg_attr(not(all(test, feature = "test-policy-overrides")), allow(dead_code))]
     pub(crate) async fn answer_sign_in(
         &mut self,
         slot_id_hex: &str,
@@ -380,6 +390,7 @@ impl AppClient {
         if !storage.answer_sign_in(&listed.slot_id_hex, from, to, unix_now_seconds())? {
             return Err(AppError::DeviceGroupRefused("sign_in_answered"));
         }
+        self.unrecognized_sign_ins_changed = true;
         if to == SignInAnswer::Rejected
             && let Err(error) = self.commit_sign_in_rejections().await
         {
@@ -394,10 +405,11 @@ impl AppClient {
     }
 
     /// Commit every rejection this device made that the trusted device
-    /// group's roster lacks, in one roster update, once that group is quiet.
-    /// A rejection the roster records is settled here, and one of a slot the
-    /// roster holds as a device ends: the user confirmed a link of it. With
-    /// no trusted device group, rejections stay here.
+    /// group's roster lacks, in one roster update through the runtime's
+    /// rejected-slot write, once that group can take a commit from this
+    /// device. A rejection the roster records is settled here, and one of a
+    /// slot the roster holds as a device ends: the user confirmed a link of
+    /// it. With no trusted device group, rejections stay here.
     pub(crate) async fn commit_sign_in_rejections(&mut self) -> Result<(), AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let records = storage.sign_ins()?;
@@ -411,26 +423,42 @@ impl AppClient {
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Ok(());
         };
-        let mut operations = Vec::new();
+        let mut rejections = Vec::new();
         for record in pending {
             if linked(record, &roster) {
                 end_rejection(&storage, record)?;
                 continue;
             }
             match rejected_slot(record, &roster)? {
-                Some((slot, rejected)) => {
-                    operations.push(DeviceRosterOperationV1::SetRejectedSlot(slot, rejected));
-                }
+                Some(rejection) => rejections.push(rejection),
                 None => {
                     storage.settle_sign_in_rejection(&record.slot_id_hex)?;
                 }
             }
         }
-        if operations.is_empty() || !self.device_group_quiet(&group_id)? {
+        if rejections.is_empty() {
             return Ok(());
         }
-        self.commit_device_roster_update(group_id, operations, "reject_sign_in")
-            .await
+        let held = self.epoch_gap_held_groups()?;
+        let context = Self::local_human_action_context(
+            "reject_sign_in",
+            vec!["app_component"],
+            vec![DEVICE_ROSTER_COMPONENT_ID],
+            None,
+        );
+        let effects = self
+            .runtime
+            .reject_device_slots(&group_id, &held, rejections, context)
+            .await?;
+        self.observe_drained_session_events(&effects).await?;
+        Ok(())
+    }
+
+    /// Whether the unrecognized sign-ins may have changed since the last
+    /// call. Set at open, by a check or answer that changed them, and with
+    /// every roster change ([`Self::note_device_roster_changed`]).
+    pub(crate) fn take_unrecognized_sign_ins_changed(&mut self) -> bool {
+        std::mem::take(&mut self.unrecognized_sign_ins_changed) && self.app.device_groups_enabled()
     }
 
     /// The device group changed, or convergence superseded a roster update
@@ -492,27 +520,6 @@ impl AppClient {
             }
         }
         Ok(())
-    }
-
-    /// Whether this device may commit in the device group now: it is stable
-    /// and readable, and nothing of this device's is queued or unconfirmed
-    /// there. A later pass retries.
-    fn device_group_quiet(&self, group_id: &GroupId) -> Result<bool, AppError> {
-        if !matches!(
-            self.runtime.epoch_state(group_id),
-            Some(EpochState::Stable { .. })
-        ) || self.skips_quarantined_group_reads(group_id)
-            || self.epoch_gap_held_groups()?.contains(group_id)
-            || self.runtime.has_pending_convergence_inputs(group_id)?
-            || self.runtime.has_queued_outbound_intents(group_id)?
-        {
-            return Ok(false);
-        }
-        Ok(!self
-            .runtime
-            .outbound_fanouts_for_group(group_id)?
-            .iter()
-            .any(|fanout| matches!(fanout.mls_state(), FanoutMlsState::Pending(_))))
     }
 
     fn own_key_packages(&self) -> Result<OwnKeyPackages, AppError> {

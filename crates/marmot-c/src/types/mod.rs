@@ -25,6 +25,7 @@ pub mod message;
 pub mod notification;
 pub mod push;
 pub mod relay;
+pub mod sign_in;
 pub mod telemetry;
 pub mod timeline;
 

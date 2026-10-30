@@ -97,23 +97,26 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `KeyPackageRefreshOverdueChanged`. It opens set, for the same reason as `linked_devices_changed`.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription only brings a check forward (`SignInNudges`). The
-  first check's baseline, every slot id its read returned whether or not it counted, never a publication time,
-  separates devices that were here first from new sign-ins. Only a complete read changes whether a listed sign-in is
-  still signed in, and a slot holding a valid publication that is merely stale (`current_slots`) stays signed in. A
-  read of the configured directory relays, when the account lists none, is never complete. Rejections are recorded
-  locally first, then committed to the trusted roster only while the device group is quiet
-  (`device_group_quiet`); a device with no device group keeps them until `create_device_group` founds the roster with
-  them or it trusts a group it joined. A rejection is committed only while the roster has no entry for the slot, and
-  never replaces one; a slot the roster holds as a device ends it, since the user confirmed that link. A rejection stays
-  pending until the roster shows it. A sign-in this device dismissed is listed again once the roster has no entry for
-  its slot. Every device-group event and every superseded roster update rechecks every rejection
-  (`recheck_sign_in_rejections`): it ends at once a rejection of a slot the roster now holds as a device, so a link
-  that branch selection drops before the next pass asks again rather than restoring `not_me`, and re-arms the rest. A
-  rejection settled from another device's commit is lost when that commit loses convergence, and only a device that
-  made the rejection restores it. A slot is its `d` as published, compared as bytes;
-  one the roster cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a
-  rejected KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's
-  included, into a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7).
+  first check's baseline, every slot id its read returned whether or not it counted, never a publication time, separates
+  devices that were here first from new sign-ins. Only a complete read changes whether a listed sign-in is still signed
+  in, and a slot holding a valid publication that is merely stale (`current_slots`) stays signed in. A read of the
+  configured directory relays, when the account lists none, is never complete. Rejections are recorded locally first,
+  then committed to the trusted roster through the runtime's rejected-slot write (`reject_device_slots`), behind the
+  gate the runtime's own roster updates wait behind; a device with no device group keeps them until
+  `create_device_group` founds the roster with them or it trusts a group it joined. A rejection is committed only while
+  the roster has no entry for the slot, and never replaces one; a slot the roster holds as a device ends it, since the
+  user confirmed that link. A rejection stays pending until the roster shows it. A sign-in this device dismissed is
+  listed again once the roster has no entry for its slot. Every device-group event and every superseded roster update
+  rechecks every rejection (`recheck_sign_in_rejections`): it ends at once a rejection of a slot the roster now holds as
+  a device, so a link that branch selection drops before the next pass asks again rather than restoring `not_me`, and
+  re-arms the rest. A rejection settled from another device's commit is lost when that commit loses convergence, and
+  only a device that made the rejection restores it. A slot is its `d` as published, compared as bytes; one the roster
+  cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a rejected
+  KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's included, into
+  a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7). Hosts read the list as `unrecognized_sign_ins`. A
+  check or answer that changes it, and every roster change (`note_device_roster_changed`), sets
+  `unrecognized_sign_ins_changed`, drained at the device-group seams into one payload-free `UnrecognizedSignInsChanged`;
+  every client opens with it set.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

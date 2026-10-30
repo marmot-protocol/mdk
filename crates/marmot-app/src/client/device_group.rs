@@ -30,16 +30,19 @@
 //!   devices, from the device group this device trusts. The group's own events
 //!   never reach the host; `LinkedDevicesChanged` stands in for them.
 //!
+//! - Rejected sign-ins (3.2) reach the roster through the runtime's roster
+//!   writes, the ones its own roster updates use. The app keeps no roster
+//!   write of its own.
+//!
 //! A confirmed link comes from device pairing. Until pairing reaches the app,
 //! only the test-policy hook supplies one.
 
 use cgka_traits::app_components::{
-    AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
-    DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID,
-    decode_device_roster_v1, encode_device_roster_update_v1, encode_device_roster_v1,
+    AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterV1, DeviceSlotId,
+    DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID, decode_device_roster_v1, encode_device_roster_v1,
     encode_nostr_routing_v1,
 };
-use cgka_traits::engine::{CreateGroupRequest, SendIntent};
+use cgka_traits::engine::CreateGroupRequest;
 use cgka_traits::storage::{
     DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage as _, GroupStorage as _,
     MaintenanceStorage as _, StorageError,
@@ -393,7 +396,7 @@ impl AppClient {
             self.ensure_device_group_route(&group_id).map(drop),
         );
         super::recover_post_canonical_result("name_device_tag_group", self.sync_device_tag_group());
-        self.linked_devices_changed = true;
+        self.note_device_roster_changed();
         Ok(group_id)
     }
 
@@ -537,7 +540,7 @@ impl AppClient {
             None,
             now,
         )? {
-            self.linked_devices_changed = true;
+            self.note_device_roster_changed();
             self.sync_device_tag_group()?;
             return Ok(true);
         }
@@ -583,7 +586,7 @@ impl AppClient {
                     None,
                     record.recorded_at,
                 )?;
-                self.linked_devices_changed = true;
+                self.note_device_roster_changed();
             } else {
                 storage.delete_device_group(&record.group_id_hex, DeviceGroupTrust::Creating)?;
             }
@@ -814,42 +817,6 @@ impl AppClient {
         Ok(Some((group_id, roster)))
     }
 
-    /// One roster commit in the trusted device group `group_id`, carrying
-    /// `operations` as one diff update: the one way to write the roster.
-    /// Callers read `group_id` from [`Self::trusted_device_roster`] and check
-    /// the group is quiet first.
-    pub(crate) async fn commit_device_roster_update(
-        &mut self,
-        group_id: GroupId,
-        operations: Vec<DeviceRosterOperationV1>,
-        action: &'static str,
-    ) -> Result<(), AppError> {
-        let update = DeviceRosterUpdateV1::new(operations)
-            .and_then(|update| encode_device_roster_update_v1(&update))
-            .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
-        let audit_context = Self::local_human_action_context(
-            action,
-            vec!["app_component"],
-            vec![DEVICE_ROSTER_COMPONENT_ID],
-            None,
-        );
-        let effects = self
-            .runtime
-            .send_with_audit_context(
-                SendIntent::UpdateAppComponents {
-                    group_id,
-                    updates: vec![AppComponentData {
-                        component_id: DEVICE_ROSTER_COMPONENT_ID,
-                        data: update,
-                    }],
-                },
-                audit_context,
-            )
-            .await?;
-        self.observe_drained_session_events(&effects).await?;
-        Ok(())
-    }
-
     /// This account's devices from the trusted device group's roster: this
     /// device first, then by when each was linked, then by slot. Empty when
     /// [`Self::trusted_device_roster`] has no roster.
@@ -871,6 +838,14 @@ impl AppClient {
         // Stable, so equal keys keep the roster's slot order.
         devices.sort_by_key(|device| (!device.is_this_device, device.linked_at));
         Ok(devices)
+    }
+
+    /// A hidden device-group event or a change of trust: the roster this
+    /// device reads may differ, and with it the linked devices and how each
+    /// unrecognized sign-in is listed.
+    pub(crate) fn note_device_roster_changed(&mut self) {
+        self.linked_devices_changed = true;
+        self.unrecognized_sign_ins_changed = true;
     }
 
     /// Whether the linked devices may have changed since the last call. Set

@@ -1817,6 +1817,7 @@ pub(crate) fn notification_update_from_event_cached(
         | MarmotAppEvent::HistoryNoticesChanged { .. }
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::AccountError(_) => Ok(None),
     }
 }

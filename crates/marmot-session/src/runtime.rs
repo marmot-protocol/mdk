@@ -71,6 +71,7 @@ use crate::time::{
 mod device_roster;
 mod device_tag_key;
 mod removed_slot_expiry;
+mod sign_in_rejection;
 mod slot_announcement;
 
 const TRACE_TARGET: &str = "marmot_session::runtime";

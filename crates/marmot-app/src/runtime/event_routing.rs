@@ -28,6 +28,7 @@ pub(crate) fn runtime_message_update_from_event(
         | MarmotAppEvent::HistoryNoticesChanged { .. }
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -48,6 +49,7 @@ pub(crate) fn projection_update_from_event(
         | MarmotAppEvent::HistoryNoticesChanged { .. }
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -101,6 +103,7 @@ pub(crate) fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str,
         | MarmotAppEvent::HistoryNoticesChanged { .. }
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -130,6 +133,7 @@ pub(crate) fn chat_list_event_route(event: &MarmotAppEvent) -> Option<(&str, &Gr
         | MarmotAppEvent::HistoryNoticesChanged { .. }
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -172,6 +176,7 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
         | MarmotAppEvent::HistoryNoticesChanged { .. }
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::AccountError(_) => ChatListUpdateTrigger::SnapshotRefresh,
     }
 }
