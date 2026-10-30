@@ -243,7 +243,7 @@ impl AppClient {
     /// device-group sends became, from one drain's effects: published,
     /// unresolved or failed. Best effort: a send whose id is never filled in
     /// is not handed on if withdrawn.
-    pub(crate) fn note_device_group_message_ids(
+    pub(crate) fn note_device_group_sent_ids(
         &self,
         effects: &marmot_session::AccountDeviceEffects,
     ) {
@@ -291,7 +291,7 @@ impl AppClient {
         if let Err(error) = noted {
             tracing::warn!(
                 target: TRACE_TARGET,
-                method = "note_device_group_message_ids",
+                method = "note_device_group_sent_ids",
                 error_kind = error.privacy_safe_kind(),
                 "device-group message ids were not recorded"
             );
