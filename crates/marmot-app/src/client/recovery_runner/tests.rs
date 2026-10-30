@@ -1,7 +1,8 @@
 //! The runner over real account storage, against a model relay and a fake
 //! live-tail source (or, in one test, an account's real live tails). The host
 //! runs worker turns inline and reads the tails once at the start of each debt
-//! turn, as the account worker will.
+//! turn, as the account worker will. Its engine marks every staged event it
+//! is handed as seen, unless a test says it keeps no trace of it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -19,8 +20,9 @@ use cgka_traits::{
 use nostr::prelude::{Event, EventId, Keys, Kind, PublicKey, Signature, Tag, Timestamp};
 use storage_sqlite::{
     RecoveryCoverageProof, RecoveryCoverageRange, RecoveryCoverageSlice, RecoveryRelayCaps,
-    RecoveryUnit, RecoveryUnitBreak, RecoveryUnitOutcome, RecoveryUnitState, SqlCipherKey,
-    SqliteAccountStorage, SqliteAppStorage, TransportReconciliationRoute,
+    RecoveryStagedSlice, RecoveryUnit, RecoveryUnitBreak, RecoveryUnitOutcome, RecoveryUnitState,
+    SqlCipherKey, SqliteAccountStorage, SqliteAppStorage, StoredAccountState,
+    TransportReconciliationRoute,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -30,10 +32,13 @@ use transport_nostr_adapter::sweep::{
     SweepPolicy, SweepRange, SweepRelay, SweepRoute, UnreachableKind,
 };
 
+use super::admission::{Drained, LiveFence, Stalled, live_fences};
 use super::policy::{
     RUNNER_BACKOFF_BASE_SECS, RUNNER_QUANTUM, RUNNER_RECHECK_INTERVAL_SECS, RUNNER_REQUEST_TIMEOUT,
+    RUNNER_UNREACHABLE_RETRY_SECS,
 };
 use super::quantum::{SinkStop, classify};
+use super::select::{Survey, survey};
 use super::*;
 use crate::client::AppClient;
 use crate::runtime::account_worker::recovery_credits::{
@@ -50,9 +55,18 @@ const GROUP_MESSAGE_KIND: u16 = 445;
 
 type Route = TransportReconciliationRoute;
 type Outcome = RecoveryUnitOutcome;
+/// What an engine took from staging, in order: `(created_at, event id)`.
+type AdmittedLog = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
 
 fn group(byte: u8) -> Route {
     Route::Group([byte; 32])
+}
+
+fn range(since: u64, until: u64) -> RecoveryCoverageRange {
+    RecoveryCoverageRange {
+        since_seconds: since,
+        until_seconds: until,
+    }
 }
 
 fn unit_key(route: &Route, relay: &str) -> UnitKey {
@@ -65,6 +79,7 @@ fn unit_key(route: &Route, relay: &str) -> UnitKey {
 fn required(route: &Route, relays: &[&str]) -> RunnerRoute {
     RunnerRoute {
         route: route.clone(),
+        group_id: None,
         required: relays.iter().map(|relay| (*relay).to_owned()).collect(),
         best_effort: Vec::new(),
     }
@@ -93,6 +108,8 @@ struct Account {
     _dir: tempfile::TempDir,
     _storage: SqliteAccountStorage,
     app: SqliteAppStorage,
+    /// What its engine took from staging, in order: `(created_at, event id)`.
+    admitted: AdmittedLog,
 }
 
 fn account() -> Account {
@@ -107,6 +124,7 @@ fn account() -> Account {
         _dir: dir,
         _storage: storage,
         app,
+        admitted: Arc::default(),
     }
 }
 
@@ -158,6 +176,58 @@ impl Account {
             .recovery_unit(route, relay)
             .unwrap()
             .expect("the runner touched the unit")
+    }
+
+    /// Every range a unit keeps fenced: `(route, relay, range)`.
+    fn fences(&self) -> Vec<(Route, String, RecoveryCoverageRange)> {
+        self.app
+            .recovery_unit_fences()
+            .unwrap()
+            .into_iter()
+            .map(|fence| (fence.route, fence.relay, fence.range))
+            .collect()
+    }
+
+    /// What the engine took from staging, in order.
+    fn admitted(&self) -> Vec<(u64, Vec<u8>)> {
+        self.admitted.lock().unwrap().clone()
+    }
+
+    /// How many distinct events the engine took from staging.
+    fn admitted_events(&self) -> u64 {
+        let admitted = self.admitted();
+        admitted
+            .iter()
+            .map(|(_, event_id)| event_id)
+            .collect::<BTreeSet<_>>()
+            .len() as u64
+    }
+
+    /// Events still staged, from `relay` on `route`'s group alone.
+    fn staged_from(&self, routes: &[Route], relay: &str) -> u64 {
+        self.app
+            .staged_recovery_usage(routes, Some(relay))
+            .unwrap()
+            .events
+    }
+
+    /// `relay` already swept `[since, until]` and staged `events`.
+    fn swept(&self, route: &Route, relay: &str, events: &[Event], since: u64, until: u64) {
+        let deliveries = events.iter().map(delivery).collect::<Vec<_>>();
+        self.app
+            .stage_recovery_slice(
+                &RecoveryStagedSlice {
+                    route,
+                    relay,
+                    events: &deliveries,
+                    fetched_bytes: 0,
+                    covered: &[range(since, until)],
+                    proof: RecoveryCoverageProof::SweepSlice,
+                    mark: self.app.recovery_coverage_mark().unwrap(),
+                },
+                until.saturating_add(1),
+            )
+            .unwrap();
     }
 
     /// The last second the ledger covers on `relay`.
@@ -797,6 +867,21 @@ struct TestHost {
     clock: Clock,
     routes: Mutex<Vec<RunnerRoute>>,
     tails: TailSource,
+    /// The live REQs' counts each debt turn reads.
+    counts: Mutex<Vec<LiveCount>>,
+    admitted: AdmittedLog,
+    /// Events the engine keeps no trace of.
+    no_trace: Mutex<BTreeSet<Vec<u8>>>,
+    /// Events whose ingest fails locally.
+    failing_ingests: Mutex<BTreeSet<Vec<u8>>>,
+    /// How many seconds of the host's clock each ingest and each debt turn
+    /// takes.
+    ingest_seconds: AtomicU64,
+    debt_turn_seconds: AtomicU64,
+    /// A laggard every admission is checked against: each admitted event's
+    /// second, with the first second the laggard owed then.
+    laggard: Mutex<Option<UnitKey>>,
+    behind: Mutex<Vec<(u64, Option<u64>)>>,
     /// When set, debt turns read this client's real live tails instead.
     client: Option<Arc<AppClient>>,
     relays: BTreeMap<&'static str, Arc<ModelRelay>>,
@@ -815,7 +900,14 @@ impl TestHost {
         routes: Vec<RunnerRoute>,
         relays: &[&Arc<ModelRelay>],
     ) -> Arc<Self> {
-        Self::reading(account.app.clone(), None, clock, routes, relays)
+        Self::reading(
+            account.app.clone(),
+            None,
+            &account.admitted,
+            clock,
+            routes,
+            relays,
+        )
     }
 
     /// A host over `client`'s account whose debt turns read its live tails.
@@ -826,12 +918,20 @@ impl TestHost {
         routes: Vec<RunnerRoute>,
         relays: &[&Arc<ModelRelay>],
     ) -> Arc<Self> {
-        Self::reading(app, Some(Arc::new(client)), clock, routes, relays)
+        Self::reading(
+            app,
+            Some(Arc::new(client)),
+            &Arc::default(),
+            clock,
+            routes,
+            relays,
+        )
     }
 
     fn reading(
         app: SqliteAppStorage,
         client: Option<Arc<AppClient>>,
+        admitted: &AdmittedLog,
         clock: &Clock,
         routes: Vec<RunnerRoute>,
         relays: &[&Arc<ModelRelay>],
@@ -841,6 +941,14 @@ impl TestHost {
             clock: clock.clone(),
             routes: Mutex::new(routes),
             tails: TailSource::default(),
+            counts: Mutex::default(),
+            admitted: admitted.clone(),
+            no_trace: Mutex::default(),
+            failing_ingests: Mutex::default(),
+            ingest_seconds: AtomicU64::new(0),
+            debt_turn_seconds: AtomicU64::new(0),
+            laggard: Mutex::default(),
+            behind: Mutex::default(),
             client,
             relays: relays
                 .iter()
@@ -855,6 +963,31 @@ impl TestHost {
 
     fn debt_turns(&self) -> usize {
         self.debt_turns.load(Ordering::SeqCst)
+    }
+
+    fn set_counts(&self, counts: Vec<LiveCount>) {
+        *self.counts.lock().unwrap() = counts;
+    }
+
+    /// Each fenced group's release point, as one debt turn reads it.
+    async fn fences(&self) -> Vec<(Vec<Route>, u64)> {
+        self.debt_turn(|turn| live_fences(turn).unwrap())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(
+                |LiveFence {
+                     routes,
+                     release_before,
+                 }| (routes, release_before),
+            )
+            .collect()
+    }
+
+    async fn survey(&self, policy: RecoveryRunnerPolicy) -> Survey {
+        self.debt_turn(move |turn| survey(turn, &policy, &Stalled::default()).unwrap())
+            .await
+            .unwrap()
     }
 
     /// The next `turns` worker turns (not debt turns) run on a closed
@@ -904,13 +1037,17 @@ impl RunnerHost for TestHost {
             None => Box::new(self.tails.read()),
         };
         let routes = self.routes.lock().unwrap().clone();
+        let counts = self.counts.lock().unwrap().clone();
         let answer = turn(&DebtTurn {
             app: &self.app,
             routes: &routes,
             now,
             tails: &*tails,
+            live_counts: &counts,
         });
         self.debt_turns.fetch_add(1, Ordering::SeqCst);
+        self.clock
+            .advance(self.debt_turn_seconds.load(Ordering::SeqCst));
         Some(answer)
     }
 
@@ -952,6 +1089,51 @@ impl RunnerHost for TestHost {
 
     async fn deliveries(&self, _relay: &str, event: Event) -> Vec<TransportDelivery> {
         vec![delivery(&event)]
+    }
+
+    async fn admit_staged(
+        &self,
+        delivery: TransportDelivery,
+    ) -> Option<Result<Admitted, &'static str>> {
+        self.clock
+            .advance(self.ingest_seconds.load(Ordering::SeqCst));
+        let at = delivery.message.timestamp.0;
+        let event_id = delivery.message.id.as_slice().to_vec();
+        if self.no_trace.lock().unwrap().contains(&event_id) {
+            return Some(Ok(Admitted::NoTrace));
+        }
+        if self.failing_ingests.lock().unwrap().contains(&event_id) {
+            return Some(Err("storage"));
+        }
+        if let Some(laggard) = self.laggard.lock().unwrap().as_ref() {
+            let now = self.clock.now();
+            let owed_until = self
+                .tails
+                .read()
+                .owed_until(&laggard.route, &laggard.relay, now);
+            let owed = self
+                .app
+                .recovery_unit_debt(&laggard.route, &laggard.relay, owed_until)
+                .unwrap()
+                .first()
+                .map(|range| range.since_seconds);
+            self.behind.lock().unwrap().push((at, owed));
+        }
+        self.app
+            .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+                &StoredAccountState {
+                    label: "runner".to_owned(),
+                    seen_events: vec![hex::encode(&event_id)],
+                    ..StoredAccountState::default()
+                },
+                100_000,
+                0,
+                &[],
+                &[],
+            )
+            .unwrap();
+        self.admitted.lock().unwrap().push((at, event_id));
+        Some(Ok(Admitted::Kept))
     }
 
     fn now_seconds(&self) -> u64 {
@@ -1055,7 +1237,11 @@ async fn recovery_runner_never_charges_an_idle_connected_account_for_its_own_tai
         clock.advance(10 * 60);
     }
 
-    assert_eq!(host.debt_turns(), 3, "each step read the tails again");
+    assert_eq!(
+        host.debt_turns(),
+        6,
+        "each step read the tails again, to admit and to survey"
+    );
     assert!(relay.queries().is_empty());
     assert!(account.app.recovery_unit(&route, RELAY).unwrap().is_none());
     assert_eq!(
@@ -1219,14 +1405,14 @@ async fn recovery_runner_begins_on_tails_read_after_its_credit_wait() {
     let (mut runner, _handle) = runner_sharing(&host, &credits);
     let stepping = tokio::spawn(async move { matches!(runner.step().await, Step::Raced) });
 
-    wait_until("the survey", WAIT, || host.debt_turns() == 1).await;
+    wait_until("the survey", WAIT, || host.debt_turns() == 2).await;
     // While it waits for a credit, the relay reconnects and its new tail
     // stands over the whole debt.
     host.tails.stand(&route, RELAY, opened);
     drop(held);
 
     assert!(stepping.await.unwrap(), "begin found nothing owed");
-    assert_eq!(host.debt_turns(), 2);
+    assert_eq!(host.debt_turns(), 3);
     assert!(relay.queries().is_empty());
     assert!(account.app.recovery_unit(&route, RELAY).unwrap().is_none());
     assert_eq!(available_credits(&credits), 2);
@@ -1288,7 +1474,8 @@ async fn recovery_runner_cancelled_or_crashed_mid_sweep_requests_no_slice_twice(
         Vec::<u64>::new(),
         "a proven slice was fetched again"
     );
-    assert_eq!(account.app.staged_recovery_total().unwrap().events, total);
+    assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+    assert_eq!(account.admitted_events(), total, "every event was admitted");
     assert_eq!(available_credits(&credits), 2);
 }
 
@@ -1638,7 +1825,8 @@ async fn recovery_runner_catches_up_a_cap_only_relay_by_count_proofs() {
             .iter()
             .all(|proved| proved.proof == RecoveryCoverageProof::SweepSlice)
     );
-    assert_eq!(account.app.staged_recovery_total().unwrap().events, total);
+    assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+    assert_eq!(account.admitted_events(), total, "every event was admitted");
     let unit = account.unit(&route, RELAY);
     assert_eq!(
         (unit.state, unit.no_progress),
@@ -2088,6 +2276,7 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
         candidates: vec![candidate(&quiet, 30 * DAY), candidate(&busy, 60)],
         rechecks: Vec::new(),
         paused_until: None,
+        fenced: BTreeSet::new(),
     };
     let select::Pick::Unit(first) =
         select::pick(survey, &mut memory, &PriorityHints::default(), 0, true)
@@ -2536,8 +2725,855 @@ fn recovery_runner_policy_holds_the_starting_values() {
         ),
         (2_048, 8 * 1024 * 1024, 64 * 1024 * 1024)
     );
+    assert_eq!(policy.admission_per_turn, 4);
+    assert_eq!(policy.fences_per_unit, 8);
     let holds = (1..=8)
         .map(|failures| policy.local_failure_backoff_seconds(failures))
         .collect::<Vec<_>>();
     assert_eq!(holds, [1, 2, 4, 8, 16, 32, 60, 60]);
+}
+
+fn ids(events: &[Event]) -> Vec<Vec<u8>> {
+    events
+        .iter()
+        .map(|event| event.id.to_bytes().to_vec())
+        .collect()
+}
+
+/// For a paused clock: a five-minute slice holds five of these events, and a
+/// 4 s request fits twice in a 10 s quantum, so each quantum proves ten
+/// minutes. Without NIP-77, so it sweeps where the account holds events.
+fn slow_relay(url: &'static str, events: Vec<Event>) -> ModelRelay {
+    ModelRelay::new(url, caps(10, false))
+        .with_events(events)
+        .with_latency(Duration::from_secs(4))
+}
+
+fn five_minute_slices() -> RecoveryRunnerPolicy {
+    let mut policy = test_policy();
+    policy.sweep.initial_delta = 5 * 60;
+    policy
+}
+
+fn blocked(survey: Survey) -> BTreeMap<String, bool> {
+    survey
+        .candidates
+        .into_iter()
+        .map(|candidate| (candidate.key.relay, candidate.blocked))
+        .collect()
+}
+
+// A paused clock, as above.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_admits_nothing_newer_ahead_of_a_laggards_older_commit() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    // An event a minute for an hour, which A swept before. B holds a commit
+    // half a minute past minute 25 that A never had.
+    let events = every([1; 32], floor, t0, 60);
+    let commit = event([1; 32], floor + 25 * 60 + 30);
+    let mut held_by_b = events.clone();
+    held_by_b.push(commit.clone());
+    let a = ModelRelay::new(RELAY, caps(500, true)).build();
+    let b = slow_relay(OTHER_RELAY, held_by_b).build();
+    account.goal(&route, floor);
+    account.swept(&route, RELAY, &events, floor, t0 - 1);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY, OTHER_RELAY])],
+        &[&a, &b],
+    );
+    host.tails.stand(&route, RELAY, t0);
+    host.tails.stand(&route, OTHER_RELAY, t0);
+    *host.laggard.lock().unwrap() = Some(unit_key(&route, OTHER_RELAY));
+    let (mut runner, _handle) = runner(&host, five_minute_slices());
+
+    // B's first quantum proves ten minutes. A's hour waited for it.
+    let first = ran(runner.step().await);
+    assert_eq!(
+        (first.key.relay.as_str(), first.outcome),
+        (OTHER_RELAY, Outcome::Advanced)
+    );
+    assert!(account.admitted().is_empty());
+    let reached = account.covered_through(&route, OTHER_RELAY);
+    assert!(reached < commit.created_at.as_secs());
+
+    // The next step admits A's events below B's position, and none newer.
+    ran(runner.step().await);
+    let early = account.admitted();
+    assert!(!early.is_empty());
+    assert!(early.iter().all(|(at, _)| *at <= reached));
+
+    run_until_idle(&mut runner, 20).await;
+    let behind = host.behind.lock().unwrap().clone();
+    assert!(
+        behind
+            .iter()
+            .all(|(at, owed)| owed.is_none_or(|owed| *at < owed)),
+        "an event went in ahead of history B still owed"
+    );
+    assert!(behind.iter().any(|(_, owed)| owed.is_some()));
+    let mut all = events
+        .iter()
+        .chain([&commit])
+        .map(|event| (event.created_at.as_secs(), event.id.to_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    all.sort();
+    assert_eq!(account.admitted(), all, "oldest first, the commit in place");
+    assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_fences_live_frames_below_a_non_empty_count_alone() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (fenced, quiet) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    // One live REQ per relay, from `since`, requested at `requested`. A's sent
+    // nothing; B's oldest event came at `oldest`, which proves what follows.
+    let since = t0 - 30 * 60;
+    let oldest = t0 - 25 * 60;
+    let requested = t0 - 20 * 60;
+    let a = ModelRelay::new(RELAY, caps(500, true)).build();
+    let b = ModelRelay::new(OTHER_RELAY, caps(500, true)).build();
+    for route in [&fenced, &quiet] {
+        account.goal(route, floor);
+    }
+    account.live_boundary(&fenced, RELAY, floor, since - 1);
+    account.live_boundary(&fenced, OTHER_RELAY, floor, since - 1);
+    account.live_boundary(&fenced, OTHER_RELAY, oldest + 1, requested - 1);
+    // The quiet group's earlier REQ proved five minutes more, so it owes less.
+    account.live_boundary(&quiet, RELAY, floor, since + 5 * 60 - 1);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![
+            required(&fenced, &[RELAY, OTHER_RELAY]),
+            required(&quiet, &[RELAY]),
+        ],
+        &[&a, &b],
+    );
+    for (route, relay) in [(&fenced, RELAY), (&fenced, OTHER_RELAY), (&quiet, RELAY)] {
+        host.tails.stand(route, relay, requested);
+    }
+    host.set_counts(vec![
+        LiveCount {
+            routes: vec![fenced.clone(), quiet.clone()],
+            relay: RELAY.to_owned(),
+            since,
+            oldest_seen: None,
+        },
+        LiveCount {
+            routes: vec![fenced.clone()],
+            relay: OTHER_RELAY.to_owned(),
+            since,
+            oldest_seen: Some(oldest),
+        },
+    ]);
+
+    // The empty count's range is owed in both groups and holds nothing. B's
+    // capture holds the fenced group's frames from `since` on.
+    assert_eq!(
+        account.debt(&quiet, RELAY, requested - 1),
+        vec![range(since + 5 * 60, requested - 1)]
+    );
+    assert_eq!(
+        account.debt(&fenced, RELAY, requested - 1),
+        vec![range(since, requested - 1)]
+    );
+    assert_eq!(host.fences().await, vec![(vec![fenced.clone()], since)]);
+    assert_eq!(
+        host.survey(test_policy()).await.fenced,
+        BTreeSet::from([fenced.clone()])
+    );
+
+    // An admission turn keeps B's capture, so a restart, which forgets the
+    // counts, still holds the frames.
+    let (mut runner, _handle) = runner(&host, test_policy());
+    assert!(matches!(
+        runner.admit(None).await,
+        Ok(Drained { due: None, .. })
+    ));
+    assert_eq!(
+        account.fences(),
+        vec![(fenced.clone(), OTHER_RELAY.to_owned(), range(since, oldest))]
+    );
+    host.set_counts(Vec::new());
+    assert_eq!(host.fences().await, vec![(vec![fenced.clone()], since)]);
+
+    // The held group goes first, although the quiet one owes less.
+    let first = ran(runner.step().await);
+    assert_eq!(
+        (&first.key.route, first.key.relay.as_str()),
+        (&fenced, RELAY)
+    );
+
+    // B cannot be reached: it leaves the frontier and stops fencing, but
+    // keeps its capture.
+    b.set_reachable(false);
+    let second = ran(runner.step().await);
+    assert_eq!(
+        (&second.key.route, second.key.relay.as_str(), second.outcome),
+        (&fenced, OTHER_RELAY, Outcome::Unreachable)
+    );
+    assert!(host.fences().await.is_empty());
+    assert_eq!(account.fences().len(), 1);
+
+    // Back, it sweeps the capture, and the fence is gone for good.
+    b.set_reachable(true);
+    clock.advance(RUNNER_UNREACHABLE_RETRY_SECS);
+    run_until_idle(&mut runner, 10).await;
+    assert!(account.debt(&fenced, OTHER_RELAY, requested - 1).is_empty());
+    assert!(account.debt(&quiet, RELAY, requested - 1).is_empty());
+    assert!(account.fences().is_empty());
+    assert!(host.fences().await.is_empty());
+}
+
+/// Two generations of one relay's live REQ, each with a non-empty count, and
+/// between their captures history the relay owes that no count left
+/// unproven. Times are minutes before now.
+struct TwoCaptures {
+    account: Account,
+    route: Route,
+    host: Arc<TestHost>,
+    first: RecoveryCoverageRange,
+    /// The owed history between the captures starts here.
+    between: u64,
+    second: RecoveryCoverageRange,
+}
+
+impl TwoCaptures {
+    fn new(clock: &Clock) -> Self {
+        let account = account();
+        let t0 = clock.now();
+        let route = group(1);
+        let at = |minutes: u64| t0 - minutes * 60;
+        let first = range(at(50), at(45));
+        let second = range(at(30), at(25));
+        let between = at(40);
+        let b = ModelRelay::new(OTHER_RELAY, caps(500, true)).build();
+        account.goal(&route, t0 - HOUR);
+        account.live_boundary(&route, OTHER_RELAY, t0 - HOUR, first.since_seconds - 1);
+        // Each generation's boundary proves from after its oldest event to its
+        // request; the second REQ's `since` is past the first's request.
+        account.live_boundary(&route, OTHER_RELAY, first.until_seconds + 1, between - 1);
+        account.live_boundary(&route, OTHER_RELAY, second.until_seconds + 1, at(20) - 1);
+        let host = TestHost::new(
+            &account,
+            clock,
+            vec![required(&route, &[OTHER_RELAY])],
+            &[&b],
+        );
+        host.tails.stand(&route, OTHER_RELAY, at(20));
+        Self {
+            account,
+            route,
+            host,
+            first,
+            between,
+            second,
+        }
+    }
+
+    fn count(&self, capture: RecoveryCoverageRange) -> LiveCount {
+        LiveCount {
+            routes: vec![self.route.clone()],
+            relay: OTHER_RELAY.to_owned(),
+            since: capture.since_seconds,
+            oldest_seen: Some(capture.until_seconds),
+        }
+    }
+
+    /// Admit with each generation's count in turn, then restart, which
+    /// forgets the counts.
+    async fn admit_both_then_restart(&self, runner: &mut RecoveryRunner<TestHost>) {
+        for capture in [self.first, self.second] {
+            self.host.set_counts(vec![self.count(capture)]);
+            assert!(matches!(
+                runner.admit(None).await,
+                Ok(Drained { due: None, .. })
+            ));
+        }
+        self.host.set_counts(Vec::new());
+    }
+
+    fn kept(
+        &self,
+        ranges: &[RecoveryCoverageRange],
+    ) -> Vec<(Route, String, RecoveryCoverageRange)> {
+        ranges
+            .iter()
+            .map(|range| (self.route.clone(), OTHER_RELAY.to_owned(), *range))
+            .collect()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_keeps_every_owed_capture_across_a_restart() {
+    let clock = Clock::new();
+    let case = TwoCaptures::new(&clock);
+    let (mut runner, _handle) = runner(&case.host, test_policy());
+    case.admit_both_then_restart(&mut runner).await;
+    assert_eq!(case.account.fences(), case.kept(&[case.first, case.second]));
+    let held = |release_before| vec![(vec![case.route.clone()], release_before)];
+    assert_eq!(case.host.fences().await, held(case.first.since_seconds));
+
+    // The older capture is swept; the newer one still holds the frames from
+    // its own start, not from the owed history between them.
+    let (since, until) = (case.first.since_seconds, case.first.until_seconds);
+    case.account
+        .swept(&case.route, OTHER_RELAY, &[], since, until);
+    assert_eq!(
+        case.account
+            .debt(&case.route, OTHER_RELAY, case.second.until_seconds)
+            .first()
+            .map(|owed| owed.since_seconds),
+        Some(case.between)
+    );
+    assert_eq!(case.host.fences().await, held(case.second.since_seconds));
+    assert!(matches!(
+        runner.admit(None).await,
+        Ok(Drained { due: None, .. })
+    ));
+    assert_eq!(case.account.fences(), case.kept(&[case.second]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_joins_the_newest_captures_past_its_bound() {
+    let clock = Clock::new();
+    let case = TwoCaptures::new(&clock);
+    let policy = RecoveryRunnerPolicy {
+        fences_per_unit: 1,
+        ..test_policy()
+    };
+    let (mut runner, _handle) = runner(&case.host, policy);
+    case.admit_both_then_restart(&mut runner).await;
+    let joined = range(case.first.since_seconds, case.second.until_seconds);
+    assert_eq!(case.account.fences(), case.kept(&[joined]));
+
+    // Joined, it fences more, never less: the owed history between the
+    // captures holds the frames too once the older capture is swept.
+    let (since, until) = (case.first.since_seconds, case.first.until_seconds);
+    case.account
+        .swept(&case.route, OTHER_RELAY, &[], since, until);
+    assert_eq!(
+        case.host.fences().await,
+        vec![(vec![case.route.clone()], case.between)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_never_fences_an_idle_connected_account_for_its_own_tail() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .checking(&account)
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    // As for the idle account above: the live REQ opened an hour ago, its
+    // EOSE proved the day before, and its tail has stood since. The stored
+    // events it sent lie inside that tail; another REQ sent nothing.
+    let opened = t0 - HOUR;
+    account.goal(&route, t0 - DAY);
+    account.live_boundary(&route, RELAY, t0 - DAY, opened - 1);
+    host.tails.stand(&route, RELAY, opened);
+    let count = |oldest_seen| LiveCount {
+        routes: vec![route.clone()],
+        relay: RELAY.to_owned(),
+        since: opened,
+        oldest_seen,
+    };
+    host.set_counts(vec![count(Some(opened + 5 * 60)), count(None)]);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    for _ in 0..3 {
+        assert_eq!(idle(runner.step().await), None);
+        assert!(host.fences().await.is_empty());
+        assert!(host.survey(test_policy()).await.fenced.is_empty());
+        clock.advance(10 * 60);
+    }
+
+    assert!(relay.queries().is_empty());
+    assert!(
+        account.app.recovery_unit(&route, RELAY).unwrap().is_none(),
+        "no unit was touched, and none keeps a fence"
+    );
+}
+
+// A paused clock, as above.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_holds_a_full_relay_back_until_the_laggard_advances_or_leaves() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let events = every([1; 32], floor, t0, 60);
+    let a = slow_relay(RELAY, events.clone()).build();
+    let b = slow_relay(OTHER_RELAY, events).build();
+    account.goal(&route, floor);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY, OTHER_RELAY])],
+        &[&a, &b],
+    );
+    host.tails.stand(&route, RELAY, t0);
+    host.tails.stand(&route, OTHER_RELAY, t0);
+    // Five staged events fill one relay's share of the group.
+    let mut policy = five_minute_slices();
+    policy.staging.group_events = 5;
+    let (mut runner, _handle) = runner(&host, policy);
+    let routes = [route.clone()];
+    let only = |relay: &str, held: bool| {
+        BTreeMap::from([
+            (RELAY.to_owned(), relay == RELAY && held),
+            (OTHER_RELAY.to_owned(), relay == OTHER_RELAY && held),
+        ])
+    };
+
+    // A goes first and stages ten events past B, which owes from the floor.
+    let first = ran(runner.step().await);
+    assert_eq!(
+        (first.key.relay.as_str(), first.outcome),
+        (RELAY, Outcome::Advanced)
+    );
+    assert_eq!(account.staged_from(&routes, RELAY), 10);
+    assert_eq!(blocked(host.survey(policy).await), only(RELAY, true));
+
+    // So the runner serves B rather than wait on A. Once B reaches A's
+    // position, both hold the frontier and A is eligible again.
+    let second = ran(runner.step().await);
+    assert_eq!(
+        (second.key.relay.as_str(), second.outcome),
+        (OTHER_RELAY, Outcome::Advanced)
+    );
+    assert_eq!(blocked(host.survey(policy).await), only(RELAY, false));
+
+    // The next step admits A's events and runs A ahead again.
+    let third = ran(runner.step().await);
+    assert_eq!(third.key.relay, RELAY);
+    assert_eq!(account.admitted_events(), 10);
+    assert_eq!(account.staged_from(&routes, RELAY), 10);
+    assert_eq!(blocked(host.survey(policy).await), only(RELAY, true));
+
+    // B cannot be reached: it leaves the frontier, so A holds it, full or
+    // not, and runs.
+    b.set_reachable(false);
+    let fourth = ran(runner.step().await);
+    assert_eq!(
+        (fourth.key.relay.as_str(), fourth.outcome),
+        (OTHER_RELAY, Outcome::Unreachable)
+    );
+    assert_eq!(blocked(host.survey(policy).await), only(RELAY, false));
+    let fifth = ran(runner.step().await);
+    assert_eq!(fifth.key.relay, RELAY);
+    // What A staged past B went in as late input.
+    assert_eq!(account.admitted_events(), 20);
+}
+
+/// As above, a laggard leaves the frontier once its last quantum made no
+/// progress or was refused, and while its relay cools down; the full relay
+/// ahead of it is then eligible.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_stops_waiting_on_a_laggard_without_progress_refused_or_cooling_down() {
+    for outcome in [Outcome::NoProgress, Outcome::Refused, Outcome::RateLimited] {
+        let account = account();
+        let clock = Clock::new();
+        let t0 = clock.now();
+        let route = group(1);
+        let floor = t0 - HOUR;
+        let events = every([1; 32], floor, t0, 60);
+        let a = slow_relay(RELAY, events.clone()).build();
+        let b = slow_relay(OTHER_RELAY, events).build();
+        account.goal(&route, floor);
+        let host = TestHost::new(
+            &account,
+            &clock,
+            vec![required(&route, &[RELAY, OTHER_RELAY])],
+            &[&a, &b],
+        );
+        host.tails.stand(&route, RELAY, t0);
+        host.tails.stand(&route, OTHER_RELAY, t0);
+        let mut policy = five_minute_slices();
+        policy.staging.group_events = 5;
+        let (mut runner, _handle) = runner(&host, policy);
+
+        // A goes first, stages past B and waits on it.
+        assert_eq!(ran(runner.step().await).key.relay, RELAY);
+        assert_eq!(blocked(host.survey(policy).await).get(RELAY), Some(&true));
+
+        account
+            .app
+            .settle_recovery_unit(&route, OTHER_RELAY, outcome, &policy.unit, clock.now())
+            .unwrap();
+        assert_eq!(
+            blocked(host.survey(policy).await).get(RELAY),
+            Some(&false),
+            "B still holds the frontier after {outcome:?}"
+        );
+        if outcome == Outcome::Refused {
+            // A loss above A's coverage earns B's park a probe, so B owes
+            // from the floor again; broken, it still stays off the frontier.
+            let reached = account.covered_through(&route, RELAY);
+            account
+                .app
+                .uncover_recovery_coverage(std::slice::from_ref(&route), reached + 1)
+                .unwrap();
+            assert!(account.unit(&route, OTHER_RELAY).probe);
+            assert_eq!(
+                account.debt(&route, OTHER_RELAY, t0 - 1)[0].since_seconds,
+                floor
+            );
+            assert_eq!(
+                blocked(host.survey(policy).await).get(RELAY),
+                Some(&false),
+                "a probing broken unit holds the frontier"
+            );
+        }
+    }
+}
+
+/// A route of the MLS group with id `[9; 16]`.
+fn shared(route: &Route, relays: &[&str]) -> RunnerRoute {
+    RunnerRoute {
+        group_id: Some(vec![9; 16]),
+        ..required(route, relays)
+    }
+}
+
+// A paused clock, as above.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_shares_one_frontier_across_a_groups_routes() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (current, retained) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    let half = t0 - 30 * 60;
+    // An event every two minutes on each route. A swept the retained route's
+    // hour and the first half of the current one's; B, which the retained
+    // route alone requires, owes its hour.
+    let current_events = every([1; 32], floor, t0, 120);
+    let retained_events = every([2; 32], floor, t0, 120);
+    let first_half = current_events
+        .iter()
+        .filter(|event| event.created_at.as_secs() < half)
+        .cloned()
+        .collect::<Vec<_>>();
+    let a = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(
+            current_events
+                .iter()
+                .chain(&retained_events)
+                .cloned()
+                .collect(),
+        )
+        .build();
+    let b = slow_relay(OTHER_RELAY, retained_events.clone()).build();
+    for route in [&current, &retained] {
+        account.goal(route, floor);
+    }
+    account.swept(&retained, RELAY, &retained_events, floor, t0 - 1);
+    account.swept(&current, RELAY, &first_half, floor, half - 1);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![
+            shared(&current, &[RELAY]),
+            shared(&retained, &[RELAY, OTHER_RELAY]),
+        ],
+        &[&a, &b],
+    );
+    for (route, relay) in [
+        (&current, RELAY),
+        (&retained, RELAY),
+        (&retained, OTHER_RELAY),
+    ] {
+        host.tails.stand(route, relay, t0);
+    }
+    *host.laggard.lock().unwrap() = Some(unit_key(&retained, OTHER_RELAY));
+    // A holds 15 events on the current route and 30 on the retained one:
+    // each under the group's share, together over it.
+    let mut policy = five_minute_slices();
+    policy.staging.group_events = 40;
+    assert_eq!(
+        account.staged_from(std::slice::from_ref(&current), RELAY),
+        15
+    );
+    assert_eq!(
+        account.staged_from(std::slice::from_ref(&retained), RELAY),
+        30
+    );
+    assert_eq!(
+        blocked(host.survey(policy).await),
+        BTreeMap::from([(RELAY.to_owned(), true), (OTHER_RELAY.to_owned(), false)])
+    );
+
+    // B's frontier on the retained route holds back what A staged on the
+    // current one too.
+    let (mut runner, _handle) = runner(&host, policy);
+    let first = ran(runner.step().await);
+    assert_eq!(
+        (&first.key.route, first.key.relay.as_str()),
+        (&retained, OTHER_RELAY)
+    );
+    assert!(account.admitted().is_empty());
+
+    run_until_idle(&mut runner, 30).await;
+    let behind = host.behind.lock().unwrap().clone();
+    assert!(
+        behind
+            .iter()
+            .all(|(at, owed)| owed.is_none_or(|owed| *at < owed)),
+        "an event went in ahead of history B still owed"
+    );
+    assert!(behind.iter().any(|(_, owed)| owed.is_some()));
+    assert_eq!(account.admitted_events(), 60);
+    assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_gives_back_what_an_unlisted_route_staged() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (gone, listed) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    let events = every([1; 32], floor, t0, 10 * 60);
+    let a = ModelRelay::new(RELAY, caps(500, true)).build();
+    let b = ModelRelay::new(OTHER_RELAY, caps(500, true)).build();
+    for route in [&gone, &listed] {
+        account.goal(route, floor);
+    }
+    // A staged an hour on a route the runner no longer lists, and is ahead
+    // of B on the one it does.
+    account.swept(&gone, RELAY, &events, floor, t0 - 1);
+    account.swept(&listed, RELAY, &[], floor, t0 - 30 * 60);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&listed, &[RELAY, OTHER_RELAY])],
+        &[&a, &b],
+    );
+    for relay in [RELAY, OTHER_RELAY] {
+        host.tails.stand(&listed, relay, t0);
+    }
+    let mut policy = test_policy();
+    policy.staging.account_bytes = 1;
+    assert_eq!(account.staged_from(std::slice::from_ref(&gone), RELAY), 6);
+    assert_eq!(
+        blocked(host.survey(policy).await).get(RELAY),
+        Some(&true),
+        "the unlisted route's rows fill the account"
+    );
+
+    // Admission gives them back, owed again on their route, so they hold
+    // nothing.
+    let (mut runner, _handle) = runner(&host, policy);
+    assert!(matches!(
+        runner.admit(None).await,
+        Ok(Drained { due: None, .. })
+    ));
+    assert!(account.admitted().is_empty());
+    assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+    assert!(!account.debt(&gone, RELAY, t0 - 1).is_empty());
+    assert_eq!(blocked(host.survey(policy).await).get(RELAY), Some(&false));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_holds_a_group_behind_an_event_the_engine_kept_no_trace_of() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (stuck, other) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    // Both groups' hours were swept and staged already.
+    let stuck_events = every([1; 32], floor, t0, 10 * 60);
+    let other_events = every([2; 32], floor, t0, 10 * 60);
+    for (route, events) in [(&stuck, &stuck_events), (&other, &other_events)] {
+        account.goal(route, floor);
+        account.swept(route, RELAY, events, floor, t0 - 1);
+    }
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&stuck, &[RELAY]), required(&other, &[RELAY])],
+        &[&relay],
+    );
+    host.tails.stand(&stuck, RELAY, t0);
+    host.tails.stand(&other, RELAY, t0);
+    // For now the engine refuses the stuck group's third event.
+    host.no_trace
+        .lock()
+        .unwrap()
+        .insert(stuck_events[2].id.to_bytes().to_vec());
+    let (mut runner, _handle) = runner(&host, test_policy());
+    let admitted = || {
+        account
+            .admitted()
+            .into_iter()
+            .map(|(_, event_id)| event_id)
+            .collect::<Vec<_>>()
+    };
+
+    // The other group goes in whole, the stuck one up to the refused event.
+    // That event stays staged, and its group waits behind it.
+    let due = idle(runner.step().await).expect("the stuck group is retried");
+    let s = ids(&stuck_events);
+    let o = ids(&other_events);
+    let mut first = vec![s[0].clone(), o[0].clone(), s[1].clone(), o[1].clone()];
+    first.extend_from_slice(&o[2..]);
+    assert_eq!(admitted(), first);
+    assert_eq!(account.staged_from(std::slice::from_ref(&stuck), RELAY), 4);
+
+    // Once the engine takes it, the rest of its group follows in order.
+    host.no_trace.lock().unwrap().clear();
+    clock.advance_to(due);
+    assert_eq!(idle(runner.step().await), None);
+    first.extend_from_slice(&s[2..]);
+    assert_eq!(admitted(), first);
+    assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+}
+
+// A paused clock, as above.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_fetches_nothing_for_a_group_held_behind_an_untraced_event() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let events = every([1; 32], floor, t0, 60);
+    let relay = slow_relay(RELAY, events.clone()).build();
+    account.goal(&route, floor);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    host.tails.stand(&route, RELAY, t0);
+    // For now the engine refuses the group's second event.
+    host.no_trace
+        .lock()
+        .unwrap()
+        .insert(events[1].id.to_bytes().to_vec());
+    let (mut runner, _handle) = runner(&host, five_minute_slices());
+    let routes = [route.clone()];
+
+    let first = ran(runner.step().await);
+    assert_eq!(first.outcome, Outcome::Advanced);
+    let staged = account.staged_from(&routes, RELAY);
+    let reached = account.covered_through(&route, RELAY);
+
+    // The next step admits the first event and holds the group behind the
+    // second. Nothing more is fetched for it while it cannot drain, though
+    // its relay holds the frontier and owes the rest of the hour: not at the
+    // hold's end, when admission retries first, and not when admission's own
+    // turns outlast the hold, which then still stands for the step's survey.
+    let queries = relay.queries().len();
+    let due = idle(runner.step().await).expect("the held group is retried");
+    clock.advance_to(due - 1);
+    assert_eq!(idle(runner.step().await), Some(due));
+    host.debt_turn_seconds.store(5, Ordering::SeqCst);
+    for _ in 0..3 {
+        let due = idle(runner.step().await).expect("the held group is retried");
+        clock.advance_to(due);
+    }
+    host.debt_turn_seconds.store(0, Ordering::SeqCst);
+    assert_eq!(relay.queries().len(), queries);
+    assert_eq!(account.admitted_events(), 1);
+    assert_eq!(account.staged_from(&routes, RELAY), staged - 1);
+    assert_eq!(account.covered_through(&route, RELAY), reached);
+
+    // Once the engine takes it, the group drains and the sweep goes on.
+    host.no_trace.lock().unwrap().clear();
+    let resumed = ran(runner.step().await);
+    assert_eq!(
+        (resumed.key.relay.as_str(), resumed.outcome),
+        (RELAY, Outcome::Advanced)
+    );
+    assert_eq!(account.admitted_events(), staged);
+    assert!(account.covered_through(&route, RELAY) > reached);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_fetches_nothing_while_admission_waits_after_a_local_failure() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (failing, other) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    let mid = t0 - HOUR / 2;
+    // The failing group's hour was swept and staged already. The other group
+    // owes its newer half hour, and its older one is due a re-check.
+    let failing_events = every([1; 32], floor, t0, 10 * 60);
+    account.goal(&failing, floor);
+    account.swept(&failing, RELAY, &failing_events, floor, t0 - 1);
+    account.goal(&other, floor);
+    account.live_boundary(&other, RELAY, floor, mid);
+    account
+        .app
+        .record_recovery_relay_caps(
+            RELAY,
+            Some(RecoveryRelayCaps {
+                max_limit: Some(500),
+                negentropy: true,
+            }),
+            t0,
+        )
+        .unwrap();
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(every([2; 32], floor, t0, 10 * 60))
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&failing, &[RELAY]), required(&other, &[RELAY])],
+        &[&relay],
+    );
+    host.tails.stand(&failing, RELAY, t0);
+    host.tails.stand(&other, RELAY, t0);
+    // For now the failing group's first event fails to go in, after longer
+    // than the first wait it arms.
+    host.failing_ingests
+        .lock()
+        .unwrap()
+        .insert(failing_events[0].id.to_bytes().to_vec());
+    host.ingest_seconds.store(5, Ordering::SeqCst);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    // Admission waits after the failure, and nothing is fetched for any group
+    // meanwhile: not the other group's debt, nor its re-check.
+    let due = idle(runner.step().await).expect("admission is retried");
+    assert!(due > clock.now(), "the wait was born expired");
+    assert!(account.admitted().is_empty());
+    assert!(relay.queries().is_empty());
+    assert!(relay.comparisons().is_empty());
+    assert_eq!(
+        account.debt(&other, RELAY, t0 - 1),
+        [range(mid + 1, t0 - 1)]
+    );
+
+    // Once the wait ends and the ingest goes through, the other group's debt
+    // runs.
+    host.failing_ingests.lock().unwrap().clear();
+    clock.advance_to(due);
+    let resumed = ran(runner.step().await);
+    assert_eq!((&resumed.key.route, resumed.recheck), (&other, false));
+    assert_eq!(account.admitted_events(), failing_events.len() as u64);
 }

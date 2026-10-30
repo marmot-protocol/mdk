@@ -32,8 +32,12 @@
 //! of sweeping when its relay compares and the account already holds events
 //! in the owed ranges. Once no debt unit is eligible, re-check units
 //! ([`recheck`]) compare each required NIP-77 relay's covered and retired
-//! ranges again, on their own schedule. Admission from staging (PR 4b) plugs
-//! into the same select and settle seams.
+//! ranges again, on their own schedule.
+//!
+//! Each step first admits what staging may release ([`admission`]): per MLS
+//! group, oldest first, up to its admission frontier. The same reads hold back
+//! a relay staging is full for, block every unit of a group admission cannot
+//! drain, and serve fenced groups first.
 //!
 //! Live tails are a query, never a stored value ([`tails`]): the select and
 //! begin turns each read them fresh, and nothing keeps an answer across an
@@ -42,6 +46,7 @@
 //! Logs carry aggregates only: no route, relay, group or account identity.
 #![cfg_attr(not(test), allow(dead_code))]
 
+mod admission;
 mod compare;
 mod policy;
 mod quantum;
@@ -68,6 +73,7 @@ use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::compare::CompareRelay;
 use transport_nostr_adapter::sweep::{RelayCaps, SweepRelay};
 
+pub(crate) use admission::{Admitted, LiveCount};
 pub(crate) use policy::RecoveryRunnerPolicy;
 pub(crate) use tails::LiveTailRead;
 
@@ -83,6 +89,9 @@ const TARGET: &str = "marmot_app::recovery_runner";
 #[derive(Clone)]
 pub(crate) struct RunnerRoute {
     pub(crate) route: TransportReconciliationRoute,
+    /// The MLS group it carries, shared by a group's current and retained
+    /// routes; `None` when the route is its own group.
+    pub(crate) group_id: Option<Vec<u8>>,
     /// The relays that owe the route its history (decision 3): its operated
     /// relays when it lists any, otherwise all of them.
     pub(crate) required: Vec<String>,
@@ -109,7 +118,8 @@ impl RunnerRoute {
 /// Routes the caller wants served first. Not `Debug`: it carries routes.
 #[derive(Clone, Default)]
 pub(crate) struct PriorityHints {
-    /// Groups whose live frames are held behind a fence (PR 4b feeds this).
+    /// Groups whose live frames are held behind a fence. Each survey adds
+    /// the routes its own fences hold.
     pub(crate) held: BTreeSet<TransportReconciliationRoute>,
     /// Groups with an open conversation window (PR 5 feeds this).
     pub(crate) window: BTreeSet<TransportReconciliationRoute>,
@@ -130,13 +140,15 @@ pub(crate) struct WorkerTurn<'a> {
 }
 
 /// What a turn that reads debt sees: the account's current routes, and the
-/// live tails read for this turn alone.
+/// live tails and live counts read for this turn alone.
 pub(crate) struct DebtTurn<'a> {
     pub(crate) app: &'a SqliteAppStorage,
     /// The account's current routes, as of this turn.
     pub(crate) routes: &'a [RunnerRoute],
     pub(crate) now: u64,
     pub(crate) tails: &'a dyn LiveTailRead,
+    /// The open live REQs' counts, for the fence.
+    pub(crate) live_counts: &'a [LiveCount],
 }
 
 /// What one account gives its runner. Turns run on the account worker (PR 5
@@ -150,8 +162,8 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
         F: FnOnce(&WorkerTurn<'_>) -> T + Send + 'static,
         T: Send + 'static;
 
-    /// Run `turn` on the worker with the live tails read at its start
-    /// ([`AppClient::recovery_runner_live_tails`](crate::client::AppClient)).
+    /// Run `turn` on the worker with the live tails and live counts read at
+    /// its start ([`AppClient::recovery_runner_live_tails`](crate::client::AppClient)).
     async fn debt_turn<T, F>(&self, turn: F) -> Option<T>
     where
         F: FnOnce(&DebtTurn<'_>) -> T + Send + 'static,
@@ -182,6 +194,14 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
     /// Route one fetched event to this account (the adapter's
     /// `reconciled_deliveries`); nothing when it routes nowhere or is invalid.
     async fn deliveries(&self, relay: &str, event: Event) -> Vec<TransportDelivery>;
+
+    /// Hand one staged delivery to the account's recovered-ingest path, as
+    /// one worker command. `None` once the worker is gone; an error is its
+    /// privacy-safe kind.
+    async fn admit_staged(
+        &self,
+        delivery: TransportDelivery,
+    ) -> Option<Result<Admitted, &'static str>>;
 
     /// Unix seconds.
     fn now_seconds(&self) -> u64;
@@ -282,6 +302,7 @@ pub(crate) struct RecoveryRunner<H> {
     hints: watch::Receiver<PriorityHints>,
     cancel: CancellationToken,
     memory: Memory,
+    admission: admission::Memory,
     /// Surveys that failed in a row, for the runner's own local backoff.
     survey_failures: u32,
     /// Reconnect writes that failed in a row, likewise.
@@ -309,6 +330,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             hints,
             cancel: cancel.clone(),
             memory: Memory::default(),
+            admission: admission::Memory::default(),
             survey_failures: 0,
             reconnect_failures: 0,
             reported_pause: None,
@@ -349,7 +371,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         tracing::debug!(target: TARGET, method = "run", "recovery runner stopped");
     }
 
-    /// One step: select, credit, begin, quantum, stage, settle.
+    /// One step: admit, then select, credit, begin, quantum, stage, settle.
     pub(crate) async fn step(&mut self) -> Step {
         self.step_within(None, true).await
     }
@@ -386,10 +408,17 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         if let Some(step) = self.take_reconnects(pass_deadline).await {
             return step;
         }
+        let admission::Drained {
+            due: admission_due,
+            stalled,
+        } = match self.admit(pass_deadline).await {
+            Ok(drained) => drained,
+            Err(step) => return step,
+        };
         let policy = self.policy;
-        let survey = match self
+        let mut survey = match self
             .host
-            .debt_turn(move |turn| select::survey(turn, &policy))
+            .debt_turn(move |turn| select::survey(turn, &policy, &stalled))
             .await
         {
             None => return Step::Stopped,
@@ -402,16 +431,24 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 log_failure("survey", error);
                 let hold = policy.local_failure_backoff_seconds(self.survey_failures);
                 return Step::Idle {
-                    next_due: Some(self.host.now_seconds().saturating_add(hold)),
+                    next_due: sooner(
+                        Some(self.host.now_seconds().saturating_add(hold)),
+                        admission_due,
+                    ),
                 };
             }
         };
         let now = self.host.now_seconds();
         self.report_pause(survey.paused_until, now);
-        let hints = self.hints.borrow().clone();
+        let mut hints = self.hints.borrow().clone();
+        hints.held.append(&mut survey.fenced);
         let candidate = match select::pick(survey, &mut self.memory, &hints, now, new_round) {
             Pick::Unit(candidate) => candidate,
-            Pick::Idle { next_due } => return Step::Idle { next_due },
+            Pick::Idle { next_due } => {
+                return Step::Idle {
+                    next_due: sooner(next_due, admission_due),
+                };
+            }
         };
         let credit = tokio::select! {
             biased;
@@ -742,6 +779,14 @@ fn recovery_caps(caps: RelayCaps) -> RecoveryRelayCaps {
     RecoveryRelayCaps {
         max_limit: caps.max_limit,
         negentropy: caps.negentropy,
+    }
+}
+
+/// The earlier of two optional due times.
+fn sooner(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (due, None) | (None, due) => due,
     }
 }
 
