@@ -4841,6 +4841,8 @@ where
             .map(|target| target.endpoint.clone())
             .collect::<Vec<_>>();
         if !remaining.is_empty() {
+            let required_acks = fanout.required_acks.max(1);
+            let accepted_before = accepted_fanout_targets(&fanout);
             // Secondary retries are audited like the first pass, so a relay
             // that never received the exact event is visible (mdk#2255).
             let msg_id_hex = hex::encode(message_id.as_slice());
@@ -4947,11 +4949,7 @@ where
                 }
             }
             self.session.put_transport_fanout(&fanout)?;
-            let accepted_total = fanout
-                .targets
-                .iter()
-                .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
-                .count();
+            let accepted_total = accepted_fanout_targets(&fanout);
             self.record_audit_event(
                 fanout.group_id.as_ref(),
                 Some(publish_context),
@@ -4963,7 +4961,7 @@ where
                     accepted_relay_urls: pass_accepted,
                     failed_relays: pass_failed,
                     required_acks: fanout.required_acks as u64,
-                    met_required_acks: accepted_total >= fanout.required_acks.max(1),
+                    met_required_acks: accepted_total >= required_acks,
                     transport: Some(wire),
                     event_age_secs: publish_event_age_secs(
                         &fanout.exact_message,
@@ -4971,6 +4969,15 @@ where
                     ),
                 },
             );
+            // A Welcome is delivered by whichever attempt meets its policy,
+            // this retry included, so it stops being owed now rather than at
+            // the next open.
+            if matches!(artifact_kind, Some(MessageArtifactKind::Welcome))
+                && accepted_before < required_acks
+                && accepted_total >= required_acks
+            {
+                self.mark_welcome_delivered_best_effort(message_id);
+            }
         }
         Ok(())
     }
@@ -6511,6 +6518,14 @@ fn note_key_package_attempt(
 
 fn key_package_target_retry_due(target: &TransportFanoutTarget, now: Timestamp) -> bool {
     transport_fanout_target_retry_due(target, now)
+}
+
+fn accepted_fanout_targets(fanout: &DurableTransportFanout) -> usize {
+    fanout
+        .targets
+        .iter()
+        .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
+        .count()
 }
 
 fn transport_fanout_target_retry_due(target: &TransportFanoutTarget, now: Timestamp) -> bool {
