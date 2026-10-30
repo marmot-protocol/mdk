@@ -912,6 +912,8 @@ struct TestHost {
     /// Worker turns still to fail, against `closed`.
     failing_turns: AtomicUsize,
     closed: OnceLock<Account>,
+    /// The relay pool's connection generations, by relay.
+    connections: watch::Sender<BTreeMap<String, u64>>,
 }
 
 impl TestHost {
@@ -980,6 +982,7 @@ impl TestHost {
             caps_latency: Mutex::new(Duration::ZERO),
             failing_turns: AtomicUsize::new(0),
             closed: OnceLock::new(),
+            connections: watch::channel(BTreeMap::new()).0,
         })
     }
 
@@ -1010,6 +1013,13 @@ impl TestHost {
         self.debt_turn(move |turn| survey(turn, &policy, &Stalled::default()).unwrap())
             .await
             .unwrap()
+    }
+
+    /// The pool's `relay` connects again (or for the first time).
+    fn connect(&self, relay: &str) {
+        self.connections.send_modify(|open| {
+            *open.entry(relay.to_owned()).or_default() += 1;
+        });
     }
 
     /// The next `turns` worker turns (not debt turns) run on a closed
@@ -1165,6 +1175,10 @@ impl RunnerHost for TestHost {
 
     fn now_seconds(&self) -> u64 {
         self.clock.now()
+    }
+
+    fn relay_connections(&self) -> Option<watch::Receiver<BTreeMap<String, u64>>> {
+        Some(self.connections.subscribe())
     }
 }
 
@@ -2256,6 +2270,60 @@ async fn recovery_runner_retries_a_failed_reconnect_before_the_cooldown_ends() {
     wait_until("the reconnect", Duration::from_secs(5 * 60), || !cooling()).await;
     wait_until("the sweep", WAIT, || relay.requests() > 0).await;
     assert!(started.elapsed() < Duration::from_secs(60));
+
+    handle.shutdown();
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_hears_the_pools_reconnects() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, t0 - HOUR);
+    host.tails.stand(&route, RELAY, t0);
+    let mut policy = test_policy();
+    policy.unit.cooldown_base_seconds = HOUR;
+    for _ in 0..policy.unit.cooldown_after_unreachable {
+        account
+            .app
+            .settle_recovery_unit(&route, RELAY, Outcome::Unreachable, &policy.unit, t0)
+            .unwrap();
+    }
+    let cooling = || {
+        account
+            .app
+            .recovery_relay_health(RELAY)
+            .unwrap()
+            .unwrap()
+            .cooldown
+            .is_some()
+    };
+    // The pool publishes the relay's URL as it parsed it, with a slash.
+    let published = format!("{RELAY}/");
+    // A connection made before the runner first looks ends nothing.
+    host.connect(&published);
+    let (runner, handle) = runner(&host, policy);
+    let task = runner.spawn();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(cooling());
+    assert_eq!(relay.requests(), 0, "every unit is cooling");
+
+    // The pool connects it again: the idle task wakes, ends the cooldown,
+    // and the survey that follows reads the tails.
+    let turns = host.debt_turns();
+    host.connect(&published);
+    wait_until("the reconnect", WAIT, || !cooling()).await;
+    wait_until("the sweep", WAIT, || relay.requests() > 0).await;
+    assert!(host.debt_turns() > turns);
 
     handle.shutdown();
     task.await.unwrap();

@@ -1059,6 +1059,9 @@ impl FrontierState {
 struct SdkNotificationFrontier {
     sender: broadcast::Sender<NostrSdkNotification>,
     cutovers: watch::Sender<u64>,
+    /// Each monitored relay's latest connection seen opening, by URL
+    /// ([`NostrSdkRelayClient::relay_connections`]).
+    connections: watch::Sender<BTreeMap<String, u64>>,
     loss: watch::Sender<Option<NostrNotificationLoss>>,
     subscription_floors: Arc<StdMutex<SubscriptionFloors>>,
     owed: Arc<OwedSubscriptions>,
@@ -1088,6 +1091,7 @@ impl SdkNotificationFrontier {
         Self {
             sender,
             cutovers: watch::channel(reader).0,
+            connections: watch::channel(BTreeMap::new()).0,
             loss,
             subscription_floors,
             owed,
@@ -1345,6 +1349,10 @@ impl SdkNotificationFrontier {
                                 entry.connections_seen += 1;
                                 entry.connected_at =
                                     connection_stamp(&relay, entry.connections_seen);
+                                let connection = entry.connection;
+                                frontier.connections.send_modify(|open| {
+                                    open.insert(monitor_url.to_string(), connection);
+                                });
                                 let _ = frontier.sender.send(NostrSdkNotification::Replay {
                                     endpoint: TransportEndpoint(monitor_url.to_string()),
                                     epoch: [reader, entry.connection],
@@ -2133,6 +2141,16 @@ impl NostrSdkRelayClient {
 
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// Each relay of this pool that has connected since its monitor attached,
+    /// with the generation of its latest connection: a relay's generation
+    /// changes each time it connects again. A consumer compares generations
+    /// with the ones it last saw to learn which relays reconnected; a change
+    /// carries nothing else. Only relays this transport monitors appear.
+    #[doc(hidden)]
+    pub fn relay_connections(&self) -> watch::Receiver<BTreeMap<String, u64>> {
+        self.frontier.connections.subscribe()
     }
 
     /// Receive transport payloads and replay boundaries in each relay's order.
@@ -7200,6 +7218,14 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut native = relay.notifications_with_gaps();
+        let connections = replay.sdk.relay_connections();
+        let endpoint = replay.wire.endpoint.0.clone();
+        let connection = || connections.borrow().get(&endpoint).copied();
+        assert_eq!(
+            connection(),
+            Some(initial_epoch[1]),
+            "the open connection is published"
+        );
         replay
             .wire
             .send(serde_json::json!(["AUTH", "held active replay"]))
@@ -7230,6 +7256,7 @@ mod tests {
             initial_epoch,
             "ordinary AUTH is not a connection boundary"
         );
+        assert_eq!(connection(), Some(initial_epoch[1]));
         assert_eq!(relay.stats().success(), 1);
         assert_eq!(
             relay
@@ -7284,9 +7311,19 @@ mod tests {
             disconnected,
             "the old connection's end precedes the new connection's boundary"
         );
-        let NostrSdkNotification::Replay { connected_at, .. } = &replacement else {
+        let NostrSdkNotification::Replay {
+            connected_at,
+            epoch,
+            ..
+        } = &replacement
+        else {
             unreachable!("the loop breaks on a replay boundary");
         };
+        assert_eq!(
+            connection(),
+            Some(epoch[1]),
+            "a reconnect publishes its new connection"
+        );
         assert!(
             connected_at
                 .is_some_and(|at| (reconnecting_at..=crate::unix_now_seconds()).contains(&at)),

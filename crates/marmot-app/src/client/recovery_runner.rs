@@ -60,7 +60,7 @@ mod tails;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -242,6 +242,13 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
 
     /// Unix seconds.
     fn now_seconds(&self) -> u64;
+
+    /// The account relay pool's connection generations, by relay
+    /// (`NostrSdkRelayClient::relay_connections`): a relay whose generation
+    /// moves has connected again. `None` while the account has no pool.
+    fn relay_connections(&self) -> Option<watch::Receiver<BTreeMap<String, u64>>> {
+        None
+    }
 }
 
 /// One quantum's result. Not `Debug`: it carries its unit.
@@ -282,6 +289,37 @@ struct Signals {
     reconnected: Mutex<BTreeSet<String>>,
     /// Events re-checks found inside ranges already covered (PR 5 exports it).
     late_findings: AtomicU64,
+}
+
+/// The relay pool's connection feed and the generations the runner has
+/// already seen on it.
+struct Connections {
+    feed: watch::Receiver<BTreeMap<String, u64>>,
+    seen: BTreeMap<String, u64>,
+}
+
+impl Connections {
+    /// The relays whose generation moved since the last look, canonical.
+    fn moved(&mut self) -> Vec<String> {
+        let current = self.feed.borrow_and_update().clone();
+        let moved = current
+            .iter()
+            .filter(|&(relay, connection)| self.seen.get(relay) != Some(connection))
+            .map(|(relay, _)| transport_nostr::canonical_relay(relay))
+            .collect();
+        self.seen = current;
+        moved
+    }
+
+    /// Resolves when the feed publishes, or never once its pool is gone.
+    async fn published(connections: &mut Option<Self>) {
+        let Some(open) = connections else {
+            return std::future::pending().await;
+        };
+        if open.feed.changed().await.is_err() {
+            *connections = None;
+        }
+    }
 }
 
 /// One explicit pass a spawned runner owes a caller.
@@ -367,6 +405,8 @@ pub(crate) struct RecoveryRunner<H> {
     survey_failures: u32,
     /// Reconnect writes that failed in a row, likewise.
     reconnect_failures: u32,
+    /// The relay pool's connection feed, once the host has a pool.
+    connections: Option<Connections>,
     /// The account breaker's pause last reported, so each pause logs once.
     reported_pause: Option<u64>,
     /// Attempts begun and not settled, for its owner to refund on a stop.
@@ -407,6 +447,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             admission: admission::Memory::default(),
             survey_failures: 0,
             reconnect_failures: 0,
+            connections: None,
             reported_pause: None,
             open: OpenAttempts::default(),
         };
@@ -452,6 +493,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 Some(request) = self.passes.recv() => self.serve_pass(request).await,
                 changed = self.wake.changed() => if changed.is_err() { break },
                 changed = self.hints.changed() => if changed.is_err() { break },
+                () = Connections::published(&mut self.connections) => {}
                 () = sleep_for(sleep) => {}
             }
         }
@@ -498,6 +540,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         if self.cancel.is_cancelled() {
             return Step::Stopped;
         }
+        self.note_reconnects();
         if let Some(step) = self.take_reconnects(pass_deadline).await {
             return step;
         }
@@ -846,6 +889,30 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             }
         }
         None
+    }
+
+    /// Add the relays the pool has connected again since the last look to
+    /// the reconnects. The first look, once the host has a pool, only takes
+    /// the generations it publishes then: a connection made before it ends
+    /// no cooldown, as one made before the runner was built never did.
+    fn note_reconnects(&mut self) {
+        let moved = match self.connections.as_mut() {
+            Some(connections) => connections.moved(),
+            None => {
+                self.connections = self.host.relay_connections().map(|feed| {
+                    let mut connections = Connections {
+                        feed,
+                        seen: BTreeMap::new(),
+                    };
+                    connections.moved();
+                    connections
+                });
+                return;
+            }
+        };
+        if !moved.is_empty() {
+            self.reconnected().extend(moved);
+        }
     }
 
     /// When an idle task wakes: at `next_due`, or sooner while a reconnect

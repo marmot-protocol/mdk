@@ -14,6 +14,7 @@
 //! The runner never trusts a wake: every bump (`AppTransportRouting`'s
 //! sender) only makes it read the ledger again.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -23,7 +24,7 @@ use async_trait::async_trait;
 use cgka_traits::{MemberId, TransportDelivery, TransportEndpoint};
 use nostr::prelude::{Event, RelayUrl};
 use storage_sqlite::{RecoveryUnitPolicy, SqliteAppStorage};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use transport_nostr::MarmotRelayPlane;
 use transport_nostr_adapter::compare::CompareRelay;
@@ -254,6 +255,12 @@ impl RunnerHost for AccountRunnerHost {
 
     fn now_seconds(&self) -> u64 {
         unix_now()
+    }
+
+    fn relay_connections(&self) -> Option<watch::Receiver<BTreeMap<String, u64>>> {
+        self.relay_client()
+            .as_ref()
+            .map(NostrSdkRelayClient::relay_connections)
     }
 }
 
