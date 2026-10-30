@@ -26,12 +26,10 @@
 //!   more until a new count arms it again. The range stays owed. A fence left
 //!   holding nothing (no unanswered count, no owner point) ends at once, so
 //!   the next count or plan begins a whole deadline of its own.
-//! - **What already left.** A fence that begins or moves down also holds what
-//!   its group already handed native ingress and the consumer has not taken:
-//!   a borrowed batch's gate closes, and the held suffix of a queued batch
-//!   returns to the buffer before the next take. A frame delivered without
-//!   native ingress rejoins the buffer if the fence holds it before its
-//!   hand-off. What was handed off is gone.
+//! - **What already left.** A fence holds only what is still in the replay
+//!   buffer. A frame its group already handed off, to native ingress (queued
+//!   or borrowed) or to a draining batch without it, goes on as late input,
+//!   as at the fence's deadline, and the range stays owed.
 //! - **One group.** A fence holds its own group's frames only. They count
 //!   neither in the account's pending admission nor against other groups'
 //!   placement, so other groups' live boundaries, tails and ingest go on.
@@ -211,7 +209,6 @@ impl AccountReplayCoverage {
                 since,
                 answerable,
             };
-            let before = group.held_from();
             match group.fence.as_mut().filter(|fence| !fence.spent) {
                 Some(fence) => {
                     // A newer count of the same endpoint replaces its last.
@@ -234,29 +231,14 @@ impl AccountReplayCoverage {
                         .push(group_id.clone());
                 }
             }
-            self.recall_native(&group_id, before);
         }
         self.wake_replay();
     }
 
-    /// The fence on `group_id` began or moved down from `before`: close the
-    /// gate on its native batch, so a borrowed one comes back and the next
-    /// take returns the held suffix to the buffer.
-    fn recall_native(&self, group_id: &GroupId, before: Option<u64>) {
-        let Some(after) = self.groups.get(group_id).and_then(GroupReplay::held_from) else {
-            return;
-        };
-        if before.is_some_and(|before| before <= after) {
-            return;
-        }
-        if let Some(ingress) = &self.ingress {
-            ingress.invalidate_group(group_id);
-        }
-    }
-
-    /// The oldest buffered frame a fence holds. A cursor that passed it would
-    /// leave it to no restart, so the cursor seal stops there.
-    pub(super) fn fence_held_since(&self) -> Option<u64> {
+    /// The oldest buffered frame a fence holds at or after `floor`. A cursor
+    /// that passed it would leave it to no restart, so the cursor seal stops
+    /// there; a held frame below the floor is already the restart's.
+    pub(super) fn fence_held_since(&self, floor: u64) -> Option<u64> {
         if !self.fencing {
             return None;
         }
@@ -269,67 +251,8 @@ impl AccountReplayCoverage {
                     .filter(|event| group.holds(event))
                     .map(|event| event.delivery.message.timestamp.0)
             })
+            .filter(|held| *held >= floor)
             .min()
-    }
-
-    /// Return to the buffer the frames a fence holds that its group's queued
-    /// native batch still carries: they wait with the rest of the hold, and
-    /// count as buffered again rather than as placements.
-    pub(super) fn reclaim_fenced_native(&mut self) {
-        let Some(ingress) = self.ingress.clone() else {
-            return;
-        };
-        if !self.fencing {
-            return;
-        }
-        let fenced = self
-            .groups
-            .iter()
-            .filter_map(|(id, group)| group.held_from().map(|from| (id.clone(), from)))
-            .collect::<Vec<_>>();
-        for (group_id, from) in fenced {
-            for frame in ingress.take_held_suffix(&group_id, from) {
-                let delivery = frame.delivery;
-                let id: [u8; 32] = delivery
-                    .message
-                    .id
-                    .as_slice()
-                    .try_into()
-                    .expect("native event id");
-                self.native_ids.remove(&id);
-                if let Some(groups) = self.unplaced.get_mut(&id)
-                    && groups.remove(&group_id)
-                {
-                    if groups.is_empty() {
-                        self.unplaced.remove(&id);
-                    }
-                    if let Some(group) = self.groups.get_mut(&group_id) {
-                        group.placements -= 1;
-                    }
-                }
-                let bytes = delivery.message.payload.len();
-                let retained = frame.origin == ReplayFrameOrigin::Retained;
-                let group = self.groups.entry(group_id.clone()).or_default();
-                if !group.ready_history.insert(id) {
-                    continue;
-                }
-                match group.events.entry(id) {
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        entry.get_mut().owners += 1;
-                        entry.get_mut().retained |= retained;
-                    }
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(BufferedReplay {
-                            delivery,
-                            owners: 1,
-                            retained,
-                        });
-                        self.buffered_items += 1;
-                        self.buffered_bytes += bytes;
-                    }
-                }
-            }
-        }
     }
 
     /// The boundaries of `admitted` (request, relay, serial) were just
@@ -451,9 +374,7 @@ impl AccountReplayCoverage {
         }
         let deadline = tokio::time::Instant::now() + REPLAY_PAGE_LIMITS.max_duration;
         let mut begun = Vec::new();
-        let mut recalled = Vec::new();
         for (group_id, group) in &mut self.groups {
-            let before = group.held_from();
             let owner = group
                 .routes
                 .values()
@@ -484,10 +405,6 @@ impl AccountReplayCoverage {
                     }
                 }
             }
-            recalled.push((group_id.clone(), before));
-        }
-        for (group_id, before) in recalled {
-            self.recall_native(&group_id, before);
         }
         if !begun.is_empty() {
             self.fence_deadlines
@@ -869,7 +786,7 @@ mod tests {
             "a fetch that waits on the request still waits for its held frames"
         );
         assert_eq!(
-            coverage.fence_held_since(),
+            coverage.fence_held_since(0),
             Some(150),
             "the cursor stops there"
         );
@@ -887,7 +804,7 @@ mod tests {
         coverage.apply_fence_plan(&plan(&coverage, &[]));
         assert!(coverage.admission_pending(), "released, not yet placed");
         assert!(!coverage.request_groups_placed(&id, true));
-        assert_eq!(coverage.fence_held_since(), None);
+        assert_eq!(coverage.fence_held_since(0), None);
     }
 
     /// A plan read before the last one applied moves no fence: its points
@@ -949,8 +866,9 @@ mod tests {
     }
 
     /// Without native ingress, a hand-off waiting for channel capacity
-    /// rejoins the buffer for an arrival to sort in or a fence that now holds
-    /// it, never for frames a fence already holds behind it.
+    /// rejoins the buffer only for an arrival to sort in, never for frames a
+    /// fence holds behind it. A fence that moves below it does not call it
+    /// back: it already left, so it goes on as late input.
     #[tokio::test]
     async fn a_held_suffix_never_sends_a_hand_off_back() {
         let (mut coverage, id, _) = fenced_coverage(true);
@@ -962,9 +880,42 @@ mod tests {
         assert!(!coverage.draining_rejoins(&outgoing), "held 300 stays held");
         coverage.apply_fence_plan(&plan(&coverage, &[(0, 120)]));
         assert!(
-            coverage.draining_rejoins(&outgoing),
-            "the fence moved below it"
+            !coverage.draining_rejoins(&outgoing),
+            "a fence below the hand-off does not recall it"
         );
+    }
+
+    /// A hand-off that rejoins the buffer is no longer a placement: once a
+    /// lower plan holds it there, the account's admission is not pending.
+    #[tokio::test]
+    async fn a_restored_hand_off_a_fence_covers_is_not_pending() {
+        let (mut coverage, id, _) = fenced_coverage(true);
+        let (tx, _rx) = mpsc::channel(8);
+        replay(&mut coverage, &id, &[(0, 150), (0, 300)], &tx);
+        coverage.apply_fence_plan(&plan(&coverage, &[(0, 200)]));
+        let outgoing = delivery(0, 150, 1, &id, 1);
+        assert_eq!(released(&mut coverage), vec![(0, 150)]);
+        // An arrival below the fence sorts in while 150 waits for capacity.
+        coverage.flushing = true;
+        coverage
+            .stage_delivery(
+                delivery(0, 160, 9, &id, 1),
+                Some(RelayIndex(1)),
+                ReplayInput::Live,
+                &tx,
+            )
+            .unwrap();
+        assert!(coverage.draining_rejoins(&outgoing));
+        coverage.restore_draining(VecDeque::from([outgoing]));
+        coverage.flushing = false;
+        assert_eq!(coverage.groups[&group_id(0)].placements, 0);
+
+        coverage.apply_fence_plan(&plan(&coverage, &[(0, 120)]));
+        assert_eq!(coverage.fence_held_items(), 3);
+        assert!(!coverage.admission_pending(), "held frames, not placements");
+        coverage.apply_fence_plan(&plan(&coverage, &[]));
+        assert_eq!(released(&mut coverage), vec![(0, 150), (0, 160), (0, 300)]);
+        assert_eq!(coverage.groups[&group_id(0)].placements, 3);
     }
 
     /// A fence holds its frames for order, not for completeness: a clamped

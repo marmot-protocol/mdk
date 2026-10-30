@@ -5161,16 +5161,13 @@ impl AccountReplayCoverage {
     }
 
     /// Whether an unstarted hand-off must rejoin its group's buffer: the group
-    /// is no longer ready, an arrival there must be sorted in first, or a
-    /// fence now holds it. Frames a fence already holds stay where they are.
+    /// is no longer ready, or an arrival there must be sorted in first.
+    /// Frames a fence holds stay where they are, and a fence that began after
+    /// the hand-off does not call it back: it goes on as late input.
     fn draining_rejoins(&self, delivery: &TransportDelivery) -> bool {
         delivery.group_id_hint.as_ref().is_some_and(|id| {
             self.groups.get(id).is_some_and(|group| {
-                !self.group_ready(group)
-                    || group.events.values().any(|event| !group.holds(event))
-                    || group
-                        .held_from()
-                        .is_some_and(|from| delivery.message.timestamp.0 >= from)
+                !self.group_ready(group) || group.events.values().any(|event| !group.holds(event))
             })
         })
     }
@@ -5192,6 +5189,18 @@ impl AccountReplayCoverage {
                 .as_slice()
                 .try_into()
                 .expect("validated draining event id");
+            // Buffered again, it is no placement: the next hand-off pins it
+            // anew, and a fence that holds it meanwhile leaves it unpending.
+            if let Some(groups) = self.unplaced.get_mut(&id)
+                && groups.remove(group_id)
+            {
+                if groups.is_empty() {
+                    self.unplaced.remove(&id);
+                }
+                if let Some(group) = self.groups.get_mut(group_id) {
+                    group.placements -= 1;
+                }
+            }
             let group = self.groups.entry(group_id.clone()).or_default();
             if group.ready_history.insert(id) {
                 match group.events.entry(id) {

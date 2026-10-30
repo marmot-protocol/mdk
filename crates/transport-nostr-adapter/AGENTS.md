@@ -175,11 +175,13 @@ for reconnect/backoff and relay status mechanics.
   REQ's groups from its `since` until a `fence_replay` plan whose ticket saw that count as admitted answers it; a count
   that ends unadmitted drops its arming. A fence holds at most one `REPLAY_PAGE_LIMITS.max_duration`; then its frames
   go out as late input and plans are ignored until a new count arms the group; a plan older than the last applied is
-  ignored, and a fence nothing holds ends at once. A fence that begins or moves down closes its group's ingress gate,
-  so a borrowed native batch comes back and the next take returns its held suffix to the buffer; a draining hand-off
-  at or above the point rejoins it. Held frames stay under the replay buffer bounds, so overflow is loss, and wait on
-  no paging. `placed()` stays strict; only the recorder's `placed_apart_from_fences` passes held frames, and
-  `fence_held_since` caps the plane's cursor seal. With fencing off, every changed predicate reduces to its old form.
+  ignored, and a fence nothing holds ends at once. A fence holds only what is still in the replay buffer: never
+  call back a frame already handed off (a queued or borrowed native batch, a draining hand-off); it goes on as late
+  input, as at expiry, and the range stays owed. A hand-off that rejoins the buffer for an arrival drops its
+  placement pin. Held frames stay under the replay buffer bounds, so overflow is loss, and wait on no paging.
+  `placed()` stays strict; only the recorder's `placed_apart_from_fences` passes held frames, and `fence_held_since`
+  caps the plane's cursor seal at the oldest held frame its restart floor does not cover. With fencing off, every
+  changed predicate reduces to its old form.
 - Record each REQ's filter `since` and the routes it selects (`NostrSubscription::delivery_routes`) in its SDK
   account context before the REQ goes out, find it by subscription id when the REQ closes, and keep a closed
   REQ's floors for the rest of the context's life: routing is content-keyed, and a closed REQ's buffered or

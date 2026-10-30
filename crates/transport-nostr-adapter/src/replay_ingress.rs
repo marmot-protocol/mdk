@@ -48,9 +48,9 @@ struct ReplayBatchData {
     gate: Arc<AtomicBool>,
 }
 
-pub(super) struct ReplayFrame {
-    pub(super) delivery: TransportDelivery,
-    pub(super) origin: ReplayFrameOrigin,
+struct ReplayFrame {
+    delivery: TransportDelivery,
+    origin: ReplayFrameOrigin,
 }
 
 impl ReplayFrame {
@@ -263,41 +263,6 @@ impl ReplayIngressState {
         Some(data)
     }
 
-    /// Take back the frames at or after `from` that `group`'s queued, not
-    /// borrowed, batch carries, oldest first; the batch keeps the rest, and
-    /// leaves the queue when nothing is left.
-    pub(super) fn take_held_suffix(&self, group: &GroupId, from: u64) -> Vec<ReplayFrame> {
-        let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(serial) = queue.groups.get(group).and_then(|slot| slot.ready) else {
-            return Vec::new();
-        };
-        let Some(data) = queue.ready.get_mut(&serial) else {
-            return Vec::new();
-        };
-        let Some(at) = data
-            .deliveries
-            .iter()
-            .position(|frame| frame.delivery.message.timestamp.0 >= from)
-        else {
-            return Vec::new();
-        };
-        let suffix = data.deliveries.split_off(at);
-        let bytes = suffix
-            .iter()
-            .map(|frame| frame.delivery.message.payload.len())
-            .sum::<usize>();
-        data.bytes -= bytes;
-        let emptied = data.deliveries.is_empty();
-        queue.items -= suffix.len();
-        queue.bytes -= bytes;
-        if emptied && let Some(data) = queue.take_serial(serial) {
-            queue.release_group(&data);
-        }
-        drop(queue);
-        self.changed.store(true, Ordering::Release);
-        suffix.into()
-    }
-
     fn retain(&self, delivery: TransportDelivery) {
         let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
         queue.items += 1;
@@ -381,7 +346,6 @@ impl ReplayIngress {
             return ReplayBatchTake::Empty;
         };
         coverage.admit_retained();
-        coverage.reclaim_fenced_native();
         if coverage.buffered_items > coverage.outbox.len() {
             coverage.queue_owner_batches();
         }
@@ -1870,11 +1834,11 @@ mod tests {
         assert!(!state.account_replay_coverage[&account].admission_pending());
         assert!(state.replay_losses.pending.lock().unwrap().is_empty());
     }
-    /// A fence that begins after its group's frames went to native ingress
-    /// still holds what the consumer has not taken: the borrowed batch's gate
-    /// closes, and the held suffix returns to the buffer before the next take.
+    /// A hold covers only what is still in the replay buffer: a native batch
+    /// queued before the fence began, and still borrowed when it moves down,
+    /// goes on whole as late input, and the fence holds nothing of it.
     #[tokio::test]
-    async fn a_fence_recalls_native_input_the_consumer_has_not_taken() {
+    async fn a_fence_leaves_a_batch_native_ingress_already_holds() {
         let mut state = AdapterState::default();
         let shared = Arc::new(ReplayIngressState::default());
         shared.queue.lock().unwrap().consumer = Some(1);
@@ -1892,6 +1856,9 @@ mod tests {
                 .unwrap();
         }
         coverage.record_eose(&id, RelayIndex(0), 0);
+        coverage.queue_owner_batches();
+        let group = GroupId::new(vec![0; 16]);
+        assert!(shared.queued(&group), "the batch left the buffer");
         let account = MemberId::new(vec![0xA1; 32]);
         state
             .account_replay_coverage
@@ -1909,7 +1876,7 @@ mod tests {
             state: Arc::downgrade(&state),
             account: account.clone(),
         };
-        let fence = |release_before: Option<u64>| {
+        let fence = |release_before: u64| {
             let state = state.clone();
             let account = account.clone();
             async move {
@@ -1917,47 +1884,32 @@ mod tests {
                 let coverage = state.account_replay_coverage.get_mut(&account).unwrap();
                 let plan = ReplayFencePlan {
                     ticket: ReplayFenceTicket(coverage.fence_ticket),
-                    fences: release_before
-                        .map(|release_before| ReplayFence {
-                            route: [0; 32],
-                            release_before,
-                        })
-                        .into_iter()
-                        .collect(),
+                    fences: vec![ReplayFence {
+                        route: [0; 32],
+                        release_before,
+                    }],
                 };
                 coverage.apply_fence_plan(&plan);
             }
         };
-        let batch = ready(&mut ingress).await;
+        fence(35).await;
+        let mut batch = ready(&mut ingress).await;
         assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(30));
-        fence(Some(35)).await;
-        assert!(
-            batch.delivery().is_none(),
-            "the borrowed batch's gate closed"
+        fence(25).await;
+        batch.acknowledge().await;
+        assert_eq!(
+            batch.delivery().unwrap().message.timestamp,
+            Timestamp(40),
+            "the borrowed batch's gate stays open"
         );
-        drop(batch);
-        let mut batch = ready(&mut ingress).await;
-        assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(30));
         batch.acknowledge().await;
-        assert!(batch.delivery().is_none(), "40 went back to the buffer");
-        drop(batch);
-        {
-            let state = state.read().await;
-            let coverage = &state.account_replay_coverage[&account];
-            assert_eq!(coverage.fence_held_since(), Some(40));
-            assert!(!coverage.admission_pending(), "held, not pending");
-        }
-        assert!(matches!(
-            ingress.take_batch(None).await,
-            ReplayBatchTake::Empty
-        ));
-        fence(None).await;
-        let mut batch = ready(&mut ingress).await;
-        assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(40));
-        batch.acknowledge().await;
+        assert!(batch.delivery().is_none());
         drop(batch);
         let state = state.read().await;
-        assert!(!state.account_replay_coverage[&account].admission_pending());
+        let coverage = &state.account_replay_coverage[&account];
+        assert_eq!(coverage.groups[&group].held_from(), Some(25));
+        assert_eq!(coverage.fence_held_since(0), None, "nothing held");
+        assert!(!coverage.admission_pending());
         assert!(state.replay_losses.pending.lock().unwrap().is_empty());
     }
 }

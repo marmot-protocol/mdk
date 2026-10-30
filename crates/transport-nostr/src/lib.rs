@@ -652,7 +652,7 @@ impl AccountDeliveryOverflowState {
         let covered = admission.durable_since.unwrap_or(0);
         // A frame a fence holds in the adapter is in no queue yet: it caps
         // the commit like a queued delivery.
-        let held = replay.fence_held_since().filter(|held| *held >= covered);
+        let held = replay.fence_held_since(covered);
         let cap = admission
             .queued
             .range(covered..)

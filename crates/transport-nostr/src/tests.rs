@@ -4324,7 +4324,7 @@ async fn fence_held_frame_caps_cursor() {
     let ticket = {
         let status = adapter.replay_admission().await;
         assert!(!status.pending, "a held frame is not pending admission");
-        assert_eq!(status.fence_held_since(), Some(created_at));
+        assert_eq!(status.fence_held_since(0), Some(created_at));
         status.fence_ticket()
     };
     let candidate = Some(OPENED_CURSOR + 2_000);
@@ -4353,6 +4353,86 @@ async fn fence_held_frame_caps_cursor() {
     assert_eq!(
         adapter.seal_transport_cursor(candidate, |_| true),
         candidate
+    );
+    plane.shutdown().await;
+}
+
+/// A held frame below the restart floor is the restart's already, and must
+/// not hide one above it: the commit stops at the oldest held frame the
+/// floor does not cover.
+#[tokio::test]
+async fn fence_held_frames_on_both_sides_of_the_floor_cap_at_the_upper() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = plane.account_adapter(account.clone(), relay.clone());
+    adapter.open_transport_cursor(Some(OPENED_CURSOR));
+    adapter.enable_replay_fencing().await;
+    let endpoint = TransportEndpoint("wss://relay.example/".into());
+    let transport_group_id = vec![0xD3; 32];
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 16]),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+                retained_since: None,
+            }],
+            since: Some(Timestamp(OPENED_CURSOR - 1_000)),
+        })
+        .await
+        .unwrap();
+    let group = issued_id(&relay, |subscription| {
+        matches!(subscription, NostrSubscription::GroupBatch { .. })
+    });
+    let floor = OPENED_CURSOR - CURSOR_LOOKBACK;
+    let below = floor - 500;
+    let above = OPENED_CURSOR + 500;
+    for (name, created_at) in [("fence-held-below", below), ("fence-held-above", above)] {
+        let mut event = group_event(name, &transport_group_id);
+        event.created_at = created_at;
+        sign_group_event(&mut event);
+        plane
+            .inner
+            .transport
+            .adapter
+            .observe_relay_event(
+                &hex::decode(&event.id).unwrap(),
+                &endpoint,
+                Some(&group),
+                created_at,
+            )
+            .await;
+        plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some(group.clone()),
+                event,
+            })
+            .await
+            .unwrap();
+    }
+    let issued = relay.subscriptions.lock().unwrap().clone();
+    for subscription in issued {
+        plane
+            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+            .await;
+    }
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(adapter.try_receive_account_delivery().is_none(), "held");
+    {
+        let status = adapter.replay_admission().await;
+        assert_eq!(status.fence_held_since(0), Some(below));
+        assert_eq!(status.fence_held_since(floor), Some(above));
+    }
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 2_000), |_| true),
+        Some(above + CURSOR_LOOKBACK),
+        "the held frame above the floor caps the commit"
     );
     plane.shutdown().await;
 }

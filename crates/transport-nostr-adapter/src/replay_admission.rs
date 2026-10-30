@@ -377,13 +377,14 @@ impl ReplayAdmissionStatus<'_> {
         )
     }
 
-    /// The oldest frame a fence holds for this account. A cursor commit stops
-    /// there, so a restart fetches it again.
-    pub fn fence_held_since(&self) -> Option<u64> {
+    /// The oldest frame a fence holds for this account at or after `floor`,
+    /// the second a restart already fetches from. A cursor commit stops there,
+    /// so a restart fetches it again.
+    pub fn fence_held_since(&self, floor: u64) -> Option<u64> {
         self._guard
             .account_replay_coverage
             .get(self.account_id)
-            .and_then(|coverage| coverage.fence_held_since())
+            .and_then(|coverage| coverage.fence_held_since(floor))
     }
 
     /// The routes of every group whose live frames a fence holds now, a route
