@@ -1,4 +1,5 @@
 mod account_device_signer;
+mod announced_key_packages;
 mod capabilities;
 mod convergence_passes;
 mod convergence_policy;
