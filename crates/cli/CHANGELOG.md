@@ -113,12 +113,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   Welcome. It removes the leaf only if the group's tree still has it, and the roster entry either way. Like a link,
   it is never queued: while the device group is settling it is refused with `EngineError::LinkDeviceUnsettled`, and
   the caller retries. It is reachable only in test-policy builds.
-- A retained outbound Welcome now keeps the event id of the KeyPackage it answers, staged, owed and after
+- A retained outbound Welcome now keeps the `KeyPackageRef` of the KeyPackage it answers, staged, owed and after
   withdrawal (mdk#2628 item 3.3b). `Engine::sent_welcomes_for_key_package`, forwarded as the runtime's
   `welcomes_for_key_package`, finds a group's Welcomes by it, so a device link that failed can withdraw its Welcome
   even when a crash lost the Welcome's id. `StoredMessagePayload::OutboundWelcome` becomes a struct variant carrying
-  `key_package_event_id`, as `StagedInviteWelcome` now also does; two new stored-payload variants hold it, a Welcome
-  without one keeps its original bytes, and legacy JSON rows still decode.
+  `key_package_ref`, as `StagedInviteWelcome` now also does; two new stored-payload variants hold it, a Welcome
+  stored without one keeps its original bytes, and legacy JSON rows still decode.
 - The engine can create a group under a group id the host chose before the group exists
   (`create_group_with_chosen_id_and_audit_context`), as a device link needs (mdk#2628). The id has 1 to 255 bytes.
   An id that names any group this device holds, a removed or forgotten copy included, is refused before anything is

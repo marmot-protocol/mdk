@@ -17,12 +17,12 @@
 - Migration 0133 advances account storage to schema 133 (mdk#2628 item 3.3b).
   It adds `device_links`, one row per device this device approved adding to
   the account's device group, written before the approving commit, with the
-  added KeyPackage's event id (which names the link's Welcome) and its leaf's
-  signature key, its outcome (`pending`, `linked` or `failed`), and whether a
-  failed link's Welcome is withdrawn. It also adds `device_group_joins`, the
-  device groups this device joined through a link whose first commit there has
-  not landed yet. `SqliteAppStorage` gains `record_device_link` (taking a
-  `LinkedKeyPackage`), `mark_device_link_welcome_withdrawn`, `device_link`,
+  added KeyPackage's `KeyPackageRef` (which also finds the link's Welcome) and
+  its leaf's signature key, its outcome (`pending`, `linked` or `failed`), and
+  whether a failed link's Welcome is withdrawn. It also adds
+  `device_group_joins`, the device groups this device joined through a link
+  whose first commit there has not landed yet. `SqliteAppStorage` gains
+  `record_device_link`, `mark_device_link_welcome_withdrawn`, `device_link`,
   `device_links`, `decide_device_link`, `record_device_group_join`,
   `device_group_joins` and `delete_device_group_join`. A local forget removes
   the group's rows. No rows are seeded.

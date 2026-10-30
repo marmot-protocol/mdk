@@ -554,10 +554,9 @@ impl<S: StorageProvider> Engine<S> {
             self.record_staged_invite_welcome(
                 &wrapped,
                 commit_id,
-                source_kp
-                    .source
-                    .as_ref()
-                    .map(|source| source.event_id.clone()),
+                crate::key_package::key_package_ref(parsed_kp)?
+                    .as_slice()
+                    .to_vec(),
                 group_id,
                 source_epoch,
             )?;

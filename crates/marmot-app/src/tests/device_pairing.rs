@@ -18,7 +18,7 @@ use cgka_traits::app_components::{
     encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
-use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome, LinkedKeyPackage};
+use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome};
 
 /// One of Alice's devices, with its own cursor over the shared relay.
 struct Device {
@@ -275,12 +275,12 @@ async fn a_first_link_creates_the_device_group_with_the_chosen_label_and_setting
     let record = link_record(&phone, &group, &laptop.slot_hex());
     assert_eq!(record.outcome, DeviceLinkOutcome::Linked);
     assert!(record.decided_at.is_some_and(|at| at >= record.linked_at));
-    let event_id = MessageId::new(hex::decode(&record.key_package_event_id_hex).unwrap());
+    let key_package_ref = hex::decode(&record.key_package_ref_hex).unwrap();
     assert_eq!(
         phone
             .client
             .runtime
-            .welcomes_for_key_package(&group, &event_id)
+            .welcomes_for_key_package(&group, &key_package_ref)
             .unwrap()
             .len(),
         1,
@@ -752,24 +752,6 @@ async fn a_device_with_no_first_commit_by_the_deadline_is_removed_and_told() {
     );
     let group = phone.client.trusted_device_group().unwrap().unwrap();
     let laptop_slot: [u8; 32] = hex::decode(&slot).unwrap().try_into().unwrap();
-    // A Welcome that cannot be found yet does not hold the removal back.
-    let link = link_record(&phone, &group, &slot);
-    phone
-        .app
-        .account_storage("alice")
-        .unwrap()
-        .app_storage()
-        .record_device_link(
-            &link.group_id_hex,
-            &link.slot_hex,
-            LinkedKeyPackage {
-                key_package_ref_hex: &link.key_package_ref_hex,
-                key_package_event_id_hex: "zz",
-                leaf_signature_key_hex: &link.leaf_signature_key_hex,
-            },
-            link.linked_at,
-        )
-        .unwrap();
 
     phone
         .client
@@ -787,10 +769,7 @@ async fn a_device_with_no_first_commit_by_the_deadline_is_removed_and_told() {
         DeviceLinkOutcome::Failed
     );
     assert!(!phone.roster(&group).devices.contains_key(&laptop_slot));
-    assert!(
-        !link_record(&phone, &group, &slot).welcome_withdrawn,
-        "a Welcome not yet withdrawn is withdrawn on a later drive"
-    );
+    assert!(link_record(&phone, &group, &slot).welcome_withdrawn);
 
     let removed = laptop.step(&relay).await; // the Welcome, then its removal
     assert_eq!(
@@ -966,9 +945,9 @@ async fn a_failed_links_removal_lost_to_a_crash_is_sent_again_whole() {
 }
 
 /// A crash right after a link's commit loses nothing its failure needs: the
-/// link is recorded before the commit, with its KeyPackage's event id, and a
-/// failed link finds its Welcome by that id. Here the restart keeps only what
-/// was written before the commit. At the deadline the Welcome is withdrawn,
+/// link is recorded before the commit, with its KeyPackage's ref, and a
+/// failed link finds its Welcome by that ref. Here the restart keeps only
+/// what was written before the commit. At the deadline the Welcome is withdrawn,
 /// and no recovery publishes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_link_that_crashed_after_its_commit_still_withdraws_its_welcome() {
@@ -995,11 +974,8 @@ async fn a_link_that_crashed_after_its_commit_still_withdraws_its_welcome() {
         .record_device_link(
             &link.group_id_hex,
             &link.slot_hex,
-            LinkedKeyPackage {
-                key_package_ref_hex: &link.key_package_ref_hex,
-                key_package_event_id_hex: &link.key_package_event_id_hex,
-                leaf_signature_key_hex: &link.leaf_signature_key_hex,
-            },
+            &link.key_package_ref_hex,
+            &link.leaf_signature_key_hex,
             link.linked_at,
         )
         .unwrap();
@@ -1062,8 +1038,8 @@ async fn a_link_whose_welcome_is_owed_across_a_restart_fails_at_the_deadline() {
 }
 
 /// A restart drops a later link's prompt after its commit. Its Welcome is
-/// still found by its KeyPackage's event id, and the new device's first
-/// commit still makes the link.
+/// still found by its KeyPackage's ref, and the new device's first commit
+/// still makes the link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_link_is_made_across_a_restart_by_the_new_devices_first_commit() {
     let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
@@ -1073,16 +1049,16 @@ async fn a_link_is_made_across_a_restart_by_the_new_devices_first_commit() {
     let mut phone = reopen(phone).await;
     let record = link_record(&phone, &group, &slot);
     assert_eq!(record.outcome, DeviceLinkOutcome::Pending);
-    let event_id = MessageId::new(hex::decode(&record.key_package_event_id_hex).unwrap());
+    let key_package_ref = hex::decode(&record.key_package_ref_hex).unwrap();
     assert_eq!(
         phone
             .client
             .runtime
-            .welcomes_for_key_package(&group, &event_id)
+            .welcomes_for_key_package(&group, &key_package_ref)
             .unwrap()
             .len(),
         1,
-        "a later link's Welcome is found by its KeyPackage's event id"
+        "a later link's Welcome is found by its KeyPackage's ref"
     );
 
     let joined = tablet.step(&relay).await; // the Welcome, and its first commit
@@ -1092,6 +1068,46 @@ async fn a_link_is_made_across_a_restart_by_the_new_devices_first_commit() {
         link_record(&phone, &group, &slot).outcome,
         DeviceLinkOutcome::Linked
     );
+}
+
+/// A failed link's removal does not wait for its Welcome: one that cannot
+/// be found yet is left to withdraw on a later drive, and the device still
+/// leaves the device group. The restart drops the prompt, so only the link's
+/// row names the KeyPackage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_links_removal_does_not_wait_for_its_welcome() {
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let (group, slot) =
+        link_tablet_until_commit(&relay, &mut phone, &mut laptop, &mut tablet).await;
+    phone.step(&relay).await; // tablet's confirm in: the commit
+    let mut phone = reopen(phone).await;
+    let link = link_record(&phone, &group, &slot);
+    phone
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .record_device_link(
+            &link.group_id_hex,
+            &link.slot_hex,
+            "zz",
+            &link.leaf_signature_key_hex,
+            link.linked_at,
+        )
+        .unwrap();
+
+    phone
+        .client
+        .drive_device_pairing_at(crate::unix_now_seconds() + LINK_DEADLINE_SECS + 1)
+        .await;
+    let record = link_record(&phone, &group, &slot);
+    assert_eq!(record.outcome, DeviceLinkOutcome::Failed);
+    assert!(
+        !record.welcome_withdrawn,
+        "a Welcome not yet withdrawn is withdrawn on a later drive"
+    );
+    let tablet_slot: [u8; 32] = hex::decode(&slot).unwrap().try_into().unwrap();
+    assert!(!phone.roster(&group).devices.contains_key(&tablet_slot));
 }
 
 /// Prompt ids never repeat across a reopen, so an id a host kept from
@@ -1449,16 +1465,7 @@ async fn an_approval_whose_device_group_never_existed_fails() {
     let (group_hex, slot_hex) = ("ab".repeat(16), "cd".repeat(32));
     let storage = phone.app.account_storage("alice").unwrap().app_storage();
     storage
-        .record_device_link(
-            &group_hex,
-            &slot_hex,
-            LinkedKeyPackage {
-                key_package_ref_hex: &"ef".repeat(32),
-                key_package_event_id_hex: &"34".repeat(32),
-                leaf_signature_key_hex: &"12".repeat(32),
-            },
-            1,
-        )
+        .record_device_link(&group_hex, &slot_hex, &"ef".repeat(32), &"12".repeat(32), 1)
         .unwrap();
 
     phone
