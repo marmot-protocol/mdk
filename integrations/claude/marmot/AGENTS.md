@@ -22,7 +22,8 @@ socket. Read `README.md`, `../../AGENTS.md`, and
 
 - `src/main.rs` - binary entrypoint and shared runtime wiring.
 - `src/config.rs` - Claude-specific environment configuration.
-- `src/claude.rs` - Claude command construction, UUID handling, JSONL parsing,
+- `src/claude.rs` - Claude command construction, attachment revalidation and
+  manifest, UUID handling, JSONL parsing,
   supported-version check, and shared subprocess invocation.
 - `tests/e2e_connector.rs` - ignored process-level test using real `wn-agent`
   and a fake Claude executable.
@@ -36,7 +37,9 @@ socket. Read `README.md`, `../../AGENTS.md`, and
   inference. Fresh sessions use `--session-id`; resumed sessions use the exact
   stored UUID with `--resume`.
 - Keep execution argv derived from the shared typed execution profile. Do not
-  add free-form backend arguments or mutate Claude Code settings.
+  add free-form backend arguments or mutate Claude Code settings. The only
+  other argv is `--add-dir` naming the connector-owned attachment batch
+  directory for the current turn.
 - Keep `WN_CLAUDE_MAX_REPLY_BYTES=30000` below the Marmot message cap.
 - Keep event validation strict and diagnostics privacy-safe.
 - The supported minimum is Claude Code 2.1.0. The required print, streaming,
