@@ -3777,10 +3777,11 @@ impl AppClient {
     ///
     /// For each row carrying `'member'`, it asks the engine for the group's
     /// roster (`runtime.members`, sourced from the hydrated Marmot record's
-    /// post-merge member set) and plans `Removed` only when this device's own
-    /// leaf is gone: the local account id is absent, or the engine has marked
-    /// the copy removed while a sibling device keeps the account on the
-    /// roster. A pending publication, engine error, or malformed id aborts
+    /// post-merge member set) and plans a departure only when this device's own
+    /// leaf is gone: `Removed` when the local account id is absent, and
+    /// `DeviceRemoved` when the engine has marked the copy removed while a
+    /// sibling device keeps the account on the roster (mdk#2628 D62). A
+    /// pending publication, engine error, or malformed id aborts
     /// before any plan is written, so uncertainty never suppresses. The work is
     /// gated behind a once-only account-import marker, so subsequent opens are
     /// a single marker read and the hot path stays projection-only.
@@ -3848,18 +3849,21 @@ impl AppClient {
                     return Ok(());
                 }
             };
-            reconciliation.push((
-                group_id_hex,
-                copy_removed || local_account_removed_from_roster(&members, &local_account_id_hex),
-            ));
+            let account_removed =
+                local_account_removed_from_roster(&members, &local_account_id_hex);
+            let membership = if copy_removed && !account_removed {
+                Some(SelfMembership::DeviceRemoved)
+            } else if copy_removed || account_removed {
+                Some(SelfMembership::Removed)
+            } else {
+                None
+            };
+            reconciliation.push((group_id_hex, membership));
         }
-        for (group_id_hex, removed) in reconciliation {
-            if removed {
-                self.app.set_group_self_membership(
-                    &self.state.label,
-                    &group_id_hex,
-                    SelfMembership::Removed,
-                )?;
+        for (group_id_hex, membership) in reconciliation {
+            if let Some(membership) = membership {
+                self.app
+                    .set_group_self_membership(&self.state.label, &group_id_hex, membership)?;
             }
         }
         self.app.mark_account_import_complete(
@@ -7987,11 +7991,13 @@ mod self_membership_backfill_tests {
         );
     }
 
-    /// A removed copy backfills as removed even while its account stays on the
-    /// roster: another device of the account can keep a leaf after this
-    /// device's own leaf is gone.
+    /// A removed copy whose account stays on the roster backfills as
+    /// `DeviceRemoved`: another device of the account keeps a leaf after this
+    /// device's own leaf is gone, which is not a removal of the account
+    /// (mdk#2628 D62). A removed copy without the account backfills as
+    /// `Removed`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn removed_copy_with_its_account_on_the_roster_backfills_removed() {
+    async fn removed_copy_with_its_account_on_the_roster_backfills_device_removed() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -8000,6 +8006,7 @@ mod self_membership_backfill_tests {
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let removed = client.create_group("removed device", &[]).await.unwrap();
+        let removed_account = client.create_group("removed account", &[]).await.unwrap();
         let live = client.create_group("live device", &[]).await.unwrap();
         let storage = app.account_storage("alice").unwrap();
         storage
@@ -8015,11 +8022,16 @@ mod self_membership_backfill_tests {
                 .any(|member| member.id == client.runtime.self_id())
         );
         storage.put_group(&record).unwrap();
+        let mut record = storage.get_group(&removed_account).unwrap();
+        record.removed = true;
+        record.members.clear();
+        storage.put_group(&record).unwrap();
 
         client.backfill_self_membership_once().unwrap();
 
         for (group_id, membership) in [
-            (&removed, SelfMembership::Removed),
+            (&removed, SelfMembership::DeviceRemoved),
+            (&removed_account, SelfMembership::Removed),
             (&live, SelfMembership::Member),
         ] {
             assert_eq!(

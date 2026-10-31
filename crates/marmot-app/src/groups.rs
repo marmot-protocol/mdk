@@ -464,12 +464,13 @@ pub(crate) fn app_group_roster_from_session(
         SelfMembership::Member => 0,
         SelfMembership::Left => 1,
         SelfMembership::Removed => 2,
+        SelfMembership::DeviceRemoved => 3,
     };
     AppGroupRoster {
         group_id_hex: group_record.group_id_hex,
         members,
         epoch,
-        roster_revision: epoch.saturating_mul(3).saturating_add(membership_revision),
+        roster_revision: epoch.saturating_mul(4).saturating_add(membership_revision),
         self_membership: group_record.self_membership,
         member_count: mls_state.member_count,
         lifecycle_state: mls_state.lifecycle_state,
@@ -3142,7 +3143,7 @@ mod group_roster_api_tests {
             HashMap::from([(self_id.to_owned(), "Alice".to_owned())]),
         );
         assert_eq!(roster.epoch, 7);
-        assert_eq!(roster.roster_revision, 23);
+        assert_eq!(roster.roster_revision, 30);
         assert_eq!(roster.self_membership, SelfMembership::Removed);
         assert_eq!(roster.member_count, 1);
         assert_eq!(roster.lifecycle_state, AppGroupLifecycleState::Stable);

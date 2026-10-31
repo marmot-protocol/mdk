@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `MarmotSelfMembership` and `MarmotConversationParticipation` add
+  `DeviceRemoved` (mdk#2628 item 3.6b): this device's leaf was removed from a
+  chat the account stays in through another of its devices. Show no "removed
+  from group" notice for it. Handle the new values and use matching
+  regenerated headers and libraries.
+
 - `MarmotGroupEventKind` adds `QueuedIntentRefused { intent_id_hex,
   intent_kind, reason }` (mdk#2694), freed with its event. Handle the new tag
   and use matching regenerated headers and libraries.

@@ -2527,3 +2527,42 @@ async fn hot_checkpoints_do_not_postpone_not_ready_retry() {
 async fn hot_checkpoints_do_not_postpone_normal_refresh() {
     assert_hot_checkpoints_do_not_postpone_refresh(false).await;
 }
+
+/// A stale `Member` row reads as `DeviceRemoved` when the removed copy still
+/// lists the account, and as `Removed` when it does not (mdk#2628 D62).
+#[test]
+fn a_stale_member_row_reads_a_device_removal_apart_from_an_account_removal() {
+    let snapshot = |is_member, account_listed, removed| GroupAuthoritySnapshot {
+        facts: cgka_engine::group_authority::GroupAuthorityFacts {
+            epoch: cgka_traits::EpochId(2),
+            member_count: 2,
+            is_member,
+            account_listed,
+            is_admin: false,
+            admin_count: 0,
+            removed,
+            unrecoverable: false,
+            disbanded: false,
+            disbanding_enabled: false,
+            has_disbanding_blockers: false,
+        },
+        lifecycle: cgka_traits::GroupLifecycleState::Stable,
+        disbanding: false,
+    };
+    for (is_member, account_listed, removed, expected) in [
+        (true, true, false, None),
+        (
+            false,
+            true,
+            true,
+            Some(crate::SelfMembership::DeviceRemoved),
+        ),
+        (false, false, true, Some(crate::SelfMembership::Removed)),
+        (false, false, false, Some(crate::SelfMembership::Removed)),
+    ] {
+        assert_eq!(
+            stale_member_departure(&snapshot(is_member, account_listed, removed)),
+            expected
+        );
+    }
+}

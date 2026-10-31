@@ -328,6 +328,22 @@ pub(crate) fn publish_conversation_captures_from_session(
 }
 /// Only called with the live client. Frozen startup/recovery snapshots return
 /// NotReady at their dispatch sites instead of entering this path.
+/// What a stale `Member` row reads as from a capture's live facts, if this
+/// device is not a member. Live removal facts do not distinguish voluntary
+/// departure from eviction, so `Removed` is the conservative fallback, except
+/// for a removed copy that still lists the account: only this device's leaf
+/// went (mdk#2628 D62).
+fn stale_member_departure(authority: &GroupAuthoritySnapshot) -> Option<crate::SelfMembership> {
+    let facts = authority.facts;
+    if facts.removed && facts.account_listed {
+        Some(crate::SelfMembership::DeviceRemoved)
+    } else if facts.removed || (!facts.is_member && !facts.disbanded && !facts.unrecoverable) {
+        Some(crate::SelfMembership::Removed)
+    } else {
+        None
+    }
+}
+
 pub(super) fn capture_conversation(
     client: &mut AppClient,
     group: &GroupId,
@@ -371,14 +387,12 @@ fn capture_conversation_from_session(
                 .conversation_account_snapshot(&group_hex, query.clone())?;
             // A startup migration can still carry Member until its owner backfills.
             // Use this capture's compact live membership, without loading another roster.
-            // Live removal facts do not distinguish voluntary departure from eviction.
-            // Removed is the conservative fallback only for stale Member rows; explicit
-            // Leaving/Left/Removed/Disbanded projection states remain authoritative.
-            let facts = authority.facts;
+            // Explicit Leaving/Left/Removed/DeviceRemoved/Disbanded projection
+            // states remain authoritative.
             if account.presentation_input.self_membership == crate::SelfMembership::Member
-                && (facts.removed || (!facts.is_member && !facts.disbanded && !facts.unrecoverable))
+                && let Some(departed) = stale_member_departure(&authority)
             {
-                account.presentation_input.self_membership = crate::SelfMembership::Removed;
+                account.presentation_input.self_membership = departed;
             }
             Ok(CapturedConversation {
                 account,

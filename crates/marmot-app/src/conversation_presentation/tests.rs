@@ -174,6 +174,13 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
             ConversationParticipation::Removed,
         ),
         (
+            SelfMembership::DeviceRemoved,
+            false,
+            false,
+            AppGroupLifecycleState::Stable,
+            ConversationParticipation::DeviceRemoved,
+        ),
+        (
             SelfMembership::Member,
             false,
             false,

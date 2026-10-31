@@ -4510,9 +4510,12 @@ impl MarmotApp {
         // is authored by a peer, and the roster-derived classification of
         // that commit reads as an eviction. Now that peers apply a leave
         // within seconds (mdk#1736) the two writes land back to back, so the
-        // eviction must never overwrite the recorded intent.
-        if membership == SelfMembership::Removed
-            && storage.group_self_membership(group_id_hex)? == Some(SelfMembership::Left)
+        // eviction must never overwrite the recorded intent. Nor may a sibling
+        // removing this device's leaf (mdk#2628 D62).
+        if matches!(
+            membership,
+            SelfMembership::Removed | SelfMembership::DeviceRemoved
+        ) && storage.group_self_membership(group_id_hex)? == Some(SelfMembership::Left)
         {
             tracing::debug!(
                 target: "marmot_app",

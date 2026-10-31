@@ -6881,6 +6881,8 @@ impl AppClient {
                     .stored_group_self_membership(&self.state.label, &group_id_hex)?;
                 let membership = if *voluntary || existing == Some(SelfMembership::Left) {
                     SelfMembership::Left
+                } else if self.account_keeps_a_leaf(group_id)? {
+                    SelfMembership::DeviceRemoved
                 } else {
                     SelfMembership::Removed
                 };
@@ -6942,6 +6944,16 @@ impl AppClient {
         Ok(routes_dirty)
     }
 
+    /// Whether this device's copy of the group is removed while the account
+    /// still has a leaf in it: a removal of this device alone, which is not a
+    /// removal of the account from the group (mdk#2628 D62). A removed copy
+    /// keeps the members the removal left.
+    pub(crate) fn account_keeps_a_leaf(&self, group_id: &GroupId) -> Result<bool, AppError> {
+        let record = self.runtime.group_record(group_id)?;
+        let self_id = self.runtime.self_id();
+        Ok(record.removed && record.members.iter().any(|member| member.id == self_id))
+    }
+
     /// Restore departed projections from canonical local-device state, without a timeline invitation.
     /// An outstanding local leave remains a departure intent even before its proposal merges.
     pub(crate) fn reconcile_canonical_self_membership(
@@ -6949,11 +6961,11 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<bool, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        if !matches!(
-            self.app
-                .stored_group_self_membership(&self.state.label, &group_id_hex)?,
-            Some(SelfMembership::Left | SelfMembership::Removed)
-        ) || self.runtime.group_record(group_id)?.is_terminal()
+        if !self
+            .app
+            .stored_group_self_membership(&self.state.label, &group_id_hex)?
+            .is_some_and(SelfMembership::departed)
+            || self.runtime.group_record(group_id)?.is_terminal()
             || self.has_local_group_deletion_frontier(group_id)?
             || self
                 .runtime
@@ -6977,11 +6989,10 @@ impl AppClient {
     /// Canonical restoration repairs membership while preserving local archive intent.
     fn restore_canonical_self_membership(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let departed = matches!(
-            self.app
-                .stored_group_self_membership(&self.state.label, &group_id_hex)?,
-            Some(SelfMembership::Left | SelfMembership::Removed)
-        );
+        let departed = self
+            .app
+            .stored_group_self_membership(&self.state.label, &group_id_hex)?
+            .is_some_and(SelfMembership::departed);
         if !departed {
             return Ok(false);
         }

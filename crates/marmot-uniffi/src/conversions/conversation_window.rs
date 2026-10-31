@@ -25,6 +25,10 @@ pub enum ConversationParticipationFfi {
     Removed,
     Disbanded,
     Unavailable,
+    /// This device's leaf was removed while the account keeps another device
+    /// in the conversation. Not a removal from the conversation: show no
+    /// "removed from group" notice for it.
+    DeviceRemoved,
 }
 impl From<app::conversation_presentation::ConversationParticipation>
     for ConversationParticipationFfi
@@ -41,6 +45,9 @@ impl From<app::conversation_presentation::ConversationParticipation>
             app::conversation_presentation::ConversationParticipation::Disbanded => Self::Disbanded,
             app::conversation_presentation::ConversationParticipation::Unavailable => {
                 Self::Unavailable
+            }
+            app::conversation_presentation::ConversationParticipation::DeviceRemoved => {
+                Self::DeviceRemoved
             }
         }
     }
