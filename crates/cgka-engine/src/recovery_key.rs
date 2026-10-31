@@ -147,7 +147,7 @@ mod tests {
         let other = derive_recovery_key_pair(&crypto, &[8; RECOVERY_ENTROPY_LEN]).unwrap();
         assert_eq!(first.public.len(), 32);
         assert_eq!(first.public, again.public);
-        assert_eq!(first.private.as_ref(), again.private.as_ref());
+        assert_eq!(*first.private, *again.private);
         assert_ne!(first.public, other.public);
     }
 
@@ -172,7 +172,7 @@ mod tests {
             ),
         ] {
             let pair = derive_recovery_key_pair(&crypto, &entropy).unwrap();
-            assert_eq!(hex::encode(pair.private.as_ref()), private);
+            assert_eq!(hex::encode(&*pair.private), private);
             assert_eq!(hex::encode(&pair.public), public);
         }
     }

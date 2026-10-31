@@ -38,7 +38,7 @@ fn entropy_of(shown: &RecoveryWords) -> [u8; 16] {
 /// The recovery key pair `shown`'s words derive: (public, private).
 fn key_pair_of(shown: &RecoveryWords) -> (Vec<u8>, Vec<u8>) {
     let pair = derive_recovery_key_pair(&RustCrypto::default(), &entropy_of(shown)).unwrap();
-    (pair.public, pair.private.as_ref().to_vec())
+    (pair.public, pair.private.to_vec())
 }
 
 /// Make and confirm new words on `device`; the public key they derive.
