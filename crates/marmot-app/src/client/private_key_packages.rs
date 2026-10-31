@@ -729,16 +729,19 @@ impl AppClient {
     }
 
     /// Nothing goes out until this device's own leaf is tagged, since its
-    /// sibling would refuse it. A Welcome carried by a 461 this process sent
-    /// waits for that 461's outcome; one carried before the app last stopped
-    /// is sent again, since its 461 may never have left. One from a slot
-    /// other than this device's, or to a device the roster no longer lists,
-    /// waits until it expires.
+    /// sibling would refuse it. Each 461 goes out only while the device group
+    /// would take a commit from this device, so the send publishes at the
+    /// epoch whose tag was read and never queues behind a commit that may
+    /// change it. A Welcome carried by a 461 this process sent waits for that
+    /// 461's outcome; one carried before the app last stopped is sent again,
+    /// since its 461 may never have left. One from a slot other than this
+    /// device's, or to a device the roster no longer lists, waits until it
+    /// expires.
     async fn try_send_owed_sibling_welcomes(&mut self, held: &[GroupId]) -> Result<(), AppError> {
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
-        if held.contains(&exchange.group_id) || !exchange.tagged {
+        if !exchange.tagged {
             return Ok(());
         }
         let mut sent = 0usize;
@@ -746,6 +749,12 @@ impl AppClient {
             .runtime
             .owed_sibling_welcomes(Timestamp(unix_now_seconds()))?
         {
+            if !self
+                .runtime
+                .device_group_takes_commit(&exchange.group_id, held)?
+            {
+                break;
+            }
             if let Some(carrier) = &owed.carrier
                 && (self.sibling_welcome_carriers.contains(carrier)
                     || !self
@@ -798,7 +807,9 @@ impl AppClient {
     /// Settle every sibling Welcome a 461 in `effects` carried: delivered
     /// once published, owed again once it reached no one. A 461 goes only
     /// to the device group this device tags from, so effects from other
-    /// groups read nothing.
+    /// groups read nothing. Each carrier leaves the in-flight set before the
+    /// engine settles it, so one whose settling fails reads as carried
+    /// before this run and the next pass sends its Welcome again.
     pub(crate) fn settle_sibling_welcome_carriers(
         &mut self,
         effects: &marmot_session::AccountDeviceEffects,
@@ -824,6 +835,9 @@ impl AppClient {
         if published.is_empty() && failed.is_empty() {
             return;
         }
+        for carrier in published.iter().chain(&failed) {
+            self.sibling_welcome_carriers.remove(carrier);
+        }
         let result = self
             .runtime
             .owed_sibling_welcomes(Timestamp(0))
@@ -838,10 +852,7 @@ impl AppClient {
                     } else if failed.contains(&carrier) {
                         self.runtime
                             .sibling_welcome_send_failed(&owed.id, &carrier)?;
-                    } else {
-                        continue;
                     }
-                    self.sibling_welcome_carriers.remove(&carrier);
                 }
                 Ok(())
             });

@@ -29,7 +29,7 @@ use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::private_key_packages::SiblingWelcome;
 use crate::provider::EngineOpenMlsProvider;
-use cgka_traits::app_components::{DeviceSlotId, DeviceTagClaim};
+use cgka_traits::app_components::DeviceSlotId;
 use cgka_traits::engine::{KeyPackage, SendResult, SiblingKeyPackage};
 use cgka_traits::engine_state::{EpochState, InvalidTransition, StagedCommitHandle};
 use cgka_traits::error::EngineError;
@@ -348,10 +348,11 @@ impl<S: StorageProvider> Engine<S> {
     /// Check the siblings a same-account Add names, as device-group.md
     /// ("Sibling Welcomes") needs them, and settle what their sibling
     /// Welcomes carry. This device must be tagged in the device group it
-    /// trusts. Each KeyPackage, already checked to be this account's, names no
-    /// publication (D14), and its device tag reads as its named slot in that
-    /// roster: another roster device, one KeyPackage each. The chat names one
-    /// to 16 relays for the new member to fetch from.
+    /// trusts. Each KeyPackage names no publication (D14) and passes the check
+    /// a hand-off from its named slot passes: this account's, single-use,
+    /// unexpired, its device tag reading as that slot in that roster, another
+    /// roster device, one KeyPackage each. The chat names one to 16 relays for
+    /// the new member to fetch from.
     fn sibling_welcome_plan(
         &self,
         mls_group: &MlsGroup,
@@ -372,13 +373,14 @@ impl<S: StorageProvider> Engine<S> {
             if !slots.insert(sibling.slot) {
                 return Err(refused("two KeyPackages name the same sibling"));
             }
-            if crate::key_package::key_package_device_tag_claim(&sibling.key_package, own.roster())?
-                != DeviceTagClaim::Device(sibling.slot)
-            {
-                return Err(refused(
-                    "the KeyPackage's device tag does not read as the named sibling",
-                ));
-            }
+            crate::private_key_packages::validate_received_private_key_package(
+                &sibling.key_package,
+                self.identity.self_id(),
+                own.roster(),
+                &sibling.slot,
+                self.wall_clock.now().0,
+            )
+            .map_err(|error| refused(&error.to_string()))?;
         }
         let relays: Vec<String> = crate::group_lifecycle::welcome_relays_for_group(mls_group)?
             .unwrap_or_default()

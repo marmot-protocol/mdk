@@ -1171,7 +1171,11 @@ async fn deliver_group_messages_letting_projection_fail(
 /// A second connection to the phone's account database, for a test to make
 /// one of its writes or reads fail.
 fn phone_database(devices: &Devices) -> rusqlite::Connection {
-    let app = &devices.phone_app;
+    account_database(&devices.phone_app)
+}
+
+/// A second connection to `app`'s account database.
+fn account_database(app: &MarmotApp) -> rusqlite::Connection {
     let path = app.account_storage_path("alice");
     let keys = app.account_home().load_signing_keys("alice").unwrap();
     let key = app
@@ -1386,6 +1390,83 @@ async fn a_sibling_welcome_in_flight_is_not_sent_again() {
     );
     deliver_all(&mut devices.phone, &devices.relay).await;
     assert_eq!(stashed(&devices.phone), 0);
+}
+
+/// A 461 whose publication cannot be settled, because the engine write
+/// fails, leaves the in-flight set anyway: the next pass finds its carrier
+/// from no 461 of this run, so it sends the Welcome again, and settles that
+/// one delivered. The phone joins the chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_whose_settling_fails_is_sent_again() {
+    let (mut devices, _) = tagging_devices().await;
+    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    add_the_phone_unpublished(&mut devices, &chat).await;
+    let [owed_welcome] = <[_; 1]>::try_from(owed(&devices.laptop)).unwrap();
+    let connection = account_database(&devices.laptop_app);
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_settle BEFORE UPDATE ON cgka_messages
+             WHEN OLD.id = X'{}' AND NEW.state <> OLD.state
+             BEGIN SELECT RAISE(ABORT, 'injected settle failure'); END;",
+            hex::encode(owed_welcome.id.as_slice())
+        ))
+        .unwrap();
+
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    let [unsettled] = <[_; 1]>::try_from(owed(&devices.laptop)).unwrap();
+    let carrier = unsettled.carrier.unwrap();
+    assert!(!devices.laptop.sibling_welcome_carriers.contains(&carrier));
+
+    connection
+        .execute_batch("DROP TRIGGER fail_settle")
+        .unwrap();
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert!(owed(&devices.laptop).is_empty());
+    assert!(devices.laptop.sibling_welcome_carriers.is_empty());
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert!(devices.phone.state_group_record(&chat).is_some());
+}
+
+/// A 461 goes out only while the device group would take a commit from the
+/// laptop, so it never queues behind a commit that may change the tag it
+/// was sent under: a pass while the laptop's own device-group Commit waits
+/// on its publication sends nothing and leaves the Welcome uncarried, and
+/// the pass after that Commit fails sends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_waits_while_the_device_group_is_busy() {
+    let (mut devices, group) = tagging_devices().await;
+    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    add_the_phone_unpublished(&mut devices, &chat).await;
+    let effects = devices
+        .laptop
+        .runtime
+        .session_mut()
+        .send(SendIntent::SelfUpdate { group_id: group })
+        .await
+        .unwrap();
+    let Some(PublishWork::GroupEvolution { pending, .. }) = effects.publish.into_iter().next()
+    else {
+        panic!("expected a group evolution")
+    };
+
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    let [waiting] = <[_; 1]>::try_from(owed(&devices.laptop)).unwrap();
+    assert_eq!(waiting.carrier, None);
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 0);
+
+    devices
+        .laptop
+        .runtime
+        .session_mut()
+        .publish_failed(pending)
+        .await
+        .unwrap();
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert!(owed(&devices.laptop).is_empty());
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 1);
 }
 
 /// A sibling Welcome goes out only once its Add's Commit is published: an

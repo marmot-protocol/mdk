@@ -142,9 +142,10 @@ async fn a_sibling_welcome_is_delivered_only_by_its_carrier() {
 }
 
 /// A sibling Welcome is owed until its KeyPackage expires, when the sibling
-/// drops the key, and then settles unsent.
+/// drops the key. From then on nothing sends it; its row stays as it is, as
+/// an invite Welcome's does past its deadline.
 #[tokio::test]
-async fn a_sibling_welcome_settles_unsent_when_its_key_package_expires() {
+async fn a_sibling_welcome_is_owed_until_its_key_package_expires() {
     let (mut m, mut new) = siblings(1).await;
     let gid = m.gid.clone();
     let sibling = handed(&mut new[0], slot(2), slot(1));
@@ -226,6 +227,17 @@ async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
         slot: slot(2),
         key_package: new_sibling_key_package(&mut m.bob, b"bob").await,
     };
+    // The laptop's own last-resort KeyPackage carries its tag and names no
+    // publication, but no sibling hands one over.
+    let last_resort = SiblingKeyPackage {
+        slot: slot(2),
+        key_package: new[0]
+            .engine
+            .fresh_key_package()
+            .await
+            .unwrap()
+            .with_protocol_profile(ProtocolProfile::Current),
+    };
     let before = (Untouched::of(&m.bob, &gid), rows(&m.bob, &gid));
     let assert_untouched = |bob: &Device| {
         assert_eq!((Untouched::of(bob, &gid), rows(bob, &gid)), before);
@@ -240,18 +252,10 @@ async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
             vec![laptop.clone(), named(&tablet, 2)],
             "two KeyPackages name the same sibling",
         ),
-        (
-            vec![named(&tablet, 2)],
-            "the KeyPackage's device tag does not read as the named sibling",
-        ),
-        (
-            vec![named(&laptop, 9)],
-            "the KeyPackage's device tag does not read as the named sibling",
-        ),
-        (
-            vec![untagged],
-            "the KeyPackage's device tag does not read as the named sibling",
-        ),
+        (vec![named(&tablet, 2)], "not tagged as the sender's"),
+        (vec![named(&laptop, 9)], "not tagged as the sender's"),
+        (vec![untagged], "not tagged as the sender's"),
+        (vec![last_resort], "last resort"),
     ] {
         assert_refused(
             m.bob.engine.send(add_own_devices(&gid, siblings)).await,

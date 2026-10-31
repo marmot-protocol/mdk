@@ -222,11 +222,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   be untagged.
 - Send a sibling Welcome (mdk#2628 3.5b-2, `src/client/private_key_packages.rs`) only once the engine owes it, after
   its Add's Commit confirmed, as a 461 in the trusted device group while this device's leaf there is tagged: right
-  after the Add and in each maintenance pass. Record the 461's app event id on the Welcome before the send. A drain
-  that reports that 461 published marks it delivered (`settle_sibling_welcome_carriers`, from
-  `retain_effect_projection`); one that reports it failed, or a send that errs, leaves it owed for the next pass. A
-  carrier this process did not send was in flight when the app last stopped, so its Welcome is sent again; a second
-  461 joins nothing twice. Never send a delivered one again: resending is 3.5e.
+  after the Add and in each maintenance pass. Send each 461 only while the device group takes a commit from this
+  device (`device_group_takes_commit`), so it publishes at the epoch whose tag was read and never queues behind a
+  commit. Record the 461's app event id on the Welcome before the send. A drain that reports that 461 published marks
+  it delivered (`settle_sibling_welcome_carriers`, from `retain_effect_projection`); one that reports it failed, or a
+  send that errs, leaves it owed for the next pass. A carrier leaves the in-flight set before the engine settles it,
+  and a carrier not in that set was sent before this run or never settled, so its Welcome is sent again; a second 461
+  joins nothing twice. Never send a delivered one again: resending is 3.5e.
 - Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77,
   `src/history_delivery.rs` for the format, `src/client/history_delivery.rs` for both sides). Only the adder sends: the engine records each
   sibling an own confirmed Commit adds (`SiblingAddStorage`), and maintenance owes each its chat's history
