@@ -290,6 +290,8 @@ mod migration_0136_recovery_conversion;
 mod migration_0137_device_renames;
 #[path = "migrations/0138_account_device_history_keys.rs"]
 mod migration_0138_account_device_history_keys;
+#[path = "migrations/0139_app_event_imports.rs"]
+mod migration_0139_app_event_imports;
 #[path = "migrations/0140_private_key_packages.rs"]
 mod migration_0140_private_key_packages;
 #[path = "migrations/0141_sonar_stickers.rs"]
@@ -1156,6 +1158,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0138_account_device_history_keys",
         suspend_foreign_keys: &[],
         apply: migration_0138_account_device_history_keys::apply,
+    },
+    Migration {
+        version: 139,
+        name: "0139_app_event_imports",
+        suspend_foreign_keys: &[],
+        apply: migration_0139_app_event_imports::apply,
     },
     Migration {
         version: 140,

@@ -51,8 +51,14 @@
 //!   it out. A current publication there that this device never authored,
 //!   compared by event id and whatever it holds, is `OwnSlotForeign`: the
 //!   runtime replaces it with a newer KeyPackage of its own, or deletes it by
-//!   id when it is dated too far ahead to outrank (D63). An incomplete read
-//!   still acts on what it found, and the check runs again within the hour.
+//!   id when it is dated too far ahead to outrank (D63). A relay that
+//!   accepted this device's current publication and, read to its end,
+//!   serves nothing in the slot was emptied by a deletion; the runtime
+//!   publishes a new KeyPackage there too, at most once a day and, with a
+//!   device group, only while its roster lists this device. Only a relay's
+//!   finished read shows it empty, even when no relay returned anything
+//!   else. An incomplete read still acts on what it found, and the check
+//!   runs again within the hour.
 //!
 //! Everything here runs only while device groups are on.
 
@@ -66,7 +72,7 @@ use cgka_traits::storage::{
     ANNOUNCED_KEY_PACKAGE_RETENTION_SECS, AnnouncedKeyPackage, AnnouncedKeyPackageStorage as _,
     MaintenanceStorage as _,
 };
-use cgka_traits::{GroupId, MessageId, Timestamp};
+use cgka_traits::{GroupId, MessageId, Timestamp, TransportEndpoint};
 use marmot_session::{ForeignSlotOutcome, ForeignSlotPublication};
 use nostr_directory::OwnSlotRead;
 use storage_sqlite::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord, SqliteAppStorage};
@@ -184,6 +190,9 @@ pub(crate) struct SignInCheckReport {
     /// What the runtime did about publications in this device's slot that
     /// it did not make.
     pub(crate) foreign: ForeignSlotOutcome,
+    /// A relay that accepted this device's current publication serves
+    /// nothing in its slot, so the runtime made a new KeyPackage due.
+    pub(crate) refilling: bool,
 }
 
 /// When an account's devices next check for sign-ins. Ephemeral: a new
@@ -230,12 +239,13 @@ impl SignInNudges {
     }
 }
 
-/// This device's slot and every publication it made that may still be
-/// served there, by event id.
+/// This device's slot, every publication it made that may still be served
+/// there, by event id, and the relays its current one went to.
 #[derive(Debug, Default)]
 struct OwnKeyPackages {
     slot: Option<String>,
     events: BTreeSet<String>,
+    targets: Vec<TransportEndpoint>,
 }
 
 impl AppClient {
@@ -292,10 +302,14 @@ impl AppClient {
             .app
             .read_account_key_package_slots(&self.state.label, own.slot.as_deref())
             .await?;
+        let trusted = self.trusted_device_roster()?;
         if !read.reached {
+            // A relay whose own read finished still shows the slot empty,
+            // though no relay returned any of the account's publications.
+            let roster = trusted.as_ref().map(|(_, roster)| roster);
+            self.refill_own_slot(&own, read.own_slot.as_ref(), roster)?;
             return Err(AppError::DeviceGroupRefused("key_packages_unreachable"));
         }
-        let trusted = self.trusted_device_roster()?;
         let announced = match &trusted {
             Some((group_id, _)) => self.announced_key_packages(group_id)?,
             None => BTreeSet::new(),
@@ -309,6 +323,7 @@ impl AppClient {
             complete: read.complete,
             own_slot_complete: read.own_slot.as_ref().is_none_or(|own| own.complete),
             foreign: ForeignSlotOutcome::default(),
+            refilling: false,
         };
         let mut unrecognized = Vec::new();
         for slot_key_package in read.key_packages {
@@ -366,7 +381,45 @@ impl AppClient {
                     .insert(slot_hex.to_owned(), SlotOutcome::OwnSlot);
             }
         }
+        report.refilling = self.refill_own_slot(&own, read.own_slot.as_ref(), roster.as_ref())?;
         Ok(report)
+    }
+
+    /// Publish a new KeyPackage into this device's slot when a relay that
+    /// accepted its current publication, read to its end, serves nothing
+    /// there, while its device group lists it. See the module docs.
+    fn refill_own_slot(
+        &mut self,
+        own: &OwnKeyPackages,
+        own_read: Option<&OwnSlotRead>,
+        roster: Option<&DeviceRosterV1>,
+    ) -> Result<bool, AppError> {
+        let (Some(slot_hex), Some(own_read)) = (own.slot.as_deref(), own_read) else {
+            return Ok(false);
+        };
+        if !self.listed_as_device(slot_hex, roster)? {
+            return Ok(false);
+        }
+        Ok(self
+            .runtime
+            .refill_emptied_slot(&emptied_targets(&own.targets, &own_read.empty))?)
+    }
+
+    /// Whether this device's device group lets it refill its slot: always
+    /// with no trusted device group, and with one only while its trusted
+    /// roster lists this device's slot as a device. A copy that ended, as
+    /// one does when this device's siblings remove it (3.6b), lists nothing.
+    /// Once the device forgets such a copy, nothing here remembers it: what
+    /// a removed device does with its slot is 3.6b's (its own side).
+    fn listed_as_device(
+        &self,
+        slot_hex: &str,
+        roster: Option<&DeviceRosterV1>,
+    ) -> Result<bool, AppError> {
+        if let Some(roster) = roster {
+            return Ok(roster_slot(slot_hex).is_some_and(|slot| roster.devices.contains_key(&slot)));
+        }
+        Ok(self.trusted_device_group()?.is_none())
     }
 
     /// Check now, for the host, and restart the schedule from this check as
@@ -683,6 +736,11 @@ impl AppClient {
             // its slot empty: there is no slot of its own to read yet.
             slot: Some(lifecycle.stable_slot_id).filter(|slot| !slot.is_empty()),
             events,
+            targets: lifecycle
+                .publication_targets
+                .into_iter()
+                .map(|target| target.endpoint)
+                .collect(),
         })
     }
 }
@@ -800,6 +858,24 @@ fn foreign_slot_publications(
                 created_at: Timestamp(publication.created_at),
             })
         })
+        .collect()
+}
+
+/// Each of `targets`, the relays this device's current publication went to
+/// as its lifecycle names them, that the read found serving nothing in the
+/// slot (`empty`), however the read spelled it.
+fn emptied_targets(
+    targets: &[TransportEndpoint],
+    empty: &[TransportEndpoint],
+) -> Vec<TransportEndpoint> {
+    let empty = empty
+        .iter()
+        .map(|relay| transport_nostr::canonical_relay(relay.as_str()))
+        .collect::<BTreeSet<_>>();
+    targets
+        .iter()
+        .filter(|target| empty.contains(&transport_nostr::canonical_relay(target.as_str())))
+        .cloned()
         .collect()
 }
 
@@ -974,11 +1050,35 @@ mod tests {
         hex::encode([byte; 32])
     }
 
+    /// An empty relay is matched to the publication target that names it,
+    /// however either spells it, and a relay this device never published
+    /// to is no target.
+    #[test]
+    fn an_emptied_relay_is_named_as_its_publication_target() {
+        let endpoint = |url: &str| TransportEndpoint(url.to_owned());
+        let targets = [
+            endpoint("wss://relay.example"),
+            endpoint("wss://kept.example"),
+        ];
+        assert_eq!(
+            emptied_targets(
+                &targets,
+                &[
+                    endpoint("WSS://Relay.Example:443/"),
+                    endpoint("wss://elsewhere.example")
+                ],
+            ),
+            [endpoint("wss://relay.example")]
+        );
+        assert!(emptied_targets(&targets, &[]).is_empty());
+    }
+
     #[test]
     fn a_slot_is_classified_by_its_slot_and_key_package() {
         let own = OwnKeyPackages {
             slot: Some(slot(1)),
             events: BTreeSet::from([event(1)]),
+            ..Default::default()
         };
         let roster = roster();
         let none = Default::default();

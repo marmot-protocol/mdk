@@ -1203,6 +1203,8 @@ fn accepted_activity_order_sql(group_id_expression: &str) -> String {
     let accepted_activity_filter = chat_list_activity_filter_sql("accepted.");
     // Walk newest insertions first; the first eligible row is the high water.
     // CROSS JOIN keeps the ordered source index outside the timeline lookup.
+    // A row imported from a sibling's history is older history, not new
+    // activity, so it never displaces a pending send (mdk#2628 4.2a).
     format!(
         "SELECT accepted_source.insert_order
          FROM app_events AS accepted_source INDEXED BY idx_app_events_accepted_insert_order
@@ -1216,6 +1218,11 @@ fn accepted_activity_order_sql(group_id_expression: &str) -> String {
            AND NOT (
                accepted.direction = 'sent'
                AND accepted.source_message_id_hex IS NULL
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM app_event_imports AS imported
+               WHERE imported.group_id_hex = accepted_source.group_id_hex
+                 AND imported.message_id_hex = accepted_source.message_id_hex
            )
          ORDER BY accepted_source.insert_order DESC
          LIMIT 1"
@@ -1903,6 +1910,10 @@ fn reconcile_unread_messages_tx(
 
 // Edits affect presentation, while mention eligibility stays on the original message.
 const ORIGINAL_PLAINTEXT_SQL: &str = "COALESCE((SELECT original.plaintext FROM app_events AS original WHERE original.group_id_hex=message_timeline.group_id_hex AND original.message_id_hex=message_timeline.message_id_hex), plaintext)";
+/// A row imported from a sibling's history never counts as unread (mdk#2628
+/// 4.2a). The read marker stays this device's own read, so an import never
+/// moves it.
+const NOT_IMPORTED_SQL: &str = "NOT EXISTS (SELECT 1 FROM app_event_imports AS imported WHERE imported.group_id_hex=message_timeline.group_id_hex AND imported.message_id_hex=message_timeline.message_id_hex)";
 
 /// WHERE clause + parameters selecting rows that sort after a conversation's
 /// read cursor: the single definition of "unread" shared by the projection
@@ -1977,7 +1988,7 @@ fn unread_membership_for_message_tx(
          FROM message_timeline
          WHERE group_id_hex = ?1 AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2 AND message_id_hex = ?3
            AND {activity_filter} AND deleted = 0
-           AND invalidation_status IS NULL AND {where_sql}"
+           AND invalidation_status IS NULL AND {NOT_IMPORTED_SQL} AND {where_sql}"
     );
     let mut query_params = vec![
         rusqlite::types::Value::Text(group_id_hex.to_owned()),
@@ -2045,6 +2056,7 @@ fn rebuild_unread_membership_tx(
            AND deleted = 0
            AND invalidation_status IS NULL
            AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2
+           AND {NOT_IMPORTED_SQL}
            AND {where_sql}
          ORDER BY {order_sql}"
     );
@@ -2159,6 +2171,7 @@ fn retention_expiry_scan_tx(
                     AND invalidation_status IS NULL
                     AND sender NOT IN (SELECT public_key FROM user_blocks)
                     AND sender != ?2
+                    AND {NOT_IMPORTED_SQL}
                     AND message_id_hex IN (
                         SELECT message_id_hex FROM app_events
                         WHERE group_id_hex = ?1 AND retention_expires_at <= ?3)
@@ -2174,13 +2187,17 @@ fn retention_expiry_scan_tx(
         }
         // No read cursor yet: stay conservative, as the replaced page scan
         // did, and treat every expired received row as unread rather than
-        // guessing what the account has seen.
+        // guessing what the account has seen. An imported row is never
+        // unread, so it expires on time.
         _ => timeline_exists_tx(
             tx,
             "SELECT EXISTS(SELECT 1 FROM app_events
                       WHERE group_id_hex = ?1
                         AND direction = 'received'
-                        AND retention_expires_at <= ?2)",
+                        AND retention_expires_at <= ?2
+                        AND NOT EXISTS (SELECT 1 FROM app_event_imports AS imported
+                            WHERE imported.group_id_hex = app_events.group_id_hex
+                              AND imported.message_id_hex = app_events.message_id_hex))",
             &[group, now],
         )?,
     };

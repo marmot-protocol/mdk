@@ -90,6 +90,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("agent_stream_publisher_sequences", Side::App),
     ("agent_stream_starts", Side::App),
     ("app_epoch_stall_evidence", Side::App),
+    ("app_event_imports", Side::App),
     ("app_events", Side::App),
     ("app_group_recovery_failures", Side::App),
     ("app_installed_sticker_packs", Side::App),

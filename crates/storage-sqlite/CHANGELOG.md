@@ -27,8 +27,8 @@
   `started_fresh`, and `trust_device_group`, which makes a device group
   trusted and takes its roster as this device's first in one transaction.
   `insert_device_group` and `set_device_group_trust` now refuse a trusted
-  state. The numbers below 148 that are not yet used (139 and 145) belong to
-  other work, which lands later; the runner applies them in order.
+  state. The number below 148 that is not yet used (145) belongs to other
+  work, which lands later; the runner applies it in order.
 - Migration 0147 advances account storage to schema 147 (mdk#2628 item
   3.6b). `SelfMembership` adds `DeviceRemoved`, stored as `device_removed`:
   this device's leaf was removed from a chat the account stays in. The
@@ -119,6 +119,19 @@
   does. `SqliteAppStorage` gains `record_device_removal`, which keeps a
   decision already recorded, `device_removals` and
   `set_device_removal_slot_withdrawn`. No rows are seeded.
+- Migration 0139 (mdk#2628 item 4.2a) runs on every account database that
+  lacks it, including one already at schema 146. It adds `app_event_imports`,
+  which marks each app event imported from a sibling's history with the roster
+  slot of the device that sent it. `SqliteAppStorage::import_app_events`
+  records only events the account does not hold, as received rows with their
+  epoch and no transport id, and `app_event_import_source` reads the mark. An
+  imported review label or admin removal takes the sender's verdict
+  (`ImportedAppEvent::moderation_grant`) and has no authority without one.
+  Unread counts and the retention sweep's unread check skip imported rows, so
+  they never count as unread and expire on time; the read marker never moves
+  for them. `history_export_page` reads a chat's app events in chat order
+  (epoch, `created_at`, id) for a history bundle, with no event for each row
+  that must stay out.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`

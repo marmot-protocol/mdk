@@ -21,23 +21,35 @@
 //!   the request goes out, and put back if no relay accepts.
 //! - Otherwise the finding lives in memory only: the host reads the slot
 //!   again at open, and finds any foreign publication still there.
-//! - **Known gap.** A deletion a relay honored but never acknowledged, or
-//!   one made while a replacement is already on its way, can leave that
-//!   relay's slot empty until the weekly refresh: the rollback assumes no
-//!   acknowledgement means nothing was deleted, and promoting the in-flight
-//!   replacement reschedules the refresh. Reading the slot cannot show the
-//!   gap, since an empty slot holds no foreign publication. The slot
-//!   withdrawal's rollback has the same gap. A read that refills a relay
-//!   that accepted this device's latest publication but serves nothing is
-//!   mdk#2628's follow-up under 3.4.
+//! - **An emptied slot.** A relay that accepted this device's current
+//!   publication can come to serve nothing in the slot: it honored a
+//!   deletion by id it never acknowledged, or one made while a replacement
+//!   was already on its way; it honored a slot withdrawal that rolled back
+//!   for want of an acknowledgement; or someone holding the account key
+//!   deleted the slot by its address. No foreign publication shows it, so
+//!   the host also hands over each relay whose read of the slot finished and
+//!   returned nothing there, and
+//!   [`AccountDeviceRuntime::refill_emptied_slot`] makes a new KeyPackage
+//!   due when one of them accepted the current publication. A new one, not
+//!   the current one again: a deletion by address covers every publication
+//!   in the slot up to its time, the current one included. Only a
+//!   publication at least a day old is refilled. A refill is a new
+//!   publication, so a relay that accepts KeyPackages and keeps none costs a
+//!   KeyPackage a day, not one per read or per restart.
 
-use cgka_traits::{MessageId, Timestamp, TransportAdapter};
+use cgka_traits::{
+    MessageId, Timestamp, TransportAdapter, TransportEndpoint, TransportFanoutAttemptState,
+};
 
 use super::{AccountDeviceRuntime, KEY_PACKAGE_MAX_FUTURE_SKEW_SECS, TRACE_TARGET};
 use crate::error::AccountResult;
 use crate::key_package::{KeyPackageEventDeletion, KeyPackagePublisher};
 use crate::routing::TransportRoutingPolicy;
 use cgka_traits::KeyPackageLifecycleState;
+
+/// How old this device's current publication must be before a relay that
+/// serves nothing in the slot gets a new one.
+const SLOT_REFILL_MIN_AGE_SECS: u64 = 24 * 60 * 60;
 
 /// A current publication in this device's slot that this device did not
 /// make, as the host's read of the slot found it.
@@ -111,6 +123,65 @@ where
             }
         }
         Ok(outcome)
+    }
+
+    /// Make a new KeyPackage due, which maintenance publishes, when one of
+    /// `empty`, the relays whose read of this device's slot finished and
+    /// returned nothing there, accepted this device's current publication.
+    /// Nothing happens while a replacement is on its way or already due,
+    /// while the slot is withdrawn or maintenance is paused, or while the
+    /// current publication is less than a day old. Returns whether one was
+    /// made due.
+    pub fn refill_emptied_slot(&mut self, empty: &[TransportEndpoint]) -> AccountResult<bool> {
+        if empty.is_empty() || self.key_package_slot_withdrawn || self.maintenance_paused {
+            return Ok(false);
+        }
+        let Some(lifecycle) = self.session.key_package_lifecycle()? else {
+            return Ok(false);
+        };
+        let Some(published) = lifecycle
+            .authored_event_id
+            .as_ref()
+            .and(lifecycle.authored_event_created_at)
+        else {
+            return Ok(false);
+        };
+        if lifecycle.pending_replacement.is_some()
+            || self.current_publication_superseded(&lifecycle)
+        {
+            return Ok(false);
+        }
+        let emptied = lifecycle
+            .publication_targets
+            .iter()
+            .filter(|target| {
+                target.state == TransportFanoutAttemptState::Accepted
+                    && empty.contains(&target.endpoint)
+            })
+            .count();
+        if emptied == 0 {
+            return Ok(false);
+        }
+        let now = self.wall_clock.now();
+        if now.0 < published.0.saturating_add(SLOT_REFILL_MIN_AGE_SECS) {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                method = "refill_emptied_slot",
+                relay_count = emptied,
+                "relays that accepted this device's key package serve nothing in its slot; it is less than a day old, so waiting"
+            );
+            return Ok(false);
+        }
+        if self.make_refresh_due(now)?.is_none() {
+            return Ok(false);
+        }
+        tracing::warn!(
+            target: TRACE_TARGET,
+            method = "refill_emptied_slot",
+            relay_count = emptied,
+            "relays that accepted this device's key package serve nothing in its slot; publishing a new one"
+        );
+        Ok(true)
     }
 
     /// Whether this device's publication at `created_at` no longer stands in

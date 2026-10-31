@@ -136,16 +136,16 @@ pub use app::stickers::{
     StoredStickerOutboxEvent, StoredStickerPack, StoredStickerPackVersion,
 };
 pub use app::timeline::{
-    BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
+    AppEventImport, BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
     ConversationAccountSnapshot, ConversationAnchor, ConversationOpenAnchorOutcome,
     ConversationOpenError, ConversationOpenQuery, ConversationOpenReadState,
     ConversationOpenSnapshot, ConversationOpenTarget, ConversationPresentationPage,
-    ConversationWindowQuery, DeletionSource, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
-    SecurePruneAppEventsResult, StoredAppEvent, TimelineEditHistoryPage, TimelineEditSummary,
-    TimelineEditVersion, TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord,
-    TimelineMessageTarget, TimelinePage, TimelinePagination, TimelineProjectionUpdate,
-    TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
-    TimelineUserReaction,
+    ConversationWindowQuery, DeletionSource, HistoryExportEvent, HistoryExportRow,
+    ImportedAppEvent, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT, SecurePruneAppEventsResult,
+    StoredAppEvent, TimelineEditHistoryPage, TimelineEditSummary, TimelineEditVersion,
+    TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord, TimelineMessageTarget,
+    TimelinePage, TimelinePagination, TimelineProjectionUpdate, TimelineReactionSummary,
+    TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
 };
 pub use app::transport::prepared_group_image_upload::{
     ACTIVE_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS,

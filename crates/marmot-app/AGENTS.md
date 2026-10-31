@@ -37,7 +37,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and gossip, with announces and join windows in `push/announce.rs`, repair replies in `push/repair.rs`, and
   notification-trigger publishing),
   `retention.rs` (the engine-owned retention sweep policy, the
-  storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `history_notices.rs` ("history may be incomplete"
+  storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `chat_history.rs` (a
+  chat's history exported as sealed bundles and a sibling's bundle imported, never for a device group), `history_notices.rs` ("history may be incomplete"
   notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
   in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
@@ -140,7 +141,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   NIP-01's rule, valid or not. One whose event id is none of this device's current, pending or retained events is
   foreign (`OwnSlotForeign`); an older event of its own is a lagging relay, which fanout retry owns. `check_sign_ins`
   hands foreign ones to `replace_foreign_slot_publications`, which publishes a newer KeyPackage or, for one dated past
-  the skew window, asks the relays to delete it by id (D63). An incomplete own-slot read is retried within the hour.
+  the skew window, asks the relays to delete it by id (D63). It also hands over each relay whose own read finished and
+  returned nothing in the slot (`OwnSlotRead::empty`), named as the lifecycle's publication targets name it, to
+  `refill_emptied_slot`, which publishes a new KeyPackage when one accepted the current publication, while this
+  device's trusted roster, if it has one, lists it as a device (`listed_as_device`). A failed or unfinished read never
+  shows a relay empty. An incomplete own-slot read is retried within the hour.
 - The compromise warning (`src/client/compromise_warning.rs`, mdk#2628 3.7a, D53) is storage's
   (`account_compromise_warning_items`): every `not_me` slot and rejected KeyPackage in the trusted roster, plus this
   device's own rejected sign-ins, gathered with insert-or-ignore so a seen mark survives branch selection dropping and
@@ -731,7 +736,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `user_blocks.rs` (block policy and NIP-51 sync), `moderation_reports.rs` (private NIP-59-wrapped NIP-56 reports
   to the deployment operator: config validation, staged outbox, retry, purge; tests in
   `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
-  `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
+  `history_bundle.rs` (the history bundle's encoding, filling in chat order and sealing; tests in
+  `history_bundle/tests.rs`), `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
   `nostr_verification.rs` (stateless public-event verification), `relay_caps.rs` (each relay's NIP-11
   `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `profile_pseudonyms.rs` (cosmetic display names; not a
