@@ -74,6 +74,7 @@ pub(crate) mod audit_v5_probe;
 mod chat_history;
 #[cfg(feature = "test-policy-overrides")]
 pub use chat_history::DevSealedHistoryBundle;
+pub(crate) mod backups;
 pub(crate) mod compromise_warning;
 pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
@@ -451,9 +452,33 @@ pub(crate) fn preserve_encrypted_media_upload_error(
     error
 }
 
+/// Whether this device holds an epoch's media secret.
+enum EpochMediaSecret {
+    Available(SecretBytes),
+    /// Retired or never held here; the error says which.
+    Unavailable(AppError),
+}
+
+/// What opens a prepared download: the source epoch's media secret, or the
+/// file's own key, imported with a sibling's history (mdk#2628 4.2a).
+#[derive(Clone)]
+pub(crate) enum MediaDownloadKey {
+    EpochSecret(SecretBytes),
+    File(zeroize::Zeroizing<[u8; 32]>),
+}
+
+impl MediaDownloadKey {
+    fn as_key(&self) -> crate::media::MediaKey<'_> {
+        match self {
+            Self::EpochSecret(secret) => crate::media::MediaKey::EpochSecret(secret.as_ref()),
+            Self::File(key) => crate::media::MediaKey::File(key),
+        }
+    }
+}
+
 pub(crate) struct EncryptedMediaDownloadHttp {
     reference: MediaAttachmentReference,
-    media_secret: SecretBytes,
+    key: MediaDownloadKey,
     default_blob_endpoints: Vec<AppBlobEndpoint>,
     allowed_locator_kinds: Vec<String>,
     transport: BlossomHttpTransport,
@@ -469,12 +494,17 @@ pub(crate) enum AcquiredMediaBody {
 }
 
 impl EncryptedMediaDownloadHttp {
+    #[cfg(all(test, feature = "test-policy-overrides"))]
+    pub(crate) fn opens_with_imported_key(&self) -> bool {
+        matches!(self.key, MediaDownloadKey::File(_))
+    }
+
     pub(crate) async fn run_acquisition(
         self,
         resume: crate::media::attachment_resume::AttachmentResume,
     ) -> Result<AcquiredMediaBody, crate::media::AttachmentDownloadFailure> {
         let reference = self.reference.clone();
-        let secret = self.media_secret.clone();
+        let key = self.key.clone();
         let endpoints = self.default_blob_endpoints.clone();
         let kinds = self.allowed_locator_kinds.clone();
         let transport = self.transport.clone();
@@ -494,7 +524,7 @@ impl EncryptedMediaDownloadHttp {
                 resume.phase(0).await?;
                 let file = crate::media::file_transfer::download_file(
                     reference,
-                    secret.as_ref(),
+                    key.as_key(),
                     &endpoints,
                     &kinds,
                     &transport,
@@ -520,7 +550,7 @@ impl EncryptedMediaDownloadHttp {
         let transport = self.transport.with_resume(resume.clone());
         let result = crate::media::download_encrypted_media_classified(
             self.reference,
-            self.media_secret.as_ref(),
+            self.key.as_key(),
             &self.default_blob_endpoints,
             &self.allowed_locator_kinds,
             &transport,
@@ -544,7 +574,7 @@ impl EncryptedMediaDownloadHttp {
     ) -> Result<MediaDownloadResult, AppError> {
         download_encrypted_media_with_transport(
             self.reference,
-            self.media_secret.as_ref(),
+            self.key.as_key(),
             &self.default_blob_endpoints,
             &self.allowed_locator_kinds,
             &self.transport,
@@ -801,6 +831,10 @@ pub struct AppClient {
     /// incomplete"): one small entry per parked occurrence, compared at each
     /// publication seam so a change raises `HistoryNoticesChanged`.
     pub(crate) history_notice_baseline: Option<history_notices::HistoryNoticeBaseline>,
+    /// The recovery runner's survey changed what is catching up since hosts
+    /// last heard; the worker's account-level seam drains it into one
+    /// `RecoveryStatusChanged` (mdk#2660 phase 4). Only a runner sets it.
+    pub(crate) recovery_status_owed: bool,
     /// The linked devices may have changed since hosts last heard: a hidden
     /// device-group event, a change of trust, or an open, which cannot know
     /// what hosts last read. The worker's account-level and applied-summary
@@ -810,6 +844,9 @@ pub struct AppClient {
     /// pass that judges differently owes hosts a `LinkedDevicesChanged`.
     /// `None` until a pass has judged.
     pub(crate) inactive_siblings: Option<std::collections::BTreeSet<String>>,
+    /// Recovery words shown and not yet confirmed (mdk#2628 4.4a): in memory
+    /// only, until they are confirmed or cancelled, or the client closes.
+    pub(crate) pending_recovery_words: Option<backups::PendingRecoveryWords>,
     /// The last overdue-refresh answer a maintenance pass computed, and
     /// whether hosts owe a `KeyPackageRefreshOverdueChanged`. The flag starts
     /// set, since a fresh client cannot know what hosts last read.
@@ -3797,10 +3834,11 @@ impl AppClient {
     ///
     /// For each row carrying `'member'`, it asks the engine for the group's
     /// roster (`runtime.members`, sourced from the hydrated Marmot record's
-    /// post-merge member set) and plans `Removed` only when this device's own
-    /// leaf is gone: the local account id is absent, or the engine has marked
-    /// the copy removed while a sibling device keeps the account on the
-    /// roster. A pending publication, engine error, or malformed id aborts
+    /// post-merge member set) and plans a departure only when this device's own
+    /// leaf is gone: `Removed` when the local account id is absent, and
+    /// `DeviceRemoved` when the engine has marked the copy removed while a
+    /// sibling device keeps the account on the roster (mdk#2628 D62). A
+    /// pending publication, engine error, or malformed id aborts
     /// before any plan is written, so uncertainty never suppresses. The work is
     /// gated behind a once-only account-import marker, so subsequent opens are
     /// a single marker read and the hot path stays projection-only.
@@ -3868,18 +3906,21 @@ impl AppClient {
                     return Ok(());
                 }
             };
-            reconciliation.push((
-                group_id_hex,
-                copy_removed || local_account_removed_from_roster(&members, &local_account_id_hex),
-            ));
+            let account_removed =
+                local_account_removed_from_roster(&members, &local_account_id_hex);
+            let membership = if copy_removed && !account_removed {
+                Some(SelfMembership::DeviceRemoved)
+            } else if copy_removed || account_removed {
+                Some(SelfMembership::Removed)
+            } else {
+                None
+            };
+            reconciliation.push((group_id_hex, membership));
         }
-        for (group_id_hex, removed) in reconciliation {
-            if removed {
-                self.app.set_group_self_membership(
-                    &self.state.label,
-                    &group_id_hex,
-                    SelfMembership::Removed,
-                )?;
+        for (group_id_hex, membership) in reconciliation {
+            if let Some(membership) = membership {
+                self.app
+                    .set_group_self_membership(&self.state.label, &group_id_hex, membership)?;
             }
         }
         self.app.mark_account_import_complete(
@@ -5715,13 +5756,29 @@ impl AppClient {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) fn prepare_background_attachment_download(
+        &self,
+        group_id: &GroupId,
+        reference: MediaAttachmentReference,
+        max_bytes: u64,
+    ) -> Result<Option<EncryptedMediaDownloadHttp>, AppError> {
+        self.prepare_background_attachment_download_for_message(
+            group_id, None, reference, max_bytes,
+        )
+    }
+
     /// Storage-only preparation for automatic work. Received-message projection
     /// caches each message's source-epoch secret and sync warms current epochs;
     /// missing/retired epoch material cannot trigger engine hydration here.
     /// Queued explicit work first calls `cache_attachment_source_epoch_secret`.
-    pub(crate) fn prepare_background_attachment_download(
+    /// Without a cached secret, only the key a sibling sent with this very
+    /// message (`message_id_hex`, when this device imported it) opens it; a
+    /// message this device received waits for its secret.
+    pub(crate) fn prepare_background_attachment_download_for_message(
         &self,
         group_id: &GroupId,
+        message_id_hex: Option<&str>,
         reference: MediaAttachmentReference,
         max_bytes: u64,
     ) -> Result<Option<EncryptedMediaDownloadHttp>, AppError> {
@@ -5736,26 +5793,34 @@ impl AppClient {
             .endpoint_policy()?;
         let version = EncryptedMediaVersion::parse(&reference.version)?;
         let storage = self.app.account_storage(&self.state.label)?;
-        if !storage
+        let secret = if storage
             .app_storage()
             .encrypted_media_epoch_secret_may_be_served(
                 &hex::encode(group_id.as_slice()),
                 reference.source_epoch,
+            )? {
+            self.cached_encrypted_media_epoch_secret(
+                group_id,
+                version.component_id(),
+                reference.source_epoch,
             )?
-        {
-            return Ok(None);
-        }
-        let Some(secret) = self.cached_encrypted_media_epoch_secret(
-            group_id,
-            version.component_id(),
-            reference.source_epoch,
-        )?
-        else {
-            return Ok(None);
+        } else {
+            None
+        };
+        let key = match secret {
+            Some(secret) => MediaDownloadKey::EpochSecret(SecretBytes::new(secret)),
+            None => match message_id_hex
+                .map(|message| self.imported_media_file_key(group_id, message, &reference))
+                .transpose()?
+                .flatten()
+            {
+                Some(key) => MediaDownloadKey::File(key),
+                None => return Ok(None),
+            },
         };
         Ok(Some(EncryptedMediaDownloadHttp {
             reference,
-            media_secret: SecretBytes::new(secret),
+            key,
             default_blob_endpoints: policy.default_blob_endpoints,
             allowed_locator_kinds: policy.allowed_locator_kinds,
             transport: self
@@ -5770,15 +5835,51 @@ impl AppClient {
     /// explicit work (Retry, download again) needs this for references projected
     /// before their source epoch was cached. Reads live engine state only: an
     /// unhydrated group errors instead of hydrating.
+    /// A message this device imported (mdk#2628 4.2a) downloads with the key
+    /// its sibling sent when the epoch's secret is unavailable here; storage
+    /// and engine failures still fail.
     pub(crate) fn cache_attachment_source_epoch_secret(
         &self,
         group_id: &GroupId,
+        message_id_hex: &str,
         reference: &MediaAttachmentReference,
     ) -> Result<(), AppError> {
         self.ensure_group(group_id)?;
         let component_id = EncryptedMediaVersion::parse(&reference.version)?.component_id();
-        self.encrypted_media_secret_for_epoch(group_id, reference.source_epoch, component_id)?;
-        Ok(())
+        match self.encrypted_media_secret_if_available(
+            group_id,
+            reference.source_epoch,
+            component_id,
+        )? {
+            EpochMediaSecret::Available(_) => Ok(()),
+            EpochMediaSecret::Unavailable(_)
+                if self
+                    .imported_media_file_key(group_id, message_id_hex, reference)?
+                    .is_some() =>
+            {
+                Ok(())
+            }
+            EpochMediaSecret::Unavailable(error) => Err(error),
+        }
+    }
+
+    /// The key a sibling sent for `reference` with the imported chat message
+    /// `message_id_hex` (mdk#2628 4.2a). A received message has none.
+    fn imported_media_file_key(
+        &self,
+        group_id: &GroupId,
+        message_id_hex: &str,
+        reference: &MediaAttachmentReference,
+    ) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .imported_media_file_key(
+                &hex::encode(group_id.as_slice()),
+                message_id_hex,
+                &reference.ciphertext_sha256.to_ascii_lowercase(),
+            )?)
     }
 
     pub(crate) async fn prepare_encrypted_media_download(
@@ -5793,14 +5894,30 @@ impl AppClient {
         // row contains its source-epoch exporter. Adopted V1 -> V2 migration
         // deliberately leaves historical V1 references as V1.
         let reference_version = EncryptedMediaVersion::parse(&reference.version)?;
-        let media_secret = self.encrypted_media_secret_for_epoch(
+        // The host names no message, so an imported message's file opens with
+        // the chat's one imported key for its ciphertext (mdk#2628 4.2a), and
+        // only when the epoch's secret is unavailable here.
+        let key = match self.encrypted_media_secret_if_available(
             group_id,
             reference.source_epoch,
             reference_version.component_id(),
-        )?;
+        )? {
+            EpochMediaSecret::Available(secret) => MediaDownloadKey::EpochSecret(secret),
+            EpochMediaSecret::Unavailable(error) => match self
+                .app
+                .account_storage(&self.state.label)?
+                .app_storage()
+                .imported_media_file_key_for_ciphertext(
+                    &hex::encode(group_id.as_slice()),
+                    &reference.ciphertext_sha256.to_ascii_lowercase(),
+                )? {
+                Some(key) => MediaDownloadKey::File(key),
+                None => return Err(error),
+            },
+        };
         Ok(EncryptedMediaDownloadHttp {
             reference,
-            media_secret,
+            key,
             default_blob_endpoints: policy.default_blob_endpoints,
             allowed_locator_kinds: policy.allowed_locator_kinds,
             transport: self.blossom_http_transport.clone(),
@@ -6568,12 +6685,15 @@ impl AppClient {
         Ok((epoch.0, secret))
     }
 
-    fn encrypted_media_secret_for_epoch(
+    /// The epoch's media secret, or why this device does not hold it (retired,
+    /// or neither cached nor exportable). Storage and engine failures are
+    /// errors, not unavailability.
+    fn encrypted_media_secret_if_available(
         &self,
         group_id: &GroupId,
         source_epoch: u64,
         component_id: u16,
-    ) -> Result<SecretBytes, AppError> {
+    ) -> Result<EpochMediaSecret, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
         if !self
             .app
@@ -6581,14 +6701,16 @@ impl AppClient {
             .app_storage()
             .encrypted_media_epoch_secret_may_be_served(&group_id_hex, source_epoch)?
         {
-            return Err(AppError::InvalidEncryptedMedia(format!(
-                "encrypted media secret retired for epoch {source_epoch}"
-            )));
+            return Ok(EpochMediaSecret::Unavailable(
+                AppError::InvalidEncryptedMedia(format!(
+                    "encrypted media secret retired for epoch {source_epoch}"
+                )),
+            ));
         }
         if let Some(secret) =
             self.cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
         {
-            return Ok(SecretBytes::new(secret));
+            return Ok(EpochMediaSecret::Available(SecretBytes::new(secret)));
         }
         if let Some(secret) = self.exportable_encrypted_media_secret(group_id, source_epoch)? {
             self.remember_encrypted_media_epoch_secret_for_component(
@@ -6600,12 +6722,14 @@ impl AppClient {
             if let Some(secret) =
                 self.cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
             {
-                return Ok(SecretBytes::new(secret));
+                return Ok(EpochMediaSecret::Available(SecretBytes::new(secret)));
             }
         }
-        Err(AppError::InvalidEncryptedMedia(format!(
-            "missing encrypted media secret for epoch {source_epoch}"
-        )))
+        Ok(EpochMediaSecret::Unavailable(
+            AppError::InvalidEncryptedMedia(format!(
+                "missing encrypted media secret for epoch {source_epoch}"
+            )),
+        ))
     }
 
     fn remember_current_encrypted_media_secret(&self, group_id: &GroupId) -> Result<(), AppError> {
@@ -8007,11 +8131,13 @@ mod self_membership_backfill_tests {
         );
     }
 
-    /// A removed copy backfills as removed even while its account stays on the
-    /// roster: another device of the account can keep a leaf after this
-    /// device's own leaf is gone.
+    /// A removed copy whose account stays on the roster backfills as
+    /// `DeviceRemoved`: another device of the account keeps a leaf after this
+    /// device's own leaf is gone, which is not a removal of the account
+    /// (mdk#2628 D62). A removed copy without the account backfills as
+    /// `Removed`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn removed_copy_with_its_account_on_the_roster_backfills_removed() {
+    async fn removed_copy_with_its_account_on_the_roster_backfills_device_removed() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -8020,6 +8146,7 @@ mod self_membership_backfill_tests {
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let removed = client.create_group("removed device", &[]).await.unwrap();
+        let removed_account = client.create_group("removed account", &[]).await.unwrap();
         let live = client.create_group("live device", &[]).await.unwrap();
         let storage = app.account_storage("alice").unwrap();
         storage
@@ -8035,11 +8162,16 @@ mod self_membership_backfill_tests {
                 .any(|member| member.id == client.runtime.self_id())
         );
         storage.put_group(&record).unwrap();
+        let mut record = storage.get_group(&removed_account).unwrap();
+        record.removed = true;
+        record.members.clear();
+        storage.put_group(&record).unwrap();
 
         client.backfill_self_membership_once().unwrap();
 
         for (group_id, membership) in [
-            (&removed, SelfMembership::Removed),
+            (&removed, SelfMembership::DeviceRemoved),
+            (&removed_account, SelfMembership::Removed),
             (&live, SelfMembership::Member),
         ] {
             assert_eq!(

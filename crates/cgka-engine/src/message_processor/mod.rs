@@ -909,6 +909,15 @@ impl<S: StorageProvider> Engine<S> {
             ) {
                 return Err(EngineError::LinkDeviceUnsettled { group_id });
             }
+            // Nor does an account entry replacement: the app answers a backup
+            // change only once it went out or was refused (D75), and a queued
+            // one could be refused at drain after the user was told it was
+            // made, with the words already forgotten. The caller retries. A
+            // re-issue after a lost fork is queued by the engine itself, not
+            // here.
+            if matches!(&intent, SendIntent::ReplaceAccountEntry { .. }) {
+                return Err(EngineError::AccountEntryUnsettled { group_id });
+            }
             // An activation the current state already refuses is answered now,
             // not accepted and then refused at drain.
             if matches!(&intent, SendIntent::EnableAccountDevices { .. }) {
@@ -4140,6 +4149,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::ReplaceDeviceEntry { group_id, .. }
+        | SendIntent::ReplaceAccountEntry { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. }
         | SendIntent::EnableDisbanding { group_id }
         | SendIntent::EnableAccountDevices { group_id }
@@ -4165,6 +4175,7 @@ pub(crate) fn is_fair_scheduled_intent(
         | SendIntent::RemoveMembers { .. }
         | SendIntent::UpdateAppComponents { .. }
         | SendIntent::ReplaceDeviceEntry { .. }
+        | SendIntent::ReplaceAccountEntry { .. }
         | SendIntent::UpdateGroupData { .. }
         | SendIntent::EnableDisbanding { .. }
         | SendIntent::EnableAccountDevices { .. }

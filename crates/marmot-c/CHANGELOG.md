@@ -9,9 +9,29 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `MARMOT_COMPROMISE_WARNING_REASON_REJECTED_KEY_PACKAGE` is now
+  `MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE`, with the
+  same value (mdk#2628 D74, 3.7b): a KeyPackage this device found in its own
+  slot that it did not make, which only this device warns of. Kind 462 is no
+  longer reserved. The device roster changed its encoding, so existing
+  development device groups must be recreated. Use matching regenerated
+  headers and libraries.
+
+- `MarmotSelfMembership` and `MarmotConversationParticipation` add
+  `DeviceRemoved` (mdk#2628 item 3.6b): this device's leaf was removed from a
+  chat the account stays in through another of its devices. Show no "removed
+  from group" notice for it. Handle the new values and use matching
+  regenerated headers and libraries.
+
 - `MarmotGroupEventKind` adds `QueuedIntentRefused { intent_id_hex,
   intent_kind, reason }` (mdk#2694), freed with its event. Handle the new tag
   and use matching regenerated headers and libraries.
+
+- `MarmotHistoryNoticeCause` appends `UnprovenHistory`, and `MarmotEvent`
+  appends `RecoveryStatusChanged { account_id_hex, account_label }`, freed with
+  its event (mdk#2660). Existing values keep their numbers. Handle the new
+  values in exhaustive switches and use matching regenerated headers and
+  libraries. Neither is produced until the recovery runner owns history.
 
 - `marmot_deployment_set_key_package_client_preference` is removed
   (mdk#2628): the KeyPackage `client` tag no longer ranks invite candidates.
@@ -19,6 +39,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_account_recovery_status` writes an owned
+  `MarmotAccountRecoveryStatus`: the groups whose history is still being
+  fetched (`catching_up_group_ids_hex`), whether the inbox's is
+  (`inbox_catching_up`), and every notice (`notices`) (mdk#2660). Free it with
+  `marmot_account_recovery_status_free`, and re-read it on
+  `MARMOT_EVENT_RECOVERY_STATUS_CHANGED`. Until the recovery runner owns
+  history nothing is ever catching up.
 - `MarmotClientOptions` gains a trailing `device_platform`: the platform this
   device runs on, such as "iOS", which each device writes with its client
   label into its own roster entry (mdk#2628 item 3.6). NULL leaves it out.
@@ -111,7 +138,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 ### Changed
 
 - `marmot_send_custom_event` refuses the device-group kinds 457, 459, 460,
-  461, 462, 475 and 476 as reserved, and one received in a chat makes no
+  461, 475 and 476 as reserved, and one received in a chat makes no
   timeline row, message or notification (mdk#2628). They are read only in
   the account's device group.
 - Creating a group or inviting adds every device of each recipient account

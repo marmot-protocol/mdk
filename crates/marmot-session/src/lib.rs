@@ -41,6 +41,7 @@ pub use session::{
 pub use session::{AccountDeviceSession, IngestEffects};
 // Engine items the session's API exposes, re-exported so hosts need not name
 // the engine (mdk#2602).
+pub use session::RECOVERY_ENTROPY_LEN;
 pub use session::{
     AccountIdentityProofRequest, AccountIdentityProofSigner, CanonicalGroupMembership,
     CanonicalizationPolicy, FeatureRegistry, GroupAuthoritySnapshot, KeyPackageMetadata,

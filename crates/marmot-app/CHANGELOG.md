@@ -4,6 +4,25 @@
 
 ### Breaking changes
 
+- The device roster no longer holds rejected KeyPackages, and kind 462 is no
+  longer reserved for an anomaly alert (mdk#2628 D74). The roster's encoding
+  changed under the same component id, so existing development device groups
+  must be recreated: a roster an earlier build wrote no longer decodes.
+  Nothing has shipped it. `CompromiseWarningReason::RejectedKeyPackage` is
+  now `ForeignOwnSlotKeyPackage` (3.7b): a valid KeyPackage of the account
+  that this device found in its own slot and did not make, because its
+  LeafNode's signature key is not this device's. Only that device warns of
+  it, before it replaces the publication; a copy of a KeyPackage it made, an
+  invalid publication or one from before a restored backup never warns.
+
+- `SelfMembership` adds `DeviceRemoved` and `ConversationParticipation` adds
+  `DeviceRemoved` (mdk#2628 item 3.6b): this device's leaf was removed from a
+  chat the account stays in through another of its devices. It is not a
+  removal of the account from the chat, so hosts show no "removed from group"
+  notice; the chat lists with the departed chats and takes no sends.
+  Exhaustive matches add an arm for each. `AppGroupRoster::roster_revision`
+  now steps by four per epoch, so each membership changes it.
+
 - `GroupEvent` adds `QueuedIntentRefused { group_id, intent_id, intent_kind,
   reason }` (mdk#2694), forwarded to hosts as `MarmotAppEvent::GroupEvent`.
   Exhaustive matches add an arm for it.
@@ -16,6 +35,10 @@
   account_label }` (mdk#2628). Exhaustive matches add an arm for it.
 - `MarmotAppEvent` adds `CompromiseWarningChanged { account_id_hex,
   account_label }` (mdk#2628). Exhaustive matches add an arm for it.
+- `HistoryNoticeCause` adds `UnprovenHistory`, and `MarmotAppEvent` adds
+  `RecoveryStatusChanged { account_id_hex, account_label }` (mdk#2660).
+  Exhaustive matches add arms for them. Neither is produced until the recovery
+  runner owns history.
 
 - `MarmotDeployment::key_package_client_preference` and
   `KeyPackageClientPreference` are removed (mdk#2628). The KeyPackage `client`
@@ -24,6 +47,22 @@
 
 ### Added
 
+- `MarmotAppRuntime::begin_recovery_words`, `confirm_recovery_words`,
+  `cancel_recovery_words`, `turn_off_backups` and `backup_settings` set up
+  the recovery words an account's backups will be sealed to, and turn backups
+  off (mdk#2628 item 4.4a, D75). MDK makes 12 BIP-39 English words and holds
+  them in memory only; the user types back the two at the positions MDK
+  picks, and only the key's public half is kept: in the device group's
+  roster, committed as a compare-and-set over the entry this device read, or
+  by a device with no device group until the roster it founds carries it.
+  Turning backups on makes the confirming device the backup writer; new words
+  keep the writer; turning them off clears the writer and the key the same
+  way. MDK never sends a backup change again itself: the engine re-issues one
+  a fork dropped while the entry it was made over still stands, and the
+  runtime retries one the relays refused. A change whose re-issue is refused
+  stays lost; `BackupSettings` shows the roster's account entry as it is now,
+  so the user sees that and can make the change again. Only behind
+  `dev_device_groups`. Nothing writes backups yet.
 - Each device keeps an HPKE history key, generated on first use and stored in
   its encrypted account storage, and writes its public half into its own
   device-group roster entry (`history_key`) so siblings can seal chat history
@@ -41,6 +80,23 @@
   handles a device group. Only through the `test-policy-overrides` hooks
   `dev_export_chat_history` and `dev_import_history_bundle` until the bundle's
   transport lands.
+- History bundles carry a key for each attachment the sending device can open
+  (mdk#2628 item 4.2a). The key is derived from the attachment's epoch media
+  secret, or is the one the sender imported itself, and the epoch secret never
+  goes in a bundle. The receiving device keeps a key only for a message it
+  adds and only when the key names one of that message's attachments.
+  Downloading an imported attachment uses its key when the epoch's secret is
+  not here, so a device that was never in the attachment's epoch can still
+  open it. A message the device received itself never uses an imported key.
+- `MarmotAppRuntime::account_recovery_status(account_ref)` returns an
+  `AccountRecoveryStatus`: the groups whose history is still being fetched,
+  whether the inbox's is, and every notice as `history_notices` lists them
+  (mdk#2660). Re-read it on `RecoveryStatusChanged`. Until the recovery runner
+  owns history nothing is ever catching up, so it holds only the notices.
+- Audit v5 `recovery_need_changed` rows gain cause `unproven_history`: a
+  coverage-ledger route's notice, shown and dismissed, with the route's
+  one-way tag as `obligation_ref` (mdk#2660). Unproduced until the recovery
+  runner owns history; strict v5 receivers must accept it before then.
 - `MarmotAppConfig::device_platform` (`with_device_platform`) names the
   platform this device runs on. Each device writes it and
   `key_package_client_name` into its own roster entry with its next KeyPackage
@@ -113,8 +169,9 @@
   are empty and silent in release builds until the roster's spec lands.
 - `MarmotAppRuntime::compromise_warning` lists the account's open compromise
   warning on this device as `CompromiseWarningItem`s (mdk#2628 item 3.7a):
-  each rejected sign-in or rejected KeyPackage, from this device or its device
-  group's roster, that the user has not seen here. A device's first roster
+  each rejected sign-in, from this device or its device group's roster, and
+  each KeyPackage this device found in its own slot that it did not make,
+  that the user has not seen here. A device's first roster
   counts as seen. `dismiss_compromise_warning` marks everything it gathers as
   seen, on this device only, and `CompromiseWarningChanged` says to re-read.
   `start_fresh` answers every sign-in from before this device Not now, now and
@@ -445,10 +502,10 @@
 ### Fixed
 
 - Kinds sent only in a device group (heartbeat 457, private KeyPackage
-  request 459 and hand-off 460, sibling Welcome 461, anomaly alert 462,
-  small-state update 475 and broadcast request 476) are ignored in any other
-  group (mdk#2628). One received in a chat makes no timeline row, host
-  message or notification, and `send_custom_event` refuses each as reserved
+  request 459 and hand-off 460, sibling Welcome 461, small-state update 475
+  and broadcast request 476) are ignored in any other group (mdk#2628). One
+  received in a chat makes no timeline row, host message or notification,
+  and `send_custom_event` refuses each as reserved
   (`is_reserved_app_event_kind`). The device group itself still reads them.
 - External-signer sticker installs and uninstalls prepare event IDs and
   finish signing before changing local intent. Refused signatures leave

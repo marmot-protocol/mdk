@@ -1128,7 +1128,7 @@ Signed-in local/external accounts, independent of any list or active worker.
 pub async fn compromise_warning( &self, account_ref: String, ) -> Result<Vec<CompromiseWarningItemFfi>, MarmotKitError>
 ```
 
-List the account's open compromise warning on this device: each rejection the user has not seen here, the earliest gathered first. An empty list means no warning is open. A rejection means someone holding the account's signing key, or a session with its remote signer, published where the account's devices did not: a sign-in answered This wasn't me (`RejectedSignIn`), or a KeyPackage one of the account's devices found where they had not published (`RejectedKeyPackage`, with its `key_package_ref_hex`). Later releases add reasons; show one the app does not know as a generic one. The warning gathers this device's rejections and those in its device group's roster, so a rejection made on another device warns here too; rejections already in the first roster this device trusts count as seen. A rejected sign-in leaves the warning once its slot is linked as a device. The app writes the wording, and never says the account's devices stopped them. Read from local state with no network I/O. Always empty in release builds until the roster's spec lands. Refresh on `MarmotEventFfi::CompromiseWarningChanged`, which also fires once each time the account's worker opens, so it may fire with no visible change. Runs on the account worker.
+List the account's open compromise warning on this device: each item the user has not seen here, the earliest gathered first. An empty list means no warning is open. An item means someone holding the account's signing key, or a session with its remote signer, published where the account's devices did not: a sign-in answered This wasn't me (`RejectedSignIn`), or a KeyPackage this device found in its own slot that it did not make (`ForeignOwnSlotKeyPackage`, with its `key_package_ref_hex`; only the device that found it warns of it). Later releases add reasons; show one the app does not know as a generic one. The warning gathers this device's rejections and those in its device group's roster, so a rejection made on another device warns here too; rejections already in the first roster this device trusts count as seen. A rejected sign-in leaves the warning once its slot is linked as a device. The app writes the wording, and never says the account's devices stopped them. Read from local state with no network I/O. Always empty in release builds until the roster's spec lands. Refresh on `MarmotEventFfi::CompromiseWarningChanged`, which also fires once each time the account's worker opens, so it may fire with no visible change. Runs on the account worker.
 
 [Source](src/commands/compromise_warning.rs#L17)
 
@@ -2370,7 +2370,19 @@ pub async fn history_notices( &self, account_ref: String, ) -> Result<Vec<Histor
 
 List the account's "history may be incomplete" notices, oldest first. Each is one parked recovery occurrence: automatic recovery stopped retrying because it could not prove some history complete. `cause` picks the host's wording; `group_id_hex` names the affected group for a group-scoped occurrence (an epoch gap) and is `None` when the account's history as a whole may be incomplete (delivery or notification loss, incremental or explicit history). The list is local and durable, needs no network, and is cheap to re-read: refresh it on `MarmotEventFfi::HistoryNoticesChanged`. A group's own occurrences also appear in `group_recovery_status` as `history_may_be_incomplete` and `history_notice_ids`. Treat `notice_id` as opaque; it changes when new evidence re-arms recovery, so never store it as an identity of a group or account.
 
-[Source](src/commands/history_notice.rs#L13)
+[Source](src/commands/history_notice.rs#L14)
+
+### `Marmot::account_recovery_status`
+
+**Current.**
+
+```rust
+pub async fn account_recovery_status( &self, account_ref: String, ) -> Result<AccountRecoveryStatusFfi, MarmotKitError>
+```
+
+Read the account's recovery in one call: `catching_up_group_ids_hex` lists the groups whose history is still being fetched (lowercase hex, sorted), `inbox_catching_up` says whether the inbox's is, and `notices` holds every notice exactly as `history_notices` lists them. Show the first two as "catching up" and the notices as "history may be incomplete". It reads local state on the account worker, needs no network, and is cheap to re-read: refresh it on `MarmotEventFfi::RecoveryStatusChanged`. Until the recovery runner owns history (mdk#2660) nothing is ever catching up and that event never fires, so the record holds only the notices.
+
+[Source](src/commands/history_notice.rs#L31)
 
 ### `Marmot::dismiss_history_notice`
 
@@ -2382,7 +2394,7 @@ pub async fn dismiss_history_notice( &self, account_ref: String, notice_id: Stri
 
 Dismiss one notice after the user accepts that this history may be incomplete. The dismissal is durable and is recorded as its own outcome, never as recovered history. It retires exactly that occurrence; for delivery or notification loss the transport cursor may advance again once no loss recovery remains pending. Returns `false`, changing nothing, for a stale id (new evidence re-armed recovery, or it was already dismissed); re-read the list and show the current notices. A malformed id is `InvalidHex`. New loss, a higher missing epoch, a later startup comparison or a new explicit repair can raise a new notice with a new id. Runs on the account worker in order with other mutations; it performs no network I/O.
 
-[Source](src/commands/history_notice.rs#L30)
+[Source](src/commands/history_notice.rs#L46)
 
 </details>
 
@@ -2721,7 +2733,7 @@ Edit `target_message_id` by publishing a kind-1009 event that references it and 
 pub async fn send_custom_event( &self, account_ref: String, group_id_hex: String, kind: u64, tags: Vec<Vec<String>>, content: String, ) -> Result<SendSummaryFfi, MarmotKitError>
 ```
 
-Send an app-defined event with an arbitrary non-reserved kind. `tags` and `content` pass through verbatim; kinds MDK owns (chat, reaction, edit, delete, agent, group system, push token, device group: 457, 459, 460, 461, 462, 475, 476) are rejected so an app cannot forge protocol events. Custom events appear in the timeline as standalone rows and can be fetched via `Marmot::messages` with a `kinds` filter.
+Send an app-defined event with an arbitrary non-reserved kind. `tags` and `content` pass through verbatim; kinds MDK owns (chat, reaction, edit, delete, agent, group system, push token, device group: 457, 459, 460, 461, 475, 476) are rejected so an app cannot forge protocol events. Custom events appear in the timeline as standalone rows and can be fetched via `Marmot::messages` with a `kinds` filter.
 
 [Source](src/commands/message.rs#L232)
 
@@ -3975,7 +3987,7 @@ pub fn includes_chat_list_version(&self, version: Arc<ChatListDraftVersionFfi>) 
 
 Compare a chat-list row’s opaque `draft_version` with this captured composer revision. True means the same account store/group and a version no newer than this revision; false includes foreign store/group metadata and newer identical edits. This is presentation correlation, not mutation authorization. Keep both values device-local and use revision-checked cleanup. See [pending-send draft presentation](CHAT-LIST-ROWS.md#pending-send-draft-presentation-0130).
 
-[Source](src/conversions/conversation_window.rs#L340)
+[Source](src/conversions/conversation_window.rs#L347)
 
 </details>
 

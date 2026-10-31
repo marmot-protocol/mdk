@@ -1,18 +1,18 @@
 //! Kinds sent only in a device group (mdk#2628): heartbeats (457), private
-//! KeyPackage requests and hand-offs (459, 460), sibling Welcomes (461),
-//! anomaly alerts (462) and small-state updates and broadcast requests (475,
-//! 476). A device reads them only in the device group it trusts. In an
-//! ordinary chat they make no row, no host message and no notification, and
-//! no host sends one as a custom event.
+//! KeyPackage requests and hand-offs (459, 460), sibling Welcomes (461) and
+//! small-state updates and broadcast requests (475, 476). A device reads them
+//! only in the device group it trusts. In an ordinary chat they make no row,
+//! no host message and no notification, and no host sends one as a custom
+//! event.
 
 use super::*;
 use crate::notifications::{notification_update_from_event, recover_notification_updates};
 
-const DEVICE_GROUP_KINDS: [u64; 7] = [457, 459, 460, 461, 462, 475, 476];
+const DEVICE_GROUP_KINDS: [u64; 6] = [457, 459, 460, 461, 475, 476];
 
 /// Alice cannot send any of them as a custom event, so she sends each the way
 /// a device-group message goes out. Bob's chat shows the custom event and the
-/// chat message she sends after them, and nothing of the four.
+/// chat message she sends after them, and nothing of the five.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn device_group_kinds_in_a_chat_are_ignored_and_never_sent_as_custom_events() {
     let dir = tempfile::tempdir().unwrap();

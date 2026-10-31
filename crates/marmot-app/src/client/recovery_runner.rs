@@ -29,17 +29,20 @@
 //! 6. **Settle** (worker turn): map the quantum's end to the outcome table and
 //!    apply it; then the credit is released.
 //!
-//! Debt units are one per (group route, required relay) (decision 3), plus
-//! one attempt per new debt on each best-effort relay. A unit compares instead
-//! of sweeping when its relay compares and the account already holds events
-//! in the owed ranges. Once no debt unit is eligible, re-check units
-//! ([`recheck`]) compare each required NIP-77 relay's covered and retired
-//! ranges again, on their own schedule.
+//! Debt units are one per (route, required relay) (decision 3), plus one
+//! attempt per new debt on each best-effort relay. A group unit compares
+//! instead of sweeping when its relay compares and the account already holds
+//! events in the owed ranges. The account inbox is only ever compared: many
+//! inbox relays restrict who may read gift wraps, so a short page proves
+//! nothing there, and an inbox relay that will not compare refuses its unit.
+//! Once no debt unit is eligible, re-check units ([`recheck`]) compare each
+//! required NIP-77 relay's covered and retired ranges again, on their own
+//! schedule.
 //!
 //! Each step first admits what staging may release ([`admission`]): per MLS
-//! group, oldest first, up to its admission frontier. The same reads hold back
-//! a relay staging is full for, block every unit of a group admission cannot
-//! drain, and serve fenced groups first.
+//! group, and for the inbox, oldest first, up to its admission frontier. The
+//! same reads hold back a relay staging is full for, block every unit of a
+//! group admission cannot drain, and serve fenced groups first.
 //!
 //! Live tails are a query, never a stored value ([`tails`]): the select and
 //! begin turns each read them fresh, and nothing keeps an answer across an
@@ -55,6 +58,7 @@ mod open_attempts;
 mod policy;
 mod quantum;
 mod recheck;
+mod repair;
 mod select;
 mod tails;
 #[cfg(test)]
@@ -77,7 +81,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::compare::CompareRelay;
-use transport_nostr_adapter::sweep::{RelayCaps, SweepRelay};
+use transport_nostr_adapter::sweep::{RelayCaps, SweepRelay, SweepRoute};
 
 pub(crate) use admission::{Admitted, LiveCount, LiveFence};
 pub(crate) use policy::RecoveryRunnerPolicy;
@@ -135,6 +139,12 @@ impl RunnerRoute {
                     .map(|relay| (relay.as_str(), true)),
             )
     }
+
+    /// Whether its group is suspended (Unrecoverable): its units are not
+    /// scheduled, charged, broken or noticed.
+    pub(crate) fn suspended(&self) -> bool {
+        select::suspended(self)
+    }
 }
 
 /// Routes the caller wants served first. Not `Debug`: it carries routes.
@@ -171,6 +181,8 @@ pub(crate) struct DebtTurn<'a> {
     pub(crate) app: &'a SqliteAppStorage,
     /// The account's current routes, as of this turn.
     pub(crate) routes: &'a [RunnerRoute],
+    /// The account's public key: its inbox's `#p` on the wire.
+    pub(crate) inbox: [u8; 32],
     pub(crate) now: u64,
     pub(crate) tails: &'a dyn LiveTailRead,
     /// The open live REQs' counts, for the fence.
@@ -258,6 +270,9 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
     fn relay_connections(&self) -> Option<watch::Receiver<BTreeMap<String, u64>>> {
         None
     }
+    /// What the last survey found still catching up, for the account's
+    /// recovery status. Called after every survey; the host keeps the last.
+    fn surveyed(&self, catching_up: BTreeSet<UnitKey>);
 }
 
 /// One quantum's result. Not `Debug`: it carries its unit.
@@ -352,13 +367,70 @@ impl Connections {
     }
 }
 
-/// One explicit pass a spawned runner owes a caller.
-struct PassRequest {
-    budget: Duration,
-    reply: oneshot::Sender<PassReport>,
+/// When an explicit pass or repair must end: at its deadline, counted from
+/// the caller's request, or once the caller trips `stop`, which only its
+/// cancel does, so the two ends stay apart. The runner ends on it wherever
+/// it would end on its pass deadline, preempting a quantum in flight, and
+/// settles what it ran.
+#[derive(Clone)]
+pub(crate) struct PassBound {
+    pub(crate) deadline: Instant,
+    pub(crate) stop: CancellationToken,
 }
 
-/// Pass requests a spawned runner holds before it serves them.
+impl PassBound {
+    /// A bound only its deadline ends.
+    pub(crate) fn within(budget: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + budget,
+            stop: CancellationToken::new(),
+        }
+    }
+
+    fn ended(&self) -> bool {
+        self.stop.is_cancelled() || Instant::now() >= self.deadline
+    }
+
+    async fn reached(&self) {
+        tokio::select! {
+            () = tokio::time::sleep_until(self.deadline) => {}
+            () = self.stop.cancelled() => {}
+        }
+    }
+}
+
+/// How a runner-owned explicit repair ended ([`RecoveryRunner::repair`]).
+/// Not `Debug`.
+pub(crate) enum RepairEnd {
+    /// Every current route's window is covered and admitted on each of its
+    /// required relays ([`repair::repaired`]).
+    Covered,
+    /// A pass within the bound served nothing, and the window is not covered.
+    Unproven,
+    /// The bound's deadline came first.
+    Deadline,
+    /// The caller tripped the bound's stop.
+    Cancelled,
+    /// The runner was shut down, or its worker is gone.
+    Stopped,
+    /// The re-arm or the verdict could not use storage.
+    Failed(cgka_traits::storage::StorageError),
+}
+
+/// One explicit request a spawned runner owes a caller, served between its
+/// own steps.
+enum Request {
+    Pass {
+        bound: PassBound,
+        reply: oneshot::Sender<PassReport>,
+    },
+    Repair {
+        bound: PassBound,
+        reply: oneshot::Sender<RepairEnd>,
+    },
+}
+
+/// Requests a spawned runner holds before it serves them.
 const PASS_REQUESTS: usize = 4;
 
 /// The caller's side of a runner: wake it, steer it, ask it for a pass, stop
@@ -367,7 +439,7 @@ const PASS_REQUESTS: usize = 4;
 pub(crate) struct RecoveryRunnerHandle {
     wake: watch::Sender<u64>,
     hints: watch::Sender<PriorityHints>,
-    passes: mpsc::Sender<PassRequest>,
+    passes: mpsc::Sender<Request>,
     signals: Arc<Signals>,
     cancel: CancellationToken,
 }
@@ -403,13 +475,30 @@ impl RecoveryRunnerHandle {
     }
 
     /// Have the spawned task run one explicit pass ([`RecoveryRunner::run_pass`])
-    /// once its current step ends, and wait for its report. `None` once the
-    /// runner has stopped. Never await this on the account worker: the pass
-    /// runs worker turns.
+    /// once its current step ends, within what is left then of `budget`, and
+    /// wait for its report. `None` once the runner has stopped. Never await
+    /// this on the account worker: the pass runs worker turns.
     pub(crate) async fn run_pass(&self, budget: Duration) -> Option<PassReport> {
         let (reply, report) = oneshot::channel();
-        self.passes.send(PassRequest { budget, reply }).await.ok()?;
+        let bound = PassBound::within(budget);
+        self.passes
+            .send(Request::Pass { bound, reply })
+            .await
+            .ok()?;
         report.await.ok()
+    }
+
+    /// Have the spawned task serve one explicit repair
+    /// ([`RecoveryRunner::repair`]) once its current step ends, and wait for
+    /// how it ended. `None` once the runner has stopped. Never await this on
+    /// the account worker: the repair runs worker turns.
+    pub(crate) async fn repair(&self, bound: PassBound) -> Option<RepairEnd> {
+        let (reply, end) = oneshot::channel();
+        self.passes
+            .send(Request::Repair { bound, reply })
+            .await
+            .ok()?;
+        end.await.ok()
     }
 
     /// Events re-checks have found inside ranges already covered, since the
@@ -427,7 +516,7 @@ pub(crate) struct RecoveryRunner<H> {
     signals: Arc<Signals>,
     wake: watch::Receiver<u64>,
     hints: watch::Receiver<PriorityHints>,
-    passes: mpsc::Receiver<PassRequest>,
+    passes: mpsc::Receiver<Request>,
     cancel: CancellationToken,
     memory: Memory,
     admission: admission::Memory,
@@ -505,7 +594,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     async fn run(mut self) {
         loop {
             if let Ok(request) = self.passes.try_recv() {
-                self.serve_pass(request).await;
+                self.serve(request).await;
                 continue;
             }
             self.wake.borrow_and_update();
@@ -520,7 +609,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => break,
-                Some(request) = self.passes.recv() => self.serve_pass(request).await,
+                Some(request) = self.passes.recv() => self.serve(request).await,
                 changed = self.wake.changed() => if changed.is_err() { break },
                 changed = self.hints.changed() => if changed.is_err() { break },
                 () = Connections::published(&mut self.connections) => {}
@@ -530,10 +619,16 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         tracing::debug!(target: TARGET, method = "run", "recovery runner stopped");
     }
 
-    /// One caller's explicit pass on the spawned task.
-    async fn serve_pass(&mut self, request: PassRequest) {
-        let report = self.run_pass(request.budget).await;
-        let _ = request.reply.send(report);
+    /// One caller's explicit request on the spawned task.
+    async fn serve(&mut self, request: Request) {
+        match request {
+            Request::Pass { bound, reply } => {
+                let _ = reply.send(self.run_pass_within(&bound).await);
+            }
+            Request::Repair { bound, reply } => {
+                let _ = reply.send(self.repair(&bound).await);
+            }
+        }
     }
 
     /// One step: admit, then select, credit, begin, quantum, stage, settle.
@@ -548,11 +643,15 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     /// cuts gives its request in flight up to the sweep's interrupt grace
     /// (`INTERRUPT_GRACE`) to report what it read.
     pub(crate) async fn run_pass(&mut self, budget: Duration) -> PassReport {
-        let deadline = Instant::now() + budget;
+        self.run_pass_within(&PassBound::within(budget)).await
+    }
+
+    /// As [`Self::run_pass`], until `bound` ends.
+    async fn run_pass_within(&mut self, bound: &PassBound) -> PassReport {
         self.memory.new_round();
         let mut report = PassReport::default();
-        while Instant::now() < deadline {
-            match self.step_within(Some(deadline), false).await {
+        while !bound.ended() {
+            match self.step_within(Some(bound), false).await {
                 Step::Ran(summary) => {
                     report.quanta += 1;
                     if summary.outcome == RecoveryUnitOutcome::Advanced {
@@ -566,18 +665,18 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         report
     }
 
-    async fn step_within(&mut self, pass_deadline: Option<Instant>, new_round: bool) -> Step {
+    async fn step_within(&mut self, pass: Option<&PassBound>, new_round: bool) -> Step {
         if self.cancel.is_cancelled() {
             return Step::Stopped;
         }
         self.note_reconnects();
-        if let Some(step) = self.take_reconnects(pass_deadline).await {
+        if let Some(step) = self.take_reconnects(pass).await {
             return step;
         }
         let admission::Drained {
             due: admission_due,
             stalled,
-        } = match self.admit(pass_deadline).await {
+        } = match self.admit(pass).await {
             Ok(drained) => drained,
             Err(step) => return step,
         };
@@ -604,6 +703,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 };
             }
         };
+        self.host.surveyed(std::mem::take(&mut survey.catching_up));
         let now = self.host.now_seconds();
         if let Some(step) = self.report_pause(survey.paused_until, now).await {
             return step;
@@ -622,23 +722,23 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let credit = tokio::select! {
             biased;
             () = self.cancel.cancelled() => return Step::Stopped,
-            () = sleep_until(pass_deadline) => return Step::Idle { next_due: None },
+            () = pass_end(pass) => return Step::Idle { next_due: None },
             credit = recovery_credits::acquire_recovery_credit(&self.credits) => credit,
         };
-        let step = self.quantum(candidate, pass_deadline).await;
+        let step = self.quantum(candidate, pass).await;
         drop(credit);
         step
     }
 
     /// Begin, run, stage and settle one quantum on `candidate`, holding a
     /// credit.
-    async fn quantum(&mut self, candidate: Candidate, pass_deadline: Option<Instant>) -> Step {
+    async fn quantum(&mut self, candidate: Candidate, pass: Option<&PassBound>) -> Step {
         if candidate.recheck {
-            return self.recheck(candidate, pass_deadline).await;
+            return self.recheck(candidate, pass).await;
         }
         let policy = self.policy;
         let caps = match self
-            .bounded(pass_deadline, self.host.relay_caps(&candidate.key.relay))
+            .bounded(pass, self.host.relay_caps(&candidate.key.relay))
             .await
         {
             Ok(caps) => caps,
@@ -681,7 +781,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         };
         let deadline = Instant::now() + policy.quantum;
         let ranges = plan.ranges.len();
-        // The pass deadline preempts the quantum as shutdown does. The sweep's
+        // The pass's end preempts the quantum as shutdown does. The sweep's
         // own deadline stays the quantum's, so a cut pass reads as a
         // preemption, never as the relay's verdict.
         let preempt = self.cancel.child_token();
@@ -705,13 +805,15 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             tokio::pin!(run);
             tokio::select! {
                 ran = &mut run => ran,
-                () = sleep_until(pass_deadline) => {
+                () = pass_end(pass) => {
                     preempt.cancel();
                     run.await
                 }
             }
         };
-        if facts.is_some_and(|facts| compare::would_not_compare(facts.end)) {
+        if let (Some(compared), Some(facts)) = (&plan.compare, facts)
+            && compare::would_not_compare(compared, facts.end)
+        {
             self.memory.would_not_compare(&candidate.key.relay);
         }
         let open = self.open.clone();
@@ -760,10 +862,10 @@ impl<H: RunnerHost> RecoveryRunner<H> {
 
     /// Begin, run, stage and settle one re-check quantum on `candidate`,
     /// holding a credit.
-    async fn recheck(&mut self, candidate: Candidate, pass_deadline: Option<Instant>) -> Step {
+    async fn recheck(&mut self, candidate: Candidate, pass: Option<&PassBound>) -> Step {
         let policy = self.policy;
         let caps = match self
-            .bounded(pass_deadline, self.host.relay_caps(&candidate.key.relay))
+            .bounded(pass, self.host.relay_caps(&candidate.key.relay))
             .await
         {
             Ok(caps) => caps,
@@ -807,13 +909,13 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             tokio::pin!(run);
             tokio::select! {
                 ran = &mut run => ran,
-                () = sleep_until(pass_deadline) => {
+                () = pass_end(pass) => {
                     preempt.cancel();
                     run.await
                 }
             }
         };
-        if compare::would_not_compare(facts.end) {
+        if compare::would_not_compare(&plan.compare, facts.end) {
             self.memory.would_not_compare(&candidate.key.relay);
         }
         let open = self.open.clone();
@@ -878,15 +980,12 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     /// again (a known change re-arms the units planned with other caps). The
     /// survey that follows reads fresh tails, so a reconnect's new tail, which
     /// starts at its EOSE, leaves the downtime owed as ordinary sweep debt.
-    /// A shutdown or the pass deadline during a caps read leaves that relay
+    /// A shutdown or the pass's end during a caps read leaves that relay
     /// and the rest for the next step. Returns the step to end with, if any.
-    async fn take_reconnects(&mut self, pass_deadline: Option<Instant>) -> Option<Step> {
+    async fn take_reconnects(&mut self, pass: Option<&PassBound>) -> Option<Step> {
         let mut relays = std::mem::take(&mut *self.reconnected());
         while let Some(relay) = relays.pop_first() {
-            let caps = match self
-                .bounded(pass_deadline, self.host.relay_caps(&relay))
-                .await
-            {
+            let caps = match self.bounded(pass, self.host.relay_caps(&relay)).await {
                 Ok(caps) => caps.map(recovery_caps),
                 Err(step) => {
                     relays.insert(relay);
@@ -971,16 +1070,16 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     }
 
     /// Await `read` off the worker unless the runner shuts down or the pass
-    /// deadline comes first.
+    /// ends first.
     async fn bounded<T>(
         &self,
-        pass_deadline: Option<Instant>,
+        pass: Option<&PassBound>,
         read: impl std::future::Future<Output = T>,
     ) -> Result<T, Step> {
         tokio::select! {
             biased;
             () = self.cancel.cancelled() => Err(Step::Stopped),
-            () = sleep_until(pass_deadline) => Err(Step::Idle { next_due: None }),
+            () = pass_end(pass) => Err(Step::Idle { next_due: None }),
             value = read => Ok(value),
         }
     }
@@ -1046,6 +1145,17 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     }
 }
 
+/// What `route` asks relays for: its group's `#h`, or the account inbox's
+/// gift wraps by `inbox`, the account's key.
+fn fetch_route(route: &TransportReconciliationRoute, inbox: [u8; 32]) -> SweepRoute {
+    match route {
+        TransportReconciliationRoute::Group(nostr_group_id) => SweepRoute::Group {
+            nostr_group_id: *nostr_group_id,
+        },
+        TransportReconciliationRoute::Inbox => SweepRoute::Inbox { pubkey: inbox },
+    }
+}
+
 fn recovery_caps(caps: RelayCaps) -> RecoveryRelayCaps {
     RecoveryRelayCaps {
         max_limit: caps.max_limit,
@@ -1068,9 +1178,10 @@ async fn sleep_for(duration: Option<Duration>) {
     }
 }
 
-async fn sleep_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
+/// Once `pass` ends; never without one.
+async fn pass_end(pass: Option<&PassBound>) {
+    match pass {
+        Some(pass) => pass.reached().await,
         None => std::future::pending().await,
     }
 }

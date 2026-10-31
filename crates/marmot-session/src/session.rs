@@ -28,6 +28,7 @@ pub use cgka_engine::private_key_packages::{
     PRIVATE_KEY_PACKAGE_STOCK_TARGET, PrivateKeyPackageHandOff, PrivateKeyPackageRequest,
     SiblingWelcome, private_key_package_stock, validate_received_private_key_package,
 };
+pub use cgka_engine::recovery_key::RECOVERY_ENTROPY_LEN;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{
     AppComponentId, AppComponentSet, DeviceRosterV1, DeviceTagClaim, default_group_components,
@@ -1482,6 +1483,11 @@ impl AccountDeviceSession {
         Ok(self.engine.reissue_superseded_own_commits_from_state()?)
     }
 
+    /// See `Engine::owes_superseded_own_commit_reissue`.
+    pub fn owes_superseded_own_commit_reissue(&self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.engine.owes_superseded_own_commit_reissue(group_id)?)
+    }
+
     pub async fn retry_rejoins_after_trusted_removal(&mut self) -> SessionResult<bool> {
         Ok(self.engine.retry_rejoins_after_trusted_removal().await?)
     }
@@ -1808,6 +1814,37 @@ impl AccountDeviceSession {
         Ok(self.engine.open_history(context, sealed)?)
     }
 
+    /// See [`cgka_engine::engine::Engine::recovery_public_key`].
+    pub fn recovery_public_key(
+        &self,
+        entropy: &[u8; RECOVERY_ENTROPY_LEN],
+    ) -> SessionResult<Vec<u8>> {
+        Ok(self.engine.recovery_public_key(entropy)?)
+    }
+
+    /// See [`cgka_engine::engine::Engine::seal_to_recovery_key`].
+    pub fn seal_to_recovery_key(
+        &self,
+        recovery_public_key: &[u8],
+        context: &[u8],
+        plaintext: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.engine
+            .seal_to_recovery_key(recovery_public_key, context, plaintext)
+    }
+
+    /// See [`cgka_engine::engine::Engine::open_with_recovery_key`].
+    pub fn open_with_recovery_key(
+        &self,
+        entropy: &[u8; RECOVERY_ENTROPY_LEN],
+        context: &[u8],
+        sealed: &[u8],
+    ) -> SessionResult<Option<Vec<u8>>> {
+        Ok(self
+            .engine
+            .open_with_recovery_key(entropy, context, sealed)?)
+    }
+
     /// See `CgkaEngine::withdraw_device_group_welcome`.
     pub fn withdraw_device_group_welcome(
         &mut self,
@@ -1948,6 +1985,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::ReplaceDeviceEntry { .. } => "replace_device_entry",
+        SendIntent::ReplaceAccountEntry { .. } => "replace_account_entry",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",

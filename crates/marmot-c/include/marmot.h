@@ -505,12 +505,15 @@ typedef enum MarmotEncryptedMediaVersion {
 
 /**
  * Whether the local account is still a member of this group, and if
- * not, whether it left voluntarily or was removed.
+ * not, whether it left voluntarily or was removed. `DeviceRemoved`: this
+ * device's leaf was removed while the account keeps another device in
+ * the group, which is not a removal from the group.
  */
 typedef enum MarmotSelfMembership {
   MARMOT_SELF_MEMBERSHIP_MEMBER,
   MARMOT_SELF_MEMBERSHIP_LEFT,
   MARMOT_SELF_MEMBERSHIP_REMOVED,
+  MARMOT_SELF_MEMBERSHIP_DEVICE_REMOVED,
 } MarmotSelfMembership;
 
 /**
@@ -555,7 +558,9 @@ typedef enum MarmotSendMaintenanceDisposition {
 
 /**
  * Why recovery parked. Current policy parks only the first five;
- * `KnownEvent` and `MaintenanceBoundary` are reserved.
+ * `KnownEvent` and `MaintenanceBoundary` are reserved, and
+ * `UnprovenHistory` is not raised until the recovery runner owns
+ * history (mdk#2660).
  */
 typedef enum MarmotHistoryNoticeCause {
   /**
@@ -587,6 +592,12 @@ typedef enum MarmotHistoryNoticeCause {
    * A post-join maintenance boundary was never observed.
    */
   MARMOT_HISTORY_NOTICE_CAUSE_MAINTENANCE_BOUNDARY,
+  /**
+   * The recovery runner could not prove this history on a route's
+   * relays and stopped retrying them: a group's (`group_id_hex` names
+   * it) or the account inbox's.
+   */
+  MARMOT_HISTORY_NOTICE_CAUSE_UNPROVEN_HISTORY,
 } MarmotHistoryNoticeCause;
 
 /**
@@ -1197,6 +1208,7 @@ typedef enum MarmotConversationParticipation {
   MARMOT_CONVERSATION_PARTICIPATION_REMOVED,
   MARMOT_CONVERSATION_PARTICIPATION_DISBANDED,
   MARMOT_CONVERSATION_PARTICIPATION_UNAVAILABLE,
+  MARMOT_CONVERSATION_PARTICIPATION_DEVICE_REMOVED,
 } MarmotConversationParticipation;
 
 typedef enum MarmotConversationAnchorKind {
@@ -1471,10 +1483,10 @@ typedef enum MarmotCompromiseWarningReason {
    */
   MARMOT_COMPROMISE_WARNING_REASON_REJECTED_SIGN_IN,
   /**
-   * A KeyPackage one of the account's devices found where they had
-   * not published, and rejected.
+   * A KeyPackage this device found in its own slot that it did not
+   * make. This device has replaced it.
    */
-  MARMOT_COMPROMISE_WARNING_REASON_REJECTED_KEY_PACKAGE,
+  MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE,
 } MarmotCompromiseWarningReason;
 
 typedef struct MarmotAccountAttachmentCursor MarmotAccountAttachmentCursor;
@@ -2803,6 +2815,21 @@ typedef struct MarmotHistoryNoticeList {
 } MarmotHistoryNoticeList;
 
 /**
+ * The account's recovery: `catching_up_group_ids_hex` lists the groups
+ * whose history is still being fetched (lowercase hex, sorted),
+ * `inbox_catching_up` whether the inbox's is, and `notices` every
+ * current notice. Nothing is catching up until the recovery runner owns
+ * history (mdk#2660).
+ */
+typedef struct MarmotAccountRecoveryStatus {
+  char **catching_up_group_ids_hex;
+  uintptr_t catching_up_group_ids_hex_len;
+  bool inbox_catching_up;
+  struct MarmotHistoryNotice *notices;
+  uintptr_t notices_len;
+} MarmotAccountRecoveryStatus;
+
+/**
  * One of this account's own devices, as the roster of the device group
  * this device trusts lists it. `slot_id_hex` (64 lowercase hex
  * characters) is the handle actions on the device take. `label`,
@@ -2877,10 +2904,12 @@ typedef struct MarmotUnrecognizedSignInList {
  * One thing the open compromise warning gathers. `reason` is a
  * `MarmotCompromiseWarningReason` discriminant carried as `uint32_t`, so
  * a host can show a value it does not know as a generic reason.
- * `slot_id_hex` is the KeyPackage slot the rejection names.
- * `key_package_ref_hex` is set only for `RejectedKeyPackage`.
- * `occurred_at` is when the rejection was made, in Unix seconds, as the
- * device that made it wrote it.
+ * `slot_id_hex` is the KeyPackage slot the item names: the rejected
+ * sign-in's, or this device's own for a KeyPackage found there.
+ * `key_package_ref_hex` is set only for `ForeignOwnSlotKeyPackage`.
+ * `occurred_at` is in Unix seconds: when the rejection was made, as the
+ * device that made it wrote it, or when this device found the
+ * KeyPackage.
  */
 typedef struct MarmotCompromiseWarningItem {
   uint32_t reason;
@@ -5854,6 +5883,12 @@ typedef enum MarmotEvent_Tag {
    * fire with no visible change.
    */
   MARMOT_EVENT_DEVICE_LINK_CHANGED,
+  /**
+   * The account's recovery status may have changed; re-read
+   * `marmot_account_recovery_status`. Carries no group identities. Not
+   * raised until the recovery runner owns history (mdk#2660).
+   */
+  MARMOT_EVENT_RECOVERY_STATUS_CHANGED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -5950,6 +5985,11 @@ typedef struct MarmotEvent_DeviceLinkChanged_Body {
   char *account_label;
 } MarmotEvent_DeviceLinkChanged_Body;
 
+typedef struct MarmotEvent_RecoveryStatusChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_RecoveryStatusChanged_Body;
+
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
   union {
@@ -5969,6 +6009,7 @@ typedef struct MarmotEvent {
     MarmotEvent_UnrecognizedSignInsChanged_Body UNRECOGNIZED_SIGN_INS_CHANGED;
     MarmotEvent_CompromiseWarningChanged_Body COMPROMISE_WARNING_CHANGED;
     MarmotEvent_DeviceLinkChanged_Body DEVICE_LINK_CHANGED;
+    MarmotEvent_RecoveryStatusChanged_Body RECOVERY_STATUS_CHANGED;
   };
 } MarmotEvent;
 
@@ -7944,6 +7985,22 @@ MarmotStatus marmot_decline_group_rejoin(const struct MarmotClient *client,
 MarmotStatus marmot_history_notices(const struct MarmotClient *client,
                                     const char *account_ref,
                                     struct MarmotHistoryNoticeList **out);
+
+/**
+ * Read the account's recovery status: the groups whose history is still
+ * being fetched, whether the inbox's is, and every notice. Re-read on the
+ * `RecoveryStatusChanged` event. Free with
+ * `marmot_account_recovery_status_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_account_recovery_status(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            struct MarmotAccountRecoveryStatus **out);
 
 /**
  * Dismiss one notice once the user accepts the history may be incomplete.
@@ -13454,6 +13511,16 @@ void marmot_group_recovery_status_free(struct MarmotGroupRecoveryStatus *ptr);
  * library.
  */
 void marmot_history_notice_list_free(struct MarmotHistoryNoticeList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_account_recovery_status_free(struct MarmotAccountRecoveryStatus *ptr);
 
 /**
  * Free a list returned by this library. NULL is a no-op.

@@ -304,12 +304,18 @@ mod migration_0143_device_activity;
 mod migration_0144_announced_key_packages;
 #[path = "migrations/0146_device_removals.rs"]
 mod migration_0146_device_removals;
+#[path = "migrations/0147_device_removed_membership.rs"]
+mod migration_0147_device_removed_membership;
 #[path = "migrations/0148_compromise_warning.rs"]
 mod migration_0148_compromise_warning;
 #[path = "migrations/0160_sibling_welcomes.rs"]
 mod migration_0160_sibling_welcomes;
 #[path = "migrations/0161_small_state.rs"]
 mod migration_0161_small_state;
+#[path = "migrations/0162_imported_media_file_keys.rs"]
+mod migration_0162_imported_media_file_keys;
+#[path = "migrations/0163_backup_recovery_key.rs"]
+mod migration_0163_backup_recovery_key;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1202,6 +1208,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0146_device_removals::apply,
     },
     Migration {
+        version: 147,
+        name: "0147_device_removed_membership",
+        suspend_foreign_keys: &[],
+        apply: migration_0147_device_removed_membership::apply,
+    },
+    Migration {
         version: 148,
         name: "0148_compromise_warning",
         suspend_foreign_keys: &[],
@@ -1218,6 +1230,18 @@ const MIGRATIONS: &[Migration] = &[
         name: "0161_small_state",
         suspend_foreign_keys: &[],
         apply: migration_0161_small_state::apply,
+    },
+    Migration {
+        version: 162,
+        name: "0162_imported_media_file_keys",
+        suspend_foreign_keys: &[],
+        apply: migration_0162_imported_media_file_keys::apply,
+    },
+    Migration {
+        version: 163,
+        name: "0163_backup_recovery_key",
+        suspend_foreign_keys: &[],
+        apply: migration_0163_backup_recovery_key::apply,
     },
 ];
 

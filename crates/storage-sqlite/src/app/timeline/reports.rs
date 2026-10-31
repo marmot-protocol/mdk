@@ -1331,6 +1331,7 @@ mod tests {
             created_at: e.recorded_at,
             retention: None,
             moderation_grant: grant,
+            file_keys: Vec::new(),
         }
     }
     // mdk#2628 4.2a: an imported control takes the sending device's verdict,

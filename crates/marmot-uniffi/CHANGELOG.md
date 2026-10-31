@@ -4,6 +4,18 @@
 
 ### Breaking changes
 
+- `CompromiseWarningReasonFfi::RejectedKeyPackage` is now
+  `ForeignOwnSlotKeyPackage` (mdk#2628 D74, 3.7b): a KeyPackage this device
+  found in its own slot that it did not make, which only this device warns
+  of. Kind 462 is no longer reserved. The device roster changed its encoding,
+  so existing development device groups must be recreated.
+
+- `SelfMembershipFfi` and `ConversationParticipationFfi` add `DeviceRemoved`
+  (mdk#2628 item 3.6b): this device's leaf was removed from a chat the account
+  stays in through another of its devices. Show no "removed from group"
+  notice for it. Update exhaustive Swift/Kotlin handling and regenerate
+  bindings with the matching native library.
+
 - `GroupEventKindFfi` adds `QueuedIntentRefused { intent_id_hex, intent_kind,
   reason }` (mdk#2694): a send that waited for the group to settle was dropped
   because the settled state refused it; tell the user, who may try again.
@@ -28,6 +40,10 @@
 - `MarmotEventFfi` adds `CompromiseWarningChanged { account_id_hex,
   account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
   regenerate bindings with the matching native library.
+- `HistoryNoticeCauseFfi` adds `UnprovenHistory`, and `MarmotEventFfi` adds
+  `RecoveryStatusChanged { account_id_hex, account_label }` (mdk#2660). Update
+  exhaustive Swift/Kotlin handling and regenerate bindings with the matching
+  native library. Neither is produced until the recovery runner owns history.
 
 - `MarmotKitError` adds `AccountDevicesActivationRefused { group_id_hex, reason }`
   for an `enable_account_devices` call the group cannot take now (mdk#2628).
@@ -64,6 +80,13 @@
   `StickerFfi.plaintext_sha256` is the exact hash a `StickerRefFfi` carries.
 
 ### Added
+
+- `account_recovery_status(account_ref)` returns an `AccountRecoveryStatusFfi`:
+  the groups whose history is still being fetched (`catching_up_group_ids_hex`),
+  whether the inbox's is (`inbox_catching_up`), and every notice as
+  `history_notices` lists them (mdk#2660). Re-read it on
+  `RecoveryStatusChanged`. Until the recovery runner owns history nothing is
+  ever catching up.
 
 - `MarmotOptions.devicePlatform` names the platform this device runs on, such
   as `iOS`. With `clientName`, each device writes it into its own roster
@@ -133,8 +156,8 @@
 
 ### Changed
 
-- `send_custom_event` refuses the device-group kinds 457, 459, 460, 461, 462,
-  475 and 476 as reserved, and one received in a chat makes no timeline row,
+- `send_custom_event` refuses the device-group kinds 457, 459, 460, 461, 475
+  and 476 as reserved, and one received in a chat makes no timeline row,
   message or notification (mdk#2628). They are read only in the account's
   device group.
 - Creating a group or inviting adds every device of each recipient account

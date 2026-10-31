@@ -478,8 +478,8 @@ on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`.
 `marmot_compromise_warning` blocks on the account worker, reads local state only, and writes the account's open
 compromise warning on this device as an owned `MarmotCompromiseWarningItemList`; free it with
 `marmot_compromise_warning_item_list_free`. An empty list means no warning is open. Each `MarmotCompromiseWarningItem`
-has its `reason`, the `slot_id_hex` the rejection names, a `key_package_ref_hex` set only for
-`MARMOT_COMPROMISE_WARNING_REASON_REJECTED_KEY_PACKAGE`, and `occurred_at`. `reason` is a
+has its `reason`, the `slot_id_hex` the item names, a `key_package_ref_hex` set only for
+`MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE`, and `occurred_at`. `reason` is a
 `MarmotCompromiseWarningReason` discriminant carried as `uint32_t`: later releases add values, so show one the host
 does not know as a generic reason. `marmot_dismiss_compromise_warning` closes the warning on this device only. Re-read
 it on `MARMOT_EVENT_COMPROMISE_WARNING_CHANGED`. It is empty in every release build until the roster's spec lands. See
@@ -509,6 +509,11 @@ on `MARMOT_EVENT_HISTORY_NOTICES_CHANGED`; a group's own occurrences also set
 `marmot_group_recovery_status_free`. See the
 [shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices) for when notices appear,
 disappear and return.
+`marmot_account_recovery_status` writes an owned `MarmotAccountRecoveryStatus`: the groups still catching up
+(`catching_up_group_ids_hex`/`catching_up_group_ids_hex_len`), `inbox_catching_up`, and every notice
+(`notices`/`notices_len`); free it with `marmot_account_recovery_status_free` and re-read it on
+`MARMOT_EVENT_RECOVERY_STATUS_CHANGED`. Nothing is catching up, and neither that event nor
+`MARMOT_HISTORY_NOTICE_CAUSE_UNPROVEN_HISTORY` is produced, until the recovery runner owns history (mdk#2660).
 Group changes for a group whose unresolved epoch-gap recovery covers its current local epoch
 return `MARMOT_STATUS_GROUP_CATCHING_UP`. Retry after it syncs, or, once the user accepts that
 the change may split the group, call `marmot_acknowledge_group_catching_up` and retry. See the

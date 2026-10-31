@@ -907,7 +907,13 @@ async fn remove_sibling_leaf(fixture: &mut TwoDeviceAccountGroup) -> u32 {
     sibling_leaf
 }
 
-fn realized_removal(engine: &mut Engine<SqliteAccountStorage>, group_id: &GroupId) {
+/// `account_listed`: whether the removal left another leaf of the account,
+/// which the removed copy still lists (mdk#2628 D62).
+fn realized_removal(
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    account_listed: bool,
+) {
     use cgka_traits::engine::GroupEvent;
 
     assert!(engine.group_record(group_id).unwrap().removed);
@@ -922,7 +928,9 @@ fn realized_removal(engine: &mut Engine<SqliteAccountStorage>, group_id: &GroupI
         )),
         "the removed device terminates its copy: {events:?}"
     );
-    assert!(!engine.group_authority(group_id).unwrap().facts.is_member);
+    let facts = engine.group_authority(group_id).unwrap().facts;
+    assert!(!facts.is_member);
+    assert_eq!(facts.account_listed, account_listed);
 }
 
 /// An admin's Remove of one of an account's two leaves is a device removal:
@@ -943,7 +951,7 @@ async fn removing_one_device_leaf_terminates_only_that_device() {
     } = fixture;
     let bob_id = bob.self_id();
 
-    realized_removal(&mut bob_sibling, &group_id);
+    realized_removal(&mut bob_sibling, &group_id, true);
 
     let bob_events = bob.drain_events();
     assert!(
@@ -1003,7 +1011,7 @@ async fn removed_device_rejoins_without_confirmation_while_its_sibling_stays() {
         group_id,
         ..
     } = fixture;
-    realized_removal(&mut bob_sibling, &group_id);
+    realized_removal(&mut bob_sibling, &group_id, true);
 
     let SendResult::GroupEvolution {
         pending,
@@ -1051,7 +1059,7 @@ async fn removed_device_copy_drops_its_leave_request_through_its_sibling_leaf() 
         group_id,
         ..
     } = fixture;
-    realized_removal(&mut bob_sibling, &group_id);
+    realized_removal(&mut bob_sibling, &group_id, true);
     drop(bob_sibling);
     let realized = bob_sibling_storage.get_group(&group_id).unwrap();
     assert!(
@@ -1149,7 +1157,7 @@ async fn removing_an_account_removes_every_device_leaf_in_one_commit() {
     for device in [&mut bob, &mut bob_sibling] {
         device.ingest(routed.clone()).await.unwrap();
         converge_buffered_commit(device, &group_id);
-        realized_removal(device, &group_id);
+        realized_removal(device, &group_id, false);
     }
 }
 

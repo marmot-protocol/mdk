@@ -144,6 +144,14 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_send_replace_device_entry(group_id, slot, *expected, *entry)
                     .await
             }
+            SendIntent::ReplaceAccountEntry {
+                group_id,
+                expected,
+                entry,
+            } => {
+                self.do_send_replace_account_entry(group_id, *expected, *entry)
+                    .await
+            }
             SendIntent::UpdateGroupData {
                 group_id,
                 name,

@@ -1,7 +1,7 @@
 //! Re-check units (decision 5 of mdk#2660's phase 4 plan): one resumable
-//! pass per (group route, required relay) over the unit's covered and retired
-//! ranges inside the route's complete inventory window, by NIP-77 comparison
-//! with what the account holds there.
+//! pass per (route, required relay), the inbox's included, over the unit's
+//! covered and retired ranges inside the route's complete inventory window,
+//! by NIP-77 comparison with what the account holds there.
 //!
 //! - The window is `transport_reconciliation_inventory`'s: the retention
 //!   window, raised past whatever the inventory compacted away. Automatic
@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use cgka_traits::storage::StorageResult;
 use storage_sqlite::{
     RecoveryCoverageProof, RecoveryRecheckPass, RecoveryStagedSlice, RecoveryUnitOutcome,
-    SqliteAppStorage, TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationRoute,
+    SqliteAppStorage, TRANSPORT_RECONCILIATION_RETENTION_SECS,
 };
 use transport_nostr_adapter::compare::CompareEnd;
 use transport_nostr_adapter::sweep::{RelayCaps, SweepRange};
@@ -45,8 +45,10 @@ use transport_nostr_adapter::sweep::{RelayCaps, SweepRange};
 use super::admission::{Admission, Stalled};
 use super::compare::{CompareFacts, ComparePlan, PlannedRange, local_items, recorded_caps};
 use super::quantum::{QuantumReport, classify};
-use super::select::{Candidate, cooldown_until, suspended, sweepable};
-use super::{DebtTurn, RecoveryRunnerPolicy, UnitKey, WorkerTurn, recovery_caps};
+use super::select::{Candidate, cooldown_until, suspended};
+use super::{
+    DebtTurn, RecoveryRunnerPolicy, RunnerRoute, UnitKey, WorkerTurn, fetch_route, recovery_caps,
+};
 
 /// One re-check quantum's plan. Not `Debug`: it carries its unit.
 pub(super) struct RecheckPlan {
@@ -99,11 +101,10 @@ pub(super) fn survey(
 ) -> StorageResult<Vec<Candidate>> {
     let app = turn.app;
     let now = turn.now;
-    let floor = now.saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS);
     let mut caps = BTreeMap::new();
     let mut cooldowns = BTreeMap::new();
     let mut candidates = Vec::new();
-    for route in sweepable(turn.routes) {
+    for route in turn.routes {
         for (relay, best_effort) in route.relays() {
             if best_effort {
                 continue;
@@ -125,15 +126,10 @@ pub(super) fn survey(
             let unit = app.recovery_unit(&key.route, relay)?;
             let pass = unit.as_ref().map(|unit| unit.recheck).unwrap_or_default();
             let due = due_at(pass, policy);
-            let start = floor.max(pass.position_seconds.unwrap_or(0));
             let to_check = if due <= now {
-                let seconds = ranges_to_check(app, &key, start, turn.checked_until(route))?
-                    .iter()
-                    .map(|planned| planned.range.until - planned.range.since + 1)
-                    .fold(0u64, u64::saturating_add);
-                if seconds == 0 && pass.position_seconds.is_none() {
+                let Some(seconds) = owed(turn, route, &key, pass)? else {
                     continue;
-                }
+                };
                 seconds
             } else {
                 0
@@ -145,7 +141,7 @@ pub(super) fn survey(
                 key,
                 best_effort: false,
                 owed_seconds: to_check,
-                position: start,
+                position: start(now, pass),
                 last_served_at: unit.as_ref().and_then(|unit| unit.last_served_at_seconds),
                 due_at: due.max(cooldown.unwrap_or(0)),
                 blocked: suspended(route) || held_back,
@@ -154,6 +150,37 @@ pub(super) fn survey(
         }
     }
     Ok(candidates)
+}
+
+/// Where `pass` checks from: where it got to, never below the retention
+/// floor.
+fn start(now: u64, pass: RecoveryRecheckPass) -> u64 {
+    now.saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS)
+        .max(pass.position_seconds.unwrap_or(0))
+}
+
+/// The seconds a due `pass` of `key`, a unit of `route`, has left to check,
+/// or `None` when it owes nothing: it never started, and nothing in its
+/// window is left to check. The survey schedules exactly what this owes, and
+/// an explicit repair's verdict waits for no more
+/// ([`super::repair::repaired`]), so neither waits on a pass the other
+/// never runs.
+pub(super) fn owed(
+    turn: &DebtTurn<'_>,
+    route: &RunnerRoute,
+    key: &UnitKey,
+    pass: RecoveryRecheckPass,
+) -> StorageResult<Option<u64>> {
+    let seconds = ranges_to_check(
+        turn.app,
+        key,
+        start(turn.now, pass),
+        turn.checked_until(route),
+    )?
+    .iter()
+    .map(|planned| planned.range.until - planned.range.since + 1)
+    .fold(0u64, u64::saturating_add);
+    Ok((seconds > 0 || pass.position_seconds.is_some()).then_some(seconds))
 }
 
 /// The unit's covered and retired ranges from `since` through `until`, each
@@ -242,10 +269,7 @@ pub(super) fn begin(
 ) -> StorageResult<Option<RecheckPlan>> {
     let app = turn.app;
     let now = turn.now;
-    let TransportReconciliationRoute::Group(nostr_group_id) = key.route else {
-        return Ok(None);
-    };
-    let Some(route) = sweepable(turn.routes).find(|route| {
+    let Some(route) = turn.routes.iter().find(|route| {
         route.route == key.route
             && !suspended(route)
             && route
@@ -304,7 +328,7 @@ pub(super) fn begin(
     Ok(Some(RecheckPlan {
         compare: ComparePlan {
             key: key.clone(),
-            nostr_group_id,
+            route: fetch_route(&key.route, turn.inbox),
             best_effort: false,
             caps,
             ranges,

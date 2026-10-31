@@ -96,6 +96,8 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::AppMessageEpochUnsettled { .. }
         | EngineError::LinkDeviceUnsettled { .. }
         | EngineError::DeviceEntryChanged { .. }
+        | EngineError::AccountEntryChanged { .. }
+        | EngineError::AccountEntryUnsettled { .. }
         | EngineError::InvalidTransition(_)
         | EngineError::Serialize(_)
         // Every OpenMLS error, verdicts included; see the module docs.

@@ -234,7 +234,7 @@ async fn cancelled_before_start_requests_nothing_and_keeps_overflow() {
     client.delivery_overflow_recovery_marker_token = Some(7);
     let retry = storage.recovery_retry_state().unwrap();
     let failure = client
-        .repair_full_history_cancellable(&|| true)
+        .repair_full_history_cancellable(&|| true, None)
         .await
         .unwrap_err();
     assert!(

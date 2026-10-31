@@ -308,6 +308,80 @@ async fn a_device_that_did_not_decide_cleans_up_after_a_removal() {
     assert_eq!(slot_deletions(&relay, &account_id_hex, &laptop_slot), 0);
 }
 
+/// The phone removes only the laptop's leaf from a chat both are in. The
+/// account stays in the chat through the phone, so the laptop records the
+/// chat as `DeviceRemoved`, not as a removal of the account from it (D62):
+/// it stops sending and routing there like any departed chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_removed_from_a_chat_its_account_stays_in_is_not_removed_from_it() {
+    let (mut devices, group) = tagging_devices().await;
+    let chat = chat_with_both(&mut devices).await;
+    let mut laptop_cursor = published_count(&devices.relay);
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        mut phone,
+        laptop_app,
+        mut laptop,
+        ..
+    } = devices;
+    let chat_hex = hex::encode(chat.as_slice());
+    let leaves = phone
+        .runtime
+        .own_account_leaf_claims(&chat, &roster(&phone, &group))
+        .unwrap()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    assert_eq!(leaves.len(), 1, "the laptop's leaf");
+
+    phone
+        .remove_own_account_leaves(&chat, leaves)
+        .await
+        .unwrap();
+    assert!(
+        phone
+            .runtime
+            .own_account_leaf_claims(&chat, &roster(&phone, &group))
+            .unwrap()
+            .is_empty(),
+        "the laptop's chat leaf is gone"
+    );
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.retry_group_convergence(&chat).await.unwrap();
+
+    assert!(laptop.runtime.group_record(&chat).unwrap().removed);
+    assert_eq!(
+        laptop_app
+            .stored_group_self_membership("alice", &chat_hex)
+            .unwrap(),
+        Some(SelfMembership::DeviceRemoved)
+    );
+    assert_eq!(installed_group_routes(&laptop, &chat), 0);
+    let removal_rows = laptop_app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(chat_hex.clone()),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .filter_map(|row| row.group_system)
+        .filter(|row| row.system_type == cgka_traits::app_event::GROUP_SYSTEM_TYPE_MEMBER_REMOVED)
+        .count();
+    assert_eq!(removal_rows, 0, "no row says the account was removed");
+    assert_eq!(
+        phone_app
+            .stored_group_self_membership("alice", &chat_hex)
+            .unwrap(),
+        Some(SelfMembership::Member)
+    );
+}
+
 /// The phone removes the laptop, and deletes its slot, while the laptop
 /// renames itself twice from the same epoch. The laptop's longer branch wins
 /// and drops the removal, so the laptop is listed again. The phone's next

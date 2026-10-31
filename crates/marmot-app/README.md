@@ -422,6 +422,27 @@ with nothing sent, since a commit then could build on a roster that is about to 
 commit loses a fork is made again on a later maintenance pass, unless another rename of that device won; that one
 stands. Show the label the next list returns after `LinkedDevicesChanged`, not the one the user typed.
 
+### Recovery words
+
+An account's backups are sealed to a recovery key that 12 recovery words derive, separate from the nsec (mdk#2628).
+`MarmotAppRuntime::begin_recovery_words(account_ref)` makes new words as `RecoveryWords`: show the 12 `words` once,
+then ask for the words at `confirm_positions` (1-based) and pass them, in order, to `confirm_recovery_words`. MDK holds
+the words in memory only and forgets them once their change went out or after `cancel_recovery_words`; a restart
+starts over with new words. Confirming keeps only the key's public half: in the device group's roster, or on this
+device while it has no device group, until the device group it founds carries it. A device that joins a device group
+instead leaves the group's backups as they are and forgets the key it kept. The first device to turn backups on writes
+them, and new words from any device keep that writer. A mismatch (`recovery_words_mismatch`), a busy device group
+(`device_group_busy`) or any other error keeps the words for another try; trying again commits nothing if the roster
+already holds their key. `turn_off_backups` turns backups off for every device of the account by clearing the writer
+and the key; backups already written stay until deleted, and turning backups on again takes new words. Both are
+refused as `device_group_busy` while the device group can't take the change, including while a change of this
+device's is still in flight. `backup_settings` says whether backups are on and whether this device writes them, as the
+device group's roster holds them now. Two devices changing backups at once can drop one change: MDK commits it again
+only while what it changed still stands, and otherwise it stays lost. Read `backup_settings` each time backup settings
+are shown, rather than showing what the user chose, so the user sees a lost change and can make it again. Nothing writes
+backups yet, and every call is refused as `DeviceGroupRefused("roster_unsupported")` in release builds until the backup
+spec lands.
+
 ### Overdue KeyPackage refresh
 
 While this device trusts a device group, each KeyPackage it publishes is first announced in its own roster entry there,
@@ -456,10 +477,11 @@ are here.
 ## Compromise warning
 
 `MarmotAppRuntime::compromise_warning(account_ref)` lists the account's open compromise warning on this device as
-`CompromiseWarningItem`s (mdk#2628), the earliest gathered first; it is empty when no warning is open. Each item is a
-rejection: a sign-in answered This wasn't me (`RejectedSignIn`), on this device or another, or a KeyPackage one of the
-account's devices found where they had not published (`RejectedKeyPackage`). Someone holding the account's signing key
-published there. The warning gathers this device's rejections and those in its device group's roster; rejections
+`CompromiseWarningItem`s (mdk#2628), the earliest gathered first; it is empty when no warning is open. Each item means
+someone holding the account's signing key published where the account's devices did not: a sign-in answered This
+wasn't me (`RejectedSignIn`), on this device or another, or a KeyPackage this device found in its own slot that it did
+not make (`ForeignOwnSlotKeyPackage`), which warns on this device only and which it has replaced. The warning gathers
+this device's rejections and those in its device group's roster; rejections
 already in the first roster this device trusts count as seen, and a rejected sign-in leaves once its slot is linked as
 a device. `dismiss_compromise_warning` marks everything it gathers as seen, on this device only; a rejection that
 branch selection drops and restores stays seen. `CompromiseWarningReason` gains reasons in later releases; show one the
@@ -499,6 +521,12 @@ own occurrences also set `GroupRecoveryStatus::history_may_be_incomplete` and li
 account-wide ones (loss, incremental and explicit history) appear only in the list.
 `MarmotAppEvent::HistoryNoticesChanged` announces any change, and a group whose own notices changed also gets
 `GroupStateUpdated`.
+
+`MarmotAppRuntime::account_recovery_status(account_ref)` reads the account's recovery as one `AccountRecoveryStatus`:
+the groups whose history is still being fetched, whether the inbox's is, and every notice as `history_notices` lists
+them. Re-read it on `MarmotAppEvent::RecoveryStatusChanged`. Until the recovery runner owns history (mdk#2660) nothing
+is ever catching up and neither that event nor `HistoryNoticeCause::UnprovenHistory` (history the runner could not
+prove on a route's relays) is produced.
 
 `dismiss_history_notice(account_ref, notice_id)` runs on the account worker. After the user accepts that the history may
 be incomplete, it durably retires exactly that occurrence as its own outcome (`state = 2`), never as coverage. A retired

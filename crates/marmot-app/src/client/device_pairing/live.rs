@@ -822,12 +822,10 @@ impl AppClient {
         {
             // Already linked; the prompt shows who added it.
             return Ok(());
-        } else if roster.as_ref().is_some_and(|roster| {
-            roster.rejected_slots.contains_key(&found.slot)
-                || roster
-                    .rejected_key_packages
-                    .contains_key(prompt.key_package_ref.as_slice())
-        }) {
+        } else if roster
+            .as_ref()
+            .is_some_and(|roster| roster.rejected_slots.contains_key(&found.slot))
+        {
             Some(Stage::Rejected)
         } else {
             let missing = missing_capabilities(&required, &metadata);

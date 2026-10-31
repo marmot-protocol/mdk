@@ -958,6 +958,40 @@ where
         self.session.open_history(context, sealed)
     }
 
+    /// The public half of the recovery key `entropy` derives (mdk#2628
+    /// 4.4a); nothing is stored. See [`cgka_engine::recovery_key`].
+    pub fn recovery_public_key(
+        &self,
+        entropy: &[u8; crate::RECOVERY_ENTROPY_LEN],
+    ) -> SessionResult<Vec<u8>> {
+        self.session.recovery_public_key(entropy)
+    }
+
+    /// `plaintext` sealed to a recovery key's public half, as the roster's
+    /// account entry holds it, for `context`; `None` when that key is not
+    /// one this device can seal to.
+    pub fn seal_to_recovery_key(
+        &self,
+        recovery_public_key: &[u8],
+        context: &[u8],
+        plaintext: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.session
+            .seal_to_recovery_key(recovery_public_key, context, plaintext)
+    }
+
+    /// `sealed` opened with the recovery key `entropy` derives, for
+    /// `context`; `None` when it does not open.
+    pub fn open_with_recovery_key(
+        &self,
+        entropy: &[u8; crate::RECOVERY_ENTROPY_LEN],
+        context: &[u8],
+        sealed: &[u8],
+    ) -> SessionResult<Option<Vec<u8>>> {
+        self.session
+            .open_with_recovery_key(entropy, context, sealed)
+    }
+
     /// See `CgkaEngine::withdraw_device_group_welcome`.
     pub fn withdraw_device_group_welcome(&mut self, group_id: &GroupId) -> SessionResult<bool> {
         Ok(self.session.withdraw_device_group_welcome(group_id)?)
@@ -6705,6 +6739,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::SelfUpdate { .. }
             | SendIntent::UpdateAppComponents { .. }
             | SendIntent::ReplaceDeviceEntry { .. }
+            | SendIntent::ReplaceAccountEntry { .. }
             | SendIntent::UpdateGroupData { .. }
             | SendIntent::EnableDisbanding { .. }
             | SendIntent::EnableAccountDevices { .. }

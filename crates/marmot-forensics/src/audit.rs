@@ -1228,7 +1228,9 @@ pub enum AuditEventKind {
     /// `obligation_id` is the owner's durable 16-byte obligation id (hex); v5
     /// writes it as the one-way `obligation_ref`, stable across the
     /// obligation's life so later rows join it. `obligation_revision` is the
-    /// revision the change left. `bound`/`floor_secs` describe the goal's
+    /// revision the change left. A coverage-ledger route's notice
+    /// ([`RecoveryObligationCause::UnprovenHistory`]) has no obligation and
+    /// carries the route's tag and park revision instead. `bound`/`floor_secs` describe the goal's
     /// lower bound after the change, and `charged` counts the deliveries
     /// (queue loss) or lagged notifications (notification loss) this change
     /// newly charged. A notification count is an observation count, never a

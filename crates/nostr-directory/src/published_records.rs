@@ -786,6 +786,18 @@ pub struct SlotPublication {
     /// Lowercase hex event id.
     pub event_id: String,
     pub created_at: u64,
+    /// The KeyPackage it holds, when it holds a valid one of the account
+    /// with the current profile (mdk#2628 item 3.7b).
+    pub key_package: Option<SlotPublicationKeyPackage>,
+}
+
+/// What a device's own-slot check needs of a valid KeyPackage there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotPublicationKeyPackage {
+    /// Lowercase hex `KeyPackageRef`.
+    pub key_package_ref_hex: String,
+    /// Its LeafNode's signature key.
+    pub leaf_signature_key: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -860,27 +872,37 @@ fn current_slot_publications(
     slot: &str,
     records: &[RelayEventRecord],
 ) -> Vec<SlotPublication> {
-    let mut newest_by_relay = std::collections::BTreeMap::<&str, &NostrTransportEvent>::new();
+    let mut newest_by_relay = std::collections::BTreeMap::<&str, &RelayEventRecord>::new();
     for record in records.iter().filter(|record| {
         record.event.kind == KIND_MARMOT_KEY_PACKAGE
             && record.event.pubkey == account
             && record.event.tag_value("d") == Some(slot)
     }) {
         for endpoint in &record.endpoints {
-            let newest = newest_by_relay
-                .entry(endpoint.as_str())
-                .or_insert(&record.event);
-            if newest_publication_first(&record.event, newest.created_at, &newest.id).is_lt() {
-                *newest = &record.event;
+            let newest = newest_by_relay.entry(endpoint.as_str()).or_insert(record);
+            if newest_publication_first(&record.event, newest.event.created_at, &newest.event.id)
+                .is_lt()
+            {
+                *newest = record;
             }
         }
     }
     let mut current: Vec<SlotPublication> = Vec::new();
-    for event in newest_by_relay.into_values() {
-        if !current.iter().any(|seen| seen.event_id == event.id) {
+    for record in newest_by_relay.into_values() {
+        if !current.iter().any(|seen| seen.event_id == record.event.id) {
+            let key_package = key_package_and_metadata_from_borrowed_record(record)
+                .ok()
+                .filter(|(fetched, _)| {
+                    fetched.key_package.protocol_profile == ProtocolProfile::Current
+                })
+                .map(|(_, metadata)| SlotPublicationKeyPackage {
+                    key_package_ref_hex: metadata.key_package_ref_hex,
+                    leaf_signature_key: metadata.leaf_signature_key,
+                });
             current.push(SlotPublication {
-                event_id: event.id.clone(),
-                created_at: event.created_at,
+                event_id: record.event.id.clone(),
+                created_at: record.event.created_at,
+                key_package,
             });
         }
     }

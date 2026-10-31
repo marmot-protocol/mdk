@@ -2,9 +2,9 @@
 //!
 //! The roster is the GroupContext state of an account's device group
 //! (mdk#2628 D16, D32). It holds the key that seals the account's device
-//! tags and three kinds of keyed entry: devices keyed by their KeyPackage
-//! publication slot, rejected slots, and rejected KeyPackages. One
-//! account-wide entry holds stage 4's reserved fields. Nothing in it is about
+//! tags and two kinds of keyed entry: devices keyed by their KeyPackage
+//! publication slot, and rejected slots. One account-wide entry holds stage
+//! 4's reserved fields. Nothing in it is about
 //! the other groups the devices are in: each leaf's own device tag says which
 //! device holds it.
 //!
@@ -49,7 +49,6 @@ pub struct DeviceRosterV1 {
     pub leaf_tag_key: [u8; 32],
     pub devices: BTreeMap<DeviceSlotId, DeviceEntryV1>,
     pub rejected_slots: BTreeMap<DeviceSlotId, RejectedSlotV1>,
-    pub rejected_key_packages: BTreeMap<Vec<u8>, RejectedKeyPackageV1>,
     pub account: AccountEntryV1,
 }
 
@@ -115,30 +114,24 @@ pub enum RejectedSlotReasonV1 {
     Removed,
 }
 
-/// A rejected KeyPackage, keyed by its `KeyPackageRef`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RejectedKeyPackageV1 {
-    /// The slot the KeyPackage appeared in.
-    pub slot: DeviceSlotId,
-    pub rejected_at: u64,
-}
-
-/// Account-wide fields, reserved for account sync. Opaque here.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Account-wide fields for backups (mdk#2628 4.4): the device that writes
+/// them, by slot, and the recovery key's public half. Opaque to the codec,
+/// which checks only their bounds. Serializable because a queued
+/// `SendIntent::ReplaceAccountEntry` carries it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountEntryV1 {
     pub backup_writer: Option<DeviceSlotId>,
     pub recovery_public_key: Option<Vec<u8>>,
 }
 
-/// One roster operation. Each names one entry.
+/// One roster operation. Each names one entry. Types 4 and 5 belonged to
+/// the removed rejected-KeyPackage operations and are never reused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceRosterOperationV1 {
     SetDevice(DeviceSlotId, DeviceEntryV1),
     RemoveDevice(DeviceSlotId),
     SetRejectedSlot(DeviceSlotId, RejectedSlotV1),
     RemoveRejectedSlot(DeviceSlotId),
-    SetRejectedKeyPackage(Vec<u8>, RejectedKeyPackageV1),
-    RemoveRejectedKeyPackage(Vec<u8>),
     SetAccount(AccountEntryV1),
 }
 
@@ -149,8 +142,6 @@ impl DeviceRosterOperationV1 {
             Self::RemoveDevice(..) => 1,
             Self::SetRejectedSlot(..) => 2,
             Self::RemoveRejectedSlot(..) => 3,
-            Self::SetRejectedKeyPackage(..) => 4,
-            Self::RemoveRejectedKeyPackage(..) => 5,
             Self::SetAccount(..) => 6,
         }
     }
@@ -161,9 +152,7 @@ impl DeviceRosterOperationV1 {
         match self {
             Self::SetDevice(slot, _) | Self::RemoveDevice(slot) => (0, slot),
             Self::SetRejectedSlot(slot, _) | Self::RemoveRejectedSlot(slot) => (1, slot),
-            Self::SetRejectedKeyPackage(key_package_ref, _)
-            | Self::RemoveRejectedKeyPackage(key_package_ref) => (2, key_package_ref),
-            Self::SetAccount(_) => (3, &[]),
+            Self::SetAccount(_) => (2, &[]),
         }
     }
 }
@@ -205,10 +194,6 @@ impl DeviceRosterUpdateV1 {
                 DeviceRosterOperationV1::SetDevice(_, device) => validate_device(device)?,
                 DeviceRosterOperationV1::SetRejectedSlot(_, rejected) => {
                     validate_rejected_slot(rejected)?;
-                }
-                DeviceRosterOperationV1::SetRejectedKeyPackage(key_package_ref, _)
-                | DeviceRosterOperationV1::RemoveRejectedKeyPackage(key_package_ref) => {
-                    validate_key_package_ref(key_package_ref)?;
                 }
                 DeviceRosterOperationV1::SetAccount(account) => validate_account(account)?,
                 DeviceRosterOperationV1::RemoveDevice(_)
@@ -254,9 +239,6 @@ impl DeviceRosterV1 {
                 return Err("device roster gives a not-me slot a tag signature key".into());
             }
         }
-        for key_package_ref in self.rejected_key_packages.keys() {
-            validate_key_package_ref(key_package_ref)?;
-        }
         validate_account(&self.account)
     }
 
@@ -282,15 +264,6 @@ impl DeviceRosterV1 {
                     next.rejected_slots
                         .remove(slot)
                         .ok_or("device roster update removes a rejected slot it does not hold")?;
-                }
-                DeviceRosterOperationV1::SetRejectedKeyPackage(key_package_ref, rejected) => {
-                    next.rejected_key_packages
-                        .insert(key_package_ref.clone(), *rejected);
-                }
-                DeviceRosterOperationV1::RemoveRejectedKeyPackage(key_package_ref) => {
-                    next.rejected_key_packages.remove(key_package_ref).ok_or(
-                        "device roster update removes a rejected KeyPackage it does not hold",
-                    )?;
                 }
                 DeviceRosterOperationV1::SetAccount(account) => {
                     next.account = account.clone();
@@ -392,15 +365,9 @@ pub fn encode_device_roster_v1(roster: &DeviceRosterV1) -> Result<Vec<u8>, Strin
         rejected_slots.extend_from_slice(slot);
         encode_rejected_slot(rejected, &mut rejected_slots);
     }
-    let mut rejected_key_packages = Vec::new();
-    for (key_package_ref, rejected) in &roster.rejected_key_packages {
-        encode_var_bytes(key_package_ref, &mut rejected_key_packages);
-        encode_rejected_key_package(rejected, &mut rejected_key_packages);
-    }
     let mut out = roster.leaf_tag_key.to_vec();
     encode_var_bytes(&devices, &mut out);
     encode_var_bytes(&rejected_slots, &mut out);
-    encode_var_bytes(&rejected_key_packages, &mut out);
     encode_account(&roster.account, &mut out);
     Ok(out)
 }
@@ -422,13 +389,6 @@ pub fn encode_device_roster_update_v1(update: &DeviceRosterUpdateV1) -> Result<V
             DeviceRosterOperationV1::SetRejectedSlot(slot, rejected) => {
                 operations.extend_from_slice(slot);
                 encode_rejected_slot(rejected, &mut operations);
-            }
-            DeviceRosterOperationV1::SetRejectedKeyPackage(key_package_ref, rejected) => {
-                encode_var_bytes(key_package_ref, &mut operations);
-                encode_rejected_key_package(rejected, &mut operations);
-            }
-            DeviceRosterOperationV1::RemoveRejectedKeyPackage(key_package_ref) => {
-                encode_var_bytes(key_package_ref, &mut operations);
             }
             DeviceRosterOperationV1::SetAccount(account) => {
                 encode_account(account, &mut operations);
@@ -478,11 +438,6 @@ fn encode_rejected_slot(rejected: &RejectedSlotV1, out: &mut Vec<u8>) {
     encode_optional_bytes(rejected.tag_signature_key.as_deref(), out);
 }
 
-fn encode_rejected_key_package(rejected: &RejectedKeyPackageV1, out: &mut Vec<u8>) {
-    out.extend_from_slice(&rejected.slot);
-    out.extend_from_slice(&rejected.rejected_at.to_be_bytes());
-}
-
 fn encode_account(account: &AccountEntryV1, out: &mut Vec<u8>) {
     encode_optional_slot(account.backup_writer.as_ref(), out);
     encode_optional_bytes(account.recovery_public_key.as_deref(), out);
@@ -517,7 +472,6 @@ pub fn decode_device_roster_v1(bytes: &[u8]) -> Result<DeviceRosterV1, String> {
     let leaf_tag_key = decode_slot(&mut cursor, "leaf tag key")?;
     let devices_bytes = decode_vector(&mut cursor, "devices")?;
     let rejected_slots_bytes = decode_vector(&mut cursor, "rejected slots")?;
-    let rejected_key_packages_bytes = decode_vector(&mut cursor, "rejected KeyPackages")?;
     let account = decode_account(&mut cursor)?;
     if !cursor.is_empty() {
         return Err("device roster has trailing bytes".into());
@@ -539,17 +493,6 @@ pub fn decode_device_roster_v1(bytes: &[u8]) -> Result<DeviceRosterV1, String> {
         let slot = decode_slot(&mut items, "rejected slot")?;
         let rejected = decode_rejected_slot(&mut items)?;
         insert_sorted(&mut roster.rejected_slots, slot, rejected, "rejected slots")?;
-    }
-    let mut items = rejected_key_packages_bytes.as_slice();
-    while !items.is_empty() {
-        let key_package_ref = decode_key_package_ref(&mut items)?;
-        let rejected = decode_rejected_key_package(&mut items)?;
-        insert_sorted(
-            &mut roster.rejected_key_packages,
-            key_package_ref,
-            rejected,
-            "rejected KeyPackages",
-        )?;
     }
     roster.validate()?;
     Ok(roster)
@@ -580,16 +523,6 @@ pub fn decode_device_roster_update_v1(bytes: &[u8]) -> Result<DeviceRosterUpdate
             3 => DeviceRosterOperationV1::RemoveRejectedSlot(decode_slot(
                 &mut items,
                 "rejected slot",
-            )?),
-            4 => {
-                let key_package_ref = decode_key_package_ref(&mut items)?;
-                DeviceRosterOperationV1::SetRejectedKeyPackage(
-                    key_package_ref,
-                    decode_rejected_key_package(&mut items)?,
-                )
-            }
-            5 => DeviceRosterOperationV1::RemoveRejectedKeyPackage(decode_key_package_ref(
-                &mut items,
             )?),
             6 => DeviceRosterOperationV1::SetAccount(decode_account(&mut items)?),
             _ => return Err("device roster update has an unknown operation type".into()),
@@ -695,12 +628,6 @@ fn decode_rejected_slot(cursor: &mut &[u8]) -> Result<RejectedSlotV1, String> {
     })
 }
 
-fn decode_rejected_key_package(cursor: &mut &[u8]) -> Result<RejectedKeyPackageV1, String> {
-    let slot = decode_slot(cursor, "rejected KeyPackage slot")?;
-    let rejected_at = take_u64(cursor, "rejected_at")?;
-    Ok(RejectedKeyPackageV1 { slot, rejected_at })
-}
-
 fn decode_account(cursor: &mut &[u8]) -> Result<AccountEntryV1, String> {
     let backup_writer = decode_optional_slot(cursor, "backup writer")?;
     let recovery_public_key = decode_optional(cursor, "recovery key", |cursor| {
@@ -803,8 +730,7 @@ mod tests {
     }
 
     /// One of everything: a leaf tag key, two devices, one with every
-    /// optional field, a rejected slot, a rejected KeyPackage and the
-    /// reserved account fields.
+    /// optional field, a rejected slot and the reserved account fields.
     fn full_roster() -> DeviceRosterV1 {
         let phone = DeviceEntryV1 {
             label: "Phone".into(),
@@ -835,15 +761,6 @@ mod tests {
             leaf_tag_key: [0x33; 32],
             devices: [(slot(1), phone), (slot(2), laptop)].into_iter().collect(),
             rejected_slots: [(slot(9), removed())].into_iter().collect(),
-            rejected_key_packages: [(
-                vec![0xbb; 32],
-                RejectedKeyPackageV1 {
-                    slot: slot(2),
-                    rejected_at: 1_700_002_000,
-                },
-            )]
-            .into_iter()
-            .collect(),
             account: AccountEntryV1 {
                 backup_writer: Some(slot(1)),
                 recovery_public_key: Some(vec![0x04; 33]),
@@ -852,10 +769,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_roster_is_its_leaf_tag_key_three_empty_vectors_and_an_empty_account_entry() {
+    fn empty_roster_is_its_leaf_tag_key_two_empty_vectors_and_an_empty_account_entry() {
         let bytes = encode_device_roster_v1(&DeviceRosterV1::default()).unwrap();
         let mut expected = vec![0; 32];
-        expected.extend_from_slice(&[0, 0, 0, 0, 0]);
+        expected.extend_from_slice(&[0, 0, 0, 0]);
         assert_eq!(bytes, expected);
         assert_eq!(
             decode_device_roster_v1(&bytes).unwrap(),
@@ -921,7 +838,6 @@ mod tests {
             "204444444444444444444444444444444444444444444444444444444444444444",
             "00",   // no history key
             "00",   // rejected_slots<V>
-            "00",   // rejected_key_packages<V>
             "0000", // account entry
         );
         let bytes = encode_device_roster_v1(&roster).unwrap();
@@ -963,6 +879,43 @@ mod tests {
             apply_device_roster_update_v1(&bytes, &removal_bytes).unwrap(),
             encode_device_roster_v1(&next).unwrap()
         );
+
+        let mut announcing = roster.devices[&slot(0x11)].clone();
+        announcing.announced_key_package = Some(vec![0x66; 32]);
+        let announcement = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
+            slot(0x11),
+            announcing,
+        )])
+        .unwrap();
+        let entry = concat!(
+            "1111111111111111111111111111111111111111111111111111111111111111", // slot
+            "0550686f6e65",                                                     // label "Phone"
+            "0155555555555555555555555555555555",                               // rename id
+            "02776e",                                                           // client "wn"
+            "00",                                                               // platform ""
+            "000000006553f100",                                                 // linked_at
+            "00",                                                               // linked_by absent
+            "05",                                                               // settings
+            "00",                                                               // status active
+            "01", // announced_key_package present
+            "206666666666666666666666666666666666666666666666666666666666666666",
+            "01", // tag signature key
+            "204444444444444444444444444444444444444444444444444444444444444444",
+            "00", // no history key
+        );
+        let announcement_bytes = encode_device_roster_update_v1(&announcement).unwrap();
+        assert_eq!(
+            hex::encode(&announcement_bytes),
+            format!("408c00{entry}") // operations<V>: 140 bytes; set_device
+        );
+        let announced = apply_device_roster_update_v1(&bytes, &announcement_bytes).unwrap();
+        assert_eq!(
+            hex::encode(&announced),
+            format!(
+                "{}408b{entry}000000",
+                "3333333333333333333333333333333333333333333333333333333333333333"
+            )
+        );
     }
 
     #[test]
@@ -976,10 +929,10 @@ mod tests {
         let bytes = encode_device_roster_v1(&two).unwrap();
         // Swap the two device entries, which have the same length. The leaf
         // tag key comes first; the devices' 102-byte vector takes a two-byte
-        // length prefix; the two empty rejection vectors and the empty
-        // account entry, four bytes, follow.
+        // length prefix; the empty rejected-slot vector and the empty
+        // account entry, three bytes, follow.
         let devices_at = 32 + 2;
-        let entry_len = (bytes.len() - devices_at - 4) / 2;
+        let entry_len = (bytes.len() - devices_at - 3) / 2;
         let mut swapped = bytes[..devices_at].to_vec();
         swapped.extend_from_slice(&bytes[devices_at + entry_len..devices_at + 2 * entry_len]);
         swapped.extend_from_slice(&bytes[devices_at..devices_at + entry_len]);
@@ -1127,11 +1080,10 @@ mod tests {
             .is_err()
         );
         // A device and a rejected slot with the same slot are different
-        // entries. Kinds sort devices, rejected slots, rejected KeyPackages,
-        // then the account entry.
+        // entries. Kinds sort devices, rejected slots, then the account
+        // entry.
         let update = DeviceRosterUpdateV1::new(vec![
             DeviceRosterOperationV1::SetAccount(AccountEntryV1::default()),
-            DeviceRosterOperationV1::RemoveRejectedKeyPackage(vec![0xbb; 32]),
             DeviceRosterOperationV1::RemoveRejectedSlot(slot(1)),
             DeviceRosterOperationV1::RemoveDevice(slot(2)),
             DeviceRosterOperationV1::RemoveDevice(slot(1)),
@@ -1143,7 +1095,6 @@ mod tests {
                 DeviceRosterOperationV1::RemoveDevice(first),
                 DeviceRosterOperationV1::RemoveDevice(second),
                 DeviceRosterOperationV1::RemoveRejectedSlot(_),
-                DeviceRosterOperationV1::RemoveRejectedKeyPackage(_),
                 DeviceRosterOperationV1::SetAccount(_),
             ] if *first == slot(1) && *second == slot(2)
         ));
@@ -1163,9 +1114,12 @@ mod tests {
         reversed.extend_from_slice(&in_order[34..]);
         reversed.extend_from_slice(&in_order[1..34]);
         assert!(decode_device_roster_update_v1(&reversed).is_err());
-        let mut unknown_op = in_order;
-        unknown_op[1] = 7;
-        assert!(decode_device_roster_update_v1(&unknown_op).is_err());
+        // 4 and 5 were the removed rejected-KeyPackage operations.
+        for op_type in [4, 5, 7] {
+            let mut unknown_op = in_order.clone();
+            unknown_op[1] = op_type;
+            assert!(decode_device_roster_update_v1(&unknown_op).is_err());
+        }
         assert!(decode_device_roster_update_v1(&[0]).is_err());
     }
 
@@ -1176,14 +1130,12 @@ mod tests {
             DeviceRosterOperationV1::SetDevice(slot(2), device("Work laptop")),
             DeviceRosterOperationV1::SetDevice(slot(3), device("Tablet")),
             DeviceRosterOperationV1::RemoveRejectedSlot(slot(9)),
-            DeviceRosterOperationV1::RemoveRejectedKeyPackage(vec![0xbb; 32]),
         ])
         .unwrap();
         let next = prior.apply(&update).unwrap();
         assert_eq!(next.devices[&slot(2)], device("Work laptop"));
         assert_eq!(next.devices[&slot(3)], device("Tablet"));
         assert!(next.rejected_slots.is_empty());
-        assert!(next.rejected_key_packages.is_empty());
         assert_eq!(next.account, prior.account);
         assert_eq!(next.leaf_tag_key, prior.leaf_tag_key);
         assert_eq!(
@@ -1198,7 +1150,6 @@ mod tests {
         for invalid in [
             DeviceRosterOperationV1::RemoveDevice(slot(7)),
             DeviceRosterOperationV1::RemoveRejectedSlot(slot(7)),
-            DeviceRosterOperationV1::RemoveRejectedKeyPackage(vec![0xcc; 32]),
             DeviceRosterOperationV1::SetRejectedSlot(
                 slot(1),
                 RejectedSlotV1 {

@@ -24,7 +24,7 @@ impl MarmotConversationPageDirection {
         }
     }
 }
-c_enum! { MarmotConversationParticipation from ConversationParticipationFfi { PendingInvitation, Active, Leaving, Left, Removed, Disbanded, Unavailable, } }
+c_enum! { MarmotConversationParticipation from ConversationParticipationFfi { PendingInvitation, Active, Leaving, Left, Removed, Disbanded, Unavailable, DeviceRemoved, } }
 c_enum! { MarmotConversationAnchorKind from ConversationAnchorKindFfi { Empty, Latest, FirstUnread, Message, Retained, RecoveredNext, RecoveredPrevious, } }
 c_mirror! { MarmotConversationCapabilities from ConversationCapabilitiesFfi {
 copy participation: MarmotConversationParticipation,

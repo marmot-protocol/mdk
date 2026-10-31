@@ -32,10 +32,8 @@
 //!   no entry for the slot, and it never replaces an entry.
 //! - **Slots.** A slot is its `d` exactly as published, compared as bytes the
 //!   way relays compare it. A rejection names the slot alone, never its
-//!   KeyPackage, and a rejected KeyPackage never makes another slot rejected:
-//!   whoever holds the account key can copy any KeyPackage, a real device's
-//!   included, into a slot the user rejects. Rejected KeyPackages are Scene
-//!   8's (3.7).
+//!   KeyPackage: whoever holds the account key can copy any KeyPackage, a
+//!   real device's included, into a slot the user rejects.
 //! - **Any one device's answer.** A prompt for a slot another device linked or
 //!   rejected stays up, saying so, until dismissed. That answer holds only
 //!   while the roster does: a sign-in dismissed here is listed again once the
@@ -59,6 +57,15 @@
 //!   finished read shows it empty, even when no relay returned anything
 //!   else. An incomplete read still acts on what it found, and the check
 //!   runs again within the hour.
+//! - **A KeyPackage this device did not make** (3.7b). Before it replaces a
+//!   foreign publication there, the device raises the compromise warning,
+//!   on this device only, for each valid current-profile KeyPackage of the
+//!   account in one whose LeafNode signature key is not this device's. This
+//!   device's signature key never changes, so a copy of a KeyPackage it made
+//!   (from before a restored backup, or before its device group) never
+//!   warns; nor does an invalid publication. A copy of this device's own
+//!   KeyPackage gains whoever published it nothing: only this device can
+//!   open a Welcome to it.
 //!
 //! Everything here runs only while device groups are on.
 
@@ -371,6 +378,23 @@ impl AppClient {
                 report
                     .slots
                     .insert(slot_hex.to_owned(), SlotOutcome::OwnSlotForeign);
+                // Warn before replacing, so a failed write leaves the
+                // publication for the next check to find.
+                let not_made = key_packages_not_made_here(
+                    slot_hex,
+                    own_read,
+                    &own,
+                    &self.runtime.own_signature_key(),
+                );
+                if !not_made.is_empty()
+                    && storage.record_foreign_own_slot_key_packages(
+                        slot_hex,
+                        &not_made,
+                        unix_now_seconds(),
+                    )?
+                {
+                    self.compromise_warning_changed = true;
+                }
                 report.foreign = self
                     .runtime
                     .replace_foreign_slot_publications(&foreign)
@@ -792,19 +816,10 @@ fn classify(
     {
         return SlotOutcome::Rejected;
     }
-    let device = roster.zip(slot).and_then(|(roster, slot)| {
-        roster
-            .devices
-            .get(&slot)
-            .map(|device| (roster, slot, device))
-    });
-    if let Some((roster, slot, device)) = device {
-        // A rejected KeyPackage in a device's slot is rejected, not the device.
-        if key_package_ref.as_ref().is_some_and(|key_package_ref| {
-            roster.rejected_key_packages.contains_key(key_package_ref)
-        }) {
-            return SlotOutcome::Rejected;
-        }
+    let device = roster
+        .zip(slot)
+        .and_then(|(roster, slot)| roster.devices.get(&slot).map(|device| (slot, device)));
+    if let Some((slot, device)) = device {
         let seen = key_package_ref.is_some_and(|key_package_ref| {
             device.announced_key_package.as_ref() == Some(&key_package_ref)
                 || announced.contains(&AnnouncedKeyPackage {
@@ -822,7 +837,7 @@ fn classify(
             },
         };
     }
-    // A rejected KeyPackage elsewhere rejects nothing here: it may be a real
+    // A rejection names the slot alone: its KeyPackage may be a real
     // device's, copied into the slot the user rejected.
     if rejected_slots.contains(slot_hex) {
         SlotOutcome::Rejected
@@ -858,6 +873,39 @@ fn foreign_slot_publications(
                 created_at: Timestamp(publication.created_at),
             })
         })
+        .collect()
+}
+
+/// The `KeyPackageRef` of each valid KeyPackage of the account in a foreign
+/// publication in this device's slot, `slot_hex`, that this device did not
+/// make: its LeafNode's signature key is not this device's, which never
+/// changes. A copy of a KeyPackage this device made, from before a backup
+/// it was restored from or before its device group, is its own; so is an
+/// invalid publication, which holds no KeyPackage at all.
+fn key_packages_not_made_here(
+    slot_hex: &str,
+    read: &OwnSlotRead,
+    own: &OwnKeyPackages,
+    own_signature_key: &[u8],
+) -> Vec<String> {
+    read.current
+        .iter()
+        .filter(|publication| {
+            classify(
+                slot_hex,
+                &publication.event_id,
+                "",
+                own,
+                None,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            ) == SlotOutcome::OwnSlotForeign
+        })
+        .filter_map(|publication| publication.key_package.as_ref())
+        .filter(|key_package| key_package.leaf_signature_key != own_signature_key)
+        .map(|key_package| key_package.key_package_ref_hex.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -982,7 +1030,7 @@ fn rejected_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cgka_traits::app_components::{DeviceEntryV1, RejectedKeyPackageV1};
+    use cgka_traits::app_components::DeviceEntryV1;
 
     fn slot(byte: u8) -> String {
         hex::encode([byte; 32])
@@ -1034,13 +1082,6 @@ mod tests {
                 reason: RejectedSlotReasonV1::NotMe,
                 rejected_at: 1,
                 tag_signature_key: None,
-            },
-        );
-        roster.rejected_key_packages.insert(
-            vec![9; 32],
-            RejectedKeyPackageV1 {
-                slot: [2; 32],
-                rejected_at: 1,
             },
         );
         roster
@@ -1159,14 +1200,10 @@ mod tests {
                 announced: Announcement::Differs
             }
         );
-        // A rejected KeyPackage in a device's slot is rejected, not the
-        // device.
-        assert_eq!(classify(2, 9, Some(&roster)), SlotOutcome::Rejected);
+        // A slot the user rejected is rejected.
         assert_eq!(classify(3, 3, Some(&roster)), SlotOutcome::Rejected);
         // An announcement never makes a slot the roster does not list known.
         assert_eq!(classify(5, 5, Some(&roster)), SlotOutcome::Unrecognized);
-        // A rejected KeyPackage in any other slot leaves that slot a sign-in.
-        assert_eq!(classify(5, 9, Some(&roster)), SlotOutcome::Unrecognized);
         // Without a roster, every other slot is unrecognized unless rejected
         // here.
         assert_eq!(classify(2, 2, None), SlotOutcome::Unrecognized);

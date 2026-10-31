@@ -95,7 +95,7 @@ fn bound(record: &mut DeviceRenameRecord, base: Option<DeviceRenameId>) {
 /// confirmed nor rolled back waits for the runtime's retry and may still land.
 /// An error carries no resolution, so `None`: it may come before the commit
 /// was staged or after it was published.
-fn nothing_went_out(edit: &AccountResult<DeviceRosterEdit>) -> Option<bool> {
+pub(super) fn nothing_went_out(edit: &AccountResult<DeviceRosterEdit>) -> Option<bool> {
     Some(match edit {
         Ok(DeviceRosterEdit::Committed(effects)) => {
             // Only this commit was in flight: the gate let nothing else of

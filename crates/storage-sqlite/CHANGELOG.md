@@ -4,6 +4,20 @@
 
 ### Breaking changes
 
+- Migration 0163 advances account storage to schema 163 (mdk#2628 item 4.4a).
+  It adds `backup_recovery_key`, at most one row: the public half of the
+  recovery key that words confirmed while this device trusts no device group
+  derive. `trust_device_group` deletes it in the same transaction, since the
+  roster's account entry is then the account's. The words and the private
+  half are never stored. `SqliteAppStorage` gains `kept_recovery_key`,
+  `keep_recovery_key` and `forget_kept_recovery_key`.
+- `CompromiseWarningReason::RejectedKeyPackage` is now
+  `ForeignOwnSlotKeyPackage`, stored as `foreign_own_slot_key_package`
+  (mdk#2628 D74, 3.7b), and `record_foreign_own_slot_key_packages` records
+  the KeyPackages this device found in its own slot that it did not make. A
+  seen one goes 7,261,200 seconds after it was found, an unseen one stays
+  until dismissed or the 4,096-row cap drops it. No migration: the reason
+  is text, and no build wrote the old one.
 - Migration 0143 advances account storage to schema 143 (mdk#2628 item 3.6).
   It adds `device_activity`, one row per sibling the trusted device group's
   roster lists (that entry's `linked_at`, when this device first found it
@@ -27,8 +41,15 @@
   `started_fresh`, and `trust_device_group`, which makes a device group
   trusted and takes its roster as this device's first in one transaction.
   `insert_device_group` and `set_device_group_trust` now refuse a trusted
-  state. The numbers below 148 that are not yet used (145 and 147) belong
-  to other work, which lands later; the runner applies them in order.
+  state. The number below 148 that is not yet used (145) belongs to other
+  work, which lands later; the runner applies it in order.
+- Migration 0147 advances account storage to schema 147 (mdk#2628 item
+  3.6b). `SelfMembership` adds `DeviceRemoved`, stored as `device_removed`:
+  this device's leaf was removed from a chat the account stays in. The
+  migration recreates the chat-list triggers so such a chat lists with the
+  departed chats, and setting it suppresses the chat's unread like the other
+  departed states.
+
 - Migration 0161 advances account storage to schema 161 (mdk#2628 item 4.3).
   It adds `small_state_items`, one row per chat and item (`read`, `pin`,
   `mute`, `archive`) holding the value the account's devices agree on, what
@@ -135,6 +156,22 @@
   for them. `history_export_page` reads a chat's app events in chat order
   (epoch, `created_at`, id) for a history bundle, with no event for each row
   that must stay out.
+- Migration 0162 (mdk#2628 item 4.2a) adds `imported_media_file_keys`, which
+  holds the per-file attachment keys a sibling sent with imported history.
+  Each key is named by its media reference's `ciphertext_sha256`, is zeroed
+  before its app event is deleted, and goes with it.
+  `ImportedAppEvent::file_keys` carries the keys, and `import_app_events`
+  stores them only for rows it adds, refusing a second, different key for a
+  ciphertext the chat already holds one for. `imported_media_file_key` reads
+  an imported message's key for one media reference,
+  `imported_media_file_key_for_ciphertext` reads the chat's key for a
+  ciphertext when the caller cannot name the message, and
+  `imported_media_file_keys` reads a message's keys so they can be passed on.
+  `AttachmentAcquisitionSource` gains `message_id_hex`. Imported chat messages
+  now get attachment slots, which a timeline rebuild keeps.
+  `attachment_history_source` and its insert trigger take a row without a
+  transport id when `app_event_imports` marks it, and the attachment tables
+  use its app event id as its `source_message_id_hex`.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`
@@ -305,6 +342,9 @@
 
 ### Added
 
+- `dismiss_recovery_route_park_on` dismisses a route's broken units on the
+  given relays and its remainder, checking the revision against them only;
+  a broken unit on any other relay stays as it is (mdk#2660 phase 4).
 - `settle_recovery_recheck` applies one re-check quantum's outcome to its
   relay and the account's rolling-hour budget, never to its unit's retry
   state (mdk#2660 phase 4). `staged_recovery_items` lists the ids and times a

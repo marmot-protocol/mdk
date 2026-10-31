@@ -7,9 +7,7 @@ use super::canonical_membership::{deliver_new, published_key_package};
 use super::sign_ins::{Account, commit_roster, link_for, own_slot, roster};
 use super::*;
 use crate::{CompromiseWarningItem, CompromiseWarningReason, SignInResponse};
-use cgka_traits::app_components::{
-    DeviceRosterOperationV1, RejectedKeyPackageV1, RejectedSlotReasonV1, RejectedSlotV1,
-};
+use cgka_traits::app_components::{DeviceRosterOperationV1, RejectedSlotReasonV1, RejectedSlotV1};
 use storage_sqlite::SignInAnswer;
 
 fn warned(client: &mut AppClient) -> Vec<(CompromiseWarningReason, String)> {
@@ -244,9 +242,9 @@ async fn rejections_in_a_devices_first_roster_count_as_seen() {
 }
 
 /// Of the roster's rejected slots only `not_me` ones warn, not a removed
-/// device's; a rejected KeyPackage warns with the slot it appeared in.
+/// device's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_rejected_key_package_warns_and_a_removed_slot_does_not() {
+async fn a_removed_slot_does_not_warn() {
     let account = Account::new(2, true);
     let relay = &account.relay;
     let mut phone = account.open(0).await;
@@ -265,44 +263,30 @@ async fn a_rejected_key_package_warns_and_a_removed_slot_does_not() {
     laptop.sync().await.unwrap();
     assert_eq!(laptop.trusted_device_group().unwrap(), Some(group.clone()));
 
-    let (removed_slot, key_package_slot) = ([0x11; 32], [0x22; 32]);
-    let key_package_ref = vec![0x33; 32];
-    let rejected_at = crate::unix_now_seconds();
+    let removed_slot = [0x11; 32];
     commit_roster(
         &mut phone,
         &group,
-        vec![
-            DeviceRosterOperationV1::SetRejectedSlot(
-                removed_slot,
-                RejectedSlotV1 {
-                    reason: RejectedSlotReasonV1::Removed,
-                    rejected_at,
-                    tag_signature_key: None,
-                },
-            ),
-            DeviceRosterOperationV1::SetRejectedKeyPackage(
-                key_package_ref.clone(),
-                RejectedKeyPackageV1 {
-                    slot: key_package_slot,
-                    rejected_at,
-                },
-            ),
-        ],
+        vec![DeviceRosterOperationV1::SetRejectedSlot(
+            removed_slot,
+            RejectedSlotV1 {
+                reason: RejectedSlotReasonV1::Removed,
+                rejected_at: crate::unix_now_seconds(),
+                tag_signature_key: None,
+            },
+        )],
     )
     .await;
-    let expected = [CompromiseWarningItem {
-        reason: CompromiseWarningReason::RejectedKeyPackage,
-        slot_id_hex: hex::encode(key_package_slot),
-        key_package_ref_hex: Some(hex::encode(&key_package_ref)),
-        occurred_at: rejected_at,
-    }];
     phone.note_compromise_warning_due();
-    assert_eq!(phone.compromise_warning().unwrap(), expected);
-    laptop.take_compromise_warning_changed();
+    assert!(phone.compromise_warning().unwrap().is_empty());
     deliver_new(&mut laptop, relay, &mut laptop_cursor).await;
     laptop.sync().await.unwrap();
-    assert!(laptop.take_compromise_warning_changed());
-    assert_eq!(laptop.compromise_warning().unwrap(), expected);
+    assert!(
+        roster(&laptop, &group)
+            .rejected_slots
+            .contains_key(&removed_slot)
+    );
+    assert!(laptop.compromise_warning().unwrap().is_empty());
 }
 
 /// A rejected sign-in the user goes on to link has ended: it leaves the

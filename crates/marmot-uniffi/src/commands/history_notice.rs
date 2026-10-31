@@ -1,7 +1,8 @@
-//! "History may be incomplete" notices and their durable dismissal.
+//! "History may be incomplete" notices, their durable dismissal, and the
+//! account's recovery status.
 
 use crate::Marmot;
-use crate::conversions::HistoryNoticeFfi;
+use crate::conversions::{AccountRecoveryStatusFfi, HistoryNoticeFfi};
 use crate::errors::MarmotKitError;
 
 #[marmot_uniffi_macros::on_tokio_runtime]
@@ -21,6 +22,21 @@ impl Marmot {
             .into_iter()
             .map(Into::into)
             .collect())
+    }
+
+    /// The account's recovery status: the groups whose history is still
+    /// being fetched, whether the inbox's is, and every notice as
+    /// `history_notices` lists them. Refresh on `RecoveryStatusChanged`.
+    /// Until the recovery runner owns history, nothing is ever catching up.
+    pub async fn account_recovery_status(
+        &self,
+        account_ref: String,
+    ) -> Result<AccountRecoveryStatusFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .account_recovery_status(&account_ref)
+            .await?
+            .into())
     }
 
     /// Dismiss one notice once the user accepts that this history may be

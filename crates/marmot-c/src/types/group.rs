@@ -83,11 +83,14 @@ impl Default for MarmotEncryptedMediaVersion {
 
 c_enum! {
     /// Whether the local account is still a member of this group, and if
-    /// not, whether it left voluntarily or was removed.
+    /// not, whether it left voluntarily or was removed. `DeviceRemoved`: this
+    /// device's leaf was removed while the account keeps another device in
+    /// the group, which is not a removal from the group.
     MarmotSelfMembership from SelfMembershipFfi {
         Member,
         Left,
         Removed,
+        DeviceRemoved,
     }
 }
 

@@ -990,14 +990,14 @@ Shared conventions:
 
 #### `recovery_need_changed`
 
-Recovery need changed for one obligation.
+Recovery need changed for one obligation, or for one coverage-ledger route's notice (`unproven_history`).
 
 | Field | Meaning |
 | --- | --- |
-| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, or `subscription_replay` (the code's `RecoveryCause`). |
+| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, or `subscription_replay` (the code's `RecoveryCause`), or `unproven_history`: a route the recovery runner parked or could not prove, which has no obligation (mdk#2660, unproduced until the runner owns history). |
 | `change` | `recorded` (new debt), `joined` (charged to pending work), `resumed` (new evidence reopened a parked or retired obligation), `notice_shown` (it parked; its "history may be incomplete" notice is now shown), `notice_dismissed` (the user retired it), `closed` (a parked obligation completed with qualified coverage), or `closed_below_window` (an explicit full-history request closed because its whole retained window was certified and what remains lies below it; neither coverage nor a dismissal). |
-| `obligation_ref` | Hashed obligation id. |
-| `obligation_revision` | Revision the change left. |
+| `obligation_ref` | Hashed obligation id; for `unproven_history`, the hashed route tag, never the route. |
+| `obligation_revision` | Revision the change left; for `unproven_history`, the route's park revision. |
 | `bound` | For `recorded` / `joined` / `resumed`: `floor`, `unbounded`, or `retained_window`, the goal's lower bound as the comparison will use it. |
 | `floor_secs` | Present exactly when `bound` is `floor`: the goal's floor after the change, the lowest bound charged by any unresolved generation of the cause. That is the earliest dropped wire `created_at` (queue loss) or the lowest REQ `since` read at a lag (notification loss). |
 | `charged` | Loss causes only: deliveries (queue loss) or lagged notifications (notification loss) newly charged by this change. A notification count is an observation count, not a count of missed events. |
@@ -1012,8 +1012,9 @@ Where it is recorded:
 - Startup incremental history (`retained_window`) and explicit full-history repair (`unbounded`, by design) requests.
 - Native source observation (`subscription_replay`) records original-window input need without a loss charge.
   Limited native admission never reports certified history, `window_certified`, or loss acknowledgment.
-- The notice publication seam (`take_history_notice_changes`): `notice_shown` for each newly parked occurrence, and
-  `closed` for a withdrawn occurrence whose obligation is now satisfied. Parked obligations get no automatic retries,
+- The notice publication seam (`take_history_notice_changes`): `notice_shown` for each newly parked occurrence, a
+  ledger route's included, and `closed` for a withdrawn occurrence whose obligation is now satisfied. A ledger notice
+  records only `notice_shown` and `notice_dismissed`, with no `bound` or `charged`. Parked obligations get no automatic retries,
   so `closed` means an explicit deep repair completed it. The first call after open only takes the baseline.
 - Dismissal (`dismiss_history_notice`): `notice_dismissed`.
 - Explicit full-history repair's own close after a `BelowRetentionWindow` pass: `closed_below_window`, only when
@@ -1389,7 +1390,7 @@ metadata keys for indexing.
 | `new_state` | `sent`, `created`, `processed`, `failed`, `retryable`, `peel_deferred`, `epoch_invalidated` |
 | `ForkWinner` | `candidate`, `incumbent`, `missing_snapshot` |
 | `PeelerOutcomeKind` | `success`, `decrypt_failed`, `stale_epoch`, `malformed`, `other` |
-| `RecoveryObligationCause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, `subscription_replay` |
+| `RecoveryObligationCause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, `subscription_replay`, `unproven_history` |
 | `RecoveryNeedChange` | `recorded`, `joined`, `resumed`, `notice_shown`, `notice_dismissed`, `closed`, `closed_below_window` |
 | `RecoveryGoalBound` | `floor`, `unbounded`, `retained_window` |
 | `RecoveryAttemptScope` | `history`, `exact_event`, `maintenance_boundary`, `mixed` |
