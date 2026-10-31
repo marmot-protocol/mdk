@@ -2,8 +2,9 @@
 //! (`recovery_need_changed`, `recovery_attempt_started`,
 //! `recovery_attempt_finished`, `recovery_obligation_reassessed`) and the
 //! transport-cursor row (`transport_cursor_advanced`) and historical wire-reissue row
-//! (`subscription_eose_repaired`). These kinds exist only
-//! in audit v5; a v4 recorder drops them (see `AuditEventKind::is_v5_only`).
+//! (`subscription_eose_repaired`), and the recovery runner's account breaker
+//! row (`recovery_runner_paused`). These kinds exist only in audit v5; a v4
+//! recorder drops them (see `AuditEventKind::is_v5_only`).
 //!
 //! Each enum mirrors a name the recovery code already uses, so a reader can
 //! grep from a row value to its producer.
@@ -270,6 +271,17 @@ pub enum EoseRepairTrigger {
     NotificationLag,
     /// An earlier pass left recovery pending and scheduled this one.
     FollowUp,
+}
+
+/// Which of the account's rolling-hour recovery caps paused the recovery
+/// runner (`RecoveryUnitPolicy::max_attempts_per_hour` and
+/// `max_event_bytes_per_hour`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryRunnerCap {
+    Attempts,
+    EventBytes,
+    Both,
 }
 
 #[cfg(test)]

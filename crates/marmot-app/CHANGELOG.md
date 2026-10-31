@@ -396,6 +396,20 @@
   fixtures and `_for_test` hooks, including methods on `ProductAnalytics`
   (mdk#2627). Enable it only as a dev-dependency, as before. Builds without
   it are unchanged.
+- Diagnostics log events carry the module that emits them (mdk#2627). The
+  relay-telemetry exporter's events move from the
+  `marmot_app::relay_telemetry_export` target to
+  `marmot_observability::relay_telemetry_export`, and the app-performance
+  recorder's from `marmot_app::app_telemetry` to
+  `marmot_observability::app_telemetry`. The runtime's warning that relay
+  telemetry export was requested in a build without `otlp-export` moves from
+  `marmot_app::relay_telemetry_export` to `marmot_app::runtime`, and
+  `configure_product_analytics_from_environment`'s warning from
+  `marmot_app::product_analytics` to `marmot_app::usage_diagnostics`. A log
+  filter that named an old target must name the new one to keep its events,
+  and one that selected the whole `marmot_app` crate must add
+  `marmot_observability` to keep the exporter's and the recorder's. Every
+  event keeps its fields, level, message and `method`.
 
 ### Fixed
 

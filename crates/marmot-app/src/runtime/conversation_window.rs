@@ -16,6 +16,7 @@ use marmot_observability::PerformanceRecorder;
 use marmot_observability::{Observation, Outcome as TelemetryOutcome};
 use marmot_session::GroupAuthoritySnapshot;
 use std::{
+    collections::BTreeSet,
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
@@ -247,6 +248,16 @@ impl AppClient {
                 self.conversation_captures.push(observer);
             }
         }
+    }
+    /// The groups with a conversation window open on this account. A window
+    /// registers its capture at its first worker read and releases it when
+    /// it closes. The recovery runner serves their routes first.
+    pub(crate) fn open_conversation_groups(&self) -> BTreeSet<Vec<u8>> {
+        self.conversation_captures
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|capture| capture.group.as_slice().to_vec())
+            .collect()
     }
     pub(crate) fn publish_conversation_captures(&mut self, group: &GroupId) {
         self.conversation_captures

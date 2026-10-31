@@ -30,9 +30,10 @@ On a hydrated account open or a live audit enable, at most 64 stored groups rece
 eligible, selected, omitted by that cap, and unreadable; these are read counts, not durable-write
 claims. A failed group enumeration leaves all four counts unknown.
 
-Account recovery, transport-cursor and subscription-refusal rows exist only in v5 (see
-[Account recovery owner rows](#account-recovery-owner-rows-v5-only) and
-[`subscription_refused`](#subscription_refused-v5-only)); a v4 recorder drops them.
+Account recovery, transport-cursor, subscription-refusal and recovery-runner pause rows exist only in v5 (see
+[Account recovery owner rows](#account-recovery-owner-rows-v5-only),
+[`subscription_refused`](#subscription_refused-v5-only) and
+[`recovery_runner_paused`](#recovery_runner_paused-v5-only)); a v4 recorder drops them.
 
 The host can configure a dedicated v5 OTLP `/v1/logs` sender in memory through
 `MarmotAppRuntime::set_audit_otlp_sender(Some(sender))`, or through the additive
@@ -251,8 +252,9 @@ This catalogue is not yet complete. These event kinds have no section here yet â
 `group_hydration_quarantined`, `group_hydration_recovered`,
 `pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`, `subscription_rebuild`,
 `sync_drain`, and `transport_received`. The v5-only recovery kinds are written up under
-[Account recovery owner rows](#account-recovery-owner-rows-v5-only), and the v5-only refusal row under
-[`subscription_refused`](#subscription_refused-v5-only).
+[Account recovery owner rows](#account-recovery-owner-rows-v5-only), the v5-only refusal row under
+[`subscription_refused`](#subscription_refused-v5-only), and the runner's pause row under
+[`recovery_runner_paused`](#recovery_runner_paused-v5-only).
 
 The authoritative catalogue is the `AuditEventKind` enum together with
 [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json); the
@@ -1226,6 +1228,24 @@ Notes:
   fetch is ignored here; one-shot fetches report their closes through acquisition.
 - An account without a v5 recorder still drains its reports at the seam and discards them.
 
+### `recovery_runner_paused` (v5 only)
+
+The phase 4 recovery runner's account breaker paused this account's history fetches at a rolling-hour cap (mdk#2660).
+The runner records it in a worker turn once per pause. Nothing writes it until the runner owns recovery debt, which
+an internal gate keeps off. Account-scoped, so `group_ref` is `None`.
+
+| Field | Meaning |
+| --- | --- |
+| `cap` | The cap reached: `attempts`, `event_bytes` or `both`. |
+| `attempts` | Attempts the rolling hour holds as it pauses. |
+| `event_bytes` | Event bytes the rolling hour holds as it pauses. |
+| `paused_for_secs` | Seconds until enough of the hour rolls off for the runner to go on. |
+| `pauses` | Pauses since the process started, across its accounts, this one included. |
+| `late_findings` | Events re-checks found inside history already covered, since the process started, across its accounts. |
+
+A pause is a bug signal: the per-unit backoff and per-relay cooldowns should stop a misbehaving relay or route long
+before the account's caps. The pause changes no unit; units stay due and run once the hour rolls.
+
 ### `auto_commit_decision`
 
 Emitted after `LowestIndexAutoCommitter::decide` returns a decision for a queued proposal.
@@ -1728,6 +1748,7 @@ let server-side tooling collate multiple devices into group-level analytics.
 | Why did the transport cursor move, and did live promotion push arrivals into the spill? | `transport_cursor_advanced`: trigger, before/after cursor, lookback, and spill and queue-loss placement counts. `sync_drain` keeps per-drain cursors. |
 | Did a notification gap or incomplete native replay require recovery? | Current sessions use owner rows with `notification_loss` or `subscription_replay`; limited native admission is not a history certificate or loss acknowledgment. `subscription_eose_repaired` describes historical repair passes only. |
 | Did a relay refuse this account's inbox or group subscriptions, and why? | `subscription_refused`: per relay and route kind, the refusal category, whether the relay client kept or dropped the REQ, and how often. |
+| Did the recovery runner hit the account's hourly cap? | `recovery_runner_paused`: the cap, the hour's usage, how long the pause lasts, and process totals of pauses and late findings. |
 | Can a dashboard correlate the same member across client files? | `group_state_changed.actor_member_ref` and `subject_member_ref` are stable 16-byte hashes of member identity bytes. A producing engine's optional `source_context.local_member_ref` uses that same member-ref domain so a removal/leave subject can be joined to the producer. Absence is not a removal. This is not a membership interval or Goggles classification. |
 
 Intentional non-goals / limits:

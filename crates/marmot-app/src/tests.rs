@@ -25728,3 +25728,15 @@ pub(crate) mod alloc_audit {
         PEAK.load(Ordering::Relaxed)
     }
 }
+
+/// A retained route's recovery goal ends one clock-skew allowance after its
+/// switch, which its subscription floor sits one allowance before.
+#[test]
+fn a_retained_routes_recovery_goal_ends_an_allowance_after_its_switch() {
+    let switch = 1_800_000_000;
+    let allowance = HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE.as_secs();
+    assert_eq!(
+        crate::retained_route_goal_until(crate::history_floor(switch)),
+        switch + allowance
+    );
+}

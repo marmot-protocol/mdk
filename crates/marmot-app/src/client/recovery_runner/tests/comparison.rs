@@ -646,3 +646,35 @@ async fn recovery_runner_holds_a_full_relays_recheck_back_but_not_its_frontier_d
         (Some(false), Some(true))
     );
 }
+
+/// A re-check of a retained prior route passes over nothing past its goal's
+/// end, though the ledger covers later seconds there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_rechecks_a_retained_route_only_through_its_goal() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let ceiling = t0 - HOUR / 2;
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    account.record_caps(RELAY, caps(500, true), t0);
+    account.live_boundary(&route, RELAY, floor, t0);
+    account.goal(&route, floor);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![RunnerRoute {
+            goal_until: Some(ceiling),
+            ..required(&route, &[RELAY])
+        }],
+        &[&relay],
+    );
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    let summary = ran(runner.step().await);
+    assert!(summary.recheck);
+    let comparisons = relay.comparisons();
+    assert!(!comparisons.is_empty());
+    assert!(comparisons.iter().all(|window| window.until <= ceiling));
+}

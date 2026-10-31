@@ -14,6 +14,7 @@
 //! The runner never trusts a wake: every bump (`AppTransportRouting`'s
 //! sender) only makes it read the ledger again.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -23,7 +24,7 @@ use async_trait::async_trait;
 use cgka_traits::{MemberId, TransportDelivery, TransportEndpoint};
 use nostr::prelude::{Event, RelayUrl};
 use storage_sqlite::{RecoveryUnitPolicy, SqliteAppStorage};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use transport_nostr::MarmotRelayPlane;
 use transport_nostr_adapter::compare::CompareRelay;
@@ -145,9 +146,11 @@ impl RunnerHost for AccountRunnerHost {
         self.on_client(false, move |client| {
             Box::pin(async move {
                 let app = runner_storage(client)?;
+                let audit = |kind| client.record_audit_event(None, None, kind);
                 Some(turn(&WorkerTurn {
                     app: &app,
                     now: unix_now(),
+                    audit: &audit,
                 }))
             })
         })
@@ -166,6 +169,7 @@ impl RunnerHost for AccountRunnerHost {
             Box::pin(async move {
                 let app = runner_storage(client)?;
                 let now = unix_now();
+                client.settle_recovery_route_changes(&app, now);
                 let tails = client.recovery_runner_live_tails(&app, now).await;
                 let routes = client.recovery_runner_routes();
                 // The live counts and the fences they raise come with PR 5c.
@@ -182,11 +186,7 @@ impl RunnerHost for AccountRunnerHost {
     }
 
     async fn relay_caps(&self, relay: &str) -> Option<RelayCaps> {
-        let caps = self.relay_caps.caps(relay, self.allow_loopback).await;
-        // The cache folds an unknown read into the default caps. Read those as
-        // unknown, which is never evidence of a change, until the read tells
-        // them apart (PR 5b).
-        (caps != RelayCaps::default()).then_some(caps)
+        self.relay_caps.caps(relay, self.allow_loopback).await
     }
 
     fn sweep_relay(
@@ -257,6 +257,12 @@ impl RunnerHost for AccountRunnerHost {
 
     fn now_seconds(&self) -> u64 {
         unix_now()
+    }
+
+    fn relay_connections(&self) -> Option<watch::Receiver<BTreeMap<String, u64>>> {
+        self.relay_client()
+            .as_ref()
+            .map(NostrSdkRelayClient::relay_connections)
     }
 }
 
@@ -341,6 +347,7 @@ impl AppClient {
     /// Build the account's runner over this client, woken by its routing's
     /// chokepoint bumps. Its turns wait until this client's owner serves them.
     async fn build_recovery_runner(&self) -> AccountRunner {
+        self.routing.track_route_changes();
         let (turns_tx, turns) = mpsc::channel(1);
         let account_id = self.adapter.account_id().clone();
         let host = AccountRunnerHost {

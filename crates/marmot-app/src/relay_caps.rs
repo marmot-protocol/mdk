@@ -11,8 +11,10 @@
 //! a resolved address. Redirects are refused.
 //!
 //! A missing, malformed, oversized or unreachable document reads as unknown
-//! caps ([`RelayCaps::default`]), so the sweep infers the cap from full replies
-//! instead. Unknown caps are retried sooner than a document is refreshed.
+//! caps (`None`), kept apart from a document that advertises nothing, so an
+//! unknown read is never mistaken for a change. The sweep then infers the cap
+//! from full replies. Unknown caps are retried sooner than a document is
+//! refreshed.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -166,7 +168,8 @@ fn document_url(endpoint: &str, allow_loopback: bool) -> Result<Url, Nip11Failur
 }
 
 struct CachedCaps {
-    caps: RelayCaps,
+    /// `None` when unknown.
+    caps: Option<RelayCaps>,
     fresh_until: Instant,
 }
 
@@ -181,15 +184,15 @@ pub(crate) struct RelayCapsCache {
 }
 
 impl RelayCapsCache {
-    /// The relay's caps, from cache or a fresh fetch. Unknown caps when the
-    /// document is missing, malformed, unreachable or refused.
-    pub(crate) async fn caps(&self, endpoint: &str, allow_loopback: bool) -> RelayCaps {
+    /// The relay's caps, from cache or a fresh fetch. `None` (unknown) when
+    /// the document is missing, malformed, unreachable or refused.
+    pub(crate) async fn caps(&self, endpoint: &str, allow_loopback: bool) -> Option<RelayCaps> {
         // Refused relays cost no I/O, so they take no cache entry.
         let url = match document_url(endpoint, allow_loopback) {
             Ok(url) => url,
             Err(failure) => {
                 log_unknown(failure);
-                return RelayCaps::default();
+                return None;
             }
         };
         let slot = self.slot(url.as_str());
@@ -200,10 +203,10 @@ impl RelayCapsCache {
             return entry.caps;
         }
         let (caps, fresh_for) = match self.fetch.caps(url, allow_loopback).await {
-            Ok(caps) => (caps, DOCUMENT_FRESH_FOR),
+            Ok(caps) => (Some(caps), DOCUMENT_FRESH_FOR),
             Err(failure) => {
                 log_unknown(failure);
-                (RelayCaps::default(), UNKNOWN_FRESH_FOR)
+                (None, UNKNOWN_FRESH_FOR)
             }
         };
         *cached = Some(CachedCaps {

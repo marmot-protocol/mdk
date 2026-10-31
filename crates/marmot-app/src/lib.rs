@@ -4,7 +4,7 @@
 //! early app surfaces: encrypted session storage, Nostr MLS peeling, Nostr
 //! transport publishing, and relay-backed app projections.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,7 +63,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use storage_sqlite::{
     SecurePruneAppEventsResult, SqliteAccountStorage, SqliteSharedStorage, StoredAppMessageQuery,
-    TimelineProjectionUpdate,
+    TimelineProjectionUpdate, TransportReconciliationRoute,
 };
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
@@ -1478,20 +1478,23 @@ impl MarmotApp {
 
     /// A relay's caps for the time-sliced history sweep (#2660), from its
     /// NIP-11 document behind the relay dial gate and cached per canonical
-    /// relay URL. Unknown caps when the document is missing, malformed,
+    /// relay URL. `None` (unknown) when the document is missing, malformed,
     /// unreachable or refused, so the sweep infers the cap from full replies.
+    /// A document that advertises nothing is known: it reads as
+    /// [`RelayCaps::default`](transport_nostr_adapter::sweep::RelayCaps).
     ///
     /// Nothing refreshes in the background: a call on a stale entry fetches
     /// again, so call it when a relay reconnects. Caps compare by value, so a
     /// caller sees a change by comparing a known read with the caps it
     /// planned with. An unknown read means no information, not a change: a
     /// failed fetch reads as unknown until a later one succeeds.
-    // Phase 4 of #2660 hands these to `SdkSweepRelay` from the recovery runner.
+    // The recovery runner reads the cache through its host; this is the
+    // app-level read the dial-gate tests pin.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn relay_caps(
         &self,
         endpoint: &str,
-    ) -> transport_nostr_adapter::sweep::RelayCaps {
+    ) -> Option<transport_nostr_adapter::sweep::RelayCaps> {
         self.relay_caps
             .caps(endpoint, self.config.allow_loopback_relay_endpoints)
             .await
@@ -8055,6 +8058,75 @@ struct SharedAppRouting {
     /// recovery chokepoints. The account's recovery runner, if one runs,
     /// reads its debt again (mdk#2660 phase 4).
     recovery_runner_wake: tokio::sync::watch::Sender<u64>,
+    /// What replacements changed that the account's recovery runner has not
+    /// settled yet. `None` until a runner tracks them, so nothing is kept
+    /// while none runs.
+    route_changes: Mutex<Option<RouteChanges>>,
+}
+
+/// What routing replacements changed since the account's recovery runner
+/// last settled them (mdk#2660 section 3), as (route, relay) pairs keyed as
+/// the recovery ledger keys them ([`ledger_route_pairs`]). Not `Debug`: it
+/// carries routes and relays.
+#[derive(Default)]
+pub(crate) struct RouteChanges {
+    /// Each pair a replacement dropped, with the group it dropped from;
+    /// `None` for the inbox. A rebuild of every group drops nothing here:
+    /// only one group's own replacement, or the inbox's, may.
+    pub(crate) dropped: BTreeSet<(Option<Vec<u8>>, TransportReconciliationRoute, String)>,
+    /// Some route changed since the last settle, or tracking just began.
+    pub(crate) changed: bool,
+}
+
+impl RouteChanges {
+    fn record(
+        &mut self,
+        group: Option<&GroupId>,
+        before: &BTreeSet<(TransportReconciliationRoute, String)>,
+        after: &BTreeSet<(TransportReconciliationRoute, String)>,
+    ) {
+        self.dropped
+            .extend(before.difference(after).map(|(route, relay)| {
+                (
+                    group.map(|group| group.as_slice().to_vec()),
+                    route.clone(),
+                    relay.clone(),
+                )
+            }));
+        self.changed = true;
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.dropped.extend(other.dropped);
+        self.changed |= other.changed;
+    }
+}
+
+/// The (route, relay) pairs the recovery ledger keys `group_routes` and
+/// `inbox` by: each group route with a 32-byte transport id, and the inbox,
+/// with each relay spelled as the ledger spells it.
+pub(crate) fn ledger_route_pairs<'a>(
+    group_routes: impl IntoIterator<Item = &'a TransportGroupSubscription>,
+    inbox: &[TransportEndpoint],
+) -> BTreeSet<(TransportReconciliationRoute, String)> {
+    let relay = |endpoint: &TransportEndpoint| transport_nostr::canonical_relay(endpoint.as_str());
+    group_routes
+        .into_iter()
+        .filter_map(|route| {
+            let id = <[u8; 32]>::try_from(route.transport_group_id.as_slice()).ok()?;
+            Some(
+                route.endpoints.iter().map(move |endpoint| {
+                    (TransportReconciliationRoute::Group(id), relay(endpoint))
+                }),
+            )
+        })
+        .flatten()
+        .chain(
+            inbox
+                .iter()
+                .map(|endpoint| (TransportReconciliationRoute::Inbox, relay(endpoint))),
+        )
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -8072,8 +8144,43 @@ impl AppTransportRouting {
             inner: Arc::new(SharedAppRouting {
                 state: RwLock::new(state),
                 recovery_runner_wake: tokio::sync::watch::channel(0).0,
+                route_changes: Mutex::default(),
             }),
         }
+    }
+
+    /// Keep what replacements change from now on, for the account's recovery
+    /// runner to settle. The first settle checks every route.
+    fn track_route_changes(&self) {
+        self.route_changes().get_or_insert_with(|| RouteChanges {
+            changed: true,
+            ..RouteChanges::default()
+        });
+    }
+
+    /// What replacements changed since the last take, if a runner tracks them.
+    fn take_route_changes(&self) -> Option<RouteChanges> {
+        self.route_changes().as_mut().map(std::mem::take)
+    }
+
+    /// Put back changes a settle could not write, ahead of newer ones.
+    fn restore_route_changes(&self, changes: RouteChanges) {
+        if let Some(held) = self.route_changes().as_mut() {
+            held.merge(changes);
+        }
+    }
+
+    fn record_route_changes(&self, record: impl FnOnce(&mut RouteChanges)) {
+        if let Some(changes) = self.route_changes().as_mut() {
+            record(changes);
+        }
+    }
+
+    fn route_changes(&self) -> std::sync::MutexGuard<'_, Option<RouteChanges>> {
+        self.inner
+            .route_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The sender a recovery runner wakes on.
@@ -8121,6 +8228,13 @@ impl AppTransportRouting {
         state
             .group_routes
             .retain(|route| route.group_id != *group_id);
+        self.record_route_changes(|changes| {
+            changes.record(
+                Some(group_id),
+                &ledger_route_pairs(&installed, &[]),
+                &ledger_route_pairs(&routes, &[]),
+            )
+        });
         state.group_routes.extend(routes);
         drop(state);
         self.wake_recovery_runner();
@@ -8148,6 +8262,17 @@ impl AppTransportRouting {
         let mut installed = self.write();
         let routes_changed = installed.local_inbox_endpoints != state.local_inbox_endpoints
             || installed.group_routes != state.group_routes;
+        if routes_changed {
+            // A rebuild or a restore may leave a group out for a while, so
+            // only the inbox drops anything here.
+            self.record_route_changes(|changes| {
+                changes.record(
+                    None,
+                    &ledger_route_pairs([], &installed.local_inbox_endpoints),
+                    &ledger_route_pairs([], &state.local_inbox_endpoints),
+                )
+            });
+        }
         *installed = state;
         drop(installed);
         if routes_changed {
@@ -8582,6 +8707,16 @@ pub(crate) fn history_floor(anchor_secs: u64) -> cgka_traits::transport::Timesta
     cgka_traits::transport::Timestamp(
         anchor_secs.saturating_sub(HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE.as_secs()),
     )
+}
+
+/// The last second a retained route owes recovered history: its switch plus
+/// [`HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE`], from its subscription floor
+/// ([`history_floor`] of that switch). Later traffic there comes from members
+/// that have not applied the switch, and its live subscription delivers it.
+pub(crate) fn retained_route_goal_until(retained_since: cgka_traits::transport::Timestamp) -> u64 {
+    retained_since
+        .0
+        .saturating_add(2 * HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE.as_secs())
 }
 
 fn sqlite_file_requires_key(path: &Path) -> bool {

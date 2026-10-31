@@ -749,7 +749,7 @@ impl RuntimeSharedServices {
         {
             if config.enabled {
                 tracing::warn!(
-                    target: "marmot_app::relay_telemetry_export",
+                    target: "marmot_app::runtime",
                     method = "configure_relay_telemetry_exporter",
                     "relay telemetry export requested, but marmot-app was built without otlp-export",
                 );
