@@ -24,6 +24,13 @@ use openmls_traits::OpenMlsProvider as _;
 use std::collections::HashSet;
 use tls_codec::Serialize as _;
 
+/// A staged Commit's Welcome wrapped for one added KeyPackage, not yet
+/// recorded ([`Engine::wrap_staged_welcomes`]).
+pub(crate) struct WrappedWelcome {
+    message: TransportMessage,
+    key_package_ref: Vec<u8>,
+}
+
 impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_send_ready(
         &mut self,
@@ -444,26 +451,14 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
-        self.record_sent_openmls_message(
-            &commit_msg,
-            commit_bytes.as_slice(),
-            &group_id,
-            pre_commit_epoch,
-        )?;
-
         let welcomes = self
-            .wrap_staged_welcomes(
-                &mls_group,
-                &group_id,
-                &commit_msg.id,
-                pre_commit_epoch,
-                &welcome_bytes,
-                &key_packages,
-                &parsed_kps,
-                None,
-            )
+            .wrap_staged_welcomes(&mls_group, &welcome_bytes, &key_packages, &parsed_kps)
             .await?;
-
+        crate::capability_manager::check_key_package_profiles(
+            &self.storage,
+            &group_id,
+            &parsed_kps,
+        )?;
         // Update the Marmot record with the projected post-merge member
         // list — `members()` walks this list (and `feature_status` counts the
         // pending commit's added leaves), and users expect the API to
@@ -471,14 +466,24 @@ impl<S: StorageProvider> Engine<S> {
         // Epoch stays at the pre-merge value; that updates on confirm.
         // On `publish_failed`, the engine re-derives from the (still-
         // unmerged) MLS state, which naturally drops the projection.
-        crate::capability_manager::check_key_package_profiles(
-            &self.storage,
+        let projected_members =
+            crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;
+
+        self.record_sent_openmls_message(
+            &commit_msg,
+            commit_bytes.as_slice(),
             &group_id,
-            &parsed_kps,
+            pre_commit_epoch,
+        )?;
+        let welcomes = self.record_staged_welcomes(
+            welcomes,
+            &group_id,
+            &commit_msg.id,
+            pre_commit_epoch,
+            None,
         )?;
         let mut group_record = existing;
-        group_record.members =
-            crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;
+        group_record.members = projected_members;
         self.storage.put_group(&group_record)?;
 
         // State: begin pending at the projected new epoch via EpochManager.
@@ -523,23 +528,18 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Wrap a staged Commit's Welcome once per added KeyPackage, addressed to
-    /// that KeyPackage's account and naming its publication, and record each
-    /// as staged delivery work of `commit_id`. Invites and same-account Adds
-    /// deliver their Welcomes this way (joining.md, "Delivery"). A device
-    /// link's Welcome records `deliver_until`, after which it is never
-    /// published.
-    #[allow(clippy::too_many_arguments)]
+    /// that KeyPackage's account and naming its publication (joining.md,
+    /// "Delivery"). This writes nothing, and a caller wraps every Welcome
+    /// before it records its Commit: a Welcome that cannot be wrapped, as one
+    /// for a KeyPackage that names no publication, refuses the intent with
+    /// nothing written. [`Self::record_staged_welcomes`] records them.
     pub(crate) async fn wrap_staged_welcomes(
-        &mut self,
+        &self,
         mls_group: &MlsGroup,
-        group_id: &GroupId,
-        commit_id: &MessageId,
-        source_epoch: EpochId,
         welcome_bytes: &[u8],
         key_packages: &[cgka_traits::engine::KeyPackage],
         parsed_kps: &[openmls::prelude::KeyPackage],
-        deliver_until: Option<cgka_traits::transport::Timestamp>,
-    ) -> Result<Vec<TransportMessage>, EngineError> {
+    ) -> Result<Vec<WrappedWelcome>, EngineError> {
         let mut welcomes = Vec::with_capacity(parsed_kps.len());
         let welcome_relays = crate::group_lifecycle::welcome_relays_for_group(mls_group)?;
         for (source_kp, parsed_kp) in key_packages.iter().zip(parsed_kps.iter()) {
@@ -552,7 +552,7 @@ impl<S: StorageProvider> Engine<S> {
                 ciphertext: welcome_bytes.to_vec(),
                 aad: vec![],
             };
-            let wrapped = if let Some(metadata) =
+            let message = if let Some(metadata) =
                 crate::group_lifecycle::welcome_metadata_for_key_package(
                     source_kp,
                     welcome_relays.as_deref(),
@@ -564,19 +564,42 @@ impl<S: StorageProvider> Engine<S> {
                 self.peeler.wrap_welcome(&payload, &recipient).await
             }
             .map_err(EngineError::Peeler)?;
-            self.record_staged_invite_welcome(
-                &wrapped,
-                commit_id,
-                crate::key_package::key_package_ref(parsed_kp)?
+            welcomes.push(WrappedWelcome {
+                message,
+                key_package_ref: crate::key_package::key_package_ref(parsed_kp)?
                     .as_slice()
                     .to_vec(),
-                deliver_until,
-                group_id,
-                source_epoch,
-            )?;
-            welcomes.push(wrapped);
+            });
         }
         Ok(welcomes)
+    }
+
+    /// Record wrapped Welcomes as staged delivery work of `commit_id`, once
+    /// its Commit is recorded. Invites and same-account Adds deliver their
+    /// Welcomes this way. A device link's Welcome records `deliver_until`,
+    /// after which it is never published.
+    pub(crate) fn record_staged_welcomes(
+        &mut self,
+        welcomes: Vec<WrappedWelcome>,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+        source_epoch: EpochId,
+        deliver_until: Option<cgka_traits::transport::Timestamp>,
+    ) -> Result<Vec<TransportMessage>, EngineError> {
+        welcomes
+            .into_iter()
+            .map(|welcome| {
+                self.record_staged_invite_welcome(
+                    &welcome.message,
+                    commit_id,
+                    welcome.key_package_ref,
+                    deliver_until,
+                    group_id,
+                    source_epoch,
+                )?;
+                Ok(welcome.message)
+            })
+            .collect()
     }
 
     async fn do_send_remove_members(

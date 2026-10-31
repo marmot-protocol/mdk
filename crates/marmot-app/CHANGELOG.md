@@ -522,6 +522,11 @@
 
 ### Fixed
 
+- An invite, device link or legacy-profile group create whose Welcome cannot
+  be wrapped for the transport, such as an invite of a private KeyPackage, is
+  refused with nothing written. Each used to fail after writing its commit or
+  group record, and the record stayed. Every Add path now wraps each Welcome
+  before its first write.
 - Kinds sent only in a device group (heartbeat 457, private KeyPackage
   request 459 and hand-off 460, sibling Welcome 461, history delivery 473,
   small-state update 475 and broadcast request 476) are ignored in any other

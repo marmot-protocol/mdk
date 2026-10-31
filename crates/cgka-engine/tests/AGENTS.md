@@ -42,7 +42,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** `EngineBuilder` validation and empty-engine behavior
 
 - **File:** `group_creation.rs`
-  - **Owns:** Fresh KeyPackage, create, join welcome, confirm
+  - **Owns:** Fresh KeyPackage, create, join welcome, confirm; a legacy create whose Welcome cannot be wrapped
+    writes no group
 
 - **File:** `group_context_view.rs`
   - **Owns:** `GroupContextView` exporter-secret length contract
@@ -218,7 +219,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     (D40): one privileged Commit removing the linked leaf and its entry, which the removed device sees as its removal;
     refused for another leaf than one other leaf of the account, an update that doesn't remove exactly one listed
     entry, or while an own Commit is in flight. A device it removed that forgot its copy joins again through the next
-    link's Welcome, which no forget cutoff dates.
+    link's Welcome, which no forget cutoff dates. A link whose Welcome cannot be wrapped writes nothing.
 
 - **File:** `account_devices/device_group_welcome.rs` (test-policy builds only)
   - **Owns:** Which Welcome a new device joins its device group through (mdk#2628 D28, D30): only the one a stored
@@ -252,7 +253,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only). A sibling
     Welcome (3.5b) consumes only the private KeyPackage it names, issued to its sender, and one back into a chat still
     held active is held, writing nothing, until that copy reads removed or unrecoverable. One carried no later than a
-    local forget is refused for that carrier alone, so the same Welcome in a later carrier joins.
+    local forget is refused for that carrier alone, so the same Welcome in a later carrier joins. An invite or a
+    same-account Add with a private KeyPackage, whose Welcome the Nostr binding cannot wrap, writes nothing.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and

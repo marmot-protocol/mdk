@@ -40,7 +40,7 @@ use cgka_traits::app_components::{
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
     CgkaEngine, CommitOrderingPriority, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent,
-    SendResult,
+    SendResult, WelcomeMetadata,
 };
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
@@ -215,6 +215,54 @@ impl TransportPeeler for MockPeeler {
     }
 }
 
+/// [`MockPeeler`], except that it wraps a Welcome only for a KeyPackage that
+/// names its publication, as the Nostr binding does: a Welcome for a private
+/// KeyPackage cannot be wrapped (joining.md, "Delivery").
+#[derive(Default)]
+struct PublishedWelcomesOnly(MockPeeler);
+
+#[async_trait]
+impl TransportPeeler for PublishedWelcomesOnly {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        self.0.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        self.0.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        _payload: &EncryptedPayload,
+        _recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        Err(PeelerError::MissingContext {
+            label: "welcome_metadata".into(),
+        })
+    }
+
+    async fn wrap_welcome_with_metadata(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+        _metadata: &WelcomeMetadata,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.wrap_welcome(payload, recipient).await
+    }
+}
+
 fn registry() -> FeatureRegistry {
     let mut r = FeatureRegistry::new();
     r.register(
@@ -244,6 +292,19 @@ struct Device {
 /// A current-profile device of `account`. Devices built from one label share
 /// the account identity and differ in their MLS signature keys.
 fn device(account: &[u8], advertises_account_devices: bool) -> Device {
+    device_with_peeler(
+        account,
+        advertises_account_devices,
+        Box::<MockPeeler>::default(),
+    )
+}
+
+/// [`device`] with `peeler` in place of the [`MockPeeler`].
+fn device_with_peeler(
+    account: &[u8],
+    advertises_account_devices: bool,
+    peeler: Box<dyn TransportPeeler>,
+) -> Device {
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut supported: Vec<_> = default_group_components().into_iter().collect();
     if advertises_account_devices {
@@ -255,7 +316,7 @@ fn device(account: &[u8], advertises_account_devices: bool) -> Device {
         .protocol_profile(ProtocolProfile::Current)
         .feature_registry(registry())
         .supported_app_components(supported)
-        .peeler(Box::<MockPeeler>::default())
+        .peeler(peeler)
         .build()
         .unwrap();
     Device { engine, storage }
