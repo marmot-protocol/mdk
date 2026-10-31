@@ -197,10 +197,11 @@ impl UnlinkedPublishGate {
         Self { inner, unlinked }
     }
 
-    fn refusal(&self) -> Option<TransportAdapterError> {
-        self.unlinked
-            .load(Ordering::Acquire)
-            .then(|| TransportAdapterError::Publish("this device is unlinked".to_owned()))
+    /// Whether this publish is refused. Read once per publish: a failed
+    /// link's undo lifts the stop (D40), so a batch is refused whole or not
+    /// at all.
+    fn stopped(&self) -> bool {
+        self.unlinked.load(Ordering::Acquire)
     }
 }
 
@@ -298,8 +299,8 @@ impl NostrRelayClient for UnlinkedPublishGate {
         event: &NostrTransportEvent,
         required_acks: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
-        if let Some(refusal) = self.refusal() {
-            return Err(refusal);
+        if self.stopped() {
+            return Err(unlinked_refusal());
         }
         self.inner
             .publish_event(endpoints, event, required_acks)
@@ -313,8 +314,8 @@ impl NostrRelayClient for UnlinkedPublishGate {
         event: &NostrTransportEvent,
         required_acks: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
-        if let Some(refusal) = self.refusal() {
-            return Err(refusal);
+        if self.stopped() {
+            return Err(unlinked_refusal());
         }
         self.inner
             .publish_event_for_account(account_id, endpoints, event, required_acks)
@@ -326,8 +327,8 @@ impl NostrRelayClient for UnlinkedPublishGate {
         account_id: &MemberId,
         requests: &[NostrEventPublishRequest],
     ) -> Vec<Result<NostrPublishOutcome, TransportAdapterError>> {
-        if self.refusal().is_some() {
-            return refuse_all(self, requests);
+        if self.stopped() {
+            return refuse_all(requests);
         }
         self.inner
             .publish_events_for_account(account_id, requests)
@@ -339,8 +340,8 @@ impl NostrRelayClient for UnlinkedPublishGate {
         account_id: &MemberId,
         requests: &[NostrEventPublishRequest],
     ) -> NostrPublishBatch {
-        if self.refusal().is_some() {
-            return refused_batch(self, requests);
+        if self.stopped() {
+            return refused_batch(requests);
         }
         self.inner
             .publish_events_for_account_with_timings(account_id, requests)
@@ -351,8 +352,8 @@ impl NostrRelayClient for UnlinkedPublishGate {
         &self,
         requests: &[NostrEventPublishRequest],
     ) -> Vec<Result<NostrPublishOutcome, TransportAdapterError>> {
-        if self.refusal().is_some() {
-            return refuse_all(self, requests);
+        if self.stopped() {
+            return refuse_all(requests);
         }
         self.inner.publish_events(requests).await
     }
@@ -361,29 +362,85 @@ impl NostrRelayClient for UnlinkedPublishGate {
         &self,
         requests: &[NostrEventPublishRequest],
     ) -> NostrPublishBatch {
-        if self.refusal().is_some() {
-            return refused_batch(self, requests);
+        if self.stopped() {
+            return refused_batch(requests);
         }
         self.inner.publish_events_with_timings(requests).await
     }
 }
 
-fn refuse_all(
-    gate: &UnlinkedPublishGate,
-    requests: &[NostrEventPublishRequest],
-) -> Vec<Result<NostrPublishOutcome, TransportAdapterError>> {
-    requests
-        .iter()
-        .map(|_| Err(gate.refusal().expect("the gate is closed for good")))
-        .collect()
+fn unlinked_refusal() -> TransportAdapterError {
+    TransportAdapterError::Publish("this device is unlinked".to_owned())
 }
 
-fn refused_batch(
-    gate: &UnlinkedPublishGate,
+fn refuse_all(
     requests: &[NostrEventPublishRequest],
-) -> NostrPublishBatch {
+) -> Vec<Result<NostrPublishOutcome, TransportAdapterError>> {
+    requests.iter().map(|_| Err(unlinked_refusal())).collect()
+}
+
+fn refused_batch(requests: &[NostrEventPublishRequest]) -> NostrPublishBatch {
     NostrPublishBatch {
         request_durations: vec![std::time::Duration::ZERO; requests.len()],
-        outcomes: refuse_all(gate, requests),
+        outcomes: refuse_all(requests),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::ScriptedPushRelayClient;
+
+    /// A batch is refused whole or published whole, though a failed link's
+    /// undo lifts the stop while the batch is decided (D40).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_is_refused_whole_while_the_stop_lifts() {
+        let unlinked = Arc::new(AtomicBool::new(true));
+        let gate = UnlinkedPublishGate::new(
+            Arc::new(ScriptedPushRelayClient::default()),
+            unlinked.clone(),
+        );
+        let requests: Vec<_> = (0..64)
+            .map(|_| NostrEventPublishRequest {
+                endpoints: Vec::new(),
+                event: NostrTransportEvent::new_unsigned(
+                    "00".repeat(32),
+                    1,
+                    Vec::new(),
+                    String::new(),
+                ),
+                required_acks: 1,
+            })
+            .collect();
+        let done = Arc::new(AtomicBool::new(false));
+        let toggler = std::thread::spawn({
+            let (unlinked, done) = (unlinked.clone(), done.clone());
+            move || {
+                while !done.load(Ordering::Relaxed) {
+                    unlinked.fetch_xor(true, Ordering::AcqRel);
+                }
+            }
+        });
+        let mut refused = 0;
+        for _ in 0..2_000 {
+            let outcomes = gate.publish_events(&requests).await;
+            let refusals = outcomes
+                .iter()
+                .filter(|outcome| {
+                    outcome
+                        .as_ref()
+                        .is_err_and(|error| error.to_string().contains("unlinked"))
+                })
+                .count();
+            assert!(refusals == 0 || refusals == requests.len());
+            if refusals > 0 {
+                refused += 1;
+            }
+            let batch = gate.publish_events_with_timings(&requests).await;
+            assert_eq!(batch.outcomes.len(), requests.len());
+        }
+        done.store(true, Ordering::Relaxed);
+        toggler.join().unwrap();
+        assert!(refused > 0, "some batches were decided while stopped");
     }
 }
