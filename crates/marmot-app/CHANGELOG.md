@@ -61,6 +61,11 @@
 
 ### Added
 
+- A device adds a sibling to a chat with a private KeyPackage that sibling
+  handed it, and sends the sibling Welcome in the device group as a 461 once
+  the Add's Commit is published (mdk#2628 3.5b-2). A 461 that reached no
+  relay is sent again by the next maintenance pass. Only behind
+  `dev_device_groups`; nothing outside tests adds a sibling yet.
 - `MarmotAppRuntime::begin_recovery_words`, `confirm_recovery_words`,
   `cancel_recovery_words`, `turn_off_backups` and `backup_settings` set up
   the recovery words an account's backups will be sealed to, and turn backups

@@ -270,8 +270,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     failed by a rollback or a restart before it; one carrier at a time, and only that carrier delivers or fails it;
     settled unsent once its KeyPackage expires; and every refusal (a published KeyPackage, this device's own slot, a
     slot named twice, a tag that reads as another slot, an untagged adder, a chat that names no relays) writes nothing.
-    Its fixtures (`tagged_devices`, `found_routed_group`, `handed`, `assert_joins_from`) are how the gated
-    same-account tests in `send_intents.rs`, `creation.rs` and `device_tag.rs` add a sibling.
+
+- **File:** `account_devices/tagged_siblings.rs` (test-policy builds only)
+  - **Owns:** No tests. Its fixtures (`tagged_devices`, `found_routed_group`, `handed`, `assert_joins_from`) are how
+    the gated same-account tests in `sibling_welcomes.rs`, `send_intents.rs`, `creation.rs` and `device_tag.rs` add a
+    sibling: tagged devices, a chat that names relays, and a join through the sibling Welcome the Add owes.
 
 - **File:** `epoch_sealed_transport.rs`
   - **Owns:** Engine behavior under production transport visibility via `support::epoch_sealed_peeler` — the sealing

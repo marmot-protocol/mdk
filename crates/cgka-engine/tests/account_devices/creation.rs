@@ -178,7 +178,7 @@ async fn a_host_cannot_supply_account_devices_data_at_creation() {
 #[tokio::test]
 async fn a_member_adds_and_removes_its_own_devices_from_the_start() {
     use super::device_roster::slot;
-    use super::sibling_welcomes::{
+    use super::tagged_siblings::{
         assert_joins_from, chat_device, found_routed_group, handed, owed, tagged_devices,
     };
     let (mut bob, mut new, _) = tagged_devices(b"bob", 1).await;

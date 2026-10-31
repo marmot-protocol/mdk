@@ -20,7 +20,7 @@ use super::device_roster::{
     entry, found_device_group, phone_and_laptop, roster, roster_device, roster_device_on,
     roster_of, roster_update, slot,
 };
-use super::sibling_welcomes::{found_routed_group, handed};
+use super::tagged_siblings::{found_routed_group, handed};
 use super::*;
 use cgka_engine::device_tag::{DeviceTagClaim, device_tag_claim, seal_device_tag};
 use cgka_traits::app_components::{

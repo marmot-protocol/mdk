@@ -806,27 +806,21 @@ impl AppClient {
         let Some(device_group) = self.runtime.device_tag_group() else {
             return;
         };
-        let carriers = |app_event_ids: Vec<(&GroupId, &String)>| -> Vec<Vec<u8>> {
-            app_event_ids
-                .into_iter()
-                .filter(|(group_id, _)| *group_id == device_group)
-                .filter_map(|(_, app_event_id)| hex::decode(app_event_id).ok())
-                .collect()
+        let carrier = |group_id: &GroupId, app_event_id: &str| {
+            (group_id == device_group)
+                .then(|| hex::decode(app_event_id).ok())
+                .flatten()
         };
-        let published = carriers(
-            effects
-                .published_app_messages
-                .iter()
-                .map(|message| (&message.group_id, &message.app_event_id))
-                .collect(),
-        );
-        let failed = carriers(
-            effects
-                .failed_app_messages
-                .iter()
-                .map(|message| (&message.group_id, &message.app_event_id))
-                .collect(),
-        );
+        let published: Vec<Vec<u8>> = effects
+            .published_app_messages
+            .iter()
+            .filter_map(|message| carrier(&message.group_id, &message.app_event_id))
+            .collect();
+        let failed: Vec<Vec<u8>> = effects
+            .failed_app_messages
+            .iter()
+            .filter_map(|message| carrier(&message.group_id, &message.app_event_id))
+            .collect();
         if published.is_empty() && failed.is_empty() {
             return;
         }

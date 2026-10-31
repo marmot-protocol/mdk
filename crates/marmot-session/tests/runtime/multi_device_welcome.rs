@@ -92,6 +92,9 @@ impl TransportRoutingPolicy for SharedRouting {
 /// KeyPackage.
 struct Device {
     runtime: AccountDeviceRuntime<RecordingAdapter, SharedRouting, RecordingKeyPackages>,
+    /// What the runtime publishes, and where.
+    adapter: RecordingAdapter,
+    routing: SharedRouting,
     /// The device's current KeyPackage as an inviter fetches it, carrying the
     /// id of its publication for the inviter to name in the rumor.
     key_package: cgka_traits::engine::KeyPackage,
@@ -119,10 +122,12 @@ impl Device {
         Self {
             runtime: AccountDeviceRuntime::new(
                 session,
-                adapter,
-                routing,
+                adapter.clone(),
+                routing.clone(),
                 RecordingKeyPackages::default(),
             ),
+            adapter,
+            routing,
             key_package,
         }
     }
@@ -1001,43 +1006,82 @@ mod same_account_welcome {
         (phone, phone_storage, laptop, group_id)
     }
 
+    /// A non-admin device adds its sibling to a chat that requires
+    /// account-devices. The Add publishes no Welcome to the account's inbox:
+    /// its Welcome is owed as a sibling Welcome, which the adder carries as a
+    /// 461 in the device group, and the sibling joins through it
+    /// (mdk#2628 3.5b), spending only the private KeyPackage it names.
+    #[cfg(feature = "test-policy-overrides")]
     #[tokio::test]
     async fn a_device_joins_through_its_siblings_welcome_once_required() {
+        use super::tagged_siblings::*;
         let dir = tempfile::tempdir().unwrap();
-        let (phone, phone_storage, mut laptop, group_id) = phone_in_bobs_group(&dir, true).await;
+        let (mut phone, mut laptop, device_group) = tagged_phone_and_laptop(&dir).await;
+        let chat = bobs_chat_with(&dir, &mut phone).await;
+        let phone_epoch = phone.runtime.session().epoch(&chat).unwrap();
+        let sibling = handed(&mut laptop, &phone);
         let laptop_before = laptop.lifecycle();
-        let phone_epoch = phone.runtime.session().epoch(&group_id).unwrap();
 
-        // The phone, not an admin, adds the laptop. The runtime carries a
-        // same-account Add's Welcome only as a sibling Welcome in the device
-        // group (mdk#2628 3.5b), so this one is built with raw OpenMLS and
-        // delivered as any Welcome is: one rumor, gift-wrapped to the account
-        // and naming the laptop's KeyPackage.
-        let welcome = same_account_add(&phone, &phone_storage, &group_id, &laptop.key_package);
-        let to_laptop = rewrapped(
-            b"alice",
-            b"alice",
-            welcome,
-            publication_id(&laptop.key_package),
-        )
-        .await;
+        let effects = phone
+            .runtime
+            .send(SendIntent::AddOwnAccountDevices {
+                group_id: chat.clone(),
+                siblings: vec![sibling.clone()],
+            })
+            .await
+            .unwrap();
+        assert!(effects.failures.is_empty(), "{:?}", effects.failures);
+        assert_eq!(
+            phone.runtime.session().epoch(&chat).unwrap().0,
+            phone_epoch.0 + 1
+        );
+        assert!(
+            phone
+                .adapter
+                .publishes()
+                .iter()
+                .all(|publish| !matches!(publish.message.envelope, TransportEnvelope::Welcome { .. }))
+        );
+        let [owed] = &phone
+            .runtime
+            .owed_sibling_welcomes(Timestamp(NOW))
+            .unwrap()[..]
+        else {
+            panic!("one owed sibling Welcome");
+        };
+        let carried = carry(&mut phone, &device_group, owed).await;
+        assert!(
+            phone
+                .runtime
+                .owed_sibling_welcomes(Timestamp(NOW))
+                .unwrap()
+                .is_empty()
+        );
 
-        let results = laptop.ingest_all(&[&to_laptop]).await;
-        assert_eq!(joins(&results), vec![(group_id.clone(), to_laptop.id.clone())]);
-        let welcomers: Vec<_> = results
+        let events = join_from(&mut laptop, carried, &device_group).await;
+        let welcomers: Vec<_> = events
             .iter()
-            .flat_map(|effects| &effects.effects.events)
             .filter_map(|event| match event {
-                GroupEvent::GroupJoined { welcomer, .. } => welcomer.clone(),
+                GroupEvent::GroupJoined {
+                    group_id, welcomer, ..
+                } if group_id == &chat => welcomer.clone(),
                 _ => None,
             })
             .collect();
         assert_eq!(welcomers, vec![phone.runtime.self_id()]);
         assert_eq!(
-            laptop.runtime.session().epoch(&group_id).unwrap().0,
-            phone_epoch.0 + 1
+            laptop.runtime.session().epoch(&chat).unwrap(),
+            phone.runtime.session().epoch(&chat).unwrap()
         );
-        assert_only_consumed(&laptop_before, laptop.lifecycle(), &laptop.key_package);
+        assert!(
+            laptop
+                .runtime
+                .issued_private_key_packages()
+                .unwrap()
+                .iter()
+                .all(|issued| issued.key_package != sibling.key_package.bytes())
+        );
+        assert_eq!(laptop.lifecycle(), laptop_before);
     }
 
     #[tokio::test]

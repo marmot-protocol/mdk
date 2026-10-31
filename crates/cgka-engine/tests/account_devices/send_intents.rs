@@ -14,7 +14,7 @@
 #[cfg(feature = "test-policy-overrides")]
 use super::device_roster::{roster_device_on, slot};
 #[cfg(feature = "test-policy-overrides")]
-use super::sibling_welcomes::{
+use super::tagged_siblings::{
     assert_joins_from, chat_device, handed, owed, routed_members, siblings, tagged_devices,
 };
 use super::*;

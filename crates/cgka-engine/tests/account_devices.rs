@@ -123,6 +123,11 @@ mod announced_key_packages;
 #[path = "account_devices/sibling_welcomes.rs"]
 mod sibling_welcomes;
 
+// The setup every test that adds a sibling to a chat shares.
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/tagged_siblings.rs"]
+mod tagged_siblings;
+
 const ACCOUNT_DEVICES: Feature = Feature("account-devices");
 
 fn pad32(name: &[u8]) -> Vec<u8> {

@@ -1350,6 +1350,44 @@ async fn a_sibling_welcome_owed_across_a_restart_is_sent_once() {
     }
 }
 
+/// A 461 this run sent stays in flight until the effects that publish or
+/// fail it settle it: a pass that finds its carrier on the owed Welcome
+/// leaves the carrier alone and sends no second 461.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_in_flight_is_not_sent_again() {
+    let (mut devices, _) = tagging_devices().await;
+    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    add_the_phone_unpublished(&mut devices, &chat).await;
+    let [carried] = &owed(&devices.laptop)[..] else {
+        panic!("one owed sibling Welcome");
+    };
+    assert!(
+        devices
+            .laptop
+            .runtime
+            .carry_sibling_welcome(&carried.id, &[0xfe; 32])
+            .unwrap()
+    );
+    devices
+        .laptop
+        .sibling_welcome_carriers
+        .insert(vec![0xfe; 32]);
+
+    devices.laptop.run_due_maintenance().await.unwrap();
+    let [still] = &owed(&devices.laptop)[..] else {
+        panic!("the Welcome stays owed");
+    };
+    assert_eq!(still.carrier.as_deref(), Some(&[0xfe; 32][..]));
+    assert!(
+        devices
+            .laptop
+            .sibling_welcome_carriers
+            .contains(&vec![0xfe; 32])
+    );
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 0);
+}
+
 /// A sibling Welcome goes out only once its Add's Commit is published: an
 /// Add whose Commit every relay refused fails, and neither it nor a later
 /// pass sends the Welcome. Adding the phone again goes through.
