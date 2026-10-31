@@ -77,7 +77,7 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     `deliver_owed_welcomes_with_audit_context`, which sends only those the engine says are owed now.
   - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b), and join a
     chat from a sibling Welcome the app admitted (3.5b); like a confirmed rejoin, that join's events wait for the
-    caller's drain. The request and hand-off checks read device tags through `member_device_tag_claim`.
+    caller's drain. The request and hand-off checks read device tags through `member_device_tag_claim_at`.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.

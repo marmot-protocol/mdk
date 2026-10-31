@@ -718,6 +718,27 @@ async fn a_sibling_welcome_adds_this_device_to_a_chat() {
     assert_eq!(stashed(&phone), 0);
 }
 
+/// A sibling Welcome sent in the device group before the phone's own commit
+/// there, and read after it, is read in the epoch it was sent in: its
+/// sender's leaf comes from that epoch's retained anchor, so it is stashed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_from_an_earlier_device_group_epoch_is_stashed() {
+    let (mut devices, group) = tagging_devices().await;
+    let (_, welcome) = chat_adding_the_phone(&mut devices).await;
+    let mut cursor = devices.relay.published_events.lock().unwrap().len();
+    send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
+    let epoch = devices.laptop.runtime.group_record(&group).unwrap().epoch;
+    let phone_slot = own_slot(&devices.phone);
+    devices
+        .phone
+        .rename_linked_device(&phone_slot, "Phone")
+        .await
+        .unwrap();
+    assert!(devices.phone.runtime.group_record(&group).unwrap().epoch > epoch);
+    deliver_new(&mut devices.phone, &devices.relay, &mut cursor).await;
+    assert_eq!(stashed(&devices.phone), 1);
+}
+
 /// A sibling Welcome that reaches the phone before the removal it follows is
 /// held, never offered (D72): the stash keeps each carrier under the chat's
 /// id, and passes leave them, after a restart too, writing nothing while the
