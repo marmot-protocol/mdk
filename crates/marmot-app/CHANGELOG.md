@@ -110,9 +110,10 @@
   history. An event too large for one delivery is left out. The receiver reads
   a delivery only from a sibling whose leaf is tagged, addressed to it, and
   opening with its own history key; it imports the bundle once it holds the
-  chat and parks it for up to a week until then. A delivery read after a later
-  device-group commit has no readable sender and is refused, and there are no
-  receipts, so its history is lost. A withdrawn delivery is owed again only
+  chat and parks it for up to a week until then. A delivery from an epoch
+  older than the device group's retained anchors has no readable sender and is
+  refused, and there are no receipts, so its history is lost. A withdrawn
+  delivery is owed again only
   when the sender hears of the withdrawal, so one whose record was evicted, or
   that a crash interrupted, is lost too. A history is still sent when branch
   selection later withdraws the adding Commit. Only behind
