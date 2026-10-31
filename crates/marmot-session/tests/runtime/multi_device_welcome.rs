@@ -92,8 +92,11 @@ impl TransportRoutingPolicy for SharedRouting {
 /// KeyPackage.
 struct Device {
     runtime: AccountDeviceRuntime<RecordingAdapter, SharedRouting, RecordingKeyPackages>,
-    /// What the runtime publishes, and where.
+    /// What the runtime publishes, and where. Only the test-policy
+    /// tagged-sibling tests read them.
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
     adapter: RecordingAdapter,
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
     routing: SharedRouting,
     /// The device's current KeyPackage as an inviter fetches it, carrying the
     /// id of its publication for the inviter to name in the rumor.
