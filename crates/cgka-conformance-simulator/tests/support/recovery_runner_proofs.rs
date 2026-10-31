@@ -443,11 +443,30 @@ fn wasted(events: &[Value]) -> usize {
         .count()
 }
 
-/// Runner attempts that newly covered part of a unit's debt.
-fn advanced(events: &[Value]) -> usize {
-    let covered = |event: &&Value| event["newly_covered_seconds"].as_u64() > Some(0);
+/// Seconds of debt the runner's advancing attempts newly covered.
+fn advanced_seconds(events: &[Value]) -> u64 {
     let advanced = events.iter().filter(|event| event["outcome"] == "advanced");
-    advanced.filter(covered).count()
+    advanced
+        .filter_map(|event| event["newly_covered_seconds"].as_u64())
+        .sum()
+}
+
+/// History requests with each route replaced by its label, so the saved
+/// evidence carries no route ids or account keys.
+fn labeled(history: &[Vec<HistoryRequestV1>], labels: &BTreeMap<String, String>) -> Value {
+    let label = |request: &HistoryRequestV1| {
+        let route = request.route.as_deref();
+        route.map(|route| labels.get(route).map_or("other", String::as_str))
+    };
+    let endpoints = history.iter().map(|requests| {
+        let requests = requests.iter().map(|request| {
+            let mut value = json!(request);
+            value["route"] = json!(label(request));
+            value
+        });
+        requests.collect::<Vec<_>>()
+    });
+    json!(endpoints.collect::<Vec<_>>())
 }
 
 /// The runner's attempts captured in `[from, to)` on the trace clock.
@@ -747,7 +766,7 @@ pub(super) async fn stalled_relay_loop() {
             "history": history.iter().map(|requests| history_summary(requests, &labels)).collect::<Vec<_>>(),
             "status_at_end": status_summary(&status),
         });
-        save(out, "history.json", &history)?;
+        save(out, "history.json", &labeled(&history, &labels))?;
         save(out, "runner-trace.json", &runner_trace::since(trace_t0))?;
         if !complete || recovered.is_none() {
             return Err("the backlog did not recover exactly from the healthy endpoint".into());
@@ -828,7 +847,8 @@ pub(super) async fn owed_history() {
         let (_, chat) = bob.chat_view(&busy, None).await?;
         let busy_visible_when_quiet_seen = chat.iter().filter(|text| text.starts_with("owed-")).count();
         // Beside the earlier owner the runner may make no attempt at all here,
-        // so its caught-up report is recorded, not awaited.
+        // so its caught-up report is recorded, not awaited: sampled from the
+        // drain through the idle window below.
         let (mut drained, mut reported_caught_up) = (None, None);
         while drained.is_none() {
             if t0.elapsed() >= RECOVERY_DEADLINE {
@@ -854,9 +874,16 @@ pub(super) async fn owed_history() {
         let trace_idle = runner_trace::now_ms();
         let restart_trace = trace_between(trace_restart, trace_idle);
 
-        // Idle: nothing is owed, so nothing is fetched.
+        // Idle: nothing is owed, so nothing is fetched. (A status read is local.)
         let idle_clocks = relay_clocks(subject).await?;
-        tokio::time::sleep(QUIET_AGE).await;
+        let idle_started = Instant::now();
+        while idle_started.elapsed() < QUIET_AGE {
+            if drained.is_some() && reported_caught_up.is_none() && caught_up(&bob, trace_restart).await? {
+                reported_caught_up = Some(t0.elapsed().as_secs_f64());
+                note(started, "runner reports caught up");
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
         let idle = history_since(subject, &idle_clocks).await?;
         let trace_reconnect = runner_trace::now_ms();
         let idle_trace = trace_between(trace_idle, trace_reconnect);
@@ -928,7 +955,12 @@ pub(super) async fn owed_history() {
             },
             "status_at_end": status_summary(&status),
         });
-        save(out, "history.json", &json!({"restart": after_restart, "idle": idle, "reconnect": after_reconnect}))?;
+        let history = json!({
+            "restart": labeled(&after_restart, &labels),
+            "idle": labeled(&idle, &labels),
+            "reconnect": labeled(&after_reconnect, &labels),
+        });
+        save(out, "history.json", &history)?;
         save(out, "runner-trace.json", &runner_trace::since(trace_restart))?;
         let failure = |what: &str| Err::<Value, _>(format!("{what}: {proof}").into());
         if drained.is_none() || !busy_exact {
@@ -958,9 +990,10 @@ pub(super) async fn owed_history() {
         if resweep_result.is_err() {
             return failure("the reconnect's owed ranges were not swept");
         }
-        // A failed quantum or an inbox re-check alone is no re-proof.
-        if advanced(&reconnect_trace) == 0 {
-            return failure("the runner re-proved nothing after the reconnect");
+        // A failed quantum or an inbox re-check alone is no re-proof, and every
+        // route's owed range there spans at least the outage.
+        if advanced_seconds(&reconnect_trace) < OUTAGE_MS / 1000 {
+            return failure("the runner re-proved less than the outage after the reconnect");
         }
         Ok(json!({"proof": proof}))
     })

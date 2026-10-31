@@ -155,14 +155,14 @@ switch-over.
 
   Then it records a 200-second idle window and cuts endpoint 0 for 10 seconds. With nothing inside the rebuild
   lookback, every route's new live count there is empty. The journey asserts that both routes are asked again on
-  endpoint 0, that a runner quantum newly covers part of a route after the reconnect, that the account reports
-  caught up within five minutes (read after a runner attempt since the reconnect: until a runner surveys, the status
-  lists nothing, and across a reconnect it keeps its last answer), and that a quiet-group message sent after the
-  reconnect arrives. Beside the earlier owner its capture holds live frames until the backlog lands, so the restart
+  endpoint 0, that the runner's quanta after the reconnect newly cover at least the outage's span, that the account
+  reports caught up within five minutes (nothing catching up and no notice, read after a runner attempt since the
+  reconnect: until a runner surveys, the status lists nothing, and across a reconnect it keeps its last answer), and
+  that a quiet-group message sent after the reconnect arrives. Beside the earlier owner its capture holds live frames until the backlog lands, so the restart
   bounds no live message's wait.
 
-Each run writes `report.json`, `history.json` and the runner's `runner-trace.json` under
-`MDK_APP_JOURNEY_ARTIFACTS`:
+Each run writes `report.json`, `history.json` (bob's history requests, routes by label) and the runner's
+`runner-trace.json` under `MDK_APP_JOURNEY_ARTIFACTS`, and reports give the recovery status as counts, without ids:
 
 ```sh
 MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
