@@ -218,10 +218,10 @@ pub use cgka_traits::{
     PollProjection, PollType, PollVote, PollVotePage,
 };
 pub use client::AppClient;
-pub use client::compromise_warning::{CompromiseWarningItem, CompromiseWarningReason};
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::DevSealedHistoryBundle;
+pub use client::compromise_warning::{CompromiseWarningItem, CompromiseWarningReason};
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::device_group::ConfirmedDeviceLink;

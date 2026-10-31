@@ -17,8 +17,8 @@
   `started_fresh`, and `trust_device_group`, which makes a device group
   trusted and takes its roster as this device's first in one transaction.
   `insert_device_group` and `set_device_group_trust` now refuse a trusted
-  state. The numbers below 148 that are not yet used (139, 143, 145 and
-  147) belong to other work, which lands later; the runner applies them in
+  state. The numbers below 148 that are not yet used (143, 145 and 147)
+  belong to other work, which lands later; the runner applies them in
   order.
 - Migration 0161 advances account storage to schema 161 (mdk#2628 item 4.3).
   It adds `small_state_items`, one row per chat and item (`read`, `pin`,
