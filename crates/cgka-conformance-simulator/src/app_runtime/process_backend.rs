@@ -210,6 +210,18 @@ impl ParticipantRuntime {
                 .map_err(WireError::app),
         }
     }
+    pub async fn account_recovery_status(
+        &self,
+        account: &str,
+    ) -> Result<marmot_app::AccountRecoveryStatus, AppError> {
+        match self {
+            Self::Local(r) => r.account_recovery_status(account).await,
+            Self::Remote(p) => p
+                .call_async("account_recovery_status", json!([account]))
+                .await
+                .map_err(WireError::app),
+        }
+    }
     pub async fn confirm_group_rejoin(
         &self,
         account: &str,
@@ -480,6 +492,7 @@ impl ParticipantServer {
             init.settlement_ms,
             init.immediate_maintenance
                 .then(marmot_app::MaintenanceTiming::immediate),
+            false,
         );
         let runtime = MarmotAppRuntime::new(app.clone());
         let setup: Result<String, WireError> = async {
@@ -568,6 +581,10 @@ impl ParticipantServer {
             "group_recovery_status" => {
                 let (account, group): (String, GroupId) = args(arguments)?;
                 value(r.group_recovery_status(&account, &group).await?)
+            }
+            "account_recovery_status" => {
+                let (account,): (String,) = args(arguments)?;
+                value(r.account_recovery_status(&account).await?)
             }
             "confirm_group_rejoin" => {
                 let (account, welcome, token): (String, MessageId, Vec<u8>) = args(arguments)?;

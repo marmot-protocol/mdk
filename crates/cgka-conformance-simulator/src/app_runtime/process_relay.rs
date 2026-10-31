@@ -297,6 +297,40 @@ impl RelayBackend {
     }
 }
 impl ProxyBackend {
+    /// Withhold history requests from one endpoint's relay, or forward them.
+    pub async fn stall_history(&self, endpoint: usize, stalled: bool) -> Result<(), SubjectError> {
+        match self {
+            Self::Local(p) if endpoint == 0 => {
+                p.stall_history(stalled);
+                Ok(())
+            }
+            Self::Local(_) => Err(unknown_endpoint()),
+            Self::Remote(p) => p
+                .client
+                .call_async("stall_history", json!([endpoint, stalled]))
+                .await
+                .map_err(|e| e.subject()),
+        }
+    }
+    /// Serve `document` as one endpoint's NIP-11 document, or none.
+    pub async fn set_information(
+        &self,
+        endpoint: usize,
+        document: Option<String>,
+    ) -> Result<(), SubjectError> {
+        match self {
+            Self::Local(p) if endpoint == 0 => {
+                p.set_information(document);
+                Ok(())
+            }
+            Self::Local(_) => Err(unknown_endpoint()),
+            Self::Remote(p) => p
+                .client
+                .call_async("information", json!([endpoint, document]))
+                .await
+                .map_err(|e| e.subject()),
+        }
+    }
     pub async fn interrupt(&self, duration: Duration) -> Result<(u64, u64), SubjectError> {
         match self {
             Self::Local(p) => p
@@ -310,6 +344,13 @@ impl ProxyBackend {
                 .map_err(|e| e.subject()),
         }
     }
+}
+fn unknown_endpoint() -> SubjectError {
+    SubjectError::classified(
+        crate::SubjectFailureCategory::ExpectedRefusal,
+        "relay_endpoint_unknown",
+        "the relay has no endpoint with that index",
+    )
 }
 pub(super) struct RelayServer {
     _relay: LocalRelay,
@@ -361,6 +402,24 @@ impl RelayServer {
                 let traffic =
                     |index: usize| self.proxies[index].traffic_since(first(index), events);
                 encode([0, 1].map(traffic))
+            }
+            "stall_history" => {
+                let (endpoint, stalled): (usize, bool) = decode(args)?;
+                let proxy = self
+                    .proxies
+                    .get(endpoint)
+                    .ok_or_else(|| WireError::environment("app_relay_endpoint_unknown"))?;
+                proxy.stall_history(stalled);
+                encode(())
+            }
+            "information" => {
+                let (endpoint, document): (usize, Option<String>) = decode(args)?;
+                let proxy = self
+                    .proxies
+                    .get(endpoint)
+                    .ok_or_else(|| WireError::environment("app_relay_endpoint_unknown"))?;
+                proxy.set_information(document);
+                encode(())
             }
             "close" => encode(()),
             "cursor" => encode(self.control.publication_cursor().await),

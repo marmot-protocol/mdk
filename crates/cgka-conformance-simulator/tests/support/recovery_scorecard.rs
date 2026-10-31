@@ -382,6 +382,7 @@ fn wire_totals(relay: &RelayTrafficV1) -> Value {
     let mut totals = serde_json::to_value(relay).unwrap_or_default();
     if let Some(fields) = totals.as_object_mut() {
         fields.remove("events");
+        fields.remove("history_requests");
     }
     totals
 }

@@ -1,13 +1,16 @@
 //! Real socket interruption in front of the harness-owned loopback relay.
 //! All advertised relay URLs use this gate, so reconnect/discovery cannot bypass it.
-//! Each proxy also taps the forwarded WebSocket frames into aggregate traffic counts.
+//! Each proxy also taps the forwarded WebSocket frames into aggregate traffic counts,
+//! logs the history requests clients send, and can withhold them (a relay that
+//! never answers history while live traffic flows). It answers NIP-11 requests
+//! itself, since the harness relay serves no information document.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -17,6 +20,15 @@ use tokio::task::{JoinHandle, JoinSet};
 
 // Larger frames stop the tap; loopback relay messages stay far below this.
 const MAX_TAPPED_FRAME: u64 = 8 * 1024 * 1024;
+// A client's HTTP request head; an upgrade is far smaller.
+const MAX_REQUEST_HEAD: usize = 16 * 1024;
+
+/// The NIP-11 document every endpoint serves until a scenario replaces it:
+/// the White Noise relays' shape (strfry with NIP-77 and a 500-result filter
+/// cap). The harness relay itself honors a requested `limit` but caps no
+/// filter, so an unlimited REQ still returns every match.
+pub const PRODUCTION_RELAY_INFORMATION: &str =
+    r#"{"name":"cgka-conformance relay","supported_nips":[1,9,11,40,77],"limitation":{"max_limit":500}}"#;
 
 /// Wire traffic through one proxied relay endpoint, summed over a range of
 /// its connections. Byte counts are raw TCP payload per direction; message
@@ -36,6 +48,29 @@ pub struct RelayTrafficV1 {
     pub undecoded_frames: u64,
     /// Relay-to-client `EVENT` deliveries by event id, when requested.
     pub events: BTreeMap<String, RelayEventDeliveryV1>,
+    /// Client history requests in arrival order, when events are requested.
+    #[serde(default)]
+    pub history_requests: Vec<HistoryRequestV1>,
+}
+
+/// One history filter a client sent: a `REQ` filter with an `until`, or a
+/// `NEG-OPEN` filter. Live subscriptions carry no `until` and are not logged.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryRequestV1 {
+    /// Milliseconds since the proxy started.
+    pub at_ms: u64,
+    /// `REQ` or `NEG-OPEN`.
+    pub verb: String,
+    /// The filter's first `#h` value (a group route), else its first `#p`
+    /// value (an inbox).
+    pub route: Option<String>,
+    pub since: Option<u64>,
+    pub until: Option<u64>,
+    pub limit: Option<u64>,
+    /// Event ids the filter names; zero for a window.
+    pub ids: usize,
+    /// The proxy withheld it from the relay.
+    pub withheld: bool,
 }
 
 /// One client connection's counters.
@@ -46,6 +81,7 @@ pub(crate) struct RelayTrafficSessionV1 {
     upstream_messages: BTreeMap<String, u64>,
     downstream_messages: BTreeMap<String, u64>,
     events: BTreeMap<String, RelayEventDeliveryV1>,
+    history_requests: Vec<HistoryRequestV1>,
     undecoded_frames: u64,
     first_eof: Option<&'static str>,
 }
@@ -73,6 +109,16 @@ pub(crate) struct RelayFaultProxy {
     rejected: Arc<AtomicU64>,
     active: Arc<AtomicU64>,
     traffic: Traffic,
+    gate: Arc<Gate>,
+}
+
+/// What every connection of one proxy reads as it forwards.
+struct Gate {
+    started: Instant,
+    /// Withhold history requests from the relay.
+    stall_history: AtomicBool,
+    /// The NIP-11 document, or `None` to pass information requests through.
+    information: Mutex<Option<String>>,
 }
 
 /// Incremental WebSocket reader for one direction of a proxied connection.
@@ -168,10 +214,16 @@ fn next_frame(bytes: &[u8]) -> Option<Option<(usize, u8, Vec<u8>)>> {
     Some(Some((end, first, payload)))
 }
 
-fn record_message(session: &mut RelayTrafficSessionV1, message: &[u8], upstream: bool) {
+/// Count one completed message and return its items, or `None` when it is no
+/// JSON array.
+fn record_message(
+    session: &mut RelayTrafficSessionV1,
+    message: &[u8],
+    upstream: bool,
+) -> Option<Vec<serde_json::Value>> {
     let Ok(serde_json::Value::Array(items)) = serde_json::from_slice(message) else {
         session.undecoded_frames += 1;
-        return;
+        return None;
     };
     let verb = items.first().and_then(|verb| verb.as_str()).unwrap_or("?");
     let verbs = if upstream {
@@ -194,17 +246,175 @@ fn record_message(session: &mut RelayTrafficSessionV1, message: &[u8], upstream:
         delivery.count += 1;
         delivery.bytes += message.len() as u64;
     }
+    Some(items)
 }
 
-/// Forward one direction, recording its bytes and completed messages.
+/// The history filters of one client message, or none for any other message.
+fn history_filters(items: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    match items.first().and_then(serde_json::Value::as_str) {
+        Some("REQ") => items
+            .iter()
+            .skip(2)
+            .filter(|filter| filter.get("until").is_some())
+            .collect(),
+        Some("NEG-OPEN") => items.get(2).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn history_request(
+    verb: &str,
+    filter: &serde_json::Value,
+    at_ms: u64,
+    withheld: bool,
+) -> HistoryRequestV1 {
+    let tag = |name: &str| filter[name].as_array()?.first()?.as_str().map(str::to_owned);
+    HistoryRequestV1 {
+        at_ms,
+        verb: verb.to_owned(),
+        route: tag("#h").or_else(|| tag("#p")),
+        since: filter["since"].as_u64(),
+        until: filter["until"].as_u64(),
+        limit: filter["limit"].as_u64(),
+        ids: filter["ids"].as_array().map_or(0, Vec::len),
+        withheld,
+    }
+}
+
+/// Client-to-relay forwarding after the HTTP upgrade. Each frame is
+/// forwarded unchanged once it is complete. While the stall is on, a data
+/// message that starts is held until its last frame; a history `REQ` or
+/// `NEG-OPEN` is then withheld, as are later `CLOSE`, `NEG-MSG` and
+/// `NEG-CLOSE` messages for its subscription. Control frames always pass at
+/// once. A frame the gate cannot parse ends withholding for the connection.
+#[derive(Default)]
+struct RequestGate {
+    passthrough: bool,
+    pending: Vec<u8>,
+    /// The message in progress: `None` between messages, `Some(None)` when
+    /// it is forwarded as it arrives, `Some(Some(..))` with its raw frames
+    /// and payload when it is held.
+    current: Option<Option<(Vec<u8>, Vec<u8>)>>,
+    /// Subscriptions whose opening request was withheld.
+    withheld: BTreeSet<String>,
+}
+
+impl RequestGate {
+    /// Bytes to forward now, and the payloads of messages completed by
+    /// `bytes` that the gate withheld.
+    fn feed(&mut self, bytes: &[u8], stall: bool) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut withheld = Vec::new();
+        if self.passthrough {
+            return (bytes.to_vec(), withheld);
+        }
+        self.pending.extend_from_slice(bytes);
+        let mut forward = Vec::new();
+        let mut offset = 0;
+        while let Some(frame) = next_frame(&self.pending[offset..]) {
+            let Some((length, first, payload)) = frame else {
+                self.passthrough = true;
+                break;
+            };
+            let raw = &self.pending[offset..offset + length];
+            offset += length;
+            let opcode = first & 0x0f;
+            if opcode >= 0x8 {
+                forward.extend_from_slice(raw);
+                continue;
+            }
+            if opcode != 0x0 || self.current.is_none() {
+                // A compressed message cannot be read, so it is never held.
+                let hold = stall && first & 0x40 == 0;
+                if let Some(Some((frames, _))) = self.current.take() {
+                    forward.extend(frames);
+                }
+                self.current = Some(hold.then(|| (Vec::new(), Vec::new())));
+            }
+            match self.current.as_mut().expect("message in progress") {
+                Some((frames, message)) => {
+                    frames.extend_from_slice(raw);
+                    message.extend_from_slice(&payload);
+                }
+                None => forward.extend_from_slice(raw),
+            }
+            if first & 0x80 != 0
+                && let Some(Some((frames, message))) = self.current.take()
+            {
+                if self.withholds(&message) {
+                    withheld.push(message);
+                } else {
+                    forward.extend(frames);
+                }
+            }
+        }
+        if self.passthrough {
+            if let Some(Some((frames, _))) = self.current.take() {
+                forward.extend(frames);
+            }
+            forward.extend_from_slice(&self.pending[offset..]);
+            self.pending = Vec::new();
+        } else {
+            self.pending.drain(..offset);
+        }
+        (forward, withheld)
+    }
+
+    fn withholds(&mut self, payload: &[u8]) -> bool {
+        let Ok(serde_json::Value::Array(items)) = serde_json::from_slice(payload) else {
+            return false;
+        };
+        let (Some(verb), Some(id)) = (
+            items.first().and_then(serde_json::Value::as_str),
+            items.get(1).and_then(serde_json::Value::as_str),
+        ) else {
+            return false;
+        };
+        match verb {
+            "REQ" | "NEG-OPEN" if !history_filters(&items).is_empty() => {
+                self.withheld.insert(id.to_owned());
+                true
+            }
+            // A live REQ that reuses a withheld id replaces it.
+            "REQ" => {
+                self.withheld.remove(id);
+                false
+            }
+            "CLOSE" | "NEG-CLOSE" => self.withheld.remove(id),
+            "NEG-MSG" => self.withheld.contains(id),
+            _ => false,
+        }
+    }
+}
+
+/// The client-to-relay side of a connection.
+#[derive(Clone, Copy)]
+struct Upstream<'a> {
+    gate: &'a Gate,
+    /// Whether the client's request head was already read and forwarded.
+    opened: bool,
+}
+
+/// Forward one direction, recording its bytes and completed messages. The
+/// client side passes its requests through its gate.
 async fn pump(
     mut from: impl AsyncRead + Unpin,
     mut to: impl AsyncWrite + Unpin,
     traffic: &Traffic,
     index: usize,
-    upstream: bool,
+    client: Option<Upstream<'_>>,
 ) -> io::Result<()> {
-    let mut tap = FrameTap::default();
+    let opened = client.is_some_and(|client| client.opened);
+    let mut tap = FrameTap {
+        opened,
+        ..FrameTap::default()
+    };
+    // Bytes that opened no WebSocket are never parsed as frames.
+    let mut requests = RequestGate {
+        passthrough: !opened,
+        ..RequestGate::default()
+    };
+    let upstream = client.is_some();
+    let gate = client.map(|client| client.gate);
     let mut buffer = vec![0; 16 * 1024];
     loop {
         let read = from.read(&mut buffer).await?;
@@ -215,8 +425,16 @@ async fn pump(
                 .get_or_insert(side);
             return to.shutdown().await;
         }
-        to.write_all(&buffer[..read]).await?;
-        let (messages, undecoded) = tap.feed(&buffer[..read]);
+        let bytes = &buffer[..read];
+        let (forward, withheld) = match gate {
+            Some(gate) => requests.feed(bytes, gate.stall_history.load(Ordering::SeqCst)),
+            None => (bytes.to_vec(), Vec::new()),
+        };
+        to.write_all(&forward).await?;
+        let (messages, undecoded) = tap.feed(bytes);
+        let at_ms = gate.map_or(0, |gate| {
+            u64::try_from(gate.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+        });
         let mut sessions = traffic.lock().expect("relay traffic lock poisoned");
         let session = &mut sessions[index];
         if upstream {
@@ -226,9 +444,81 @@ async fn pump(
         }
         session.undecoded_frames += undecoded;
         for message in &messages {
-            record_message(session, message, upstream);
+            let Some(items) = record_message(session, message, upstream) else {
+                continue;
+            };
+            if upstream {
+                let verb = items.first().and_then(|verb| verb.as_str()).unwrap_or("?");
+                let held = withheld.contains(message);
+                for filter in history_filters(&items) {
+                    let request = history_request(verb, filter, at_ms, held);
+                    session.history_requests.push(request);
+                }
+            }
         }
     }
+}
+
+/// How a client connection opened.
+enum Opening {
+    /// An HTTP request head through its blank line, and the bytes after it.
+    Head(Vec<u8>, Vec<u8>),
+    /// Bytes that are no HTTP `GET`, passed on unread.
+    Other(Vec<u8>),
+}
+
+/// Read a client's opening bytes until they hold a complete HTTP request head
+/// or can no longer start one. `None` when the client closes first or sends
+/// an oversized head.
+async fn read_opening(stream: &mut TcpStream) -> Option<Opening> {
+    let mut head = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+            let rest = head.split_off(end + 4);
+            return Some(Opening::Head(head, rest));
+        }
+        let prefix = head.len().min(4);
+        if head[..prefix] != b"GET "[..prefix] {
+            return Some(Opening::Other(head));
+        }
+        if head.len() > MAX_REQUEST_HEAD {
+            return None;
+        }
+        let read = stream.read(&mut buffer).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        head.extend_from_slice(&buffer[..read]);
+    }
+}
+
+/// Whether a request head asks for the relay's NIP-11 document: an HTTP
+/// request that is no WebSocket upgrade and accepts `application/nostr+json`.
+fn asks_for_information(head: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(head) else {
+        return false;
+    };
+    let header = |name: &str| {
+        text.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_ascii_lowercase())
+        })
+    };
+    let upgrade = header("upgrade").is_some_and(|value| value.contains("websocket"));
+    let accept = header("accept").is_some_and(|value| value.contains("application/nostr+json"));
+    !upgrade && accept
+}
+
+async fn serve_information(stream: &mut TcpStream, document: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{document}",
+        document.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
 }
 
 struct ActiveConnection(Arc<AtomicU64>);
@@ -265,6 +555,12 @@ impl RelayFaultProxy {
         let rejected_task = rejected.clone();
         let traffic = Traffic::default();
         let traffic_task = traffic.clone();
+        let gate = Arc::new(Gate {
+            started: Instant::now(),
+            stall_history: AtomicBool::new(false),
+            information: Mutex::new(Some(PRODUCTION_RELAY_INFORMATION.to_owned())),
+        });
+        let gate_task = gate.clone();
         let task = tokio::spawn(async move {
             let mut available = true;
             let mut sessions = JoinSet::new();
@@ -290,6 +586,7 @@ impl RelayFaultProxy {
                         }
                         let active = active_task.clone();
                         let traffic = traffic_task.clone();
+                        let gate = gate_task.clone();
                         sessions.spawn(async move {
                             // The exact harness-owned address is pinned above; no DNS or external dial.
                             let Ok(Ok(mut upstream)) = tokio::time::timeout(
@@ -297,16 +594,39 @@ impl RelayFaultProxy {
                             ).await else { return };
                             active.fetch_add(1, Ordering::SeqCst);
                             let _active = ActiveConnection(active);
+                            let Some(opening) = read_opening(&mut downstream).await else { return };
+                            let (head, rest) = match opening {
+                                Opening::Head(head, rest) => (Some(head), rest),
+                                Opening::Other(bytes) => (None, bytes),
+                            };
+                            let information = gate.information.lock().expect("relay information lock").clone();
+                            // A NIP-11 fetch is answered here and opens no relay session.
+                            if let (Some(head), Some(document)) = (&head, information)
+                                && asks_for_information(head)
+                            {
+                                serve_information(&mut downstream, &document).await;
+                                return;
+                            }
                             let index = {
                                 let mut sessions = traffic.lock().expect("relay traffic lock poisoned");
                                 sessions.push(RelayTrafficSessionV1::default());
                                 sessions.len() - 1
                             };
+                            if let Some(head) = &head {
+                                if upstream.write_all(head).await.is_err() {
+                                    return;
+                                }
+                                traffic.lock().expect("relay traffic lock poisoned")[index]
+                                    .upstream_bytes += head.len() as u64;
+                            }
                             let (client_read, client_write) = downstream.split();
                             let (relay_read, relay_write) = upstream.split();
+                            // Bytes the client sent after its head pass the gate first.
+                            let client_read = std::io::Cursor::new(rest).chain(client_read);
+                            let client = Upstream { gate: &gate, opened: head.is_some() };
                             let _ = tokio::try_join!(
-                                pump(client_read, relay_write, &traffic, index, true),
-                                pump(relay_read, client_write, &traffic, index, false),
+                                pump(client_read, relay_write, &traffic, index, Some(client)),
+                                pump(relay_read, client_write, &traffic, index, None),
                             );
                         });
                     }
@@ -322,7 +642,19 @@ impl RelayFaultProxy {
             rejected,
             active,
             traffic,
+            gate,
         })
+    }
+
+    /// Withhold history requests from the relay, or forward them again. Live
+    /// subscriptions and publications keep flowing either way.
+    pub(crate) fn stall_history(&self, stalled: bool) {
+        self.gate.stall_history.store(stalled, Ordering::SeqCst);
+    }
+
+    /// Serve `document` to NIP-11 requests, or pass them to the relay.
+    pub(crate) fn set_information(&self, document: Option<String>) {
+        *self.gate.information.lock().expect("relay information lock") = document;
     }
 
     pub(crate) fn url(&self) -> String {
@@ -353,6 +685,11 @@ impl RelayFaultProxy {
             add(&mut total.downstream_messages, &session.downstream_messages);
             if let Some(side) = session.first_eof {
                 *total.closed_first_by.entry(side.to_owned()).or_default() += 1;
+            }
+            if events {
+                total
+                    .history_requests
+                    .extend(session.history_requests.iter().cloned());
             }
             for (id, delivery) in session.events.iter().filter(|_| events) {
                 let merged = total.events.entry(id.clone()).or_default();
@@ -623,5 +960,120 @@ mod tests {
         };
         assert_eq!(broken.feed(&[0x81, 127, 0xff, 0, 0, 0, 0, 0, 0, 0]).1, 1);
         assert!(broken.feed(&frame(0x81, b"[]", None)).0.is_empty());
+    }
+
+    fn masked(payload: &str) -> Vec<u8> {
+        frame(0x81, payload.as_bytes(), Some([7, 1, 9, 3]))
+    }
+
+    #[test]
+    fn request_gate_withholds_only_stalled_history_and_its_follow_ups() {
+        let live = r##"["REQ","live",{"#h":["g"],"since":10}]"##;
+        let history = r##"["REQ","old",{"#h":["g"],"since":1,"until":5,"limit":501}]"##;
+        let negentropy = r##"["NEG-OPEN","neg",{"#h":["g"],"until":5},"61"]"##;
+        let follow_ups = [
+            r#"["NEG-MSG","neg","62"]"#,
+            r#"["CLOSE","old"]"#,
+            r#"["NEG-CLOSE","neg"]"#,
+        ];
+        let ping = frame(0x89, b"ping", Some([1, 2, 3, 4]));
+        let compressed = frame(0xc1, b"compressed", Some([1, 2, 3, 4]));
+        let mut stream = masked(live);
+        // A fragmented history request with a ping between its frames.
+        stream.extend(frame(0x01, &history.as_bytes()[..9], Some([1, 2, 3, 4])));
+        stream.extend(&ping);
+        stream.extend(frame(0x80, &history.as_bytes()[9..], Some([5, 6, 7, 8])));
+        stream.extend(masked(negentropy));
+        for follow_up in follow_ups {
+            stream.extend(masked(follow_up));
+        }
+        stream.extend(masked(r#"["CLOSE","live"]"#));
+        stream.extend(&compressed);
+        let run = |stall: bool| {
+            let (mut gate, mut forwarded, mut withheld) =
+                (RequestGate::default(), Vec::new(), Vec::new());
+            for chunk in stream.chunks(5) {
+                let (forward, held) = gate.feed(chunk, stall);
+                forwarded.extend(forward);
+                withheld.extend(held.into_iter().map(|m| String::from_utf8(m).unwrap()));
+            }
+            (forwarded, withheld)
+        };
+
+        assert_eq!(run(false), (stream.clone(), Vec::new()));
+
+        let mut expected = masked(live);
+        expected.extend(&ping);
+        expected.extend(masked(r#"["CLOSE","live"]"#));
+        expected.extend(&compressed);
+        let mut withheld = vec![history, negentropy];
+        withheld.extend(follow_ups);
+        let withheld = withheld.into_iter().map(str::to_owned).collect();
+        assert_eq!(run(true), (expected, withheld));
+    }
+
+    #[test]
+    fn request_gate_passes_everything_after_a_frame_it_cannot_parse() {
+        let mut gate = RequestGate::default();
+        let broken = [0x81, 127, 0xff, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(gate.feed(&broken, true), (broken.to_vec(), Vec::new()));
+        let history = masked(r#"["REQ","old",{"until":5}]"#);
+        assert_eq!(gate.feed(&history, true), (history, Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn information_fetches_are_answered_and_upgrades_reach_the_relay() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy = RelayFaultProxy::start(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let fetch = b"GET / HTTP/1.1\r\nHost: relay\r\nAccept: application/nostr+json\r\n\r\n";
+        let mut client = TcpStream::connect(proxy.address).await.unwrap();
+        let (_dialled, _) = listener.accept().await.unwrap();
+        client.write_all(fetch).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(PRODUCTION_RELAY_INFORMATION));
+        assert_eq!(proxy.traffic_since(0, true).connections, 0);
+
+        // An upgrade reaches the relay with its head intact, and a stalled
+        // history request is logged and withheld while a live one passes.
+        let upgrade = b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nAccept: application/nostr+json\r\n\r\n";
+        let mut client = TcpStream::connect(proxy.address).await.unwrap();
+        let (mut relay, _) = listener.accept().await.unwrap();
+        client.write_all(upgrade).await.unwrap();
+        let mut received = vec![0; upgrade.len()];
+        relay.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, upgrade);
+        proxy.stall_history(true);
+        let live = masked(r##"["REQ","live",{"#h":["g"],"since":10}]"##);
+        client
+            .write_all(&masked(
+                r##"["REQ","old",{"#h":["g"],"since":1,"until":5,"limit":501}]"##,
+            ))
+            .await
+            .unwrap();
+        client.write_all(&live).await.unwrap();
+        let mut received = vec![0; live.len()];
+        relay.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, live);
+        let requests = proxy.traffic_since(0, true).history_requests;
+        let logged: Vec<_> = requests
+            .iter()
+            .map(|r| (r.verb.as_str(), r.route.as_deref(), r.since, r.until, r.limit, r.withheld))
+            .collect();
+        assert_eq!(logged, [("REQ", Some("g"), Some(1), Some(5), Some(501), true)]);
+        assert!(proxy.traffic_since(0, false).history_requests.is_empty());
+
+        // With no document set, a fetch reaches the relay too.
+        proxy.set_information(None);
+        let mut client = TcpStream::connect(proxy.address).await.unwrap();
+        let (mut relay, _) = listener.accept().await.unwrap();
+        client.write_all(fetch).await.unwrap();
+        let mut received = vec![0; fetch.len()];
+        relay.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, fetch);
+        assert_eq!(proxy.traffic_since(0, true).connections, 2);
     }
 }
