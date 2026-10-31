@@ -422,6 +422,13 @@ with nothing sent, since a commit then could build on a roster that is about to 
 commit loses a fork is made again on a later maintenance pass, unless another rename of that device won; that one
 stands. Show the label the next list returns after `LinkedDevicesChanged`, not the one the user typed.
 
+When another of the account's devices removes this one, the account stops on this device once it reads the removal, and
+nothing more is sent from it. `MarmotAppEvent::DeviceUnlinked` fires once, after the account is signed out; from then on
+`ManagedAccount::unlinked` and `signed_out` stay set, and signing in, logging in, importing its key or starting
+onboarding for it fails with `AccountHomeError::AccountUnlinked`. Stop showing its local history; reads still return it,
+as for any signed-out account. `sign_out_and_wipe` wipes the account without leaving its chats or deleting its slot,
+which the other devices did; signing in again is then a new link.
+
 ### Recovery words
 
 An account's backups are sealed to a recovery key that 12 recovery words derive, separate from the nsec (mdk#2628).

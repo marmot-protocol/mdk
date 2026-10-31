@@ -2509,6 +2509,7 @@ impl AppClient {
         self.remember_pending_convergence_groups(effects);
         self.remember_published_reports(effects);
         self.note_device_group_sent_ids(effects);
+        self.note_device_group_removal(effects);
         self.note_superseded_intent_reports(effects);
         self.settle_accepted_push_announces(effects);
         self.enqueue_effect_projection(effects, source_message_id_hex, received_at, drained);
@@ -3485,6 +3486,11 @@ impl AppClient {
                 on_progress.publish(self, committed).await;
             } else {
                 self.pending_native_sync_summary.merge(committed);
+            }
+            // An unlinked account receives nothing more; the drain ends as a
+            // quiet relay ends it (mdk#2628 D67).
+            if self.device_unlinked {
+                break false;
             }
             let wait = if first_wait {
                 SDK_FIRST_SYNC_WAIT

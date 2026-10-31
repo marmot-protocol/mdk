@@ -629,6 +629,182 @@ async fn account_owned_profile_publish_rejects_signed_out_and_stopped_accounts()
     assert!(matches!(stopped, AppError::RuntimeStopping));
 }
 
+/// Once the device group unlinks this device, its worker stops and the
+/// runtime deactivates the account: hosts hear `DeviceUnlinked`, the account
+/// lists as unlinked and signed out, neither signing in nor reconciling starts
+/// it again, and wiping it skips the leave and slot stages (mdk#2628 D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unlinked_device_stops_its_account_for_good() {
+    let root = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(root.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(root.path(), "wss://unlink.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = app.runtime();
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    let managed = || runtime.accounts().managed_accounts().unwrap().remove(0);
+    assert!(managed().running && !managed().unlinked);
+
+    // Hosts hear the unlink only once the account is signed out, so one that
+    // wipes and signs in again on hearing it never meets the deactivation.
+    // While the lifecycle lock is held the deactivation waits, and the event
+    // with it.
+    let worker_transactions = runtime.accounts().worker_transactions.clone();
+    let held = worker_transactions.lock().await;
+    runtime
+        .accounts()
+        .unlink_device_for_test("alice")
+        .await
+        .unwrap();
+    async fn device_unlinked(events: &mut broadcast::Receiver<MarmotAppEvent>, account_id: &str) {
+        loop {
+            if let Ok(MarmotAppEvent::DeviceUnlinked { account_id_hex, .. }) = events.recv().await
+                && account_id_hex == account_id
+            {
+                break;
+            }
+        }
+    }
+    assert!(
+        timeout(
+            Duration::from_millis(500),
+            device_unlinked(&mut events, &account.account_id_hex)
+        )
+        .await
+        .is_err(),
+        "no host hears the unlink before the account is signed out"
+    );
+    drop(held);
+
+    timeout(
+        Duration::from_secs(10),
+        device_unlinked(&mut events, &account.account_id_hex),
+    )
+    .await
+    .expect("hosts hear the unlink");
+    let unlinked = managed();
+    assert!(!unlinked.running && unlinked.unlinked && unlinked.signed_out);
+
+    assert!(matches!(
+        runtime.sign_in_account("alice").await,
+        Err(AppError::AccountHome(AccountHomeError::AccountUnlinked(_)))
+    ));
+    runtime.reconcile_accounts().await.unwrap();
+    assert!(!managed().running);
+
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let attempted = relay.attempted_events().len();
+    let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
+    assert_eq!(outcome.groups_left, 0);
+    assert!(outcome.group_leave_failures.is_empty());
+    assert_eq!(outcome.key_packages_deleted, 0);
+    assert!(outcome.key_package_failures.is_empty());
+    assert!(outcome.local_cleanup.completed);
+    assert_eq!(
+        relay.attempted_events().len(),
+        attempted,
+        "an unlinked wipe sends nothing"
+    );
+    assert!(app.account_home().accounts().unwrap().is_empty());
+
+    // The account's publish stop went with it: linked again here, it
+    // publishes.
+    app.account_home()
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while relay.attempted_events().len() == attempted {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the account linked again publishes");
+    runtime.shutdown().await;
+}
+
+/// The wipe of an unlinked account commits its removal, then fails to remove
+/// its secret. The account is gone all the same, so its publish stop goes
+/// with it: the same account linked again here publishes (mdk#2628 D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() {
+    use marmot_account::{
+        AccountHomeResult, AccountSecretStore, AccountSummary, LocalFileSecretStore,
+    };
+
+    struct FailSecretRemoval(LocalFileSecretStore);
+    impl AccountSecretStore for FailSecretRemoval {
+        fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
+            self.0.has_secret_for_label(label)
+        }
+        fn write_secret(
+            &self,
+            account: &AccountSummary,
+            keys: &nostr::prelude::Keys,
+        ) -> AccountHomeResult<()> {
+            self.0.write_secret(account, keys)
+        }
+        fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::prelude::Keys> {
+            self.0.load_secret(account)
+        }
+        fn remove_secret(&self, _account: &AccountSummary) -> AccountHomeResult<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let home = AccountHome::open_with_secret_store(
+        root.path(),
+        Arc::new(FailSecretRemoval(LocalFileSecretStore::new(root.path()))),
+    );
+    home.create_account("alice").unwrap();
+    let keys = home.load_signing_keys("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays_and_account_home_and_config(
+        root.path(),
+        vec!["wss://unlink.example".to_owned()],
+        home,
+        crate::MarmotAppConfig::white_noise().with_dev_settlement_quiescence_ms(0),
+    )
+    .with_test_relay_client(relay.clone());
+    let runtime = app.runtime();
+    runtime.reconcile_accounts().await.unwrap();
+    let managed = || runtime.accounts().managed_accounts().unwrap();
+    runtime
+        .accounts()
+        .unlink_device_for_test("alice")
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while managed()[0].running {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the runtime deactivates the account");
+
+    let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
+    assert!(!outcome.local_cleanup.completed, "the secret is kept");
+    assert!(app.account_home().accounts().unwrap().is_empty());
+
+    let attempted = relay.attempted_events().len();
+    app.account_home()
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while relay.attempted_events().len() == attempted {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the account linked again publishes");
+    runtime.shutdown().await;
+}
+
 #[test]
 fn generated_setup_context_round_trips_inbox_relays_and_reads_legacy_contexts() {
     let request = AccountSetupRequest {

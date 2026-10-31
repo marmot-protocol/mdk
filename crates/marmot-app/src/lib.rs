@@ -74,6 +74,7 @@ use transport_nostr_adapter::{
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 mod close_registry;
+mod unlinked_publish_gate;
 mod user_blocks;
 pub use runtime::RuntimeBlockListSubscription;
 pub use user_blocks::{BlockListSnapshot, BlockedUser};
@@ -612,11 +613,19 @@ pub struct MarmotApp {
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
     #[cfg(test)]
     audit_v5_peel_slot: Option<(String, Arc<Mutex<client::audit_v5_probe::PeelSlot>>)>,
+    /// Fail every client's durable unlink mark, as a full or read-only disk
+    /// would. The runtime's own mark as it deactivates still lands.
+    #[cfg(test)]
+    test_fail_unlink_mark: Arc<AtomicBool>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
     /// Live KeyPackages of this app's accounts that their clients have not
     /// checked for new sign-ins yet (mdk#2628 3.2).
     pub(crate) sign_in_nudges: Arc<client::sign_ins::SignInNudges>,
+    /// Each account's publish stop, by account id: set once its device group
+    /// unlinked this device, and shared by every publisher
+    /// [`Self::relay_client_for_account_id`] hands out for it (mdk#2628 D67).
+    unlinked_publish_stops: Arc<Mutex<HashMap<String, unlinked_publish_gate::AccountPublishStop>>>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
@@ -1722,9 +1731,12 @@ impl MarmotApp {
             test_relay_client: None,
             #[cfg(test)]
             audit_v5_peel_slot: None,
+            #[cfg(test)]
+            test_fail_unlink_mark: Arc::default(),
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             sign_in_nudges: Arc::new(Default::default()),
+            unlinked_publish_stops: Arc::default(),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
@@ -1829,9 +1841,12 @@ impl MarmotApp {
             test_relay_client: None,
             #[cfg(test)]
             audit_v5_peel_slot: None,
+            #[cfg(test)]
+            test_fail_unlink_mark: Arc::default(),
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             sign_in_nudges: Arc::new(Default::default()),
+            unlinked_publish_stops: Arc::default(),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
@@ -1956,8 +1971,11 @@ impl MarmotApp {
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
         }
-        self.finish_client_open_network_maintenance(&mut client)
-            .await;
+        // An unlinked client does no maintenance (mdk#2628 D67).
+        if !client.device_unlinked() {
+            self.finish_client_open_network_maintenance(&mut client)
+                .await;
+        }
         // Seated here, where the client is already held: in `client()` the
         // extra await would copy the client through its stack, gate off or
         // not.
@@ -1986,7 +2004,15 @@ impl MarmotApp {
         let app = self.clone();
         // Resolve every supported account ref before touching label-keyed
         // caches or the session-owner registry.
-        let label = self.account_home().account(label)?.label;
+        let account = self.account_home().account(label)?;
+        // An account its device group unlinked never runs on this device
+        // again: it can only be wiped (mdk#2628 D67).
+        if account.unlinked {
+            return Err(AppError::AccountHome(
+                marmot_account::AccountHomeError::AccountUnlinked(account.label),
+            ));
+        }
+        let label = account.label;
         let relay_plane_for_open = relay_plane.clone();
         let permit = lifecycle
             .as_ref()
@@ -2092,6 +2118,8 @@ impl MarmotApp {
             test_comparison_results: None,
             #[cfg(test)]
             test_comparison_delay: None,
+            #[cfg(all(test, feature = "unreleased-device-pairing"))]
+            test_fail_roster_read: false,
             #[cfg(test)]
             test_comparison_saved_cursor: None,
             recovery_owner,
@@ -2140,6 +2168,7 @@ impl MarmotApp {
             compromise_warning_changed: true,
             compromise_warning_gather_due: true,
             device_link_changed: true,
+            device_unlinked: false,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
@@ -2255,6 +2284,7 @@ impl MarmotApp {
         // Hosts read the notice list after open; later changes raise an event.
         client.take_history_notice_changes();
         client.sync_key_package_announcement_group()?;
+        client.note_stored_device_group_removal();
         Ok(client)
     }
 
@@ -7825,12 +7855,22 @@ impl MarmotApp {
         account_id_hex: &str,
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     ) -> Arc<dyn NostrRelayClient> {
+        let stop = self.account_publish_stop(account_id_hex);
         #[cfg(test)]
         if let Some(client) = &self.test_relay_client {
-            return client.clone();
+            return Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
+                client.clone(),
+                stop,
+            ));
         }
-        self.relay_plane
-            .account_publish_client(account_id_hex, signer)
+        // The one place an account publisher is built (see clippy.toml).
+        #[allow(clippy::disallowed_methods)]
+        let client = self
+            .relay_plane
+            .account_publish_client(account_id_hex, signer);
+        Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
+            client, stop,
+        ))
     }
 
     #[cfg(test)]

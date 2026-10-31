@@ -767,6 +767,9 @@ pub struct AppClient {
     pub(crate) test_comparison_results: Option<sync::ScriptedComparisons>,
     #[cfg(test)]
     pub(crate) test_comparison_delay: Option<std::time::Duration>,
+    /// Fail the device-roster read that tells an unlink from a failed link.
+    #[cfg(all(test, feature = "unreleased-device-pairing"))]
+    pub(crate) test_fail_roster_read: bool,
     /// A cursor a scripted comparison saves before its delay, as the adapter
     /// does before each exact-ID fetch.
     #[cfg(test)]
@@ -874,6 +877,10 @@ pub struct AppClient {
     /// client just opened, ending any link in progress. The same seams drain
     /// it into one `DeviceLinkChanged`.
     pub(crate) device_link_changed: bool,
+    /// The device group removed this device after its link was made, and the
+    /// account is marked unlinked (mdk#2628 D67). The account worker stops at
+    /// its next turn and asks the runtime to deactivate the account.
+    pub(crate) device_unlinked: bool,
     /// Account-queue placement counts at this client's previous
     /// `transport_cursor_advanced` row (or its open), so each row reports
     /// what changed since.
@@ -1498,6 +1505,12 @@ impl AppClient {
     }
 
     pub async fn run_due_maintenance(&mut self) -> Result<crate::MaintenanceRunSummary, AppError> {
+        // An unlinked account does no more work here (mdk#2628 D67).
+        if self.device_unlinked {
+            return Err(AppError::AccountHome(
+                marmot_account::AccountHomeError::AccountUnlinked(self.state.label.clone()),
+            ));
+        }
         if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
             self.runtime.sweep_expired_key_package_private_material()?;
             self.discard_expired_sibling_key_packages();

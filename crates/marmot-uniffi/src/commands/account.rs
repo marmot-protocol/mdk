@@ -34,6 +34,7 @@ impl Marmot {
                 external_signing: m.external_signing,
                 signed_out: m.signed_out,
                 running: m.running,
+                unlinked: m.unlinked,
             })
             .collect())
     }
@@ -140,6 +141,7 @@ impl Marmot {
             external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
+            unlinked: result.account.unlinked,
         })
     }
 
@@ -232,6 +234,7 @@ impl Marmot {
             external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
+            unlinked: result.account.unlinked,
         })
     }
 
@@ -293,6 +296,7 @@ impl Marmot {
             external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
+            unlinked: result.account.unlinked,
         })
     }
 
@@ -337,6 +341,7 @@ impl Marmot {
             external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
+            unlinked: result.account.unlinked,
         })
     }
 
@@ -372,6 +377,7 @@ impl Marmot {
             external_signing: account.external_signing,
             signed_out: account.signed_out,
             running: account.running,
+            unlinked: account.unlinked,
         })
     }
 
@@ -778,6 +784,7 @@ impl Marmot {
                 external_signing: result.account.external_signing,
                 signed_out: result.account.signed_out,
                 running: true,
+                unlinked: result.account.unlinked,
             },
             profile: profile.into(),
             readiness: result.readiness.into(),

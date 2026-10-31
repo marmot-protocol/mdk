@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use cgka_traits::app_components::{
     AppComponentSet, DEVICE_ROSTER_COMPONENT_ID, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
     DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1, DeviceSettingsV1, DeviceSlotId,
-    MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID, encode_device_roster_update_v1,
+    MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID, decode_device_roster_v1,
+    encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
 use cgka_traits::storage::{MaintenanceStorage as _, StorageError};
@@ -194,6 +195,14 @@ enum NewDeviceOutcome {
     Ended(DeviceLinkEndReason),
 }
 
+/// This device's removal from its trusted device group.
+pub(super) struct DeviceGroupRemoval {
+    group_id: GroupId,
+    /// The removal undid a failed link (D40) rather than unlinking this
+    /// device (D67).
+    link_failed: bool,
+}
+
 /// A sign-in that asked this device to link it.
 struct Prompt {
     id: String,
@@ -318,6 +327,25 @@ impl AppClient {
         if !self.app.device_groups_enabled() {
             return;
         }
+        // A removal an ingest applied stops an unlinked device before
+        // anything in the drive sends (D67). A failed link's undo is
+        // followed below, once the link's own progress is read (D40).
+        let noted = match self.note_device_group_removal_live() {
+            Ok(_) if self.device_unlinked => self.follow_device_group_removal_live().await,
+            noted => noted.map(|_| false),
+        };
+        if let Err(error) = noted {
+            tracing::warn!(
+                target: TARGET,
+                method = "drive_device_pairing_at",
+                error_kind = error.privacy_safe_kind(),
+                "could not follow this device's removal from its device group; retrying"
+            );
+            return;
+        }
+        if self.device_unlinked {
+            return;
+        }
         let messages = self
             .device_pairing
             .inbox
@@ -341,6 +369,10 @@ impl AppClient {
             );
         }
         self.follow_device_group_joins().await;
+        if self.device_unlinked {
+            // An unlinked device answers nothing more (D67).
+            return;
+        }
         self.decide_device_links(now).await;
         self.device_pairing.prompts.retain(|prompt| {
             !prompt.stage.is_terminal() || now < prompt.updated_at.saturating_add(SESSION_TTL_SECS)
@@ -1645,9 +1677,8 @@ impl AppClient {
     /// Make this device's first commit in the device group it joined through
     /// a link as soon as it can, rather than on the next maintenance pass,
     /// and forget the join once that commit is on the selected branch. A
-    /// device removed from its device group forgets its copy, so its next
-    /// Welcome is a first join; one removed before its first commit there
-    /// landed tells its user that linking failed (D40).
+    /// device removed from its device group first follows that removal
+    /// ([`Self::follow_device_group_removal_live`]).
     async fn follow_device_group_joins(&mut self) {
         if let Err(error) = self.follow_device_group_joins_inner().await {
             tracing::warn!(
@@ -1660,33 +1691,12 @@ impl AppClient {
     }
 
     async fn follow_device_group_joins_inner(&mut self) -> Result<(), AppError> {
-        let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        let trusted = self.trusted_device_group()?;
-        let joins = storage.device_group_joins()?;
-        if let Some(group_id) = &trusted
-            && self
-                .stored_group(group_id)?
-                .is_some_and(|group| group.removed)
-        {
-            let joined = joins
-                .iter()
-                .any(|(group_id_hex, _)| *group_id_hex == hex::encode(group_id.as_slice()));
-            self.forget_group_local(group_id).await?;
-            self.linked_devices_changed = true;
-            self.sync_device_tag_group()?;
-            if joined {
-                match self.device_pairing.new_device.as_mut() {
-                    Some(link) if matches!(link.outcome, Some(NewDeviceOutcome::Linked)) => {
-                        link.outcome =
-                            Some(NewDeviceOutcome::Ended(DeviceLinkEndReason::LinkFailed));
-                    }
-                    Some(_) => {}
-                    None => self.device_pairing.removed_after_join = true,
-                }
-            }
+        if self.follow_device_group_removal_live().await? {
             return Ok(());
         }
-        for (group_id_hex, _) in joins {
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let trusted = self.trusted_device_group()?;
+        for (group_id_hex, _) in storage.device_group_joins()? {
             let joined = trusted
                 .as_ref()
                 .is_some_and(|group_id| hex::encode(group_id.as_slice()) == group_id_hex);
@@ -1701,6 +1711,100 @@ impl AppClient {
             self.set_device_tag_key().await?;
         }
         Ok(())
+    }
+
+    /// Forget this device's device-group copy once the group has removed
+    /// this device, and say whether it did. One whose failed link the
+    /// removal undid tells its user that linking failed (D40), and its next
+    /// Welcome is a first join. One unlinked was stopped and marked when the
+    /// removal was noted (D67). Local work only.
+    pub(super) async fn follow_device_group_removal_live(&mut self) -> Result<bool, AppError> {
+        let Some(removal) = self.note_device_group_removal_live()? else {
+            return Ok(false);
+        };
+        self.forget_group_local(&removal.group_id).await?;
+        self.linked_devices_changed = true;
+        self.sync_device_tag_group()?;
+        if removal.link_failed {
+            match self.device_pairing.new_device.as_mut() {
+                Some(link) if matches!(link.outcome, Some(NewDeviceOutcome::Linked)) => {
+                    link.outcome = Some(NewDeviceOutcome::Ended(DeviceLinkEndReason::LinkFailed));
+                }
+                Some(_) => {}
+                None => self.device_pairing.removed_after_join = true,
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether this device's trusted device group has removed it. A removal
+    /// that unlinks it stops the account here and marks it unlinked (D67),
+    /// before anything more goes out; a failed link's undo stops nothing
+    /// (D40), and lifts the stop the app set when it found the removal
+    /// stored. Synchronous and repeatable, so each ingest can note a removal
+    /// as it applies it.
+    pub(super) fn note_device_group_removal_live(
+        &mut self,
+    ) -> Result<Option<DeviceGroupRemoval>, AppError> {
+        let Some(group_id) = self.app.removed_device_group(&self.state.label)? else {
+            return Ok(None);
+        };
+        // A classification that fails counts as an unlink: stopping is the
+        // safe side, and a failed link ends in a new link either way.
+        let link_failed = self.removal_undid_failed_link(&group_id).unwrap_or(false);
+        if link_failed {
+            self.app
+                .lift_failed_link_publish_stop(&hex::encode(self.adapter.account_id().as_slice()));
+        } else {
+            self.mark_device_unlinked()?;
+        }
+        Ok(Some(DeviceGroupRemoval {
+            group_id,
+            link_failed,
+        }))
+    }
+
+    /// Whether this device's removal undid a link that failed (D40) rather
+    /// than unlinking a made one (D67). A device unlinks another only once
+    /// its roster shows that device's first commit, and leaves a `removed`
+    /// record for its slot; a failed link's undo drops the slot's entry and
+    /// leaves none. So the roster the removal left decides, even when this
+    /// device applied its first commit and the removal in one catch-up. Only
+    /// a device that joined the group can have a failed link; a missing or
+    /// undecodable roster counts as an unlink, and the caller counts an
+    /// error as one too.
+    fn removal_undid_failed_link(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
+        let joined = self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .device_group_joins()?
+            .iter()
+            .any(|(group_id_hex, _)| *group_id_hex == hex::encode(group_id.as_slice()));
+        if !joined {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        if self.test_fail_roster_read {
+            return Err(AppError::DeviceGroupRefused("roster_unavailable"));
+        }
+        if !self
+            .runtime
+            .ensure_group_hydrated(group_id)
+            .map_err(|_| AppError::DeviceGroupRefused("roster_unavailable"))?
+        {
+            return Ok(false);
+        }
+        let Some(roster) = self
+            .runtime
+            .app_component(group_id, DEVICE_ROSTER_COMPONENT_ID)
+            .map_err(|_| AppError::DeviceGroupRefused("roster_unavailable"))?
+            .and_then(|bytes| decode_device_roster_v1(&bytes).ok())
+        else {
+            return Ok(false);
+        };
+        let slot = self.own_slot()?;
+        Ok(!roster.devices.contains_key(&slot) && !roster.rejected_slots.contains_key(&slot))
     }
 
     /// Whether this device's first commit in its trusted device group is on

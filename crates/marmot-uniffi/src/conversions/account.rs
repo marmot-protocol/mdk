@@ -15,6 +15,10 @@ pub struct AccountSummaryFfi {
     pub external_signing: bool,
     pub signed_out: bool,
     pub running: bool,
+    /// The account's device group removed this device after its link was
+    /// made; the account stays signed out here. Show that this device was
+    /// unlinked and offer `sign_out_and_wipe` (mdk#2628 D67).
+    pub unlinked: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]

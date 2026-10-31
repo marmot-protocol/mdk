@@ -1529,6 +1529,7 @@ mod tests {
                 local_signing,
                 external_signing: false,
                 signed_out,
+                unlinked: false,
             };
             let path = dir.join("account.json");
             std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();

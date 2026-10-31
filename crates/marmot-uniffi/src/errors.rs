@@ -392,6 +392,11 @@ pub enum MarmotKitError {
     StickerImport { details: String },
     #[error("Signal sticker import is unavailable for external-signing accounts")]
     StickerImportUnsupported,
+    /// This device was unlinked from the account by its other devices. The
+    /// account stays signed out here: wipe it, then link the device again
+    /// (mdk#2628 D67).
+    #[error("this device was unlinked from the account: {account_ref}")]
+    AccountUnlinked { account_ref: String },
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
     /// The account worker is completing an exclusive catch-up and definitely
@@ -495,6 +500,11 @@ impl From<&AppError> for MarmotKitError {
             AppError::AccountHome(AccountHomeError::AccountExists(account)) => {
                 Self::DuplicateIdentity {
                     account: account.clone(),
+                }
+            }
+            AppError::AccountHome(AccountHomeError::AccountUnlinked(account_ref)) => {
+                Self::AccountUnlinked {
+                    account_ref: account_ref.clone(),
                 }
             }
             // #543: reveal_nsec must surface its required failure modes as typed
