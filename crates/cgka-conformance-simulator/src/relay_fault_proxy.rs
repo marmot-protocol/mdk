@@ -25,8 +25,9 @@ const MAX_REQUEST_HEAD: usize = 16 * 1024;
 
 /// The NIP-11 document every endpoint serves until a scenario replaces it:
 /// the White Noise relays' shape (strfry with NIP-77 and a 500-result filter
-/// cap). The harness relay itself honors a requested `limit` but caps no
-/// filter, so an unlimited REQ still returns every match.
+/// cap). The harness relay returns at most 500 events for a filter with no
+/// `limit`, like strfry, but honors a larger requested `limit`, which strfry
+/// clamps.
 pub const PRODUCTION_RELAY_INFORMATION: &str = r#"{"name":"cgka-conformance relay","supported_nips":[1,9,11,40,77],"limitation":{"max_limit":500}}"#;
 
 /// Wire traffic through one proxied relay endpoint, summed over a range of
@@ -47,7 +48,7 @@ pub struct RelayTrafficV1 {
     pub undecoded_frames: u64,
     /// Relay-to-client `EVENT` deliveries by event id, when requested.
     pub events: BTreeMap<String, RelayEventDeliveryV1>,
-    /// Client history requests in arrival order, when events are requested.
+    /// Client history requests by proxy clock, when events are requested.
     #[serde(default)]
     pub history_requests: Vec<HistoryRequestV1>,
     /// The proxy's clock when this snapshot was taken, on the scale of
@@ -717,6 +718,7 @@ impl RelayFaultProxy {
                 merged.bytes += delivery.bytes;
             }
         }
+        total.history_requests.sort_by_key(|request| request.at_ms);
         total
     }
 
