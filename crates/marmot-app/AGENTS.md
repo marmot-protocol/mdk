@@ -457,12 +457,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   takes at a step boundary (`RecoveryRunner::repair` under a `PassBound`): a re-arm turn, then passes whose turns the
   waiting caller serves, until a verdict turn or the bound's stop or deadline, which settles the quantum in flight. The
   worker spawns its runner before the startup drain and hands its `SpawnedRunner` through the command context.
-  Only the caller's cancel trips the bound's stop. Verdicts are today's, never `Ok`, and leave a suspended group's
-  routes out. Each survey publishes the required units still catching up
+  Only the caller's cancel trips the bound's stop, which only preempts: the caller decides `Cancelled` first, as
+  today (`serve_repair`). Verdicts are today's, never `Ok`, leave a suspended group's routes out, and need something
+  judged: no covered window without a non-suspended route, each with a required relay. A verdict waits for a re-check
+  only where `recheck::owed`, the survey's own predicate, owes one. Each survey publishes the required units still catching up
   (`RunnerHost::surveyed`) into `AppTransportRouting`'s catching-up watch: the only source of the account recovery
   status, the worker's `RecoveryStatusChanged` cue, and the condition for a remainder's notice. Ledger notices
   (`HistoryNoticeCause::UnprovenHistory`, ids from `ledger_route_tag` and the park revision) skip a suspended group's
-  routes (`RunnerRoute::suspended`); they, the status and its event show nothing with the gate off.
+  routes (`RunnerRoute::suspended`) and a broken unit on a relay its route no longer requires; they, the status and
+  its event show nothing with the gate off.
   An Unrecoverable group's routes are suspended (`RunnerRoute.unrecoverable`, read from the engine's group record
   each debt turn): never scheduled, charged, broken or noticed, left out of admission so what they staged is given
   back as an unlisted route's is, and with the gate on the comparison owner drops their

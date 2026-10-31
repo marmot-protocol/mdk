@@ -895,13 +895,16 @@ in flight is interrupted and settles, so what it read is charged. Its verdicts a
 never success. `BelowRetentionWindow` once every current route, a suspended group's left out,
 has nothing staged and its required relays' units are still active, owe nothing up to their
 live tails (a retained route's goal end, if earlier), and, on each that compares, were
-re-checked since the re-arm. The caller's cancel wins even over a covered window, and a covered
-window over the deadline. `Cancelled` or `Deadline` when the caller or the
-budget ends it. Otherwise `CoverageUnproven` after a pass that served nothing. A route the ledger parks is one
-"history may be incomplete" notice with the cause `UnprovenHistory`, whose id is a hash of the
-route with its park revision; a group route's also shows in that group's status. A remainder
-is a notice only once the runner has surveyed and catches up nothing on its route. A suspended
-(Unrecoverable) group's routes give no notice. Each survey
+re-checked since the re-arm wherever the re-check survey owes a pass. As today, something must
+have been judged: a route with no required relay keeps the window unproven, and so does a
+repair whose every route is suspended. The caller decides a cancel first, as today, even over a
+covered window; a covered window wins over the deadline. `Cancelled` or `Deadline` when the
+caller or the budget ends it. Otherwise `CoverageUnproven` after a pass that served nothing. A
+route the ledger parks on a relay it requires is one "history may be incomplete" notice with
+the cause `UnprovenHistory`, whose id is a hash of the route with its park revision; a group
+route's also shows in that group's status. A park on a relay the route now carries only as best
+effort, or no longer, raises none. A remainder is a notice only once the runner has surveyed and
+catches up nothing on its route. A suspended (Unrecoverable) group's routes give no notice. Each survey
 publishes the required units still catching up; the account's recovery status reads that, and
 a change in it or in the notices is one `RecoveryStatusChanged`. With the gate off none of this
 shows.

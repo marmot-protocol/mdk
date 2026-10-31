@@ -20,8 +20,9 @@
 //! - **The verdict**, a debt turn after each pass: every current route's
 //!   window, a suspended group's left out, covered and admitted on each of
 //!   its required relays, none of whose units broke or was dismissed since,
-//!   and re-checked since the re-arm on each that compares ([`repaired`]), is
-//!   `BelowRetentionWindow`:
+//!   and re-checked since the re-arm on each that compares wherever the
+//!   survey owes a pass ([`repaired`]), is `BelowRetentionWindow`, once
+//!   something was judged:
 //!   what is left lies below the window, where no pass can search. The repair
 //!   never succeeds outright, as today. Otherwise the caller or the budget
 //!   ends it (`Cancelled`, `Deadline`), or a pass that served nothing within

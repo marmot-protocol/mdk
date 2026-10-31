@@ -60,11 +60,13 @@ impl AppClient {
 
     /// The routes the coverage ledger parks, one notice each, oldest first,
     /// behind the internal `runner_owns_debt` gate: a route with a broken
-    /// unit, or with a parked remainder once the window above it is covered,
-    /// that is once the runner has surveyed and catches up none of the
-    /// route's units. A group route's notice names its group; one that is no
-    /// current route's, a suspended group's, or one the host may not see, is
-    /// left out.
+    /// unit on a relay it now requires, or with a parked remainder once the
+    /// window above it is covered, that is once the runner has surveyed and
+    /// catches up none of the route's units. A broken unit on a relay the
+    /// route carries only as best effort, or no longer, owes nothing, so it
+    /// raises none; a remainder is the route's. A group route's notice names
+    /// its group; one that is no current route's, a suspended group's, or one
+    /// the host may not see, is left out.
     pub(crate) fn ledger_notices(
         &self,
         app: &SqliteAppStorage,
@@ -72,16 +74,21 @@ impl AppClient {
         if !self.app.recovery_runner_owns_debt() {
             return Ok(Vec::new());
         }
-        let groups = self
+        let routes = self
             .recovery_runner_routes()
             .into_iter()
             .filter(|route| !route.suspended())
-            .map(|route| (route.route, route.group_id))
+            .map(|route| (route.route, (route.group_id, route.required)))
             .collect::<BTreeMap<_, _>>();
         let catching_up = self.routing.recovery_runner_catching_up_now();
         let mut parked = app
             .parked_recovery_routes()?
             .into_iter()
+            .filter(|parked| {
+                routes.get(&parked.route).is_some_and(|(_, required)| {
+                    parked.relays.iter().any(|relay| required.contains(relay))
+                })
+            })
             .map(|parked| (parked.route, (parked.revision, parked.parked_at_seconds)))
             .collect::<BTreeMap<_, _>>();
         for remainder in app.recovery_coverage_remainders()? {
@@ -103,7 +110,7 @@ impl AppClient {
             .filter_map(|(route, (revision, parked_at_seconds))| {
                 let group_id = match route {
                     TransportReconciliationRoute::Inbox => None,
-                    TransportReconciliationRoute::Group(_) => Some(groups.get(&route)?.clone()?),
+                    TransportReconciliationRoute::Group(_) => Some(routes.get(&route)?.0.clone()?),
                 };
                 if !self.host_may_see_parked(group_id.as_deref()) {
                     return None;

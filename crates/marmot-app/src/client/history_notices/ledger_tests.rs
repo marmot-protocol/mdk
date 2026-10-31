@@ -3,8 +3,9 @@
 //! route is a notice in that group's status, an inbox park only in the
 //! account's list, a remainder only once nothing on its route catches up,
 //! and dismissal retires the park, each shown and dismissed notice audited.
-//! A suspended (Unrecoverable) group's routes give none. With the gate off
-//! none of it shows.
+//! A suspended (Unrecoverable) group's routes give none, nor does a park on
+//! a relay a route carries only as best effort. With the gate off none of it
+//! shows.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -100,13 +101,18 @@ fn need_changed(app: &MarmotApp, change: &str) -> Vec<serde_json::Value> {
 
 /// Break `route`'s unit on the relay the way a refusing relay does.
 fn park(app: &SqliteAppStorage, route: &TransportReconciliationRoute) {
+    park_on(app, route, RELAY);
+}
+
+/// Break `route`'s unit on `relay` the way a refusing relay does.
+fn park_on(app: &SqliteAppStorage, route: &TransportReconciliationRoute, relay: &str) {
     let now = crate::unix_now_seconds();
-    app.begin_recovery_unit_attempt(route, RELAY, None, now)
+    app.begin_recovery_unit_attempt(route, relay, None, now)
         .unwrap();
     let unit = app
         .settle_recovery_unit(
             route,
-            RELAY,
+            relay,
             RecoveryUnitOutcome::Refused,
             &RecoveryRunnerPolicy::default().unit,
             now,
@@ -382,6 +388,55 @@ async fn a_suspended_groups_park_and_remainder_are_no_notices() {
     assert!(shown(&client).is_empty(), "a suspended remainder");
     suspend(false);
     assert_eq!(shown(&client).len(), 1);
+}
+
+/// A broken unit on a relay the route carries only as best effort owes
+/// nothing, so it raises no notice; one on the relay the route requires
+/// does, and that notice is the route's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_park_on_a_relay_the_route_carries_only_as_best_effort_is_no_notice() {
+    const OPERATED: &str = "wss://operated.example";
+    const BEST_EFFORT: &str = "wss://best-effort.example";
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relays_and_config(
+        dir.path(),
+        vec![RELAY.into()],
+        crate::MarmotAppConfig::white_noise()
+            .with_open_ranking_provider(None, Vec::new())
+            .with_recovery_operated_relays(vec![OPERATED.into()]),
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()))
+    .with_recovery_runner_owning_debt();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client
+        .create_group_with_options(
+            "best effort",
+            &[],
+            crate::AppCreateGroupOptions {
+                relays: Some(vec![OPERATED.into(), BEST_EFFORT.into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let route = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
+        .unwrap();
+    assert_eq!(route.required, vec![OPERATED.to_owned()]);
+    assert_eq!(route.best_effort, vec![BEST_EFFORT.to_owned()]);
+    let storage = app.account_storage("alice").unwrap().app_storage();
+
+    park_on(&storage, &route.route, BEST_EFFORT);
+    assert!(client.history_notices().unwrap().is_empty());
+    park_on(&storage, &route.route, OPERATED);
+    let notices = client.history_notices().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].group_id_hex, Some(hex::encode(group.as_slice())));
 }
 
 /// The status reports the groups and inbox the runner's last survey found
