@@ -2532,7 +2532,10 @@ mod tests {
             storage.delete_message(&ids[0])?;
             Err(StorageError::Backend("rollback source pruning".into()))
         });
-        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(StorageError::Backend(message)) if message == "rollback source pruning"),
+            "{result:?}"
+        );
         assert_eq!(
             store
                 .pending_application_authority_batch(None, 100)
@@ -2640,7 +2643,10 @@ mod tests {
             storage.put_pending_application_event(&application_event(rolled_back.id.clone()))?;
             Err(StorageError::Backend("force rollback".to_owned()))
         });
-        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(StorageError::Backend(message)) if message == "force rollback"),
+            "{result:?}"
+        );
         assert_eq!(
             store.get_message(&rolled_back.id).unwrap().state,
             MessageState::Created

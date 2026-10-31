@@ -577,7 +577,10 @@ mod tests {
             storage.delete_group(&group.id)?;
             Err(StorageError::Backend("force rollback".to_string()))
         });
-        assert!(matches!(result, Err(StorageError::Backend(_))));
+        assert!(
+            matches!(&result, Err(StorageError::Backend(message)) if message == "force rollback"),
+            "{result:?}"
+        );
         assert_eq!(store.get_group(&group.id).unwrap(), group);
         let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
         assert!(state.is_some());
