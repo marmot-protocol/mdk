@@ -1198,7 +1198,13 @@ by app deduplication (#1721). Both run in the required public recovery CI job.
 (one with 51 members), about 11,000 retained kind-445 events on two relay endpoints, and one hidden-then-restored older
 commit. After a cold restart it records latency, traffic and recovery time under live traffic, and asserts only that,
 within 600 seconds, the commit is applied and the later messages decrypt, and that every gap chat message is present
-exactly once.
+exactly once. `public_app_large_account_recovery_scorecard_runner_owns_debt` runs it with the recovery runner owning
+history debt.
+`public_app_runner_stalled_relay_does_not_loop` and `public_app_runner_finishes_tens_of_thousands_of_owed_events` are
+the recovery-runner proofs. In the first, one relay endpoint never answers history while live traffic flows; the
+account must recover from the other endpoint, and attempts on the stalled one must thin out. In the second, 20,000
+owed events and a quiet group must finish exactly after a restart, with no sweep window asked twice, and again after a
+reconnect.
 Commands, limits, and remaining coverage gaps are in
 [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).
 

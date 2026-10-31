@@ -111,6 +111,47 @@ Setup sends retry a `transport_closed` refusal, which happens while the sender's
 when the sender's own timeline lacks the message. The report counts those retries. The measured phase never retries:
 it counts failed status, send and live-send calls.
 
+`public_app_large_account_recovery_scorecard_runner_owns_debt` runs the same workload with bob's recovery runner
+owning history debt (`AppRuntimeHarness::new_with_relay_pair_owning_debt`). Its `scorecard.json` names the history
+owner. Both forms also record each endpoint's history requests (`REQ` filters with `until`, and `NEG-OPEN`s, by verb
+and group kind, with sweep windows asked more than once) and bob's `account_recovery_status` at the end.
+
+## Recovery-runner proofs
+
+`tests/support/recovery_runner_proofs.rs` holds two ignored journeys for the recovery runner (mdk#2660), run in release
+with production policy. Bob runs in this process with the runner owning debt; alice and three senders run in their
+own processes. Both relay endpoints publish the White Noise relays' NIP-11 shape (NIP-77, `max_limit` 500), which the
+relay proxy serves itself, and the proxy logs every history request. Until the runner owns debt by default, the
+earlier owner still runs beside it, so each bound holds for both owners together.
+
+- `public_app_runner_stalled_relay_does_not_loop` reproduces the 0.14.0 loop's shape. Bob owes 3,000 events. Endpoint
+  1 stays connected but never answers history (`stall_relay_history`), while alice sends a live message every two
+  seconds for 16 minutes. It asserts that bob recovers the backlog exactly from endpoint 0, that every live message
+  arrives, and that in the second half of the window the stalled endpoint sees at most one burst of history requests
+  every two minutes. On 0.14.0 an attempt came about every 30 seconds for as long as the app ran.
+- `public_app_runner_finishes_tens_of_thousands_of_owed_events` owes 20,000 events in one group, published while bob
+  is stopped. A second group stays quiet: its messages are older than the restart's rebuild lookback. After the
+  restart alice sends a live message to the busy group every three seconds. It asserts:
+  - both timelines are exact;
+  - the runner reports the account caught up within 30 minutes;
+  - every live message arrives;
+  - no sweep window is asked twice on one endpoint;
+  - both groups' routes are swept on both endpoints after the restart;
+  - a message to the quiet group arrives while the busy group is still owed.
+
+  Then it records a 200-second idle window and cuts endpoint 0 for 10 seconds. With nothing inside the rebuild
+  lookback, every route's new live count there is empty. The journey asserts that endpoint 0 re-sweeps both routes,
+  that the runner reports caught up again within five minutes, and that a quiet-group message sent after the
+  reconnect arrives.
+
+Each run writes `report.json` and `history.json` under `MDK_APP_JOURNEY_ARTIFACTS`:
+
+```sh
+MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
+cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_journeys \
+  public_app_runner -- --ignored --test-threads=1 --nocapture
+```
+
 ## First basic public journeys
 
 These tests use `AppRuntimeHarness`, which invokes `MarmotAppRuntime` over a real loopback Nostr relay and separate
