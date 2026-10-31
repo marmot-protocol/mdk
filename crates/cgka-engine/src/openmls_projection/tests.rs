@@ -6,7 +6,7 @@ use cgka_traits::transport::{Timestamp, TransportSource};
 use storage_sqlite::SqliteAccountStorage;
 
 fn graph_fixture(history: u64) -> (SqliteAccountStorage, GroupId, Vec<MessageId>) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let group_id = GroupId::new(vec![1; 16]);
     storage
         .put_group(&Group {

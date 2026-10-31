@@ -5,7 +5,7 @@ mod attachments;
 pub(crate) mod recovery_credits;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
-use marmot_observability::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
+use marmot_observability::{Observation, Outcome as TelemetryOutcome};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -53,9 +53,7 @@ use crate::{
     RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
-use marmot_observability::app_telemetry::{
-    AppPerformanceOperation, SyncFailureClassification, SyncFailureStage,
-};
+use marmot_observability::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 
 enum ComparisonRecoveryOrigin {
     PeriodicMaintenance,
@@ -243,7 +241,7 @@ impl AccountStartupStage {
 /// worker keeps its stage in flight until the open itself moves on.
 #[derive(Clone, Debug)]
 pub(crate) struct AccountStartupProgress {
-    telemetry: marmot_observability::observer::PerformanceRecorder,
+    telemetry: marmot_observability::PerformanceRecorder,
     state: Arc<Mutex<StartupStageState>>,
 }
 
@@ -281,7 +279,7 @@ impl Drop for StageSpan {
 
 impl AccountStartupProgress {
     /// Open the `Spawned` span of a worker about to be spawned.
-    pub(crate) fn new(telemetry: marmot_observability::observer::PerformanceRecorder) -> Self {
+    pub(crate) fn new(telemetry: marmot_observability::PerformanceRecorder) -> Self {
         let stage = AccountStartupStage::Spawned;
         let span = StageSpan {
             observation: Some(telemetry.observe(stage.operation())),
@@ -506,6 +504,13 @@ pub(crate) enum AccountWorkerCommand {
         slot_id_hex: String,
         label: String,
         respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    RemoveLinkedDevice {
+        slot_id_hex: String,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    RemovedDeviceLeftoverChats {
+        respond: oneshot::Sender<Result<u32, AppError>>,
     },
     DismissHistoryNotice {
         notice_id: String,
@@ -982,7 +987,7 @@ impl Drop for WelcomeRecoveryTask {
 
 fn install_storage_telemetry(
     client: &AppClient,
-    telemetry: &marmot_observability::observer::PerformanceRecorder,
+    telemetry: &marmot_observability::PerformanceRecorder,
 ) {
     if let Ok(storage) = client.app.account_storage(&client.state.label) {
         let telemetry = telemetry.clone();
@@ -3390,7 +3395,7 @@ async fn finish_periodic_maintenance_after_recovery(
     account_id_hex: &str,
     account_label: &str,
     shared: &RuntimeSharedServices,
-    product_backlog: &marmot_observability::observer::ProductBacklogSource,
+    product_backlog: &marmot_observability::ProductBacklogSource,
     scheduled_convergence: &mut ScheduledConvergence,
 ) {
     if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
@@ -4186,7 +4191,7 @@ async fn handle_startup_hydration_command(
 const MEDIA_HTTP_IN_FLIGHT_LIMIT: usize = 4;
 
 struct MediaHttpContext {
-    product: marmot_observability::observer::ProductRecorder,
+    product: marmot_observability::ProductRecorder,
     tx: mpsc::UnboundedSender<MediaHttpDone>,
     permits: Arc<Semaphore>,
     /// Prevent concurrent host retries from uploading the same durable blob
@@ -4204,7 +4209,7 @@ struct MediaHttpDone {
     /// bounded by `MEDIA_HTTP_IN_FLIGHT_LIMIT`.
     permit: OwnedSemaphorePermit,
     completion: MediaHttpCompletion,
-    cancellation: Option<marmot_observability::observer::ProductOperation>,
+    cancellation: Option<marmot_observability::ProductOperation>,
 }
 
 /// Stores a fetched avatar image as a cache file and settles its attempt.
@@ -5831,6 +5836,23 @@ fn account_worker_command_future<'a>(
         } => Box::pin(async move {
             let result = client.rename_linked_device(&slot_id_hex, &label).await;
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::RemoveLinkedDevice {
+            slot_id_hex,
+            respond,
+        } => Box::pin(async move {
+            let result = client.remove_linked_device(&slot_id_hex).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::RemovedDeviceLeftoverChats { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.removed_device_leftover_chats(),
+            );
             true
         }),
         AccountWorkerCommand::AcknowledgeGroupCatchingUp { group_id, respond } => {
@@ -8964,7 +8986,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn avatar_dispatch_shares_media_capacity_and_holds_it_through_publication() {
-        let store = storage_sqlite::SqliteAccountStorage::in_memory()
+        let store = storage_sqlite::SqliteAccountStorage::in_memory_for_test()
             .unwrap()
             .app_storage();
         for n in 0..5 {
@@ -9026,7 +9048,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn avatar_shutdown_cancels_io_and_leaves_resumable_intent() {
-        let store = storage_sqlite::SqliteAccountStorage::in_memory()
+        let store = storage_sqlite::SqliteAccountStorage::in_memory_for_test()
             .unwrap()
             .app_storage();
         let reference = store

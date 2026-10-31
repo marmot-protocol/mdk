@@ -33,11 +33,12 @@ use cgka_traits::maintenance::{
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePassStorage, ConvergencePolicyStorage, DeviceGroupWelcomeExpectation,
-    DeviceGroupWelcomeStorage, DisbandCandidate, DisbandCandidateStorage, DisbandRequest,
-    DisbandRequestStatus, DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef,
-    GroupStorage, KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
+    AccountDeviceHistoryKey, AccountDeviceHistoryKeyStorage, AccountDeviceSignerBinding,
+    AccountDeviceSignerStorage, CapabilityStorage, ConvergencePassStorage,
+    ConvergencePolicyStorage, DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage,
+    DisbandCandidate, DisbandCandidateStorage, DisbandRequest, DisbandRequestStatus,
+    DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage,
+    KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
     MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
     QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
     WelcomeStorage,
@@ -237,7 +238,7 @@ fn build(id: &[u8]) -> impl CgkaEngine {
 }
 
 fn build_with_clock(id: &[u8], clock: ManualConvergenceClock) -> impl CgkaEngine {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -249,7 +250,7 @@ fn build_with_clock(id: &[u8], clock: ManualConvergenceClock) -> impl CgkaEngine
 }
 
 fn build_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> impl CgkaEngine {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -289,7 +290,7 @@ fn retained_anchor_snapshot_names(
 
 #[tokio::test]
 async fn self_update_is_staged_and_retains_the_exact_signed_transport_message() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let (group_id, created) = alice
         .create_group(CreateGroupRequest {
@@ -343,7 +344,7 @@ async fn self_update_is_staged_and_retains_the_exact_signed_transport_message() 
 
 #[tokio::test]
 async fn send_gate_filters_stored_rows() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let message_rows = Arc::new(AtomicUsize::new(0));
     let mut alice = EngineBuilder::new(FaultStorage {
         inner: storage.clone(),
@@ -433,7 +434,7 @@ async fn send_gate_filters_stored_rows() {
 
 #[tokio::test]
 async fn current_group_creation_persists_automatic_maintenance_enrollment() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = EngineBuilder::new(storage.clone())
         .identity(pad32(b"current-alice"))
         .account_identity_proof_signer(proof_signer(b"current-alice"))
@@ -468,7 +469,7 @@ async fn current_group_creation_persists_automatic_maintenance_enrollment() {
 
 #[tokio::test]
 async fn self_update_restart_republishes_the_identical_signed_event() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let (group_id, created) = alice
         .create_group(CreateGroupRequest {
@@ -515,7 +516,7 @@ async fn self_update_restart_republishes_the_identical_signed_event() {
 
 #[tokio::test]
 async fn invite_publish_failed_rolls_back_projected_member_set() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let mut bob = build(b"bob");
     let mut carol = build(b"carol");
@@ -772,7 +773,7 @@ async fn invite_wrap_failure_clears_staged_pending_commit_before_retry() {
 
 #[tokio::test]
 async fn confirmed_commits_prune_retained_anchor_snapshots_to_rewind_horizon() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let mut bob = build(b"bob");
 
@@ -1494,6 +1495,21 @@ impl AccountDeviceSignerStorage for FaultStorage {
     }
 }
 
+impl AccountDeviceHistoryKeyStorage for FaultStorage {
+    fn put_account_device_history_key_if_absent(
+        &self,
+        key: &AccountDeviceHistoryKey,
+    ) -> StorageResult<AccountDeviceHistoryKey> {
+        self.inner.put_account_device_history_key_if_absent(key)
+    }
+    fn account_device_history_key(
+        &self,
+        marmot_identity: &MemberId,
+    ) -> StorageResult<Option<AccountDeviceHistoryKey>> {
+        self.inner.account_device_history_key(marmot_identity)
+    }
+}
+
 impl DeviceGroupWelcomeStorage for FaultStorage {
     fn put_device_group_welcome_expectation(
         &self,
@@ -1729,7 +1745,7 @@ fn build_fault_engine(
     id: &[u8],
     fault: ProcessedFault,
 ) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let engine = EngineBuilder::new(FaultStorage {
         message_rows: Arc::default(),
@@ -1752,7 +1768,7 @@ fn build_fault_engine(
 
 #[tokio::test]
 async fn disband_publish_failure_reconciliation_is_atomic_and_retryable() {
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let disband_request_fault = ProcessedFault::default();
     let mut alice = EngineBuilder::new(FaultStorage {
@@ -1842,7 +1858,7 @@ async fn disband_publish_failure_reconciliation_is_atomic_and_retryable() {
 
 #[test]
 fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let lifecycle_fault = ProcessedFault::default();
     let mut engine = EngineBuilder::new(FaultStorage {
@@ -2028,7 +2044,7 @@ async fn confirmation_anchor_and_membership_failures_preserve_author_effects() {
 
     for fail_anchor in [true, false] {
         for remove_member in [false, true] {
-            let storage = SqliteAccountStorage::in_memory().unwrap();
+            let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
             let fault = ConfirmationFault::default();
             let mut alice = EngineBuilder::new(FaultStorage {
                 inner: storage.clone(),
@@ -2046,7 +2062,7 @@ async fn confirmation_anchor_and_membership_failures_preserve_author_effects() {
             .build()
             .unwrap();
             let peer = |seed: &[u8]| {
-                EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+                EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
                     .identity(pad32(seed))
                     .account_identity_proof_signer(proof_signer(seed))
                     .protocol_profile(ProtocolProfile::Current)
@@ -2250,7 +2266,7 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
         Advance::Inputs,
         Advance::DeterministicInputs,
     ] {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let fault = ConfirmationFault::default();
         let clock = ManualConvergenceClock::new(1_000, 10_000);
         let mut alice = EngineBuilder::new(FaultStorage {
@@ -2927,7 +2943,7 @@ async fn an_unreadable_intent_queue_still_schedules_the_drain() {
     // traffic touches it or the process restarts. Unknown must therefore be
     // treated as retained.
     for resolve_by_confirming in [true, false] {
-        let inner = SqliteAccountStorage::in_memory().unwrap();
+        let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
         let queued_intent_list_fault = ProcessedFault::default();
         let mut alice = EngineBuilder::new(FaultStorage {
             message_rows: Arc::default(),
@@ -2997,7 +3013,7 @@ async fn an_unreadable_intent_queue_still_schedules_the_drain() {
 
 #[tokio::test]
 async fn an_unreadable_intent_queue_at_pass_close_still_rearms_and_drains() {
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let queued_intent_list_fault = ProcessedFault::default();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut alice = EngineBuilder::new(FaultStorage {
@@ -3087,7 +3103,7 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
     // which neither `confirm_published` nor `publish_failed` is ever called.
     // Without a cap, a sender looping into that group grows the durable store
     // without bound while every call still reports `Queued`.
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let mut bob = build(b"bob");
     let group_id = group_with_bob(&mut alice, &mut bob).await;
@@ -3230,7 +3246,10 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
 /// under a publication this client is still holding.
 #[tokio::test]
 async fn a_publication_is_never_staged_while_a_convergence_input_is_unresolved() {
-    let mut alice = build_engine_with_storage(b"alice", SqliteAccountStorage::in_memory().unwrap());
+    let mut alice = build_engine_with_storage(
+        b"alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
     let mut bob = build(b"bob");
     let group_id = group_with_bob(&mut alice, &mut bob).await;
     let stable_epoch = alice.epoch(&group_id).unwrap();
@@ -3285,7 +3304,10 @@ async fn a_publication_is_never_staged_while_a_convergence_input_is_unresolved()
 /// empty no-op, and the publication still resolves through its own transition.
 #[tokio::test]
 async fn an_inbound_commit_under_a_held_publication_is_retained_not_converged() {
-    let mut alice = build_engine_with_storage(b"alice", SqliteAccountStorage::in_memory().unwrap());
+    let mut alice = build_engine_with_storage(
+        b"alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
     let mut bob = build(b"bob");
     let group_id = group_with_bob(&mut alice, &mut bob).await;
 

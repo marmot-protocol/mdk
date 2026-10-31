@@ -1,6 +1,6 @@
 //! Product-analytics tests that need a real `MarmotApp`, its runtime or `AppError`: consent
 //! persistence, the runtime's host timing and shutdown drain, and how storage errors count. They
-//! reach the collector through `wiring`, `observer` and the collector's test hooks.
+//! reach the collector through `wiring`, `Observer`'s views and the collector's test hooks.
 
 #[cfg(feature = "product-analytics-export")]
 use std::collections::BTreeMap;
@@ -18,10 +18,10 @@ use crate::{
     DiagnosticsExporterStatus, MarmotApp, ProductAnalyticsRuntimeConfig, ProductFamily,
     ProductUnit, UsageDiagnosticsDecision,
 };
-use marmot_observability::observability_test_support::configured;
+use marmot_observability::configured;
 #[cfg(feature = "product-analytics-export")]
-use marmot_observability::observability_test_support::grant;
-use marmot_observability::observer::permit_valid;
+use marmot_observability::grant;
+use marmot_observability::permit_valid;
 #[cfg(feature = "product-analytics-export")]
 use marmot_observability::wiring;
 

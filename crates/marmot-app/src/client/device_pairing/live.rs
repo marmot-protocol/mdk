@@ -448,15 +448,6 @@ impl AppClient {
         Ok(AccountKey::new(bytes))
     }
 
-    fn own_slot(&self) -> Result<DeviceSlotId, AppError> {
-        let lifecycle = self
-            .app
-            .account_storage(&self.state.label)?
-            .key_package_lifecycle()?
-            .ok_or(AppError::DeviceGroupRefused("slot_unavailable"))?;
-        device_slot(&lifecycle.stable_slot_id)
-    }
-
     // New device.
 
     fn start_new_device_link(&mut self, now: u64) -> Result<(), AppError> {
@@ -1605,38 +1596,6 @@ impl AppClient {
             }
         }
         Ok(())
-    }
-
-    /// Remove the leaf `leaf_signature_key` from the device group and its
-    /// roster entry in one commit, published as the link's was.
-    async fn unlink_device_from_group(
-        &mut self,
-        group_id: &GroupId,
-        leaf_signature_key: Vec<u8>,
-        operations: Vec<DeviceRosterOperationV1>,
-    ) -> Result<(), AppError> {
-        let roster_update = DeviceRosterUpdateV1::new(operations)
-            .and_then(|update| encode_device_roster_update_v1(&update).map_err(|e| e.to_string()))
-            .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
-        let audit_context = Self::local_human_action_context(
-            "unlink_device",
-            vec!["members"],
-            vec![DEVICE_ROSTER_COMPONENT_ID],
-            Some(1),
-        );
-        let effects = self
-            .runtime
-            .send_with_audit_context(
-                SendIntent::UnlinkDevice {
-                    group_id: group_id.clone(),
-                    leaf_signature_key,
-                    roster_update,
-                },
-                audit_context,
-            )
-            .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
-            .await
     }
 
     /// End the linking prompt of `link` with its outcome, telling the new

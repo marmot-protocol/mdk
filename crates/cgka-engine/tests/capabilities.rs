@@ -174,7 +174,7 @@ fn registry_selfremove_required_and_component_optional() -> FeatureRegistry {
 }
 
 fn build_client(id: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -188,7 +188,7 @@ fn build_engine_with_components(
     id: &[u8],
     components: impl IntoIterator<Item = u16>,
 ) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -203,7 +203,7 @@ fn build_engine_with_registry_and_components(
     registry: FeatureRegistry,
     components: impl IntoIterator<Item = u16>,
 ) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -1090,7 +1090,7 @@ fn build_concrete_with_storage(
     id: &[u8],
     registry: FeatureRegistry,
 ) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -1385,7 +1385,7 @@ async fn join_welcome_self_check_rejects_local_member_missing_required_role() {
         registry_with_agent_stream_roles(),
         agent_stream_supported_components(),
     );
-    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut bob = build_engine_on_storage_with_registry_and_components(
         b"bob",
         bob_storage.clone(),
@@ -1539,12 +1539,16 @@ struct MixedDeviceGroup {
 }
 
 async fn mixed_device_group() -> MixedDeviceGroup {
-    let alice_storage = SqliteAccountStorage::in_memory().unwrap();
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = device_on(b"alice", alice_storage.clone(), true);
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut carol = device_on(b"carol", carol_storage.clone(), true);
-    let mut bob = device_on(b"bob", SqliteAccountStorage::in_memory().unwrap(), true);
-    let bob_sibling_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = device_on(
+        b"bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        true,
+    );
+    let bob_sibling_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut bob_sibling = device_on(b"bob", bob_sibling_storage.clone(), false);
 
     // One invitee per Welcome: the mock peeler names a Welcome by its bytes.
@@ -1757,9 +1761,21 @@ fn raw_remove_leaf_commit(
 /// in `members()`; a failed publish drops it again.
 #[tokio::test]
 async fn a_pending_invite_counts_the_leaf_it_adds_until_its_publish_fails() {
-    let mut alice = device_on(b"alice", SqliteAccountStorage::in_memory().unwrap(), true);
-    let mut carol = device_on(b"carol", SqliteAccountStorage::in_memory().unwrap(), true);
-    let mut dave = device_on(b"dave", SqliteAccountStorage::in_memory().unwrap(), false);
+    let mut alice = device_on(
+        b"alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        true,
+    );
+    let mut carol = device_on(
+        b"carol",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        true,
+    );
+    let mut dave = device_on(
+        b"dave",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        false,
+    );
     let (group_id, _) = alice
         .create_group(CreateGroupRequest {
             name: "pending invite".into(),
@@ -1794,9 +1810,21 @@ async fn a_pending_invite_counts_the_leaf_it_adds_until_its_publish_fails() {
 /// several of one account: bob's second device lacks the component.
 #[tokio::test]
 async fn every_key_package_of_an_account_bounds_what_a_new_group_can_require() {
-    let mut alice = device_on(b"alice", SqliteAccountStorage::in_memory().unwrap(), true);
-    let mut bob = device_on(b"bob", SqliteAccountStorage::in_memory().unwrap(), true);
-    let mut bob_sibling = device_on(b"bob", SqliteAccountStorage::in_memory().unwrap(), false);
+    let mut alice = device_on(
+        b"alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        true,
+    );
+    let mut bob = device_on(
+        b"bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        true,
+    );
+    let mut bob_sibling = device_on(
+        b"bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        false,
+    );
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let bob_sibling_kp = bob_sibling.fresh_key_package().await.unwrap();
 

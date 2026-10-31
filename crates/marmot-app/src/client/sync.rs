@@ -1,5 +1,5 @@
 use crate::RuntimePerformanceOperation as RuntimeOp;
-use marmot_observability::app_telemetry::runtime::Outcome as TelemetryOutcome;
+use marmot_observability::Outcome as TelemetryOutcome;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -29,8 +29,8 @@ use marmot_forensics::{
     AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillExecutionSeam,
     EpochStallBackfillTrigger, ForensicRecorder as _,
 };
-use marmot_observability::app_telemetry::{AppPerformanceOperation, SyncFailureStage};
-use marmot_observability::observer::PerformanceRecorder;
+use marmot_observability::PerformanceRecorder;
+use marmot_observability::{AppPerformanceOperation, SyncFailureStage};
 
 #[cfg(test)]
 use marmot_forensics::EpochBackfillCompletionKind;
@@ -7766,7 +7766,7 @@ mod runtime_group_subscription_refresh_tests {
     use crate::MarmotApp;
     use crate::tests::ScriptedPushRelayClient;
     use marmot_account::AccountHome;
-    use marmot_observability::observer::PerformanceRecorder;
+    use marmot_observability::PerformanceRecorder;
 
     /// A send can release a peer's route update without changing membership.
     /// Its retained observer must install that route and retry a failed rebuild.

@@ -108,10 +108,7 @@ impl AppClient {
             })
         };
         observed
-            .run_async(
-                Box::pin(work),
-                marmot_observability::observer::success_or_failure,
-            )
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
             .await
     }
 

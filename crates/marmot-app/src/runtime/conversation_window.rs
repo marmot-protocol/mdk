@@ -12,8 +12,8 @@ use crate::conversation_presentation::{
 use crate::drafts::MessageDraftInvalidation;
 use crate::{AppClient, AppError, MarmotApp, MarmotAppEvent, SelectedMessageDraft};
 use cgka_traits::{GroupId, StorageError};
-use marmot_observability::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
-use marmot_observability::observer::PerformanceRecorder;
+use marmot_observability::PerformanceRecorder;
+use marmot_observability::{Observation, Outcome as TelemetryOutcome};
 use marmot_session::GroupAuthoritySnapshot;
 use std::{
     sync::{Arc, Mutex, Weak},
