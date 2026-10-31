@@ -408,20 +408,24 @@ impl AppClient {
                         && now < issued.not_after
                 });
                 let chat = match hex::decode(chat) {
-                    Ok(chat) if key_package_held => self.held_chat(&GroupId::new(chat))?,
-                    _ => HeldChat::Gone,
+                    Ok(chat) if key_package_held => self.held_chat(&GroupId::new(chat)),
+                    _ => Ok(HeldChat::Gone),
                 };
                 match chat {
-                    HeldChat::Active => {
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                    Ok(HeldChat::Active) => {
                         held += 1;
                         continue;
                     }
-                    HeldChat::Gone => {
+                    Ok(HeldChat::Gone) => {
                         storage.delete_stashed_sibling_welcome(&record.message_id_hex)?;
                         expired += 1;
                         continue;
                     }
-                    HeldChat::LetGo => {}
+                    Ok(HeldChat::LetGo) => {}
                 }
             }
             match self
