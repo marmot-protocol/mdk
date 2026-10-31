@@ -122,29 +122,35 @@ and group kind, with sweep windows asked more than once) and bob's `account_reco
 with production policy. Bob runs in this process with the runner owning debt; alice and three senders run in their
 own processes. Both relay endpoints publish the White Noise relays' NIP-11 shape (NIP-77, `max_limit` 500), which the
 relay proxy serves itself, and the proxy logs every history request. Until the runner owns debt by default, the
-earlier owner still runs beside it, so each bound holds for both owners together.
+earlier owner still runs beside it. Wire bounds count both owners' requests. The runner's own bounds read its
+`quantum` and `recheck` debug events, captured in process, and the sweep requests only it sends: a window `REQ`
+asking exactly the published cap, where the earlier owner's pages carry no limit. Both owners compare with the same
+`NEG-OPEN` shape, so those are counted, not attributed.
 
 - `public_app_runner_stalled_relay_does_not_loop` reproduces the 0.14.0 loop's shape. Bob owes 3,000 events. Endpoint
   1 stays connected but never answers history (`stall_relay_history`), while alice sends a live message every two
   seconds for 16 minutes. It asserts that bob recovers the backlog exactly from endpoint 0, that every live message
   arrives, and that in the second half of the window the stalled endpoint sees at most one burst of history requests
-  every two minutes. On 0.14.0 an attempt came about every 30 seconds for as long as the app ran.
+  every two minutes and the runner makes at most four attempts that ask a relay and end without progress. On 0.14.0
+  an attempt came about every 30 seconds for as long as the app ran.
 - `public_app_runner_finishes_tens_of_thousands_of_owed_events` owes 20,000 events in one group, published while bob
   is stopped. A second group stays quiet: its messages are older than the restart's rebuild lookback. After the
   restart alice sends a live message to the busy group every three seconds. It asserts:
   - both timelines are exact;
   - the runner reports the account caught up within 30 minutes;
   - every live message arrives;
-  - no sweep window is asked twice on one endpoint;
+  - the runner asks no sweep window twice on one endpoint;
+  - at most four runner attempts ask a relay and end without progress;
   - both groups' routes are swept on both endpoints after the restart;
   - a message to the quiet group arrives while the busy group is still owed.
 
   Then it records a 200-second idle window and cuts endpoint 0 for 10 seconds. With nothing inside the rebuild
-  lookback, every route's new live count there is empty. The journey asserts that endpoint 0 re-sweeps both routes,
-  that the runner reports caught up again within five minutes, and that a quiet-group message sent after the
+  lookback, every route's new live count there is empty. The journey asserts that the runner re-sweeps both routes on
+  endpoint 0, that it reports caught up again within five minutes, and that a quiet-group message sent after the
   reconnect arrives.
 
-Each run writes `report.json` and `history.json` under `MDK_APP_JOURNEY_ARTIFACTS`:
+Each run writes `report.json`, `history.json` and the runner's `runner-trace.json` under
+`MDK_APP_JOURNEY_ARTIFACTS`:
 
 ```sh
 MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
