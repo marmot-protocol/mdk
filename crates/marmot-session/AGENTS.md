@@ -34,7 +34,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   - `runtime/own_slot.rs` — the own-slot check's runtime half (mdk#2628 3.4): the host hands over publications in this
     device's slot that it did not make. `slot_publication_superseded` is the one test of whether a publication of this
     device's own still stands there; every step that stages, publishes, resends or republishes asks it. One dated past
-    the skew window is deleted by id (D63) and never outranked, so it never holds back a refresh.
+    the skew window is deleted by id (D63) and never outranked, so it never holds back a refresh. A relay the host read
+    as serving nothing in the slot, though it accepted the current publication, gets a new KeyPackage
+    (`refill_emptied_slot`) once that publication is a day old, so one that keeps nothing costs one a day.
   - `runtime/device_roster.rs` — this device's reads and writes of its device group's roster: its slot, the merged
     roster, the gate its roster commits wait behind (`device_group_takes_commit`: not stable, held, quarantined,
     settling, or a change of this device's still queued or unconfirmed; public, so the host judges a lost rename only

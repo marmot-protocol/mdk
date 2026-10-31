@@ -995,6 +995,12 @@ the device group this device trusts, for a Devices screen:
 - Each device writes its own `client` and `platform`: its `clientName` and `devicePlatform` options (a short name
   such as `iOS`), trimmed, and empty when blank or over 64 bytes. It writes them with its next KeyPackage
   announcement in the device group, so they appear after its next maintenance pass.
+- `last_active_at` is when a heartbeat last showed a sibling running, in Unix seconds. Each running device sends one
+  in the device group at most once an hour; each is dated when it was created or, if earlier, when this device read
+  it. It is `None` for this device and for a sibling none of whose heartbeats has counted yet.
+- `inactive` is this device's own judgement, for showing the user: 30 days have passed since a sibling's last activity
+  or since this device first found it in the roster, whichever is later. It is never set for this device. `status`
+  `Inactive` is the roster's own mark.
 - The list is empty until this device trusts a device group (a single-device account has none), and in every release
   build until the roster's spec lands.
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
@@ -1043,6 +1049,32 @@ It is false in every release build until the roster's spec lands.
   `check_sign_ins(account_ref)` checks now and returns the list after the check.
 - Re-read on `MarmotEventFfi::UnrecognizedSignInsChanged`, which carries no slots. It also fires once each time the
   account's worker opens or reconnects, so it may fire with no visible change.
+- The list is empty in every release build until the roster's spec lands.
+- `start_fresh(account_ref)` is "No, start fresh" when the user no longer has the devices the first check found: every
+  sign-in from before this device is answered `NotNow`, now and when one is listed later. It rejects nothing and
+  raises no compromise warning, so one of those devices can still link this one. It is refused before the first check
+  (`sign_ins_unchecked`) and once this device trusts a device group (`device_group_exists`). `started_fresh` says
+  whether the device did so and still has no device group: say that only chats it is invited to from now on are here.
+  Re-read it after `start_fresh` and on `LinkedDevicesChanged`.
+
+## Compromise warning
+
+`compromise_warning(account_ref)` returns the account's open compromise warning on this device as
+`CompromiseWarningItemFfi` records, the earliest gathered first. An empty list means no warning is open:
+
+- Each item is a rejection, which means someone holding the account's signing key, or a session with its remote
+  signer, published where the account's devices did not. `RejectedSignIn` is a sign-in answered This wasn't me, on
+  this device or another; `RejectedKeyPackage` is a KeyPackage one of the account's devices found where they had not
+  published, with its `key_package_ref_hex`. `slot_id_hex` and `occurred_at` say where and when.
+- Later releases add reasons. Show one the app does not know as a generic one.
+- The warning gathers this device's rejections and those in its device group's roster, so a rejection made on another
+  device warns here too. Rejections already in the first roster this device trusts count as seen: the user saw them on
+  the devices that were there. A rejected sign-in leaves the warning once its slot is linked as a device.
+- `dismiss_compromise_warning(account_ref)` marks everything the warning gathers as seen, on this device only. It stays
+  closed until a new rejection arrives, and a rejection that branch selection drops and brings back stays seen.
+- The app writes the wording, and never says the account's devices stopped them.
+- Re-read on `MarmotEventFfi::CompromiseWarningChanged`, which carries no slots. It also fires once each time the
+  account's worker opens, so it may fire with no visible change.
 - The list is empty in every release build until the roster's spec lands.
 
 ## Linking a new device

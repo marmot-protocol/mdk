@@ -42,6 +42,8 @@ _Static_assert(MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED == 100, "moderation 
 _Static_assert(MARMOT_SIGN_IN_RESPONSE_NOT_NOW == 0, "sign-in response ABI value");
 _Static_assert(MARMOT_SIGN_IN_RESPONSE_REJECT == 1, "sign-in response ABI value");
 _Static_assert(MARMOT_SIGN_IN_RESPONSE_DISMISS == 2, "sign-in response ABI value");
+_Static_assert(MARMOT_COMPROMISE_WARNING_REASON_REJECTED_SIGN_IN == 0, "compromise warning reason ABI value");
+_Static_assert(MARMOT_COMPROMISE_WARNING_REASON_REJECTED_KEY_PACKAGE == 1, "compromise warning reason ABI value");
 
 static int failures = 0;
 

@@ -51,10 +51,9 @@
 
 use base64::Engine as _;
 use cgka_traits::app_components::{
-    DeviceRosterV1, DeviceSlotId, DeviceTagClaim, NOSTR_ROUTING_MAX_RELAYS,
-    validate_nostr_relay_url,
+    DeviceSlotId, NOSTR_ROUTING_MAX_RELAYS, validate_nostr_relay_url,
 };
-use cgka_traits::storage::{IssuedPrivateKeyPackage, MaintenanceStorage as _, MessageStorage as _};
+use cgka_traits::storage::{IssuedPrivateKeyPackage, MessageStorage as _};
 use cgka_traits::welcome::SiblingWelcomeJoin;
 use cgka_traits::{
     EpochId, GroupId, IngestOutcome, KeyPackage, MemberId, MessageId, MessageState, StorageError,
@@ -70,7 +69,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use storage_sqlite::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage, StashedSiblingWelcome};
 
 use super::AppClient;
-use super::device_group::device_slot;
+use super::device_group::Exchange;
 use crate::{AppError, unix_now_seconds};
 
 const TRACE_TARGET: &str = "marmot_app::client::private_key_packages";
@@ -78,16 +77,6 @@ const TRACE_TARGET: &str = "marmot_app::client::private_key_packages";
 /// While a need lasts, a device asks the same sibling again at most this
 /// often.
 const REQUEST_INTERVAL_SECS: u64 = 60 * 60;
-
-/// The device group private KeyPackages travel in, its roster, this
-/// device's slot there, and whether this device's own leaf carries a device
-/// tag that reads as that slot.
-struct Exchange {
-    group_id: GroupId,
-    roster: DeviceRosterV1,
-    own_slot: DeviceSlotId,
-    tagged: bool,
-}
 
 /// Where the chat a held sibling Welcome is into stands.
 enum HeldChat {
@@ -109,54 +98,7 @@ pub(super) enum SiblingWelcomeAdmission {
     Admitted(StashedSiblingWelcome),
 }
 
-impl Exchange {
-    /// Every other device the roster lists.
-    fn siblings(&self) -> Vec<DeviceSlotId> {
-        self.roster
-            .devices
-            .keys()
-            .filter(|slot| **slot != self.own_slot)
-            .copied()
-            .collect()
-    }
-
-    fn is_sibling(&self, slot: &DeviceSlotId) -> bool {
-        *slot != self.own_slot && self.roster.devices.contains_key(slot)
-    }
-}
-
 impl AppClient {
-    /// The exchange this device takes part in: the trusted device group's,
-    /// while the roster lists this device.
-    fn private_key_package_exchange(&mut self) -> Result<Option<Exchange>, AppError> {
-        let Some((group_id, roster)) = self.trusted_device_roster()? else {
-            return Ok(None);
-        };
-        let Some(own_slot) = self
-            .app
-            .account_storage(&self.state.label)?
-            .key_package_lifecycle()?
-            .and_then(|lifecycle| device_slot(&lifecycle.stable_slot_id).ok())
-        else {
-            return Ok(None);
-        };
-        if !roster.devices.contains_key(&own_slot) {
-            return Ok(None);
-        }
-        let epoch = self.runtime.group_record(&group_id)?.epoch;
-        let own_leaf = self.runtime.own_leaf_index(&group_id)?;
-        let tagged = self
-            .runtime
-            .member_device_tag_claim(&group_id, epoch, own_leaf, &roster)?
-            == Some(DeviceTagClaim::Device(own_slot));
-        Ok(Some(Exchange {
-            group_id,
-            roster,
-            own_slot,
-            tagged,
-        }))
-    }
-
     /// Answer a sibling's request by issuing what it wants. Upkeep sends the
     /// hand-offs. A request answered before issues nothing, and so does one
     /// that reaches this device before its own leaf is tagged.
@@ -167,7 +109,7 @@ impl AppClient {
         sender: (EpochId, Option<u32>),
         content: &str,
     ) -> Result<(), AppError> {
-        let Some(exchange) = self.private_key_package_exchange()? else {
+        let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
         let request = PrivateKeyPackageRequest::decode(content)
@@ -204,7 +146,7 @@ impl AppClient {
         sender: (EpochId, Option<u32>),
         content: &str,
     ) -> Result<(), AppError> {
-        let Some(exchange) = self.private_key_package_exchange()? else {
+        let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
         let invalid = || AppError::InvalidAppMessagePayload("private KeyPackage hand-off".into());
@@ -272,7 +214,7 @@ impl AppClient {
         content: &str,
     ) -> Result<SiblingWelcomeAdmission, AppError> {
         use SiblingWelcomeAdmission::{Admitted, NotAddressed, Refused};
-        let Some(exchange) = self.private_key_package_exchange()? else {
+        let Some(exchange) = self.device_group_exchange()? else {
             return Ok(NotAddressed);
         };
         let invalid = || Refused(AppError::InvalidAppMessagePayload("sibling Welcome".into()));
@@ -319,8 +261,9 @@ impl AppClient {
     }
 
     /// Keep an admitted sibling Welcome for the next maintenance pass to
-    /// join. One more than the stash holds is dropped; its sender's resend
-    /// (3.5e) is the repair.
+    /// join. A full stash makes room by evicting its oldest held Welcome;
+    /// with none held, the new one is dropped, and its sender's resend (3.5e)
+    /// is the repair.
     pub(super) fn stash_sibling_welcome(
         &mut self,
         admitted: &StashedSiblingWelcome,
@@ -530,7 +473,7 @@ impl AppClient {
 
     async fn try_sibling_key_package_upkeep(&mut self, held: &[GroupId]) -> Result<(), AppError> {
         let now = unix_now_seconds();
-        let Some(exchange) = self.private_key_package_exchange()? else {
+        let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
         if held.contains(&exchange.group_id) || !exchange.tagged {

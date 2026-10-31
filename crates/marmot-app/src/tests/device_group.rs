@@ -21,6 +21,8 @@ use storage_sqlite::DeviceGroupTrust;
 
 mod chat_kinds;
 mod devices;
+mod heartbeats;
+mod history;
 mod private_key_packages;
 mod removal;
 
@@ -1058,6 +1060,8 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         add_to_all_chats: true,
         bring_history: true,
         keep_while_inactive: false,
+        last_active_at: None,
+        inactive: false,
         removal_pending: false,
     };
     // The dev hook links the new device with both settings off.
@@ -1153,6 +1157,8 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         add_to_all_chats: true,
         bring_history: true,
         keep_while_inactive: false,
+        last_active_at: None,
+        inactive: false,
         removal_pending: false,
     };
     let desk = LinkedDevice {
@@ -1748,18 +1754,33 @@ async fn an_unreadable_device_group_refuses_publication() {
         mut phone,
         ..
     } = phone_and_laptop().await;
+    let storage = phone_app.account_storage("alice").unwrap().app_storage();
     assert!(
-        phone_app
-            .account_storage("alice")
-            .unwrap()
-            .app_storage()
+        storage
             .insert_device_group(&storage_sqlite::DeviceGroupRecord {
                 group_id_hex: "not a group id".to_owned(),
-                trust: DeviceGroupTrust::Created,
+                trust: DeviceGroupTrust::Creating,
                 key_package_ref_hex: Some("00".repeat(32)),
                 recorded_at: 1,
             })
             .unwrap()
+    );
+    assert!(
+        storage
+            .trust_device_group(
+                "not a group id",
+                DeviceGroupTrust::Creating,
+                DeviceGroupTrust::Created,
+                None,
+                1,
+                &storage_sqlite::FirstTrustedRoster {
+                    own: &[],
+                    roster: &[],
+                    now: 1,
+                },
+            )
+            .unwrap()
+            .is_some()
     );
 
     let before = relay.published_events.lock().unwrap().len();

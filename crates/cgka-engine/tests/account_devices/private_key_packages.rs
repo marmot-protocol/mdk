@@ -526,7 +526,10 @@ fn assert_held_wrote_nothing(
             .iter()
             .any(|issued| issued.key_package_ref == welcome.key_package_ref)
     );
-    assert_eq!(laptop.storage.stored_key_package_bundles().unwrap().len(), keys);
+    assert_eq!(
+        laptop.storage.stored_key_package_bundles().unwrap().len(),
+        keys
+    );
     assert_eq!(&laptop.engine.group_record(gid).unwrap(), before);
 }
 
@@ -580,7 +583,13 @@ async fn a_sibling_welcome_into_a_chat_still_held_waits_for_its_removal() {
         laptop.engine.epoch(&gid).unwrap(),
         phone.engine.epoch(&gid).unwrap()
     );
-    assert!(laptop.engine.issued_private_key_packages().unwrap().is_empty());
+    assert!(
+        laptop
+            .engine
+            .issued_private_key_packages()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         join_sibling(&mut laptop, b"another carrier", &sibling).await,
         Settled(refused(InputRejectionCategory::Duplicate))

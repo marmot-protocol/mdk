@@ -18,6 +18,9 @@
 //!   sending leaf's device tag (D33), through 3.1d's one tag reader. A
 //!   message from an earlier epoch is read from that epoch's retained anchor,
 //!   so one older than the retained anchors has no readable sender.
+//! - [`AppClient::device_group_exchange`] names the device group, its roster,
+//!   this device's slot and whether this device's own leaf is tagged, which
+//!   decides whether siblings will read what it sends.
 //! - [`AppClient::device_group_message_withdrawn`] hands a withdrawn message
 //!   to the feature that owns its kind. The engine names a withdrawn message
 //!   only by its message id (an own send's transport id, a received
@@ -30,11 +33,13 @@
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
 use cgka_traits::app_event::MarmotAppEvent;
 use cgka_traits::engine::{GroupEvent, SendIntent};
+use cgka_traits::storage::MaintenanceStorage as _;
 use cgka_traits::{EpochId, GroupId, MessageId};
 use marmot_session::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
 };
 
+use super::device_slot;
 use crate::client::AppClient;
 use crate::client::private_key_packages::SiblingWelcomeAdmission;
 use crate::small_state::{KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE};
@@ -65,7 +70,65 @@ pub(crate) fn is_device_group_kind(kind: u64) -> bool {
     )
 }
 
+/// The trusted device group this device talks to its siblings in, its
+/// roster, this device's slot there, and whether this device's own leaf
+/// carries a device tag that reads as that slot. Siblings read nothing this
+/// device sends until it does.
+pub(crate) struct Exchange {
+    pub(crate) group_id: GroupId,
+    pub(crate) roster: DeviceRosterV1,
+    pub(crate) own_slot: DeviceSlotId,
+    pub(crate) tagged: bool,
+}
+
+impl Exchange {
+    /// Every other device the roster lists.
+    pub(crate) fn siblings(&self) -> Vec<DeviceSlotId> {
+        self.roster
+            .devices
+            .keys()
+            .filter(|slot| **slot != self.own_slot)
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn is_sibling(&self, slot: &DeviceSlotId) -> bool {
+        *slot != self.own_slot && self.roster.devices.contains_key(slot)
+    }
+}
+
 impl AppClient {
+    /// The exchange this device takes part in: the trusted device group's,
+    /// while the roster lists this device.
+    pub(crate) fn device_group_exchange(&mut self) -> Result<Option<Exchange>, AppError> {
+        let Some((group_id, roster)) = self.trusted_device_roster()? else {
+            return Ok(None);
+        };
+        let Some(own_slot) = self
+            .app
+            .account_storage(&self.state.label)?
+            .key_package_lifecycle()?
+            .and_then(|lifecycle| device_slot(&lifecycle.stable_slot_id).ok())
+        else {
+            return Ok(None);
+        };
+        if !roster.devices.contains_key(&own_slot) {
+            return Ok(None);
+        }
+        let epoch = self.runtime.group_record(&group_id)?.epoch;
+        let own_leaf = self.runtime.own_leaf_index(&group_id)?;
+        let tagged = self
+            .runtime
+            .member_device_tag_claim(&group_id, epoch, own_leaf, &roster)?
+            == Some(DeviceTagClaim::Device(own_slot));
+        Ok(Some(Exchange {
+            group_id,
+            roster,
+            own_slot,
+            tagged,
+        }))
+    }
+
     /// Take a message from a device-group event and hand it to the feature
     /// that owns its kind. Anything else is ignored, and so is anything that
     /// feature finds not addressed to this device. A refused message is
@@ -99,22 +162,21 @@ impl AppClient {
         let Ok(message) = MarmotAppEvent::decode(payload) else {
             return Ok(());
         };
+        let sender = (*epoch, *sender_leaf_index);
         let result = match message.kind {
-            KIND_PRIVATE_KEY_PACKAGE_REQUEST => self.receive_key_package_request(
-                group_id,
-                message_id,
-                (*epoch, *sender_leaf_index),
-                &message.content,
-            ),
-            KIND_PRIVATE_KEY_PACKAGE_HAND_OFF => self.receive_key_package_hand_off(
-                group_id,
-                (*epoch, *sender_leaf_index),
-                &message.content,
-            ),
+            KIND_DEVICE_HEARTBEAT => {
+                self.receive_device_heartbeat(group_id, sender, message.created_at)
+            }
+            KIND_PRIVATE_KEY_PACKAGE_REQUEST => {
+                self.receive_key_package_request(group_id, message_id, sender, &message.content)
+            }
+            KIND_PRIVATE_KEY_PACKAGE_HAND_OFF => {
+                self.receive_key_package_hand_off(group_id, sender, &message.content)
+            }
             KIND_SIBLING_WELCOME => match self.admit_sibling_welcome(
                 group_id,
                 message_id,
-                (*epoch, *sender_leaf_index),
+                sender,
                 message.created_at,
                 &message.content,
             )? {

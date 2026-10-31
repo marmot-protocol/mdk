@@ -71,8 +71,13 @@ mod audit;
 mod audit_recovery;
 mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
+mod chat_history;
+#[cfg(feature = "test-policy-overrides")]
+pub use chat_history::DevSealedHistoryBundle;
+pub(crate) mod compromise_warning;
 pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
+pub(crate) mod device_heartbeats;
 pub(crate) mod device_pairing;
 mod device_removal;
 mod device_renames;
@@ -801,6 +806,10 @@ pub struct AppClient {
     /// what hosts last read. The worker's account-level and applied-summary
     /// seams drain it into one `LinkedDevicesChanged`.
     pub(crate) linked_devices_changed: bool,
+    /// The siblings the last maintenance pass judged inactive, by slot, so a
+    /// pass that judges differently owes hosts a `LinkedDevicesChanged`.
+    /// `None` until a pass has judged.
+    pub(crate) inactive_siblings: Option<std::collections::BTreeSet<String>>,
     /// The last overdue-refresh answer a maintenance pass computed, and
     /// whether hosts owe a `KeyPackageRefreshOverdueChanged`. The flag starts
     /// set, since a fresh client cannot know what hosts last read.
@@ -814,6 +823,15 @@ pub struct AppClient {
     /// open. The same seams as `linked_devices_changed` drain it into one
     /// `UnrecognizedSignInsChanged`.
     pub(crate) unrecognized_sign_ins_changed: bool,
+    /// The compromise warning may have changed since hosts last heard: a
+    /// gather that added or dropped an unseen item, a dismissal, or an open.
+    /// The same seams drain it into one `CompromiseWarningChanged`
+    /// (mdk#2628 3.7a).
+    pub(crate) compromise_warning_changed: bool,
+    /// The roster changed, or this device rejected a sign-in, since the
+    /// warning last gathered; set at open. The next seam or host read
+    /// gathers.
+    pub(crate) compromise_warning_gather_due: bool,
     /// Linking a new device may have changed as hosts would read it, or the
     /// client just opened, ending any link in progress. The same seams drain
     /// it into one `DeviceLinkChanged`.
@@ -1493,6 +1511,7 @@ impl AppClient {
         self.sync_device_tag_group()?;
         self.join_stashed_sibling_welcomes().await;
         self.sibling_key_package_upkeep(&held).await;
+        self.device_heartbeat_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
         self.note_key_package_refresh_overdue();
         let mut activity = self.runtime.take_maintenance_activity();

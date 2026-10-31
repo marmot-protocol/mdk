@@ -101,6 +101,7 @@ mod error;
 pub mod error_kind_table;
 mod external_signer;
 mod groups;
+mod history_bundle;
 mod history_notices;
 pub use history_notices::{HistoryNotice, HistoryNoticeCause};
 mod ids;
@@ -217,6 +218,10 @@ pub use cgka_traits::{
     PollProjection, PollType, PollVote, PollVotePage,
 };
 pub use client::AppClient;
+#[cfg(feature = "test-policy-overrides")]
+#[doc(hidden)]
+pub use client::DevSealedHistoryBundle;
+pub use client::compromise_warning::{CompromiseWarningItem, CompromiseWarningReason};
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::device_group::ConfirmedDeviceLink;
@@ -2123,10 +2128,13 @@ impl MarmotApp {
             history_notice_baseline: None,
             // A fresh client cannot know what hosts last read.
             linked_devices_changed: true,
+            inactive_siblings: None,
             key_package_refresh_overdue: None,
             key_package_refresh_overdue_changed: true,
             sign_in_schedule: Default::default(),
             unrecognized_sign_ins_changed: true,
+            compromise_warning_changed: true,
+            compromise_warning_gather_due: true,
             device_link_changed: true,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
@@ -5691,6 +5699,8 @@ impl MarmotApp {
             .read_account_key_package_slots(&account_id_hex, &source_relays, own_slot)
             .await?;
         slots.complete &= listed;
+        // A relay's own finished read still shows what that relay serves, so
+        // the relays it found empty stand.
         if let Some(own_slot) = slots.own_slot.as_mut() {
             own_slot.complete &= listed;
         }
@@ -7143,6 +7153,31 @@ impl MarmotApp {
             self.presentation_signals.wake();
         }
         Ok(update)
+    }
+
+    /// Import a sibling's history for one chat (mdk#2628 4.2a), with the
+    /// chat-list refresh in the same transaction. `None` when every event was
+    /// already held or skipped.
+    pub(crate) fn import_account_app_events(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        source_slot: &cgka_traits::app_components::DeviceSlotId,
+        events: &[storage_sqlite::ImportedAppEvent],
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            let import = storage.app_storage().import_app_events(
+                group_id_hex,
+                source_slot,
+                events,
+                unix_now_seconds(),
+            )?;
+            if import.update.changes.is_empty() {
+                return Ok(None);
+            }
+            self.app_projection_update(label, import.update).map(Some)
+        })
     }
 
     /// Reconcile a local publication with its engine-stamped source authority.

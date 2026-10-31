@@ -1,7 +1,9 @@
 // The own-slot check's runtime half (mdk#2628 item 3.4): a publication in
 // this device's slot that it did not make is replaced by a newer KeyPackage
 // of its own, and one dated too far ahead to outrank is deleted by id (D63)
-// without ever holding back the device's refreshes.
+// without ever holding back the device's refreshes. A relay that accepted
+// this device's publication and now serves nothing in the slot gets a new
+// KeyPackage, at most once a day.
 // `foundation/key-packages.md`, "A publication the device did not make".
 
 #[derive(Clone, Default)]
@@ -275,5 +277,73 @@ async fn paused_or_withdrawn_slots_ignore_foreign_publications() {
         .await
         .unwrap();
     assert_eq!(outcome, ForeignSlotOutcome::default());
+    assert!(publisher.deletions().is_empty());
+}
+
+#[tokio::test]
+async fn an_emptied_slot_is_refilled_at_most_once_a_day() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("kp emptied slot").unwrap();
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let publisher = DeletingKeyPackages::default();
+    let open = || {
+        slot_runtime(
+            current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+            publisher.clone(),
+            &wall,
+            0,
+            &[KEY_ENDPOINT],
+        )
+    };
+    let mut runtime = open();
+    runtime.publish_fresh_key_package().await.unwrap();
+    let accepted = TransportEndpoint(KEY_ENDPOINT.into());
+    let refill = |runtime: &mut AccountDeviceRuntime<_, _, _>| {
+        runtime
+            .refill_emptied_slot(std::slice::from_ref(&accepted))
+            .unwrap()
+    };
+
+    // A publication less than a day old waits, across a restart too.
+    wall.set(now + DAY - 1);
+    assert!(!refill(&mut runtime));
+    drop(runtime);
+    let mut runtime = open();
+    assert!(!refill(&mut runtime));
+    wall.set(now + DAY);
+
+    // A relay this device never published to, or nothing at all, owes it
+    // nothing.
+    let elsewhere = TransportEndpoint("wss://elsewhere.example".into());
+    assert!(!runtime.refill_emptied_slot(&[elsewhere]).unwrap());
+    assert!(!runtime.refill_emptied_slot(&[]).unwrap());
+    // Paused maintenance publishes nothing, so the next read asks again.
+    runtime.pause_maintenance();
+    assert!(!refill(&mut runtime));
+    runtime.resume_maintenance();
+    assert!(!runtime.key_package_network_maintenance_due().unwrap());
+
+    // A relay that accepted the current publication: a new KeyPackage.
+    assert!(refill(&mut runtime));
+    assert!(runtime.key_package_network_maintenance_due().unwrap());
+    runtime.run_due_maintenance().await.unwrap();
+    let publications = publisher.publications.publications();
+    assert_eq!(publications.len(), 2);
+    assert_ne!(publications[0].key_package, publications[1].key_package);
+    assert_eq!(publications[1].created_at, cgka_traits::Timestamp(now + DAY));
+
+    // Not again within the day, should the relay keep nothing.
+    wall.set(now + 2 * DAY - 1);
+    assert!(!refill(&mut runtime));
+    assert!(!runtime.key_package_network_maintenance_due().unwrap());
+
+    // A replacement on its way fills the slot wherever it lands.
+    wall.set(now + 2 * DAY);
+    runtime
+        .prepare_fresh_key_package(vec![accepted.clone()])
+        .await
+        .unwrap();
+    assert!(!refill(&mut runtime));
     assert!(publisher.deletions().is_empty());
 }

@@ -290,16 +290,22 @@ mod migration_0136_recovery_conversion;
 mod migration_0137_device_renames;
 #[path = "migrations/0138_account_device_history_keys.rs"]
 mod migration_0138_account_device_history_keys;
+#[path = "migrations/0139_app_event_imports.rs"]
+mod migration_0139_app_event_imports;
 #[path = "migrations/0140_private_key_packages.rs"]
 mod migration_0140_private_key_packages;
 #[path = "migrations/0141_sonar_stickers.rs"]
 mod migration_0141_sonar_stickers;
 #[path = "migrations/0142_sticker_asset_history.rs"]
 mod migration_0142_sticker_asset_history;
+#[path = "migrations/0143_device_activity.rs"]
+mod migration_0143_device_activity;
 #[path = "migrations/0144_announced_key_packages.rs"]
 mod migration_0144_announced_key_packages;
 #[path = "migrations/0146_device_removals.rs"]
 mod migration_0146_device_removals;
+#[path = "migrations/0148_compromise_warning.rs"]
+mod migration_0148_compromise_warning;
 #[path = "migrations/0160_sibling_welcomes.rs"]
 mod migration_0160_sibling_welcomes;
 #[path = "migrations/0161_small_state.rs"]
@@ -1154,6 +1160,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0138_account_device_history_keys::apply,
     },
     Migration {
+        version: 139,
+        name: "0139_app_event_imports",
+        suspend_foreign_keys: &[],
+        apply: migration_0139_app_event_imports::apply,
+    },
+    Migration {
         version: 140,
         name: "0140_private_key_packages",
         suspend_foreign_keys: &[],
@@ -1172,6 +1184,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0142_sticker_asset_history::apply,
     },
     Migration {
+        version: 143,
+        name: "0143_device_activity",
+        suspend_foreign_keys: &[],
+        apply: migration_0143_device_activity::apply,
+    },
+    Migration {
         version: 144,
         name: "0144_announced_key_packages",
         suspend_foreign_keys: &[],
@@ -1182,6 +1200,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0146_device_removals",
         suspend_foreign_keys: &[],
         apply: migration_0146_device_removals::apply,
+    },
+    Migration {
+        version: 148,
+        name: "0148_compromise_warning",
+        suspend_foreign_keys: &[],
+        apply: migration_0148_compromise_warning::apply,
     },
     Migration {
         version: 160,

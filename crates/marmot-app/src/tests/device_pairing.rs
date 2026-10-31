@@ -857,6 +857,78 @@ async fn links_again_after_a_failed_link(restart: bool) {
     assert!(laptop.roster(&group).devices.contains_key(&laptop_slot));
 }
 
+/// A slot linked again after a failed link is a new entry with a fresh
+/// rename id (mdk#2628 3.6a). A rename the phone made of its earlier entry,
+/// still kept because the phone settles renames only in a later pass, reads
+/// that id as another rename's: the phone drops its rename rather than make
+/// it again over the label the second link chose. Only the second link's
+/// commit matters here, so the tablet never joins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_linked_again_keeps_its_new_label_over_an_earlier_rename() {
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let slot = choose_link(&relay, &mut phone, &mut tablet).await;
+    tablet.op(DeviceLinkOp::ConfirmMatch).await;
+    tablet.step(&relay).await; // phone's confirm in, tablet's out
+    phone.step(&relay).await; // tablet's confirm in: the link commit
+    let tablet_slot: [u8; 32] = hex::decode(&slot).unwrap().try_into().unwrap();
+    let first = phone.roster(&group).devices[&tablet_slot].rename_id;
+    assert!(
+        first.is_some(),
+        "a linked entry is created with a rename id"
+    );
+
+    let give_up = std::time::Instant::now() + Duration::from_secs(5);
+    while let Err(error) = phone.client.rename_linked_device(&slot, "Kitchen").await {
+        assert!(std::time::Instant::now() < give_up, "{error:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let advanced = phone
+            .client
+            .runtime
+            .advance_convergence(&group)
+            .await
+            .unwrap();
+        phone
+            .client
+            .observe_drained_session_events(&advanced)
+            .await
+            .unwrap();
+    }
+    let renames = |phone: &Device| {
+        phone
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .device_renames()
+            .unwrap()
+    };
+    assert_eq!(renames(&phone).len(), 1);
+
+    // The tablet never makes its first commit, so the phone removes it.
+    phone
+        .client
+        .drive_device_pairing_at(crate::unix_now_seconds() + LINK_DEADLINE_SECS + 1)
+        .await;
+    phone.step(&relay).await;
+    assert!(!phone.roster(&group).devices.contains_key(&tablet_slot));
+    tablet.step(&relay).await; // the Welcome, then its removal
+    assert_eq!(renames(&phone).len(), 1, "no rename pass ran meanwhile");
+
+    // Linked again, as "Laptop" again, by a KeyPackage it has not joined by:
+    // the phone's commit creates the entry anew.
+    published_key_package(&mut tablet.client, &relay).await;
+    assert_eq!(choose_link(&relay, &mut phone, &mut tablet).await, slot);
+    tablet.op(DeviceLinkOp::ConfirmMatch).await;
+    tablet.step(&relay).await; // phone's confirm in, tablet's out
+    phone.step(&relay).await; // tablet's confirm in: the second link commit
+    let again = phone.roster(&group).devices[&tablet_slot].rename_id;
+    assert!(again.is_some() && again != first);
+    phone.client.try_device_rename_upkeep().await.unwrap();
+    assert_eq!(phone.roster(&group).devices[&tablet_slot].label, "Laptop");
+    assert!(renames(&phone).is_empty());
+}
+
 /// Closes `device`'s client and opens it again, as a restart does: pairing
 /// keeps nothing across it.
 async fn reopen(device: Device) -> Device {

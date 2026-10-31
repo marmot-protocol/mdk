@@ -787,10 +787,11 @@ where
         Ok(self.session.admin_pubkeys(group_id)?)
     }
 
-    /// Which roster slot the leaf at `leaf_index` belongs to, read from its
-    /// device tag against the device group's current `roster`. `None` when
-    /// `epoch` is not the group's current epoch or no leaf sits at that
-    /// index. See [`cgka_engine::engine::Engine::member_device_tag_claim`].
+    /// Which roster slot the leaf at `leaf_index` belonged to at `epoch`,
+    /// read from its device tag against the device group's current `roster`.
+    /// A past epoch is read from its own retained anchor. `None` when `epoch`
+    /// is neither current nor retained, or no leaf sat at that index. See
+    /// [`cgka_engine::engine::Engine::member_device_tag_claim`].
     pub fn member_device_tag_claim(
         &self,
         group_id: &GroupId,

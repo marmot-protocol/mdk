@@ -43,6 +43,7 @@ use crate::types::chat_list::{
     MarmotExistingDirectConversation,
 };
 use crate::types::common::{MarmotMessageTag, MarmotStringArray, MarmotStringList};
+use crate::types::compromise_warning::MarmotCompromiseWarningItemList;
 use crate::types::device_link::MarmotDeviceLinkSnapshot;
 use crate::types::directory::MarmotCachedIdentityProjectionList;
 use crate::types::directory::MarmotUserDirectorySearchResultList;
@@ -824,6 +825,32 @@ c_cmd! {
     /// the list after the check. A read that reached no relay fails. Free
     /// with `marmot_unrecognized_sign_in_list_free`.
     async fn marmot_check_sign_ins(account_ref: str) -> rec(MarmotUnrecognizedSignInList) = check_sign_ins;
+
+    /// Start this device without the devices its first check found ("No,
+    /// start fresh"): each sign-in from before this device is answered Not
+    /// now, now and when one is listed later. It rejects nothing and raises
+    /// no warning, so one of those devices can still link this one. Fails
+    /// before the first check and once this device trusts a device group.
+    async fn marmot_start_fresh(account_ref: str) -> unit = start_fresh;
+
+    /// Whether this device started fresh and still has no device group, so
+    /// the host can say that only chats it is invited to from now on are
+    /// here. Always false in release builds until the roster's spec lands.
+    async fn marmot_started_fresh(account_ref: str) -> scalar(bool) = started_fresh;
+
+    /// List the account's open compromise warning on this device: each
+    /// rejection the user has not seen here, the earliest gathered first.
+    /// Empty when no warning is open. The host writes the wording, and never
+    /// says the account's devices stopped whoever holds the key. Always empty
+    /// in release builds until the roster's spec lands. Re-read on the
+    /// `CompromiseWarningChanged` event. Free with
+    /// `marmot_compromise_warning_item_list_free`.
+    async fn marmot_compromise_warning(account_ref: str) -> rec(MarmotCompromiseWarningItemList) = compromise_warning;
+
+    /// Dismiss the compromise warning on this device: everything it gathers
+    /// now is seen here, and it stays closed until something new arrives.
+    /// Other devices' warnings are unchanged.
+    async fn marmot_dismiss_compromise_warning(account_ref: str) -> unit = dismiss_compromise_warning;
 
     /// On a new device: ask a device of this account already signed in to
     /// link this one. Refused in release builds until the pairing and

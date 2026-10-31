@@ -37,7 +37,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and gossip, with announces and join windows in `push/announce.rs`, repair replies in `push/repair.rs`, and
   notification-trigger publishing),
   `retention.rs` (the engine-owned retention sweep policy, the
-  storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `history_notices.rs` ("history may be incomplete"
+  storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `chat_history.rs` (a
+  chat's history exported as sealed bundles and a sibling's bundle imported, never for a device group), `history_notices.rs` ("history may be incomplete"
   notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
   in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
@@ -102,8 +103,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   id next to the label and is kept on disk before its commit is sent. Maintenance reads only the rename id the winning
   roster holds (D37): one the rename wrote means applied, one its renames replaced means lost with nothing renamed
   since (made again with a fresh id), any other means another rename stands. Never infer a rename's fate from labels
-  or commit ids. Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots`
-  instead, never as device entries.
+  or commit ids. Every entry is created with a fresh rename id (`fresh_rename_id`: the creator's founding entry, the
+  founding Add's and every later link's), so a kept id shows up again only when a fork brings back an earlier state.
+  Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots` instead, never as
+  device entries.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
   `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this
@@ -131,12 +134,32 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `unrecognized_sign_ins`. A check or answer that changes it, and every roster change (`note_device_roster_changed`),
   sets `unrecognized_sign_ins_changed`, drained at the device-group seams into one payload-free
   `UnrecognizedSignInsChanged`; every client opens with it set.
+  Start fresh (D54, `start_fresh`) answers every before-this-device sign-in Not now, including baseline slots listed
+  later (storage writes them as `not_now` while `started_fresh_at` is set); it never rejects and never warns.
 - The own-slot check (mdk#2628 3.4, `src/client/sign_ins.rs`) rides 3.2's read: `read_account_key_package_slots` also
   reads this device's slot by `d` from every relay (`OwnSlotRead`), keeping each relay's current publication there by
   NIP-01's rule, valid or not. One whose event id is none of this device's current, pending or retained events is
   foreign (`OwnSlotForeign`); an older event of its own is a lagging relay, which fanout retry owns. `check_sign_ins`
   hands foreign ones to `replace_foreign_slot_publications`, which publishes a newer KeyPackage or, for one dated past
-  the skew window, asks the relays to delete it by id (D63). An incomplete own-slot read is retried within the hour.
+  the skew window, asks the relays to delete it by id (D63). It also hands over each relay whose own read finished and
+  returned nothing in the slot (`OwnSlotRead::empty`), named as the lifecycle's publication targets name it, to
+  `refill_emptied_slot`, which publishes a new KeyPackage when one accepted the current publication, while this
+  device's trusted roster, if it has one, lists it as a device (`listed_as_device`). A failed or unfinished read never
+  shows a relay empty. An incomplete own-slot read is retried within the hour.
+- The compromise warning (`src/client/compromise_warning.rs`, mdk#2628 3.7a, D53) is storage's
+  (`account_compromise_warning_items`): every `not_me` slot and rejected KeyPackage in the trusted roster, plus this
+  device's own rejected sign-ins, gathered with insert-or-ignore so a seen mark survives branch selection dropping and
+  restoring an item. Never gather `removed` slots. Gathering is lazy: a roster change (`note_device_roster_changed`)
+  or a Reject answer sets `compromise_warning_gather_due`, and the next host read or publication seam gathers once.
+  The first roster this device trusts from a device group goes in seen (D68: the user saw those on the devices that
+  were there); its own rejections still warn. Storage takes that roster in the same transaction that makes the group
+  trusted, so every trust site goes through `AppClient::trust_device_group` (storage refuses any other move into a
+  trusted state): Creating to Created passes no roster rejections (a founding roster holds only the founder's), and
+  AwaitingWelcome to Linked passes the roster the engine holds. Only a group trusted before migration 0148 takes its
+  first gather instead. Dismiss is per
+  device. An unseen rejected sign-in that neither this device nor the roster holds leaves the warning (a link ended
+  it, or a branch dropped it); a seen one stays seen. Keep `CompromiseWarningReason` exhaustive so each binding maps a new reason
+  explicitly; the stored reason is text with no CHECK, and an unknown one is skipped on read.
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
   `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in `observe_device_group_event`
   (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
@@ -169,6 +192,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.
+- Heartbeats (mdk#2628 item 3.6, D35) live in `src/client/device_heartbeats.rs`. Send one only from the trusted
+  device group, once this device's own leaf reads as its slot, at most once an hour. Record the sent time only once the
+  send returns that it went out (published, unresolved or queued), and leave the record alone when it reached no one
+  or failed, so a crash mid-send costs at most one extra heartbeat, never an hour's silence. Count one only when the sending leaf's tag reads as a
+  sibling in the tree this device holds when it reads it (one from an earlier epoch counts for no device), never read
+  its content, and date it `min(created_at, now)`. Judge `inactive` locally for the Devices screen; never write the
+  roster's `inactive` status from it.
 - Keep device pairing (mdk#2628 item 3.3b) in `src/client/device_pairing.rs` (host DTOs) and
   `src/client/device_pairing/live.rs` (behind `unreleased-device-pairing`, and inert unless
   `MarmotAppConfig::dev_device_groups` is set). The Welcome peeler opens each gift wrap to the account once and hands
@@ -717,7 +747,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `user_blocks.rs` (block policy and NIP-51 sync), `moderation_reports.rs` (private NIP-59-wrapped NIP-56 reports
   to the deployment operator: config validation, staged outbox, retry, purge; tests in
   `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
-  `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
+  `history_bundle.rs` (the history bundle's encoding, filling in chat order and sealing; tests in
+  `history_bundle/tests.rs`), `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
   `nostr_verification.rs` (stateless public-event verification), `relay_caps.rs` (each relay's NIP-11
   `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `profile_pseudonyms.rs` (cosmetic display names; not a

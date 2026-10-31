@@ -1,6 +1,7 @@
 //! The device groups this device knows of, and how it came to know each
 //! (mdk#2628 item 3.1). See migration 0125 for the states.
 
+use crate::app::compromise_warning::{FirstTrustedRoster, record_first_trusted_roster};
 use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -106,6 +107,7 @@ impl SqliteAppStorage {
     /// the account's device group, unless another row already does. An
     /// account has one device group. Returns whether the row was inserted.
     pub fn insert_device_group(&self, record: &DeviceGroupRecord) -> StorageResult<bool> {
+        check_untrusted_target(record.trust)?;
         check_ref(record.trust, record.key_package_ref_hex.as_deref())?;
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
@@ -140,7 +142,8 @@ impl SqliteAppStorage {
     /// Move the group's row from `from` to `to`, keeping its
     /// `KeyPackageRef` unless `key_package_ref_hex` names one. Moving an
     /// untrusted row to a claiming state fails if another row claims the
-    /// account. Returns whether the row moved.
+    /// account. Returns whether the row moved. A move into a trusted state
+    /// goes through [`Self::trust_device_group`].
     pub fn set_device_group_trust(
         &self,
         group_id_hex: &str,
@@ -149,48 +152,56 @@ impl SqliteAppStorage {
         key_package_ref_hex: Option<&str>,
         recorded_at: u64,
     ) -> StorageResult<bool> {
+        check_untrusted_target(to)?;
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        let current: Option<Option<String>> = tx
-            .query_row_cached(
-                "SELECT key_package_ref_hex FROM device_groups
-                 WHERE group_id_hex = ?1 AND trust = ?2",
-                params![group_id_hex, from.as_str()],
-                |row| row.get(0),
-            )
-            .optional()
-            .storage()?;
-        let Some(current_ref) = current else {
-            return Ok(false);
-        };
-        let next_ref = key_package_ref_hex.map(str::to_owned).or(current_ref);
-        check_ref(to, next_ref.as_deref())?;
-        if to.claims_account() && !from.claims_account() {
-            let claimed: bool = tx
-                .query_row_cached(
-                    &format!("SELECT EXISTS(SELECT 1 FROM device_groups WHERE {CLAIMING})"),
-                    [],
-                    |row| row.get(0),
-                )
-                .storage()?;
-            if claimed {
-                return Ok(false);
-            }
-        }
-        tx.execute_cached(
-            "UPDATE device_groups
-             SET trust = ?2, key_package_ref_hex = ?3, recorded_at = ?4
-             WHERE group_id_hex = ?1",
-            params![
-                group_id_hex,
-                to.as_str(),
-                next_ref,
-                u64_to_i64(recorded_at)?
-            ],
-        )
-        .storage()?;
+        let moved = move_trust(
+            &tx,
+            group_id_hex,
+            from,
+            to,
+            key_package_ref_hex,
+            recorded_at,
+        )?;
         tx.commit().storage()?;
-        Ok(true)
+        Ok(moved)
+    }
+
+    /// Move the group's row from `from` into the trusted state `to`, as
+    /// [`Self::set_device_group_trust`] does, and in the same transaction
+    /// take `first` as the roster this device first trusts: the compromise
+    /// warning counts its rejections as seen and this device's own as unseen
+    /// (mdk#2628 3.7a, D68). Returns `None` if the row did not move, otherwise
+    /// whether the open warning changed.
+    pub fn trust_device_group(
+        &self,
+        group_id_hex: &str,
+        from: DeviceGroupTrust,
+        to: DeviceGroupTrust,
+        key_package_ref_hex: Option<&str>,
+        recorded_at: u64,
+        first: &FirstTrustedRoster<'_>,
+    ) -> StorageResult<Option<bool>> {
+        if !to.is_trusted() {
+            return Err(StorageError::Backend(
+                "trust_device_group moves only into a trusted state".into(),
+            ));
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        if !move_trust(
+            &tx,
+            group_id_hex,
+            from,
+            to,
+            key_package_ref_hex,
+            recorded_at,
+        )? {
+            return Ok(None);
+        }
+        let changed = record_first_trusted_roster(&tx, group_id_hex, first)?;
+        tx.commit().storage()?;
+        Ok(Some(changed))
     }
 
     /// Delete the group's row if it is in `trust`. Returns whether it went.
@@ -227,6 +238,69 @@ fn device_group_record(
     })
 }
 
+/// Move the group's row from `from` to `to` in `tx`. Returns whether it
+/// moved.
+fn move_trust(
+    tx: &rusqlite::Transaction<'_>,
+    group_id_hex: &str,
+    from: DeviceGroupTrust,
+    to: DeviceGroupTrust,
+    key_package_ref_hex: Option<&str>,
+    recorded_at: u64,
+) -> StorageResult<bool> {
+    let current: Option<Option<String>> = tx
+        .query_row_cached(
+            "SELECT key_package_ref_hex FROM device_groups
+             WHERE group_id_hex = ?1 AND trust = ?2",
+            params![group_id_hex, from.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .storage()?;
+    let Some(current_ref) = current else {
+        return Ok(false);
+    };
+    let next_ref = key_package_ref_hex.map(str::to_owned).or(current_ref);
+    check_ref(to, next_ref.as_deref())?;
+    if to.claims_account() && !from.claims_account() {
+        let claimed: bool = tx
+            .query_row_cached(
+                &format!("SELECT EXISTS(SELECT 1 FROM device_groups WHERE {CLAIMING})"),
+                [],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if claimed {
+            return Ok(false);
+        }
+    }
+    tx.execute_cached(
+        "UPDATE device_groups
+         SET trust = ?2, key_package_ref_hex = ?3, recorded_at = ?4
+         WHERE group_id_hex = ?1",
+        params![
+            group_id_hex,
+            to.as_str(),
+            next_ref,
+            u64_to_i64(recorded_at)?
+        ],
+    )
+    .storage()?;
+    Ok(true)
+}
+
+/// Refuse a trusted state: only [`SqliteAppStorage::trust_device_group`]
+/// moves a row there, with the roster the compromise warning takes as this
+/// device's first.
+fn check_untrusted_target(trust: DeviceGroupTrust) -> StorageResult<()> {
+    if trust.is_trusted() {
+        return Err(StorageError::Backend(
+            "a device group becomes trusted only through trust_device_group".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn check_ref(trust: DeviceGroupTrust, key_package_ref_hex: Option<&str>) -> StorageResult<()> {
     if (trust == DeviceGroupTrust::Untrusted) != key_package_ref_hex.is_none() {
         return Err(StorageError::Backend(
@@ -241,6 +315,12 @@ mod tests {
     use super::*;
     use crate::SqliteAccountStorage;
     use DeviceGroupTrust::*;
+
+    const NO_ROSTER: FirstTrustedRoster<'static> = FirstTrustedRoster {
+        own: &[],
+        roster: &[],
+        now: 2,
+    };
 
     fn record(group: &str, trust: DeviceGroupTrust) -> DeviceGroupRecord {
         DeviceGroupRecord {
@@ -264,16 +344,18 @@ mod tests {
         assert!(store.insert_device_group(&record("bb", Untrusted)).unwrap());
         // An untrusted group cannot become the account's while another
         // claims it.
-        assert!(
-            !store
-                .set_device_group_trust("bb", Untrusted, Linked, Some("cd"), 2)
-                .unwrap()
+        assert_eq!(
+            store
+                .trust_device_group("bb", Untrusted, Linked, Some("cd"), 2, &NO_ROSTER)
+                .unwrap(),
+            None
         );
         assert!(store.delete_device_group("aa", Creating).unwrap());
-        assert!(
+        assert_eq!(
             store
-                .set_device_group_trust("bb", Untrusted, Linked, Some("cd"), 2)
-                .unwrap()
+                .trust_device_group("bb", Untrusted, Linked, Some("cd"), 2, &NO_ROSTER)
+                .unwrap(),
+            Some(false)
         );
         assert_eq!(
             store.device_group("bb").unwrap().unwrap(),
@@ -290,15 +372,17 @@ mod tests {
     fn trust_moves_only_from_the_expected_state() {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         assert!(store.insert_device_group(&record("aa", Creating)).unwrap());
-        assert!(
-            !store
-                .set_device_group_trust("aa", AwaitingWelcome, Linked, None, 2)
-                .unwrap()
-        );
-        assert!(
+        assert_eq!(
             store
-                .set_device_group_trust("aa", Creating, Created, None, 2)
-                .unwrap()
+                .trust_device_group("aa", AwaitingWelcome, Linked, None, 2, &NO_ROSTER)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .trust_device_group("aa", Creating, Created, None, 2, &NO_ROSTER)
+                .unwrap(),
+            Some(false)
         );
         assert!(!store.delete_device_group("aa", Creating).unwrap());
         let held = store.device_group("aa").unwrap().unwrap();
@@ -308,10 +392,45 @@ mod tests {
         assert_eq!(store.device_groups().unwrap(), vec![held]);
     }
 
+    /// Only `trust_device_group` makes a row trusted, so the compromise
+    /// warning's first roster is always written with it; it moves into
+    /// nothing else.
+    #[test]
+    fn a_group_becomes_trusted_only_through_the_trust_write() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        assert!(store.insert_device_group(&record("aa", Created)).is_err());
+        assert!(store.insert_device_group(&record("aa", Linked)).is_err());
+        assert!(store.insert_device_group(&record("aa", Creating)).unwrap());
+        assert!(
+            store
+                .set_device_group_trust("aa", Creating, Created, None, 2)
+                .is_err()
+        );
+        assert!(
+            store
+                .trust_device_group("aa", Creating, Untrusted, None, 2, &NO_ROSTER)
+                .is_err()
+        );
+        assert_eq!(store.device_group("aa").unwrap().unwrap().trust, Creating);
+        // The way back is a plain move.
+        assert_eq!(
+            store
+                .trust_device_group("aa", Creating, Created, None, 2, &NO_ROSTER)
+                .unwrap(),
+            Some(false)
+        );
+        assert!(
+            store
+                .set_device_group_trust("aa", Created, Creating, None, 3)
+                .unwrap()
+        );
+        assert_eq!(store.device_group("aa").unwrap().unwrap().trust, Creating);
+    }
+
     #[test]
     fn only_an_untrusted_group_has_no_confirmed_key_package() {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-        let mut missing = record("aa", Created);
+        let mut missing = record("aa", Creating);
         missing.key_package_ref_hex = None;
         assert!(store.insert_device_group(&missing).is_err());
         let mut named = record("aa", Untrusted);
