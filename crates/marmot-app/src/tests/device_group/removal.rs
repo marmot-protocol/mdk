@@ -974,21 +974,13 @@ async fn removal_arriving_live(fail_unlink_mark: bool) {
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
 
-    // The laptop's own startup work may still be publishing; the removal
-    // arrives once that is done.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let mut seen = relay.attempted_events().len();
-        loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let now = relay.attempted_events().len();
-            if now == seen {
-                break;
-            }
-            seen = now;
-        }
-    })
-    .await
-    .expect("the laptop's startup work settles");
+    // The worker starts with a maintenance pass, whose sends (small state, a
+    // private KeyPackage hand-off, a heartbeat) can land after a quiet spell
+    // on a loaded machine. The worker takes one turn at a time and commands
+    // first, so a pass run as a command either waits for that one or goes
+    // before it and leaves it nothing owed: the removal arrives once the
+    // laptop has nothing more to send.
+    runtime.run_due_maintenance("alice").await.unwrap();
     let removal_start = published_count(&relay);
     phone.remove_linked_device(&slot).await.unwrap();
     drop(phone);
