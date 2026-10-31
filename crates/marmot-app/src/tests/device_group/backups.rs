@@ -358,6 +358,70 @@ async fn a_sibling_turning_off_a_founded_key_stands() {
     settings(OFF, &mut phone);
 }
 
+/// A creation whose trust write failed leaves its row `creating` and the
+/// kept key in place, though the roster it founded already carries that
+/// key. Confirming new words, or turning backups off, settles that creation
+/// first and changes the roster, never only the kept key that trusting the
+/// group then forgets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unsettled_creation_is_settled_before_backups_change() {
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        mut laptop,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    let founded_key = confirm_new_words(&mut phone).await;
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    let mut cursor = 0;
+    deliver_new(&mut laptop, &relay, &mut cursor).await;
+    laptop.sync().await.unwrap();
+    let mut cursors = (cursor, cursor);
+    exchange(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;
+    let as_if_trust_failed = |phone: &AppClient, key: &[u8]| {
+        let storage = phone
+            .app
+            .account_storage(&phone.state.label)
+            .unwrap()
+            .app_storage();
+        assert!(
+            storage
+                .set_device_group_trust(
+                    &hex::encode(group.as_slice()),
+                    DeviceGroupTrust::Created,
+                    DeviceGroupTrust::Creating,
+                    None,
+                    1,
+                )
+                .unwrap()
+        );
+        storage.keep_recovery_key(key).unwrap();
+    };
+
+    as_if_trust_failed(&phone, &founded_key);
+    let new_key = confirm_new_words(&mut phone).await;
+    assert_eq!(kept(&phone), None);
+    assert_eq!(
+        account_entry(&phone, &group).recovery_public_key,
+        Some(new_key.clone())
+    );
+    exchange(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;
+
+    as_if_trust_failed(&phone, &new_key);
+    phone.turn_off_backups().await.unwrap();
+    assert_eq!(kept(&phone), None);
+    exchange(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;
+    for device in [&phone, &laptop] {
+        assert_eq!(account_entry(device, &group), AccountEntryV1::default());
+    }
+    settings(OFF, &mut phone);
+}
+
 /// A device that kept a key without a device group and then joins one
 /// leaves the group's backups as they are, since its roster cannot tell
 /// backups turned off from backups never on: nothing is sent, and trusting

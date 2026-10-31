@@ -112,7 +112,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   A device that trusts no device group keeps only the key's public half (`backup_recovery_key`), and
   `create_device_group` founds the roster with it and this device writing; trusting any device group, founded or
   joined, forgets it in the trust write (`trust_device_group`), so a device that joins one leaves the group's backups
-  as they are. In a device group, write the roster's account entry only through the runtime's
+  as they are. Confirm and turn-off settle an unsettled creation first (`reconcile_device_groups`), so a creation whose
+  trust write failed takes the change in its roster rather than in the kept key. In a device group, write the roster's account entry only through the runtime's
   `edit_roster_account_entry` (`ReplaceAccountEntry`, a compare-and-set over the entry this device read), and only
   while the device group takes a commit from this device. That gate stays closed while a re-issue is owed, so neither
   action answers "nothing to send" while a change of this device's may still land. Never send a backup change again

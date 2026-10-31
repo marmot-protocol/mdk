@@ -181,6 +181,11 @@ impl AppClient {
         let public_key = self.runtime.recovery_public_key(&pending.entropy)?;
         self.sync_runtime_groups_for_send("confirm_recovery_words")
             .await?;
+        // A creation whose trust write failed still claims the account, and
+        // the roster it founded already carries the kept key: settle it
+        // first, so the change reaches that roster, not a kept key that
+        // trusting the group forgets.
+        self.reconcile_device_groups()?;
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             // No device group: the key is this device's to keep, and the
             // roster it founds carries it.
@@ -216,6 +221,8 @@ impl AppClient {
         }
         self.sync_runtime_groups_for_send("turn_off_backups")
             .await?;
+        // As in `confirm_recovery_words`.
+        self.reconcile_device_groups()?;
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             self.app
                 .account_storage(&self.state.label)?
