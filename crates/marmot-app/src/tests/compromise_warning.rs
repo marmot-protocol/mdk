@@ -284,6 +284,7 @@ async fn a_rejected_key_package_warns_and_a_removed_slot_does_not() {
                 key_package_ref.clone(),
                 RejectedKeyPackageV1 {
                     slot: key_package_slot,
+                    leaf_signature_key: vec![0x07; 32],
                     rejected_at,
                 },
             ),

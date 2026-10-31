@@ -91,7 +91,13 @@ only telemetry, a closed operation and timing metadata, never a client or storag
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
-| `cgka_announced_key_packages` | One row per (group, slot, KeyPackageRef) a device-group roster this device applied announced, so it grows only with commits that change an announcement; at most 16 per group slot (`ANNOUNCED_KEY_PACKAGES_PER_SLOT`). | A repeat sighting renews a row. Every write prunes rows last seen more than 30 days ago (`ANNOUNCED_KEY_PACKAGE_RETENTION_SECS`) and each slot's rows past its 16 most recently seen. Deleting the group cascades. A branch-selection rewind keeps them: they sit outside snapshots on purpose. |
+| `cgka_announced_key_packages` | One row per (group, slot, KeyPackageRef) a device-group roster this device applied announced, so it grows only with roster commits by the account's own devices that change an announcement; no count cap, since evicting by count would drop the oldest announcements, the ones a rejection must still respect. | A repeat sighting renews a row. Every write prunes rows last seen more than 7,261,200 seconds ago, the longest a KeyPackage can be valid (`ANNOUNCED_KEY_PACKAGE_RETENTION_SECS`). Deleting the group cascades. A branch-selection rewind keeps them: they sit outside snapshots on purpose. |
+
+### `marmot-session` KeyPackages this device made (`cgka-traits` `KeyPackageLifecycleState::made_key_packages`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `made_key_packages` | One `KeyPackageRef` per KeyPackage this device published to its slot and has deleted the private material of, each kept once, so it grows only with this device's own publications (a refresh about once a week, and a replacement each time maintenance finds one due). | None while the device keeps the slot: the spec keeps them that long (`features/device-group.md`, "A KeyPackage the roster does not announce"), so a copy of any of them is never rejected. A new slot starts with none. |
 
 ### `storage-sqlite` compromise warning (`src/app/compromise_warning.rs`)
 

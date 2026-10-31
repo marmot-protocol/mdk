@@ -577,7 +577,7 @@ async fn a_rejection_before_any_device_group_founds_the_roster() {
     let mut laptop = account.open(1).await;
     let laptop_key_package = published_key_package(&mut laptop, relay).await;
     let mut tablet = account.open(2).await;
-    published_key_package(&mut tablet, relay).await;
+    let tablet_key_package = published_key_package(&mut tablet, relay).await;
     phone.check_sign_ins().await.unwrap();
     let tablet_slot = own_slot(&tablet);
     phone
@@ -614,8 +614,25 @@ async fn a_rejection_before_any_device_group_founds_the_roster() {
         RejectedSlotReasonV1::NotMe
     );
     assert_eq!(roster.rejected_slots.len(), 1);
-    // The slot alone: its KeyPackage could be a copy of a real device's.
-    assert!(roster.rejected_key_packages.is_empty(), "{roster:?}");
+    // The complete check after the answer found the tablet's KeyPackage in
+    // that slot and in no other, so this device rejected it too (D59).
+    let tablet_metadata = marmot_session::key_package_metadata(&tablet_key_package).unwrap();
+    assert_eq!(
+        roster
+            .rejected_key_packages
+            .iter()
+            .map(|(key_package_ref, record)| (
+                hex::encode(key_package_ref),
+                record.slot,
+                record.leaf_signature_key.clone()
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            tablet_metadata.key_package_ref_hex,
+            tablet_slot_id,
+            tablet_metadata.leaf_signature_key
+        )]
+    );
     assert_eq!(roster.devices.len(), 2);
 
     let before = relay.published_events.lock().unwrap().len();
@@ -1272,7 +1289,8 @@ pub(super) fn published_at(client: &AppClient) -> u64 {
 /// A publication in this device's own slot that it did not make, valid or
 /// not, is replaced by a newer KeyPackage of its own, even with no device
 /// group: `foundation/key-packages.md`, "A publication the device did not
-/// make" (mdk#2628 3.4).
+/// make" (mdk#2628 3.4). One that holds no valid KeyPackage is not rejected
+/// (3.7b): there is nothing to name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_foreign_publication_in_its_own_slot_is_replaced() {
     let account = Account::new(1, true);
@@ -1287,6 +1305,16 @@ async fn a_foreign_publication_in_its_own_slot_is_replaced() {
     assert!(report.foreign.replacing);
     assert!(report.own_slot_complete);
     assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
+    assert!(
+        phone
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .kept_rejected_key_packages()
+            .unwrap()
+            .is_empty()
+    );
     phone.run_due_maintenance().await.unwrap();
     assert!(published_at(&phone) > forged_at);
 

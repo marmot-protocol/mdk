@@ -23,6 +23,7 @@ mod chat_kinds;
 mod devices;
 mod heartbeats;
 mod history;
+mod key_package_rejections;
 mod private_key_packages;
 mod removal;
 
@@ -2329,7 +2330,8 @@ async fn an_open_names_the_device_group_to_tag_from_once_it_is_hydrated() {
 /// roster does not keep every device the account ever removed. Any device
 /// drops it, in one commit, once the device group can take a commit from it.
 /// A younger record and every `not_me` record stay, and once the expired one
-/// is gone, maintenance owes the roster nothing.
+/// is gone, maintenance owes the roster nothing. A rejected KeyPackage goes
+/// 30 days after its `rejected_at` too, in the same commit (3.7b).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removed_device_record_is_dropped_after_30_days() {
     let (
@@ -2349,6 +2351,12 @@ async fn a_removed_device_record_is_dropped_after_30_days() {
         tag_signature_key,
     };
     let (expired, young, not_me) = ([7; 32], [8; 32], [9; 32]);
+    let rejected_key_package =
+        |slot, days_ago: u64| cgka_traits::app_components::RejectedKeyPackageV1 {
+            slot,
+            leaf_signature_key: vec![9; 32],
+            rejected_at: now - days_ago * 24 * 60 * 60,
+        };
     let update = encode_device_roster_update_v1(
         &DeviceRosterUpdateV1::new(vec![
             DeviceRosterOperationV1::SetRejectedSlot(
@@ -2362,6 +2370,14 @@ async fn a_removed_device_record_is_dropped_after_30_days() {
             DeviceRosterOperationV1::SetRejectedSlot(
                 not_me,
                 rejected(RejectedSlotReasonV1::NotMe, 31, None),
+            ),
+            DeviceRosterOperationV1::SetRejectedKeyPackage(
+                vec![0x31; 32],
+                rejected_key_package(not_me, 31),
+            ),
+            DeviceRosterOperationV1::SetRejectedKeyPackage(
+                vec![0x29; 32],
+                rejected_key_package(not_me, 29),
             ),
         ])
         .unwrap(),
@@ -2395,6 +2411,7 @@ async fn a_removed_device_record_is_dropped_after_30_days() {
         .unwrap();
     assert!(published_kinds(&relay, phone_cursor).is_empty());
     assert_eq!(roster(&laptop, &group).rejected_slots.len(), 3);
+    assert_eq!(roster(&laptop, &group).rejected_key_packages.len(), 2);
 
     laptop.run_due_maintenance().await.unwrap();
     assert_eq!(
@@ -2404,8 +2421,11 @@ async fn a_removed_device_record_is_dropped_after_30_days() {
     deliver_new(&mut phone, &relay, &mut phone_cursor).await;
     phone.sync().await.unwrap();
     for client in [&phone, &laptop] {
-        let kept: Vec<_> = roster(client, &group).rejected_slots.into_keys().collect();
+        let roster = roster(client, &group);
+        let kept: Vec<_> = roster.rejected_slots.into_keys().collect();
         assert_eq!(kept, vec![young, not_me]);
+        let kept: Vec<_> = roster.rejected_key_packages.into_keys().collect();
+        assert_eq!(kept, vec![vec![0x29; 32]]);
     }
 
     let before = relay.published_events.lock().unwrap().len();

@@ -36,26 +36,13 @@ impl AnnouncedKeyPackageStorage for SqliteAccountStorage {
         Ok(())
     }
 
-    fn prune_announced_key_packages(&self, before: u64, per_slot: usize) -> StorageResult<()> {
-        let conn = self.lock()?;
-        conn.execute_cached(
-            "DELETE FROM cgka_announced_key_packages WHERE last_seen_at < ?1",
-            params![u64_to_i64(before)?],
-        )
-        .storage()?;
-        conn.execute_cached(
-            "DELETE FROM cgka_announced_key_packages WHERE rowid IN (
-                 SELECT rowid FROM (
-                     SELECT rowid, ROW_NUMBER() OVER (
-                         PARTITION BY group_id, slot
-                         ORDER BY last_seen_at DESC, rowid DESC
-                     ) AS newest
-                     FROM cgka_announced_key_packages
-                 ) WHERE newest > ?1
-             )",
-            params![u64_to_i64(per_slot as u64)?],
-        )
-        .storage()?;
+    fn prune_announced_key_packages(&self, before: u64) -> StorageResult<()> {
+        self.lock()?
+            .execute_cached(
+                "DELETE FROM cgka_announced_key_packages WHERE last_seen_at < ?1",
+                params![u64_to_i64(before)?],
+            )
+            .storage()?;
         Ok(())
     }
 
@@ -150,33 +137,27 @@ mod tests {
         );
     }
 
+    /// Pruning goes by time alone: however many a slot announced, each stays
+    /// until it was last seen before the bound.
     #[test]
-    fn pruning_drops_old_announcements_and_keeps_each_slots_newest() {
+    fn pruning_drops_only_old_announcements() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store.put_group(&sample_group(gid(1), 0, 1)).unwrap();
-        for reference in 1..=4 {
+        for reference in 1..=40 {
             store
                 .record_announced_key_packages(
                     &gid(1),
-                    &[announced(1, reference), announced(2, 10 + reference)],
+                    &[announced(1, reference)],
                     u64::from(reference) * 100,
                 )
                 .unwrap();
         }
-        store.prune_announced_key_packages(200, 2).unwrap();
+        store.prune_announced_key_packages(200).unwrap();
         assert_eq!(
             store.announced_key_packages(&gid(1), 0).unwrap(),
-            vec![
-                announced(1, 3),
-                announced(1, 4),
-                announced(2, 13),
-                announced(2, 14)
-            ]
-        );
-        store.prune_announced_key_packages(400, 2).unwrap();
-        assert_eq!(
-            store.announced_key_packages(&gid(1), 0).unwrap(),
-            vec![announced(1, 4), announced(2, 14)]
+            (2..=40)
+                .map(|reference| announced(1, reference))
+                .collect::<Vec<_>>()
         );
     }
 

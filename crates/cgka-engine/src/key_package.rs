@@ -542,7 +542,7 @@ impl<S: StorageProvider> Engine<S> {
 /// Which roster slot `kp`'s leaf belongs to, as its device tag says
 /// ([`crate::device_tag::device_tag_claim`]). Tags are read only on the
 /// reader's own account's leaves; the caller checks that first.
-pub(crate) fn key_package_device_tag_claim(
+pub fn key_package_device_tag_claim(
     kp: &KeyPackage,
     roster: &cgka_traits::app_components::DeviceRosterV1,
 ) -> Result<cgka_traits::app_components::DeviceTagClaim, EngineError> {

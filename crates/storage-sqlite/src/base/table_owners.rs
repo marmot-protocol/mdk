@@ -83,6 +83,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("account_recovery_unit_fences", Side::App),
     ("account_recovery_unit_spans", Side::App),
     ("account_recovery_units", Side::App),
+    ("account_rejected_key_packages", Side::App),
     ("account_sign_in_baseline", Side::App),
     ("account_sign_in_baseline_slots", Side::App),
     ("account_sign_ins", Side::App),

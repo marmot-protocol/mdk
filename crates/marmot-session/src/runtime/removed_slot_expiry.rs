@@ -1,10 +1,12 @@
-//! Dropping old `removed` slot records (mdk#2628 item 3.1d).
+//! Dropping old `removed` slot records (mdk#2628 item 3.1d) and rejected
+//! KeyPackages (3.7b).
 //!
 //! A `removed` record keeps a removed device's tag signature key, so the
 //! account's devices still recognize its tags. A device drops the record once
 //! 30 days have passed since its `rejected_at`, by this device's own clock
 //! (device-roster-v1.md), so the roster does not keep every device the
-//! account ever removed. `not_me` records stay. Maintenance makes the update
+//! account ever removed. `not_me` records stay. A rejected KeyPackage is
+//! dropped the same way, in the same update. Maintenance makes the update
 //! after its KeyPackage steps, under the same gate as the runtime's other
 //! roster updates.
 
@@ -77,6 +79,9 @@ where
                         .is_some_and(|expires_at| expires_at <= now)
             })
             .map(|(slot, _)| DeviceRosterOperationV1::RemoveRejectedSlot(*slot))
+            .chain(super::key_package_rejection::expired_rejected_key_packages(
+                &roster, now,
+            ))
             .collect();
         if expired.is_empty() || !self.device_group_takes_commit(&group_id, held)? {
             return Ok(AccountDeviceEffects::default());
@@ -85,7 +90,7 @@ where
             target: TRACE_TARGET,
             method = "drop_expired_removed_slots",
             record_count = expired.len(),
-            "dropping expired removed-device records from the device group"
+            "dropping expired removed-device and rejected key package records from the device group"
         );
         self.send_device_roster_update(group_id, expired, None)
             .await

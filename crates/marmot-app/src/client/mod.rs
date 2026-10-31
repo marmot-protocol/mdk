@@ -84,6 +84,7 @@ mod device_renames;
 pub(crate) mod epoch_stall;
 pub(crate) mod history_notices;
 mod invite_recovery;
+pub(crate) mod key_package_rejections;
 mod private_key_packages;
 mod projection;
 mod push;

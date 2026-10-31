@@ -1569,6 +1569,7 @@ async fn account_records_report_a_closed_store_as_the_engine_storage_failure() {
         last_consumed_key_package_ref: None,
         last_consumed_at: None,
         retained_private_material: Vec::new(),
+        made_key_packages: Vec::new(),
         pending_replacement: None,
         unusable_artifact_replaced_by: None,
         slot_withdrawn_at: None,

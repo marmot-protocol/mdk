@@ -747,6 +747,9 @@ pub struct AccountKeyPackageSlots {
     /// inviter's rules, fresh or not: the slots still signed in. Freshness
     /// is a publication time, so it never signs a slot out.
     pub current_slots: BTreeSet<String>,
+    /// The KeyPackage each of [`Self::current_slots`] serves, fresh or not
+    /// (mdk#2628 item 3.7b): what a check may reject.
+    pub current_key_packages: Vec<CurrentKeyPackage>,
     /// The `d` of every KeyPackage publication of the account the read
     /// returned, whether or not it counts: which slots exist, whatever their
     /// publications' times.
@@ -786,6 +789,18 @@ pub struct SlotPublication {
     /// Lowercase hex event id.
     pub event_id: String,
     pub created_at: u64,
+    /// The KeyPackage it holds, when it holds a valid one of the account
+    /// with the current profile (mdk#2628 item 3.7b).
+    pub key_package: Option<CurrentKeyPackage>,
+}
+
+/// A valid KeyPackage of the account that a slot serves, with what a
+/// rejected KeyPackage records of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CurrentKeyPackage {
+    pub fetched: FetchedKeyPackage,
+    /// Its LeafNode's signature key.
+    pub leaf_signature_key: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -822,6 +837,14 @@ pub fn account_key_package_slots_from_records(
         .map(|candidate| candidate.fetched.key_package_id.clone())
         .filter(|slot| !slot.is_empty())
         .collect();
+    let current_key_packages = candidates
+        .iter()
+        .filter(|candidate| !candidate.fetched.key_package_id.is_empty())
+        .map(|candidate| CurrentKeyPackage {
+            fetched: candidate.fetched.clone(),
+            leaf_signature_key: candidate.signature_key.clone(),
+        })
+        .collect();
     let key_packages = candidates
         .into_iter()
         .map(|candidate| candidate.fetched)
@@ -847,6 +870,7 @@ pub fn account_key_package_slots_from_records(
     AccountKeyPackageSlots {
         key_packages,
         current_slots,
+        current_key_packages,
         returned_slots,
         complete,
         reached,
@@ -860,27 +884,37 @@ fn current_slot_publications(
     slot: &str,
     records: &[RelayEventRecord],
 ) -> Vec<SlotPublication> {
-    let mut newest_by_relay = std::collections::BTreeMap::<&str, &NostrTransportEvent>::new();
+    let mut newest_by_relay = std::collections::BTreeMap::<&str, &RelayEventRecord>::new();
     for record in records.iter().filter(|record| {
         record.event.kind == KIND_MARMOT_KEY_PACKAGE
             && record.event.pubkey == account
             && record.event.tag_value("d") == Some(slot)
     }) {
         for endpoint in &record.endpoints {
-            let newest = newest_by_relay
-                .entry(endpoint.as_str())
-                .or_insert(&record.event);
-            if newest_publication_first(&record.event, newest.created_at, &newest.id).is_lt() {
-                *newest = &record.event;
+            let newest = newest_by_relay.entry(endpoint.as_str()).or_insert(record);
+            if newest_publication_first(&record.event, newest.event.created_at, &newest.event.id)
+                .is_lt()
+            {
+                *newest = record;
             }
         }
     }
     let mut current: Vec<SlotPublication> = Vec::new();
-    for event in newest_by_relay.into_values() {
-        if !current.iter().any(|seen| seen.event_id == event.id) {
+    for record in newest_by_relay.into_values() {
+        if !current.iter().any(|seen| seen.event_id == record.event.id) {
+            let key_package = key_package_and_metadata_from_borrowed_record(record)
+                .ok()
+                .filter(|(fetched, _)| {
+                    fetched.key_package.protocol_profile == ProtocolProfile::Current
+                })
+                .map(|(fetched, metadata)| CurrentKeyPackage {
+                    fetched,
+                    leaf_signature_key: metadata.leaf_signature_key,
+                });
             current.push(SlotPublication {
-                event_id: event.id.clone(),
-                created_at: event.created_at,
+                event_id: record.event.id.clone(),
+                created_at: record.event.created_at,
+                key_package,
             });
         }
     }

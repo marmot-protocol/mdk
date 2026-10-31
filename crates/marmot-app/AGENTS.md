@@ -128,9 +128,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   only a device that made the rejection restores it. A slot is its `d` as published, compared as bytes; one the roster
   cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a rejected
   KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's included, into
-  a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7). A roster device's KeyPackage matches its slot when
-  the trusted roster announces it now or the engine recorded it from a roster state applied in the last 30 days
-  (`announced_key_packages`, D31 item 7); only this classification reads that record. Hosts read the list as
+  a slot the user rejects. A roster device's KeyPackage matches its slot when
+  the trusted roster announces it now or the engine recorded it from a roster state applied within a KeyPackage's
+  longest validity (`announced_key_packages`, D31 item 7); only this classification and the rejection guard read that
+  record. Hosts read the list as
   `unrecognized_sign_ins`. A check or answer that changes it, and every roster change (`note_device_roster_changed`),
   sets `unrecognized_sign_ins_changed`, drained at the device-group seams into one payload-free
   `UnrecognizedSignInsChanged`; every client opens with it set.
@@ -148,7 +149,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   shows a relay empty. An incomplete own-slot read is retried within the hour.
 - The compromise warning (`src/client/compromise_warning.rs`, mdk#2628 3.7a, D53) is storage's
   (`account_compromise_warning_items`): every `not_me` slot and rejected KeyPackage in the trusted roster, plus this
-  device's own rejected sign-ins, gathered with insert-or-ignore so a seen mark survives branch selection dropping and
+  device's own rejected sign-ins and rejected KeyPackages, gathered with insert-or-ignore so a seen mark survives branch selection dropping and
   restoring an item. Never gather `removed` slots. Gathering is lazy: a roster change (`note_device_roster_changed`)
   or a Reject answer sets `compromise_warning_gather_due`, and the next host read or publication seam gathers once.
   The first roster this device trusts from a device group goes in seen (D68: the user saw those on the devices that
@@ -160,6 +161,20 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   device. An unseen rejected sign-in that neither this device nor the roster holds leaves the warning (a link ended
   it, or a branch dropped it); a seen one stays seen. Keep `CompromiseWarningReason` exhaustive so each binding maps a new reason
   explicitly; the stored reason is text with no CHECK, and an unknown one is skipped on read.
+- Rejected KeyPackages (`src/client/key_package_rejections.rs`, mdk#2628 3.7b, D52, D59) are decided only in
+  `check_sign_ins`, while this device holds each KeyPackage: a valid account KeyPackage in a foreign publication of its
+  own slot, and, on a complete check only, one served by a `not_me` slot (roster or kept here) and by no other slot.
+  `RejectionGuard` refuses one this device made (`made_key_package_refs`: the lifecycle's current, pending and
+  retained refs and `made_key_packages`, kept for as long as the slot, the spec's one definition), one the roster
+  rejects, one any roster announced (the engine's announced store or a roster entry) and
+  one whose tag reads as a device's; a tag read error refuses too. A rejection is kept in storage
+  (`account_rejected_key_packages`) before anything is committed. Every `drive_sign_ins` pass compares the kept ones
+  with the trusted roster and commits each one it lacks through the runtime's `reject_key_packages`; nothing records
+  that the roster took one, so one a branch drops, or one a restart interrupted, is committed again. One whose slot the
+  roster cannot name stays on this device only, the eight newest per stored slot. A kept one lapses 30 days after it
+  was recorded, once outside the eight newest for its slot (roster and kept together), or once a roster announces it. The
+  founding roster carries the eight newest per slot, other than refs the founding entries announce. This wasn't me makes
+  a check due at once.
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
   `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in `observe_device_group_event`
   (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628

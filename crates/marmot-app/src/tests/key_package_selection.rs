@@ -177,7 +177,8 @@ async fn selection_keeps_the_highest_ranked_slots_up_to_the_cap() {
 /// A device's read of its own account's slots (new sign-ins, mdk#2628 3.2)
 /// keeps every fresh, valid slot: none past the inviter's cap, none dropped
 /// for sharing a signature key with another slot, and none for a `d` the
-/// device roster could not name.
+/// device roster could not name. A valid one past freshness still counts as
+/// signed in, with the KeyPackage it serves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_account_slot_read_keeps_every_valid_slot() {
     let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
@@ -229,6 +230,29 @@ async fn the_account_slot_read_keeps_every_valid_slot() {
     // signed in.
     assert!(slots.current_slots.contains("stale"));
     assert_eq!(slots.current_slots.len(), slots.key_packages.len() + 1);
+    // The KeyPackage each of those slots serves, the stale one included, so a
+    // check can reject a valid KeyPackage past freshness (mdk#2628 3.7b).
+    let current: std::collections::BTreeSet<_> = slots
+        .current_key_packages
+        .iter()
+        .map(|current| current.fetched.key_package_id.as_str())
+        .collect();
+    assert_eq!(
+        current,
+        slots.current_slots.iter().map(String::as_str).collect()
+    );
+    assert!(
+        slots
+            .current_key_packages
+            .iter()
+            .any(|current| current.fetched.key_package_event_id == stale.id)
+    );
+    assert!(
+        !slots
+            .key_packages
+            .iter()
+            .any(|slot| slot.fetched.key_package_event_id == stale.id)
+    );
     let mut read = slots
         .key_packages
         .into_iter()

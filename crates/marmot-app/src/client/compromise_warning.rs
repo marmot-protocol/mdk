@@ -1,9 +1,9 @@
 //! The compromise warning (mdk#2628 item 3.7a, D53): someone holding the
 //! account's signing key published where the account's devices did not.
 //!
-//! - **What it gathers.** Every `not_me` rejected slot, in the trusted device
-//!   group's roster or among this device's own rejections, and every rejected
-//!   KeyPackage in the roster. A `removed` slot is not a rejection in this
+//! - **What it gathers.** Every `not_me` rejected slot and every rejected
+//!   KeyPackage, in the trusted device group's roster or among this device's
+//!   own rejections (3.7b). A `removed` slot is not a rejection in this
 //!   sense. Later items join the open warning rather than raising another.
 //! - **When.** At open, after every roster change, and after this device
 //!   answers This wasn't me. Gathering runs at the next publication seam or
@@ -255,6 +255,17 @@ impl AppClient {
                 slot_id_hex: record.slot_id_hex,
                 occurred_at: record.answered_at.unwrap_or(now),
             })
+            .chain(
+                storage
+                    .kept_rejected_key_packages()?
+                    .into_iter()
+                    .map(|kept| ObservedWarningItem {
+                        reason: storage_sqlite::CompromiseWarningReason::RejectedKeyPackage,
+                        subject: kept.key_package_ref_hex,
+                        slot_id_hex: kept.slot_id_hex,
+                        occurred_at: kept.rejected_at,
+                    }),
+            )
             .collect();
         let mut rejected = Vec::new();
         if let Some(roster) = roster {

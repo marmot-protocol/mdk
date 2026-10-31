@@ -2305,6 +2305,42 @@ async fn consumed_last_resort_private_material_outlives_replacement_for_retentio
             category: cgka_traits::ingest::InputRejectionCategory::MissingWelcomeKeyPackage
         }
     ));
+
+    // The device still knows the deleted package as its own, so it never
+    // rejects a copy of it (mdk#2628 3.7b).
+    let lifecycle = runtime.key_package_maintenance_status().unwrap().unwrap();
+    let old_ref = key_package_ref(&old_key_package);
+    assert_eq!(
+        lifecycle
+            .made_key_packages
+            .iter()
+            .map(|made| made.key_package_ref.clone())
+            .collect::<Vec<_>>(),
+        vec![old_ref.clone()]
+    );
+    assert!(
+        lifecycle
+            .made_key_package_refs()
+            .any(|made| made == old_ref.as_slice())
+    );
+    // It keeps every one it published to its slot for as long as it keeps
+    // the slot, past expiry: the current one once its own private material
+    // goes too.
+    let current_ref = lifecycle.current_key_package_ref.clone().unwrap();
+    wall.set(now + 365 * 24 * 60 * 60);
+    runtime
+        .sweep_expired_key_package_private_material()
+        .unwrap();
+    let lifecycle = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert!(lifecycle.current_key_package_ref.is_none());
+    assert_eq!(
+        lifecycle
+            .made_key_packages
+            .iter()
+            .map(|made| made.key_package_ref.clone())
+            .collect::<Vec<_>>(),
+        vec![old_ref, current_ref]
+    );
 }
 
 fn unix_now() -> u64 {

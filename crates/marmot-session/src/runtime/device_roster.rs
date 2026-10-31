@@ -220,8 +220,9 @@ where
             .and_then(|bytes| DeviceSlotId::try_from(bytes).ok()))
     }
 
-    /// Commit rejected-slot `operations` to `group_id`'s roster as one
-    /// update, audited with `context` when the host gives one. The returned
+    /// Commit rejected-slot and rejected-KeyPackage `operations` to
+    /// `group_id`'s roster as one update, audited with `context` when the
+    /// host gives one. The returned
     /// effects carry the commit. A device entry is never written here:
     /// [`Self::edit_device_roster_entry`] replaces one only while it is still
     /// the entry it read.
@@ -235,6 +236,8 @@ where
             operation,
             DeviceRosterOperationV1::SetRejectedSlot(..)
                 | DeviceRosterOperationV1::RemoveRejectedSlot(_)
+                | DeviceRosterOperationV1::SetRejectedKeyPackage(..)
+                | DeviceRosterOperationV1::RemoveRejectedKeyPackage(_)
         )));
         let update = DeviceRosterUpdateV1::new(operations)
             .and_then(|update| encode_device_roster_update_v1(&update))

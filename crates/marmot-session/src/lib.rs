@@ -28,8 +28,8 @@ pub use runtime::{
     FailedApplicationMessage, ForeignSlotOutcome, ForeignSlotPublication, MaintenanceActivity,
     MaintenanceAttemptDuration, MaintenanceTiming, PendingResolution, PreparedSessionCommit,
     PreparedSessionSend, PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage,
-    UndeliveredCommit, UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
-    WelcomeDeliveryFailure,
+    REJECTED_KEY_PACKAGE_RETENTION_SECS, UndeliveredCommit, UnresolvedApplicationMessage,
+    UnresolvedPublish, UnresolvedPublishReason, WelcomeDeliveryFailure,
 };
 pub use session::{
     CreateGroupEffects, GroupAuthorityView, HydrationProgress, PublishWork, QueuedIntentRef,
@@ -45,7 +45,8 @@ pub use session::{
     AccountIdentityProofRequest, AccountIdentityProofSigner, CanonicalGroupMembership,
     CanonicalizationPolicy, FeatureRegistry, GroupAuthoritySnapshot, KeyPackageMetadata,
     KeyPackageRequirements, V1_SETTLEMENT_QUIESCENCE_MS, WelcomeDeliveryIndex, WelcomeWithdrawal,
-    application_message_len, durably_owned_key_packages, key_package_metadata,
+    application_message_len, durably_owned_key_packages, key_package_device_tag_claim,
+    key_package_metadata,
 };
 pub use session::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,

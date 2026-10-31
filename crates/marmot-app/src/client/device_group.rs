@@ -367,8 +367,14 @@ impl AppClient {
             announced_key_package: Some(hex::decode(&link.key_package_ref_hex)?),
             ..DeviceEntryV1::default()
         };
-        // Rejections this device made before it had a device group (3.2).
+        // Rejections this device made before it had a device group (3.2,
+        // 3.7b). Neither founding entry's KeyPackage is rejected: the roster
+        // announces both.
         self.founding_sign_in_rejections(&mut roster, &sibling_slot)?;
+        self.founding_key_package_rejections(
+            &mut roster,
+            sibling_entry.announced_key_package.as_slice(),
+        )?;
         let roster = encode_device_roster_v1(&roster)
             .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
         let roster_update = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(

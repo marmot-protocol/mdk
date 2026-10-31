@@ -107,9 +107,10 @@
   scheduled check. A Welcome delivery naming another KeyPackage of the
   account brings the next check forward, as a live one of its KeyPackages
   does, whether it arrives before or after this device's own delivery of
-  that Welcome. A KeyPackage the roster announced for a device's slot in
-  the last 30 days counts as that device's, even after a newer announcement
-  or a rewind. `UnrecognizedSignInsChanged` says to re-read the list. All
+  that Welcome. A KeyPackage the roster announced for a device's slot
+  counts as that device's for as long as a KeyPackage can be valid
+  (7,261,200 seconds from the last roster state announcing it), even after
+  a newer announcement or a rewind. `UnrecognizedSignInsChanged` says to re-read the list. All
   are empty and silent in release builds until the roster's spec lands.
 - `MarmotAppRuntime::compromise_warning` lists the account's open compromise
   warning on this device as `CompromiseWarningItem`s (mdk#2628 item 3.7a):

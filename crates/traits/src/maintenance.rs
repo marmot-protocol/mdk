@@ -408,6 +408,17 @@ impl RetainedKeyPackagePrivateMaterial {
     }
 }
 
+/// A KeyPackage this device published to its slot whose private material it
+/// deleted. The device keeps its `KeyPackageRef` for as long as it keeps the
+/// slot, expired or not, so it can still tell a copy of it is its own and
+/// never rejects it (`features/device-group.md`, "A KeyPackage the roster
+/// does not announce", where the KeyPackages a device made are defined;
+/// mdk#2628 3.7b).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MadeKeyPackage {
+    pub key_package_ref: Vec<u8>,
+}
+
 /// The one stable replaceable-event slot for an account-device's last-resort
 /// KeyPackage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +463,10 @@ pub struct KeyPackageLifecycleState {
     /// confirmed. See [`RetainedKeyPackagePrivateMaterial::delete_at`].
     #[serde(default)]
     pub retained_private_material: Vec<RetainedKeyPackagePrivateMaterial>,
+    /// Packages whose private material was deleted, kept for as long as the
+    /// slot. See [`MadeKeyPackage`].
+    #[serde(default)]
+    pub made_key_packages: Vec<MadeKeyPackage>,
     pub pending_replacement: Option<PendingKeyPackageReplacement>,
     /// The build that last replaced a KeyPackage because the publisher
     /// refused its signed bytes as unusable (mdk#2628, D8). Each build does so
@@ -491,9 +506,47 @@ impl KeyPackageLifecycleState {
             last_consumed_key_package_ref: None,
             last_consumed_at: None,
             retained_private_material: Vec::new(),
+            made_key_packages: Vec::new(),
             pending_replacement: None,
             unusable_artifact_replaced_by: None,
             slot_withdrawn_at: None,
+        }
+    }
+
+    /// The `KeyPackageRef` of every KeyPackage this device made in this
+    /// slot: the current one, a pending replacement, each retained one and
+    /// each in [`Self::made_key_packages`].
+    pub fn made_key_package_refs(&self) -> impl Iterator<Item = &[u8]> {
+        self.current_key_package_ref
+            .iter()
+            .map(Vec::as_slice)
+            .chain(
+                self.pending_replacement
+                    .iter()
+                    .map(|pending| pending.key_package_ref.as_slice()),
+            )
+            .chain(
+                self.retained_private_material
+                    .iter()
+                    .map(|material| material.key_package_ref.as_slice()),
+            )
+            .chain(
+                self.made_key_packages
+                    .iter()
+                    .map(|made| made.key_package_ref.as_slice()),
+            )
+    }
+
+    /// Keep `key_package_ref` among [`Self::made_key_packages`] once its
+    /// private material goes. A ref already kept is kept once.
+    pub fn remember_made_key_package(&mut self, key_package_ref: Vec<u8>) {
+        if !self
+            .made_key_packages
+            .iter()
+            .any(|made| made.key_package_ref == key_package_ref)
+        {
+            self.made_key_packages
+                .push(MadeKeyPackage { key_package_ref });
         }
     }
 

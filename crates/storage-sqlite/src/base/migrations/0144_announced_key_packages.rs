@@ -6,8 +6,8 @@
 //! last applied a roster state that announced it. The engine writes them in
 //! the transaction that applies each roster state, and never reads them: no
 //! snapshot or replay fingerprint covers them, so a branch-selection rewind
-//! keeps them. A row is dropped 30 days after it was last seen, each group
-//! slot keeps only its newest few, and deleting the group deletes its rows.
+//! keeps them. A row is dropped once it was last seen longer ago than a
+//! KeyPackage can be valid, and deleting the group deletes its rows.
 //!
 //! No rows are seeded.
 use crate::SqliteResultExt;

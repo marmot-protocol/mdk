@@ -11,14 +11,14 @@
 //! The engine only writes them. No convergence input, snapshot or replay
 //! fingerprint reads them, so group state and branch selection are what they
 //! would be without them. The app reads them to tell a slot still serving an
-//! earlier announcement from one serving a KeyPackage no roster announced.
+//! earlier announcement from one serving a KeyPackage no roster announced,
+//! and never to reject a KeyPackage a roster announced.
 
 use std::collections::BTreeSet;
 
 use cgka_traits::Timestamp;
 use cgka_traits::storage::{
-    ANNOUNCED_KEY_PACKAGE_RETENTION_SECS, ANNOUNCED_KEY_PACKAGES_PER_SLOT, AnnouncedKeyPackage,
-    StorageError, StorageProvider,
+    ANNOUNCED_KEY_PACKAGE_RETENTION_SECS, AnnouncedKeyPackage, StorageError, StorageProvider,
 };
 use cgka_traits::types::GroupId;
 use openmls::group::MlsGroup;
@@ -62,10 +62,7 @@ pub(crate) fn record_announcements<S: StorageProvider>(
     }
     let announced = announced.iter().cloned().collect::<Vec<_>>();
     store.record_announced_key_packages(group_id, &announced, now.0)?;
-    store.prune_announced_key_packages(
-        now.0.saturating_sub(ANNOUNCED_KEY_PACKAGE_RETENTION_SECS),
-        ANNOUNCED_KEY_PACKAGES_PER_SLOT,
-    )
+    store.prune_announced_key_packages(now.0.saturating_sub(ANNOUNCED_KEY_PACKAGE_RETENTION_SECS))
 }
 
 /// Record what `group`'s roster announces now.

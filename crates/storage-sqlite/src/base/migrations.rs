@@ -308,6 +308,8 @@ mod migration_0146_device_removals;
 mod migration_0148_compromise_warning;
 #[path = "migrations/0161_small_state.rs"]
 mod migration_0161_small_state;
+#[path = "migrations/0165_rejected_key_packages.rs"]
+mod migration_0165_rejected_key_packages;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1210,6 +1212,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0161_small_state",
         suspend_foreign_keys: &[],
         apply: migration_0161_small_state::apply,
+    },
+    Migration {
+        version: 165,
+        name: "0165_rejected_key_packages",
+        suspend_foreign_keys: &[],
+        apply: migration_0165_rejected_key_packages::apply,
     },
 ];
 

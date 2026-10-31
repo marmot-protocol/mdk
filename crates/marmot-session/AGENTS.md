@@ -49,7 +49,7 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     announcement also writes the host's `DeviceSelfReport` (this device's client and platform) and this device's
     history key (4.1) into its own entry; the tag-key commit carries the history key too. Only this device's own
     entry ever gets its history key.
-    `send_device_roster_update` carries rejected-slot operations only.
+    `send_device_roster_update` carries rejected-slot and rejected-KeyPackage operations only.
   - `runtime/device_tag_key.rs` — this device's tag signature key (mdk#2628 3.1d): the host names the device group to
     tag from (`set_device_tag_group`). Maintenance, and the host before each KeyPackage publication
     (`set_device_tag_key_holding`), set this device's MLS signature key in its own roster entry when the entry lacks
@@ -57,8 +57,14 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     while the key is due and not in the merged roster, and a staged one that no longer advertises what this device
     would build is replaced. The engine tags only from the entry at this device's slot. A refresh held back this way
     counts toward `key_package_refresh_overdue` like one held back by its announcement.
-  - `runtime/removed_slot_expiry.rs` — maintenance drops `removed` slot records 30 days after their `rejected_at`, by
-    this device's clock (device-roster-v1.md), in one roster update after the KeyPackage steps. `not_me` records stay.
+  - `runtime/key_package_rejection.rs` — the host's rejected KeyPackages (mdk#2628 3.7b) in one roster update behind
+    the same gate (`reject_key_packages`). A KeyPackage the merged roster already rejects is left out, and each update
+    keeps the eight newest records for each slot of the roster's and its own, removing the roster's others in the same
+    update (`newest_rejected_key_packages`). It works that out from the roster it reads each time, so a retry starts
+    from the new parent.
+  - `runtime/removed_slot_expiry.rs` — maintenance drops `removed` slot records and rejected KeyPackages 30 days after
+    their `rejected_at`, by this device's clock (device-roster-v1.md), in one roster update after the KeyPackage steps.
+    `not_me` records stay.
   - `runtime/sign_in_rejection.rs` — the host's rejected sign-ins (mdk#2628 3.2) as `not_me` rejected slots, in one
     roster update behind the same gate (`reject_device_slots`). A slot the merged roster already holds, as a device or
     a rejected slot, is left out: a rejection never replaces an entry.

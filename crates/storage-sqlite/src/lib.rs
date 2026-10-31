@@ -130,6 +130,7 @@ pub use app::recovery_units::{
     RecoveryUnitBreak, RecoveryUnitFence, RecoveryUnitOutcome, RecoveryUnitPark,
     RecoveryUnitPolicy, RecoveryUnitSpan, RecoveryUnitState,
 };
+pub use app::rejected_key_packages::KeptKeyPackageRejection;
 pub use app::sign_ins::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord};
 pub use app::stickers::{
     StoredInstalledStickerState, StoredSticker, StoredStickerInstallOperation,

@@ -74,11 +74,12 @@ use cgka_traits::storage::{
 };
 use cgka_traits::{GroupId, MessageId, Timestamp, TransportEndpoint};
 use marmot_session::{ForeignSlotOutcome, ForeignSlotPublication};
-use nostr_directory::OwnSlotRead;
+use nostr_directory::{CurrentKeyPackage, OwnSlotRead};
 use storage_sqlite::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord, SqliteAppStorage};
 
 use super::AppClient;
 use super::device_group::device_slot;
+use super::key_package_rejections::RejectionGuard;
 use crate::{AppError, unix_now_seconds};
 
 /// How often a running device reads its account's slots.
@@ -240,12 +241,15 @@ impl SignInNudges {
 }
 
 /// This device's slot, every publication it made that may still be served
-/// there, by event id, and the relays its current one went to.
+/// there, by event id, the relays its current one went to, and the
+/// `KeyPackageRef` of each KeyPackage it made that may still be valid
+/// (`made_key_package_refs`).
 #[derive(Debug, Default)]
 struct OwnKeyPackages {
     slot: Option<String>,
     events: BTreeSet<String>,
     targets: Vec<TransportEndpoint>,
+    refs: BTreeSet<Vec<u8>>,
 }
 
 impl AppClient {
@@ -289,6 +293,14 @@ impl AppClient {
                 "could not record sign-in rejections in the device group; retrying later"
             );
         }
+        if let Err(error) = self.commit_key_package_rejections().await {
+            tracing::warn!(
+                target: "marmot_app::client::sign_ins",
+                method = "commit_key_package_rejections",
+                error_kind = error.privacy_safe_kind(),
+                "could not record key package rejections in the device group; retrying later"
+            );
+        }
     }
 
     /// Read every slot of the account and record each unrecognized one. See
@@ -315,6 +327,14 @@ impl AppClient {
             None => BTreeSet::new(),
         };
         let roster = trusted.map(|(_, roster)| roster);
+        let guard = RejectionGuard {
+            roster: roster.clone(),
+            announced: announced
+                .iter()
+                .map(|announced| announced.key_package_ref.clone())
+                .collect(),
+            own: own.refs.clone(),
+        };
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let rejected_here = rejected_slots_here(&storage.sign_ins()?);
 
@@ -365,7 +385,27 @@ impl AppClient {
             complete = read.complete,
             "checked the account's key packages for new sign-ins"
         );
+        if read.complete {
+            let mut not_me: BTreeSet<String> = roster
+                .iter()
+                .flat_map(|roster| roster.rejected_slots.iter())
+                .filter(|(_, rejected)| rejected.reason == RejectedSlotReasonV1::NotMe)
+                .map(|(slot, _)| hex::encode(slot))
+                .collect();
+            not_me.extend(rejected_here.iter().cloned());
+            for found in not_me_slot_key_packages(&read.current_key_packages, &not_me) {
+                self.reject_found_key_package(found, &guard)?;
+            }
+        }
         if let (Some(slot_hex), Some(own_read)) = (own.slot.as_deref(), read.own_slot.as_ref()) {
+            for found in own_read
+                .current
+                .iter()
+                .filter(|publication| !own.events.contains(&publication.event_id))
+                .filter_map(|publication| publication.key_package.as_ref())
+            {
+                self.reject_found_key_package(found, &guard)?;
+            }
             let foreign = foreign_slot_publications(slot_hex, own_read, &own);
             if !foreign.is_empty() {
                 report
@@ -517,6 +557,9 @@ impl AppClient {
         self.unrecognized_sign_ins_changed = true;
         if to == SignInAnswer::Rejected {
             self.note_compromise_warning_due();
+            // D59: a complete check now rejects the KeyPackages in that
+            // slot, while this device holds them.
+            self.sign_in_schedule.due = Some(Instant::now());
         }
         if to == SignInAnswer::Rejected
             && let Err(error) = self.commit_sign_in_rejections().await
@@ -690,9 +733,9 @@ impl AppClient {
     }
 
     /// What rosters of the device group `group_id` announced within a
-    /// KeyPackage's lifetime (D31 item 7). The engine records them as it
-    /// applies each roster state.
-    fn announced_key_packages(
+    /// KeyPackage's longest validity (D31 item 7). The engine records them
+    /// as it applies each roster state.
+    pub(crate) fn announced_key_packages(
         &self,
         group_id: &GroupId,
     ) -> Result<BTreeSet<AnnouncedKeyPackage>, AppError> {
@@ -731,6 +774,10 @@ impl AppClient {
             )
             .map(|event_id| hex::encode(event_id.as_slice()))
             .collect();
+        let refs = lifecycle
+            .made_key_package_refs()
+            .map(<[u8]>::to_vec)
+            .collect();
         Ok(OwnKeyPackages {
             // A Welcome join before this device's first publication records
             // its slot empty: there is no slot of its own to read yet.
@@ -741,6 +788,7 @@ impl AppClient {
                 .into_iter()
                 .map(|target| target.endpoint)
                 .collect(),
+            refs,
         })
     }
 }
@@ -879,9 +927,28 @@ fn emptied_targets(
         .collect()
 }
 
+/// The KeyPackages in `current` that a complete check rejects (D59): each
+/// that a slot in `not_me` serves, unless a slot outside `not_me` serves it
+/// too. Whoever holds the account key can copy a real device's KeyPackage
+/// into a slot the user then rejects.
+fn not_me_slot_key_packages<'a>(
+    current: &'a [CurrentKeyPackage],
+    not_me: &BTreeSet<String>,
+) -> impl Iterator<Item = &'a CurrentKeyPackage> {
+    let elsewhere: BTreeSet<&str> = current
+        .iter()
+        .filter(|found| !not_me.contains(&found.fetched.key_package_id))
+        .map(|found| found.fetched.key_package_ref_hex.as_str())
+        .collect();
+    current.iter().filter(move |found| {
+        not_me.contains(&found.fetched.key_package_id)
+            && !elsewhere.contains(found.fetched.key_package_ref_hex.as_str())
+    })
+}
+
 /// The roster's name for `slot_hex`: only a `d` of 32 bytes in lowercase
 /// hex, so no other spelling of a device's slot passes for it.
-fn roster_slot(slot_hex: &str) -> Option<DeviceSlotId> {
+pub(crate) fn roster_slot(slot_hex: &str) -> Option<DeviceSlotId> {
     device_slot(slot_hex)
         .ok()
         .filter(|slot| hex::encode(slot) == slot_hex)
@@ -1040,6 +1107,7 @@ mod tests {
             vec![9; 32],
             RejectedKeyPackageV1 {
                 slot: [2; 32],
+                leaf_signature_key: vec![7; 32],
                 rejected_at: 1,
             },
         );

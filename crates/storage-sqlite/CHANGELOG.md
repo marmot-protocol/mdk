@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- Migration 0165 advances account storage to schema 165 (mdk#2628 item 3.7b).
+  It adds `account_rejected_key_packages`, one row per KeyPackage this device
+  rejected itself, keyed by its `KeyPackageRef`, with the slot it appeared in,
+  its LeafNode's signature key and when this device recorded it.
+  `SqliteAppStorage` gains `keep_rejected_key_package`,
+  `kept_rejected_key_packages` and `forget_rejected_key_packages`. The numbers between 161 and 165 that are
+  not yet used belong to other work.
 - Migration 0143 advances account storage to schema 143 (mdk#2628 item 3.6).
   It adds `device_activity`, one row per sibling the trusted device group's
   roster lists (that entry's `linked_at`, when this device first found it
@@ -101,7 +108,8 @@
   device-group roster this device applied announced for a slot, with when it
   last applied one that did. `SqliteAccountStorage` implements the new
   `AnnouncedKeyPackageStorage`. Rows survive a branch-selection rewind, go
-  with their group, and are pruned after 30 days or past 16 per slot. Nothing
+  with their group, and are pruned once last seen longer ago than a
+  KeyPackage can be valid (7,261,200 seconds), with no per-slot cap. Nothing
   writes them unless device groups are on.
 - Migration 0146 advances account storage to schema 146 (mdk#2628 item 3.6b).
   It adds `device_removals`, one row per device this device's user removed

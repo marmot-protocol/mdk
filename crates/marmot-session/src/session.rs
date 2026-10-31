@@ -20,7 +20,8 @@ pub use cgka_engine::engine::{WelcomeDeliveryIndex, WelcomeWithdrawal};
 pub use cgka_engine::feature_registry::FeatureRegistry;
 pub use cgka_engine::group_authority::{CanonicalGroupMembership, GroupAuthoritySnapshot};
 pub use cgka_engine::key_package::{
-    KeyPackageRequirements, durably_owned_key_packages, key_package_metadata,
+    KeyPackageRequirements, durably_owned_key_packages, key_package_device_tag_claim,
+    key_package_metadata,
 };
 pub use cgka_engine::private_key_packages::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,

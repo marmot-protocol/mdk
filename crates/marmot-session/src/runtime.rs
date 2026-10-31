@@ -71,6 +71,8 @@ use crate::time::{
 mod device_roster;
 pub use device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked, DeviceSelfReport};
 mod device_tag_key;
+mod key_package_rejection;
+pub use key_package_rejection::REJECTED_KEY_PACKAGE_RETENTION_SECS;
 mod own_slot;
 pub use own_slot::{ForeignSlotOutcome, ForeignSlotPublication};
 mod private_key_packages;
@@ -1359,6 +1361,7 @@ where
                     last_consumed_key_package_ref: None,
                     last_consumed_at: None,
                     retained_private_material: Vec::new(),
+                    made_key_packages: Vec::new(),
                     pending_replacement: None,
                     unusable_artifact_replaced_by: None,
                     slot_withdrawn_at: None,
@@ -1627,8 +1630,14 @@ where
                     }),
                 // Without a lifetime there is no deletion bound to retain it
                 // under.
-                _ if previous_was_consumed => retired.push(key_package),
-                _ => {}
+                (key_package_ref, _) => {
+                    if let Some(key_package_ref) = key_package_ref {
+                        lifecycle.remember_made_key_package(key_package_ref);
+                    }
+                    if previous_was_consumed {
+                        retired.push(key_package);
+                    }
+                }
             }
         }
         lifecycle.current_key_package = Some(replacement.key_package.clone());
@@ -2014,7 +2023,9 @@ where
             .is_some_and(|deadline| deadline <= now)
             && let Some(expired) = lifecycle.current_key_package.take()
         {
-            lifecycle.current_key_package_ref = None;
+            if let Some(key_package_ref) = lifecycle.current_key_package_ref.take() {
+                lifecycle.remember_made_key_package(key_package_ref);
+            }
             lifecycle.current_not_before = None;
             lifecycle.current_not_after = None;
             lifecycle.authored_signed_event = None;
@@ -2030,12 +2041,16 @@ where
             && let Some(expired) = lifecycle.pending_replacement.take()
         {
             lifecycle.phase = cgka_traits::MaintenancePhase::Failed;
+            lifecycle.remember_made_key_package(expired.key_package_ref);
             retired.push(expired.key_package);
         }
         let marker_migrated = lifecycle.migrate_legacy_consumption_marker();
         let mut retained = Vec::with_capacity(lifecycle.retained_private_material.len());
-        for material in lifecycle.retained_private_material.drain(..) {
+        for material in std::mem::take(&mut lifecycle.retained_private_material) {
             if material.delete_at() <= now {
+                // Remember a deleted package as this device's own for as long
+                // as it keeps the slot (mdk#2628 3.7b).
+                lifecycle.remember_made_key_package(material.key_package_ref);
                 retired.push(material.key_package);
             } else {
                 retained.push(material);

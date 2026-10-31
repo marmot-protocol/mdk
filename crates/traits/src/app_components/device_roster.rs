@@ -39,6 +39,10 @@ pub const DEVICE_ROSTER_KEY_PACKAGE_REF_MAX_LEN: usize = 64;
 pub const DEVICE_ROSTER_TAG_SIGNATURE_KEY_MAX_LEN: usize = 255;
 /// Largest reserved stage 4 key value, in bytes.
 pub const DEVICE_ROSTER_RESERVED_KEY_MAX_LEN: usize = 255;
+/// Largest LeafNode signature key a rejected KeyPackage records, in bytes.
+pub const DEVICE_ROSTER_LEAF_SIGNATURE_KEY_MAX_LEN: usize = 255;
+/// The most rejected KeyPackages a roster holds for one slot.
+pub const DEVICE_ROSTER_REJECTED_KEY_PACKAGES_PER_SLOT: usize = 8;
 
 /// The whole roster. Maps keep entries sorted and unique by key, which is
 /// the canonical order on the wire.
@@ -116,10 +120,14 @@ pub enum RejectedSlotReasonV1 {
 }
 
 /// A rejected KeyPackage, keyed by its `KeyPackageRef`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RejectedKeyPackageV1 {
     /// The slot the KeyPackage appeared in.
     pub slot: DeviceSlotId,
+    /// The KeyPackage's LeafNode signature key, without its length prefix,
+    /// so a device that never saw the KeyPackage can still recognize a leaf
+    /// that joined with it.
+    pub leaf_signature_key: Vec<u8>,
     pub rejected_at: u64,
 }
 
@@ -206,8 +214,15 @@ impl DeviceRosterUpdateV1 {
                 DeviceRosterOperationV1::SetRejectedSlot(_, rejected) => {
                     validate_rejected_slot(rejected)?;
                 }
-                DeviceRosterOperationV1::SetRejectedKeyPackage(key_package_ref, _)
-                | DeviceRosterOperationV1::RemoveRejectedKeyPackage(key_package_ref) => {
+                DeviceRosterOperationV1::SetRejectedKeyPackage(key_package_ref, rejected) => {
+                    validate_key_package_ref(key_package_ref)?;
+                    validate_bounded(
+                        &rejected.leaf_signature_key,
+                        DEVICE_ROSTER_LEAF_SIGNATURE_KEY_MAX_LEN,
+                        "leaf signature key",
+                    )?;
+                }
+                DeviceRosterOperationV1::RemoveRejectedKeyPackage(key_package_ref) => {
                     validate_key_package_ref(key_package_ref)?;
                 }
                 DeviceRosterOperationV1::SetAccount(account) => validate_account(account)?,
@@ -254,8 +269,23 @@ impl DeviceRosterV1 {
                 return Err("device roster gives a not-me slot a tag signature key".into());
             }
         }
-        for key_package_ref in self.rejected_key_packages.keys() {
+        for (key_package_ref, rejected) in &self.rejected_key_packages {
             validate_key_package_ref(key_package_ref)?;
+            validate_bounded(
+                &rejected.leaf_signature_key,
+                DEVICE_ROSTER_LEAF_SIGNATURE_KEY_MAX_LEN,
+                "leaf signature key",
+            )?;
+        }
+        let mut per_slot = BTreeMap::<DeviceSlotId, usize>::new();
+        for rejected in self.rejected_key_packages.values() {
+            let count = per_slot.entry(rejected.slot).or_default();
+            *count += 1;
+            if *count > DEVICE_ROSTER_REJECTED_KEY_PACKAGES_PER_SLOT {
+                return Err(format!(
+                    "device roster holds more than {DEVICE_ROSTER_REJECTED_KEY_PACKAGES_PER_SLOT} rejected KeyPackages for one slot"
+                ));
+            }
         }
         validate_account(&self.account)
     }
@@ -285,7 +315,7 @@ impl DeviceRosterV1 {
                 }
                 DeviceRosterOperationV1::SetRejectedKeyPackage(key_package_ref, rejected) => {
                     next.rejected_key_packages
-                        .insert(key_package_ref.clone(), *rejected);
+                        .insert(key_package_ref.clone(), rejected.clone());
                 }
                 DeviceRosterOperationV1::RemoveRejectedKeyPackage(key_package_ref) => {
                     next.rejected_key_packages.remove(key_package_ref).ok_or(
@@ -300,6 +330,38 @@ impl DeviceRosterV1 {
         next.validate()?;
         Ok(next)
     }
+}
+
+/// Which of `records` a roster keeps: for each slot, the
+/// [`DEVICE_ROSTER_REJECTED_KEY_PACKAGES_PER_SLOT`] newest, by latest
+/// `rejected_at` and then highest `KeyPackageRef`. A device works this out
+/// from the parent it commits on together with the records it adds, and
+/// from a founding roster's records (device-roster-v1.md, "State"). A
+/// `KeyPackageRef` given twice counts once, as its first record.
+pub fn newest_rejected_key_packages<'a>(
+    records: impl IntoIterator<Item = (&'a [u8], &'a RejectedKeyPackageV1)>,
+) -> std::collections::BTreeSet<Vec<u8>> {
+    let mut first = BTreeMap::<&'a [u8], &'a RejectedKeyPackageV1>::new();
+    for (key_package_ref, rejected) in records {
+        first.entry(key_package_ref).or_insert(rejected);
+    }
+    let mut by_slot = BTreeMap::<DeviceSlotId, Vec<(u64, &'a [u8])>>::new();
+    for (key_package_ref, rejected) in first {
+        by_slot
+            .entry(rejected.slot)
+            .or_default()
+            .push((rejected.rejected_at, key_package_ref));
+    }
+    by_slot
+        .into_values()
+        .flat_map(|mut records| {
+            records.sort_unstable_by(|a, b| b.cmp(a));
+            records
+                .into_iter()
+                .take(DEVICE_ROSTER_REJECTED_KEY_PACKAGES_PER_SLOT)
+                .map(|(_, key_package_ref)| key_package_ref.to_vec())
+        })
+        .collect()
 }
 
 /// Apply encoded update bytes to encoded state bytes and return the
@@ -480,6 +542,7 @@ fn encode_rejected_slot(rejected: &RejectedSlotV1, out: &mut Vec<u8>) {
 
 fn encode_rejected_key_package(rejected: &RejectedKeyPackageV1, out: &mut Vec<u8>) {
     out.extend_from_slice(&rejected.slot);
+    encode_var_bytes(&rejected.leaf_signature_key, out);
     out.extend_from_slice(&rejected.rejected_at.to_be_bytes());
 }
 
@@ -697,8 +760,17 @@ fn decode_rejected_slot(cursor: &mut &[u8]) -> Result<RejectedSlotV1, String> {
 
 fn decode_rejected_key_package(cursor: &mut &[u8]) -> Result<RejectedKeyPackageV1, String> {
     let slot = decode_slot(cursor, "rejected KeyPackage slot")?;
+    let leaf_signature_key = decode_bounded(
+        cursor,
+        DEVICE_ROSTER_LEAF_SIGNATURE_KEY_MAX_LEN,
+        "leaf signature key",
+    )?;
     let rejected_at = take_u64(cursor, "rejected_at")?;
-    Ok(RejectedKeyPackageV1 { slot, rejected_at })
+    Ok(RejectedKeyPackageV1 {
+        slot,
+        leaf_signature_key,
+        rejected_at,
+    })
 }
 
 fn decode_account(cursor: &mut &[u8]) -> Result<AccountEntryV1, String> {
@@ -839,6 +911,7 @@ mod tests {
                 vec![0xbb; 32],
                 RejectedKeyPackageV1 {
                     slot: slot(2),
+                    leaf_signature_key: vec![0x07; 32],
                     rejected_at: 1_700_002_000,
                 },
             )]
@@ -963,6 +1036,34 @@ mod tests {
             apply_device_roster_update_v1(&bytes, &removal_bytes).unwrap(),
             encode_device_roster_v1(&next).unwrap()
         );
+        let rejection =
+            DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetRejectedKeyPackage(
+                vec![0x55; 32],
+                RejectedKeyPackageV1 {
+                    slot: slot(0x11),
+                    leaf_signature_key: vec![0x66; 32],
+                    rejected_at: 0x6553_f300,
+                },
+            )])
+            .unwrap();
+        let rejection_bytes = encode_device_roster_update_v1(&rejection).unwrap();
+        let record = concat!(
+            "205555555555555555555555555555555555555555555555555555555555555555", // key_package_ref
+            "1111111111111111111111111111111111111111111111111111111111111111",   // slot
+            "206666666666666666666666666666666666666666666666666666666666666666", // leaf_signature_key
+            "000000006553f300",                                                   // rejected_at
+        );
+        assert_eq!(
+            hex::encode(&rejection_bytes),
+            format!("406b04{record}") // operations<V>: 107 bytes; set_rejected_key_package
+        );
+        let alone = DeviceRosterV1::default().apply(&rejection).unwrap();
+        let alone_bytes = encode_device_roster_v1(&alone).unwrap();
+        assert_eq!(
+            hex::encode(&alone_bytes[32..]),
+            format!("0000406a{record}0000") // rejected_key_packages<V>: 106 bytes
+        );
+        assert_eq!(decode_device_roster_v1(&alone_bytes).unwrap(), alone);
     }
 
     #[test]
@@ -1114,6 +1215,74 @@ mod tests {
                 .unwrap_err()
                 .contains("not-me slot")
         );
+    }
+
+    /// A roster holds at most eight rejected KeyPackages for one slot, each
+    /// with a leaf signature key; a device keeps the newest by
+    /// `rejected_at`, then by the higher `KeyPackageRef`.
+    #[test]
+    fn rejected_key_packages_are_bounded_per_slot() {
+        let rejected = |slot_byte: u8, rejected_at: u64| RejectedKeyPackageV1 {
+            slot: slot(slot_byte),
+            leaf_signature_key: vec![0x07; 32],
+            rejected_at,
+        };
+        let mut roster = DeviceRosterV1 {
+            rejected_key_packages: (0..8u8)
+                .map(|n| (vec![n; 32], rejected(1, u64::from(n))))
+                .chain([(vec![0xf0; 32], rejected(2, 0))])
+                .collect(),
+            ..DeviceRosterV1::default()
+        };
+        assert!(encode_device_roster_v1(&roster).is_ok());
+        roster
+            .rejected_key_packages
+            .insert(vec![0xf1; 32], rejected(1, 100));
+        assert!(
+            encode_device_roster_v1(&roster)
+                .unwrap_err()
+                .contains("more than 8 rejected KeyPackages")
+        );
+        for bad_key in [Vec::new(), vec![0x07; 256]] {
+            let roster = DeviceRosterV1 {
+                rejected_key_packages: [(
+                    vec![0x01; 32],
+                    RejectedKeyPackageV1 {
+                        leaf_signature_key: bad_key,
+                        ..rejected(1, 0)
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..DeviceRosterV1::default()
+            };
+            assert!(encode_device_roster_v1(&roster).is_err());
+        }
+
+        // Nine for slot 1: the oldest goes. Of two at the same time, the
+        // higher ref stays. A ref given twice counts once, as its first.
+        let late = rejected(1, 50);
+        let early = rejected(1, 0);
+        let records: Vec<(Vec<u8>, RejectedKeyPackageV1)> = (1..=7u8)
+            .map(|n| (vec![n; 32], rejected(1, 10 * u64::from(n))))
+            .chain([
+                (vec![0x30; 32], rejected(1, 5)),
+                (vec![0x20; 32], rejected(1, 5)),
+                (vec![0xf0; 32], rejected(2, 0)),
+                (vec![0x01; 32], late.clone()),
+                (vec![0x02; 32], early.clone()),
+            ])
+            .collect();
+        let kept = newest_rejected_key_packages(
+            records
+                .iter()
+                .map(|(key_package_ref, record)| (key_package_ref.as_slice(), record)),
+        );
+        let mut expected: std::collections::BTreeSet<Vec<u8>> =
+            (1..=7u8).map(|n| vec![n; 32]).collect();
+        expected.insert(vec![0x30; 32]);
+        expected.insert(vec![0xf0; 32]);
+        assert_eq!(kept, expected);
     }
 
     #[test]

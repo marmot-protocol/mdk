@@ -1024,13 +1024,13 @@ pub struct AnnouncedKeyPackage {
 }
 
 /// How long an announcement is kept after the last roster state this device
-/// applied that announced it: as long as a KeyPackage publication stays
-/// fresh, so a relay still serving it after a newer announcement is covered.
-/// A slot whose roster entry still announces it needs no record.
-pub const ANNOUNCED_KEY_PACKAGE_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
-
-/// How many announcements each slot of a group keeps, newest first.
-pub const ANNOUNCED_KEY_PACKAGES_PER_SLOT: usize = 16;
+/// applied that announced it: 7,261,200 seconds, the longest a KeyPackage
+/// can be valid, so a KeyPackage a roster announced stays announced for as
+/// long as any device may still select it, fresh or not (device-group.md, "A
+/// KeyPackage the roster does not announce"). A slot whose roster entry
+/// still announces it needs no record. Nothing else bounds the records: each
+/// one comes from a roster commit by one of the account's own devices.
+pub const ANNOUNCED_KEY_PACKAGE_RETENTION_SECS: u64 = 7_261_200;
 
 /// Every KeyPackage a device-group roster this device held announced, by
 /// group and slot (mdk#2628 D31 item 7). The engine records each roster
@@ -1044,9 +1044,8 @@ pub trait AnnouncedKeyPackageStorage {
         announced: &[AnnouncedKeyPackage],
         seen_at: u64,
     ) -> StorageResult<()>;
-    /// Drop every record last seen before `before`, and each group slot's
-    /// records beyond its `per_slot` most recently seen.
-    fn prune_announced_key_packages(&self, before: u64, per_slot: usize) -> StorageResult<()>;
+    /// Drop every record last seen before `before`.
+    fn prune_announced_key_packages(&self, before: u64) -> StorageResult<()>;
     /// What `group_id`'s rosters announced, last seen at or after `since`.
     fn announced_key_packages(
         &self,
