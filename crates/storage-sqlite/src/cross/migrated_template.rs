@@ -293,6 +293,9 @@ mod tests {
 
     #[test]
     fn a_copy_is_the_database_a_replay_opens() {
+        // Both opens must see the same process-wide setting, which a test that
+        // pins the production settings, run alongside under `cargo test`, flips.
+        crate::base::connection::use_production_storage_for_test_process();
         let dir = tempfile::tempdir().unwrap();
         let (_, copy) = template_in(&dir);
         let replay = replayed();

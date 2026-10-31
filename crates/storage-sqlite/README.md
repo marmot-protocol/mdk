@@ -71,8 +71,10 @@ Tests can opt out of two defaults, because memory security turns every SQLite al
 fsync per commit adds disk waits. Together they made up most of the workspace test lane's run time. Both helpers exist
 only in this crate's own tests or with the `test-support` feature, and do nothing until a test calls them:
 
-- `in_memory_for_test()` opens an in-memory store without `cipher_memory_security`. This crate's own unit tests get it
-  from `in_memory()`; dependents call it explicitly.
+- `in_memory_for_test()` opens an in-memory store without `cipher_memory_security`, copied from a migrated template
+  kept beside the test binary. The first store a build opens replays the migrations and writes the template; where the
+  binary's directory takes no files, every store replays them. This crate's own unit tests get it from `in_memory()`;
+  dependents call it explicitly.
 - After a test process calls `relax_storage_for_test_process()`, every database it opens skips
   `cipher_memory_security` and uses `synchronous=NORMAL`. `marmot-app`'s constructors call it in its unit tests, and
   this crate's own unit tests start that way. The tests that pin the production settings never call it, and here they
