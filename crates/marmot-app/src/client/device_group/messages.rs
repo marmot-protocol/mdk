@@ -232,7 +232,7 @@ impl AppClient {
         let claim = match sender_leaf_index {
             Some(leaf) => self
                 .runtime
-                .member_device_tag_claim(group_id, epoch, leaf, roster)?,
+                .member_device_tag_claim_at(group_id, epoch, leaf, roster)?,
             None => None,
         };
         if claim == Some(DeviceTagClaim::Device(*from)) {

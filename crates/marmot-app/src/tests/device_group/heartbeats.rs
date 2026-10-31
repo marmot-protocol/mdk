@@ -183,6 +183,38 @@ async fn a_heartbeat_counts_whatever_its_content_but_only_in_the_current_tree() 
     );
 }
 
+/// A heartbeat read while this device's own commit in the device group is
+/// staged counts: staging an auto-commit writes the record at the next epoch
+/// while the tree this device holds stays at the heartbeat's until the commit
+/// merges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_heartbeat_counts_while_this_devices_own_commit_is_staged() {
+    use cgka_traits::storage::GroupStorage as _;
+    let (mut devices, group) = settled_linked_devices().await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    forget_activity(
+        &mut devices.phone,
+        &devices.laptop,
+        crate::unix_now_seconds(),
+    );
+    age_heartbeat(&devices.laptop);
+    let mut cursor = devices.relay.published_events.lock().unwrap().len();
+    devices.laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(group_messages_since(&devices.relay, cursor), 1);
+
+    // The record a staged auto-commit leaves: one epoch ahead of the tree.
+    let storage = devices.phone.app.account_storage("alice").unwrap();
+    let mut record = storage.get_group(&group).unwrap();
+    record.epoch = cgka_traits::EpochId(record.epoch.0 + 1);
+    storage.put_group(&record).unwrap();
+    deliver_new(&mut devices.phone, &devices.relay, &mut cursor).await;
+    assert!(
+        listed(&mut devices.phone, &devices.laptop)
+            .last_active_at
+            .is_some()
+    );
+}
+
 /// A sibling shows inactive 30 days after the later of its last activity
 /// and when this device first found it in the roster. A maintenance pass
 /// that changes that owes hosts a `LinkedDevicesChanged`, and a heartbeat

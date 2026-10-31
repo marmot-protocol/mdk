@@ -3748,17 +3748,14 @@ impl<S: StorageProvider> Engine<S> {
         self.with_mls_group(group_id, f)
     }
 
-    /// Which roster slot the leaf at `leaf_index` belonged to at `epoch`, read
-    /// from its device tag against `roster`, the device group's current
-    /// roster (device-tag-v1.md, "Reading tags").
+    /// Which roster slot the leaf at `leaf_index` belongs to, read from its
+    /// device tag against `roster`, the device group's current roster
+    /// (device-tag-v1.md, "Reading tags").
     ///
-    /// A past epoch is read from its own retained anchor, never from another
-    /// epoch's tree, so a message read after later commits still names the
-    /// leaf that sent it, as that leaf was then (mdk#2628 3.5). That read
-    /// writes nothing: it rewinds inside a savepoint it always rolls back.
-    /// `None` when `epoch` is neither current nor retained, or no leaf sat at
-    /// that index. A leaf of another account reads as unclaimed: tags are
-    /// read only on the reader's own account's leaves.
+    /// `None` when `epoch` is not the group's current epoch or no leaf sits
+    /// at that index, so a caller holding an older event never reads a leaf
+    /// that has since changed hands. A leaf of another account reads as
+    /// unclaimed: tags are read only on the reader's own account's leaves.
     pub fn member_device_tag_claim(
         &self,
         group_id: &GroupId,
@@ -3766,19 +3763,31 @@ impl<S: StorageProvider> Engine<S> {
         leaf_index: u32,
         roster: &DeviceRosterV1,
     ) -> Result<Option<DeviceTagClaim>, EngineError> {
-        let claim = |mls_group: &openmls::group::MlsGroup| {
-            let leaf = mls_group
-                .public_group()
-                .leaf(openmls::prelude::LeafNodeIndex::new(leaf_index))?;
-            let own_account = openmls::prelude::BasicCredential::try_from(
-                leaf.credential().clone(),
-            )
-            .is_ok_and(|credential| credential.identity() == self.identity.self_id().as_slice());
-            Some(if own_account {
-                crate::device_tag::device_tag_claim(leaf, roster)
+        self.with_live_mls_group(group_id, |mls_group| {
+            Ok(if mls_group.epoch().as_u64() == epoch.0 {
+                self.leaf_device_tag_claim(mls_group, leaf_index, roster)
             } else {
-                DeviceTagClaim::Unclaimed
+                None
             })
+        })
+    }
+
+    /// Which roster slot the leaf at `leaf_index` belonged to at `epoch`, as
+    /// [`Self::member_device_tag_claim`] reads it, but a past epoch is read
+    /// from its own retained anchor, never from another epoch's tree, so a
+    /// message read after later commits still names the leaf that sent it, as
+    /// that leaf was then (mdk#2628 3.5). That read writes nothing: it
+    /// rewinds inside a savepoint it always rolls back. `None` when `epoch` is
+    /// neither current nor retained, or no leaf sat at that index.
+    pub fn member_device_tag_claim_at(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> Result<Option<DeviceTagClaim>, EngineError> {
+        let claim = |mls_group: &openmls::group::MlsGroup| {
+            self.leaf_device_tag_claim(mls_group, leaf_index, roster)
         };
         if let Some(current) = self.with_live_mls_group(group_id, |mls_group| {
             Ok((mls_group.epoch().as_u64() == epoch.0).then(|| claim(mls_group)))
@@ -3824,6 +3833,26 @@ impl<S: StorageProvider> Engine<S> {
             Err(Undone::Read(read)) => read,
             Err(Undone::Storage(error)) => Err(error.into()),
         }
+    }
+
+    /// The slot the leaf at `leaf_index` of `mls_group` reads as, or `None`
+    /// when no leaf sits there.
+    fn leaf_device_tag_claim(
+        &self,
+        mls_group: &openmls::group::MlsGroup,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> Option<DeviceTagClaim> {
+        let leaf = mls_group
+            .public_group()
+            .leaf(openmls::prelude::LeafNodeIndex::new(leaf_index))?;
+        let own_account = openmls::prelude::BasicCredential::try_from(leaf.credential().clone())
+            .is_ok_and(|credential| credential.identity() == self.identity.self_id().as_slice());
+        Some(if own_account {
+            crate::device_tag::device_tag_claim(leaf, roster)
+        } else {
+            DeviceTagClaim::Unclaimed
+        })
     }
 
     /// Every other leaf of this device's account in `group_id`'s current

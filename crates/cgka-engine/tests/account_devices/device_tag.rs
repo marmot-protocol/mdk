@@ -2,11 +2,12 @@
 //! of an account's devices holds a leaf (mdk#2628 item 3.1d, D32).
 //!
 //! Read through the engine, a member's leaf belongs to the roster slot its
-//! tag names, in the tree of the epoch asked for: the current one, or a past
-//! one from its retained anchor, a read that writes nothing. A tag never makes
-//! a Commit invalid. No group may require 0x800f, and a GroupContext entry
-//! under it is unknown data that this engine never writes. The tag crypto and
-//! the spec vector are tested in the engine's `device_tag` module.
+//! tag names, in the current tree only, or, read at an epoch, in the tree of
+//! that epoch: the current one, or a past one from its retained anchor, a
+//! read that writes nothing. A tag never makes a Commit invalid. No group may
+//! require 0x800f, and a GroupContext entry under it is unknown data that
+//! this engine never writes. The tag crypto and the spec vector are tested in
+//! the engine's `device_tag` module.
 //!
 //! A device tags from the roster of the device group its host names, once its
 //! entry there, the one at its KeyPackage publication slot, carries its MLS
@@ -104,7 +105,7 @@ fn claim(
 ) -> Option<DeviceTagClaim> {
     reader
         .engine
-        .member_device_tag_claim(gid, epoch, leaf_index, roster)
+        .member_device_tag_claim_at(gid, epoch, leaf_index, roster)
         .unwrap()
 }
 
@@ -136,9 +137,19 @@ async fn a_member_leaf_reads_as_the_device_its_tag_names() {
         Some(DeviceTagClaim::Device(slot(2)))
     );
 
-    // An older epoch reads the leaf as it was then, from its retained
-    // anchor, and leaves the group's state and snapshots as they were; an
-    // epoch with no anchor, or an index with no leaf, reads nothing.
+    // The current-tree reader reads only the current epoch.
+    let current = |epoch| {
+        phone
+            .engine
+            .member_device_tag_claim(&gid, epoch, laptop_leaf, &tagged)
+            .unwrap()
+    };
+    assert_eq!(current(after), Some(DeviceTagClaim::Device(slot(2))));
+    assert_eq!(current(before), None);
+
+    // Read at an epoch, an older one reads the leaf as it was then, from its
+    // retained anchor, and leaves the group's state and snapshots as they
+    // were; an epoch with no anchor, or an index with no leaf, reads nothing.
     let state = phone.storage.group_replay_state_fingerprint(&gid).unwrap();
     let snapshots = phone.storage.list_group_snapshots(&gid).unwrap();
     assert_eq!(

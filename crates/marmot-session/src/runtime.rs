@@ -787,11 +787,10 @@ where
         Ok(self.session.admin_pubkeys(group_id)?)
     }
 
-    /// Which roster slot the leaf at `leaf_index` belonged to at `epoch`,
-    /// read from its device tag against the device group's current `roster`.
-    /// A past epoch is read from its own retained anchor. `None` when `epoch`
-    /// is neither current nor retained, or no leaf sat at that index. See
-    /// [`cgka_engine::engine::Engine::member_device_tag_claim`].
+    /// Which roster slot the leaf at `leaf_index` belongs to, read from its
+    /// device tag against the device group's current `roster`. `None` when
+    /// `epoch` is not the group's current epoch or no leaf sits at that
+    /// index. See [`cgka_engine::engine::Engine::member_device_tag_claim`].
     pub fn member_device_tag_claim(
         &self,
         group_id: &GroupId,
@@ -802,6 +801,23 @@ where
         Ok(self
             .session
             .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
+    }
+
+    /// Which roster slot the leaf at `leaf_index` belonged to at `epoch`,
+    /// read as [`Self::member_device_tag_claim`] does, but a past epoch from
+    /// its own retained anchor. `None` when `epoch` is neither current nor
+    /// retained, or no leaf sat at that index. See
+    /// [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
+    pub fn member_device_tag_claim_at(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> AccountResult<Option<DeviceTagClaim>> {
+        Ok(self
+            .session
+            .member_device_tag_claim_at(group_id, epoch, leaf_index, roster)?)
     }
 
     /// This account's other leaves in `group_id`, by signature key, with the

@@ -1036,6 +1036,19 @@ impl AccountDeviceSession {
             .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
     }
 
+    /// See [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
+    pub fn member_device_tag_claim_at(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> SessionResult<Option<DeviceTagClaim>> {
+        Ok(self
+            .engine
+            .member_device_tag_claim_at(group_id, epoch, leaf_index, roster)?)
+    }
+
     /// See [`cgka_engine::engine::Engine::own_account_leaf_claims`].
     pub fn own_account_leaf_claims(
         &self,

@@ -159,9 +159,7 @@ impl AppClient {
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
-        // The tag reader reads a past epoch from its retained anchor; a
-        // heartbeat counts only from the tree this device holds now.
-        if &exchange.group_id != group_id || epoch != self.runtime.group_record(group_id)?.epoch {
+        if &exchange.group_id != group_id {
             return Ok(());
         }
         let claim = match sender_leaf_index {
@@ -172,7 +170,7 @@ impl AppClient {
             None => None,
         };
         let (slot, linked_at) = match claim {
-            // The index holds no leaf.
+            // The epoch moved on, or the index holds no leaf.
             None => return Ok(()),
             Some(DeviceTagClaim::Device(slot)) => match exchange.roster.devices.get(&slot) {
                 Some(entry) if exchange.is_sibling(&slot) => (slot, entry.linked_at),
