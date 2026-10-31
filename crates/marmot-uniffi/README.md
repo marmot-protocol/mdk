@@ -854,7 +854,7 @@ also carry their ordered `tags`, so clients can render app-defined event types w
 raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows.
 MDK-owned kinds continue to use prepared fields and references there. Custom-event tag changes invalidate
 the conversion cache. Custom events do not change chat-list activity or notification policy.
-`sendCustomEvent` refuses every kind MDK owns, the device-group kinds 457, 459, 460, 462, 475 and 476 included. Those
+`sendCustomEvent` refuses every kind MDK owns, the device-group kinds 457, 459, 460, 475 and 476 included. Those
 are read only in the account's own device group, so a chat never shows one, as a row, a message or a notification.
 
 
@@ -1062,10 +1062,11 @@ It is false in every release build until the roster's spec lands.
 `compromise_warning(account_ref)` returns the account's open compromise warning on this device as
 `CompromiseWarningItemFfi` records, the earliest gathered first. An empty list means no warning is open:
 
-- Each item is a rejection, which means someone holding the account's signing key, or a session with its remote
-  signer, published where the account's devices did not. `RejectedSignIn` is a sign-in answered This wasn't me, on
-  this device or another; `RejectedKeyPackage` is a KeyPackage one of the account's devices found where they had not
-  published, with its `key_package_ref_hex`. `slot_id_hex` and `occurred_at` say where and when.
+- Each item means someone holding the account's signing key, or a session with its remote signer, published where the
+  account's devices did not. `RejectedSignIn` is a sign-in answered This wasn't me, on this device or another;
+  `ForeignOwnSlotKeyPackage` is a KeyPackage this device found in its own slot that it did not make, with its
+  `key_package_ref_hex`. Only the device that found it warns of it, and it has replaced it. `slot_id_hex` and
+  `occurred_at` say where and when.
 - Later releases add reasons. Show one the app does not know as a generic one.
 - The warning gathers this device's rejections and those in its device group's roster, so a rejection made on another
   device warns here too. Rejections already in the first roster this device trusts count as seen: the user saw them on

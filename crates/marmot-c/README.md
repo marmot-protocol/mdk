@@ -478,8 +478,8 @@ on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`.
 `marmot_compromise_warning` blocks on the account worker, reads local state only, and writes the account's open
 compromise warning on this device as an owned `MarmotCompromiseWarningItemList`; free it with
 `marmot_compromise_warning_item_list_free`. An empty list means no warning is open. Each `MarmotCompromiseWarningItem`
-has its `reason`, the `slot_id_hex` the rejection names, a `key_package_ref_hex` set only for
-`MARMOT_COMPROMISE_WARNING_REASON_REJECTED_KEY_PACKAGE`, and `occurred_at`. `reason` is a
+has its `reason`, the `slot_id_hex` the item names, a `key_package_ref_hex` set only for
+`MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE`, and `occurred_at`. `reason` is a
 `MarmotCompromiseWarningReason` discriminant carried as `uint32_t`: later releases add values, so show one the host
 does not know as a generic reason. `marmot_dismiss_compromise_warning` closes the warning on this device only. Re-read
 it on `MARMOT_EVENT_COMPROMISE_WARNING_CHANGED`. It is empty in every release build until the roster's spec lands. See

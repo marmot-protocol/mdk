@@ -32,8 +32,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   (mdk#2628 item 3.1). A group that requires it is a device group. It holds the roster from creation and keeps
   requiring it, and only one account's devices may be members. The roster holds the key that seals the account's
   device tags, which no update changes. A roster update is a list of operations that each set or remove one entry: a
-  device keyed by its KeyPackage slot, with the key it signs its device tags with, a rejected slot (a removed device's
-  keeps that key) or a rejected KeyPackage. Every member applies the operations to the parent's roster. A roster may
+  device keyed by its KeyPackage slot, with the key it signs its device tags with, or a rejected slot (a removed
+  device's keeps that key). Every member applies the operations to the parent's roster. A roster may
   hold at most 20 devices, no two with one tag signature key. The device that creates a device group draws its tag key
   at random. Until the component's spec is adopted, only test-policy builds may advertise it. A release build can't
   create or join a device group, and it treats roster bytes in other groups as unknown data, so nothing ships the
@@ -84,16 +84,19 @@ versioning through the workspace version in the root `Cargo.toml`.
   the roster holds the slot as a device, a link the user confirmed, and commits one again whenever the roster has no
   entry for the slot; it never replaces an entry. The runtime writes them (`AccountDeviceRuntime::reject_device_slots`)
   behind the gate its other roster updates wait behind. A rejection names the slot alone, never its KeyPackage, which
-  may be a copy of a real device's, and a rejected KeyPackage never makes another slot rejected. A sign-in another
+  may be a copy of a real device's. A sign-in another
   device answered keeps its prompt, saying so, until dismissed, and is listed again if the roster loses that answer; one
   whose slot a complete check finds empty stays listed as no longer signed in. A publication that is only stale never
   signs a slot out, and a check of fallback relays, when the account lists none, is never complete. Hosts list sign-ins
   with `unrecognized_sign_ins`, answer one with `answer_sign_in`, and check now with `check_sign_ins`, in `marmot-app`,
   UniFFI and C, and re-read on the `UnrecognizedSignInsChanged` event. Only test-policy builds run any of it.
 - Hosts can warn the user that someone holding the account's signing key published where the account's devices did
-  not (mdk#2628 item 3.7a). `compromise_warning`, in `marmot-app`, UniFFI and C, lists each rejected sign-in and
-  rejected KeyPackage, from this device or its device group's roster, that the user has not seen on this device, with
-  a `CompromiseWarningChanged` event to re-read it. `dismiss_compromise_warning` marks them seen on this device only;
+  not (mdk#2628 items 3.7a and 3.7b). `compromise_warning`, in `marmot-app`, UniFFI and C, lists each rejected
+  sign-in, from this device or its device group's roster, and each KeyPackage this device found in its own slot that it
+  did not make, that the user has not seen on this device, with a `CompromiseWarningChanged` event to re-read it. A
+  device made a KeyPackage when its LeafNode carries the device's signature key, so only a foreign key warns, and only
+  on the device that found it, before it replaces the publication. Existing development device groups must be
+  recreated: the roster dropped its rejected KeyPackages (mdk#2628 D74), which changed its encoding. `dismiss_compromise_warning` marks them seen on this device only;
   a rejection branch selection drops and restores stays seen, and rejections already in a device's first roster count
   as seen. `start_fresh` lets the user start a device without the devices its first check found, answering each Not
   now without rejecting it, and `started_fresh` says whether it did. Only test-policy builds run any of it.
@@ -187,7 +190,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
-- `messages send-event` refuses the device-group kinds 457, 459, 460, 462, 475 and 476 with `reserved_app_event_kind`,
+- `messages send-event` refuses the device-group kinds 457, 459, 460, 475 and 476 with `reserved_app_event_kind`,
   and one received in a chat makes no timeline row or message (mdk#2628). They are read only in the account's device
   group.
 - Creating a group now refuses an initial entry for `marmot.group.account-devices.v1` (0x800d), or any other protocol

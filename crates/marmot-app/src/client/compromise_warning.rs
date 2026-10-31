@@ -1,10 +1,12 @@
-//! The compromise warning (mdk#2628 item 3.7a, D53): someone holding the
-//! account's signing key published where the account's devices did not.
+//! The compromise warning (mdk#2628 items 3.7a and 3.7b, D53): someone
+//! holding the account's signing key published where the account's devices
+//! did not.
 //!
 //! - **What it gathers.** Every `not_me` rejected slot, in the trusted device
-//!   group's roster or among this device's own rejections, and every rejected
-//!   KeyPackage in the roster. A `removed` slot is not a rejection in this
-//!   sense. Later items join the open warning rather than raising another.
+//!   group's roster or among this device's own rejections, and every
+//!   KeyPackage this device found in its own slot that it did not make (see
+//!   `sign_ins`). A `removed` slot is not a rejection in this sense. Later
+//!   items join the open warning rather than raising another.
 //! - **When.** At open, after every roster change, and after this device
 //!   answers This wasn't me. Gathering runs at the next publication seam or
 //!   host read, so a roster that changes many times in one batch is gathered
@@ -22,6 +24,10 @@
 //! - **Ended rejections.** A rejected sign-in the user has not seen leaves
 //!   the warning once neither this device nor the roster holds it, as when
 //!   the user links its slot; it warns again if it stands again.
+//! - **Found KeyPackages.** Only the device that found one warns of it. A
+//!   seen one is kept for a KeyPackage's lifetime from when it was found, so
+//!   a relay that serves it again does not warn twice; an unseen one stays
+//!   until dismissed.
 //!
 //! The wording is the host's. Everything here runs only while device groups
 //! are on.
@@ -48,22 +54,23 @@ use crate::{AppError, unix_now_seconds};
 pub enum CompromiseWarningReason {
     /// A sign-in the user answered This wasn't me, on this device or another.
     RejectedSignIn,
-    /// A KeyPackage one of the account's devices found where they had not
-    /// published, and rejected.
-    RejectedKeyPackage,
+    /// A KeyPackage this device found in its own slot that it did not make.
+    /// This device has replaced it.
+    ForeignOwnSlotKeyPackage,
 }
 
 /// One thing the open compromise warning gathers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompromiseWarningItem {
     pub reason: CompromiseWarningReason,
-    /// The KeyPackage slot (the Nostr `d`) the rejection names: the rejected
-    /// sign-in's, or the one the rejected KeyPackage appeared in.
+    /// The KeyPackage slot (the Nostr `d`) the item names: the rejected
+    /// sign-in's, or this device's own for a KeyPackage found there.
     pub slot_id_hex: String,
-    /// The rejected KeyPackage's `KeyPackageRef`, for `RejectedKeyPackage`.
+    /// The found KeyPackage's `KeyPackageRef`, for
+    /// `ForeignOwnSlotKeyPackage`.
     pub key_package_ref_hex: Option<String>,
-    /// When the rejection was made, in Unix seconds, as the device that made
-    /// it wrote it.
+    /// In Unix seconds: when the rejection was made, as the device that made
+    /// it wrote it, or when this device found the KeyPackage.
     pub occurred_at: u64,
 }
 
@@ -85,8 +92,8 @@ impl AppClient {
                     storage_sqlite::CompromiseWarningReason::RejectedSignIn => {
                         (CompromiseWarningReason::RejectedSignIn, None)
                     }
-                    storage_sqlite::CompromiseWarningReason::RejectedKeyPackage => (
-                        CompromiseWarningReason::RejectedKeyPackage,
+                    storage_sqlite::CompromiseWarningReason::ForeignOwnSlotKeyPackage => (
+                        CompromiseWarningReason::ForeignOwnSlotKeyPackage,
                         Some(record.subject),
                     ),
                 };
@@ -268,14 +275,6 @@ impl AppClient {
                         occurred_at: entry.rejected_at,
                     });
                 }
-            }
-            for (key_package_ref, entry) in &roster.rejected_key_packages {
-                rejected.push(ObservedWarningItem {
-                    reason: storage_sqlite::CompromiseWarningReason::RejectedKeyPackage,
-                    subject: hex::encode(key_package_ref),
-                    slot_id_hex: hex::encode(entry.slot),
-                    occurred_at: entry.rejected_at,
-                });
             }
         }
         Ok((own, rejected))

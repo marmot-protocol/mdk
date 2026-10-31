@@ -4,6 +4,12 @@
 
 ### Breaking changes
 
+- `CompromiseWarningReasonFfi::RejectedKeyPackage` is now
+  `ForeignOwnSlotKeyPackage` (mdk#2628 D74, 3.7b): a KeyPackage this device
+  found in its own slot that it did not make, which only this device warns
+  of. Kind 462 is no longer reserved. The device roster changed its encoding,
+  so existing development device groups must be recreated.
+
 - `SelfMembershipFfi` and `ConversationParticipationFfi` add `DeviceRemoved`
   (mdk#2628 item 3.6b): this device's leaf was removed from a chat the account
   stays in through another of its devices. Show no "removed from group"
@@ -139,7 +145,7 @@
 
 ### Changed
 
-- `send_custom_event` refuses the device-group kinds 457, 459, 460, 462, 475
+- `send_custom_event` refuses the device-group kinds 457, 459, 460, 475
   and 476 as reserved, and one received in a chat makes no timeline row,
   message or notification (mdk#2628). They are read only in the account's
   device group.

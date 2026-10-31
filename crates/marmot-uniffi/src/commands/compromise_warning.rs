@@ -7,10 +7,10 @@ use crate::errors::MarmotKitError;
 #[marmot_uniffi_macros::on_tokio_runtime]
 #[uniffi::export]
 impl Marmot {
-    /// The account's open compromise warning on this device: each rejection
-    /// the user has not seen here, the earliest gathered first. Empty when no
-    /// warning is open. A rejection means someone holding the account's
-    /// signing key, or a session with its remote signer, published where the
+    /// The account's open compromise warning on this device: each item the
+    /// user has not seen here, the earliest gathered first. Empty when no
+    /// warning is open. An item means someone holding the account's signing
+    /// key, or a session with its remote signer, published where the
     /// account's devices did not. The app writes the wording, and never says
     /// the account's devices stopped them. Always empty in release builds
     /// until the roster's spec lands. Refresh on `CompromiseWarningChanged`.

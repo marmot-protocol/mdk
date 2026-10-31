@@ -97,7 +97,7 @@ only telemetry, a closed operation and timing metadata, never a client or storag
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
-| `account_compromise_warning_items` | One row per rejected sign-in and rejected KeyPackage this device gathered, at most 4,096 (`COMPROMISE_WARNING_ITEM_CAP`). Sign-ins each take a user's answer and the roster keeps at most eight rejected KeyPackages per slot for 30 days, so only a misbehaving sibling nears the cap. | An unseen rejected sign-in goes once neither this device nor the roster holds it. A seen rejected KeyPackage goes once both its seen mark and its latest rejection are 7,261,200 seconds old; an unseen one stays until dismissed. Past the cap the oldest seen rows go first, and a dropped seen row that comes back warns again. |
+| `account_compromise_warning_items` | One row per rejected sign-in this device gathered and per KeyPackage it found in its own slot that it did not make, at most 4,096 (`COMPROMISE_WARNING_ITEM_CAP`). Sign-ins each take a user's answer, so only someone publishing into this device's slot many times over nears the cap. | An unseen rejected sign-in goes once neither this device nor the roster holds it. A seen found KeyPackage goes 7,261,200 seconds after it was found, by when it has expired; an unseen one stays until dismissed. Past the cap the oldest seen rows go first, and a dropped seen row that comes back warns again. |
 | `account_compromise_warning_baseline` | One row: the device group whose first roster this device gathered. | Replaced when the device trusts another device group. |
 
 ### `storage-sqlite` durable moderation (`src/timeline/reports.rs`, `src/timeline.rs`)
