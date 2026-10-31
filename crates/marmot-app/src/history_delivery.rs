@@ -170,6 +170,16 @@ pub(crate) fn blossom_server_is_valid(server: &str) -> bool {
     validate_and_normalize_blob_endpoint_url_v2(server).is_ok_and(|normalized| normalized == server)
 }
 
+/// The Blossom server a delivery names for an encrypted-media endpoint: its
+/// base URL without the query a v1 endpoint may carry, which the Blossom
+/// transport drops anyway. `None` when that is no server a delivery may name.
+pub(crate) fn blossom_server_for_endpoint(base_url: &str) -> Option<String> {
+    let mut url = url::Url::parse(base_url.trim()).ok()?;
+    url.set_query(None);
+    let server = validate_and_normalize_blob_endpoint_url_v2(url.as_str()).ok()?;
+    blossom_server_is_valid(&server).then_some(server)
+}
+
 /// The context a delivery's key and hash are sealed with: the purpose, the
 /// sending slot, the receiving slot and the chat's MLS group id, each a
 /// length-prefixed vector.
@@ -345,6 +355,31 @@ mod tests {
         let mut overlong = largest.encode();
         overlong.push_str(&" ".repeat(MAX_HISTORY_DELIVERY_CONTENT_BYTES));
         assert!(HistoryDelivery::decode(&overlong).is_err());
+    }
+
+    #[test]
+    fn a_server_is_named_without_the_query_a_v1_endpoint_may_carry() {
+        for (endpoint, server) in [
+            (
+                "https://blossom.example/?x=1",
+                Some("https://blossom.example/"),
+            ),
+            ("https://blossom.example", Some("https://blossom.example/")),
+            (
+                "https://blossom.example/media/",
+                Some("https://blossom.example/media/"),
+            ),
+            ("https://user@blossom.example/", None),
+            ("https://blossom.example/#part", None),
+            ("ftp://blossom.example/", None),
+            ("not a url", None),
+        ] {
+            assert_eq!(
+                blossom_server_for_endpoint(endpoint).as_deref(),
+                server,
+                "{endpoint}"
+            );
+        }
     }
 
     #[test]

@@ -835,10 +835,11 @@ async fn a_blossom_history_whose_delivery_reaches_no_relay_is_sent_again() {
 }
 
 /// A chat made where no media server is configured carries no media policy,
-/// so it has no Blossom endpoint: its long history is forgotten unsent.
+/// so it has no Blossom endpoint: its long history is forgotten unsent, and
+/// never holds up another chat's history behind it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_long_history_of_a_text_only_chat_is_forgotten() {
-    let (devices, _group, _chat, _first) = history_devices().await;
+    let (devices, _group, chat, _first) = history_devices().await;
     let Devices {
         _dirs,
         relay,
@@ -871,27 +872,42 @@ async fn a_long_history_of_a_text_only_chat_is_forgotten() {
         link,
     };
     let text_only = devices.phone.create_group("text only", &[]).await.unwrap();
-    send_text(
+    let text_only_hex = hex::encode(text_only.as_slice());
+    let blossom = local_blossom();
+    use_blossom(
         &mut devices.phone,
-        &text_only,
-        &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
+        &chat,
+        BLOSSOM_LOCATOR_KIND_V1,
+        &blossom.url,
     )
     .await;
-    add_laptop(&mut devices, &text_only).await;
+    for group in [&text_only, &chat] {
+        send_text(
+            &mut devices.phone,
+            group,
+            &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
+        )
+        .await;
+        add_laptop(&mut devices, group).await;
+    }
     let before = published_count(&devices.relay);
     devices.phone.drive_history_deliveries().await;
-    assert_eq!(
-        storage(&devices.phone_app)
-            .unsent_history_deliveries()
-            .unwrap()
-            .len(),
-        1,
-        "owed through Blossom"
-    );
+    let phone_storage = storage(&devices.phone_app);
+    let owed = phone_storage.unsent_history_deliveries().unwrap();
+    assert_eq!(owed.len(), 2, "both owed through Blossom");
+    // The text-only history comes up first.
+    let first = owed
+        .iter()
+        .find(|owed| owed.group_id_hex == text_only_hex)
+        .unwrap();
+    phone_storage
+        .defer_blossom_history_delivery(first, 1)
+        .unwrap();
     devices.phone.drive_history_blobs().await;
-    assert_eq!(published_count(&devices.relay), before);
+    assert_eq!(blossom.blobs.lock().unwrap().len(), 1);
+    assert_eq!(published_count(&devices.relay), before + 1);
     assert!(
-        storage(&devices.phone_app)
+        phone_storage
             .unsent_history_deliveries()
             .unwrap()
             .is_empty()
@@ -924,6 +940,41 @@ async fn a_long_history_of_a_chat_with_no_blossom_endpoint_is_forgotten() {
     assert!(
         storage(&devices.phone_app)
             .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A Blossom delivery naming the device group itself is refused when read,
+/// never parked to fetch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blossom_delivery_of_the_device_group_is_refused_unfetched() {
+    let (mut devices, group, _chat, _first) = history_devices().await;
+    let exchange = devices.phone.device_group_exchange().unwrap().unwrap();
+    let event = devices
+        .phone
+        .history_delivery_event(
+            &exchange,
+            &slot_of(&devices.laptop),
+            &group,
+            &[1; 32],
+            &[2; 32],
+            crate::history_delivery::DeliveredBundle::Blossom(vec![
+                "https://blossom.example/".to_owned(),
+            ]),
+        )
+        .unwrap();
+    assert!(
+        devices
+            .phone
+            .send_device_group_event(&group, event)
+            .await
+            .unwrap()
+    );
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    assert!(
+        storage(&devices.laptop_app)
+            .parked_history_delivery_chats()
             .unwrap()
             .is_empty()
     );

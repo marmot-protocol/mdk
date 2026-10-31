@@ -58,7 +58,7 @@ use crate::history_bundle::{ChatPosition, HISTORY_BUNDLE_MAX_PLAINTEXT, seal_his
 use crate::history_delivery::{
     DeliveredBundle, HistoryDelivery, INLINE_BUNDLE_MAX_PLAINTEXT, KIND_HISTORY_DELIVERY,
     MAX_BLOSSOM_BUNDLES, MAX_HISTORY_DELIVERY_CONTENT_BYTES, MAX_INLINE_BUNDLES,
-    blossom_server_is_valid, delivery_context, opened_key_and_hash, sealed_plaintext,
+    blossom_server_for_endpoint, delivery_context, opened_key_and_hash, sealed_plaintext,
 };
 use crate::media::{BlossomHttpTransport, fetch_history_blob, upload_history_blob};
 use crate::{AppError, unix_now_seconds};
@@ -438,7 +438,7 @@ impl AppClient {
 
     /// The delivery of one bundle to `receiver`, its key and hash sealed to
     /// the receiver's history key.
-    fn history_delivery_event(
+    pub(crate) fn history_delivery_event(
         &self,
         exchange: &Exchange,
         receiver: &DeviceSlotId,
@@ -475,8 +475,9 @@ impl AppClient {
     }
 
     /// The Blossom servers this device uploads `chat`'s history to: the
-    /// chat's Blossom endpoints a delivery can name, loopback ones only in a
-    /// build that allows them. Refused when there are none.
+    /// chat's Blossom endpoints, each named as a delivery can name it, once,
+    /// loopback ones only in a build that allows them. Refused when there are
+    /// none.
     fn history_blossom_servers(&self, chat: &GroupId) -> Result<Vec<String>, AppError> {
         let allow_loopback = self.app.allow_loopback_blob_endpoints();
         // A lookup failure stays an error, to retry; a chat with no media
@@ -487,14 +488,15 @@ impl AppClient {
             .map_err(|_| AppError::DeviceGroupRefused("history_delivery_no_blossom"))?
             .default_blob_endpoints
             .into_iter()
-            .filter(|endpoint| {
-                endpoint.locator_kind == BLOSSOM_LOCATOR_KIND_V1
-                    && blossom_server_is_valid(&endpoint.base_url)
-                    && (allow_loopback
-                        || !crate::media::is_loopback_http_endpoint(&endpoint.base_url))
-            })
-            .map(|endpoint| endpoint.base_url)
-            .collect::<Vec<_>>();
+            .filter(|endpoint| endpoint.locator_kind == BLOSSOM_LOCATOR_KIND_V1)
+            .filter_map(|endpoint| blossom_server_for_endpoint(&endpoint.base_url))
+            .filter(|server| allow_loopback || !crate::media::is_loopback_http_endpoint(server))
+            .fold(Vec::new(), |mut servers, server| {
+                if !servers.contains(&server) {
+                    servers.push(server);
+                }
+                servers
+            });
         if servers.is_empty() {
             return Err(AppError::DeviceGroupRefused("history_delivery_no_blossom"));
         }
@@ -859,11 +861,15 @@ impl AppClient {
                 Err(AppError::UnknownGroup(_)) => ParkedBundle::Inline(bundle),
                 Err(error) => return Err(error),
             },
-            // Fetched off the worker, once this device holds the chat.
-            DeliveredBundle::Blossom(servers) => ParkedBundle::Blossom {
-                servers,
-                fetch_due_at: now,
-                fetch_attempts: 0,
+            // Fetched off the worker, once this device holds the chat; one
+            // naming a chat that can carry no history is refused unfetched.
+            DeliveredBundle::Blossom(servers) => match self.history_chat(&chat) {
+                Ok(_) | Err(AppError::UnknownGroup(_)) => ParkedBundle::Blossom {
+                    servers,
+                    fetch_due_at: now,
+                    fetch_attempts: 0,
+                },
+                Err(error) => return Err(error),
             },
         };
         self.app

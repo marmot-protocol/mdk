@@ -236,8 +236,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   through Blossom as a whole, never mixed: upload its newest `MAX_BLOSSOM_BUNDLES` bundles off the worker
   (`HistoryUpload`, dispatched by `dispatch_history_blobs` on the media executor), each to the first of the chat's
   Blossom endpoints that takes it, keeping bundle keys only in memory; send its deliveries, each naming its server,
-  only once every blob is uploaded. A receiver parks a Blossom delivery and fetches the blob off the worker once it
-  holds the chat (`HistoryFetch`), through the dial-safe Blossom transport, bounded by the largest bundle
+  only once every blob is uploaded. A receiver parks a Blossom delivery (refusing one whose chat could carry no
+  history, as `history_chat` does) and fetches the blob off the worker once it holds the chat (`HistoryFetch`), through the dial-safe Blossom transport, bounded by the largest bundle
   ciphertext; a failed upload, send or fetch waits and tries again, and a row that fails to prepare waits alone
   rather than block the rest. A chat with no Blossom endpoint forgets such a history. Only a refusal drops a
   received delivery: any other error fails the projection so it is read again.

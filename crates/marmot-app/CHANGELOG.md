@@ -121,11 +121,12 @@
   large for one, goes through Blossom (mdk#2628 item 4.2c, D77): its newest 16
   bundles of up to 8 MiB of plaintext each, older ones left out, each uploaded
   as one blob to the first of the chat's Blossom endpoints that takes it, off
-  the account worker. A delivery then names that server (`blossom`) instead
-  of carrying the bundle, and is sent only once every blob is uploaded. The
-  receiver parks it and fetches the blob off the worker once it holds the
-  chat, through the dial-safe Blossom transport, reading at most the largest
-  bundle ciphertext. A failed upload, send or fetch tries again after a wait
+  the account worker. A delivery then names that server (`blossom`, without
+  the query a v1 endpoint may carry) instead of carrying the bundle, and is
+  sent only once every blob is uploaded. The receiver parks it and fetches
+  the blob off the worker once it holds the chat, through the dial-safe
+  Blossom transport, reading at most the largest bundle ciphertext; one
+  naming the device group is refused unfetched. A failed upload, send or fetch tries again after a wait
   that doubles up to an hour, until the delivery is a week old, and so does a
   delivery a relay refuses for good. A chat with no Blossom endpoint, or with
   no media servers at all, gets no such history, and blobs are never deleted:
