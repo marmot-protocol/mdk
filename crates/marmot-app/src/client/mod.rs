@@ -74,7 +74,7 @@ pub(crate) mod audit_v5_probe;
 mod chat_history;
 #[cfg(feature = "test-policy-overrides")]
 pub use chat_history::DevSealedHistoryBundle;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use chat_history::newest_bundles_start;
 pub(crate) mod backups;
 pub(crate) mod compromise_warning;

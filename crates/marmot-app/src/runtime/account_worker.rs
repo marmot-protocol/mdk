@@ -4680,23 +4680,31 @@ async fn complete_media_http(
     }
     match completion {
         MediaHttpCompletion::HistoryUpload(outcome) => {
-            client.finish_history_upload(outcome).await;
+            let settled = client.finish_history_upload(outcome).await;
             drop(permit);
             media_http
                 .history_blobs
                 .upload
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            dispatch_history_blobs(client, media_http);
+            // A failure waits for the next maintenance pass, so a deferral
+            // that could not be written never turns into a tight retry loop.
+            if settled {
+                dispatch_history_blobs(client, media_http);
+            }
             return;
         }
         MediaHttpCompletion::HistoryFetch(outcome) => {
-            client.finish_history_fetch(outcome);
+            let settled = client.finish_history_fetch(outcome);
             drop(permit);
             media_http
                 .history_blobs
                 .fetch
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            dispatch_history_blobs(client, media_http);
+            // A failure waits for the next maintenance pass, so a deferral
+            // that could not be written never turns into a tight retry loop.
+            if settled {
+                dispatch_history_blobs(client, media_http);
+            }
             return;
         }
         MediaHttpCompletion::Attachment {

@@ -540,23 +540,26 @@ impl AppClient {
     /// Send the deliveries of a history whose blobs were uploaded, each
     /// naming the server that holds its blob, and mark it sent. An upload or
     /// send that failed tries again later; a history that can no longer be
-    /// sent is forgotten.
-    pub(crate) async fn finish_history_upload(&mut self, outcome: HistoryUploadOutcome) {
+    /// sent is forgotten. Returns whether the history was settled, so the
+    /// next one may start at once.
+    pub(crate) async fn finish_history_upload(&mut self, outcome: HistoryUploadOutcome) -> bool {
         let HistoryUploadOutcome { owed, result } = outcome;
-        if let Err(error) = self.send_uploaded_history(&owed, result).await {
-            tracing::warn!(
-                target: TRACE_TARGET,
-                method = "finish_history_upload",
-                error_kind = error.privacy_safe_kind(),
-                "an uploaded history was not sent; retrying later"
-            );
-            if let Ok(storage) = self.app.account_storage(&self.state.label) {
-                let retry_at = blossom_retry_at(unix_now_seconds(), owed.blossom_attempts);
-                let _ = storage
-                    .app_storage()
-                    .defer_blossom_history_delivery(&owed, retry_at);
-            }
+        let Err(error) = self.send_uploaded_history(&owed, result).await else {
+            return true;
+        };
+        tracing::warn!(
+            target: TRACE_TARGET,
+            method = "finish_history_upload",
+            error_kind = error.privacy_safe_kind(),
+            "an uploaded history was not sent; retrying later"
+        );
+        if let Ok(storage) = self.app.account_storage(&self.state.label) {
+            let retry_at = blossom_retry_at(unix_now_seconds(), owed.blossom_attempts);
+            let _ = storage
+                .app_storage()
+                .defer_blossom_history_delivery(&owed, retry_at);
         }
+        false
     }
 
     async fn send_uploaded_history(
@@ -678,8 +681,9 @@ impl AppClient {
 
     /// Import a fetched blob and drop its parked delivery. A fetch that
     /// failed tries again later, as does an import that failed for any
-    /// reason but a refusal.
-    pub(crate) fn finish_history_fetch(&mut self, outcome: HistoryFetchOutcome) {
+    /// reason but a refusal. Returns whether the delivery was settled, so the
+    /// next one may start at once.
+    pub(crate) fn finish_history_fetch(&mut self, outcome: HistoryFetchOutcome) -> bool {
         let HistoryFetchOutcome { parked, result } = outcome;
         let result = result.and_then(|ciphertext| {
             let exchange = self
@@ -689,9 +693,10 @@ impl AppClient {
             self.import_delivered_bundle(&chat, &from, &key, &hash, &ciphertext)
         });
         let Ok(storage) = self.app.account_storage(&self.state.label) else {
-            return;
+            return false;
         };
         let storage = storage.app_storage();
+        let mut progressed = true;
         let settled = match result {
             Ok(()) => storage.drop_parked_history_delivery(&parked.app_event_id),
             Err(AppError::DeviceGroupRefused(reason)) => {
@@ -710,6 +715,7 @@ impl AppClient {
                     error_kind = error.privacy_safe_kind(),
                     "a history blob was not imported; retrying later"
                 );
+                progressed = false;
                 let attempts = match &parked.bundle {
                     ParkedBundle::Blossom { fetch_attempts, .. } => *fetch_attempts,
                     ParkedBundle::Inline(_) => 0,
@@ -726,20 +732,26 @@ impl AppClient {
                 method = "finish_history_fetch",
                 "a parked history delivery was not settled"
             );
+            return false;
         }
+        progressed
     }
 
     /// Upload and fetch every due Blossom history in place, as the account
     /// worker does off it. Test support only.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-policy-overrides"))]
     pub(crate) async fn drive_history_blobs(&mut self) {
         while let Ok(Some(upload)) = self.prepare_history_upload() {
             let outcome = upload.run().await;
-            self.finish_history_upload(outcome).await;
+            if !self.finish_history_upload(outcome).await {
+                break;
+            }
         }
         while let Ok(Some(fetch)) = self.prepare_history_fetch() {
             let outcome = fetch.run().await;
-            self.finish_history_fetch(outcome);
+            if !self.finish_history_fetch(outcome) {
+                break;
+            }
         }
     }
 
