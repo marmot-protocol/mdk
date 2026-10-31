@@ -416,6 +416,25 @@ fn a_winning_pin_or_mute_is_applied_once_and_never_taken_for_a_local_change() {
     assert_eq!(owed.len(), 1);
     assert_eq!(owed[0].value, SmallStateValue::Mute(MuteSetting::Unmuted));
     assert_eq!(owed[0].version.unwrap().version, 5);
+
+    // A winning unmute from another device clears a mute set here.
+    app.set_chat_muted("22", None).unwrap();
+    assert_eq!(sync(&store, &[], &rule).recorded, 1);
+    let outcome = sync(
+        &store,
+        &[versioned(
+            "22",
+            SmallStateValue::Mute(MuteSetting::Unmuted),
+            9,
+            9,
+        )],
+        &rule,
+    );
+    assert_eq!(
+        outcome.applied.get("22"),
+        Some(&BTreeSet::from([SmallStateItemName::Mute]))
+    );
+    assert!(!app.chat_notification_settings("22").unwrap().muted);
 }
 
 #[test]
