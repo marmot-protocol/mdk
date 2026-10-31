@@ -74,6 +74,7 @@ pub(crate) mod audit_v5_probe;
 mod chat_history;
 #[cfg(feature = "test-policy-overrides")]
 pub use chat_history::DevSealedHistoryBundle;
+pub(crate) mod compromise_warning;
 pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
 pub(crate) mod device_pairing;
@@ -817,6 +818,15 @@ pub struct AppClient {
     /// open. The same seams as `linked_devices_changed` drain it into one
     /// `UnrecognizedSignInsChanged`.
     pub(crate) unrecognized_sign_ins_changed: bool,
+    /// The compromise warning may have changed since hosts last heard: a
+    /// gather that added or dropped an unseen item, a dismissal, or an open.
+    /// The same seams drain it into one `CompromiseWarningChanged`
+    /// (mdk#2628 3.7a).
+    pub(crate) compromise_warning_changed: bool,
+    /// The roster changed, or this device rejected a sign-in, since the
+    /// warning last gathered; set at open. The next seam or host read
+    /// gathers.
+    pub(crate) compromise_warning_gather_due: bool,
     /// Linking a new device may have changed as hosts would read it, or the
     /// client just opened, ending any link in progress. The same seams drain
     /// it into one `DeviceLinkChanged`.

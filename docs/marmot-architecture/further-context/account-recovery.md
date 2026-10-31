@@ -781,6 +781,28 @@ hint change, a relay reconnect or its earliest retry time. An explicit pass runs
 once in place within a budget, as a directly owned client's `sync()` does behind the gate.
 Its starting values are convergence-ledger decision A19.
 
+The runner's inputs come from the account itself. A group with a conversation window open is
+in the window class while the window holds its capture. A reconnect is a relay whose
+connection generation in the account's relay pool moved since the runner last looked: it ends
+that relay's cooldown, its caps are read again, and the survey that follows reads fresh tails.
+The runner's first look only records the generations, so a connection made before it ends
+nothing. A reconnect that a lag of the pool's notifications skipped still moves the
+generation, and a relay that leaves the pool leaves the feed. An Unrecoverable group's routes are suspended: their debt keeps accruing, but their
+units and re-checks are not scheduled, charged, broken or noticed, since a fetch would only
+fill the frozen copy's deferred input. For the same reason admission gives back what the group
+had staged, owed again, so it holds no staging bound, frontier or fence. With the gate on, the comparison owner also leaves their
+epoch-gap obligations out of its grant, so they stay ready and are never fetched. A retained
+route owes nothing past its switch plus the clock-skew allowance: members that had not applied
+the switch by then still send there, and its live subscription carries that. A relay a route
+replacement drops is retired as gone at the runner's next debt turn, once the routes still do
+not carry it and its group is terminal or still has a route: what it owed, parked or retired
+becomes a gone span that loss never reopens. A group left with no route may only be waiting to
+hydrate, so that drop is forgotten. A gone relay that the routes carry again owes its whole
+goal again; nothing else re-arms a unit when a route gains a relay. Pending drops are not kept
+across a restart, which leaves their debt inert. The account breaker reports each pause once:
+a warning, a process count, and a v5 `recovery_runner_paused` audit row with the cap, the
+hour's usage and the process totals of pauses and late findings.
+
 A unit compares instead of sweeping when its relay's recorded caps show NIP-77 and the device
 already holds events in the owed range: its retained inventory and anything staged. With
 nothing held a sweep is cheaper, since every id the relay names would be fetched anyway. The

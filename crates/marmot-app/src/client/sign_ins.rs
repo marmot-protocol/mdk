@@ -462,6 +462,9 @@ impl AppClient {
             return Err(AppError::DeviceGroupRefused("sign_in_answered"));
         }
         self.unrecognized_sign_ins_changed = true;
+        if to == SignInAnswer::Rejected {
+            self.note_compromise_warning_due();
+        }
         if to == SignInAnswer::Rejected
             && let Err(error) = self.commit_sign_in_rejections().await
         {
@@ -473,6 +476,43 @@ impl AppClient {
             );
         }
         Ok(())
+    }
+
+    /// Start this device without the devices its first check found (D54,
+    /// Scene 3): Not now for each of them, now and for one first listed
+    /// later. It rejects nothing and raises no warning, so one of them can
+    /// still link this device. Refused before the first check
+    /// (`sign_ins_unchecked`) and once this device trusts a device group
+    /// (`device_group_exists`).
+    pub(crate) fn start_fresh(&mut self) -> Result<(), AppError> {
+        if !self.app.device_groups_enabled() {
+            return Err(AppError::DeviceGroupRefused("roster_unsupported"));
+        }
+        if self.trusted_device_group()?.is_some() {
+            return Err(AppError::DeviceGroupRefused("device_group_exists"));
+        }
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        match storage.start_fresh(unix_now_seconds())? {
+            None => Err(AppError::DeviceGroupRefused("sign_ins_unchecked")),
+            Some(changed) => {
+                self.unrecognized_sign_ins_changed |= changed;
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether this device started fresh and still trusts no device group,
+    /// so the host can say that only chats it is invited to from now on are
+    /// here. False while device groups are off.
+    pub(crate) fn started_fresh(&mut self) -> Result<bool, AppError> {
+        if !self.app.device_groups_enabled() || self.trusted_device_group()?.is_some() {
+            return Ok(false);
+        }
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .started_fresh()?)
     }
 
     /// Commit every rejection this device made that the trusted device

@@ -654,6 +654,9 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
                 "refusals are shed only once the bound is full",
             )
         }
+        AuditEventKind::RecoveryRunnerPaused { pauses, .. } => {
+            require(*pauses > 0, "a pause row counts its own pause")
+        }
         _ => Ok(()),
     }
 }

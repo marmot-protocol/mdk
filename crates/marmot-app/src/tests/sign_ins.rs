@@ -36,16 +36,16 @@ fn sign_in_app_at(
 
 /// Alice's account on `N` devices sharing one relay. A device signs in,
 /// and publishes its KeyPackage, only when a test opens it.
-struct Account {
+pub(super) struct Account {
     _dirs: Vec<tempfile::TempDir>,
-    alice_id: String,
+    pub(super) alice_id: String,
     keys: Keys,
-    relay: Arc<ScriptedPushRelayClient>,
-    apps: Vec<MarmotApp>,
+    pub(super) relay: Arc<ScriptedPushRelayClient>,
+    pub(super) apps: Vec<MarmotApp>,
 }
 
 impl Account {
-    fn new(devices: usize, device_groups: bool) -> Self {
+    pub(super) fn new(devices: usize, device_groups: bool) -> Self {
         let dirs: Vec<_> = (0..devices).map(|_| tempfile::tempdir().unwrap()).collect();
         let home = AccountHome::open(dirs[0].path());
         let alice_id = home.create_account("alice").unwrap().account_id_hex;
@@ -70,14 +70,14 @@ impl Account {
     }
 
     /// Sign in on device `index`.
-    async fn open(&self, index: usize) -> AppClient {
+    pub(super) async fn open(&self, index: usize) -> AppClient {
         let app = &self.apps[index];
         remember_test_member_inbox(app, &self.alice_id, "wss://relay.example");
         app.client("alice").await.unwrap()
     }
 }
 
-fn own_slot(client: &AppClient) -> String {
+pub(super) fn own_slot(client: &AppClient) -> String {
     client
         .app
         .account_storage("alice")
@@ -90,7 +90,7 @@ fn own_slot(client: &AppClient) -> String {
 
 /// The link `creator` confirms for `key_package`, naming device group
 /// `group`, whose Welcome comes from `creator`'s leaf.
-fn link_for(
+pub(super) fn link_for(
     key_package: &cgka_traits::KeyPackage,
     group: u8,
     creator: &AppClient,
@@ -111,7 +111,7 @@ fn key_package_ref(key_package: &cgka_traits::KeyPackage) -> String {
         .key_package_ref_hex
 }
 
-fn roster(client: &AppClient, group: &GroupId) -> DeviceRosterV1 {
+pub(super) fn roster(client: &AppClient, group: &GroupId) -> DeviceRosterV1 {
     decode_device_roster_v1(
         &client
             .runtime
@@ -124,7 +124,7 @@ fn roster(client: &AppClient, group: &GroupId) -> DeviceRosterV1 {
 
 /// One roster commit by `client` in `group`, standing in for another
 /// device's change of the roster or a link.
-async fn commit_roster(
+pub(super) async fn commit_roster(
     client: &mut AppClient,
     group: &GroupId,
     operations: Vec<DeviceRosterOperationV1>,

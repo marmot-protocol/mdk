@@ -749,7 +749,7 @@ impl RuntimeSharedServices {
         {
             if config.enabled {
                 tracing::warn!(
-                    target: "marmot_app::relay_telemetry_export",
+                    target: "marmot_app::runtime",
                     method = "configure_relay_telemetry_exporter",
                     "relay telemetry export requested, but marmot-app was built without otlp-export",
                 );
@@ -1563,6 +1563,15 @@ pub enum MarmotAppEvent {
     /// changes, and once each time the account's worker opens or reconnects.
     /// Carries no slots, and may fire with no visible change.
     UnrecognizedSignInsChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// The account's compromise warning may have changed: re-read
+    /// `compromise_warning`. Fires when something new joins it or leaves it
+    /// unseen, after a dismissal, and once each time the account's worker
+    /// opens or reconnects. Carries no slots, and may fire with no visible
+    /// change.
+    CompromiseWarningChanged {
         account_id_hex: String,
         account_label: String,
     },
@@ -2541,6 +2550,50 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
         self.accounts.check_sign_ins(account_ref).await
+    }
+
+    /// Start this device without the devices its first check found (mdk#2628
+    /// 3.7a, "No, start fresh"): every sign-in from before this device is
+    /// answered Not now, now and when one is listed later. It rejects nothing
+    /// and raises no warning, so one of those devices can still link this
+    /// one. Refusals are `DeviceGroupRefused` with `sign_ins_unchecked`
+    /// (before the first check), `device_group_exists` (this device trusts a
+    /// device group), or `roster_unsupported`.
+    pub async fn start_fresh(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.start_fresh(account_ref).await
+    }
+
+    /// Whether this device started fresh and still has no device group, so
+    /// the host can say that only chats it is invited to from now on are
+    /// here. Always false in release builds until the roster's spec lands.
+    /// Refresh on `UnrecognizedSignInsChanged`.
+    pub async fn started_fresh(&self, account_ref: &str) -> Result<bool, AppError> {
+        self.accounts.started_fresh(account_ref).await
+    }
+
+    /// The account's open compromise warning on this device (mdk#2628 3.7a):
+    /// each rejection the user has not seen here, the earliest gathered
+    /// first, with its reason and when it was made. Empty when no warning is
+    /// open. A rejection means someone holding the account's signing key, or
+    /// a session with its remote signer, published where the account's
+    /// devices did not; the host writes the wording and never says the
+    /// account's devices stopped them. Rejections already in the first
+    /// roster this device trusts count as seen. Always empty in release
+    /// builds until the roster's spec lands. Refresh on
+    /// `CompromiseWarningChanged`.
+    pub async fn compromise_warning(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::CompromiseWarningItem>, AppError> {
+        self.accounts.compromise_warning(account_ref).await
+    }
+
+    /// Dismiss the compromise warning on this device: everything it gathers
+    /// now is seen here, and it stays closed until something new arrives.
+    /// Other devices' warnings are unchanged. Refused with
+    /// `DeviceGroupRefused("roster_unsupported")` while device groups are off.
+    pub async fn dismiss_compromise_warning(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.dismiss_compromise_warning(account_ref).await
     }
 
     /// Rename one of this account's devices, this one included, by its

@@ -60,6 +60,8 @@ pub(super) struct Survey {
     pub(super) paused_until: Option<u64>,
     /// The routes whose units hold their group's live frames behind a fence.
     pub(super) fenced: BTreeSet<TransportReconciliationRoute>,
+    /// The routes whose group has a conversation window open.
+    pub(super) window: BTreeSet<TransportReconciliationRoute>,
 }
 
 pub(super) enum Pick {
@@ -209,10 +211,9 @@ pub(super) fn sweepable(routes: &[RunnerRoute]) -> impl Iterator<Item = &RunnerR
         .filter(|route| matches!(route.route, TransportReconciliationRoute::Group(_)))
 }
 
-/// Whether the route's group is suspended (Unrecoverable). PR 5 fills this
-/// from the group's lifecycle; until then every group is eligible.
-pub(super) fn suspended(_route: &RunnerRoute) -> bool {
-    false
+/// Whether the route's group is suspended: its copy is Unrecoverable.
+pub(super) fn suspended(route: &RunnerRoute) -> bool {
+    route.unrecoverable
 }
 
 /// When the relay's cooldown ends, if one is running at `now`.
@@ -251,7 +252,7 @@ pub(super) fn survey(
     let mut candidates = Vec::new();
     for route in sweepable(turn.routes) {
         for (relay, best_effort) in route.relays() {
-            let owed_until = turn.tails.owed_until(&route.route, relay, now);
+            let owed_until = turn.owed_until(route, relay);
             let debt = app.recovery_unit_debt(&route.route, relay, owed_until)?;
             let Some(first) = debt.first() else {
                 continue;
@@ -296,6 +297,12 @@ pub(super) fn survey(
         rechecks: recheck::survey(turn, policy, stalled, &mut admission)?,
         paused_until,
         fenced: admission.fenced_routes()?,
+        window: turn
+            .routes
+            .iter()
+            .filter(|route| route.window)
+            .map(|route| route.route.clone())
+            .collect(),
     })
 }
 
@@ -483,15 +490,15 @@ pub(super) fn begin(
     let TransportReconciliationRoute::Group(nostr_group_id) = key.route else {
         return Ok(None);
     };
-    let current = sweepable(turn.routes).any(|route| {
+    let Some(route) = sweepable(turn.routes).find(|route| {
         route.route == key.route
+            && !suspended(route)
             && route
                 .relays()
                 .any(|(relay, effort)| relay == key.relay && effort == best_effort)
-    });
-    if !current {
+    }) else {
         return Ok(None);
-    }
+    };
     let planned: Option<RecoveryRelayCaps> = caps.map(recovery_caps);
     if planned.is_some() {
         app.record_recovery_relay_caps(&key.relay, planned, now)?;
@@ -516,7 +523,7 @@ pub(super) fn begin(
         return Ok(None);
     }
     let mark = app.recovery_coverage_mark()?;
-    let owed_until = turn.tails.owed_until(&key.route, &key.relay, now);
+    let owed_until = turn.owed_until(route, &key.relay);
     let mut ranges = Vec::new();
     for debt in app.recovery_unit_debt(&key.route, &key.relay, owed_until)? {
         if let Some(cursor) = app.recovery_unit_cursor(

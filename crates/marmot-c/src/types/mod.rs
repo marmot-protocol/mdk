@@ -11,6 +11,7 @@ pub mod agent_stream;
 pub mod audit;
 pub mod chat_list;
 pub mod common;
+pub mod compromise_warning;
 pub mod device_link;
 pub mod directory;
 pub mod draft;

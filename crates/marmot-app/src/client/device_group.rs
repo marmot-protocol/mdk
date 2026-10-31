@@ -421,16 +421,13 @@ impl AppClient {
         // error. A restart settles the row and reinstalls the route.
         super::recover_post_canonical_result(
             "record_created_device_group",
-            storage
-                .set_device_group_trust(
-                    &group_id_hex,
-                    DeviceGroupTrust::Creating,
-                    DeviceGroupTrust::Created,
-                    None,
-                    now,
-                )
-                .map(drop)
-                .map_err(AppError::from),
+            self.trust_device_group(
+                &group_id,
+                DeviceGroupTrust::Creating,
+                DeviceGroupTrust::Created,
+                now,
+            )
+            .map(drop),
         );
         let welcome_intents = super::recover_post_canonical_result(
             "prepare_device_group_welcome_delivery_index",
@@ -599,11 +596,10 @@ impl AppClient {
             // device's first commit there as soon as it can (D40).
             storage.record_device_group_join(&group_id_hex, now)?;
         }
-        if storage.set_device_group_trust(
-            &group_id_hex,
+        if self.trust_device_group(
+            group_id,
             DeviceGroupTrust::AwaitingWelcome,
             DeviceGroupTrust::Linked,
-            None,
             now,
         )? {
             self.note_device_roster_changed();
@@ -645,11 +641,10 @@ impl AppClient {
                 requires_roster(&group) && group.local_copy_install_epoch == EpochId(0)
             });
             if created_here {
-                storage.set_device_group_trust(
-                    &record.group_id_hex,
+                self.trust_device_group(
+                    &group_id,
                     DeviceGroupTrust::Creating,
                     DeviceGroupTrust::Created,
-                    None,
                     record.recorded_at,
                 )?;
                 self.note_device_roster_changed();
@@ -993,6 +988,7 @@ impl AppClient {
     pub(crate) fn note_device_roster_changed(&mut self) {
         self.linked_devices_changed = true;
         self.unrecognized_sign_ins_changed = true;
+        self.note_compromise_warning_due();
     }
 
     /// Whether the linked devices may have changed since the last call. Set
