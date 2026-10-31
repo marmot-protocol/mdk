@@ -827,7 +827,7 @@ pub(super) async fn owed_history() {
         quiet_expected.push("quiet-after-restart".into());
         // It proves nothing unless the busy group was still owed then.
         let (_, chat) = bob.chat_view(&busy, None).await?;
-        let busy_held_when_quiet_seen = chat.iter().filter(|text| text.starts_with("owed-")).count();
+        let busy_visible_when_quiet_seen = chat.iter().filter(|text| text.starts_with("owed-")).count();
         // Beside the earlier owner the runner may make no attempt at all here,
         // so its caught-up report is recorded, not awaited.
         let (mut drained, mut reported_caught_up) = (None, None);
@@ -906,7 +906,7 @@ pub(super) async fn owed_history() {
                 "busy_timeline_exact": busy_exact,
                 "live_visibility_ms": live_visibility,
                 "quiet_message_visible_ms": quiet_after_restart,
-                "busy_held_when_quiet_seen": busy_held_when_quiet_seen,
+                "busy_visible_when_quiet_seen": busy_visible_when_quiet_seen,
                 "busy_swept_per_endpoint": swept(&after_restart, &busy_route),
                 "quiet_swept_per_endpoint": swept(&after_restart, &quiet_route),
                 "repeated_window_requests_per_endpoint": restart_repeats,
@@ -953,7 +953,7 @@ pub(super) async fn owed_history() {
         if quiet_after_restart.is_none() || quiet_after_reconnect.is_none() || !quiet_exact {
             return failure("a live message to the quiet group was held back");
         }
-        if busy_held_when_quiet_seen >= OWED_MESSAGES {
+        if busy_visible_when_quiet_seen >= OWED_MESSAGES {
             return failure("the busy group finished before the quiet group's message showed");
         }
         if resweep_result.is_err() {
