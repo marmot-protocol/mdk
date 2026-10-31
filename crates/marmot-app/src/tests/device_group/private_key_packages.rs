@@ -861,15 +861,9 @@ async fn deliver_group_messages_letting_projection_fail(
     failed
 }
 
-/// A sibling Welcome admitted while its stash write fails is not lost: the
-/// event's projection fails, is retried once the write works again, and the
-/// phone joins the chat once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_sibling_welcome_whose_stash_write_fails_is_kept_on_retry() {
-    let (mut devices, group) = tagging_devices().await;
-    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
-    send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
-
+/// A second connection to the phone's account database, for a test to make
+/// one of its writes or reads fail.
+fn phone_database(devices: &Devices) -> rusqlite::Connection {
     let app = &devices.phone_app;
     let path = app.account_storage_path("alice");
     let keys = app.account_home().load_signing_keys("alice").unwrap();
@@ -883,6 +877,46 @@ async fn a_sibling_welcome_whose_stash_write_fails_is_kept_on_retry() {
         storage_sqlite::SqlCipherHardening::cipher_only(),
     )
     .unwrap();
+    connection
+}
+
+/// A sibling Welcome that admission cannot check, because a read it makes
+/// fails, is not refused: the event's projection fails, is retried once the
+/// read works again, and the phone joins the chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_whose_admission_read_fails_is_kept_on_retry() {
+    let (mut devices, group) = tagging_devices().await;
+    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
+    send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
+
+    let connection = phone_database(&devices);
+    connection
+        .execute_batch("ALTER TABLE cgka_private_key_packages RENAME TO held_aside")
+        .unwrap();
+    let failed =
+        deliver_group_messages_letting_projection_fail(&mut devices.phone, &devices.relay).await;
+    assert!(failed > 0);
+    assert_eq!(stashed(&devices.phone), 0);
+
+    connection
+        .execute_batch("ALTER TABLE held_aside RENAME TO cgka_private_key_packages")
+        .unwrap();
+    devices.phone.drain_pending_session_events().await.unwrap();
+    assert_eq!(stashed(&devices.phone), 1);
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert!(devices.phone.state_group_record(&chat).is_some());
+}
+
+/// A sibling Welcome admitted while its stash write fails is not lost: the
+/// event's projection fails, is retried once the write works again, and the
+/// phone joins the chat once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_whose_stash_write_fails_is_kept_on_retry() {
+    let (mut devices, group) = tagging_devices().await;
+    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
+    send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
+
+    let connection = phone_database(&devices);
     connection
         .execute_batch(
             "CREATE TRIGGER fail_stash BEFORE INSERT ON sibling_welcomes_received

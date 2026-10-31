@@ -84,6 +84,16 @@ struct Exchange {
     tagged: bool,
 }
 
+/// What admission makes of a sibling Welcome. A read admission could not
+/// make is an error, never a refusal.
+pub(super) enum SiblingWelcomeAdmission {
+    /// Not addressed to this device.
+    NotAddressed,
+    /// Refused for what it says or who sent it.
+    Refused(AppError),
+    Admitted(StashedSiblingWelcome),
+}
+
 impl Exchange {
     /// Every other device the roster lists.
     fn siblings(&self) -> Vec<DeviceSlotId> {
@@ -235,8 +245,9 @@ impl AppClient {
     /// [`Self::stash_sibling_welcome`] to keep. Beyond a hand-off's checks,
     /// its relays must be one to [`NOSTR_ROUTING_MAX_RELAYS`] distinct relay
     /// URLs, and its KeyPackage one this device issued to the sender and
-    /// still holds; the join checks that KeyPackage again. `None` when it is
-    /// not addressed to this device.
+    /// still holds; the join checks that KeyPackage again. An error is a
+    /// read that failed, which the caller retries rather than drop the
+    /// Welcome.
     pub(super) fn admit_sibling_welcome(
         &mut self,
         group_id: &GroupId,
@@ -244,24 +255,31 @@ impl AppClient {
         sender: (EpochId, Option<u32>),
         created_at: u64,
         content: &str,
-    ) -> Result<Option<StashedSiblingWelcome>, AppError> {
+    ) -> Result<SiblingWelcomeAdmission, AppError> {
+        use SiblingWelcomeAdmission::{Admitted, NotAddressed, Refused};
         let Some(exchange) = self.private_key_package_exchange()? else {
-            return Ok(None);
+            return Ok(NotAddressed);
         };
-        let invalid = || AppError::InvalidAppMessagePayload("sibling Welcome".into());
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(content)
-            .map_err(|_| invalid())?;
-        let welcome = SiblingWelcome::decode(&bytes).map_err(|_| invalid())?;
+        let invalid = || Refused(AppError::InvalidAppMessagePayload("sibling Welcome".into()));
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(content) else {
+            return Ok(invalid());
+        };
+        let Ok(welcome) = SiblingWelcome::decode(&bytes) else {
+            return Ok(invalid());
+        };
         if &exchange.group_id != group_id || welcome.to != exchange.own_slot {
-            return Ok(None);
+            return Ok(NotAddressed);
         }
         if !exchange.is_sibling(&welcome.from) {
-            return Err(AppError::DeviceGroupRefused("unknown_sibling"));
+            return Ok(Refused(AppError::DeviceGroupRefused("unknown_sibling")));
         }
-        self.ensure_sent_by(&exchange.group_id, &exchange.roster, sender, &welcome.from)?;
+        match self.ensure_sent_by(&exchange.group_id, &exchange.roster, sender, &welcome.from) {
+            Ok(()) => {}
+            Err(refused @ AppError::DeviceGroupRefused(_)) => return Ok(Refused(refused)),
+            Err(error) => return Err(error),
+        }
         if !valid_sibling_welcome_relays(&welcome.relays) {
-            return Err(invalid());
+            return Ok(invalid());
         }
         if !self
             .runtime
@@ -272,11 +290,11 @@ impl AppClient {
                     && record.recipient_slot == welcome.from
             })
         {
-            return Err(AppError::DeviceGroupRefused(
+            return Ok(Refused(AppError::DeviceGroupRefused(
                 "key_package_not_issued_to_sender",
-            ));
+            )));
         }
-        Ok(Some(StashedSiblingWelcome {
+        Ok(Admitted(StashedSiblingWelcome {
             message_id_hex: hex::encode(message_id.as_slice()),
             content: bytes,
             created_at,

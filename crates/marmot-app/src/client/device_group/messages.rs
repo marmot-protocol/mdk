@@ -36,6 +36,7 @@ use marmot_session::{
 };
 
 use crate::client::AppClient;
+use crate::client::private_key_packages::SiblingWelcomeAdmission;
 use crate::small_state::{KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE};
 use crate::{AppError, unix_now_seconds};
 
@@ -68,9 +69,9 @@ impl AppClient {
     /// Take a message from a device-group event and hand it to the feature
     /// that owns its kind. Anything else is ignored, and so is anything that
     /// feature finds not addressed to this device. A refused message is
-    /// logged and dropped. An error means a sibling Welcome was admitted but
-    /// not kept: the event's projection fails and is retried, as any failed
-    /// projection write is.
+    /// logged and dropped. An error means a sibling Welcome could not be
+    /// checked or kept: the event's projection fails and is retried, as any
+    /// failed projection write is.
     pub(crate) fn observe_device_group_event(
         &mut self,
         event: &GroupEvent,
@@ -116,10 +117,12 @@ impl AppClient {
                 (*epoch, *sender_leaf_index),
                 message.created_at,
                 &message.content,
-            ) {
-                Ok(Some(admitted)) => return self.stash_sibling_welcome(&admitted),
-                Ok(None) => Ok(()),
-                Err(refused) => Err(refused),
+            )? {
+                SiblingWelcomeAdmission::Admitted(admitted) => {
+                    return self.stash_sibling_welcome(&admitted);
+                }
+                SiblingWelcomeAdmission::NotAddressed => Ok(()),
+                SiblingWelcomeAdmission::Refused(refused) => Err(refused),
             },
             KIND_SMALL_STATE_UPDATE => self.receive_small_state_update(group_id, &message.content),
             KIND_SMALL_STATE_BROADCAST_REQUEST => {
