@@ -280,6 +280,18 @@ impl AppRuntimeProbe {
         });
         read.await.map_err(environment_error)?.map_err(app_error)
     }
+
+    /// The group's current Nostr routing id in lowercase hex, its `#h` on
+    /// the wire; `None` for a group the account does not hold.
+    pub async fn nostr_route(&self, group: &GroupId) -> Result<Option<String>, SubjectError> {
+        let (app, account) = (self.app.clone(), self.account_id.clone());
+        let group_id_hex = hex::encode(group.as_slice());
+        let read = tokio::task::spawn_blocking(move || {
+            let group = app.group(&account, &group_id_hex)?;
+            Ok::<_, AppError>(group.map(|group| group.nostr_routing.nostr_group_id_hex))
+        });
+        read.await.map_err(environment_error)?.map_err(app_error)
+    }
 }
 
 struct Participant {
@@ -714,7 +726,6 @@ impl AppRuntimeHarness {
         self.relay_control.traffic(since, events).await
     }
 
-    /// Admitted relay event ids and kinds, in admission order.
     /// Withhold history requests (a `REQ` with an `until`, or a `NEG-OPEN`)
     /// from relay endpoint `endpoint`, or forward them again. Live
     /// subscriptions and publications keep flowing, so the endpoint looks
@@ -741,6 +752,7 @@ impl AppRuntimeHarness {
             .await
     }
 
+    /// Admitted relay event ids and kinds, in admission order.
     pub async fn relay_publication_ids(&self) -> Result<Vec<(String, u16)>, SubjectError> {
         self.relay_control.publication_ids().await
     }

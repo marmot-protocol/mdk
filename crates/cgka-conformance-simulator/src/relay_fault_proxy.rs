@@ -27,8 +27,7 @@ const MAX_REQUEST_HEAD: usize = 16 * 1024;
 /// the White Noise relays' shape (strfry with NIP-77 and a 500-result filter
 /// cap). The harness relay itself honors a requested `limit` but caps no
 /// filter, so an unlimited REQ still returns every match.
-pub const PRODUCTION_RELAY_INFORMATION: &str =
-    r#"{"name":"cgka-conformance relay","supported_nips":[1,9,11,40,77],"limitation":{"max_limit":500}}"#;
+pub const PRODUCTION_RELAY_INFORMATION: &str = r#"{"name":"cgka-conformance relay","supported_nips":[1,9,11,40,77],"limitation":{"max_limit":500}}"#;
 
 /// Wire traffic through one proxied relay endpoint, summed over a range of
 /// its connections. Byte counts are raw TCP payload per direction; message
@@ -51,6 +50,10 @@ pub struct RelayTrafficV1 {
     /// Client history requests in arrival order, when events are requested.
     #[serde(default)]
     pub history_requests: Vec<HistoryRequestV1>,
+    /// The proxy's clock when this snapshot was taken, on the scale of
+    /// [`HistoryRequestV1::at_ms`].
+    #[serde(default)]
+    pub now_ms: u64,
 }
 
 /// One history filter a client sent: a `REQ` filter with an `until`, or a
@@ -119,6 +122,12 @@ struct Gate {
     stall_history: AtomicBool,
     /// The NIP-11 document, or `None` to pass information requests through.
     information: Mutex<Option<String>>,
+}
+
+impl Gate {
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
 }
 
 /// Incremental WebSocket reader for one direction of a proxied connection.
@@ -268,7 +277,13 @@ fn history_request(
     at_ms: u64,
     withheld: bool,
 ) -> HistoryRequestV1 {
-    let tag = |name: &str| filter[name].as_array()?.first()?.as_str().map(str::to_owned);
+    let tag = |name: &str| {
+        filter[name]
+            .as_array()?
+            .first()?
+            .as_str()
+            .map(str::to_owned)
+    };
     HistoryRequestV1 {
         at_ms,
         verb: verb.to_owned(),
@@ -432,9 +447,7 @@ async fn pump(
         };
         to.write_all(&forward).await?;
         let (messages, undecoded) = tap.feed(bytes);
-        let at_ms = gate.map_or(0, |gate| {
-            u64::try_from(gate.started.elapsed().as_millis()).unwrap_or(u64::MAX)
-        });
+        let at_ms = gate.map_or(0, Gate::elapsed_ms);
         let mut sessions = traffic.lock().expect("relay traffic lock poisoned");
         let session = &mut sessions[index];
         if upstream {
@@ -654,7 +667,11 @@ impl RelayFaultProxy {
 
     /// Serve `document` to NIP-11 requests, or pass them to the relay.
     pub(crate) fn set_information(&self, document: Option<String>) {
-        *self.gate.information.lock().expect("relay information lock") = document;
+        *self
+            .gate
+            .information
+            .lock()
+            .expect("relay information lock") = document;
     }
 
     pub(crate) fn url(&self) -> String {
@@ -669,6 +686,7 @@ impl RelayFaultProxy {
         let first = usize::try_from(first_session).unwrap_or(usize::MAX);
         let mut total = RelayTrafficV1 {
             next_session: sessions.len() as u64,
+            now_ms: self.gate.elapsed_ms(),
             ..RelayTrafficV1::default()
         };
         let add = |into: &mut BTreeMap<String, u64>, from: &BTreeMap<String, u64>| {
@@ -1039,7 +1057,8 @@ mod tests {
 
         // An upgrade reaches the relay with its head intact, and a stalled
         // history request is logged and withheld while a live one passes.
-        let upgrade = b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nAccept: application/nostr+json\r\n\r\n";
+        let upgrade =
+            b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nAccept: application/nostr+json\r\n\r\n";
         let mut client = TcpStream::connect(proxy.address).await.unwrap();
         let (mut relay, _) = listener.accept().await.unwrap();
         client.write_all(upgrade).await.unwrap();
@@ -1061,9 +1080,21 @@ mod tests {
         let requests = proxy.traffic_since(0, true).history_requests;
         let logged: Vec<_> = requests
             .iter()
-            .map(|r| (r.verb.as_str(), r.route.as_deref(), r.since, r.until, r.limit, r.withheld))
+            .map(|r| {
+                (
+                    r.verb.as_str(),
+                    r.route.as_deref(),
+                    r.since,
+                    r.until,
+                    r.limit,
+                    r.withheld,
+                )
+            })
             .collect();
-        assert_eq!(logged, [("REQ", Some("g"), Some(1), Some(5), Some(501), true)]);
+        assert_eq!(
+            logged,
+            [("REQ", Some("g"), Some(1), Some(5), Some(501), true)]
+        );
         assert!(proxy.traffic_since(0, false).history_requests.is_empty());
 
         // With no document set, a fetch reaches the relay too.

@@ -17,6 +17,7 @@ use cgka_conformance_simulator::{
 use cgka_traits::GroupId;
 use serde_json::{Value, json};
 
+use super::recovery_runner_proofs::history_summary;
 use super::{SETTLEMENT, TestResult, journey_artifacts, save};
 
 const LARGE_GROUP_MEMBERS: usize = 51;
@@ -383,6 +384,7 @@ fn wire_totals(relay: &RelayTrafficV1) -> Value {
     if let Some(fields) = totals.as_object_mut() {
         fields.remove("events");
         fields.remove("history_requests");
+        fields.remove("now_ms");
     }
     totals
 }
@@ -422,7 +424,7 @@ fn summarize(relay: &RelayTrafficV1, workload: &Workload) -> Value {
 }
 
 /// Nearest-rank percentiles of millisecond samples.
-fn percentiles(samples: impl IntoIterator<Item = f64>) -> Value {
+pub(super) fn percentiles(samples: impl IntoIterator<Item = f64>) -> Value {
     let mut sorted = samples.into_iter().collect::<Vec<_>>();
     sorted.sort_by(f64::total_cmp);
     // Nearest rank: the smallest sample with at least p% of samples at or
@@ -587,6 +589,26 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
     tokio::time::sleep(IDLE_WINDOW).await;
     let idle_end = subject.relay_traffic(&mark, true).await?;
 
+    let mut labels = BTreeMap::new();
+    for (label, group) in &workload.groups {
+        if let Some(route) = bob.nostr_route(group).await? {
+            labels.insert(route, label.clone());
+        }
+    }
+    let history_requests = measured.iter().map(|relay| {
+        // Group labels collapse to their kind, so the report stays short.
+        let kinds = labels.iter().map(|(route, label)| {
+            let kind = if label.starts_with("history-") {
+                "history-*"
+            } else {
+                label
+            };
+            (route.clone(), kind.to_owned())
+        });
+        history_summary(&relay.history_requests, &kinds.collect())
+    });
+    let history_requests = history_requests.collect::<Vec<_>>();
+    let account_status = bob.account_recovery_status().await;
     let (_, mut observed) = bob.chat_view(&gap, None).await?;
     let mut expected = (0..GAP_MESSAGES)
         .map(|i| format!("gap-{i:05}"))
@@ -634,6 +656,8 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
         "live_visibility_ms": live_visibility,
         "relays": measured.iter().map(|relay| summarize(relay, workload)).collect::<Vec<_>>(),
         "events_delivered_by_both_relays": both.count(),
+        "history_requests": history_requests,
+        "account_recovery_status_at_end": account_status.map_err(|error| error.message),
         "idle_window": {"seconds": IDLE_WINDOW.as_secs(), "relays": idle.collect::<Vec<_>>()},
         "telemetry": {"before": telemetry_before, "after": telemetry_after},
     }))
@@ -725,6 +749,7 @@ fn telemetry_deltas(before: &Value, after: &Value) -> Value {
 
 fn print_table(report: &Value) {
     println!("\nlarge-account recovery scorecard (report only; production policy)");
+    println!("history owner: {}", report["workload"]["history_owner"]);
     println!(
         "{:<34}{:>9}{:>9}{:>9}{:>7}{:>8}",
         "latency of successful calls (ms)", "p50", "p95", "max", "ok", "failed"
@@ -755,6 +780,8 @@ fn print_table(report: &Value) {
         "final_state",
         "events_delivered_by_both_relays",
         "idle_window",
+        "history_requests",
+        "account_recovery_status_at_end",
     ] {
         println!("{key}: {}", report[key]);
     }
@@ -784,6 +811,15 @@ fn print_table(report: &Value) {
 }
 
 pub(super) async fn run() {
+    run_with(false).await;
+}
+
+/// The same workload with bob's recovery runner owning history debt.
+pub(super) async fn run_runner_owning_debt() {
+    run_with(true).await;
+}
+
+async fn run_with(runner_owns_debt: bool) {
     // Opt-in tracing for the in-process subject, for example
     // `MDK_SCORECARD_TRACE=marmot_app::relay_plane=warn`. Other participants
     // run in their own processes and are not traced.
@@ -794,11 +830,22 @@ pub(super) async fn run() {
             .with_writer(std::io::stderr)
             .try_init();
     }
-    let artifacts = journey_artifacts("scorecard");
+    let (label, owner) = if runner_owns_debt {
+        (
+            "scorecard-runner",
+            "recovery runner (with the earlier owner beside it until 5g)",
+        )
+    } else {
+        ("scorecard", "earlier recovery owner")
+    };
+    let artifacts = journey_artifacts(label);
     let clients = clients();
-    let mut subject = AppRuntimeHarness::new_with_relay_pair(&clients, &clients[1..2])
-        .await
-        .expect("scorecard harness setup");
+    let subject = if runner_owns_debt {
+        AppRuntimeHarness::new_with_relay_pair_owning_debt(&clients, &clients[1..2]).await
+    } else {
+        AppRuntimeHarness::new_with_relay_pair(&clients, &clients[1..2]).await
+    };
+    let mut subject = subject.expect("scorecard harness setup");
     save(
         artifacts.path(),
         "execution-layout.json",
@@ -814,6 +861,7 @@ pub(super) async fn run() {
         report["workload"]["relays"] =
             json!("two endpoints of one relay process over one retained store");
         report["workload"]["source_commit"] = json!(std::env::var("GITHUB_SHA").ok());
+        report["workload"]["history_owner"] = json!(owner);
         let (before, after) = (
             &report["telemetry"]["before"],
             &report["telemetry"]["after"],
