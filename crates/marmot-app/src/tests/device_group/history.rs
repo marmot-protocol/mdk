@@ -228,6 +228,197 @@ async fn a_member_who_joined_later_imports_the_history_it_missed() {
     );
 }
 
+/// Bob joins after Alice sent a photo. He was never in that epoch, so he can
+/// open the photo only with the key Alice's bundle carries for it: the
+/// photo's message gets an attachment slot and the key, a key naming no
+/// attachment is dropped, and Bob passes the key on when he exports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_imported_photo_comes_with_its_attachment_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = device_group_app_at(&dir, relay.clone());
+    remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let chat = alice.create_group("photos", &[]).await.unwrap();
+    let chat_hex = hex::encode(chat.as_slice());
+
+    let ciphertext_sha256 = "11".repeat(32);
+    let reference = crate::media::MediaAttachmentReference {
+        locators: vec![crate::media::MediaLocator {
+            kind: "blossom-v1".into(),
+            value: format!("https://blossom.example/{ciphertext_sha256}"),
+        }],
+        ciphertext_sha256: ciphertext_sha256.clone(),
+        plaintext_sha256: "22".repeat(32),
+        nonce_hex: "33".repeat(12),
+        file_name: "photo.jpg".into(),
+        media_type: "image/jpeg".into(),
+        version: crate::media::EncryptedMediaVersion::V2.as_str().into(),
+        source_epoch: 0,
+        dim: None,
+        thumbhash: None,
+    };
+    let photo = send(
+        &mut alice,
+        &chat,
+        AppMessageIntent::Media {
+            message_tags: Vec::new(),
+            caption: None,
+            attachments: vec![reference.clone()],
+        },
+    )
+    .await;
+    let alice_storage = app.account_storage("alice").unwrap();
+    let alice_storage = alice_storage.app_storage();
+    let epoch = alice_storage
+        .timeline_message(&chat_hex, &photo)
+        .unwrap()
+        .unwrap()
+        .source_epoch
+        .unwrap();
+    let secret = [0x5a; 32];
+    alice_storage
+        .remember_encrypted_media_epoch_secret(
+            &chat_hex,
+            crate::media::EncryptedMediaVersion::V2.component_id(),
+            epoch,
+            &secret,
+        )
+        .unwrap();
+    let file_key =
+        hex::encode(crate::media::media_file_key_for_reference(&secret, &reference).unwrap());
+
+    alice
+        .invite_members(&chat, &[&bob_account.account_id_hex])
+        .await
+        .unwrap();
+    let mut cursor = 0;
+    deliver_new(&mut bob, &relay, &mut cursor).await;
+    bob.sync().await.unwrap();
+    bob.accept_group_invite(&chat).unwrap();
+    let source = crate::media::MediaAttachmentReference {
+        source_epoch: epoch,
+        ..reference.clone()
+    };
+    assert!(
+        bob.cache_attachment_source_epoch_secret(&chat, &photo, &source)
+            .is_err()
+    );
+
+    let mut bundle = alice.export_chat_history(&chat, None).unwrap().unwrap();
+    let event = bundle
+        .events
+        .iter_mut()
+        .find(|event| event.event.id == photo)
+        .unwrap();
+    assert_eq!(
+        event.keys,
+        Some(vec![crate::history_bundle::FileKey {
+            ciphertext_sha256: ciphertext_sha256.clone(),
+            key: file_key.clone(),
+        }])
+    );
+    event
+        .keys
+        .as_mut()
+        .unwrap()
+        .push(crate::history_bundle::FileKey {
+            ciphertext_sha256: "44".repeat(32),
+            key: "55".repeat(32),
+        });
+    bob.dev_import_history_bundle(&chat, &PHONE_SLOT, &sealed(&bundle))
+        .unwrap()
+        .expect("the photo is new");
+
+    let storage = app.account_storage("bob").unwrap();
+    let storage = storage.app_storage();
+    assert_eq!(
+        storage
+            .imported_media_file_keys(&chat_hex, &photo)
+            .unwrap()
+            .iter()
+            .map(|key| (key.ciphertext_sha256.clone(), hex::encode(*key.key)))
+            .collect::<Vec<_>>(),
+        vec![(ciphertext_sha256.clone(), file_key.clone())]
+    );
+    let slots = storage
+        .attachment_history_page(&chat_hex, 10, None)
+        .unwrap()
+        .entries;
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].message_id_hex, photo);
+    assert_eq!(slots[0].source_message_id_hex, photo);
+    assert_eq!(slots[0].source_epoch, Some(epoch));
+    bob.cache_attachment_source_epoch_secret(&chat, &photo, &source)
+        .expect("the imported key opens the photo");
+    let prepared = bob
+        .prepare_background_attachment_download_for_message(
+            &chat,
+            Some(&photo),
+            source.clone(),
+            1024,
+        )
+        .unwrap()
+        .expect("the imported key opens the photo");
+    assert!(prepared.opens_with_imported_key());
+
+    // The key belongs to the imported photo. A message Bob received himself
+    // that names the same file waits for its epoch's secret instead.
+    let received = "ee".repeat(32);
+    assert!(
+        bob.prepare_background_attachment_download_for_message(
+            &chat,
+            Some(&received),
+            source.clone(),
+            1024,
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        bob.cache_attachment_source_epoch_secret(&chat, &received, &source)
+            .is_err()
+    );
+    // Once the epoch's secret is here, it opens even the imported photo.
+    storage
+        .remember_encrypted_media_epoch_secret(
+            &chat_hex,
+            crate::media::EncryptedMediaVersion::V2.component_id(),
+            epoch,
+            &secret,
+        )
+        .unwrap();
+    let prepared = bob
+        .prepare_background_attachment_download_for_message(
+            &chat,
+            Some(&photo),
+            source.clone(),
+            1024,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(!prepared.opens_with_imported_key());
+
+    let passed_on = bob.export_chat_history(&chat, None).unwrap().unwrap();
+    let event = passed_on
+        .events
+        .iter()
+        .find(|event| event.event.id == photo)
+        .unwrap();
+    assert_eq!(
+        event.keys,
+        Some(vec![crate::history_bundle::FileKey {
+            ciphertext_sha256,
+            key: file_key,
+        }])
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_group_never_gives_or_takes_history() {
     let Devices {

@@ -36,7 +36,7 @@ use zeroize::Zeroizing;
 use cgka_traits::MarmotAppEvent;
 use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::reporting::requires_source_authority;
-use storage_sqlite::{HistoryExportEvent, HistoryExportRow, ImportedAppEvent};
+use storage_sqlite::{HistoryExportEvent, HistoryExportRow, ImportedAppEvent, ImportedFileKey};
 
 use crate::AppError;
 
@@ -273,13 +273,15 @@ impl HistoryBundleBuilder {
 }
 
 impl BundledEvent {
-    pub(crate) fn exported(event: HistoryExportEvent, epoch: u64) -> Self {
+    /// `event` as a bundle carries it, with a key for each attachment the
+    /// sender can open.
+    pub(crate) fn exported(event: HistoryExportEvent, epoch: u64, keys: Vec<FileKey>) -> Self {
         Self {
             event: event.event,
             epoch,
             retention: event.retention_seconds,
             grant: event.moderation_grant,
-            keys: None,
+            keys: (!keys.is_empty()).then_some(keys),
         }
     }
 
@@ -297,6 +299,19 @@ impl BundledEvent {
                 .retention
                 .map(|seconds| AppMessageRetentionDecision::new(event.created_at, seconds)),
             moderation_grant: self.grant,
+            file_keys: self
+                .keys
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|key| {
+                    let mut bytes = Zeroizing::new([0_u8; 32]);
+                    hex::decode_to_slice(&key.key, bytes.as_mut_slice()).ok()?;
+                    Some(ImportedFileKey {
+                        ciphertext_sha256: key.ciphertext_sha256,
+                        key: bytes,
+                    })
+                })
+                .collect(),
         }
     }
 

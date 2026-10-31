@@ -33,6 +33,7 @@ pub(crate) mod legacy_migration;
 pub(crate) mod outgoing;
 pub(crate) mod storage_compaction;
 pub(crate) use crypto::media_hash_from_reference;
+pub(crate) use crypto::{MediaKey, media_file_key_for_reference};
 mod group_image;
 mod host_safety;
 
@@ -972,7 +973,7 @@ pub(crate) async fn download_encrypted_media(
     let transport = BlossomHttpTransport::new(allow_loopback_blob_endpoints);
     download_encrypted_media_with_transport(
         reference,
-        media_secret,
+        MediaKey::EpochSecret(media_secret),
         fallback_endpoints,
         allowed_locator_kinds,
         &transport,
@@ -1020,7 +1021,7 @@ impl AttachmentDownloadFailure {
 /// recording only reviewed aggregate phase outcomes.
 pub(crate) async fn download_encrypted_media_with_transport(
     reference: MediaAttachmentReference,
-    media_secret: &[u8],
+    key: MediaKey<'_>,
     fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     transport: &BlossomHttpTransport,
@@ -1028,7 +1029,7 @@ pub(crate) async fn download_encrypted_media_with_transport(
 ) -> Result<MediaDownloadResult, AppError> {
     download_encrypted_media_classified(
         reference,
-        media_secret,
+        key,
         fallback_endpoints,
         allowed_locator_kinds,
         transport,
@@ -1040,7 +1041,7 @@ pub(crate) async fn download_encrypted_media_with_transport(
 
 pub(crate) async fn download_encrypted_media_classified(
     reference: MediaAttachmentReference,
-    media_secret: &[u8],
+    key: MediaKey<'_>,
     fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     transport: &BlossomHttpTransport,
@@ -1071,20 +1072,16 @@ pub(crate) async fn download_encrypted_media_classified(
             .map_err(AttachmentDownloadFailure::Stop)?,
     };
     let nonce = media_nonce_from_reference(&reference).map_err(AttachmentDownloadFailure::Stop)?;
-    let file_key = derive_media_file_key(
-        media_secret,
-        version,
-        &plaintext_hash,
-        &media_type,
-        &reference.file_name,
-    )
-    .map_err(|e| AttachmentDownloadFailure::Stop(media_download_failure(e)))?;
+    let file_key = zeroize::Zeroizing::new(
+        key.file_key(version, &plaintext_hash, &media_type, &reference.file_name)
+            .map_err(|e| AttachmentDownloadFailure::Stop(media_download_failure(e)))?,
+    );
     let aad = media_aad(version, &plaintext_hash, &media_type, &reference.file_name);
     if let Some(resume) = &transport.resume {
         resume.phase(3).await?;
     }
     let decrypt_started = Instant::now();
-    let cipher = ChaCha20Poly1305::new_from_slice(&file_key).map_err(|_| {
+    let cipher = ChaCha20Poly1305::new_from_slice(file_key.as_slice()).map_err(|_| {
         record_media_download_phase(
             telemetry,
             AppPerformanceOperation::MediaDownloadDecrypt,

@@ -49,6 +49,14 @@
   handles a device group. Only through the `test-policy-overrides` hooks
   `dev_export_chat_history` and `dev_import_history_bundle` until the bundle's
   transport lands.
+- History bundles carry a key for each attachment the sending device can open
+  (mdk#2628 item 4.2a). The key is derived from the attachment's epoch media
+  secret, or is the one the sender imported itself, and the epoch secret never
+  goes in a bundle. The receiving device keeps a key only for a message it
+  adds and only when the key names one of that message's attachments.
+  Downloading an imported attachment uses its key when the epoch's secret is
+  not here, so a device that was never in the attachment's epoch can still
+  open it. A message the device received itself never uses an imported key.
 - `MarmotAppConfig::device_platform` (`with_device_platform`) names the
   platform this device runs on. Each device writes it and
   `key_package_client_name` into its own roster entry with its next KeyPackage

@@ -11,6 +11,7 @@ use super::*;
 use crate::SqliteAppStorage;
 use cgka_traits::MarmotAppEvent;
 use cgka_traits::app_components::DeviceSlotId;
+use zeroize::Zeroizing;
 
 /// One app event of a chat in chat order, as a history bundle sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +51,23 @@ pub struct ImportedAppEvent {
     /// The sending device's authority verdict for a review label or an admin
     /// removal, taken as this row's. Without one the row has no authority.
     pub moderation_grant: Option<bool>,
+    /// Per-file keys for the chat message's attachments, which this device
+    /// cannot derive: it was never in the epoch the message was sent in.
+    pub file_keys: Vec<ImportedFileKey>,
+}
+
+/// One attachment's key, named by the `ciphertext_sha256` of the media
+/// reference it opens.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ImportedFileKey {
+    pub ciphertext_sha256: String,
+    pub key: Zeroizing<[u8; 32]>,
+}
+
+impl std::fmt::Debug for ImportedFileKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportedFileKey").finish_non_exhaustive()
+    }
 }
 
 /// What one import changed.
@@ -128,6 +146,40 @@ impl SqliteAppStorage {
                     )
                     .storage()?;
                 imported += marked;
+                if marked == 1 {
+                    // The timeline insert's trigger ran before the mark existed,
+                    // so the imported message's attachment slots go in now.
+                    conn.execute_cached(
+                        "INSERT OR IGNORE INTO attachment_history(group_id_hex,message_id_hex,
+                            attachment_index,source_message_id_hex,source_epoch,sender,timeline_at,
+                            received_at,order_class,order_primary,order_phase,order_at,slot_json,visible)
+                         SELECT * FROM attachment_history_source
+                         WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+                        params![group_id_hex, event.message_id_hex],
+                    )
+                    .storage()?;
+                    // Only one key opens a ciphertext, so a key that differs
+                    // from one the chat already holds for it is not stored.
+                    for file_key in &event.file_keys {
+                        conn.execute_cached(
+                            "INSERT OR IGNORE INTO imported_media_file_keys
+                                (group_id_hex, message_id_hex, ciphertext_sha256, file_key)
+                             SELECT ?1, ?2, ?3, ?4
+                             WHERE NOT EXISTS (
+                                 SELECT 1 FROM imported_media_file_keys
+                                 WHERE group_id_hex = ?1 AND ciphertext_sha256 = ?3
+                                   AND file_key != ?4
+                             )",
+                            params![
+                                group_id_hex,
+                                event.message_id_hex,
+                                file_key.ciphertext_sha256,
+                                file_key.key.as_slice(),
+                            ],
+                        )
+                        .storage()?;
+                    }
+                }
                 if marked == 1
                     && let Some(grant) = event.moderation_grant
                 {
@@ -297,6 +349,86 @@ impl SqliteAppStorage {
         .transpose()
     }
 
+    /// The key a sibling sent with the imported chat message `message_id_hex`
+    /// for its media reference with `ciphertext_sha256`. A message this device
+    /// received itself has none.
+    pub fn imported_media_file_key(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        ciphertext_sha256: &str,
+    ) -> StorageResult<Option<Zeroizing<[u8; 32]>>> {
+        let key = self
+            .lock()?
+            .query_row_cached(
+                "SELECT file_key FROM imported_media_file_keys
+                 WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND ciphertext_sha256 = ?3",
+                params![group_id_hex, message_id_hex, ciphertext_sha256],
+                |row| row.get::<_, Vec<u8>>(0).map(Zeroizing::new),
+            )
+            .optional()
+            .storage()?;
+        key.map(|key| file_key_bytes(&key)).transpose()
+    }
+
+    /// The imported key for the chat's media reference with
+    /// `ciphertext_sha256`, for a caller that cannot name the message. Import
+    /// refuses a second, different key for a held ciphertext, so the chat has
+    /// at most one.
+    pub fn imported_media_file_key_for_ciphertext(
+        &self,
+        group_id_hex: &str,
+        ciphertext_sha256: &str,
+    ) -> StorageResult<Option<Zeroizing<[u8; 32]>>> {
+        let key = self
+            .lock()?
+            .query_row_cached(
+                "SELECT file_key FROM imported_media_file_keys
+                 WHERE group_id_hex = ?1 AND ciphertext_sha256 = ?2
+                 LIMIT 1",
+                params![group_id_hex, ciphertext_sha256],
+                |row| row.get::<_, Vec<u8>>(0).map(Zeroizing::new),
+            )
+            .optional()
+            .storage()?;
+        key.map(|key| file_key_bytes(&key)).transpose()
+    }
+
+    /// Every imported key for the chat message `message_id_hex`, so a device
+    /// that imported a message can pass its keys on.
+    pub fn imported_media_file_keys(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> StorageResult<Vec<ImportedFileKey>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT ciphertext_sha256, file_key FROM imported_media_file_keys
+                 WHERE group_id_hex = ?1 AND message_id_hex = ?2
+                 ORDER BY ciphertext_sha256",
+            )
+            .storage()?;
+        let rows = statement
+            .query_map(params![group_id_hex, message_id_hex], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    Zeroizing::new(row.get::<_, Vec<u8>>(1)?),
+                ))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        rows.into_iter()
+            .map(|(ciphertext_sha256, key)| {
+                Ok(ImportedFileKey {
+                    ciphertext_sha256,
+                    key: file_key_bytes(&key)?,
+                })
+            })
+            .collect()
+    }
+
     fn holds_app_event(&self, group_id_hex: &str, message_id_hex: &str) -> StorageResult<bool> {
         self.lock()?
             .query_row_cached(
@@ -344,6 +476,16 @@ fn grant_imported_authority_tx(
     Ok(ids)
 }
 
+fn file_key_bytes(key: &[u8]) -> StorageResult<Zeroizing<[u8; 32]>> {
+    let mut bytes = Zeroizing::new([0_u8; 32]);
+    if key.len() != bytes.len() {
+        return Err(StorageError::Backend(
+            "imported media file key is not 32 bytes".to_owned(),
+        ));
+    }
+    bytes.copy_from_slice(key);
+    Ok(bytes)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,5 +680,199 @@ mod tests {
             .unwrap();
         let rows = s.history_export_page(GROUP, None, NOW, 100).unwrap();
         assert_eq!(rows[1].event.as_ref().unwrap().moderation_grant, None);
+    }
+
+    fn imported(event: &StoredAppEvent, file_keys: Vec<ImportedFileKey>) -> ImportedAppEvent {
+        ImportedAppEvent {
+            message_id_hex: event.message_id_hex.clone(),
+            source_epoch: event.source_epoch.unwrap(),
+            sender: event.sender.clone(),
+            plaintext: event.plaintext.clone(),
+            kind: event.kind,
+            tags: event.tags.clone(),
+            created_at: event.recorded_at,
+            retention: None,
+            moderation_grant: None,
+            file_keys,
+        }
+    }
+
+    fn file_key(ciphertext: u8, key: u8) -> ImportedFileKey {
+        ImportedFileKey {
+            ciphertext_sha256: hex::encode([ciphertext; 32]),
+            key: Zeroizing::new([key; 32]),
+        }
+    }
+
+    // mdk#2628 4.2a: a key is stored only with a row the import adds, and it
+    // is zeroed and removed with that row.
+    #[test]
+    fn imported_file_keys_stay_with_the_rows_an_import_adds() {
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let held = chat(1, 1, 10, "held");
+        let new = chat(1, 1, 11, "new");
+        s.record_app_event(&held).unwrap();
+        let slot = DeviceSlotId::from([0x11; 32]);
+        s.import_app_events(
+            GROUP,
+            &slot,
+            &[
+                imported(&held, vec![file_key(0xaa, 1)]),
+                imported(&new, vec![file_key(0xbb, 2)]),
+            ],
+            NOW,
+        )
+        .unwrap();
+
+        assert!(
+            s.imported_media_file_keys(GROUP, &held.message_id_hex)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.imported_media_file_keys(GROUP, &new.message_id_hex)
+                .unwrap(),
+            vec![file_key(0xbb, 2)]
+        );
+        assert_eq!(
+            s.imported_media_file_key(GROUP, &new.message_id_hex, &hex::encode([0xbb; 32]))
+                .unwrap()
+                .map(|key| *key),
+            Some([2; 32])
+        );
+        // A key belongs to its message: another message naming the same
+        // ciphertext does not get it.
+        assert!(
+            s.imported_media_file_key(GROUP, &held.message_id_hex, &hex::encode([0xbb; 32]))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.imported_media_file_key_for_ciphertext(GROUP, &hex::encode([0xbb; 32]))
+                .unwrap()
+                .map(|key| *key),
+            Some([2; 32])
+        );
+        assert!(
+            s.imported_media_file_key_for_ciphertext(GROUP, &hex::encode([0xaa; 32]))
+                .unwrap()
+                .is_none()
+        );
+
+        let conn = s.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE removed_keys (file_key BLOB);
+             CREATE TEMP TRIGGER record_removed_key AFTER DELETE ON imported_media_file_keys
+             BEGIN INSERT INTO removed_keys VALUES (OLD.file_key); END;",
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM app_events WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![GROUP, new.message_id_hex],
+        )
+        .unwrap();
+        let removed: Vec<Vec<u8>> = conn
+            .prepare("SELECT file_key FROM removed_keys")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        drop(conn);
+        assert_eq!(removed, vec![vec![0; 32]]);
+        assert!(
+            s.imported_media_file_keys(GROUP, &new.message_id_hex)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn attachment_slots(s: &SqliteAppStorage) -> Vec<(String, String)> {
+        s.lock()
+            .unwrap()
+            .prepare(
+                "SELECT message_id_hex, source_message_id_hex FROM attachment_history ORDER BY 1",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    // mdk#2628 4.2a: an imported chat message gets attachment slots, under its
+    // app event id, and keeps them when the chat's timeline is rebuilt.
+    #[test]
+    fn an_imported_attachment_keeps_its_slot_through_a_timeline_rebuild() {
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let tags = vec![vec![
+            "imeta".to_owned(),
+            "url https://blossom.example/aa".to_owned(),
+        ]];
+        let event =
+            MarmotAppEvent::new(author(1), 10, MARMOT_APP_EVENT_KIND_CHAT, tags.clone(), "");
+        let photo = StoredAppEvent {
+            message_id_hex: event.id.clone(),
+            tags,
+            plaintext: String::new(),
+            ..chat(1, 1, 10, "")
+        };
+        // A received row without a transport id that no import marks gets no
+        // slot, as before.
+        let unmarked = chat(2, 1, 11, "unmarked");
+        s.record_app_event(&StoredAppEvent {
+            source_message_id_hex: None,
+            tags: photo.tags.clone(),
+            ..unmarked
+        })
+        .unwrap();
+        s.import_app_events(
+            GROUP,
+            &DeviceSlotId::from([0x11; 32]),
+            &[imported(&photo, Vec::new())],
+            NOW,
+        )
+        .unwrap();
+        let expected = vec![(photo.message_id_hex.clone(), photo.message_id_hex.clone())];
+        assert_eq!(attachment_slots(&s), expected);
+
+        s.rebuild_message_timeline_for_group(GROUP).unwrap();
+        assert_eq!(attachment_slots(&s), expected);
+    }
+
+    // mdk#2628 4.2a: only one key opens a ciphertext, so the chat keeps the
+    // first key it imported for one and refuses a different one.
+    #[test]
+    fn a_different_key_for_a_held_ciphertext_is_not_stored() {
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let first = chat(1, 1, 10, "first");
+        let same = chat(1, 1, 11, "same key");
+        let other = chat(1, 2, 12, "other key");
+        s.import_app_events(
+            GROUP,
+            &DeviceSlotId::from([0x11; 32]),
+            &[
+                imported(&first, vec![file_key(0xaa, 1)]),
+                imported(&same, vec![file_key(0xaa, 1)]),
+                imported(&other, vec![file_key(0xaa, 2)]),
+            ],
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(
+            s.imported_media_file_keys(GROUP, &first.message_id_hex)
+                .unwrap(),
+            vec![file_key(0xaa, 1)]
+        );
+        assert_eq!(
+            s.imported_media_file_keys(GROUP, &same.message_id_hex)
+                .unwrap(),
+            vec![file_key(0xaa, 1)]
+        );
+        assert!(
+            s.imported_media_file_keys(GROUP, &other.message_id_hex)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

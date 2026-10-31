@@ -160,6 +160,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("group_push_gossip_state", Side::App),
     ("group_push_token_tombstones", Side::App),
     ("group_push_tokens", Side::App),
+    ("imported_media_file_keys", Side::App),
     ("local_group_deletion_frontiers", Side::App),
     ("local_message_submissions", Side::App),
     ("media_file_refs", Side::App),

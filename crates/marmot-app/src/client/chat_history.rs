@@ -7,19 +7,29 @@
 //! `test-policy-overrides` hooks are the only callers. An import only adds
 //! rows: storage never overwrites a held row, marks each new one with the
 //! sending device's slot, and never counts it as unread.
+//!
+//! The receiver was never in the epochs it imports, so it cannot derive an
+//! attachment's key from the epoch's media secret. The sender puts each
+//! attachment's own key in the bundle instead, and the receiver keeps it with
+//! the message for downloads and for passing the history on.
 
 use super::AppClient;
 use crate::history_bundle::{
-    BundledEvent, ChatPosition, HISTORY_BUNDLE_MAX_PLAINTEXT, HistoryBundle, HistoryBundleBuilder,
-    open_history_bundle,
+    BundledEvent, ChatPosition, FileKey, HISTORY_BUNDLE_MAX_PLAINTEXT, HistoryBundle,
+    HistoryBundleBuilder, open_history_bundle,
 };
-use crate::media::media_imeta_tags_preserve_message;
+use crate::media::{
+    EncryptedMediaVersion, MediaAttachmentReference, media_attachment_from_imeta_tag,
+    media_file_key_for_reference, media_imeta_tags_preserve_message,
+};
 use crate::{AppError, AppProjectionUpdate, unix_now_seconds};
 use cgka_traits::MarmotAppEvent;
 use cgka_traits::app_components::DeviceSlotId;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM};
 use cgka_traits::types::GroupId;
-use storage_sqlite::ImportedAppEvent;
+use std::collections::BTreeSet;
+use storage_sqlite::{ImportedAppEvent, SqliteAppStorage};
+use zeroize::Zeroizing;
 
 const TRACE_TARGET: &str = "marmot_app::chat_history";
 /// Rows read from storage at a time while filling a bundle.
@@ -37,6 +47,7 @@ impl AppClient {
         let group_id_hex = self.history_chat(group_id)?;
         let storage = self.app.account_storage(&self.state.label)?;
         let now = unix_now_seconds();
+        let allow_loopback_http = self.app.allow_loopback_blob_endpoints();
         // Every page of one bundle comes from one snapshot, so a row that lands
         // inside the stretch already read is never vouched for but left out.
         cgka_traits::StorageProvider::with_read_snapshot(&storage, |storage| {
@@ -59,9 +70,19 @@ impl AppClient {
                 let last_page = page.len() < EXPORT_PAGE_ROWS;
                 for row in page {
                     let position = ChatPosition::of_row(&row);
-                    let event = row
-                        .event
-                        .map(|event| BundledEvent::exported(event, row.source_epoch));
+                    let event = match row.event {
+                        Some(event) => {
+                            let keys = attachment_keys(
+                                &storage,
+                                &group_id_hex,
+                                &event.event,
+                                row.source_epoch,
+                                allow_loopback_http,
+                            )?;
+                            Some(BundledEvent::exported(event, row.source_epoch, keys))
+                        }
+                        None => None,
+                    };
                     if !bundle.take(position.clone(), event) {
                         return Ok(bundle.finish());
                     }
@@ -117,8 +138,9 @@ impl AppClient {
 
     /// Import `events` into the chat `group_id` as history the device at
     /// `source_slot` sent. Drops an event whose id does not match its content,
-    /// a group-system row (those are local to each device), and a chat message
-    /// whose encrypted-media reference the live path would reject.
+    /// a group-system row (those are local to each device), a chat message
+    /// whose encrypted-media reference the live path would reject, and each
+    /// attachment key that names none of its message's attachments.
     fn import_chat_history(
         &mut self,
         group_id: &GroupId,
@@ -126,10 +148,15 @@ impl AppClient {
         events: &[ImportedAppEvent],
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let group_id_hex = self.history_chat(group_id)?;
+        let allow_loopback_http = self.app.allow_loopback_blob_endpoints();
         let importable = events
             .iter()
-            .filter(|event| importable(event, self.app.allow_loopback_blob_endpoints()))
+            .filter(|event| importable(event, allow_loopback_http))
             .cloned()
+            .map(|mut event| {
+                keep_keys_naming_attachments(&mut event, allow_loopback_http);
+                event
+            })
             .collect::<Vec<_>>();
         if importable.len() != events.len() {
             tracing::warn!(
@@ -233,4 +260,108 @@ fn importable(event: &ImportedAppEvent, allow_loopback_http: bool) -> bool {
         && event.kind != MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
         && (event.kind != MARMOT_APP_EVENT_KIND_CHAT
             || media_imeta_tags_preserve_message(&event.tags, allow_loopback_http))
+}
+
+/// The encrypted-media references of a chat message, each with `epoch` as
+/// its source epoch. Empty for any other kind.
+fn chat_media_references(
+    kind: u64,
+    tags: &[Vec<String>],
+    epoch: u64,
+    allow_loopback_http: bool,
+) -> Vec<MediaAttachmentReference> {
+    if kind != MARMOT_APP_EVENT_KIND_CHAT {
+        return Vec::new();
+    }
+    tags.iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .filter_map(|tag| {
+            media_attachment_from_imeta_tag(tag, Some(epoch), allow_loopback_http).ok()
+        })
+        .collect()
+}
+
+/// A key for each attachment of `event` this device can open: the key a
+/// sibling sent when this device imported the message, or else one derived
+/// from the source epoch's media secret while this device still holds it.
+/// The epoch secret itself never goes in a bundle.
+fn attachment_keys(
+    storage: &SqliteAppStorage,
+    group_id_hex: &str,
+    event: &MarmotAppEvent,
+    epoch: u64,
+    allow_loopback_http: bool,
+) -> Result<Vec<FileKey>, AppError> {
+    let references = chat_media_references(event.kind, &event.tags, epoch, allow_loopback_http);
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let imported = storage.imported_media_file_keys(group_id_hex, &event.id)?;
+    let mut keys = Vec::new();
+    for reference in references {
+        let ciphertext_sha256 = reference.ciphertext_sha256.to_ascii_lowercase();
+        if keys
+            .iter()
+            .any(|key: &FileKey| key.ciphertext_sha256 == ciphertext_sha256)
+        {
+            continue;
+        }
+        let key = match imported
+            .iter()
+            .find(|key| key.ciphertext_sha256 == ciphertext_sha256)
+        {
+            Some(imported) => imported.key.clone(),
+            None => {
+                let Ok(version) = EncryptedMediaVersion::parse(&reference.version) else {
+                    continue;
+                };
+                let Some(secret) = storage.encrypted_media_epoch_secret(
+                    group_id_hex,
+                    version.component_id(),
+                    epoch,
+                )?
+                else {
+                    continue;
+                };
+                let secret = Zeroizing::new(secret);
+                match media_file_key_for_reference(&secret, &reference) {
+                    Ok(key) => Zeroizing::new(key),
+                    Err(_) => continue,
+                }
+            }
+        };
+        keys.push(FileKey {
+            ciphertext_sha256,
+            key: hex::encode(*key),
+        });
+    }
+    Ok(keys)
+}
+
+/// Drops each key that names none of the chat message's attachments.
+fn keep_keys_naming_attachments(event: &mut ImportedAppEvent, allow_loopback_http: bool) {
+    if event.file_keys.is_empty() {
+        return;
+    }
+    let named = chat_media_references(
+        event.kind,
+        &event.tags,
+        event.source_epoch,
+        allow_loopback_http,
+    )
+    .into_iter()
+    .map(|reference| reference.ciphertext_sha256.to_ascii_lowercase())
+    .collect::<BTreeSet<_>>();
+    let count = event.file_keys.len();
+    event
+        .file_keys
+        .retain(|key| named.contains(&key.ciphertext_sha256));
+    if event.file_keys.len() != count {
+        tracing::warn!(
+            target: TRACE_TARGET,
+            method = "keep_keys_naming_attachments",
+            dropped = count - event.file_keys.len(),
+            "dropping imported attachment keys that name no attachment",
+        );
+    }
 }

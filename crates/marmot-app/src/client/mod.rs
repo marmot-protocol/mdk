@@ -451,9 +451,33 @@ pub(crate) fn preserve_encrypted_media_upload_error(
     error
 }
 
+/// Whether this device holds an epoch's media secret.
+enum EpochMediaSecret {
+    Available(SecretBytes),
+    /// Retired or never held here; the error says which.
+    Unavailable(AppError),
+}
+
+/// What opens a prepared download: the source epoch's media secret, or the
+/// file's own key, imported with a sibling's history (mdk#2628 4.2a).
+#[derive(Clone)]
+pub(crate) enum MediaDownloadKey {
+    EpochSecret(SecretBytes),
+    File(zeroize::Zeroizing<[u8; 32]>),
+}
+
+impl MediaDownloadKey {
+    fn as_key(&self) -> crate::media::MediaKey<'_> {
+        match self {
+            Self::EpochSecret(secret) => crate::media::MediaKey::EpochSecret(secret.as_ref()),
+            Self::File(key) => crate::media::MediaKey::File(key),
+        }
+    }
+}
+
 pub(crate) struct EncryptedMediaDownloadHttp {
     reference: MediaAttachmentReference,
-    media_secret: SecretBytes,
+    key: MediaDownloadKey,
     default_blob_endpoints: Vec<AppBlobEndpoint>,
     allowed_locator_kinds: Vec<String>,
     transport: BlossomHttpTransport,
@@ -469,12 +493,17 @@ pub(crate) enum AcquiredMediaBody {
 }
 
 impl EncryptedMediaDownloadHttp {
+    #[cfg(all(test, feature = "test-policy-overrides"))]
+    pub(crate) fn opens_with_imported_key(&self) -> bool {
+        matches!(self.key, MediaDownloadKey::File(_))
+    }
+
     pub(crate) async fn run_acquisition(
         self,
         resume: crate::media::attachment_resume::AttachmentResume,
     ) -> Result<AcquiredMediaBody, crate::media::AttachmentDownloadFailure> {
         let reference = self.reference.clone();
-        let secret = self.media_secret.clone();
+        let key = self.key.clone();
         let endpoints = self.default_blob_endpoints.clone();
         let kinds = self.allowed_locator_kinds.clone();
         let transport = self.transport.clone();
@@ -494,7 +523,7 @@ impl EncryptedMediaDownloadHttp {
                 resume.phase(0).await?;
                 let file = crate::media::file_transfer::download_file(
                     reference,
-                    secret.as_ref(),
+                    key.as_key(),
                     &endpoints,
                     &kinds,
                     &transport,
@@ -520,7 +549,7 @@ impl EncryptedMediaDownloadHttp {
         let transport = self.transport.with_resume(resume.clone());
         let result = crate::media::download_encrypted_media_classified(
             self.reference,
-            self.media_secret.as_ref(),
+            self.key.as_key(),
             &self.default_blob_endpoints,
             &self.allowed_locator_kinds,
             &transport,
@@ -544,7 +573,7 @@ impl EncryptedMediaDownloadHttp {
     ) -> Result<MediaDownloadResult, AppError> {
         download_encrypted_media_with_transport(
             self.reference,
-            self.media_secret.as_ref(),
+            self.key.as_key(),
             &self.default_blob_endpoints,
             &self.allowed_locator_kinds,
             &self.transport,
@@ -5718,13 +5747,29 @@ impl AppClient {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) fn prepare_background_attachment_download(
+        &self,
+        group_id: &GroupId,
+        reference: MediaAttachmentReference,
+        max_bytes: u64,
+    ) -> Result<Option<EncryptedMediaDownloadHttp>, AppError> {
+        self.prepare_background_attachment_download_for_message(
+            group_id, None, reference, max_bytes,
+        )
+    }
+
     /// Storage-only preparation for automatic work. Received-message projection
     /// caches each message's source-epoch secret and sync warms current epochs;
     /// missing/retired epoch material cannot trigger engine hydration here.
     /// Queued explicit work first calls `cache_attachment_source_epoch_secret`.
-    pub(crate) fn prepare_background_attachment_download(
+    /// Without a cached secret, only the key a sibling sent with this very
+    /// message (`message_id_hex`, when this device imported it) opens it; a
+    /// message this device received waits for its secret.
+    pub(crate) fn prepare_background_attachment_download_for_message(
         &self,
         group_id: &GroupId,
+        message_id_hex: Option<&str>,
         reference: MediaAttachmentReference,
         max_bytes: u64,
     ) -> Result<Option<EncryptedMediaDownloadHttp>, AppError> {
@@ -5739,26 +5784,34 @@ impl AppClient {
             .endpoint_policy()?;
         let version = EncryptedMediaVersion::parse(&reference.version)?;
         let storage = self.app.account_storage(&self.state.label)?;
-        if !storage
+        let secret = if storage
             .app_storage()
             .encrypted_media_epoch_secret_may_be_served(
                 &hex::encode(group_id.as_slice()),
                 reference.source_epoch,
+            )? {
+            self.cached_encrypted_media_epoch_secret(
+                group_id,
+                version.component_id(),
+                reference.source_epoch,
             )?
-        {
-            return Ok(None);
-        }
-        let Some(secret) = self.cached_encrypted_media_epoch_secret(
-            group_id,
-            version.component_id(),
-            reference.source_epoch,
-        )?
-        else {
-            return Ok(None);
+        } else {
+            None
+        };
+        let key = match secret {
+            Some(secret) => MediaDownloadKey::EpochSecret(SecretBytes::new(secret)),
+            None => match message_id_hex
+                .map(|message| self.imported_media_file_key(group_id, message, &reference))
+                .transpose()?
+                .flatten()
+            {
+                Some(key) => MediaDownloadKey::File(key),
+                None => return Ok(None),
+            },
         };
         Ok(Some(EncryptedMediaDownloadHttp {
             reference,
-            media_secret: SecretBytes::new(secret),
+            key,
             default_blob_endpoints: policy.default_blob_endpoints,
             allowed_locator_kinds: policy.allowed_locator_kinds,
             transport: self
@@ -5773,15 +5826,51 @@ impl AppClient {
     /// explicit work (Retry, download again) needs this for references projected
     /// before their source epoch was cached. Reads live engine state only: an
     /// unhydrated group errors instead of hydrating.
+    /// A message this device imported (mdk#2628 4.2a) downloads with the key
+    /// its sibling sent when the epoch's secret is unavailable here; storage
+    /// and engine failures still fail.
     pub(crate) fn cache_attachment_source_epoch_secret(
         &self,
         group_id: &GroupId,
+        message_id_hex: &str,
         reference: &MediaAttachmentReference,
     ) -> Result<(), AppError> {
         self.ensure_group(group_id)?;
         let component_id = EncryptedMediaVersion::parse(&reference.version)?.component_id();
-        self.encrypted_media_secret_for_epoch(group_id, reference.source_epoch, component_id)?;
-        Ok(())
+        match self.encrypted_media_secret_if_available(
+            group_id,
+            reference.source_epoch,
+            component_id,
+        )? {
+            EpochMediaSecret::Available(_) => Ok(()),
+            EpochMediaSecret::Unavailable(_)
+                if self
+                    .imported_media_file_key(group_id, message_id_hex, reference)?
+                    .is_some() =>
+            {
+                Ok(())
+            }
+            EpochMediaSecret::Unavailable(error) => Err(error),
+        }
+    }
+
+    /// The key a sibling sent for `reference` with the imported chat message
+    /// `message_id_hex` (mdk#2628 4.2a). A received message has none.
+    fn imported_media_file_key(
+        &self,
+        group_id: &GroupId,
+        message_id_hex: &str,
+        reference: &MediaAttachmentReference,
+    ) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .imported_media_file_key(
+                &hex::encode(group_id.as_slice()),
+                message_id_hex,
+                &reference.ciphertext_sha256.to_ascii_lowercase(),
+            )?)
     }
 
     pub(crate) async fn prepare_encrypted_media_download(
@@ -5796,14 +5885,30 @@ impl AppClient {
         // row contains its source-epoch exporter. Adopted V1 -> V2 migration
         // deliberately leaves historical V1 references as V1.
         let reference_version = EncryptedMediaVersion::parse(&reference.version)?;
-        let media_secret = self.encrypted_media_secret_for_epoch(
+        // The host names no message, so an imported message's file opens with
+        // the chat's one imported key for its ciphertext (mdk#2628 4.2a), and
+        // only when the epoch's secret is unavailable here.
+        let key = match self.encrypted_media_secret_if_available(
             group_id,
             reference.source_epoch,
             reference_version.component_id(),
-        )?;
+        )? {
+            EpochMediaSecret::Available(secret) => MediaDownloadKey::EpochSecret(secret),
+            EpochMediaSecret::Unavailable(error) => match self
+                .app
+                .account_storage(&self.state.label)?
+                .app_storage()
+                .imported_media_file_key_for_ciphertext(
+                    &hex::encode(group_id.as_slice()),
+                    &reference.ciphertext_sha256.to_ascii_lowercase(),
+                )? {
+                Some(key) => MediaDownloadKey::File(key),
+                None => return Err(error),
+            },
+        };
         Ok(EncryptedMediaDownloadHttp {
             reference,
-            media_secret,
+            key,
             default_blob_endpoints: policy.default_blob_endpoints,
             allowed_locator_kinds: policy.allowed_locator_kinds,
             transport: self.blossom_http_transport.clone(),
@@ -6571,12 +6676,15 @@ impl AppClient {
         Ok((epoch.0, secret))
     }
 
-    fn encrypted_media_secret_for_epoch(
+    /// The epoch's media secret, or why this device does not hold it (retired,
+    /// or neither cached nor exportable). Storage and engine failures are
+    /// errors, not unavailability.
+    fn encrypted_media_secret_if_available(
         &self,
         group_id: &GroupId,
         source_epoch: u64,
         component_id: u16,
-    ) -> Result<SecretBytes, AppError> {
+    ) -> Result<EpochMediaSecret, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
         if !self
             .app
@@ -6584,14 +6692,16 @@ impl AppClient {
             .app_storage()
             .encrypted_media_epoch_secret_may_be_served(&group_id_hex, source_epoch)?
         {
-            return Err(AppError::InvalidEncryptedMedia(format!(
-                "encrypted media secret retired for epoch {source_epoch}"
-            )));
+            return Ok(EpochMediaSecret::Unavailable(
+                AppError::InvalidEncryptedMedia(format!(
+                    "encrypted media secret retired for epoch {source_epoch}"
+                )),
+            ));
         }
         if let Some(secret) =
             self.cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
         {
-            return Ok(SecretBytes::new(secret));
+            return Ok(EpochMediaSecret::Available(SecretBytes::new(secret)));
         }
         if let Some(secret) = self.exportable_encrypted_media_secret(group_id, source_epoch)? {
             self.remember_encrypted_media_epoch_secret_for_component(
@@ -6603,12 +6713,14 @@ impl AppClient {
             if let Some(secret) =
                 self.cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
             {
-                return Ok(SecretBytes::new(secret));
+                return Ok(EpochMediaSecret::Available(SecretBytes::new(secret)));
             }
         }
-        Err(AppError::InvalidEncryptedMedia(format!(
-            "missing encrypted media secret for epoch {source_epoch}"
-        )))
+        Ok(EpochMediaSecret::Unavailable(
+            AppError::InvalidEncryptedMedia(format!(
+                "missing encrypted media secret for epoch {source_epoch}"
+            )),
+        ))
     }
 
     fn remember_current_encrypted_media_secret(&self, group_id: &GroupId) -> Result<(), AppError> {

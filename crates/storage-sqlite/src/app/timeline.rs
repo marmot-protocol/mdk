@@ -8,7 +8,9 @@ mod chat_history;
 mod edits;
 mod opening;
 mod presentation;
-pub use chat_history::{AppEventImport, HistoryExportEvent, HistoryExportRow, ImportedAppEvent};
+pub use chat_history::{
+    AppEventImport, HistoryExportEvent, HistoryExportRow, ImportedAppEvent, ImportedFileKey,
+};
 pub use edits::{TimelineEditHistoryPage, TimelineEditSummary, TimelineEditVersion};
 pub use opening::{
     ConversationAnchor, ConversationOpenAnchorOutcome, ConversationOpenError,
