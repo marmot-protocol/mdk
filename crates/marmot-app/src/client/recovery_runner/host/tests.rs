@@ -19,6 +19,7 @@ use super::super::open_attempts::AttemptKind;
 use super::super::{RecoveryRunnerPolicy, RunnerHost, UnitKey};
 use super::{AccountRunner, AccountRunnerHost, RunnerSeat, SpawnedRunner};
 use crate::client::AppClient;
+use crate::client::audit_recovery::recorded_v5_rows;
 use crate::client::history_notices::park_recovery_for_test;
 use crate::client::recovery_coverage::scenario_tests::{Fixture, fixture};
 use crate::unix_now_seconds;
@@ -319,6 +320,54 @@ async fn begun_runner(
         _refund: refund,
     };
     (spawned, runner)
+}
+
+/// A runner turn's audit sink records into the account's own v5 recorder,
+/// which takes the breaker's row as written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_turn_records_into_the_accounts_audit() {
+    let relay = MockRelay::run().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        relay.url().await.to_string(),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    )
+    .with_recovery_runner_owning_debt();
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let AccountRunner {
+        runner, mut turns, ..
+    } = client.build_recovery_runner().await;
+    let host = runner.host.clone();
+    let recorded = tokio::spawn(async move {
+        host.turn(|turn| {
+            (turn.audit)(marmot_forensics::AuditEventKind::RecoveryRunnerPaused {
+                cap: marmot_forensics::RecoveryRunnerCap::Attempts,
+                attempts: 120,
+                event_bytes: 4096,
+                paused_for_secs: 1_800,
+                pauses: 1,
+                late_findings: 0,
+            });
+        })
+        .await
+    });
+    turns.recv().await.unwrap().serve(&mut client).await;
+    recorded.await.unwrap().expect("the turn was served");
+
+    let rows = recorded_v5_rows(&app, "recovery_runner_paused");
+    assert_eq!(rows.len(), 1);
+    let event = &rows[0]["event"];
+    assert_eq!(
+        (&event["cap"], &event["attempts"], &event["paused_for_secs"]),
+        (&"attempts".into(), &120.into(), &1_800.into())
+    );
+    assert!(rows[0]["group_ref"].is_null());
 }
 
 /// A deadline the stop has already passed.
