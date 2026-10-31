@@ -303,9 +303,11 @@ impl AppClient {
     }
 
     async fn try_join_stashed_sibling_welcomes(&mut self) -> Result<(), AppError> {
-        let account = self.app.account_storage(&self.state.label)?;
-        let storage = account.app_storage();
-        let stashed = storage.stashed_sibling_welcomes()?;
+        let stashed = self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .stashed_sibling_welcomes()?;
         if stashed.is_empty() {
             return Ok(());
         }
@@ -313,6 +315,27 @@ impl AppClient {
         // their projection have settled.
         let policy_lock = self.app.block_update_lock(&self.state.label).await;
         let _policy_guard = policy_lock.lock().await;
+        // A join retires its chat's rejoin offers, which the host shows until
+        // it is told, even when a later row's failure ends the pass.
+        let offers = self.rejoin_offer_snapshot()?;
+        let joined = self.join_each_stashed_sibling_welcome(stashed).await;
+        self.reconcile_rejoin_offer_changes(offers)?;
+        if joined? > 0 {
+            // GroupJoined is journaled durably, so a failed projection is
+            // repaired by the ordinary reopen and drain path.
+            let summary = self.drain_pending_session_events().await?;
+            self.pending_applied_sync_summary.merge(summary);
+        }
+        Ok(())
+    }
+
+    /// Settle each stashed row in turn; the number that joined a chat.
+    async fn join_each_stashed_sibling_welcome(
+        &mut self,
+        stashed: Vec<StashedSiblingWelcome>,
+    ) -> Result<usize, AppError> {
+        let account = self.app.account_storage(&self.state.label)?;
+        let storage = account.app_storage();
         let issued = self.runtime.issued_private_key_packages()?;
         let now = unix_now_seconds();
         let (mut joined, mut held, mut refused, mut withdrawn, mut expired, mut failed) =
@@ -405,13 +428,7 @@ impl AppClient {
             failed,
             "joined from stashed sibling Welcomes"
         );
-        if joined > 0 {
-            // GroupJoined is journaled durably, so a failed projection is
-            // repaired by the ordinary reopen and drain path.
-            let summary = self.drain_pending_session_events().await?;
-            self.pending_applied_sync_summary.merge(summary);
-        }
-        Ok(())
+        Ok(joined)
     }
 
     /// Where the chat a held sibling Welcome is into stands. A chat whose

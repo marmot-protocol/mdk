@@ -801,6 +801,67 @@ async fn a_held_sibling_welcome_joins_a_chat_whose_copy_is_unrecoverable() {
     assert!(!key_package_issued(&devices.phone, &again));
 }
 
+/// A join from the stash retires the chat's rejoin offers, as any join
+/// does, and tells the host that chat's offers changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_from_the_stash_tells_the_host_of_the_offers_it_retires() {
+    use cgka_traits::storage::{GroupStorage as _, WelcomeStorage as _};
+    use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
+    let (mut devices, group) = tagging_devices().await;
+    let (chat, again, _) = chat_re_adding_the_phone(&mut devices, &group).await;
+    send_sibling_welcome(&mut devices.laptop, &group, &again).await;
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert_eq!(held_for(&devices.phone), vec![Some(chat.clone())]);
+
+    // A gift-wrapped Welcome back into the chat, stored as an offer while
+    // the copy was active.
+    let storage = group_storage(&devices.phone);
+    storage
+        .put_welcome(&PendingWelcome {
+            message_id: MessageId::new(vec![0xe1; 32]),
+            group_id: chat.clone(),
+            welcome_bytes: vec![],
+            rejoin: Some(RejoinWelcome {
+                epoch: cgka_traits::EpochId(0),
+                content_id: MessageId::new(vec![0xe2; 32]),
+                welcomer: devices.phone.runtime.session().self_id(),
+                local_state_token: vec![],
+            }),
+        })
+        .unwrap();
+    assert_eq!(
+        devices
+            .phone
+            .group_recovery_status(&chat)
+            .unwrap()
+            .rejoin_invitations
+            .len(),
+        1
+    );
+    let mut record = storage.get_group(&chat).unwrap();
+    record.unrecoverable = true;
+    storage.put_group(&record).unwrap();
+    devices.phone.pending_recovery_status_updates.clear();
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert_eq!(stashed(&devices.phone), 0);
+    assert!(!key_package_issued(&devices.phone, &again));
+    assert!(
+        devices
+            .phone
+            .group_recovery_status(&chat)
+            .unwrap()
+            .rejoin_invitations
+            .is_empty()
+    );
+    assert!(
+        devices
+            .phone
+            .pending_recovery_status_updates
+            .contains(&chat)
+    );
+}
+
 /// A held sibling Welcome goes, joining nothing, once it never can: its
 /// carrier is withdrawn, its private KeyPackage expires, or its chat is
 /// disbanded or forgotten. Each exit takes only its own row; a pass with
