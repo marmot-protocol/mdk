@@ -501,6 +501,12 @@ account-wide ones (loss, incremental and explicit history) appear only in the li
 `MarmotAppEvent::HistoryNoticesChanged` announces any change, and a group whose own notices changed also gets
 `GroupStateUpdated`.
 
+`MarmotAppRuntime::account_recovery_status(account_ref)` reads the account's recovery as one `AccountRecoveryStatus`:
+the groups whose history is still being fetched, whether the inbox's is, and every notice as `history_notices` lists
+them. Re-read it on `MarmotAppEvent::RecoveryStatusChanged`. Until the recovery runner owns history (mdk#2660) nothing
+is ever catching up and neither that event nor `HistoryNoticeCause::UnprovenHistory` (history the runner could not
+prove on a route's relays) is produced.
+
 `dismiss_history_notice(account_ref, notice_id)` runs on the account worker. After the user accepts that the history may
 be incomplete, it durably retires exactly that occurrence as its own outcome (`state = 2`), never as coverage. A retired
 loss keeps its evidence as a watermark, so a delayed duplicate cannot rearm it, and releases the transport-cursor fence

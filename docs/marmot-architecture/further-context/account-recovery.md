@@ -755,7 +755,7 @@ exit, a quantum in flight included. A directly owned client runs one pass in pla
 relay pool and dial nothing. The places that change debt or routes wake it: loss import, goal
 widening, route replacement, a released receipt, a dismissal and a group lifecycle change. A
 wake only makes it read the ledger again. A unit is one (route,
-required relay) of a group route; a best-effort relay gets one uncharged attempt per new debt.
+required relay) of a group route or the inbox; a best-effort relay gets one uncharged attempt per new debt.
 One step picks a unit in a worker turn and waits off the worker for one of the process's two
 recovery credits. It then begins: it reads the relay's NIP-11 caps, records known ones, reads
 the live tails again, plans the unit's owed ranges from its ledger cursor, reads the un-cover
@@ -882,6 +882,34 @@ on. The recorder writes no live boundary on a held route until its frames are re
 tail still stands. Held frames stay under the replay buffer bounds, so overflow is loss, and the
 relay plane's cursor seal stops at the oldest one its restart floor does not cover, since no
 queue holds it yet.
+
+The inbox (PR 5e) is a route of its own: its units compare the account's gift wraps and are
+never swept, admission takes its events as a group of their own and never fences them, and
+re-checks visit it as they do a group route. A relay that will not compare the inbox refuses
+its unit, which breaks and parks behind a notice, and keeps comparing groups. Explicit repair,
+behind the gate, is one request the account's runner owns. The runner takes it between its own
+steps, with no quantum in flight, and in one turn widens every current route's goal to the
+retention floor and re-arms every unit. Passes then run within the repair's 60 s while the
+caller serves their turns. Cancelling, or the budget running out, stops the request: a quantum
+in flight is interrupted and settles, so what it read is charged. Its verdicts are today's,
+never success. `BelowRetentionWindow` once every current route, a suspended group's left out,
+has nothing staged and its required relays' units are still active, owe nothing up to their
+live tails (a retained route's goal end, if earlier), and, on each that compares, were
+re-checked since the re-arm wherever the re-check survey owes a pass. As today, something must
+have been judged: a route with no required relay keeps the window unproven, and so does a
+repair whose every route is suspended. The caller decides a cancel first, as today, even over a
+covered window; a covered window wins over the deadline. `Cancelled` or `Deadline` when the
+caller or the budget ends it. Otherwise `CoverageUnproven` after a pass that served nothing. A
+route the ledger parks on a relay it requires is one "history may be incomplete" notice with
+the cause `UnprovenHistory`, whose id is a hash of the route with its park revision; a group
+route's also shows in that group's status. A park on a relay the route now carries only as best
+effort, or no longer, raises none. What a notice shows, its revision (the newest park among
+them) and what dismissing it retires are one set, so such a park moves no revision and is never
+dismissed. A remainder is a notice only once the runner has surveyed and catches up nothing on
+its route. A suspended (Unrecoverable) group's routes give no notice. Each survey
+publishes the required units still catching up; the account's recovery status reads that, and
+a change in it or in the notices is one `RecoveryStatusChanged`. With the gate off none of this
+shows.
 
 ## What gets deleted
 

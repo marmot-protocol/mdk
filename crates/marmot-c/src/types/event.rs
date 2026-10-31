@@ -383,6 +383,13 @@ pub enum MarmotEvent {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
+    /// The account's recovery status may have changed; re-read
+    /// `marmot_account_recovery_status`. Carries no group identities. Not
+    /// raised until the recovery runner owns history (mdk#2660).
+    RecoveryStatusChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
 }
 
 impl From<MarmotEventFfi> for MarmotEvent {
@@ -525,6 +532,13 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 account_id_hex: owned_c_string(account_id_hex),
                 account_label: owned_c_string(account_label),
             },
+            F::RecoveryStatusChanged {
+                account_id_hex,
+                account_label,
+            } => Self::RecoveryStatusChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
         }
     }
 }
@@ -594,6 +608,10 @@ impl CFree for MarmotEvent {
                     account_label,
                 }
                 | Self::DeviceLinkChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::RecoveryStatusChanged {
                     account_id_hex,
                     account_label,
                 } => {
@@ -837,6 +855,35 @@ mod tests {
             assert_eq!(
                 std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
                 "carol"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn recovery_status_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(MarmotEventFfi::RecoveryStatusChanged {
+            account_id_hex: "af".repeat(32),
+            account_label: "erin".to_owned(),
+        }));
+        unsafe {
+            let MarmotEvent::RecoveryStatusChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "af".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "erin"
             );
             marmot_event_free(event);
         }

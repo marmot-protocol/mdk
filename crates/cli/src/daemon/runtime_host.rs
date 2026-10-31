@@ -783,6 +783,9 @@ pub(crate) async fn handle_app_runtime_event(
         // signals above this reports a user-facing state, not activity; the
         // notices themselves are read from the runtime.
         marmot_app::MarmotAppEvent::HistoryNoticesChanged { .. } => {}
+        // The account's recovery status may have changed; it is read from
+        // the runtime.
+        marmot_app::MarmotAppEvent::RecoveryStatusChanged { .. } => {}
         // The account's linked devices may have changed; the devices are read
         // from the runtime.
         marmot_app::MarmotAppEvent::LinkedDevicesChanged { .. } => {}

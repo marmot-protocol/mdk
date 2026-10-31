@@ -14,7 +14,7 @@
 //! The runner never trusts a wake: every bump (`AppTransportRouting`'s
 //! sender) only makes it read the ledger again.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -23,18 +23,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use cgka_traits::{MemberId, TransportDelivery, TransportEndpoint};
 use nostr::prelude::{Event, RelayUrl};
-use storage_sqlite::{RecoveryUnitPolicy, SqliteAppStorage};
+use storage_sqlite::{RecoveryUnitPolicy, SqliteAppStorage, TransportReconciliationRoute};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use transport_nostr::MarmotRelayPlane;
 use transport_nostr_adapter::compare::CompareRelay;
-use transport_nostr_adapter::sweep::{RelayCaps, SdkSweepRelay, SweepRelay};
+use transport_nostr_adapter::sweep::{INTERRUPT_GRACE, RelayCaps, SdkSweepRelay, SweepRelay};
 use transport_nostr_adapter::{NostrRelayEvent, NostrSdkRelayClient};
 use transport_nostr_peeler::NostrTransportEvent;
 
 use super::{
-    Admitted, DebtTurn, OpenAttempts, PassReport, RecoveryRunner, RecoveryRunnerHandle,
-    RecoveryRunnerPolicy, RunnerHost, TARGET, WorkerTurn,
+    Admitted, DebtTurn, OpenAttempts, PassBound, PassReport, RecoveryRunner, RecoveryRunnerHandle,
+    RecoveryRunnerPolicy, RepairEnd, RunnerHost, TARGET, UnitKey, WorkerTurn,
 };
 use crate::MarmotApp;
 use crate::client::sync::{RecoveredDelivery, TRANSPORT_RECONCILIATION_QUANTUM};
@@ -46,6 +46,15 @@ use crate::relay_caps::RelayCapsCache;
 /// holds no storage, so an abort loses nothing durable, and an attempt it
 /// left unsettled is refunded ([`OpenAttemptRefund`]).
 const STOP_WAIT: Duration = Duration::from_secs(1);
+
+/// How often an explicit caller waiting on a repair looks at its
+/// cancellation.
+const CANCEL_POLL: Duration = Duration::from_millis(50);
+
+/// How long a caller waits for a repair past its cancel or deadline: its
+/// request's interrupt grace, then a stop's wait for the settle. Only a
+/// guard: the runner ends on its bound by itself.
+const CANCEL_WAIT: Duration = INTERRUPT_GRACE.saturating_add(STOP_WAIT);
 
 type ClientFuture<'c, T> = Pin<Box<dyn Future<Output = T> + Send + 'c>>;
 type ClientTurn = Box<dyn for<'c> FnOnce(&'c mut AppClient) -> ClientFuture<'c, ()> + Send>;
@@ -71,6 +80,12 @@ pub(crate) struct AccountRunnerHost {
     allow_loopback: bool,
     relay_plane: MarmotRelayPlane,
     account_id: MemberId,
+    /// The account's public key, its inbox's `#p`. An account id that is no
+    /// 32-byte key has no inbox the runner can ask for.
+    inbox: Option<[u8; 32]>,
+    /// Where the account's recovery status reads what the runner's last
+    /// survey found catching up.
+    catching_up: watch::Sender<Option<BTreeSet<UnitKey>>>,
     /// The account's relay pool. An account whose transport has not
     /// registered yet has none, so each debt turn looks again until it does.
     relay_client: Mutex<Option<NostrSdkRelayClient>>,
@@ -165,13 +180,17 @@ impl RunnerHost for AccountRunnerHost {
         // Every quantum begins in a debt turn, so its sweep finds the pool
         // once the account's transport has registered one.
         self.find_relay_client().await;
+        let inbox = self.inbox;
         self.on_client(false, move |client| {
             Box::pin(async move {
                 let app = runner_storage(client)?;
                 let now = unix_now();
                 client.settle_recovery_route_changes(&app, now);
                 let tails = client.recovery_runner_live_tails(&app, now).await;
-                let routes = client.recovery_runner_routes();
+                let mut routes = client.recovery_runner_routes();
+                if inbox.is_none() {
+                    routes.retain(|route| route.route != TransportReconciliationRoute::Inbox);
+                }
                 // The live counts and the fences they raise come with PR 5c.
                 Some(turn(&DebtTurn {
                     app: &app,
@@ -179,6 +198,7 @@ impl RunnerHost for AccountRunnerHost {
                     now,
                     tails: &*tails,
                     live_counts: &[],
+                    inbox: inbox.unwrap_or_default(),
                 }))
             })
         })
@@ -264,6 +284,16 @@ impl RunnerHost for AccountRunnerHost {
             .as_ref()
             .map(NostrSdkRelayClient::relay_connections)
     }
+
+    fn surveyed(&self, catching_up: BTreeSet<UnitKey>) {
+        self.catching_up.send_if_modified(|last| {
+            let changed = last.as_ref() != Some(&catching_up);
+            if changed {
+                *last = Some(catching_up);
+            }
+            changed
+        });
+    }
 }
 
 /// Admit one staged delivery through the account's recovered-ingest path. An
@@ -305,7 +335,7 @@ fn runner_storage(client: &AppClient) -> Option<SqliteAppStorage> {
     }
 }
 
-fn unix_now() -> u64 {
+pub(super) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
@@ -360,7 +390,9 @@ impl AppClient {
                     .await,
             ),
             relay_plane: self.relay_plane.clone(),
+            inbox: <[u8; 32]>::try_from(account_id.as_slice()).ok(),
             account_id,
+            catching_up: self.routing.recovery_runner_catching_up(),
         };
         let policy = RecoveryRunnerPolicy::default();
         let (runner, handle) = RecoveryRunner::waking_on(
@@ -427,15 +459,7 @@ impl AppClient {
     /// one, gate off, would still pay for it.
     pub(crate) fn run_recovery_runner_pass(&mut self) -> ClientFuture<'_, Option<PassReport>> {
         Box::pin(async move {
-            let mut seat = match &mut self.recovery_runner {
-                RunnerSeat::Absent => return None,
-                RunnerSeat::InPlace(seat) => match seat.take() {
-                    Some(seat) => seat,
-                    // A pass dropped mid-way took its runner with it, and
-                    // refunded the attempt it left open.
-                    None => InPlaceRunner::from(self.build_recovery_runner().await),
-                },
-            };
+            let mut seat = self.take_in_place_runner().await?;
             #[cfg(test)]
             {
                 seat.passes += 1;
@@ -455,6 +479,64 @@ impl AppClient {
             self.recovery_runner = RunnerSeat::InPlace(Box::new(Some(seat)));
             Some(report)
         })
+    }
+
+    /// This client's in-place runner, out of its seat while it runs. `None`
+    /// without one.
+    async fn take_in_place_runner(&mut self) -> Option<InPlaceRunner> {
+        match &mut self.recovery_runner {
+            RunnerSeat::Absent => None,
+            RunnerSeat::InPlace(seat) => match seat.take() {
+                Some(seat) => Some(seat),
+                // A pass dropped mid-way took its runner with it, and refunded
+                // the attempt it left open.
+                None => Some(InPlaceRunner::from(self.build_recovery_runner().await)),
+            },
+        }
+    }
+
+    /// Have the account's runner serve one explicit repair under `bound`
+    /// ([`RecoveryRunner::repair`]): `spawned`, the worker's, once its
+    /// current step ends, or else this client's in-place one. Its turns run
+    /// on this client meanwhile. Once `cancelled` says so the bound's stop is
+    /// tripped; on it, or at the deadline, the runner ends, its quantum in
+    /// flight interrupting and settling on a turn served here. A repair whose
+    /// caller cancelled is `Cancelled` however it ended ([`serve_repair`]).
+    /// `Stopped` without a runner.
+    pub(crate) async fn repair_through_recovery_runner(
+        &mut self,
+        spawned: Option<&mut SpawnedRunner>,
+        bound: PassBound,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> RepairEnd {
+        match spawned {
+            Some(spawned) => {
+                let handle = spawned.handle.clone();
+                let request = bound.clone();
+                let repair = async move { handle.repair(request).await };
+                serve_repair(self, repair, &mut spawned.turns, &bound, cancelled)
+                    .await
+                    .end
+            }
+            None => {
+                let Some(mut seat) = self.take_in_place_runner().await else {
+                    return RepairEnd::Stopped;
+                };
+                let served = {
+                    let InPlaceRunner { runner, turns, .. } = &mut seat;
+                    // On the heap: a repair's future carries a pass's.
+                    let repair = Box::pin(async { Some(runner.repair(&bound).await) });
+                    serve_repair(self, repair, turns, &bound, cancelled).await
+                };
+                // A runner that never answered is dropped with its seat, and
+                // refunds the attempt it left open; the next pass builds a
+                // fresh one.
+                if served.answered {
+                    self.recovery_runner = RunnerSeat::InPlace(Box::new(Some(seat)));
+                }
+                served.end
+            }
+        }
     }
 
     /// Whether this directly owned client runs a recovery runner in place.
@@ -584,6 +666,75 @@ impl Drop for SpawnedRunner {
         self.handle.shutdown();
         self.task.abort();
     }
+}
+
+/// How a repair ended for its caller.
+struct ServedRepair {
+    end: RepairEnd,
+    /// The runner answered; one that did not is gone or overstayed.
+    answered: bool,
+}
+
+/// Serve `turns` on `client` until `repair` answers. Whenever `cancelled`
+/// says so, trip `bound`'s stop; once it is tripped or the deadline passes,
+/// on which the runner ends by itself, give up after [`CANCEL_WAIT`] more.
+/// What the runner sent by then is still served, so a settle that came in
+/// time keeps its verdict and its bytes. The caller decides `Cancelled`
+/// first, as today's path does: a repair whose caller cancelled is
+/// `Cancelled` however the runner ended, so the stop only preempts, and a
+/// late trip changes no end. A storage failure still outranks it, as today.
+/// Nothing but the caller's cancel trips the stop, so a repair the clock
+/// ended is never `Cancelled`. An answer of `None`, the runner gone, is
+/// `Stopped`; no answer by the backstop is `Deadline`.
+async fn serve_repair(
+    client: &mut AppClient,
+    repair: impl Future<Output = Option<RepairEnd>>,
+    turns: &mut mpsc::Receiver<RunnerTurn>,
+    bound: &PassBound,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> ServedRepair {
+    tokio::pin!(repair);
+    let mut poll = tokio::time::interval(CANCEL_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut stopping_by = None;
+    let answer = loop {
+        tokio::select! {
+            biased;
+            end = &mut repair => break Some(end.unwrap_or(RepairEnd::Stopped)),
+            Some(turn) = turns.recv() => turn.serve(client).await,
+            _ = poll.tick() => {}
+        }
+        // After every arm: a runner whose turns come back to back keeps the
+        // turn arm ready, so the tick alone could wait forever. Also once the
+        // deadline armed the backstop: a cancel then still preempts.
+        if cancelled() {
+            bound.stop.cancel();
+        }
+        let now = tokio::time::Instant::now();
+        let by = match stopping_by {
+            Some(by) => by,
+            None if bound.stop.is_cancelled() || now >= bound.deadline => {
+                *stopping_by.insert(now + CANCEL_WAIT)
+            }
+            None => continue,
+        };
+        if now >= by {
+            break None;
+        }
+    };
+    let answered = answer.is_some();
+    if !answered {
+        while let Ok(turn) = turns.try_recv() {
+            turn.serve(client).await;
+        }
+    }
+    let end = match answer {
+        Some(RepairEnd::Failed(error)) => RepairEnd::Failed(error),
+        _ if cancelled() => RepairEnd::Cancelled,
+        Some(end) => end,
+        None => RepairEnd::Deadline,
+    };
+    ServedRepair { end, answered }
 }
 
 /// The worker's runner, if it has one: the next turn its runner sends.

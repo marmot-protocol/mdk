@@ -42,10 +42,12 @@
 //! group waits behind it on the local-failure backoff, stalled; other groups
 //! go on.
 //!
+//! The inbox is admitted as a group of its own, under the same frontier and
+//! bounds. It never fences: no live frames wait on its history.
+//!
 //! Nothing runs this before the switch-over (PR 5), which maps the coverage
 //! recorder's live count facts into [`LiveCount`] and has the adapter's hold
-//! read [`live_fences`] in place of owner capture. Inbox staging (PR 6) is not
-//! admitted here.
+//! read [`live_fences`] in place of owner capture.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -54,12 +56,12 @@ use storage_sqlite::{
     RecoveryCoverageRange, RecoveryStagedUsage, RecoveryUnitState, StagedRecoveryEvent,
     TransportReconciliationRoute,
 };
-use tokio::time::Instant;
 
 use super::policy::RecoveryStagingBounds;
-use super::select::{suspended, sweepable};
+use super::select::suspended;
 use super::{
-    DebtTurn, RecoveryRunner, RecoveryRunnerPolicy, RunnerHost, RunnerRoute, Step, TARGET, UnitKey,
+    DebtTurn, PassBound, RecoveryRunner, RecoveryRunnerPolicy, RunnerHost, RunnerRoute, Step,
+    TARGET, UnitKey,
 };
 use crate::AppError;
 
@@ -214,7 +216,7 @@ impl<'t> Admission<'t> {
     pub(super) fn new(turn: &'t DebtTurn<'t>) -> Self {
         let mut groups: BTreeMap<GroupKey, Vec<&RunnerRoute>> = BTreeMap::new();
         let mut route_groups = BTreeMap::new();
-        for route in sweepable(turn.routes).filter(|route| !suspended(route)) {
+        for route in turn.routes.iter().filter(|route| !suspended(route)) {
             let key = group_key(route);
             route_groups.insert(&route.route, key.clone());
             groups.entry(key).or_default().push(route);
@@ -426,7 +428,7 @@ impl<'t> Admission<'t> {
     }
 
     /// The groups a fence may hold: those with a live count's capture or a
-    /// unit that keeps a fence.
+    /// unit that keeps a fence. Never the inbox.
     fn fence_groups(&mut self) -> StorageResult<BTreeSet<GroupKey>> {
         self.stored_fences()?;
         Ok(self
@@ -439,6 +441,7 @@ impl<'t> Admission<'t> {
                     .flat_map(BTreeMap::keys)
                     .map(|unit| &unit.route),
             )
+            .filter(|route| **route != TransportReconciliationRoute::Inbox)
             .filter_map(|route| self.route_groups.get(route).cloned())
             .collect())
     }
@@ -713,12 +716,12 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     /// finds nothing. Returns how the pass ended, or the step to end with.
     /// Holds and waits are armed from the clock as read after the awaits
     /// that led to them, so none is born expired.
-    pub(super) async fn admit(&mut self, pass_deadline: Option<Instant>) -> Result<Drained, Step> {
+    pub(super) async fn admit(&mut self, pass: Option<&PassBound>) -> Result<Drained, Step> {
         loop {
             if self.cancel.is_cancelled() {
                 return Err(Step::Stopped);
             }
-            if pass_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if pass.is_some_and(PassBound::ended) {
                 return Err(Step::Idle { next_due: None });
             }
             let now = self.host.now_seconds();

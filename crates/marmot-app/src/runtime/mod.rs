@@ -1541,6 +1541,15 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's recovery status may have changed: which groups and
+    /// whether the inbox are still catching up, or its notices. Re-read
+    /// `account_recovery_status`. Carries no group identities, and fires at
+    /// most once per publication seam. Not raised until the recovery runner
+    /// owns history (mdk#2660).
+    RecoveryStatusChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
     /// The account's linked devices may have changed: re-read
     /// `linked_devices`. The device group's own events never reach hosts, so
     /// this is their only cue. Also fires once each time the account's worker
@@ -2483,6 +2492,18 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<Vec<crate::HistoryNotice>, AppError> {
         self.accounts.history_notices(account_ref).await
+    }
+
+    /// The account's recovery status: the groups whose history is still
+    /// being fetched, whether the inbox's is, and every notice as
+    /// `history_notices` lists them. Refresh on `RecoveryStatusChanged`.
+    /// Until the recovery runner owns history (mdk#2660), nothing is ever
+    /// catching up.
+    pub async fn account_recovery_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::AccountRecoveryStatus, AppError> {
+        self.accounts.account_recovery_status(account_ref).await
     }
 
     /// This account's own devices, from the roster of the device group this

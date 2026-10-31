@@ -1045,6 +1045,19 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn account_recovery_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::AccountRecoveryStatus, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AccountRecoveryStatus { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn linked_devices(
         &self,
         account_ref: &str,

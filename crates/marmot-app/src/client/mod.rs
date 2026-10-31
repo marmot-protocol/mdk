@@ -830,6 +830,10 @@ pub struct AppClient {
     /// incomplete"): one small entry per parked occurrence, compared at each
     /// publication seam so a change raises `HistoryNoticesChanged`.
     pub(crate) history_notice_baseline: Option<history_notices::HistoryNoticeBaseline>,
+    /// The recovery runner's survey changed what is catching up since hosts
+    /// last heard; the worker's account-level seam drains it into one
+    /// `RecoveryStatusChanged` (mdk#2660 phase 4). Only a runner sets it.
+    pub(crate) recovery_status_owed: bool,
     /// The linked devices may have changed since hosts last heard: a hidden
     /// device-group event, a change of trust, or an open, which cannot know
     /// what hosts last read. The worker's account-level and applied-summary

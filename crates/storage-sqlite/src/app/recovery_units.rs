@@ -751,6 +751,13 @@ pub(crate) fn rearm_all_units_tx(conn: &Connection) -> StorageResult<usize> {
             [],
         )
         .storage()?;
+    // An active unit backing off is due again too, with no streak.
+    conn.execute_cached(
+        "UPDATE account_recovery_units SET no_progress = 0, backoff_step = 0,
+         next_attempt_at_seconds = 0 WHERE state = 0",
+        [],
+    )
+    .storage()?;
     conn.execute_cached("DELETE FROM account_recovery_unit_spans", [])
         .storage()?;
     conn.execute_cached(
@@ -1561,9 +1568,11 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Explicit repair: every broken and retired unit is active again with a
-    /// fresh budget, every parked and retired span is owed again, and every
-    /// unit's re-check falls due now. Returns the units re-armed.
+    /// Explicit repair: every broken and retired unit is active again, every
+    /// unit starts a fresh budget (no backoff, no no-progress streak), every
+    /// parked and retired span is owed again, and every unit's re-check falls
+    /// due now. Relay cooldowns and the account's budget stay. Returns the
+    /// broken and retired units re-armed.
     pub fn rearm_all_recovery_units(&self) -> StorageResult<usize> {
         self.connection
             .with_transaction(|| rearm_all_units_tx(&*self.lock()?))
@@ -1637,6 +1646,28 @@ impl SqliteAppStorage {
         route: &TransportReconciliationRoute,
         revision: u64,
     ) -> StorageResult<bool> {
+        self.dismiss_route_park(route, None, revision)
+    }
+
+    /// [`Self::dismiss_recovery_route_park`] for what a notice shows: the
+    /// route's broken units on `relays` and its remainder. `revision` must be
+    /// the newest park among them, and only they are dismissed; a broken unit
+    /// on any other relay is left as it is.
+    pub fn dismiss_recovery_route_park_on(
+        &self,
+        route: &TransportReconciliationRoute,
+        relays: &[String],
+        revision: u64,
+    ) -> StorageResult<bool> {
+        self.dismiss_route_park(route, Some(relays), revision)
+    }
+
+    fn dismiss_route_park(
+        &self,
+        route: &TransportReconciliationRoute,
+        relays: Option<&[String]>,
+        revision: u64,
+    ) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let (kind, id) = route.storage_key();
@@ -1644,7 +1675,10 @@ impl SqliteAppStorage {
                 &conn,
                 "WHERE state = 1 AND route_kind = ?1 AND route_id = ?2",
                 params![kind, id],
-            )?;
+            )?
+            .into_iter()
+            .filter(|unit| relays.is_none_or(|relays| relays.contains(&unit.relay)))
+            .collect::<Vec<_>>();
             let current = broken
                 .iter()
                 .filter_map(|unit| unit.park)

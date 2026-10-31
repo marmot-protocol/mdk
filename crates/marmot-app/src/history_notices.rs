@@ -2,14 +2,18 @@
 //! automatic recovery stopped retrying, and the opaque ids hosts dismiss them
 //! with. See `docs/marmot-architecture/further-context/account-recovery.md`.
 use serde::{Deserialize, Serialize};
-use storage_sqlite::{ParkedRecoveryObligation, RecoveryCause, RecoveryDemandTicket};
+use sha2::{Digest, Sha256};
+use storage_sqlite::{
+    ParkedRecoveryObligation, RecoveryCause, RecoveryDemandTicket, TransportReconciliationRoute,
+};
 
 use crate::AppError;
 
 /// Why recovery parked. Hosts choose wording from this; it carries no
 /// identities. Current policy parks the first five causes. `KnownEvent` and
 /// `MaintenanceBoundary` are reserved for demand that may park in a later
-/// policy, so exhaustive host switches stay source-compatible.
+/// policy, so exhaustive host switches stay source-compatible, and so is
+/// `UnprovenHistory` until the recovery runner owns history (mdk#2660).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryNoticeCause {
@@ -31,6 +35,10 @@ pub enum HistoryNoticeCause {
     KnownEvent,
     /// A post-join maintenance boundary was never observed.
     MaintenanceBoundary,
+    /// The recovery runner could not prove this history on a route's relays
+    /// and stopped retrying them: a group's (`group_id_hex` names it) or the
+    /// account inbox's. The runner does not know why the history was owed.
+    UnprovenHistory,
 }
 
 impl HistoryNoticeCause {
@@ -44,6 +52,7 @@ impl HistoryNoticeCause {
             Self::ExplicitRepair => "explicit_repair",
             Self::KnownEvent => "known_event",
             Self::MaintenanceBoundary => "maintenance_boundary",
+            Self::UnprovenHistory => "unproven_history",
         }
     }
 
@@ -83,7 +92,41 @@ pub struct HistoryNotice {
     pub parked_at_ms: Option<u64>,
 }
 
+/// The account's recovery as the runner sees it: what it is still fetching,
+/// and every "history may be incomplete" notice. Hosts re-read it on
+/// `RecoveryStatusChanged`. Until the recovery runner owns history
+/// (mdk#2660), nothing is ever catching up and the notices are
+/// [`HistoryNotice`]s as `history_notices` lists them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountRecoveryStatus {
+    /// Groups whose history is still being fetched, as lowercase hex group
+    /// ids, sorted.
+    pub catching_up_group_ids_hex: Vec<String>,
+    /// The account inbox's history (Welcomes) is still being fetched.
+    pub inbox_catching_up: bool,
+    /// Every current notice, as `history_notices` lists them.
+    pub notices: Vec<HistoryNotice>,
+}
+
 const NOTICE_ID_BYTES: usize = 24;
+
+/// What a ledger-parked route's notice ids carry in place of an obligation
+/// id: a domain-separated hash of the route, so the id never names it. With
+/// the route's park revision it is the notice's ticket.
+pub(crate) fn ledger_route_tag(route: &TransportReconciliationRoute) -> [u8; 16] {
+    let mut hash = Sha256::new();
+    hash.update(b"marmot-app/history-notice/ledger-route/v1");
+    match route {
+        TransportReconciliationRoute::Inbox => hash.update([0]),
+        TransportReconciliationRoute::Group(nostr_group_id) => {
+            hash.update([1]);
+            hash.update(nostr_group_id);
+        }
+    }
+    let mut tag = [0; 16];
+    tag.copy_from_slice(&hash.finalize()[..16]);
+    tag
+}
 
 pub(crate) fn encode_notice_id(ticket: RecoveryDemandTicket) -> String {
     let mut bytes = [0_u8; NOTICE_ID_BYTES];
@@ -165,5 +208,25 @@ mod tests {
                 "maintenance_boundary",
             ]
         );
+        assert_eq!(
+            HistoryNoticeCause::UnprovenHistory.as_str(),
+            "unproven_history"
+        );
+    }
+
+    #[test]
+    fn ledger_route_tags_are_distinct_and_stable() {
+        let inbox = ledger_route_tag(&TransportReconciliationRoute::Inbox);
+        let group = ledger_route_tag(&TransportReconciliationRoute::Group([7; 32]));
+        assert_ne!(inbox, group);
+        assert_ne!(
+            group,
+            ledger_route_tag(&TransportReconciliationRoute::Group([8; 32]))
+        );
+        assert_eq!(
+            group,
+            ledger_route_tag(&TransportReconciliationRoute::Group([7; 32]))
+        );
+        assert_ne!(&group[..], &[7; 16][..], "the tag names its route");
     }
 }
