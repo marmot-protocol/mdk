@@ -1284,3 +1284,40 @@ fn invite_attention_follows_source_acceptance_archive_and_departure_before_row_r
         .unwrap();
     assert!(!app.account_attention_total().unwrap().has_unread());
 }
+
+#[test]
+fn window_reads_reject_invalid_queries_and_missing_base_rows() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let too_many = (0..201).map(|i| format!("{i:04x}")).collect();
+    for query in [
+        window_query(0, &[], 0),
+        window_query(201, &[], 0),
+        window_query(10, &[], 10),
+        crate::ChatListWindowQuery {
+            anchors: too_many,
+            ..window_query(10, &[], 0)
+        },
+    ] {
+        assert!(matches!(
+            app.read_chat_list_window(query),
+            Err(ChatListPageError::InvalidWindowQuery)
+        ));
+    }
+
+    // A group without its base chat row: the window is unavailable, not empty.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES ('01', '', 0)",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        app.read_chat_list_window(window_query(10, &[], 0)),
+        Err(ChatListPageError::Storage(
+            cgka_traits::storage::StorageError::NotFound
+        ))
+    ));
+}

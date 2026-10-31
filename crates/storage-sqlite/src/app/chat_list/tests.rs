@@ -956,6 +956,27 @@ fn select_reusable_direct_conversation_covers_policy_cases() {
     )
     .expect("activity ties break on group id");
     assert_eq!(tied.group_id_hex, "aa");
+
+    assert!(
+        select_reusable_direct_conversation(
+            &[direct_row("other-peer", 40)],
+            &local,
+            &local,
+            &memberships
+        )
+        .is_none(),
+        "the account is never its own peer"
+    );
+    assert!(
+        select_reusable_direct_conversation(
+            &[direct_row("no-roster", 50)],
+            &local,
+            &peer,
+            &memberships
+        )
+        .is_none(),
+        "a row with no known roster is not a match"
+    );
 }
 
 fn hex_id(byte: u8, len: usize) -> String {
@@ -1094,6 +1115,52 @@ fn direct_conversation_candidate_rows_are_keyed_by_peer() {
         !plan.contains("scan chat_list_rows") && !plan.contains("scan account_groups"),
         "peer lookup must not full-scan chat tables: {plan}"
     );
+}
+
+/// A direct chat with a queued leave reads as leaving, so it is not reused.
+#[test]
+fn direct_conversation_candidates_carry_a_queued_leave() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            groups: vec![direct_group(&group_id, &local, &peer)],
+            ..StoredAccountState::default()
+        },
+        256,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    app.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    let memberships = HashMap::from([(group_id.clone(), roster(&local, &peer))]);
+    let reusable = |candidates: &[ChatListRow]| {
+        select_reusable_direct_conversation(candidates, &local, &peer, &memberships)
+    };
+    assert!(reusable(&app.direct_conversation_candidate_rows(&peer).unwrap()).is_some());
+
+    let engine_id = hex::decode(&group_id).unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO cgka_groups(id, epoch, record) VALUES (?1, 0, x'00')",
+            [&engine_id],
+        )
+        .unwrap();
+    store
+        .put_leave_request(&LeaveRequest {
+            group_id: GroupId::new(engine_id),
+            requested_at_ms: 123,
+            last_proposed_epoch: None,
+        })
+        .unwrap();
+    let candidates = app.direct_conversation_candidate_rows(&peer).unwrap();
+    assert_eq!(candidates[0].leave_requested_at_ms, Some(123));
+    assert!(reusable(&candidates).is_none());
 }
 
 #[test]
@@ -1577,6 +1644,43 @@ fn refresh_chat_list_row_returns_refreshed_single_group_projection() {
             .unwrap(),
         None
     );
+    assert_eq!(
+        store
+            .set_chat_manually_unread(LOCAL, "missing-group", true, &no_mentions)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .refresh_chat_list_row_for_messages(
+                LOCAL,
+                "missing-group",
+                &["latest".to_owned()],
+                &no_mentions
+            )
+            .unwrap(),
+        None
+    );
+}
+
+/// Initializing read state again keeps the marker instead of marking the
+/// backlog read.
+#[test]
+fn initializing_read_state_again_keeps_the_marker() {
+    let store = setup_store().app_storage();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat("unread", REMOTE, 10, "after first open"))
+        .unwrap();
+
+    let row = store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("unread"));
 }
 
 #[test]
@@ -2985,6 +3089,98 @@ fn targeted_refresh_classifies_only_changed_unread_messages() {
     assert_eq!(row.unread_mention_count, 0);
 }
 
+/// A targeted refresh drops a message that stops being unread, here because
+/// its author deleted it, along with its mention.
+#[test]
+fn targeted_refresh_drops_a_deleted_unread_message() {
+    let store = setup_store().app_storage();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &mentions_local)
+        .unwrap();
+    store
+        .record_app_event(&chat("kept", REMOTE, 10, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&chat("gone", REMOTE, 20, &format!("hi {LOCAL}")))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!((row.unread_count, row.unread_mention_count), (2, 1));
+
+    let mut deletion = reaction("delete", REMOTE, "gone", 30);
+    deletion.kind = 5;
+    store.record_app_event(&deletion).unwrap();
+    let row = store
+        .refresh_chat_list_row_for_messages(
+            LOCAL,
+            GROUP,
+            &["gone".to_owned(), "delete".to_owned()],
+            &mentions_local,
+        )
+        .unwrap()
+        .expect("chat row");
+    assert_eq!((row.unread_count, row.unread_mention_count), (1, 0));
+    assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("kept"));
+}
+
+/// A targeted refresh reports a content change only when the preview keeps
+/// its message, time and activity and its body changes.
+#[test]
+fn targeted_refresh_reports_a_content_change_only_for_the_preview_body() {
+    let store = setup_store().app_storage();
+    store
+        .record_app_event(&chat("older", REMOTE, 1, "older"))
+        .unwrap();
+    store
+        .record_app_event(&chat("latest", REMOTE, 2, "original"))
+        .unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    let edit = |id: &str, target: &str, at| {
+        let mut edit = chat_with_tags(
+            id,
+            REMOTE,
+            at,
+            "edited",
+            vec![vec!["e".into(), target.into()]],
+        );
+        edit.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_EDIT;
+        edit
+    };
+    let refresh = |ids: &[&str]| {
+        let ids = ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        store
+            .refresh_chat_list_row_for_messages_with_content_change(
+                LOCAL,
+                GROUP,
+                &ids,
+                &no_mentions,
+            )
+            .unwrap()
+    };
+
+    store
+        .record_app_event(&edit("edit-older", "older", 3))
+        .unwrap();
+    assert!(
+        !refresh(&["edit-older", "older"]).1,
+        "an older message's edit"
+    );
+    store
+        .record_app_event(&edit("edit-latest", "latest", 4))
+        .unwrap();
+    let (row, changed) = refresh(&["edit-latest", "latest"]);
+    assert!(changed, "the preview's edit");
+    assert_eq!(row.unwrap().last_message.unwrap().plaintext, "edited");
+    store
+        .record_app_event(&chat("newer", REMOTE, 5, "newer"))
+        .unwrap();
+    assert!(!refresh(&["newer"]).1, "a new message replaces the preview");
+}
+
 #[test]
 fn later_targeted_refresh_rebuilds_when_an_earlier_message_is_still_dirty() {
     let store = setup_store();
@@ -3876,6 +4072,10 @@ fn pin_validation_and_unarchived_eligibility_are_explicit() {
         store.set_pinned_chat_order(&["33".to_owned()]),
         Err(ChatPinError::InvalidOrder(_))
     ));
+    assert!(matches!(
+        store.set_pinned_chat_order(&["missing".to_owned()]),
+        Err(ChatPinError::UnknownGroup(_))
+    ));
 
     let mut archived_groups = three_groups();
     archived_groups[0].archived = true;
@@ -4396,6 +4596,55 @@ fn ensure_chat_list_rows_rebuilds_stale_last_message_tags() {
     }
 }
 
+/// Each kind of drift makes a versioned projection incomplete, and ensure
+/// repairs it.
+#[test]
+fn ensure_chat_list_rows_repairs_each_kind_of_projection_drift() {
+    for (drift, sql) in [
+        ("missing row", "DELETE FROM chat_list_rows"),
+        (
+            "dirty unread message",
+            "INSERT INTO chat_list_unread_dirty_messages VALUES ('11', 'latest')",
+        ),
+        (
+            "unready unread membership",
+            "DELETE FROM chat_list_unread_ready_groups",
+        ),
+        (
+            "row without a group",
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO chat_list_rows(group_id_hex, updated_at) VALUES ('22', 0);
+             PRAGMA foreign_keys = ON;",
+        ),
+        (
+            "renamed group",
+            "UPDATE account_groups SET profile_name = 'Renamed Lab'",
+        ),
+        (
+            "manual unread",
+            "UPDATE conversation_read_state SET manually_marked_unread = 1",
+        ),
+    ] {
+        let store = setup_store().app_storage();
+        store
+            .record_app_event(&chat("latest", REMOTE, 10, "hello"))
+            .unwrap();
+        store
+            .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+            .unwrap();
+        store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        assert_projection_complete(&store, drift);
+
+        store.lock().unwrap().execute_batch(sql).unwrap();
+        {
+            let conn = store.lock().unwrap();
+            assert!(!chat_list_projection_complete_tx(&conn).unwrap(), "{drift}");
+        }
+        store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        assert_projection_complete(&store, drift);
+    }
+}
+
 /// Unread membership tolerates unreadable timeline tags; the chat-list
 /// preview must too, instead of failing every rebuild of the account.
 #[test]
@@ -4799,4 +5048,41 @@ fn retention_scan_lets_imported_rows_expire_on_time() {
         assert!(!scan.expired_unread, "marked read: {marked}");
         assert!(scan.expired_rows, "marked read: {marked}");
     }
+}
+
+/// Debug output never carries avatar key material or a page cursor's position,
+/// which names a group.
+#[test]
+fn debug_output_hides_avatar_keys_and_cursor_positions() {
+    let avatar = ChatListAvatar {
+        image_hash_hex: "a1".repeat(32),
+        image_key_hex: "b2".repeat(32),
+        image_nonce_hex: "c3".repeat(12),
+        image_upload_key_hex: "d4".repeat(32),
+        media_type: Some("image/png".to_owned()),
+    };
+    let shown = format!("{avatar:?}");
+    assert!(shown.contains(&avatar.image_hash_hex), "{shown}");
+    assert!(!shown.contains(&avatar.image_key_hex), "{shown}");
+    assert!(!shown.contains(&avatar.image_upload_key_hex), "{shown}");
+
+    let group_id = hex_id(0xab, 16);
+    let store = setup_store_with_group(StoredAccountGroup {
+        group_id_hex: group_id.clone(),
+        ..group()
+    })
+    .app_storage();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let cursor = store
+        .chat_list_page(ChatListPageQuery {
+            view: ChatListView::Chats,
+            limit: 10,
+            direction: ChatListPageDirection::Forward,
+            cursor: None,
+        })
+        .unwrap()
+        .last
+        .expect("cursor");
+    let shown = format!("{cursor:?}");
+    assert!(!shown.contains(&group_id), "{shown}");
 }
