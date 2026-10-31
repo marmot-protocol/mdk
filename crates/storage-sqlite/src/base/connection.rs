@@ -3304,6 +3304,8 @@ mod tests {
 
     #[test]
     fn custom_options_can_relax_operational_defaults_for_tests() {
+        // From the defaults, so `synchronous` comes from the options.
+        use_production_storage_for_test_process();
         let store = SqliteAccountStorage::in_memory_with_options(SqliteStorageOptions {
             busy_timeout_ms: 250,
             journal_mode: SqliteJournalMode::Delete,

@@ -340,10 +340,32 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_for_test_copies_this_binarys_template() {
-        let _ = SqliteAccountStorage::in_memory_for_test().unwrap();
-        let copy = SqliteAccountStorage::in_memory_for_test().unwrap();
-        assert_eq!(copy.migration_summary().0, 0);
-        assert!(template_path().unwrap().exists());
+    fn a_template_that_cannot_be_written_falls_back_to_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let template = dir
+            .path()
+            .join("missing")
+            .join(format!("binary{TEMPLATE_INFIX}1-1.sqlite"));
+        let first = from_template(&template);
+        let second = from_template(&template);
+        for store in [&first, &second] {
+            assert!(store.migration_summary().0 > 0);
+            assert_eq!(schema(store), schema(&replayed()));
+        }
+        assert_ne!(store_epoch(&first), store_epoch(&second));
+        assert!(!template.exists());
+    }
+
+    /// Beside a binary whose directory takes no template, both stores are
+    /// replays; otherwise the second is a copy.
+    #[test]
+    fn in_memory_for_test_copies_this_binarys_template_when_it_can() {
+        let first = SqliteAccountStorage::in_memory_for_test().unwrap();
+        let second = SqliteAccountStorage::in_memory_for_test().unwrap();
+        assert_eq!(schema(&second), schema(&replayed()));
+        assert_ne!(store_epoch(&first), store_epoch(&second));
+        if template_path().is_some_and(|template| template.exists()) {
+            assert_eq!(second.migration_summary().0, 0);
+        }
     }
 }
