@@ -1217,14 +1217,20 @@ mod tests {
             .unwrap();
 
         let bundles = store.stored_key_package_bundles().unwrap();
-        let decoded = bundles
+        let decode = |value: &[u8]| serde_json::from_slice::<TestKeyPackage>(value).unwrap();
+        let mut decoded = bundles
             .iter()
-            .map(|bundle| serde_json::from_slice::<TestKeyPackage>(&bundle.value).unwrap())
+            .map(|bundle| decode(&bundle.value))
             .collect::<Vec<_>>();
+        decoded.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(decoded, [TestKeyPackage(vec![7]), TestKeyPackage(vec![8])]);
 
+        let retired_bundle = bundles
+            .iter()
+            .find(|bundle| decode(&bundle.value) == TestKeyPackage(vec![8]))
+            .unwrap();
         store
-            .delete_stored_key_package_bundle(&bundles[1].storage_key)
+            .delete_stored_key_package_bundle(&retired_bundle.storage_key)
             .unwrap();
         assert_eq!(
             mls.key_package::<_, TestKeyPackage>(&retired).unwrap(),
