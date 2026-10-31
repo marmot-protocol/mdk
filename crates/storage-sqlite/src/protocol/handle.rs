@@ -1,15 +1,13 @@
 //! `SqliteAccountStorage`: the engine's handle on the account database.
 
+#[cfg(feature = "test-migrated-template")]
+use crate::base::connection::open_account_in_memory_from_migrated_template;
 use crate::base::connection::{
     ConnectionGuard, DatabaseCloser, OpenedAccount, SharedConnection, SqlCipherKey,
     SqliteStorageOptions, SqliteTimingObserver, open_account_encrypted, open_account_in_memory,
 };
 #[cfg(test)]
 use crate::base::connection::{finish_account_open, open_account_unkeyed};
-#[cfg(feature = "test-migrated-template")]
-use crate::base::connection::{
-    open_account_in_memory_copy, open_account_in_memory_from_migrated_template,
-};
 use crate::protocol::openmls_storage::SqliteOpenMlsStorage;
 use cgka_traits::storage::StorageResult;
 use std::path::Path;
@@ -105,13 +103,6 @@ impl SqliteAccountStorage {
     #[cfg(feature = "test-migrated-template")]
     pub fn in_memory_from_migrated_template(options: SqliteStorageOptions) -> StorageResult<Self> {
         open_account_in_memory_from_migrated_template(options).map(Self::from_opened)
-    }
-
-    /// Test-only in-memory copy of this database as it stands, opened with
-    /// `options`, so a test can take one state down several branches.
-    #[cfg(feature = "test-migrated-template")]
-    pub fn in_memory_copy(&self, options: SqliteStorageOptions) -> StorageResult<Self> {
-        open_account_in_memory_copy(&self.connection, options).map(Self::from_opened)
     }
 
     /// Open a private encrypted account store with the standard privacy and durability defaults.

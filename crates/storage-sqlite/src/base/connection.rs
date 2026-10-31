@@ -1250,24 +1250,6 @@ pub(crate) fn open_account_in_memory_from_migrated_template(
     finish_account_open(connection, options, None)
 }
 
-/// Test-only in-memory copy of `source` as it stands, so a test can take one
-/// state down several branches.
-#[cfg(feature = "test-migrated-template")]
-pub(crate) fn open_account_in_memory_copy(
-    source: &SharedConnection,
-    options: SqliteStorageOptions,
-) -> StorageResult<OpenedAccount> {
-    let source = source.lock()?;
-    let mut connection = rusqlite::Connection::open_in_memory().storage()?;
-    apply_cipher_pragmas(&connection, &options)?;
-    rusqlite::backup::Backup::new(&source, &mut connection)
-        .storage()?
-        .run_to_completion(std::ffi::c_int::MAX, Duration::ZERO, None)
-        .storage()?;
-    drop(source);
-    finish_account_open(connection, options, None)
-}
-
 /// Create private database files before opening and observing the unpublished connection.
 pub(crate) fn open_account_encrypted(
     path: &Path,

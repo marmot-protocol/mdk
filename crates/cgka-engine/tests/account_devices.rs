@@ -245,15 +245,6 @@ struct Device {
 /// the account identity and differ in their MLS signature keys.
 fn device(account: &[u8], advertises_account_devices: bool) -> Device {
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
-    device_on(storage, account, advertises_account_devices)
-}
-
-/// `device` on `storage`.
-fn device_on(
-    storage: SqliteAccountStorage,
-    account: &[u8],
-    advertises_account_devices: bool,
-) -> Device {
     let mut supported: Vec<_> = default_group_components().into_iter().collect();
     if advertises_account_devices {
         supported.push(ACCOUNT_DEVICES_COMPONENT_ID);
