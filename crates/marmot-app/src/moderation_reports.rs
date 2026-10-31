@@ -374,6 +374,8 @@ impl MarmotApp {
         );
     }
 
+    // `publish_moderation_wrap` checks the unlink before using this publisher.
+    #[allow(clippy::disallowed_methods)]
     fn moderation_report_publisher(&self) -> Arc<dyn NostrRelayClient> {
         self.moderation_reports
             .publisher

@@ -1740,24 +1740,22 @@ impl AppClient {
     /// Whether this device's trusted device group has removed it. A removal
     /// that unlinks it stops the account here and marks it unlinked (D67),
     /// before anything more goes out; a failed link's undo stops nothing
-    /// (D40). Synchronous and repeatable, so each ingest can note a removal
+    /// (D40), and lifts the stop the app set when it found the removal
+    /// stored. Synchronous and repeatable, so each ingest can note a removal
     /// as it applies it.
     pub(super) fn note_device_group_removal_live(
         &mut self,
     ) -> Result<Option<DeviceGroupRemoval>, AppError> {
-        let Some(group_id) = self.trusted_device_group()? else {
+        let Some(group_id) = self.app.removed_device_group(&self.state.label)? else {
             return Ok(None);
         };
-        if !self
-            .stored_group(&group_id)?
-            .is_some_and(|group| group.removed)
-        {
-            return Ok(None);
-        }
         // A classification that fails counts as an unlink: stopping is the
         // safe side, and a failed link ends in a new link either way.
         let link_failed = self.removal_undid_failed_link(&group_id).unwrap_or(false);
-        if !link_failed {
+        if link_failed {
+            self.app
+                .lift_failed_link_publish_stop(&hex::encode(self.adapter.account_id().as_slice()));
+        } else {
             self.mark_device_unlinked()?;
         }
         Ok(Some(DeviceGroupRemoval {

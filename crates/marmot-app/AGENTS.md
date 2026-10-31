@@ -240,17 +240,21 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `unlinked` and `signed_out`, and the copy is forgotten only once that mark lands, so a failed mark is made again at
   the next open. Every publisher `relay_client_for_account_id` hands out refuses to publish once the publish stop is set
   or the record says unlinked, so nothing goes out whichever path a publish comes from; build account publishers only
-  through it. The stop is in memory and cleared only when the account is removed. Admission stops taking input once the
-  flag is set; the pairing drive notes a removal before it sends anything; the worker stops right after an ingest that
-  unlinked it (startup and maintenance catch-ups, admission turns, deliveries) with `DeviceUnlinked`, and the runtime
-  then deactivates the account. `MarmotApp::client`, `sign_in_account` and `run_due_maintenance` refuse an unlinked
-  account; `sign_out_and_wipe` of one skips leaving chats and deleting the slot. A later link's Welcome into
-  that group is a first join, held by the engine to the link rather than to the forget's date. A new device never
-  starts a link by a KeyPackage it already joined by (`last_consumed_key_package_ref`): the link binds its Welcome by
-  KeyPackage alone, so a used one would also admit the Welcome that installed the forgotten copy. The start waits for
-  the replacement's publication (`key_package_not_published`). Each drive ends by comparing linking as hosts read it
-  with `DevicePairing::last_view` and sets `device_link_changed` when it differs; the client opens with that flag set,
-  and the same two seams as `linked_devices_changed` drain it into `DeviceLinkChanged`.
+  through it (`clippy.toml` bans the other ways). The engine stores a removal before the app marks it, so before it
+  hands out the first publisher for an account in a process, it looks once for a stored removal no record shows (a crash
+  between the two) and stops the account; only a client can tell an unlink from a failed link, so its open decides and
+  lifts the stop for a failed link (`lift_failed_link_publish_stop`). The stop is in memory and otherwise cleared only
+  when the account is removed. Admission stops taking input once the flag is set; the pairing drive notes a removal
+  before it sends anything; the worker stops right after an ingest that unlinked it (startup and maintenance catch-ups,
+  admission turns, deliveries) with `DeviceUnlinked`, and the runtime then deactivates the account. `MarmotApp::client`,
+  `sign_in_account` and `run_due_maintenance` refuse an unlinked account; `sign_out_and_wipe` of one skips leaving chats
+  and deleting the slot. A later link's Welcome into that group is a first join, held by the engine to the link rather
+  than to the forget's date. A new device never starts a link by a KeyPackage it already joined by
+  (`last_consumed_key_package_ref`): the link binds its Welcome by KeyPackage alone, so a used one would also admit the
+  Welcome that installed the forgotten copy. The start waits for the replacement's publication
+  (`key_package_not_published`). Each drive ends by comparing linking as hosts read it with `DevicePairing::last_view`
+  and sets `device_link_changed` when it differs; the client opens with that flag set, and the same two seams as
+  `linked_devices_changed` drain it into `DeviceLinkChanged`.
 - Small state (`src/small_state.rs` and `src/client/small_state.rs`, mdk#2628 4.3) keeps each chat's read position,
   pin, mute and archive the same on the account's devices, from the first maintenance pass after this device trusts a
   device group. A pass is one storage transaction (`sync_small_state`): a local state that differs from what this

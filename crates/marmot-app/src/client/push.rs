@@ -1071,6 +1071,8 @@ impl AppClient {
                             "trigger",
                             crate::ProductUnit::Attempt,
                         );
+                        // This function refuses an unlinked account above.
+                        #[allow(clippy::disallowed_methods)]
                         let result = self
                             .adapter
                             .publish_signed_event(fallback, endpoints, &event, 1)

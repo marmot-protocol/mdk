@@ -452,6 +452,17 @@ async fn a_device_its_device_group_removes_is_unlinked_from_the_account() {
         "an unlinked account never opens again"
     );
     assert_eq!(published_count(&relay), published);
+
+    // A later process finds no removal stored, since the copy is gone: the
+    // record alone stops the account's publishers.
+    drop(laptop_app);
+    let laptop_app = device_group_app_at(&_dirs[1], relay.clone());
+    let attempted = relay.attempted_events().len();
+    laptop_app
+        .publish_user_profile("alice", UserProfileMetadata::default(), profile_bootstrap())
+        .await
+        .unwrap_err();
+    assert_eq!(relay.attempted_events().len(), attempted);
 }
 
 /// The laptop sends its first commit in the device group and is closed
@@ -722,6 +733,100 @@ async fn a_client_opened_after_an_unnoted_removal_is_stopped() {
         attempted,
         "nothing goes out"
     );
+}
+
+fn profile_bootstrap() -> AccountRelayListBootstrap {
+    AccountRelayListBootstrap::new(
+        vec![TransportEndpoint("wss://relay.example".into())],
+        vec![TransportEndpoint("wss://relay.example".into())],
+    )
+}
+
+/// The same unnoted removal, and the reopened app publishes the account's
+/// profile and relay lists before any client opens. The app looks for the
+/// stored removal before it hands out a publisher, so nothing goes out; the
+/// client opened next tells it was an unlink (D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_publish_after_an_unnoted_removal_is_refused() {
+    let (devices, group) = tagging_devices().await;
+    let mut laptop_cursor = published_count(&devices.relay);
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        laptop_app,
+        mut laptop,
+        ..
+    } = devices;
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    commit_removal_decided_elsewhere(&mut phone, &group, slot_of(&laptop)).await;
+    drop((laptop, laptop_app, phone));
+    let off = MarmotApp::with_relay_and_config(
+        _dirs[1].path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0),
+    )
+    .with_test_relay_client(relay.clone());
+    let mut laptop = off.client("alice").await.unwrap();
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    assert!(laptop.runtime.group_record(&group).unwrap().removed);
+    drop((laptop, off));
+
+    let laptop_app = device_group_app_at(&_dirs[1], relay.clone());
+    let attempted = relay.attempted_events().len();
+    laptop_app
+        .publish_user_profile("alice", UserProfileMetadata::default(), profile_bootstrap())
+        .await
+        .unwrap_err();
+    laptop_app
+        .publish_account_relay_lists("alice", profile_bootstrap())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        relay.attempted_events().len(),
+        attempted,
+        "nothing goes out"
+    );
+    let laptop = laptop_app.client("alice").await.unwrap();
+    assert!(laptop.device_unlinked());
+    assert!(laptop_app.account_home().account("alice").unwrap().unlinked);
+}
+
+/// The app looks for a stored removal once per account per process: the
+/// client open looks, and the publishers handed out after it do not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stored_removal_is_looked_for_once_per_process() {
+    let (devices, _group) = tagging_devices().await;
+    let Devices {
+        _dirs,
+        relay,
+        laptop_app,
+        laptop,
+        ..
+    } = devices;
+    let account_id_hex = laptop_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    drop((laptop, laptop_app));
+
+    let laptop_app = device_group_app_at(&_dirs[1], relay.clone());
+    assert_eq!(laptop_app.stored_device_group_checks(&account_id_hex), 0);
+    let laptop = laptop_app.client("alice").await.unwrap();
+    assert_eq!(laptop_app.stored_device_group_checks(&account_id_hex), 1);
+    for _ in 0..2 {
+        laptop_app
+            .publish_user_profile("alice", UserProfileMetadata::default(), profile_bootstrap())
+            .await
+            .unwrap();
+    }
+    assert_eq!(laptop_app.stored_device_group_checks(&account_id_hex), 1);
+    drop(laptop);
 }
 
 /// The laptop's engine applies its removal but the app never notes it, as
@@ -1488,7 +1593,8 @@ async fn a_device_its_roster_lists_refills_its_slot() {
 /// (mdk#2628 3.4): they deleted that slot, and a KeyPackage dated after the
 /// deletion reads to them as the removed device trying to come back. Here
 /// the removal took the laptop's leaf, so its copy of the device group
-/// ended there and it reads no roster.
+/// ended there and it reads no roster; the removal unlinked it (D67), so
+/// its maintenance refuses and publishes nothing at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removed_device_never_refills_its_slot() {
     let (
@@ -1514,15 +1620,20 @@ async fn a_removed_device_never_refills_its_slot() {
             .unwrap()
             .removed
     );
-    // The laptop no longer tags, so its next pass replaces its tagged
-    // KeyPackage. What a removed device does with its own slot is 3.6b's
-    // (its own side); this test is about the refill.
-    laptop.run_due_maintenance().await.unwrap();
+    let unlinked = |result: Result<_, AppError>| {
+        matches!(
+            result,
+            Err(AppError::AccountHome(
+                marmot_account::AccountHomeError::AccountUnlinked(_)
+            ))
+        )
+    };
+    assert!(unlinked(laptop.run_due_maintenance().await));
 
     let published = publish_two_days_ago(&laptop);
     relay_empties_slot(&relay, &laptop_slot);
     assert!(!laptop.check_sign_ins().await.unwrap().refilling);
-    laptop.run_due_maintenance().await.unwrap();
+    assert!(unlinked(laptop.run_due_maintenance().await));
     assert_eq!(published_at(&laptop), published);
     assert!(!relay_serves_slot(&relay, &laptop_slot));
 }
