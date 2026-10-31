@@ -212,6 +212,29 @@ pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
     )
 }
 
+/// Refuse a Welcome for good: mark the delivery `welcome_id` and the
+/// Welcome's content, and retire every rejoin offer of it, whatever carried
+/// it. A decline and a terminal join failure act on the Welcome, not on the
+/// one offer or delivery they came through (mdk#2628 3.5b).
+fn refuse_welcome<S: StorageProvider>(
+    storage: &S,
+    welcome_id: &MessageId,
+    content_id: &MessageId,
+) -> Result<(), EngineError> {
+    storage.put_ingress_dedup_marker(welcome_id)?;
+    storage.put_ingress_dedup_marker(content_id)?;
+    for offer in storage.list_welcomes()? {
+        if offer
+            .rejoin
+            .as_ref()
+            .is_some_and(|rejoin| &rejoin.content_id == content_id)
+        {
+            storage.take_welcome(&offer.message_id)?;
+        }
+    }
+    Ok(())
+}
+
 fn classify_openmls_welcome_error<StorageError: std::fmt::Debug>(
     error: WelcomeError<StorageError>,
 ) -> EngineError {
@@ -1149,8 +1172,13 @@ impl<S: StorageProvider> Engine<S> {
             };
             match self.do_join_welcome(welcome, prepeeled, route).await {
                 Ok(_) => joined = true,
+                // A failure the join refused the Welcome for has already
+                // retired its offers.
                 Err(error) if terminal_welcome_error(&error) => {
-                    self.storage.take_welcome(&candidate.message_id)?;
+                    match self.storage.take_welcome(&candidate.message_id) {
+                        Ok(_) | Err(StorageError::NotFound) => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 Err(_) => {
                     // Keep retryable material owned, but isolate this offer's
@@ -1176,11 +1204,16 @@ impl<S: StorageProvider> Engine<S> {
             .into_iter()
             .find(|candidate| &candidate.message_id == welcome_id)
             .ok_or(EngineError::InvalidWelcome)?;
-        let rejoin = candidate.rejoin.as_ref().ok_or(EngineError::InvalidWelcome)?;
+        let rejoin = candidate
+            .rejoin
+            .as_ref()
+            .ok_or(EngineError::InvalidWelcome)?;
         let sibling = rejoin.sibling.clone();
         // A declined or refused Welcome never joins, as on the retry's path.
         if self.storage.has_ingress_dedup_marker(&rejoin.content_id)? {
-            self.storage.take_welcome(welcome_id)?;
+            self.storage.with_transaction(|storage| {
+                refuse_welcome(storage, welcome_id, &rejoin.content_id)
+            })?;
             return Err(EngineError::WelcomeAlreadyProcessed);
         }
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
@@ -1204,8 +1237,9 @@ impl<S: StorageProvider> Engine<S> {
                 let Some(carrier) = self.delivered_sibling_carrier(&candidate, &sibling)? else {
                     return Err(EngineError::InvalidWelcome);
                 };
-                let (welcome, route) =
-                    crate::private_key_packages::sibling_offer_welcome(&welcome, &sibling, &carrier);
+                let (welcome, route) = crate::private_key_packages::sibling_offer_welcome(
+                    &welcome, &sibling, &carrier,
+                );
                 let (peeled, content_id) =
                     self.peeled_sibling_welcome(&welcome, Some(welcome.timestamp))?;
                 (welcome, peeled, content_id, route)
@@ -1230,30 +1264,23 @@ impl<S: StorageProvider> Engine<S> {
                 route,
             )
             .await;
-        // A terminal failure refuses the Welcome, as it does on every other
-        // path, and with it the offer.
+        // A terminal failure refuses the Welcome, as on every other path.
         if let Err(error) = &result
             && terminal_welcome_error(error)
         {
-            self.storage.with_transaction(|storage| {
-                storage.take_welcome(welcome_id)?;
-                storage.put_ingress_dedup_marker(&joined_id)?;
-                storage.put_ingress_dedup_marker(&content_id)?;
-                Ok::<_, EngineError>(())
-            })?;
+            self.storage
+                .with_transaction(|storage| refuse_welcome(storage, &joined_id, &content_id))?;
         }
         result
     }
 
-    /// Reject only the selected offer. Redelivery cannot re-open it.
+    /// Reject the selected offer's Welcome. Redelivery cannot re-open it.
     pub fn decline_group_rejoin(&mut self, welcome_id: &MessageId) -> Result<(), EngineError> {
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
                 let candidate = storage.take_welcome(welcome_id)?;
                 let rejoin = candidate.rejoin.ok_or(EngineError::InvalidWelcome)?;
-                storage.put_ingress_dedup_marker(welcome_id)?;
-                storage.put_ingress_dedup_marker(&rejoin.content_id)?;
-                Ok(())
+                refuse_welcome(storage, welcome_id, &rejoin.content_id)
             })
     }
 
@@ -1339,9 +1366,7 @@ impl<S: StorageProvider> Engine<S> {
             Ok(_) => {}
             Err(error) if terminal_welcome_error(error) => {
                 self.storage.with_transaction(|storage| {
-                    storage.put_ingress_dedup_marker(&welcome_id)?;
-                    storage.put_ingress_dedup_marker(&content_id)?;
-                    Ok::<_, EngineError>(())
+                    refuse_welcome(storage, &welcome_id, &content_id)
                 })?;
             }
             Err(_) => {}
@@ -2006,8 +2031,10 @@ impl<S: StorageProvider> Engine<S> {
                     // A sibling offer none of whose carriers is still delivered.
                     let mut withdrawn = std::collections::HashSet::new();
                     for old in &offers {
-                        if let Some(sibling) =
-                            old.rejoin.as_ref().and_then(|rejoin| rejoin.sibling.as_ref())
+                        if let Some(sibling) = old
+                            .rejoin
+                            .as_ref()
+                            .and_then(|rejoin| rejoin.sibling.as_ref())
                         {
                             let mut delivered = false;
                             for carrier in &sibling.carriers {
