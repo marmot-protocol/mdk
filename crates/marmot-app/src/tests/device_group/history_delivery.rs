@@ -734,6 +734,170 @@ async fn a_failed_blossom_upload_or_fetch_tries_again_later() {
     );
 }
 
+/// A Blossom delivery the laptop reads before it holds the chat waits for
+/// it: nothing is fetched until the laptop joins, then the blob is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blossom_delivery_read_before_the_chat_is_fetched_once_the_sibling_joins() {
+    let (mut devices, _group, chat, first) = history_devices().await;
+    let chat_hex = hex::encode(chat.as_slice());
+    let blossom = local_blossom();
+    use_blossom(
+        &mut devices.phone,
+        &chat,
+        BLOSSOM_LOCATOR_KIND_V1,
+        &blossom.url,
+    )
+    .await;
+    send_text(
+        &mut devices.phone,
+        &chat,
+        &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
+    )
+    .await;
+    // The delivery overtakes the Welcome.
+    devices
+        .phone
+        .dev_record_sibling_add(&chat, &slot_of(&devices.laptop))
+        .unwrap();
+    devices.phone.drive_history_deliveries().await;
+    devices.phone.drive_history_blobs().await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let laptop_storage = storage(&devices.laptop_app);
+    let fetch_attempts =
+        || match &laptop_storage.parked_history_deliveries(&chat_hex).unwrap()[0].bundle {
+            ParkedBundle::Blossom { fetch_attempts, .. } => *fetch_attempts,
+            ParkedBundle::Inline(_) => panic!("a Blossom delivery"),
+        };
+    devices.laptop.drive_history_blobs().await;
+    assert_eq!(fetch_attempts(), 0, "no fetch before the chat is held");
+
+    add_laptop(&mut devices, &chat).await;
+    devices.laptop.drive_history_blobs().await;
+    assert!(
+        laptop_storage
+            .timeline_message(&chat_hex, &first)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        laptop_storage
+            .parked_history_delivery_chats()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Uploaded blobs whose deliveries reach no relay leave the history owed,
+/// backing off even when the refusal owes it again; the next attempt uploads
+/// afresh, under new keys, and sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blossom_history_whose_delivery_reaches_no_relay_is_sent_again() {
+    let (mut devices, _group, chat, _first) = history_devices().await;
+    let phone_storage = storage(&devices.phone_app);
+    let blossom = local_blossom();
+    use_blossom(
+        &mut devices.phone,
+        &chat,
+        BLOSSOM_LOCATOR_KIND_V1,
+        &blossom.url,
+    )
+    .await;
+    send_text(
+        &mut devices.phone,
+        &chat,
+        &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
+    )
+    .await;
+    add_laptop(&mut devices, &chat).await;
+    devices.phone.drive_history_deliveries().await;
+
+    devices.relay.reject_next_publish();
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_blobs().await;
+    assert_eq!(blossom.blobs.lock().unwrap().len(), 1);
+    assert_eq!(published_count(&devices.relay), before);
+    let owed = phone_storage.unsent_history_deliveries().unwrap().remove(0);
+    assert_eq!(owed.blossom_attempts, 1);
+    assert!(owed.blossom_due_at.unwrap() > crate::unix_now_seconds());
+
+    phone_storage
+        .defer_blossom_history_delivery(&owed, 0)
+        .unwrap();
+    devices.phone.drive_history_blobs().await;
+    assert_eq!(blossom.blobs.lock().unwrap().len(), 2, "a fresh upload");
+    assert_eq!(published_count(&devices.relay), before + 1);
+    assert!(
+        phone_storage
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A chat made where no media server is configured carries no media policy,
+/// so it has no Blossom endpoint: its long history is forgotten unsent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_history_of_a_text_only_chat_is_forgotten() {
+    let (devices, _group, _chat, _first) = history_devices().await;
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        phone,
+        laptop,
+        link,
+    } = devices;
+    drop(phone);
+    drop(phone_app);
+    let phone_app = MarmotApp::with_relay_and_config(
+        _dirs[0].path(),
+        "wss://relay.example",
+        MarmotAppConfig::default()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_dev_device_groups(true)
+            .with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(relay.clone());
+    let phone = phone_app.client("alice").await.unwrap();
+    let mut devices = Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        phone,
+        laptop,
+        link,
+    };
+    let text_only = devices.phone.create_group("text only", &[]).await.unwrap();
+    send_text(
+        &mut devices.phone,
+        &text_only,
+        &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
+    )
+    .await;
+    add_laptop(&mut devices, &text_only).await;
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_deliveries().await;
+    assert_eq!(
+        storage(&devices.phone_app)
+            .unsent_history_deliveries()
+            .unwrap()
+            .len(),
+        1,
+        "owed through Blossom"
+    );
+    devices.phone.drive_history_blobs().await;
+    assert_eq!(published_count(&devices.relay), before);
+    assert!(
+        storage(&devices.phone_app)
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// A history too long for inline deliveries, of a chat with no Blossom
 /// endpoint, is forgotten without sending any of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

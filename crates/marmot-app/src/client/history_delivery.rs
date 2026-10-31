@@ -73,6 +73,28 @@ const MAX_BLOSSOM_RETRY_SECS: u64 = 60 * 60;
 
 /// When a Blossom upload, send or fetch that failed `attempts` times before
 /// is tried again.
+/// A history owed again after one of its Blossom deliveries reached no one
+/// waits as after a failed upload, so a relay that refuses every delivery
+/// never has its blobs uploaded again at once.
+fn back_off_blossom_history(
+    storage: &storage_sqlite::SqliteAppStorage,
+    owed: &OwedHistoryDelivery,
+) -> Result<(), AppError> {
+    if owed.blossom_due_at.is_some() {
+        let retry_at = blossom_retry_at(unix_now_seconds(), owed.blossom_attempts);
+        storage.defer_blossom_history_delivery(owed, retry_at)?;
+    }
+    Ok(())
+}
+
+/// How many fetches of a parked delivery's blob have failed.
+fn parked_fetch_attempts(parked: &ParkedHistoryDelivery) -> u64 {
+    match &parked.bundle {
+        ParkedBundle::Blossom { fetch_attempts, .. } => *fetch_attempts,
+        ParkedBundle::Inline(_) => 0,
+    }
+}
+
 fn blossom_retry_at(now: u64, attempts: u64) -> u64 {
     let wait = (BLOSSOM_RETRY_SECS << attempts.min(6)).min(MAX_BLOSSOM_RETRY_SECS);
     now.saturating_add(wait)
@@ -457,8 +479,12 @@ impl AppClient {
     /// build that allows them. Refused when there are none.
     fn history_blossom_servers(&self, chat: &GroupId) -> Result<Vec<String>, AppError> {
         let allow_loopback = self.app.allow_loopback_blob_endpoints();
+        // A lookup failure stays an error, to retry; a chat with no media
+        // policy has no Blossom endpoint, for good.
         let servers = self
-            .encrypted_media_policy_for_group(chat)?
+            .try_encrypted_media_for_group(chat)?
+            .endpoint_policy()
+            .map_err(|_| AppError::DeviceGroupRefused("history_delivery_no_blossom"))?
             .default_blob_endpoints
             .into_iter()
             .filter(|endpoint| {
@@ -490,6 +516,18 @@ impl AppClient {
         };
         let account = self.app.account_storage(&self.state.label)?;
         let storage = account.app_storage();
+        // One history that fails to prepare backs off and never holds up the
+        // ones behind it.
+        let defer_unprepared = |owed: &OwedHistoryDelivery, error: AppError| {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "prepare_history_upload",
+                error_kind = error.privacy_safe_kind(),
+                "an owed history was not prepared; retrying later"
+            );
+            let retry_at = blossom_retry_at(unix_now_seconds(), owed.blossom_attempts);
+            storage.defer_blossom_history_delivery(owed, retry_at)
+        };
         for owed in storage.due_blossom_history_deliveries(unix_now_seconds())? {
             let prepared = self
                 .history_destination(&exchange, &owed)
@@ -506,7 +544,10 @@ impl AppClient {
                     );
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    defer_unprepared(&owed, error)?;
+                    continue;
+                }
             };
             // A signer that is not available yet, such as an external one not
             // registered again since launch, backs off as a failed upload does.
@@ -519,9 +560,8 @@ impl AppClient {
             let signer = match signer {
                 Ok(signer) => signer,
                 Err(error) => {
-                    let retry_at = blossom_retry_at(unix_now_seconds(), owed.blossom_attempts);
-                    storage.defer_blossom_history_delivery(&owed, retry_at)?;
-                    return Err(error);
+                    defer_unprepared(&owed, error)?;
+                    continue;
                 }
             };
             return Ok(Some(HistoryUpload {
@@ -673,7 +713,18 @@ impl AppClient {
                     );
                     storage.drop_parked_history_delivery(&parked.app_event_id)?;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        method = "prepare_history_fetch",
+                        error_kind = error.privacy_safe_kind(),
+                        "a parked history delivery was not opened; retrying later"
+                    );
+                    storage.defer_parked_history_fetch(
+                        &parked.app_event_id,
+                        blossom_retry_at(unix_now_seconds(), parked_fetch_attempts(&parked)),
+                    )?;
+                }
             }
         }
         Ok(None)
@@ -685,20 +736,33 @@ impl AppClient {
     /// next one may start at once.
     pub(crate) fn finish_history_fetch(&mut self, outcome: HistoryFetchOutcome) -> bool {
         let HistoryFetchOutcome { parked, result } = outcome;
-        let result = result.and_then(|ciphertext| {
-            let exchange = self
-                .device_group_exchange()?
-                .ok_or(AppError::DeviceGroupRefused("not_trusted_device_group"))?;
+        // No exchange now, as while trust re-settles, is no verdict on the
+        // delivery: it waits like a failed fetch (`Ok(false)`).
+        let imported = result.and_then(|ciphertext| {
+            let Some(exchange) = self.device_group_exchange()? else {
+                return Ok(false);
+            };
             let (chat, from, key, hash) = self.open_parked_history_delivery(&exchange, &parked)?;
             self.import_delivered_bundle(&chat, &from, &key, &hash, &ciphertext)
+                .map(|()| true)
         });
         let Ok(storage) = self.app.account_storage(&self.state.label) else {
             return false;
         };
         let storage = storage.app_storage();
+        let defer = || {
+            storage.defer_parked_history_fetch(
+                &parked.app_event_id,
+                blossom_retry_at(unix_now_seconds(), parked_fetch_attempts(&parked)),
+            )
+        };
         let mut progressed = true;
-        let settled = match result {
-            Ok(()) => storage.drop_parked_history_delivery(&parked.app_event_id),
+        let settled = match imported {
+            Ok(true) => storage.drop_parked_history_delivery(&parked.app_event_id),
+            Ok(false) => {
+                progressed = false;
+                defer()
+            }
             Err(AppError::DeviceGroupRefused(reason)) => {
                 tracing::warn!(
                     target: TRACE_TARGET,
@@ -716,14 +780,7 @@ impl AppClient {
                     "a history blob was not imported; retrying later"
                 );
                 progressed = false;
-                let attempts = match &parked.bundle {
-                    ParkedBundle::Blossom { fetch_attempts, .. } => *fetch_attempts,
-                    ParkedBundle::Inline(_) => 0,
-                };
-                storage.defer_parked_history_fetch(
-                    &parked.app_event_id,
-                    blossom_retry_at(unix_now_seconds(), attempts),
-                )
+                defer()
             }
         };
         if settled.is_err() {
@@ -939,7 +996,8 @@ impl AppClient {
         else {
             return Ok(());
         };
-        if storage.owe_history_delivery_again(&app_event_id)? {
+        if let Some(owed) = storage.owe_history_delivery_again(&app_event_id)? {
+            back_off_blossom_history(&storage, &owed)?;
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "history_delivery_withdrawn",
@@ -953,12 +1011,9 @@ impl AppClient {
     /// the send that queued it: when it was a history delivery, owe its
     /// history again.
     pub(crate) fn history_delivery_failed(&self, app_event_id: &str) -> Result<(), AppError> {
-        if self
-            .app
-            .account_storage(&self.state.label)?
-            .app_storage()
-            .owe_history_delivery_again(app_event_id)?
-        {
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        if let Some(owed) = storage.owe_history_delivery_again(app_event_id)? {
+            back_off_blossom_history(&storage, &owed)?;
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "history_delivery_failed",

@@ -180,8 +180,10 @@
   delivery parks either its bundle or the Blossom servers that hold it, with
   when to fetch it (`ParkedBundle`, `due_parked_history_fetches`,
   `defer_parked_history_fetch`). `OwedHistoryDelivery` gains the two fields and
-  `ParkedHistoryDelivery::bundle` is a `ParkedBundle`. Test support gains
-  `execute_batch_for_test`.
+  `ParkedHistoryDelivery::bundle` is a `ParkedBundle`.
+  `owe_history_delivery_again` returns the history it owes again
+  (`Option<OwedHistoryDelivery>`) instead of `bool`, so the caller can back off
+  one going through Blossom. Test support gains `execute_batch_for_test`.
 - Migration 0149 (mdk#2628 item 4.2b, D76) adds four tables for sealed
   history deliveries. `cgka_sibling_adds` holds each sibling slot one of this
   device's own confirmed Commits added to a group, written by the engine

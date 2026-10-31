@@ -238,8 +238,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Blossom endpoints that takes it, keeping bundle keys only in memory; send its deliveries, each naming its server,
   only once every blob is uploaded. A receiver parks a Blossom delivery and fetches the blob off the worker once it
   holds the chat (`HistoryFetch`), through the dial-safe Blossom transport, bounded by the largest bundle
-  ciphertext; a failed upload, send or fetch waits and tries again. Only a refusal drops a received delivery: any
-  other error fails the projection so it is read again.
+  ciphertext; a failed upload, send or fetch waits and tries again, and a row that fails to prepare waits alone
+  rather than block the rest. A chat with no Blossom endpoint forgets such a history. Only a refusal drops a
+  received delivery: any other error fails the projection so it is read again.
 - Heartbeats (mdk#2628 item 3.6, D35) live in `src/client/device_heartbeats.rs`. Send one only from the trusted
   device group, once this device's own leaf reads as its slot, at most once an hour. Record the sent time only once the
   send returns that it went out (published, unresolved or queued), and leave the record alone when it reached no one

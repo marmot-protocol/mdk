@@ -6883,6 +6883,9 @@ fn account_worker_command_future<'a>(
                     account_id_hex,
                     account_label,
                 );
+                // A host that drives maintenance itself starts the history
+                // blobs it made due, as the periodic pass does.
+                dispatch_history_blobs(client, media_http);
             }
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true

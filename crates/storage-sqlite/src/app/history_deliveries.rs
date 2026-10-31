@@ -6,7 +6,7 @@
 use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::StorageResult;
-use rusqlite::params;
+use rusqlite::{OptionalExtension as _, params};
 
 /// How long an owed or parked delivery is kept, in seconds.
 pub const HISTORY_DELIVERY_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
@@ -202,21 +202,30 @@ impl SqliteAppStorage {
 
     /// The delivery `app_event_id` reaches no one, because branch selection
     /// withdrew it or its publish failed for good: owe its history again, as
-    /// it was first owed. Returns false when this device sent no such
-    /// delivery or no longer owes that history.
-    pub fn owe_history_delivery_again(&self, app_event_id: &str) -> StorageResult<bool> {
-        let changed = self
-            .lock()?
-            .execute_cached(
+    /// it was first owed, and return it as it now stands. A history going
+    /// through Blossom keeps its upload time and failed attempts, for the
+    /// caller to back off. `None` when this device sent no such delivery or
+    /// no longer owes that history.
+    pub fn owe_history_delivery_again(
+        &self,
+        app_event_id: &str,
+    ) -> StorageResult<Option<OwedHistoryDelivery>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached(&format!(
                 "UPDATE history_deliveries_owed SET sent_at = NULL, revision = revision + 1
                  WHERE (group_id_hex, receiver_slot_hex) IN (
                      SELECT group_id_hex, receiver_slot_hex FROM history_delivery_sends
                      WHERE app_event_id = ?1
-                 )",
-                params![app_event_id],
-            )
+                 )
+                 RETURNING {OWED_COLUMNS}"
+            ))
             .storage()?;
-        Ok(changed > 0)
+        let row = stmt
+            .query_row(params![app_event_id], owed_row)
+            .optional()
+            .storage()?;
+        row.map(owed_delivery).transpose()
     }
 
     /// Every history still to be sent, oldest first.
@@ -578,7 +587,7 @@ mod tests {
         store
             .record_history_delivery_send("e1", "aa", "s1", 30)
             .unwrap();
-        assert!(store.owe_history_delivery_again("e1").unwrap());
+        assert!(store.owe_history_delivery_again("e1").unwrap().is_some());
         let again = store.unsent_history_deliveries().unwrap();
         assert_eq!(
             (again[0].group_id_hex.as_str(), again[0].owed_at),
@@ -587,17 +596,17 @@ mod tests {
         );
         // Owed again while its deliveries went out, as a withdrawal or
         // failure drained mid-send does: the send's mark leaves it owed.
-        assert!(store.owe_history_delivery_again("e1").unwrap());
+        assert!(store.owe_history_delivery_again("e1").unwrap().is_some());
         store.mark_history_delivery_sent(&again[0], 42).unwrap();
         let again = store.unsent_history_deliveries().unwrap();
         assert_eq!(again[0].group_id_hex, "aa");
         // Not a delivery this device sent: nothing to owe again.
-        assert!(!store.owe_history_delivery_again("e9").unwrap());
+        assert!(store.owe_history_delivery_again("e9").unwrap().is_none());
         assert_eq!(store.unsent_history_deliveries().unwrap().len(), 2);
 
         store.forget_history_delivery(&again[0]).unwrap();
         assert_eq!(store.unsent_history_deliveries().unwrap().len(), 1);
-        assert!(!store.owe_history_delivery_again("e1").unwrap());
+        assert!(store.owe_history_delivery_again("e1").unwrap().is_none());
     }
 
     #[test]
@@ -636,7 +645,7 @@ mod tests {
         store
             .record_history_delivery_send("e1", "aa", "s1", 40)
             .unwrap();
-        assert!(store.owe_history_delivery_again("e1").unwrap());
+        assert!(store.owe_history_delivery_again("e1").unwrap().is_some());
         store
             .defer_blossom_history_delivery(&deferred, 500)
             .unwrap();
@@ -744,7 +753,7 @@ mod tests {
             .record_history_delivery_send("e1", "aa", "s1", DAY)
             .unwrap();
         assert_eq!(store.expire_history_deliveries(8 * DAY + 1).unwrap(), 3);
-        assert!(!store.owe_history_delivery_again("e1").unwrap());
+        assert!(store.owe_history_delivery_again("e1").unwrap().is_none());
         assert_eq!(
             store.unsent_history_deliveries().unwrap()[0].group_id_hex,
             "bb"

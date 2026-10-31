@@ -126,9 +126,13 @@
   receiver parks it and fetches the blob off the worker once it holds the
   chat, through the dial-safe Blossom transport, reading at most the largest
   bundle ciphertext. A failed upload, send or fetch tries again after a wait
-  that doubles up to an hour, until the delivery is a week old. A chat with no
-  Blossom endpoint gets no such history, and blobs are never deleted: the
-  server keeps the ciphertext, its size and its timing until it expires them.
+  that doubles up to an hour, until the delivery is a week old, and so does a
+  delivery a relay refuses for good. A chat with no Blossom endpoint, or with
+  no media servers at all, gets no such history, and blobs are never deleted:
+  the server keeps the ciphertext, its size and its timing until it expires
+  them. Imported messages reach subscribers as the fetch completes, and a host
+  that runs maintenance itself (`run_due_maintenance`) starts the uploads and
+  fetches it makes due.
   A received delivery that fails for any reason but a refusal now fails the
   projection, so it is read again rather than lost. Only behind
   `dev_device_groups`.
