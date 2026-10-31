@@ -750,7 +750,6 @@ async fn a_sibling_welcome_into_a_chat_still_held_waits_for_its_removal() {
 
     deliver_events(&mut phone, &[removal]).await;
     assert!(phone.runtime.group_record(&chat).unwrap().removed);
-    phone.pending_recovery_status_updates.clear();
     phone.run_due_maintenance().await.unwrap();
     let record = phone.runtime.group_record(&chat).unwrap();
     assert!(!record.removed);

@@ -188,8 +188,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   that copy reads removed or unrecoverable. A held row goes only when its carrier is withdrawn, its KeyPackage is used
   or expired, the chat is forgotten or disbanded, or a full stash makes room for a new Welcome. A forget refuses only
   the carriers dated before it, so the same Welcome sent again afterwards joins, whether or not a pass held it first.
-  Every call that can store or retire a rejoin offer (ingest, the retry, a confirmation, a decline) tells the host
-  which chats' offers changed.
+  Every call that can store or retire a rejoin offer (ingest, the retry, a confirmation, a decline, a join from the
+  stash) tells the host which chats' offers changed, even when it fails after a join.
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.
