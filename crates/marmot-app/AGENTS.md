@@ -107,6 +107,26 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   founding Add's and every later link's), so a kept id shows up again only when a fork brings back an earlier state.
   Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots` instead, never as
   device entries.
+- Recovery words for backups (`src/client/backups.rs`, mdk#2628 4.4a) live only in `AppClient::pending_recovery_words`
+  as zeroized entropy, until confirmed or cancelled: never write or log the words, their entropy or the private half.
+  Only the key's public half is kept (`backup_recovery_key`), with the key the roster held when the user confirmed;
+  turning backups off (D71) keeps the key the roster held then. The record stays until the user's next change, or a
+  dismissal of words not in use; never store a verdict in it. Write the roster's account entry only through the
+  runtime's `edit_roster_account_entry` (`ReplaceAccountEntry`, a compare-and-set), only while the device group takes
+  a commit from this device. Maintenance reads only the key the winning roster holds, through the one table `upkeep`,
+  after the runtime's maintenance has re-issued any own commit a fork dropped, and only while that gate is open (it
+  stays closed while a re-issue is owed, so turning off and upkeep wait for it too): the key new words or a turn-off
+  replaced means the commit was lost, and it is carried again, since no device writes that key again, but only while
+  the engine still keeps one of this device's account-entry commits (`own_account_entry_change_retained`). That fact
+  only ever goes from true to false between this device's changes, so nothing is carried once words could have shown
+  as not in use. Never carry a change over no key: the roster holds none both before a turn-on and after a later
+  turn-off, so words that turned backups on are never carried again, and the engine's re-issue and the runtime's retry
+  are all that deliver them. Whether words are in use is read each time (`words_status`): in use while the roster
+  holds their key, not in use only on a definite no from the runtime's `recovery_key_may_be_in_use`, and pending
+  otherwise, a failed read included. A device with no device group keeps the key (`Kept`), and `create_device_group`
+  founds the roster with it and this device writing; once the device trusts any device group, founded or joined, the
+  record reads as words that turned backups on there (`recovery_key_state`), so a device that joins one leaves the
+  group's backups as they are and founds nothing with that key again.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
   `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this

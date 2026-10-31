@@ -110,6 +110,11 @@ mod device_group_welcome;
 #[path = "account_devices/device_tag.rs"]
 mod device_tag;
 
+// Whether a recovery key may still be the account's (mdk#2628 4.4a).
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/recovery_key_in_use.rs"]
+mod recovery_key_in_use;
+
 // The rosters a device applied record what they announced (mdk#2628 D31
 // item 7).
 #[cfg(feature = "test-policy-overrides")]

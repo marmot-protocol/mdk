@@ -32,6 +32,27 @@
 
 ### Added
 
+- `MarmotAppRuntime::begin_recovery_words`, `confirm_recovery_words`,
+  `cancel_recovery_words`, `turn_off_backups`, `backup_settings` and
+  `dismiss_unused_recovery_words` set up the recovery words an account's
+  backups will be sealed to, and turn backups off (mdk#2628 item 4.4a, D71).
+  MDK makes 12 BIP-39 English words and holds them in memory only; the user
+  types back the two at the positions MDK picks, and only the key's public
+  half is kept: in the device group's roster, committed as a compare-and-set,
+  or by a device with no device group until the roster it founds carries it.
+  Turning backups on makes the confirming device the backup writer; new words
+  keep the writer; turning them off clears the writer and the key the same
+  way. New words or a turn-off whose commit is lost are carried again on a
+  later maintenance pass while the roster still holds the key they replaced
+  and the engine still keeps one of this device's account-entry commits;
+  words that turned backups on never are, since the roster holds no key both
+  before a turn-on and after a later turn-off. `BackupSettings::words_unused`
+  says, until the user dismisses it, that words confirmed on this device are
+  not in use: another change won, their commit was lost, or this device
+  joined a device group with a key it kept. It is read from the roster each
+  time, never stored, and shows only once no branch the device group could
+  still select would make them the account's key; until then the words read
+  as pending. Only behind `dev_device_groups`. Nothing writes backups yet.
 - Each device keeps an HPKE history key, generated on first use and stored in
   its encrypted account storage, and writes its public half into its own
   device-group roster entry (`history_key`) so siblings can seal chat history

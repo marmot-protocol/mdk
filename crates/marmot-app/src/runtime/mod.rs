@@ -44,17 +44,17 @@ use crate::{
     AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
     AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
-    ChatListRow, ChatNotificationSettings, ChatPinState, ExistingDirectConversation,
-    GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
-    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, RetentionSweepReport,
-    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelineMessageRecord,
-    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
-    unix_now_seconds,
+    BackupSettings, ChatListRow, ChatNotificationSettings, ChatPinState,
+    ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS,
+    MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, MessageDraft,
+    MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
+    NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
+    PushPlatform, PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
+    ReceivedMessage, RecoveryWords, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
+    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, UserDirectoryRefresh,
+    UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 use marmot_observability::{
     AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
@@ -2647,6 +2647,70 @@ impl MarmotAppRuntime {
     pub async fn removed_device_leftover_chats(&self, account_ref: &str) -> Result<u32, AppError> {
         self.accounts
             .removed_device_leftover_chats(account_ref)
+            .await
+    }
+
+    /// Make new recovery words for the account's backups (mdk#2628 item
+    /// 4.4a), in place of any not yet confirmed. Show the 12 words once, then
+    /// ask for the words at `confirm_positions` and pass them to
+    /// `confirm_recovery_words`. MDK keeps the words in memory only, so a
+    /// restart starts over with new ones. Refused with `DeviceGroupRefused`:
+    /// `roster_unsupported` (release builds).
+    pub async fn begin_recovery_words(&self, account_ref: &str) -> Result<RecoveryWords, AppError> {
+        self.accounts.begin_recovery_words(account_ref).await
+    }
+
+    /// Confirm the words `begin_recovery_words` made with the words the user
+    /// typed at its confirm positions, in order; case and surrounding spaces
+    /// are ignored. Their key becomes the account's recovery key, in its
+    /// device group's roster, or kept by this device until it has one, and
+    /// the words are forgotten. Refused with `DeviceGroupRefused`, keeping
+    /// the words for another try: `roster_unsupported` (release builds),
+    /// `recovery_words_not_started`, `recovery_words_mismatch`,
+    /// `device_group_busy` (retry later) or `roster_unavailable`.
+    pub async fn confirm_recovery_words(
+        &self,
+        account_ref: &str,
+        answers: Vec<String>,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .confirm_recovery_words(account_ref, answers)
+            .await
+    }
+
+    /// Forget recovery words not yet confirmed, if any.
+    pub async fn cancel_recovery_words(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.cancel_recovery_words(account_ref).await
+    }
+
+    /// Turn the account's backups off (mdk#2628 D71): clear the device
+    /// group roster's account entry, its recovery key and backup writer, or,
+    /// with no device group, forget the key this device keeps. Backups
+    /// already written stay until deleted. Turning them on again takes new
+    /// words through `begin_recovery_words`. Off already is not an error.
+    /// Refused with `DeviceGroupRefused`, changing nothing:
+    /// `roster_unsupported` (release builds), `device_group_busy` (retry
+    /// later) or `roster_unavailable`.
+    pub async fn turn_off_backups(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.turn_off_backups(account_ref).await
+    }
+
+    /// Where the account's backups stand on this device: whether they are
+    /// on, whether this device writes them, whether words confirmed here or
+    /// turning them off here still wait to reach the device group, and
+    /// whether words confirmed here are not in use and never will be. Refused with
+    /// `DeviceGroupRefused`: `roster_unsupported` (release builds) or
+    /// `roster_unavailable`. Read it when showing backup settings; it is not
+    /// evented.
+    pub async fn backup_settings(&self, account_ref: &str) -> Result<BackupSettings, AppError> {
+        self.accounts.backup_settings(account_ref).await
+    }
+
+    /// Forget words confirmed on this device that are not in use, so the
+    /// notice ends. Words in use or pending stay.
+    pub async fn dismiss_unused_recovery_words(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts
+            .dismiss_unused_recovery_words(account_ref)
             .await
     }
 

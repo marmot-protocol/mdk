@@ -3609,6 +3609,7 @@ dependencies = [
  "agent-stream-compose",
  "async-trait",
  "base64",
+ "bip39",
  "bytes",
  "cgka-engine",
  "cgka-traits",

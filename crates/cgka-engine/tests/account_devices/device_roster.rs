@@ -18,9 +18,9 @@ use super::activation::{buffer_unsettled, queued_intents};
 use super::*;
 use cgka_engine::ManualConvergenceClock;
 use cgka_traits::app_components::{
-    DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
-    DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1, decode_device_roster_v1,
-    encode_device_roster_update_v1, encode_device_roster_v1,
+    AccountEntryV1, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
+    DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1,
+    decode_device_roster_v1, encode_device_roster_update_v1, encode_device_roster_v1,
 };
 use cgka_traits::engine::{SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport};
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, GroupStorage as _};
@@ -38,7 +38,7 @@ pub(super) fn roster_device_on(storage: SqliteAccountStorage, account: &[u8]) ->
 }
 
 /// [`roster_device`] on a manual convergence clock.
-fn clocked_roster_device(account: &[u8], clock: &ManualConvergenceClock) -> Device {
+pub(super) fn clocked_roster_device(account: &[u8], clock: &ManualConvergenceClock) -> Device {
     build_roster_device(
         SqliteAccountStorage::in_memory_for_test().unwrap(),
         account,
@@ -1016,7 +1016,7 @@ async fn roster_bytes_are_unknown_data_in_other_groups() {
 
 /// `device` renames the entry of slot `n` to `label`, computed from the entry
 /// it reads now.
-fn replace(device: &Device, gid: &GroupId, n: u8, label: &str) -> SendIntent {
+pub(super) fn replace(device: &Device, gid: &GroupId, n: u8, label: &str) -> SendIntent {
     let expected = roster_of(device, gid).devices[&slot(n)].clone();
     SendIntent::ReplaceDeviceEntry {
         group_id: gid.clone(),
@@ -1029,7 +1029,7 @@ fn replace(device: &Device, gid: &GroupId, n: u8, label: &str) -> SendIntent {
     }
 }
 
-fn now_wall_ms() -> u64 {
+pub(super) fn now_wall_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1185,6 +1185,20 @@ async fn race_entry_replacements(
     phone_slot: u8,
     laptop_slot: u8,
 ) -> (Device, Device, GroupId, SupersededIntentReport) {
+    race_roster_commits(
+        |phone, gid| replace(phone, gid, phone_slot, "By phone"),
+        |laptop, gid| replace(laptop, gid, laptop_slot, "By laptop"),
+    )
+    .await
+}
+
+/// The phone sends `by_phone` and the laptop `by_laptop`, both computed from
+/// the same epoch, and each adjudicates the other's commit; returns as
+/// [`race_entry_replacements`] does.
+pub(super) async fn race_roster_commits(
+    by_phone: impl FnOnce(&Device, &GroupId) -> SendIntent,
+    by_laptop: impl FnOnce(&Device, &GroupId) -> SendIntent,
+) -> (Device, Device, GroupId, SupersededIntentReport) {
     let mut phone = roster_device(b"alice");
     let mut laptop = roster_device(b"alice");
     let gid = found_device_group(
@@ -1193,9 +1207,9 @@ async fn race_entry_replacements(
         &mut [&mut laptop],
     )
     .await;
-    let by_phone = replace(&phone, &gid, phone_slot, "By phone");
+    let by_phone = by_phone(&phone, &gid);
     let phone_commit = send_commit(&mut phone, by_phone, &gid).await;
-    let by_laptop = replace(&laptop, &gid, laptop_slot, "By laptop");
+    let by_laptop = by_laptop(&laptop, &gid);
     let laptop_commit = send_commit(&mut laptop, by_laptop, &gid).await;
     for (device, rival) in [(&mut phone, &laptop_commit), (&mut laptop, &phone_commit)] {
         device
@@ -1255,5 +1269,179 @@ async fn a_superseded_device_entry_replacement_of_an_entry_the_winner_changed_is
     assert_eq!(
         roster_of(&loser, &gid).devices[&slot(2)].label,
         roster_of(&winner, &gid).devices[&slot(2)].label
+    );
+}
+
+/// `device` sets the account entry to name `writer` as the backup writer and
+/// the 32 bytes of `key` as the recovery key, computed from the entry it
+/// reads now (mdk#2628 4.4a).
+pub(super) fn set_account(device: &Device, gid: &GroupId, writer: u8, key: u8) -> SendIntent {
+    SendIntent::ReplaceAccountEntry {
+        group_id: gid.clone(),
+        expected: Box::new(roster_of(device, gid).account),
+        entry: Box::new(AccountEntryV1 {
+            backup_writer: Some(slot(writer)),
+            recovery_public_key: Some(vec![key; 32]),
+        }),
+    }
+}
+
+pub(super) fn account(writer: u8, key: u8) -> AccountEntryV1 {
+    AccountEntryV1 {
+        backup_writer: Some(slot(writer)),
+        recovery_public_key: Some(vec![key; 32]),
+    }
+}
+
+pub(super) fn refused_account_replacement(events: &[GroupEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(event, GroupEvent::QueuedIntentRefused { intent_kind, reason, .. }
+            if intent_kind == "replace_account_entry" && reason == "account_entry_changed")
+    })
+}
+
+/// An account entry replacement is one `SetAccount`: every member reads the
+/// new account entry, and every device entry stays as it was.
+#[tokio::test]
+async fn an_account_entry_replacement_sets_only_the_account_entry() {
+    let mut phone = roster_device(b"alice");
+    let mut laptop = roster_device(b"alice");
+    let gid = found_device_group(
+        &mut phone,
+        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        &mut [&mut laptop],
+    )
+    .await;
+    let devices = roster_of(&laptop, &gid).devices;
+    assert_eq!(roster_of(&laptop, &gid).account, AccountEntryV1::default());
+
+    let by_phone = set_account(&phone, &gid, 1, 7);
+    let commit = send_commit(&mut phone, by_phone, &gid).await;
+    assert_accepted(&mut laptop, &commit, &gid).await;
+    for device in [&phone, &laptop] {
+        let roster = roster_of(device, &gid);
+        assert_eq!(roster.account, account(1, 7));
+        assert_eq!(roster.devices, devices);
+    }
+}
+
+/// An account entry replacement names the entry it was computed from, as a
+/// device entry replacement does. A sibling's replacement is still buffered
+/// when this one is sent, so it waits in the queue; the drain applies the
+/// sibling's first and then refuses this one, which is retired and
+/// announced. Computed again from the new entry, it goes out.
+#[tokio::test]
+async fn a_queued_account_entry_replacement_never_lands_on_a_changed_entry() {
+    let clock = ManualConvergenceClock::new(1_000_000, now_wall_ms());
+    let mut phone = clocked_roster_device(b"alice", &clock);
+    let mut laptop = roster_device(b"alice");
+    let gid = found_device_group(
+        &mut phone,
+        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        &mut [&mut laptop],
+    )
+    .await;
+    let by_laptop = set_account(&laptop, &gid, 2, 7);
+    let laptop_commit = send_commit(&mut laptop, by_laptop, &gid).await;
+    buffer_unsettled(&mut phone, &laptop_commit).await;
+
+    let queued = phone
+        .engine
+        .send(set_account(&phone, &gid, 1, 8))
+        .await
+        .unwrap();
+    assert!(matches!(queued, SendResult::Queued { .. }), "{queued:?}");
+    phone.engine.drain_events();
+
+    clock.advance_ms(30_000);
+    let drained = phone.engine.advance_convergence(&gid).await.unwrap();
+    assert!(drained.is_empty(), "{drained:?}");
+    assert!(queued_intents(&phone, &gid).is_empty());
+    assert!(refused_account_replacement(&phone.engine.drain_events()));
+    assert_eq!(roster_of(&phone, &gid).account, account(2, 7));
+
+    let SendResult::GroupEvolution { pending, .. } = phone
+        .engine
+        .send(set_account(&phone, &gid, 1, 8))
+        .await
+        .unwrap()
+    else {
+        panic!("expected GroupEvolution")
+    };
+    phone.engine.confirm_published(pending).await.unwrap();
+    assert_eq!(roster_of(&phone, &gid).account, account(1, 8));
+}
+
+/// The convergence input a send settles first can change the account entry
+/// the replacement was computed from; it is then refused and nothing is
+/// kept.
+#[tokio::test]
+async fn an_account_entry_replacement_never_lands_on_an_entry_its_send_changed() {
+    let clock = ManualConvergenceClock::new(1_000_000, now_wall_ms());
+    let mut phone = clocked_roster_device(b"alice", &clock);
+    let mut laptop = roster_device(b"alice");
+    let gid = found_device_group(
+        &mut phone,
+        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        &mut [&mut laptop],
+    )
+    .await;
+    let by_laptop = set_account(&laptop, &gid, 2, 7);
+    let laptop_commit = send_commit(&mut laptop, by_laptop, &gid).await;
+    buffer_unsettled(&mut phone, &laptop_commit).await;
+    clock.advance_ms(30_000);
+
+    let stale = set_account(&phone, &gid, 1, 8);
+    let refused = phone.engine.send(stale).await;
+    assert!(
+        matches!(&refused, Err(EngineError::AccountEntryChanged { group_id }) if *group_id == gid),
+        "{refused:?}"
+    );
+    assert_eq!(roster_of(&phone, &gid).account, account(2, 7));
+    assert!(queued_intents(&phone, &gid).is_empty());
+}
+
+/// A superseded account entry replacement is re-issued when the winning
+/// branch left the account entry alone, and a superseded rename is re-issued
+/// over a winner that changed only the account entry: whichever loses, both
+/// changes land.
+#[tokio::test]
+async fn a_superseded_account_entry_replacement_is_reissued_when_the_winner_left_it_alone() {
+    let (mut loser, _winner, gid, report) = race_roster_commits(
+        |phone, gid| set_account(phone, gid, 1, 7),
+        |laptop, gid| replace(laptop, gid, 2, "By laptop"),
+    )
+    .await;
+    assert_eq!(report.kind, SupersededIntentKind::AppComponents);
+    assert_eq!(report.outcome, SupersededIntentOutcome::Reissued);
+
+    let drained = loser
+        .engine
+        .converge_and_drain_queued_outbound_intents(&gid, 2_000_000)
+        .await
+        .unwrap();
+    let [SendResult::GroupEvolution { pending, .. }] = drained.as_slice() else {
+        panic!("the re-issued change is prepared: {drained:?}")
+    };
+    loser.engine.confirm_published(*pending).await.unwrap();
+    let roster = roster_of(&loser, &gid);
+    assert_eq!(roster.account, account(1, 7));
+    assert_eq!(roster.devices[&slot(2)].label, "By laptop");
+}
+
+/// Two account entry replacements from the same epoch: the loser's is a
+/// conflict, the winner's entry stands and nothing is queued.
+#[tokio::test]
+async fn a_superseded_account_entry_replacement_the_winner_changed_is_a_conflict() {
+    let (loser, winner, gid, report) = race_roster_commits(
+        |phone, gid| set_account(phone, gid, 1, 7),
+        |laptop, gid| set_account(laptop, gid, 2, 8),
+    )
+    .await;
+    assert_eq!(report.outcome, SupersededIntentOutcome::Conflict);
+    assert!(queued_intents(&loser, &gid).is_empty());
+    assert_eq!(
+        roster_of(&loser, &gid).account,
+        roster_of(&winner, &gid).account
     );
 }

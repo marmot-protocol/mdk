@@ -4,6 +4,16 @@
 
 ### Breaking changes
 
+- Migration 0163 advances account storage to schema 163 (mdk#2628 item 4.4a).
+  It adds `backup_recovery_key`, at most one row: the public half of the
+  recovery key words confirmed with no device group derive; or the public half
+  of the recovery key the words last confirmed on this device derive, with the
+  key they replaced in the roster, if any; or the key the roster held when
+  backups were turned off on this device. The words and the private half are
+  never stored. `SqliteAppStorage` gains `backup_recovery_key` and
+  `put_backup_recovery_key`, with `BackupRecoveryKeyRecord`. The number below
+  163 that is not yet used (162) belongs to other work, which lands later; the
+  runner applies it in order.
 - Migration 0143 advances account storage to schema 143 (mdk#2628 item 3.6).
   It adds `device_activity`, one row per sibling the trusted device group's
   roster lists (that entry's `linked_at`, when this device first found it

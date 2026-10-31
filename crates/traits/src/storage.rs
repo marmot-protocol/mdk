@@ -563,10 +563,12 @@ pub struct ReinviteRetry {
 /// The intent behind a commit this device staged. A confirmed commit can still
 /// be parked by convergence for as long as it sits inside the group's rewind
 /// horizon, so the record outlives publication: it is removed when the publish
-/// is rolled back, when a supersession has been decided, or once the commit's
-/// source epoch falls below the horizon. When convergence parks the commit, the
-/// record is what lets the engine re-issue the intent against the canonical
-/// state or report why it cannot (mdk#1734).
+/// is rolled back, or once the commit's source epoch falls below the horizon.
+/// When convergence parks the commit, the record is what lets the engine
+/// re-issue the intent against the canonical state or report why it cannot
+/// (mdk#1734). Deciding the supersession consumes it, except for an
+/// account-entry change, whose record is kept, marked `decided`, since the
+/// parked commit can still be selected until the horizon.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnCommitIntent {
     /// Transport `MessageId` of the staged commit.
@@ -581,6 +583,10 @@ pub struct OwnCommitIntent {
     #[serde(default)]
     pub reissue_attempts: u32,
     pub created_at_ms: u64,
+    /// Whether its supersession has been decided. A decided record is never
+    /// re-issued again; it only says this device staged the commit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decided: bool,
 }
 
 pub trait OutboundIntentStorage {

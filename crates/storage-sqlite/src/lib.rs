@@ -12,6 +12,7 @@ mod cross;
 pub mod media_store_bench;
 mod protocol;
 
+pub use app::backup_recovery_key::BackupRecoveryKeyRecord;
 pub use app::compromise_warning::{
     COMPROMISE_WARNING_ITEM_CAP, COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS,
     CompromiseWarningGather, CompromiseWarningReason, CompromiseWarningRecord, FirstTrustedRoster,

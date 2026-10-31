@@ -422,6 +422,29 @@ with nothing sent, since a commit then could build on a roster that is about to 
 commit loses a fork is made again on a later maintenance pass, unless another rename of that device won; that one
 stands. Show the label the next list returns after `LinkedDevicesChanged`, not the one the user typed.
 
+### Recovery words
+
+An account's backups are sealed to a recovery key that 12 recovery words derive, separate from the nsec (mdk#2628).
+`MarmotAppRuntime::begin_recovery_words(account_ref)` makes new words as `RecoveryWords`: show the 12 `words` once,
+then ask for the words at `confirm_positions` (1-based) and pass them, in order, to `confirm_recovery_words`. MDK holds
+the words in memory only and forgets them once confirmed or after `cancel_recovery_words`; a restart starts over with
+new words. Confirming keeps only the key's public half: in the device group's roster, or on this device while it has
+no device group, until the device group it founds carries it. A device that joins a device group instead leaves the
+group's backups as they are, and its words no longer turn backups on. The first device to turn backups on writes them, and new
+words from any device keep that writer. A mismatch (`recovery_words_mismatch`) or a busy device group
+(`device_group_busy`) keeps the words for another try. `turn_off_backups` turns backups off for every device of the
+account by clearing the writer and the key; backups already written stay until deleted, and turning backups on again
+takes new words. It is refused as `device_group_busy` while the device group can't take the change. `backup_settings`
+says whether backups are on, whether this device writes them, whether words confirmed here (`words_pending`) or turning
+backups off here (`off_pending`) still wait to reach the device group, and whether words confirmed here are not in use
+and never will be (`words_unused`): another change won, their commit was lost, or this device joined a device group
+with words it kept. Until nothing could still make them the account's key they read as pending instead: while a change
+of this device's is in flight, and while a branch of the device group that holds them could still be selected, which
+lasts until the device group has moved more than five commits on, and while the device group is younger than that on
+this device. `dismiss_unused_recovery_words` then forgets them; confirm new words to turn backups on again. Nothing
+writes backups yet, and
+every call is refused as `DeviceGroupRefused("roster_unsupported")` in release builds until the backup spec lands.
+
 ### Overdue KeyPackage refresh
 
 While this device trusts a device group, each KeyPackage it publishes is first announced in its own roster entry there,

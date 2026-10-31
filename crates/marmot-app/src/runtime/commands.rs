@@ -1202,6 +1202,76 @@ impl AccountManager {
         local_account_worker_response(response).await
     }
 
+    pub async fn begin_recovery_words(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::RecoveryWords, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::BeginRecoveryWords { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn confirm_recovery_words(
+        &self,
+        account_ref: &str,
+        answers: Vec<String>,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ConfirmRecoveryWords { answers, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn cancel_recovery_words(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CancelRecoveryWords { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn turn_off_backups(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::TurnOffBackups { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn backup_settings(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::BackupSettings, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::BackupSettings { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn dismiss_unused_recovery_words(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DismissUnusedRecoveryWords { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
     pub async fn acknowledge_group_catching_up(
         &self,
         account_ref: &str,

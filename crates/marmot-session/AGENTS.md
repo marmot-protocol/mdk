@@ -39,8 +39,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     (`refill_emptied_slot`) once that publication is a day old, so one that keeps nothing costs one a day.
   - `runtime/device_roster.rs` — this device's reads and writes of its device group's roster: its slot, the merged
     roster, the gate its roster commits wait behind (`device_group_takes_commit`: not stable, held, quarantined,
-    settling, or a change of this device's still queued or unconfirmed; public, so the host judges a lost rename only
-    once its commits there have an outcome), and the sends. The runtime's roster-writing steps use these rather than
+    settling, or a change of this device's still queued, unconfirmed or owed a re-issue that maintenance has not yet
+    re-derived; public, so the host judges a lost rename or turn-on only once its commits there have an outcome), and
+    the sends. The runtime's roster-writing steps use these rather than
     their own copies. Device entries have one write path (`edit_device_roster_entry`, mdk#2628 3.4, 3.6): one
     `SetDevice` commit replacing one device entry with an edit applied to the roster as read now, sent as
     `SendIntent::ReplaceDeviceEntry` naming the entry it read. The engine stages it only while the slot still holds
@@ -48,7 +49,11 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     the tag signature key and the host's device edits all go through it; don't add another device-entry commit. Each
     announcement also writes the host's `DeviceSelfReport` (this device's client and platform) and this device's
     history key (4.1) into its own entry; the tag-key commit carries the history key too. Only this device's own
-    entry ever gets its history key.
+    entry ever gets its history key. The account entry (backup writer and recovery key, 4.4a) has one write path
+    too, `edit_roster_account_entry`, sent as `SendIntent::ReplaceAccountEntry` naming the entry it read
+    (`AccountEntryChanged` maps to `Busy`). `recovery_key_may_be_in_use` is the one answer to whether a key this
+    device introduced may still be the account's: the commit gate is closed, or the engine's
+    `recovery_key_selectable` says so; `own_account_entry_change_retained` passes the engine's fact through.
     `send_device_roster_update` carries rejected-slot operations only.
   - `runtime/device_tag_key.rs` — this device's tag signature key (mdk#2628 3.1d): the host names the device group to
     tag from (`set_device_tag_group`). Maintenance, and the host before each KeyPackage publication

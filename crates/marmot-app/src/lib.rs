@@ -221,6 +221,7 @@ pub use client::AppClient;
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::DevSealedHistoryBundle;
+pub use client::backups::{BackupSettings, RecoveryWords};
 pub use client::compromise_warning::{CompromiseWarningItem, CompromiseWarningReason};
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
@@ -2129,6 +2130,7 @@ impl MarmotApp {
             // A fresh client cannot know what hosts last read.
             linked_devices_changed: true,
             inactive_siblings: None,
+            pending_recovery_words: None,
             key_package_refresh_overdue: None,
             key_package_refresh_overdue_changed: true,
             sign_in_schedule: Default::default(),

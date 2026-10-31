@@ -518,6 +518,7 @@ mod tests {
             reinvite: None,
             reissue_attempts: 1,
             created_at_ms: 42,
+            decided: true,
         };
         store
             .put_own_commit_intent(&record(mid(3), gid(1)))

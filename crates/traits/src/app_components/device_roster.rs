@@ -123,8 +123,11 @@ pub struct RejectedKeyPackageV1 {
     pub rejected_at: u64,
 }
 
-/// Account-wide fields, reserved for account sync. Opaque here.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Account-wide fields for backups (mdk#2628 4.4): the device that writes
+/// them, by slot, and the recovery key's public half. Opaque to the codec,
+/// which checks only their bounds. Serializable because a queued
+/// `SendIntent::ReplaceAccountEntry` carries it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountEntryV1 {
     pub backup_writer: Option<DeviceSlotId>,
     pub recovery_public_key: Option<Vec<u8>>,

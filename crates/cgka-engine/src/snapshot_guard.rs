@@ -60,6 +60,9 @@ pub(crate) enum RewindSite {
     EncryptedMediaSource,
     /// Authenticate delayed moderation policy outside any replay guard.
     ModerationSource,
+    /// The app rewinds onto the oldest retained anchor to read the device
+    /// roster's account entry there (`Engine::recovery_key_selectable`).
+    AccountEntrySource,
     /// Hydration processes a stored proposal to decide whether it is a
     /// deferred SelfRemove.
     HydrateSelfRemove,
@@ -75,11 +78,12 @@ pub(crate) enum RewindSite {
 }
 
 impl RewindSite {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::PastPeelContext,
         Self::RetentionSource,
         Self::EncryptedMediaSource,
         Self::ModerationSource,
+        Self::AccountEntrySource,
         Self::HydrateSelfRemove,
         Self::Replay,
         Self::RetainedAnchorPass,
@@ -94,6 +98,7 @@ impl RewindSite {
             Self::RetentionSource => "retention-restore-",
             Self::EncryptedMediaSource => "encrypted-media-source-restore-",
             Self::ModerationSource => "moderation-source-restore-",
+            Self::AccountEntrySource => "account-entry-source-restore-",
             Self::HydrateSelfRemove => "hydrate-selfremove-probe-",
             Self::Replay => "openmls-probe-",
             Self::RetainedAnchorPass => "openmls-retained-probe-",

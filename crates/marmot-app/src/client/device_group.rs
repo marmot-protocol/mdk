@@ -325,9 +325,10 @@ impl AppClient {
         let now = unix_now_seconds();
         let mut roster = DeviceRosterV1::default();
         OsRng.fill_bytes(&mut roster.leaf_tag_key);
-        // The founding roster lists only this device and its rejections; the
-        // founding Add sets the new device's entry, as every later Add does,
-        // so no entry ever names a device without its leaf (D41). Each entry
+        // The founding roster lists only this device, its rejections and its
+        // recovery key; the founding Add sets the new device's entry, as
+        // every later Add does, so no entry ever names a device without its
+        // leaf (D41). Each entry
         // announces the KeyPackage in that device's slot (3.4), so neither
         // device owes a roster commit before it publishes. This device's
         // entry also carries its tag signature key, so the engine tags its
@@ -369,6 +370,8 @@ impl AppClient {
         };
         // Rejections this device made before it had a device group (3.2).
         self.founding_sign_in_rejections(&mut roster, &sibling_slot)?;
+        // The recovery key this device kept without one (4.4a).
+        roster.account = self.founding_account_entry(own_slot)?;
         let roster = encode_device_roster_v1(&roster)
             .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
         let roster_update = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(

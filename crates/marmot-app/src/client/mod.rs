@@ -74,6 +74,7 @@ pub(crate) mod audit_v5_probe;
 mod chat_history;
 #[cfg(feature = "test-policy-overrides")]
 pub use chat_history::DevSealedHistoryBundle;
+pub(crate) mod backups;
 pub(crate) mod compromise_warning;
 pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
@@ -810,6 +811,9 @@ pub struct AppClient {
     /// pass that judges differently owes hosts a `LinkedDevicesChanged`.
     /// `None` until a pass has judged.
     pub(crate) inactive_siblings: Option<std::collections::BTreeSet<String>>,
+    /// Recovery words shown and not yet confirmed (mdk#2628 4.4a): in memory
+    /// only, until they are confirmed or cancelled, or the client closes.
+    pub(crate) pending_recovery_words: Option<backups::PendingRecoveryWords>,
     /// The last overdue-refresh answer a maintenance pass computed, and
     /// whether hosts owe a `KeyPackageRefreshOverdueChanged`. The flag starts
     /// set, since a fresh client cannot know what hosts last read.
@@ -1512,6 +1516,10 @@ impl AppClient {
         self.sibling_key_package_upkeep(&held).await;
         self.device_heartbeat_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
+        // After the runtime has re-issued any own commit a fork dropped, so
+        // a turn-on it carries is in flight rather than lost. Until it has,
+        // the commit gate holds upkeep back.
+        self.recovery_key_upkeep().await;
         self.note_key_package_refresh_overdue();
         let mut activity = self.runtime.take_maintenance_activity();
         activity.absorb(previous);

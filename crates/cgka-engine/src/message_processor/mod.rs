@@ -4140,6 +4140,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::ReplaceDeviceEntry { group_id, .. }
+        | SendIntent::ReplaceAccountEntry { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. }
         | SendIntent::EnableDisbanding { group_id }
         | SendIntent::EnableAccountDevices { group_id }
@@ -4165,6 +4166,7 @@ pub(crate) fn is_fair_scheduled_intent(
         | SendIntent::RemoveMembers { .. }
         | SendIntent::UpdateAppComponents { .. }
         | SendIntent::ReplaceDeviceEntry { .. }
+        | SendIntent::ReplaceAccountEntry { .. }
         | SendIntent::UpdateGroupData { .. }
         | SendIntent::EnableDisbanding { .. }
         | SendIntent::EnableAccountDevices { .. }

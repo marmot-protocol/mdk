@@ -202,8 +202,16 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     Commits and standalone proposals; and outside a device group roster bytes are unknown data. A device entry
     replacement (`ReplaceDeviceEntry`) never lands on an entry that changed since it was read: not from its own
     send's settlement, a rival branch at the same epoch, or the drain, and a lost one is re-issued only while its
-    entry is untouched (`DeviceEntryChanged`). The
+    entry is untouched (`DeviceEntryChanged`). An account entry replacement (`ReplaceAccountEntry`, 4.4a) holds to
+    the same rules for the account entry (`AccountEntryChanged`). The
     `Parts::app_data_state` override in `account_devices.rs` lets a crafted Commit write resulting bytes of its own.
+
+- **File:** `account_devices/recovery_key_in_use.rs` (test-policy builds only)
+  - **Owns:** The two facts the app reads before it tells its user recovery words are not in use (mdk#2628 4.4a): a
+    decided account-entry record is kept until the rewind horizon and nothing acts on it again, only this device's
+    account-entry changes count as retained, and a key is selectable while the roster, a kept change or the anchor at
+    the oldest selectable epoch can hold it, or whenever that anchor is missing, restores another epoch or has an
+    older one beside it, as in a group younger than the horizon.
 
 - **File:** `account_devices/link_device.rs` (test-policy builds only)
   - **Owns:** The link Commit (mdk#2628 item 3.3b), `LinkDevice`: one privileged admin Commit that adds the linked

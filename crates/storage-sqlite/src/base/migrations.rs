@@ -310,6 +310,8 @@ mod migration_0147_device_removed_membership;
 mod migration_0148_compromise_warning;
 #[path = "migrations/0161_small_state.rs"]
 mod migration_0161_small_state;
+#[path = "migrations/0163_backup_recovery_key.rs"]
+mod migration_0163_backup_recovery_key;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1218,6 +1220,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0161_small_state",
         suspend_foreign_keys: &[],
         apply: migration_0161_small_state::apply,
+    },
+    Migration {
+        version: 163,
+        name: "0163_backup_recovery_key",
+        suspend_foreign_keys: &[],
+        apply: migration_0163_backup_recovery_key::apply,
     },
 ];
 

@@ -21,6 +21,13 @@
 //!
 //! Re-queued intents flow through the ordinary queued-intent drain, so they
 //! are regenerated against the canonical state with every existing gate.
+//!
+//! A decision consumes the record, except an account-entry change's: that is
+//! kept, marked decided, until its source epoch is past the rewind horizon,
+//! the rule that collects a confirmed commit's. The parked commit can still be
+//! selected until then, and the record is what says this device staged it
+//! (`Engine::own_account_entry_change_retained`). Nothing re-issues,
+//! re-decides or waits on a decided record.
 
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
@@ -85,7 +92,7 @@ impl<S: StorageProvider> Engine<S> {
                 ))
             }
             // The intent carries its own baseline: the entry it replaces.
-            SendIntent::ReplaceDeviceEntry { .. } => {
+            SendIntent::ReplaceDeviceEntry { .. } | SendIntent::ReplaceAccountEntry { .. } => {
                 Some((SupersededIntentKind::AppComponents, OwnCommitBaseline::None))
             }
             SendIntent::AppMessage { .. }
@@ -101,7 +108,7 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
-    fn load_mls_group(&self, group_id: &GroupId) -> Result<MlsGroup, EngineError> {
+    pub(crate) fn load_mls_group(&self, group_id: &GroupId) -> Result<MlsGroup, EngineError> {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         MlsGroup::load(provider.storage(), &mls_gid)
@@ -112,8 +119,9 @@ impl<S: StorageProvider> Engine<S> {
     /// Decide what becomes of the intent behind `commit_id` now that
     /// convergence has superseded that commit. Returns `None` when this device
     /// recorded no intent for it (a peer's commit, a self-update, or a record
-    /// already consumed). Successful decisions consume the record; a re-queued
-    /// intent replaces it atomically. Storage errors leave the original retryable.
+    /// already decided). A decision consumes the record, or marks an
+    /// account-entry change's decided, in the same transaction that queues any
+    /// re-issue. Storage errors leave the original retryable.
     pub fn reissue_superseded_own_commit(
         &mut self,
         commit_id: &MessageId,
@@ -121,7 +129,7 @@ impl<S: StorageProvider> Engine<S> {
         let Some(mut record) = self.storage.own_commit_intent(commit_id)? else {
             return Ok(None);
         };
-        if record.reinvite.is_some() {
+        if record.reinvite.is_some() || record.decided {
             return Ok(None);
         }
         // Reading canonical state and preparing a replacement must succeed
@@ -136,6 +144,9 @@ impl<S: StorageProvider> Engine<S> {
                     report.outcome == SupersededIntentOutcome::ReinviteRequired
                 }) {
                     record.reinvite = Some(cgka_traits::storage::ReinviteRetry::default());
+                    storage.put_own_commit_intent(&record)?;
+                } else if matches!(record.intent, SendIntent::ReplaceAccountEntry { .. }) {
+                    record.decided = true;
                     storage.put_own_commit_intent(&record)?;
                 } else {
                     storage.delete_own_commit_intent(commit_id)?;
@@ -162,9 +173,9 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::Invite { .. } => SupersededIntentKind::Invite,
             SendIntent::RemoveMembers { .. } => SupersededIntentKind::RemoveMembers,
             SendIntent::UpdateGroupData { .. } => SupersededIntentKind::GroupProfile,
-            SendIntent::UpdateAppComponents { .. } | SendIntent::ReplaceDeviceEntry { .. } => {
-                SupersededIntentKind::AppComponents
-            }
+            SendIntent::UpdateAppComponents { .. }
+            | SendIntent::ReplaceDeviceEntry { .. }
+            | SendIntent::ReplaceAccountEntry { .. } => SupersededIntentKind::AppComponents,
             _ => return Ok(None),
         };
         let report = |outcome, reason| SupersededIntentReport {
@@ -326,6 +337,24 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 record.intent.clone()
             }
+            // Compared again when the re-issued copy is prepared, as above.
+            SendIntent::ReplaceAccountEntry {
+                group_id, expected, ..
+            } => {
+                let mls_group = self.load_mls_group(group_id)?;
+                if crate::app_components::account_entry_of_group(&mls_group).as_ref()
+                    != Some(&**expected)
+                {
+                    return Ok(Some((
+                        report(
+                            SupersededIntentOutcome::Conflict,
+                            "the winning branch changed the account entry; its value stands",
+                        ),
+                        None,
+                    )));
+                }
+                record.intent.clone()
+            }
             _ => return Ok(None),
         };
 
@@ -357,14 +386,21 @@ impl<S: StorageProvider> Engine<S> {
     /// announcement, and garbage-collect records whose commit can no longer
     /// be superseded. A confirmed commit stays reconsiderable while its
     /// source epoch is within the group's rewind horizon, so its record is
-    /// kept until the group has advanced past that horizon. Live or in-flight
-    /// commits are left alone.
+    /// kept until the group has advanced past that horizon; a decided
+    /// account-entry change's is kept as long, and only collected. Live or in-flight commits are left
+    /// alone.
     pub fn reissue_superseded_own_commits_from_state(
         &mut self,
     ) -> Result<Vec<SupersededIntentReport>, EngineError> {
         let mut reports = Vec::new();
         for record in self.storage.list_own_commit_intents(None)? {
             if record.reinvite.is_some() {
+                continue;
+            }
+            if record.decided {
+                if self.own_commit_is_beyond_rewind_horizon(&record)? {
+                    self.storage.delete_own_commit_intent(&record.commit_id)?;
+                }
                 continue;
             }
             let state = match self.storage.get_message(&record.commit_id) {
@@ -387,9 +423,39 @@ impl<S: StorageProvider> Engine<S> {
         Ok(reports)
     }
 
+    /// Whether an own commit in `group_id` lost a fork and its re-issue is
+    /// still owed: a reconciler missed the announcement and
+    /// [`Self::reissue_superseded_own_commits_from_state`] has not decided it
+    /// since. Such a commit has not reached its outcome.
+    pub fn owes_superseded_own_commit_reissue(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        for record in self.storage.list_own_commit_intents(Some(group_id))? {
+            if record.reinvite.is_some() || record.decided {
+                continue;
+            }
+            match self.storage.get_message(&record.commit_id) {
+                Ok(message)
+                    if matches!(
+                        message.state,
+                        MessageState::ConvergenceDeferred | MessageState::EpochInvalidated
+                    ) =>
+                {
+                    return Ok(true);
+                }
+                Ok(_) | Err(cgka_traits::storage::StorageError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether a confirmed commit staged from `record.source_epoch` can no
     /// longer be rolled back by a late rival: the group has advanced more than
     /// `max_rewind_commits` epochs past it.
+    /// [`Engine::own_account_entry_change_retained`] relies on every record
+    /// staged at or after `epoch - max_rewind_commits` being kept.
     fn own_commit_is_beyond_rewind_horizon(
         &self,
         record: &OwnCommitIntent,
@@ -650,6 +716,7 @@ impl<S: StorageProvider> Engine<S> {
             reinvite: None,
             reissue_attempts,
             created_at_ms,
+            decided: false,
         })?;
         Ok(())
     }
