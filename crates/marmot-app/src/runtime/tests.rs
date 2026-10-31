@@ -648,32 +648,45 @@ async fn an_unlinked_device_stops_its_account_for_good() {
     let managed = || runtime.accounts().managed_accounts().unwrap().remove(0);
     assert!(managed().running && !managed().unlinked);
 
+    // Hosts hear the unlink only once the account is signed out, so one that
+    // wipes and signs in again on hearing it never meets the deactivation.
+    // While the lifecycle lock is held the deactivation waits, and the event
+    // with it.
+    let worker_transactions = runtime.accounts().worker_transactions.clone();
+    let held = worker_transactions.lock().await;
     runtime
         .accounts()
         .unlink_device_for_test("alice")
         .await
         .unwrap();
-
-    timeout(Duration::from_secs(10), async {
+    async fn device_unlinked(events: &mut broadcast::Receiver<MarmotAppEvent>, account_id: &str) {
         loop {
             if let Ok(MarmotAppEvent::DeviceUnlinked { account_id_hex, .. }) = events.recv().await
-                && account_id_hex == account.account_id_hex
+                && account_id_hex == account_id
             {
                 break;
             }
         }
-    })
+    }
+    assert!(
+        timeout(
+            Duration::from_millis(500),
+            device_unlinked(&mut events, &account.account_id_hex)
+        )
+        .await
+        .is_err(),
+        "no host hears the unlink before the account is signed out"
+    );
+    drop(held);
+
+    timeout(
+        Duration::from_secs(10),
+        device_unlinked(&mut events, &account.account_id_hex),
+    )
     .await
     .expect("hosts hear the unlink");
-    timeout(Duration::from_secs(10), async {
-        while managed().running {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the runtime deactivates the account");
     let unlinked = managed();
-    assert!(unlinked.unlinked && unlinked.signed_out);
+    assert!(!unlinked.running && unlinked.unlinked && unlinked.signed_out);
 
     assert!(matches!(
         runtime.sign_in_account("alice").await,

@@ -268,8 +268,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   lifts the stop for a failed link (`lift_failed_link_publish_stop`). The stop is in memory and otherwise cleared only
   when the account is removed. Admission stops taking input once the flag is set; the pairing drive notes a removal
   before it sends anything; the worker stops right after an ingest that unlinked it (startup and maintenance catch-ups,
-  admission turns, deliveries) with `DeviceUnlinked`, and the runtime then deactivates the account, making the mark
-  again in the write that signs it out. `MarmotApp::client`, `sign_in_account`, `run_due_maintenance`, both logins, a
+  admission turns, deliveries), and the runtime then deactivates the account, making the mark again in the write that
+  signs it out, and only then sends `DeviceUnlinked`, so a host that wipes and signs in again on hearing it never meets
+  that deactivation. `MarmotApp::client`, `sign_in_account`, `run_due_maintenance`, both logins, a
   key import and both onboarding starts refuse an unlinked account, before anything is written or sent;
   `sign_out_and_wipe` of one skips leaving chats and deleting the slot. A later link's Welcome into that group is a
   first join, held by the engine to the link rather than to the forget's date. A new device never starts a link by a

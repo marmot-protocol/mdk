@@ -1600,9 +1600,9 @@ pub enum MarmotAppEvent {
     },
     /// The account's device group removed this device after its link was
     /// made, so the account stopped here and is signed out for good: re-read
-    /// `accounts` and show the device-level notice. Fires once, when the
-    /// device finds its removal; afterwards `ManagedAccount::unlinked` says
-    /// so (mdk#2628 D62, D67).
+    /// `accounts` and show the device-level notice. Fires once, after the
+    /// runtime has signed out the account whose removal the device found;
+    /// `ManagedAccount::unlinked` then says so (mdk#2628 D62, D67).
     DeviceUnlinked {
         account_id_hex: String,
         account_label: String,
@@ -7129,13 +7129,21 @@ impl AccountManager {
         report_purge
     }
 
-    /// Deactivate `account_label` once its worker reports that the device
-    /// group unlinked this device. The worker stopped and tried to mark the
-    /// account unlinked; deactivation reaps it, makes the mark again as it
-    /// signs the account out, so a failed mark never leaves a plain sign-out,
-    /// and drops what the account holds in memory. A worker that ends any
-    /// other way drops the sender, and this task ends with it.
-    fn deactivate_when_unlinked(&self, account_label: String, unlinked: oneshot::Receiver<()>) {
+    /// Deactivate the account once its worker reports that the device group
+    /// unlinked this device, then tell hosts. The worker stopped and tried to
+    /// mark the account unlinked; deactivation reaps it, makes the mark again
+    /// as it signs the account out, so a failed mark never leaves a plain
+    /// sign-out, and drops what the account holds in memory. Hosts hear
+    /// `DeviceUnlinked` only after that, so a host that wipes the account and
+    /// signs in again on hearing it never races this deactivation into the
+    /// new record. A worker that ends any other way drops the sender, and
+    /// this task ends with it.
+    fn deactivate_when_unlinked(
+        &self,
+        account_id_hex: String,
+        account_label: String,
+        unlinked: oneshot::Receiver<()>,
+    ) {
         let accounts = self.clone();
         tokio::spawn(async move {
             if unlinked.await.is_err() {
@@ -7152,6 +7160,10 @@ impl AccountManager {
                     "could not deactivate an unlinked account; its next start stops it again"
                 );
             }
+            let _ = accounts.events.send(MarmotAppEvent::DeviceUnlinked {
+                account_id_hex,
+                account_label,
+            });
         });
     }
 
@@ -7423,7 +7435,11 @@ impl AccountManager {
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
                     let (unlinked_tx, unlinked_rx) = oneshot::channel();
-                    self.deactivate_when_unlinked(account.label.clone(), unlinked_rx);
+                    self.deactivate_when_unlinked(
+                        account.account_id_hex.clone(),
+                        account.label.clone(),
+                        unlinked_rx,
+                    );
                     let handle = spawn_app_runtime_account_worker(
                         AccountWorkerRuntime {
                             app: self.app.clone(),

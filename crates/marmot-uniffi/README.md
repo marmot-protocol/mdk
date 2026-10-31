@@ -1023,8 +1023,8 @@ one roster commit in the device group:
 When another of the account's devices removes this one with `remove_linked_device`, the account stops on this device
 once it reads the removal, and nothing more is sent from it (mdk#2628):
 
-- `MarmotEventFfi::DeviceUnlinked { account_id_hex, account_label }` fires once. Afterwards the account's
-  `AccountSummaryFfi` has `unlinked` and `signed_out` set, and both stay set.
+- `MarmotEventFfi::DeviceUnlinked { account_id_hex, account_label }` fires once, after the account is signed out. From
+  then on the account's `AccountSummaryFfi` has `unlinked` and `signed_out` set, and both stay set.
 - Show that this device was unlinked from the account, and stop showing its local history.
 - Signing in to it, logging in to it or importing its key fails with `MarmotKitError::AccountUnlinked`. Offer `sign_out_and_wipe`, which skips leaving the
   account's chats and deleting its KeyPackage slot, since the other devices did both. Signing in again is then a new

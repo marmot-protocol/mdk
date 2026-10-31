@@ -1309,14 +1309,7 @@ async fn run_app_runtime_account_worker(
     // anything (mdk#2628 D67).
     client.follow_device_group_removal().await;
     if client.device_unlinked() {
-        stop_unlinked_worker(
-            &mut client,
-            &events,
-            &account_id_hex,
-            &account_label,
-            unlinked,
-        )
-        .await;
+        stop_unlinked_worker(&mut client, unlinked).await;
         return;
     }
 
@@ -1786,14 +1779,7 @@ async fn run_app_runtime_account_worker(
         });
         let Some(result) = continuation.await else {
             if client.device_unlinked() {
-                stop_unlinked_worker(
-                    &mut client,
-                    &events,
-                    &account_id_hex,
-                    &account_label,
-                    unlinked,
-                )
-                .await;
+                stop_unlinked_worker(&mut client, unlinked).await;
             } else if startup_explicit_shutdown {
                 client.finish_audit_recording();
             }
@@ -1804,14 +1790,7 @@ async fn run_app_runtime_account_worker(
     // A removal the catch-up applied stops the account before anything
     // else goes out (mdk#2628 D67).
     if client.device_unlinked() {
-        stop_unlinked_worker(
-            &mut client,
-            &events,
-            &account_id_hex,
-            &account_label,
-            unlinked,
-        )
-        .await;
+        stop_unlinked_worker(&mut client, unlinked).await;
         return;
     }
     if let Err(failure) = &mut startup_sync_result {
@@ -1921,14 +1900,7 @@ async fn run_app_runtime_account_worker(
     // account before the deferred commands replay (mdk#2628 D67).
     client.follow_device_group_removal().await;
     if client.device_unlinked() {
-        stop_unlinked_worker(
-            &mut client,
-            &events,
-            &account_id_hex,
-            &account_label,
-            unlinked,
-        )
-        .await;
+        stop_unlinked_worker(&mut client, unlinked).await;
         return;
     }
     // Replay commands deferred during the initial catch-up in arrival order, now
@@ -2081,14 +2053,7 @@ async fn run_app_runtime_account_worker(
         // worker has exited (mdk#2628 D67).
         if client.device_unlinked() {
             stop_recovery_runner(&mut recovery_runner, &mut client).await;
-            stop_unlinked_worker(
-                &mut client,
-                &events,
-                &account_id_hex,
-                &account_label,
-                unlinked,
-            )
-            .await;
+            stop_unlinked_worker(&mut client, unlinked).await;
             break 'worker;
         }
         // Activation may replace the source watch. Reacquire only a live
@@ -7818,23 +7783,13 @@ struct ReceiveTailContext<'a> {
     command_tx: &'a mpsc::Sender<AccountWorkerCommand>,
 }
 
-/// Forget the device-group copy, announce that the device group unlinked
-/// this device and ask the runtime to deactivate the account; the caller
-/// then ends the worker. Once the account is marked unlinked, a crash from
-/// here on still leaves it signed out; a mark that failed keeps the copy,
-/// so the next start finds the removal and marks it (mdk#2628 D67).
-async fn stop_unlinked_worker(
-    client: &mut AppClient,
-    events: &broadcast::Sender<MarmotAppEvent>,
-    account_id_hex: &str,
-    account_label: &str,
-    unlinked: oneshot::Sender<()>,
-) {
+/// Forget the device-group copy and ask the runtime to deactivate the
+/// account, which then tells hosts the device group unlinked this device;
+/// the caller ends the worker. Once the account is marked unlinked, a crash
+/// from here on still leaves it signed out; a mark that failed keeps the
+/// copy, so the next start finds the removal and marks it (mdk#2628 D67).
+async fn stop_unlinked_worker(client: &mut AppClient, unlinked: oneshot::Sender<()>) {
     client.follow_device_group_removal().await;
-    let _ = events.send(MarmotAppEvent::DeviceUnlinked {
-        account_id_hex: account_id_hex.to_owned(),
-        account_label: account_label.to_owned(),
-    });
     client.finish_audit_recording();
     let _ = unlinked.send(());
 }
