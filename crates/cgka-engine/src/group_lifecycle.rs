@@ -747,10 +747,8 @@ impl<S: StorageProvider> Engine<S> {
             Some(bytes)
         };
 
-        // 4. Persist Marmot-side group record with the PROJECTED
-        //    post-merge member set before recording outbound welcomes.
-        //    SQLite enforces message/group foreign keys, so the group row
-        //    must exist before `record_sent_message` writes welcome records.
+        // 4. Build the Marmot-side group record with the PROJECTED
+        //    post-merge member set.
         //
         //    The MLS group is still at epoch 0 pre-merge, but the `members`
         //    field surfaced via the `CgkaEngine::members` API needs to
@@ -775,28 +773,10 @@ impl<S: StorageProvider> Engine<S> {
             // A copy this device created was never installed by a Welcome.
             local_copy_welcome_created_at: None,
         };
-        if self.new_protocol_profile == ProtocolProfile::Legacy {
-            self.storage.put_group(&group_record)?;
-            // #740: index this group's transport routing id for O(1) inbound
-            // resolution (see `Engine::transport_group_id_index`). Best-effort:
-            // a routing-read failure only forfeits the fast path.
-            if let Ok(transport_group_id) =
-                crate::app_components::transport_group_id_of_group(&mls_group)
-            {
-                // Inlined `index_transport_group_route` (field-split borrows:
-                // `provider` above still holds `&self`); creation needs no
-                // retention prune yet.
-                self.transport_group_id_index
-                    .insert(transport_group_id.clone(), group_id.clone());
-                let _ = self.storage.put_transport_group_route(
-                    &transport_group_id,
-                    &group_id,
-                    EpochId(mls_group.epoch().as_u64()),
-                );
-            }
-        }
 
-        // 5. Wrap welcomes via the peeler.
+        // 5. Wrap welcomes via the peeler, before the group record or any
+        //    Welcome is written: a Welcome that cannot be wrapped refuses the
+        //    creation.
         //
         // Note: we intentionally do NOT emit the commit. The creator is the
         // only party who'd care about the "commit that creates the group at
@@ -824,10 +804,33 @@ impl<S: StorageProvider> Engine<S> {
                     self.peeler.wrap_welcome(&payload, &recipient).await
                 }
                 .map_err(EngineError::Peeler)?;
-                if self.new_protocol_profile == ProtocolProfile::Legacy {
-                    self.record_sent_message(&wrapped, &group_id, EpochId(0))?;
-                }
                 welcomes.push(wrapped);
+            }
+        }
+
+        if self.new_protocol_profile == ProtocolProfile::Legacy {
+            // SQLite enforces message/group foreign keys, so the group row
+            // must exist before `record_sent_message` writes welcome records.
+            self.storage.put_group(&group_record)?;
+            // #740: index this group's transport routing id for O(1) inbound
+            // resolution (see `Engine::transport_group_id_index`). Best-effort:
+            // a routing-read failure only forfeits the fast path.
+            if let Ok(transport_group_id) =
+                crate::app_components::transport_group_id_of_group(&mls_group)
+            {
+                // Inlined `index_transport_group_route` (field-split borrows:
+                // `provider` above still holds `&self`); creation needs no
+                // retention prune yet.
+                self.transport_group_id_index
+                    .insert(transport_group_id.clone(), group_id.clone());
+                let _ = self.storage.put_transport_group_route(
+                    &transport_group_id,
+                    &group_id,
+                    EpochId(mls_group.epoch().as_u64()),
+                );
+            }
+            for welcome in &welcomes {
+                self.record_sent_message(welcome, &group_id, EpochId(0))?;
             }
         }
 

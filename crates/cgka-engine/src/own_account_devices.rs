@@ -208,29 +208,13 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(EngineError::Peeler)?;
         let commit_msg =
             crate::message_processor::route_wrapped_group_message(commit_msg, &pre_commit_ctx);
-        self.record_sent_openmls_message(
-            &commit_msg,
-            commit_bytes.as_slice(),
-            &group_id,
-            pre_commit_epoch,
-        )?;
         let welcomes = match welcome_bytes {
             Some(welcome_bytes) => {
-                self.wrap_staged_welcomes(
-                    &mls_group,
-                    &group_id,
-                    &commit_msg.id,
-                    pre_commit_epoch,
-                    &welcome_bytes,
-                    &key_packages,
-                    &parsed_kps,
-                    None,
-                )
-                .await?
+                self.wrap_staged_welcomes(&mls_group, &welcome_bytes, &key_packages, &parsed_kps)
+                    .await?
             }
             None => Vec::new(),
         };
-
         // `members()` shows the requested leaves while the publish is
         // pending; `confirm_published` and `publish_failed` re-derive the
         // record from MLS state. Every added leaf shares an account with a
@@ -246,6 +230,20 @@ impl<S: StorageProvider> Engine<S> {
                 credential: kp.leaf_node().signature_key().as_slice().to_vec(),
             });
         }
+
+        self.record_sent_openmls_message(
+            &commit_msg,
+            commit_bytes.as_slice(),
+            &group_id,
+            pre_commit_epoch,
+        )?;
+        let welcomes = self.record_staged_welcomes(
+            welcomes,
+            &group_id,
+            &commit_msg.id,
+            pre_commit_epoch,
+            None,
+        )?;
         self.storage.put_group(&group_record)?;
 
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
