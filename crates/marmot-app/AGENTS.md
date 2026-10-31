@@ -160,8 +160,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   distinct once parsed, and a KeyPackage this device issued to its sender; join from the stash (migration 0160) in
   the maintenance pass, never in the synchronous dispatch, only while its carrier is still `Processed`, and drain the
   joins' events as a confirmed rejoin does. A refused or withdrawn 461 is dropped; one into a chat still held active
-  is the engine's rejoin offer, which the invite-recovery seam retries once the removal lands; one admitted but not
-  stashed fails the event's projection, which is retried.
+  is the engine's rejoin offer, which the host is told about as for a delivered one and which the invite-recovery seam
+  retries once the removal lands; one admitted but not stashed fails the event's projection, which is retried. Every
+  call that can store or retire a rejoin offer (ingest, the stash joins, the retry, a confirmation, a decline) tells
+  the host which chats' offers changed.
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.

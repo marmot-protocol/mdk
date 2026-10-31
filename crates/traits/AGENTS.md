@@ -19,7 +19,7 @@ what lives here is in [`README.md`](README.md#what-lives-in-here).
 | `src/engine.rs` | Public engine trait, send/create requests, outputs, group events. |
 | `src/storage.rs` | Storage traits, the `StorageProvider` aggregate (`type Mls` / `mls_storage()`), and the snapshot/rollback contract. |
 | `src/engine_state.rs` | Epoch and welcome state machines. |
-| `src/welcome.rs` | `PendingWelcome` pending-welcome persistence record; a sibling Welcome's rejoin offer keeps its `SiblingWelcomeRoute`. |
+| `src/welcome.rs` | `PendingWelcome` pending-welcome persistence record; a sibling Welcome's rejoin offer keeps its `SiblingWelcomeRoute`, with every carrier that delivered it. |
 | `src/error.rs` | `EngineError` and `PeelerError` — the engine/peeler error vocabulary. |
 | `src/types.rs` | Core id newtypes (`GroupId`/`MemberId`/`MessageId`), `EpochId`, and the `Backend` enum. |
 | `src/group.rs` | `Group` and `Member` storage records. |
