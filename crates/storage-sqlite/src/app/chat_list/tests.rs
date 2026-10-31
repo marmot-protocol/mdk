@@ -5432,6 +5432,7 @@ fn imported(
         created_at: at,
         retention,
         moderation_grant: None,
+        file_keys: Vec::new(),
     }
 }
 

@@ -451,9 +451,26 @@ pub(crate) fn preserve_encrypted_media_upload_error(
     error
 }
 
+/// What opens a prepared download: the source epoch's media secret, or the
+/// file's own key, imported with a sibling's history (mdk#2628 4.2a).
+#[derive(Clone)]
+pub(crate) enum MediaDownloadKey {
+    EpochSecret(SecretBytes),
+    File(zeroize::Zeroizing<[u8; 32]>),
+}
+
+impl MediaDownloadKey {
+    fn as_key(&self) -> crate::media::MediaKey<'_> {
+        match self {
+            Self::EpochSecret(secret) => crate::media::MediaKey::EpochSecret(secret.as_ref()),
+            Self::File(key) => crate::media::MediaKey::File(key),
+        }
+    }
+}
+
 pub(crate) struct EncryptedMediaDownloadHttp {
     reference: MediaAttachmentReference,
-    media_secret: SecretBytes,
+    key: MediaDownloadKey,
     default_blob_endpoints: Vec<AppBlobEndpoint>,
     allowed_locator_kinds: Vec<String>,
     transport: BlossomHttpTransport,
@@ -474,7 +491,7 @@ impl EncryptedMediaDownloadHttp {
         resume: crate::media::attachment_resume::AttachmentResume,
     ) -> Result<AcquiredMediaBody, crate::media::AttachmentDownloadFailure> {
         let reference = self.reference.clone();
-        let secret = self.media_secret.clone();
+        let key = self.key.clone();
         let endpoints = self.default_blob_endpoints.clone();
         let kinds = self.allowed_locator_kinds.clone();
         let transport = self.transport.clone();
@@ -494,7 +511,7 @@ impl EncryptedMediaDownloadHttp {
                 resume.phase(0).await?;
                 let file = crate::media::file_transfer::download_file(
                     reference,
-                    secret.as_ref(),
+                    key.as_key(),
                     &endpoints,
                     &kinds,
                     &transport,
@@ -520,7 +537,7 @@ impl EncryptedMediaDownloadHttp {
         let transport = self.transport.with_resume(resume.clone());
         let result = crate::media::download_encrypted_media_classified(
             self.reference,
-            self.media_secret.as_ref(),
+            self.key.as_key(),
             &self.default_blob_endpoints,
             &self.allowed_locator_kinds,
             &transport,
@@ -544,7 +561,7 @@ impl EncryptedMediaDownloadHttp {
     ) -> Result<MediaDownloadResult, AppError> {
         download_encrypted_media_with_transport(
             self.reference,
-            self.media_secret.as_ref(),
+            self.key.as_key(),
             &self.default_blob_endpoints,
             &self.allowed_locator_kinds,
             &self.transport,
@@ -5734,6 +5751,18 @@ impl AppClient {
             .encrypted_media
             .endpoint_policy()?;
         let version = EncryptedMediaVersion::parse(&reference.version)?;
+        if let Some(key) = self.imported_media_file_key(group_id, &reference)? {
+            return Ok(Some(EncryptedMediaDownloadHttp {
+                reference,
+                key: MediaDownloadKey::File(key),
+                default_blob_endpoints: policy.default_blob_endpoints,
+                allowed_locator_kinds: policy.allowed_locator_kinds,
+                transport: self
+                    .blossom_http_transport
+                    .clone()
+                    .with_download_limit(max_bytes),
+            }));
+        }
         let storage = self.app.account_storage(&self.state.label)?;
         if !storage
             .app_storage()
@@ -5754,7 +5783,7 @@ impl AppClient {
         };
         Ok(Some(EncryptedMediaDownloadHttp {
             reference,
-            media_secret: SecretBytes::new(secret),
+            key: MediaDownloadKey::EpochSecret(SecretBytes::new(secret)),
             default_blob_endpoints: policy.default_blob_endpoints,
             allowed_locator_kinds: policy.allowed_locator_kinds,
             transport: self
@@ -5775,9 +5804,30 @@ impl AppClient {
         reference: &MediaAttachmentReference,
     ) -> Result<(), AppError> {
         self.ensure_group(group_id)?;
+        if self.imported_media_file_key(group_id, reference)?.is_some() {
+            return Ok(());
+        }
         let component_id = EncryptedMediaVersion::parse(&reference.version)?.component_id();
         self.encrypted_media_secret_for_epoch(group_id, reference.source_epoch, component_id)?;
         Ok(())
+    }
+
+    /// The key a sibling sent for `reference` with this chat's history, when
+    /// this device imported the message instead of receiving it (mdk#2628
+    /// 4.2a).
+    fn imported_media_file_key(
+        &self,
+        group_id: &GroupId,
+        reference: &MediaAttachmentReference,
+    ) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .imported_media_file_key(
+                &hex::encode(group_id.as_slice()),
+                &reference.ciphertext_sha256.to_ascii_lowercase(),
+            )?)
     }
 
     pub(crate) async fn prepare_encrypted_media_download(
@@ -5792,14 +5842,17 @@ impl AppClient {
         // row contains its source-epoch exporter. Adopted V1 -> V2 migration
         // deliberately leaves historical V1 references as V1.
         let reference_version = EncryptedMediaVersion::parse(&reference.version)?;
-        let media_secret = self.encrypted_media_secret_for_epoch(
-            group_id,
-            reference.source_epoch,
-            reference_version.component_id(),
-        )?;
+        let key = match self.imported_media_file_key(group_id, &reference)? {
+            Some(key) => MediaDownloadKey::File(key),
+            None => MediaDownloadKey::EpochSecret(self.encrypted_media_secret_for_epoch(
+                group_id,
+                reference.source_epoch,
+                reference_version.component_id(),
+            )?),
+        };
         Ok(EncryptedMediaDownloadHttp {
             reference,
-            media_secret,
+            key,
             default_blob_endpoints: policy.default_blob_endpoints,
             allowed_locator_kinds: policy.allowed_locator_kinds,
             transport: self.blossom_http_transport.clone(),

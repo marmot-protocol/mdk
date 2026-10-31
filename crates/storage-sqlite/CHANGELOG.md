@@ -125,6 +125,17 @@
   for them. `history_export_page` reads a chat's app events in chat order
   (epoch, `created_at`, id) for a history bundle, with no event for each row
   that must stay out.
+- Migration 0162 (mdk#2628 item 4.2a) adds `imported_media_file_keys`, which
+  holds the per-file attachment keys a sibling sent with imported history.
+  Each key is named by its media reference's `ciphertext_sha256`, is zeroed
+  before its app event is deleted, and goes with it.
+  `ImportedAppEvent::file_keys` carries the keys, and `import_app_events`
+  stores them only for rows it adds. `imported_media_file_key` reads the key
+  for one media reference, and `imported_media_file_keys` reads a message's
+  keys so they can be passed on. Imported chat messages now get attachment
+  slots. `attachment_history_source` takes a row without a transport id when
+  `app_event_imports` marks it, and the attachment tables use its app event id
+  as its `source_message_id_hex`.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`

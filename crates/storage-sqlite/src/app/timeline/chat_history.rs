@@ -11,6 +11,7 @@ use super::*;
 use crate::SqliteAppStorage;
 use cgka_traits::MarmotAppEvent;
 use cgka_traits::app_components::DeviceSlotId;
+use zeroize::Zeroizing;
 
 /// One app event of a chat in chat order, as a history bundle sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +51,23 @@ pub struct ImportedAppEvent {
     /// The sending device's authority verdict for a review label or an admin
     /// removal, taken as this row's. Without one the row has no authority.
     pub moderation_grant: Option<bool>,
+    /// Per-file keys for the chat message's attachments, which this device
+    /// cannot derive: it was never in the epoch the message was sent in.
+    pub file_keys: Vec<ImportedFileKey>,
+}
+
+/// One attachment's key, named by the `ciphertext_sha256` of the media
+/// reference it opens.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ImportedFileKey {
+    pub ciphertext_sha256: String,
+    pub key: Zeroizing<[u8; 32]>,
+}
+
+impl std::fmt::Debug for ImportedFileKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportedFileKey").finish_non_exhaustive()
+    }
 }
 
 /// What one import changed.
@@ -128,6 +146,33 @@ impl SqliteAppStorage {
                     )
                     .storage()?;
                 imported += marked;
+                if marked == 1 {
+                    // The timeline insert's trigger ran before the mark existed,
+                    // so the imported message's attachment slots go in now.
+                    conn.execute_cached(
+                        "INSERT OR IGNORE INTO attachment_history(group_id_hex,message_id_hex,
+                            attachment_index,source_message_id_hex,source_epoch,sender,timeline_at,
+                            received_at,order_class,order_primary,order_phase,order_at,slot_json,visible)
+                         SELECT * FROM attachment_history_source
+                         WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+                        params![group_id_hex, event.message_id_hex],
+                    )
+                    .storage()?;
+                    for file_key in &event.file_keys {
+                        conn.execute_cached(
+                            "INSERT OR IGNORE INTO imported_media_file_keys
+                                (group_id_hex, message_id_hex, ciphertext_sha256, file_key)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![
+                                group_id_hex,
+                                event.message_id_hex,
+                                file_key.ciphertext_sha256,
+                                file_key.key.as_slice(),
+                            ],
+                        )
+                        .storage()?;
+                    }
+                }
                 if marked == 1
                     && let Some(grant) = event.moderation_grant
                 {
@@ -297,6 +342,62 @@ impl SqliteAppStorage {
         .transpose()
     }
 
+    /// The imported key that opens the chat's media reference with
+    /// `ciphertext_sha256`, if a sibling sent one.
+    pub fn imported_media_file_key(
+        &self,
+        group_id_hex: &str,
+        ciphertext_sha256: &str,
+    ) -> StorageResult<Option<Zeroizing<[u8; 32]>>> {
+        let key = self
+            .lock()?
+            .query_row_cached(
+                "SELECT file_key FROM imported_media_file_keys
+                 WHERE group_id_hex = ?1 AND ciphertext_sha256 = ?2
+                 LIMIT 1",
+                params![group_id_hex, ciphertext_sha256],
+                |row| row.get::<_, Vec<u8>>(0).map(Zeroizing::new),
+            )
+            .optional()
+            .storage()?;
+        key.map(|key| file_key_bytes(&key)).transpose()
+    }
+
+    /// Every imported key for the chat message `message_id_hex`, so a device
+    /// that imported a message can pass its keys on.
+    pub fn imported_media_file_keys(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> StorageResult<Vec<ImportedFileKey>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT ciphertext_sha256, file_key FROM imported_media_file_keys
+                 WHERE group_id_hex = ?1 AND message_id_hex = ?2
+                 ORDER BY ciphertext_sha256",
+            )
+            .storage()?;
+        let rows = statement
+            .query_map(params![group_id_hex, message_id_hex], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    Zeroizing::new(row.get::<_, Vec<u8>>(1)?),
+                ))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        rows.into_iter()
+            .map(|(ciphertext_sha256, key)| {
+                Ok(ImportedFileKey {
+                    ciphertext_sha256,
+                    key: file_key_bytes(&key)?,
+                })
+            })
+            .collect()
+    }
+
     fn holds_app_event(&self, group_id_hex: &str, message_id_hex: &str) -> StorageResult<bool> {
         self.lock()?
             .query_row_cached(
@@ -344,6 +445,16 @@ fn grant_imported_authority_tx(
     Ok(ids)
 }
 
+fn file_key_bytes(key: &[u8]) -> StorageResult<Zeroizing<[u8; 32]>> {
+    let mut bytes = Zeroizing::new([0_u8; 32]);
+    if key.len() != bytes.len() {
+        return Err(StorageError::Backend(
+            "imported media file key is not 32 bytes".to_owned(),
+        ));
+    }
+    bytes.copy_from_slice(key);
+    Ok(bytes)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,5 +649,97 @@ mod tests {
             .unwrap();
         let rows = s.history_export_page(GROUP, None, NOW, 100).unwrap();
         assert_eq!(rows[1].event.as_ref().unwrap().moderation_grant, None);
+    }
+
+    fn imported(event: &StoredAppEvent, file_keys: Vec<ImportedFileKey>) -> ImportedAppEvent {
+        ImportedAppEvent {
+            message_id_hex: event.message_id_hex.clone(),
+            source_epoch: event.source_epoch.unwrap(),
+            sender: event.sender.clone(),
+            plaintext: event.plaintext.clone(),
+            kind: event.kind,
+            tags: event.tags.clone(),
+            created_at: event.recorded_at,
+            retention: None,
+            moderation_grant: None,
+            file_keys,
+        }
+    }
+
+    fn file_key(ciphertext: u8, key: u8) -> ImportedFileKey {
+        ImportedFileKey {
+            ciphertext_sha256: hex::encode([ciphertext; 32]),
+            key: Zeroizing::new([key; 32]),
+        }
+    }
+
+    // mdk#2628 4.2a: a key is stored only with a row the import adds, and it
+    // is zeroed and removed with that row.
+    #[test]
+    fn imported_file_keys_stay_with_the_rows_an_import_adds() {
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let held = chat(1, 1, 10, "held");
+        let new = chat(1, 1, 11, "new");
+        s.record_app_event(&held).unwrap();
+        let slot = DeviceSlotId::from([0x11; 32]);
+        s.import_app_events(
+            GROUP,
+            &slot,
+            &[
+                imported(&held, vec![file_key(0xaa, 1)]),
+                imported(&new, vec![file_key(0xbb, 2)]),
+            ],
+            NOW,
+        )
+        .unwrap();
+
+        assert!(
+            s.imported_media_file_keys(GROUP, &held.message_id_hex)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.imported_media_file_keys(GROUP, &new.message_id_hex)
+                .unwrap(),
+            vec![file_key(0xbb, 2)]
+        );
+        assert_eq!(
+            s.imported_media_file_key(GROUP, &hex::encode([0xbb; 32]))
+                .unwrap()
+                .map(|key| *key),
+            Some([2; 32])
+        );
+        assert!(
+            s.imported_media_file_key(GROUP, &hex::encode([0xaa; 32]))
+                .unwrap()
+                .is_none()
+        );
+
+        let conn = s.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE removed_keys (file_key BLOB);
+             CREATE TEMP TRIGGER record_removed_key AFTER DELETE ON imported_media_file_keys
+             BEGIN INSERT INTO removed_keys VALUES (OLD.file_key); END;",
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM app_events WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![GROUP, new.message_id_hex],
+        )
+        .unwrap();
+        let removed: Vec<Vec<u8>> = conn
+            .prepare("SELECT file_key FROM removed_keys")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        drop(conn);
+        assert_eq!(removed, vec![vec![0; 32]]);
+        assert!(
+            s.imported_media_file_keys(GROUP, &new.message_id_hex)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
