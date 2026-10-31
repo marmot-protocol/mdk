@@ -42,6 +42,18 @@ const OUTAGE_MS: u64 = 10_000;
 const WATCHDOG: Duration = Duration::from_secs(90 * 60);
 /// Requests on one endpoint at most this far apart form one burst.
 const BURST_GAP_MS: u64 = 2_000;
+/// The recovery runner's time-sliced sweep asks for exactly the relay's
+/// published cap (500 in the harness's NIP-11 document); the earlier owner's
+/// capture pages carry no limit. A window `REQ` with this limit is the
+/// runner's. Both owners compare with the same NIP-77 shape, so `NEG-OPEN`s
+/// are only counted, never attributed.
+const RUNNER_SWEEP_LIMIT: u64 = 500;
+/// Runner attempts on the stalled relay in the loop's second half. 0.14.0
+/// made one about every 20 seconds, about 24 there.
+const LOOP_SECOND_HALF_ATTEMPTS: usize = 4;
+/// Runner attempts that asked a relay and ended without progress while the
+/// owed group drains from two healthy endpoints.
+const OWED_WASTED_ATTEMPTS: usize = 4;
 
 fn clients() -> Vec<String> {
     let named = ["alice", "bob"].into_iter().chain(SENDERS);
@@ -243,18 +255,161 @@ pub(super) fn history_summary(
     })
 }
 
-/// Sweep windows on `route` asked more than once on one endpoint.
-fn repeated_windows(requests: &[HistoryRequestV1], route: &str) -> u64 {
-    let mut windows = BTreeMap::<(Option<u64>, Option<u64>, Option<u64>), u64>::new();
+/// The runner's sweep windows on one endpoint, and how many repeat one it
+/// asked before.
+fn runner_sweeps(requests: &[HistoryRequestV1]) -> (usize, u64) {
+    let mut windows = BTreeMap::<(Option<&str>, Option<u64>, Option<u64>), u64>::new();
     let sweeps = requests.iter().filter(|request| {
-        request.verb == "REQ" && request.ids == 0 && request.route.as_deref() == Some(route)
+        request.verb == "REQ" && request.ids == 0 && request.limit == Some(RUNNER_SWEEP_LIMIT)
     });
     for request in sweeps {
-        *windows
-            .entry((request.since, request.until, request.limit))
-            .or_default() += 1;
+        let window = (request.route.as_deref(), request.since, request.until);
+        *windows.entry(window).or_default() += 1;
     }
-    windows.values().map(|count| count - 1).sum()
+    let asked = windows.values().sum::<u64>() as usize;
+    (asked, windows.values().map(|count| count - 1).sum())
+}
+
+/// The recovery runner's own attempts, from the `quantum` and `recheck`
+/// debug events of bob's in-process runtime. They carry aggregate fields
+/// only (outcome, end, requests, newly covered seconds), never which unit.
+mod runner_trace {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    use serde_json::{Map, Value, json};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    const TARGET: &str = "marmot_app::recovery_runner";
+    static EVENTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+
+    struct Capture;
+
+    struct Fields(Map<String, Value>);
+
+    impl Visit for Fields {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.insert(field.name().into(), json!(value));
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.0.insert(field.name().into(), json!(value));
+        }
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.0.insert(field.name().into(), json!(value));
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().into(), json!(value));
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().into(), json!(format!("{value:?}")));
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for Capture {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            let mut fields = Fields(Map::new());
+            event.record(&mut fields);
+            let method = fields.0.get("method").and_then(Value::as_str);
+            if matches!(method, Some("quantum" | "recheck")) {
+                fields.0.insert("at_ms".into(), json!(now_ms()));
+                EVENTS
+                    .lock()
+                    .expect("runner trace lock")
+                    .push(Value::Object(fields.0));
+            }
+        }
+    }
+
+    /// Start capturing, dropping what an earlier test in this binary left.
+    pub(super) fn start() -> Result<(), String> {
+        static INSTALLED: OnceLock<bool> = OnceLock::new();
+        let installed = *INSTALLED.get_or_init(|| {
+            STARTED.get_or_init(Instant::now);
+            let only = Targets::new().with_target(TARGET, tracing::Level::DEBUG);
+            let capture = Capture.with_filter(only);
+            tracing_subscriber::registry()
+                .with(capture)
+                .try_init()
+                .is_ok()
+        });
+        EVENTS.lock().expect("runner trace lock").clear();
+        if installed {
+            Ok(())
+        } else {
+            Err("another tracing subscriber is installed".into())
+        }
+    }
+
+    /// The trace clock.
+    pub(super) fn now_ms() -> u64 {
+        let started = STARTED.get_or_init(Instant::now);
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Every event captured at or after `from` on the trace clock.
+    pub(super) fn since(from: u64) -> Vec<Value> {
+        let events = EVENTS.lock().expect("runner trace lock");
+        let after = events
+            .iter()
+            .filter(|event| event["at_ms"].as_u64() >= Some(from));
+        after.cloned().collect()
+    }
+}
+
+/// The runner's attempts: counts by method and outcome, and their summed
+/// requests and progress.
+fn runner_summary(events: &[Value]) -> Value {
+    let mut outcomes = BTreeMap::<String, u64>::new();
+    let mut ends = BTreeMap::<String, u64>::new();
+    let sum = |field: &str| {
+        let values = events.iter().filter_map(|event| event[field].as_u64());
+        values.sum::<u64>()
+    };
+    for event in events {
+        let key = |field: &str| {
+            format!(
+                "{}:{}",
+                event["method"].as_str().unwrap_or("?"),
+                event[field].as_str().unwrap_or("?")
+            )
+        };
+        *outcomes.entry(key("outcome")).or_default() += 1;
+        *ends.entry(key("end")).or_default() += 1;
+    }
+    json!({
+        "attempts": events.len(),
+        "by_outcome": outcomes,
+        "by_end": ends,
+        "compared": events.iter().filter(|event| event["compared"] == true).count(),
+        "requests": sum("requests"),
+        "newly_covered_seconds": sum("newly_covered_seconds"),
+        "proved_events": sum("proved_events"),
+    })
+}
+
+/// Runner attempts that asked a relay and ended without progress.
+fn wasted(events: &[Value]) -> usize {
+    let asked = |event: &&Value| event["requests"].as_u64() > Some(0);
+    let progress =
+        |event: &&Value| matches!(event["outcome"].as_str(), Some("advanced" | "nothing_owed"));
+    events
+        .iter()
+        .filter(asked)
+        .filter(|event| !progress(event))
+        .count()
+}
+
+/// The runner's attempts captured in `[from, to)` on the trace clock.
+fn trace_between(from: u64, to: u64) -> Vec<Value> {
+    let events = runner_trace::since(from).into_iter();
+    events
+        .filter(|event| event["at_ms"].as_u64() < Some(to))
+        .collect()
 }
 
 /// Alice's live sends to one group, and when each became visible to bob.
@@ -338,6 +493,17 @@ impl Live {
         summary["sends"] = json!(sent.len());
         summary["failed_sends"] = json!(sent.len() as u64 - sent_ok);
         summary["not_visible"] = json!(sent_ok - summary["n"].as_u64().unwrap_or(0));
+        // The slowest arrivals and when they were sent, to place them in the run.
+        let mut slowest = ok
+            .clone()
+            .filter_map(|(payload, at, _)| Some((seen.get(payload)? - at, *at)))
+            .collect::<Vec<_>>();
+        slowest.sort_by(|a, b| b.0.total_cmp(&a.0));
+        slowest.truncate(8);
+        let slowest = slowest
+            .iter()
+            .map(|(ms, at)| json!({"sent_at_seconds": at, "ms": ms * 1e3}));
+        summary["slowest"] = json!(slowest.collect::<Vec<_>>());
         let payloads = ok.map(|(payload, _, _)| payload.clone()).collect();
         Ok((payloads, summary))
     }
@@ -391,6 +557,7 @@ where
 {
     let artifacts = journey_artifacts(label);
     let clients = clients();
+    runner_trace::start().expect("capture the runner's trace");
     let mut subject = AppRuntimeHarness::new_with_relay_pair_owning_debt(&clients, &clients[1..2])
         .await
         .expect("runner proof harness setup");
@@ -448,6 +615,7 @@ pub(super) async fn stalled_relay_loop() {
         subject.stall_relay_history(1, true).await?;
         let clocks = relay_clocks(subject).await?;
         let t0 = Instant::now();
+        let trace_t0 = runner_trace::now_ms();
         subject.set_online("bob", true).await?;
         let (alice, bob) = (subject.probe("alice")?, subject.probe("bob")?);
         let live = Live::start(alice, bob.clone(), group.clone(), Duration::from_secs(2), "tick-");
@@ -480,6 +648,8 @@ pub(super) async fn stalled_relay_loop() {
             starts.iter().filter(|at| (from..to).contains(at)).count() as f64 / minutes
         };
         let gaps = starts.windows(2).map(|pair| (pair[1] - pair[0]) as f64 / 1e3);
+        let trace_half = trace_t0 + window_ms / 2;
+        let runner = [trace_between(trace_t0, trace_half), trace_between(trace_half, trace_t0 + window_ms)];
         let proof = json!({
             "backlog": backlog.len(),
             "recovered_seconds": recovered,
@@ -491,19 +661,28 @@ pub(super) async fn stalled_relay_loop() {
                 "second_half": per_minute(half, clocks[1] + window_ms),
             },
             "seconds_between_stalled_bursts": gaps.collect::<Vec<_>>(),
+            "runner": {
+                "first_half": runner_summary(&runner[0]),
+                "second_half": runner_summary(&runner[1]),
+                "second_half_wasted": wasted(&runner[1]),
+            },
             "history": history.iter().map(|requests| history_summary(requests, &labels)).collect::<Vec<_>>(),
             "status_at_end": status,
         });
         save(out, "history.json", &history)?;
+        save(out, "runner-trace.json", &runner_trace::since(trace_t0))?;
         if !complete || recovered.is_none() {
             return Err("the backlog did not recover exactly from the healthy endpoint".into());
         }
         if live_visibility["not_visible"] != 0 {
             return Err("live messages stopped arriving behind the stalled relay".into());
         }
-        // 0.14.0 attempted about twice a minute for as long as it ran.
+        // 0.14.0 attempted about three times a minute for as long as it ran.
         if per_minute(half, clocks[1] + window_ms) > 0.5 {
             return Err(format!("the stalled relay is still attempted every two minutes or more often: {proof}").into());
+        }
+        if wasted(&runner[1]) > LOOP_SECOND_HALF_ATTEMPTS {
+            return Err(format!("the runner keeps attempting the stalled relay: {proof}").into());
         }
         Ok(json!({"proof": proof}))
     })
@@ -558,6 +737,7 @@ pub(super) async fn owed_history() {
         // Restart: every route owes its gap since its last durable proof.
         let restart_clocks = relay_clocks(subject).await?;
         let t0 = Instant::now();
+        let trace_restart = runner_trace::now_ms();
         subject.set_online("bob", true).await?;
         let bob = subject.probe("bob")?;
         let live = Live::start(alice.clone(), bob.clone(), busy.clone(), Duration::from_secs(3), "live-");
@@ -586,11 +766,15 @@ pub(super) async fn owed_history() {
         expected.extend(live_sent);
         let busy_exact = holds_exactly(&bob, &busy, &expected).await?;
         let after_restart = history_since(subject, &restart_clocks).await?;
+        let trace_idle = runner_trace::now_ms();
+        let restart_trace = trace_between(trace_restart, trace_idle);
 
         // Idle: nothing is owed, so nothing is fetched.
         let idle_clocks = relay_clocks(subject).await?;
         tokio::time::sleep(QUIET_AGE).await;
         let idle = history_since(subject, &idle_clocks).await?;
+        let trace_reconnect = runner_trace::now_ms();
+        let idle_trace = trace_between(trace_idle, trace_reconnect);
 
         // Reconnect: endpoint 0's live generations end. Their ranges were only
         // provisional, and with no event inside the rebuild lookback every
@@ -602,14 +786,17 @@ pub(super) async fn owed_history() {
         quiet_expected.push("quiet-after-reconnect".into());
         let reconnected = Instant::now();
         let mut resweep = BTreeSet::new();
+        // The runner's own sweep of each route on endpoint 0, by its shape.
         let resweeps = async || {
             let history = history_since(subject, &reconnect_clocks).await?;
-            resweep = history[0].iter().filter_map(|request| request.route.clone()).collect();
+            let runner = history[0].iter().filter(|request| request.limit == Some(RUNNER_SWEEP_LIMIT) && request.ids == 0);
+            resweep = runner.filter_map(|request| request.route.clone()).collect();
             Ok(resweep.contains(&busy_route) && resweep.contains(&quiet_route) && caught_up(&bob).await?)
         };
         let resweep_result = wait_for("the reconnect's re-sweep", RESWEEP_DEADLINE, resweeps).await;
         let resweep_seconds = reconnected.elapsed().as_secs_f64();
         let after_reconnect = history_since(subject, &reconnect_clocks).await?;
+        let reconnect_trace = runner_trace::since(trace_reconnect);
         let quiet_exact = holds_exactly(&bob, &quiet, &quiet_expected).await?;
         let status = bob.account_recovery_status().await?;
         let summaries = |history: &[Vec<HistoryRequestV1>]| {
@@ -618,7 +805,7 @@ pub(super) async fn owed_history() {
         let swept = |history: &[Vec<HistoryRequestV1>], route: &str| {
             history.iter().map(|requests| requests.iter().any(|r| r.route.as_deref() == Some(route))).collect::<Vec<_>>()
         };
-        let repeats = after_restart.iter().map(|requests| repeated_windows(requests, &busy_route)).collect::<Vec<_>>();
+        let runner_windows = after_restart.iter().map(|requests| runner_sweeps(requests)).collect::<Vec<_>>();
         let busy_bursts = after_restart
             .iter()
             .map(|requests| bursts(requests.iter().filter(|r| r.route.as_deref() == Some(busy_route.as_str()))).len())
@@ -635,11 +822,14 @@ pub(super) async fn owed_history() {
                 "quiet_message_visible_ms": quiet_after_restart,
                 "busy_swept_per_endpoint": swept(&after_restart, &busy_route),
                 "quiet_swept_per_endpoint": swept(&after_restart, &quiet_route),
-                "busy_repeated_window_requests": repeats,
+                "runner_sweep_windows_per_endpoint": runner_windows.iter().map(|(asked, _)| asked).collect::<Vec<_>>(),
+                "runner_sweep_windows_repeated_per_endpoint": runner_windows.iter().map(|(_, repeated)| repeated).collect::<Vec<_>>(),
                 "busy_bursts": busy_bursts,
+                "runner": runner_summary(&restart_trace),
+                "runner_wasted": wasted(&restart_trace),
                 "history": summaries(&after_restart),
             },
-            "idle": {"seconds": QUIET_AGE.as_secs(), "history": summaries(&idle)},
+            "idle": {"seconds": QUIET_AGE.as_secs(), "history": summaries(&idle), "runner": runner_summary(&idle_trace)},
             "reconnect": {
                 "outage_ms": OUTAGE_MS,
                 "resweep": resweep_result.as_ref().map_or_else(|error| json!(error.to_string()), |()| json!("swept")),
@@ -648,10 +838,12 @@ pub(super) async fn owed_history() {
                 "quiet_message_visible_ms": quiet_after_reconnect,
                 "quiet_timeline_exact": quiet_exact,
                 "history": summaries(&after_reconnect),
+                "runner": runner_summary(&reconnect_trace),
             },
             "status_at_end": status,
         });
         save(out, "history.json", &json!({"restart": after_restart, "idle": idle, "reconnect": after_reconnect}))?;
+        save(out, "runner-trace.json", &runner_trace::since(trace_restart))?;
         let failure = |what: &str| Err::<Value, _>(format!("{what}: {proof}").into());
         if drained.is_none() || !busy_exact {
             return failure("the owed group did not finish exactly within the deadline");
@@ -662,8 +854,11 @@ pub(super) async fn owed_history() {
         if live_visibility["not_visible"] != 0 {
             return failure("live messages were lost while the backlog was owed");
         }
-        if repeats.iter().any(|repeats| *repeats > 0) {
-            return failure("a sweep window was requested twice on one endpoint");
+        if runner_windows.iter().any(|(_, repeated)| *repeated > 0) {
+            return failure("the runner asked one sweep window twice on one endpoint");
+        }
+        if wasted(&restart_trace) > OWED_WASTED_ATTEMPTS {
+            return failure("the runner's attempts kept ending without progress");
         }
         if !swept(&after_restart, &quiet_route).iter().all(|swept| *swept) {
             return failure("the quiet group's gap was not swept after the restart");
