@@ -693,6 +693,7 @@ fn protect(value: &mut Value) -> Result<(), ContractError> {
                     | "route_kind"
                     | "refusal_category"
                     | "disposition"
+                    | "cap"
                     | "failure" => {
                         if matches!(child, Value::String(_) | Value::Array(_)) {
                             map_strings(&mut child, |s| Ok(safe_category(s)))?;

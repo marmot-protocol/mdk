@@ -1600,3 +1600,140 @@ fn an_epoch_gap_keeps_what_a_due_pass_would_check() {
         }
     );
 }
+
+fn gone(range: RecoveryCoverageRange) -> RecoveryUnitSpan {
+    RecoveryUnitSpan {
+        range,
+        retired: Some(RecoverySpanRetirement::RouteGone),
+    }
+}
+
+/// A relay that left a route retires what it parked, retired and still owes
+/// there as route gone: its notice ends, nothing is owed, and another relay
+/// of the route is left as it is.
+#[test]
+fn a_gone_relay_retires_what_it_owes_and_parks() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 701));
+    let revision = break_unit(&app, &route, NOW - 600).park.unwrap().revision;
+    assert!(app.dismiss_recovery_route_park(&route, revision).unwrap());
+    break_unit(&app, &route, NOW - 100);
+    settle(&app, &route, OTHER, RecoveryUnitOutcome::NoProgress, NOW);
+    app.set_recovery_unit_fences(&route, RELAY, &[range(NOW - 50, NOW - 40)])
+        .unwrap();
+    assert_eq!(app.parked_recovery_routes().unwrap().len(), 1);
+
+    assert_eq!(
+        app.retire_gone_recovery_units(&route, Some(&[RELAY.to_owned()]), NOW)
+            .unwrap(),
+        1
+    );
+
+    let retired = unit(&app, &route, RELAY);
+    assert_eq!(
+        (
+            retired.state,
+            retired.no_progress,
+            retired.park,
+            retired.probe
+        ),
+        (RecoveryUnitState::Retired, 0, None, false)
+    );
+    assert_eq!(
+        app.recovery_unit_spans(&route, RELAY).unwrap(),
+        vec![gone(range(NOW - 700, NOW))]
+    );
+    assert_eq!(app.recovery_unit_debt(&route, RELAY, NOW).unwrap(), []);
+    assert!(app.parked_recovery_routes().unwrap().is_empty());
+    assert!(fences(&app).is_empty());
+    assert_eq!(unit(&app, &route, OTHER).no_progress, 1);
+}
+
+/// New loss reopens nothing a gone relay retired: it raises no probe or
+/// notice for a route that no longer carries it.
+#[test]
+fn loss_reopens_nothing_a_gone_relay_retired() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    break_unit(&app, &route, NOW);
+    app.retire_gone_recovery_units(&route, None, NOW).unwrap();
+
+    app.uncover_recovery_coverage(std::slice::from_ref(&route), NOW - 800)
+        .unwrap();
+
+    let retired = unit(&app, &route, RELAY);
+    assert_eq!(
+        (retired.state, retired.probe, retired.park),
+        (RecoveryUnitState::Retired, false, None)
+    );
+    assert_eq!(
+        app.recovery_unit_spans(&route, RELAY).unwrap(),
+        vec![gone(range(NOW - 500, NOW))]
+    );
+    assert!(app.parked_recovery_routes().unwrap().is_empty());
+}
+
+/// An ended route's remainder goes with its units, so it raises no notice.
+#[test]
+fn an_ended_route_drops_its_remainder() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    app.widen_recovery_coverage_goals(std::slice::from_ref(&route), NOW - 1_000)
+        .unwrap();
+    app.prune_recovery_coverage(NOW - 800, &[(route.clone(), vec![RELAY.to_owned()])])
+        .unwrap();
+    assert!(remainder(&app, &route).is_some());
+
+    app.retire_gone_recovery_units(&route, Some(&[RELAY.to_owned()]), NOW)
+        .unwrap();
+    assert!(remainder(&app, &route).is_some(), "the route goes on");
+    app.retire_gone_recovery_units(&route, None, NOW).unwrap();
+    assert!(remainder(&app, &route).is_none());
+    assert!(app.parked_recovery_routes().unwrap().is_empty());
+}
+
+/// A relay that carries its route again owes the whole goal: what it retired
+/// as gone is owed again with a fresh budget. A relay still gone stays
+/// retired.
+#[test]
+fn a_returning_relay_owes_its_whole_goal_again() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let (back, still_gone) = (group(1), group(2));
+    for route in [&back, &still_gone] {
+        owing(&app, route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+        break_unit(&app, route, NOW);
+        app.retire_gone_recovery_units(route, None, NOW).unwrap();
+    }
+
+    assert_eq!(
+        app.reopen_returned_recovery_units(|route, relay| route == &back && relay == RELAY)
+            .unwrap(),
+        1
+    );
+
+    let returned = unit(&app, &back, RELAY);
+    assert_eq!(
+        (returned.state, returned.no_progress, returned.park),
+        (RecoveryUnitState::Active, 0, None)
+    );
+    assert!(app.recovery_unit_spans(&back, RELAY).unwrap().is_empty());
+    assert_eq!(
+        app.recovery_unit_debt(&back, RELAY, NOW).unwrap(),
+        vec![range(NOW - 500, NOW)]
+    );
+    assert_eq!(
+        unit(&app, &still_gone, RELAY).state,
+        RecoveryUnitState::Retired
+    );
+    assert_eq!(
+        app.reopen_returned_recovery_units(|_, _| true).unwrap(),
+        1,
+        "only the still-gone unit is left to reopen"
+    );
+}

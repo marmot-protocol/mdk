@@ -145,6 +145,9 @@ for reconnect/backoff and relay status mechanics.
   SDK/frontend gaps enter the existing plane loss fence. Empty waiting or cancelled empty IO never fabricates
   discarded-input evidence. Only recorded transport REQ payloads enter the frontier; acquisition replies stay with their
   collectors. Forced paging is not physical EOSE; late stored copies cannot become live by that transition.
+- `NostrSdkRelayClient::relay_connections` publishes each monitored relay's latest connection generation from the
+  same `Connected` branch that opens its replay boundary, so it never moves on AUTH alone. It is a wake signal for
+  the recovery runner, which diffs generations; it carries no capture boundary, and nothing may order payloads by it.
 - Bound pending replay by `REPLAY_BUFFER_MAX_ITEMS` and `REPLAY_BUFFER_MAX_BYTES`, with one additional
   draining batch; include inbox and ready-delivery backpressure. A per-account supervisor owns capture tickets
   and draining tasks; atomically install tickets and ready-channel placements under the admission lock,
