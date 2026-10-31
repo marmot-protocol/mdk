@@ -188,7 +188,16 @@ impl AppClient {
                 SiblingWelcomeAdmission::Refused(refused) => Err(refused),
             },
             KIND_HISTORY_DELIVERY => {
-                self.receive_history_delivery(group_id, &message.id, sender, &message.content)
+                match self.receive_history_delivery(group_id, &message.id, sender, &message.content)
+                {
+                    // Only a refusal drops a delivery: with no receipts it is
+                    // never sent again, so any other failure fails the
+                    // projection, which reads it again, as for 461.
+                    Err(error) if !matches!(error, AppError::DeviceGroupRefused(_)) => {
+                        return Err(error);
+                    }
+                    result => result,
+                }
             }
             KIND_SMALL_STATE_UPDATE => self.receive_small_state_update(group_id, &message.content),
             KIND_SMALL_STATE_BROADCAST_REQUEST => {

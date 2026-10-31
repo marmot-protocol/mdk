@@ -74,6 +74,8 @@ pub(crate) mod audit_v5_probe;
 mod chat_history;
 #[cfg(feature = "test-policy-overrides")]
 pub use chat_history::DevSealedHistoryBundle;
+#[cfg(test)]
+pub(crate) use chat_history::newest_bundles_start;
 pub(crate) mod backups;
 pub(crate) mod compromise_warning;
 pub(crate) mod delivery_spill;
@@ -84,6 +86,7 @@ mod device_removal;
 mod device_renames;
 pub(crate) mod epoch_stall;
 mod history_delivery;
+pub(crate) use history_delivery::{HistoryFetchOutcome, HistoryUploadOutcome};
 pub(crate) mod history_notices;
 mod invite_recovery;
 mod private_key_packages;

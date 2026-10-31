@@ -209,6 +209,7 @@ pub(crate) struct HistoryBundleBuilder {
     taken: bool,
     capacity: usize,
     used: usize,
+    oversized: bool,
 }
 
 impl HistoryBundleBuilder {
@@ -226,6 +227,7 @@ impl HistoryBundleBuilder {
             taken: false,
             capacity: budget.saturating_sub(HistoryBundle::header_bound(chat)),
             used: 0,
+            oversized: false,
         }
     }
 
@@ -244,6 +246,7 @@ impl HistoryBundleBuilder {
         if let Some(event) = event {
             let len = event.encoded_len();
             if !event.is_well_formed() || len > self.capacity {
+                self.oversized |= event.is_well_formed();
                 tracing::warn!(
                     target: TRACE_TARGET,
                     method = "take",
@@ -263,6 +266,12 @@ impl HistoryBundleBuilder {
         self.bundle.to = position;
         self.taken = true;
         true
+    }
+
+    /// Whether it left out a well-formed event too large for its budget,
+    /// which a bundle with a larger budget could carry.
+    pub(crate) fn left_out_oversized(&self) -> bool {
+        self.oversized
     }
 
     /// The bundle, or none when it took no row.

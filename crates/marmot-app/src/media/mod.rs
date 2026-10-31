@@ -947,6 +947,51 @@ async fn upload_blossom_blob_with_fallback(
     )))
 }
 
+/// Uploads one history bundle's ciphertext (mdk#2628 4.2c) to the first of
+/// `servers` that takes it, as an attachment tries its chat's endpoints, and
+/// returns that server.
+pub(crate) async fn upload_history_blob(
+    servers: &[String],
+    ciphertext: Bytes,
+    hash_hex: &str,
+    signer: &dyn MarmotNostrSigner,
+    transport: &BlossomHttpTransport,
+) -> Result<String, AppError> {
+    let mut timed_out = false;
+    for server in servers {
+        match upload_blossom_blob(server, ciphertext.clone(), hash_hex, signer, transport).await {
+            Ok(_) => return Ok(server.clone()),
+            Err(AppError::ExternalSignerRejected) => return Err(AppError::ExternalSignerRejected),
+            Err(error) => timed_out |= matches!(error, AppError::MediaUploadTimedOut),
+        }
+    }
+    Err(if timed_out {
+        AppError::MediaUploadTimedOut
+    } else {
+        AppError::BlobStore("history blob upload failed for all Blossom servers".into())
+    })
+}
+
+/// Fetches one history bundle's ciphertext from the Blossom server `server`
+/// at its SHA-256 `hash`, through the dial-safe transport, reading at most
+/// `max_bytes`. Other bytes than `hash` names are refused.
+pub(crate) async fn fetch_history_blob(
+    server: &str,
+    hash: &[u8; 32],
+    max_bytes: u64,
+    transport: &BlossomHttpTransport,
+) -> Result<Vec<u8>, AppError> {
+    let url = blossom::blossom_blob_url_with_extension(server, &hex::encode(hash), None);
+    let transport = transport.clone().with_download_limit(max_bytes);
+    let ciphertext = blossom::fetch_blossom_blob_limited_with_transport(&url, &transport).await?;
+    if <[u8; 32]>::from(Sha256::digest(&ciphertext)) != *hash {
+        return Err(AppError::BlobStore(
+            "history blob does not match its hash".into(),
+        ));
+    }
+    Ok(ciphertext)
+}
+
 fn upload_error_summary(err: &AppError) -> String {
     match err {
         AppError::BlobStore(message)

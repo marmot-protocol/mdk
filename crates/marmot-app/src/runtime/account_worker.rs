@@ -1867,6 +1867,7 @@ async fn run_app_runtime_account_worker(
         tx: media_http_tx,
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+        history_blobs: HistoryBlobFlights::default(),
         worker_lifetime: media_http_worker_lifetime,
     };
     // Only with the internal `runner_owns_debt` gate on (mdk#2660 phase 4).
@@ -2130,6 +2131,7 @@ async fn run_app_runtime_account_worker(
                             &mut scheduled_convergence,
                         )
                         .await;
+                        dispatch_history_blobs(&mut client, &media_http);
                     }
                     ComparisonRecoveryOrigin::PostConvergence {
                         audit_tracker_update,
@@ -3327,6 +3329,7 @@ async fn run_app_runtime_account_worker(
                     &mut scheduled_convergence,
                 )
                 .await;
+                dispatch_history_blobs(&mut client, &media_http);
 
                 phase.finish(TelemetryOutcome::Success);
             }
@@ -4318,9 +4321,79 @@ struct MediaHttpContext {
     /// more than once. This state is deliberately ephemeral: after a worker
     /// restart, the durable staged/failed record remains retryable.
     prepared_group_image_uploads: Arc<Mutex<HashSet<String>>>,
+    /// The history upload and fetch running, at most one of each.
+    history_blobs: HistoryBlobFlights,
     /// Never sends a value. Dropping the worker-owned sender closes every
     /// receiver and cancels active HTTP futures on every worker exit path.
     worker_lifetime: watch::Sender<()>,
+}
+
+/// Whether a history upload and a history fetch (mdk#2628 4.2c) are running.
+/// Ephemeral, like the uploads above: the history stays owed, or the
+/// delivery parked, until one completes.
+#[derive(Default)]
+struct HistoryBlobFlights {
+    upload: std::sync::atomic::AtomicBool,
+    fetch: std::sync::atomic::AtomicBool,
+}
+
+/// Starts the next due history upload and history fetch on the media
+/// executor, unless one of that kind is running, keeping a slot free for
+/// commands as avatar acquisition does. Each runs off the worker; its
+/// completion sends or imports here, then starts the next.
+fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext) {
+    use std::sync::atomic::Ordering;
+    let permit = || {
+        (media_http.permits.available_permits() > 1)
+            .then(|| media_http.permits.clone().try_acquire_owned().ok())
+            .flatten()
+    };
+    if !media_http.history_blobs.upload.load(Ordering::Relaxed)
+        && let Some(permit) = permit()
+    {
+        match client.prepare_history_upload() {
+            Ok(Some(upload)) => {
+                media_http
+                    .history_blobs
+                    .upload
+                    .store(true, Ordering::Relaxed);
+                spawn_media_http(
+                    media_http,
+                    permit,
+                    upload.run(),
+                    MediaHttpCompletion::HistoryUpload,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
+                "history upload deferred")
+            }
+        }
+    }
+    if !media_http.history_blobs.fetch.load(Ordering::Relaxed)
+        && let Some(permit) = permit()
+    {
+        match client.prepare_history_fetch() {
+            Ok(Some(fetch)) => {
+                media_http
+                    .history_blobs
+                    .fetch
+                    .store(true, Ordering::Relaxed);
+                spawn_media_http(
+                    media_http,
+                    permit,
+                    fetch.run(),
+                    MediaHttpCompletion::HistoryFetch,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
+                "history fetch deferred")
+            }
+        }
+    }
 }
 
 struct MediaHttpDone {
@@ -4421,6 +4494,8 @@ enum MediaHttpCompletion {
         respond: oneshot::Sender<Result<AppPreparedGroupImageUpload, AppError>>,
         started_at: Instant,
     },
+    HistoryUpload(crate::client::HistoryUploadOutcome),
+    HistoryFetch(crate::client::HistoryFetchOutcome),
 }
 
 fn schedule_avatar_acquisition(
@@ -4604,6 +4679,26 @@ async fn complete_media_http(
         cancellation.discard();
     }
     match completion {
+        MediaHttpCompletion::HistoryUpload(outcome) => {
+            client.finish_history_upload(outcome).await;
+            drop(permit);
+            media_http
+                .history_blobs
+                .upload
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            dispatch_history_blobs(client, media_http);
+            return;
+        }
+        MediaHttpCompletion::HistoryFetch(outcome) => {
+            client.finish_history_fetch(outcome);
+            drop(permit);
+            media_http
+                .history_blobs
+                .fetch
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            dispatch_history_blobs(client, media_http);
+            return;
+        }
         MediaHttpCompletion::Attachment {
             job,
             result,
@@ -9195,6 +9290,7 @@ mod tests {
                 tx,
                 permits: Arc::new(Semaphore::new(limit)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                history_blobs: HistoryBlobFlights::default(),
                 worker_lifetime,
             },
             rx,
@@ -10434,6 +10530,7 @@ mod tests {
                 tx: media_http_tx,
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                history_blobs: HistoryBlobFlights::default(),
                 worker_lifetime: media_http_worker_lifetime,
             };
             let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
@@ -11481,6 +11578,7 @@ mod tests {
                 tx: media_http_tx,
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                history_blobs: HistoryBlobFlights::default(),
                 worker_lifetime,
             };
             let (command_tx, mut commands) = mpsc::channel(4);

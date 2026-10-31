@@ -2047,7 +2047,7 @@ pub(crate) fn blossom_blob_url(server: &str, encrypted_hash_hex: &str) -> String
     blossom_blob_url_with_extension(server, encrypted_hash_hex, Some(".bin"))
 }
 
-fn blossom_blob_url_with_extension(
+pub(super) fn blossom_blob_url_with_extension(
     server: &str,
     hash_hex: &str,
     extension: Option<&str>,

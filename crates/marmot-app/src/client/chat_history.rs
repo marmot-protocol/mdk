@@ -26,7 +26,7 @@ use cgka_traits::app_components::DeviceSlotId;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM};
 use cgka_traits::types::GroupId;
 use std::collections::BTreeSet;
-use storage_sqlite::{ImportedAppEvent, SqliteAppStorage};
+use storage_sqlite::{ImportedAppEvent, SqliteAccountStorage, SqliteAppStorage};
 use zeroize::Zeroizing;
 
 const TRACE_TARGET: &str = "marmot_app::chat_history";
@@ -42,52 +42,16 @@ impl AppClient {
         group_id: &GroupId,
         after: Option<&ChatPosition>,
         budget: usize,
-    ) -> Result<Option<HistoryBundle>, AppError> {
+    ) -> Result<Option<ExportedBundle>, AppError> {
         let group_id_hex = self.history_chat(group_id)?;
-        let storage = self.app.account_storage(&self.state.label)?;
-        let now = unix_now_seconds();
-        let allow_loopback_http = self.app.allow_loopback_blob_endpoints();
-        // Every page of one bundle comes from one snapshot, so a row that lands
-        // inside the stretch already read is never vouched for but left out.
-        cgka_traits::StorageProvider::with_read_snapshot(&storage, |storage| {
-            let storage = storage.app_storage();
-            let mut bundle = HistoryBundleBuilder::new(group_id.as_slice(), after.cloned(), budget);
-            let mut cursor = after.cloned();
-            loop {
-                let page = storage.history_export_page(
-                    &group_id_hex,
-                    cursor
-                        .as_ref()
-                        .map(|position| (position.epoch, position.at, position.id.as_str())),
-                    now,
-                    EXPORT_PAGE_ROWS,
-                )?;
-                let last_page = page.len() < EXPORT_PAGE_ROWS;
-                for row in page {
-                    let position = ChatPosition::of_row(&row);
-                    let event = match row.event {
-                        Some(event) => {
-                            let keys = attachment_keys(
-                                &storage,
-                                &group_id_hex,
-                                &event.event,
-                                row.source_epoch,
-                                allow_loopback_http,
-                            )?;
-                            Some(BundledEvent::exported(event, row.source_epoch, keys))
-                        }
-                        None => None,
-                    };
-                    if !bundle.take(position.clone(), event) {
-                        return Ok(bundle.finish());
-                    }
-                    cursor = Some(position);
-                }
-                if last_page {
-                    return Ok(bundle.finish());
-                }
-            }
-        })
+        export_history(
+            &self.app.account_storage(&self.state.label)?,
+            group_id,
+            &group_id_hex,
+            after,
+            budget,
+            self.app.allow_loopback_blob_endpoints(),
+        )
     }
 
     /// Import one bundle of the chat `group_id`'s history, sent by the device
@@ -199,7 +163,7 @@ impl AppClient {
     ) -> Result<Vec<DevSealedHistoryBundle>, AppError> {
         let mut sealed = Vec::new();
         let mut after = None;
-        while let Some(bundle) = self.export_chat_history(
+        while let Some(ExportedBundle { bundle, .. }) = self.export_chat_history(
             group_id,
             after.as_ref(),
             crate::history_bundle::HISTORY_BUNDLE_MAX_PLAINTEXT,
@@ -243,6 +207,105 @@ pub struct DevSealedHistoryBundle {
     pub key: [u8; 32],
     pub ciphertext_sha256: [u8; 32],
     pub ciphertext: Vec<u8>,
+}
+
+/// One exported bundle, and whether it left out an event too large for its
+/// budget that a larger one could carry.
+pub(crate) struct ExportedBundle {
+    pub(crate) bundle: HistoryBundle,
+    pub(crate) left_out_oversized: bool,
+}
+
+/// The next bundle of the chat `group_id`'s history in `storage`, as
+/// [`AppClient::export_chat_history`] gives it, for a caller that already
+/// checked the chat and holds no client.
+pub(crate) fn export_history(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    group_id_hex: &str,
+    after: Option<&ChatPosition>,
+    budget: usize,
+    allow_loopback_http: bool,
+) -> Result<Option<ExportedBundle>, AppError> {
+    let now = unix_now_seconds();
+    // Every page of one bundle comes from one snapshot, so a row that lands
+    // inside the stretch already read is never vouched for but left out.
+    cgka_traits::StorageProvider::with_read_snapshot(storage, |storage| {
+        let storage = storage.app_storage();
+        let mut bundle = HistoryBundleBuilder::new(group_id.as_slice(), after.cloned(), budget);
+        let mut cursor = after.cloned();
+        let finish = |bundle: HistoryBundleBuilder| {
+            let left_out_oversized = bundle.left_out_oversized();
+            bundle.finish().map(|bundle| ExportedBundle {
+                bundle,
+                left_out_oversized,
+            })
+        };
+        loop {
+            let page = storage.history_export_page(
+                group_id_hex,
+                cursor
+                    .as_ref()
+                    .map(|position| (position.epoch, position.at, position.id.as_str())),
+                now,
+                EXPORT_PAGE_ROWS,
+            )?;
+            let last_page = page.len() < EXPORT_PAGE_ROWS;
+            for row in page {
+                let position = ChatPosition::of_row(&row);
+                let event = match row.event {
+                    Some(event) => {
+                        let keys = attachment_keys(
+                            &storage,
+                            group_id_hex,
+                            &event.event,
+                            row.source_epoch,
+                            allow_loopback_http,
+                        )?;
+                        Some(BundledEvent::exported(event, row.source_epoch, keys))
+                    }
+                    None => None,
+                };
+                if !bundle.take(position.clone(), event) {
+                    return Ok(finish(bundle));
+                }
+                cursor = Some(position);
+            }
+            if last_page {
+                return Ok(finish(bundle));
+            }
+        }
+    })
+}
+
+/// Where the newest `cap` bundles of the chat's history start, each of at
+/// most `budget` bytes of plaintext: none, the history's start, when it takes
+/// at most `cap`, else the end of the bundle before them. It reads the whole
+/// history once, one bundle at a time.
+pub(crate) fn newest_bundles_start(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    group_id_hex: &str,
+    budget: usize,
+    cap: usize,
+    allow_loopback_http: bool,
+) -> Result<Option<ChatPosition>, AppError> {
+    let mut starts = std::collections::VecDeque::with_capacity(cap + 1);
+    let mut after = None;
+    while let Some(exported) = export_history(
+        storage,
+        group_id,
+        group_id_hex,
+        after.as_ref(),
+        budget,
+        allow_loopback_http,
+    )? {
+        starts.push_back(after.replace(exported.bundle.to));
+        if starts.len() > cap {
+            starts.pop_front();
+        }
+    }
+    Ok(starts.pop_front().flatten())
 }
 
 fn importable(event: &ImportedAppEvent, allow_loopback_http: bool) -> bool {

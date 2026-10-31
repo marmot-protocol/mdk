@@ -3,24 +3,30 @@
 //! by that device.
 //!
 //! A delivery's content is one UTF-8 JSON object written without whitespace,
-//! members in this order, base64 standard with padding:
+//! members in this order, base64 standard with padding, ending in exactly one
+//! of `bundle` and `blossom` (4.2c, D77):
 //!
 //! ```text
 //! {"v":1,"from":"<slot hex>","to":"<slot hex>","chat":"<MLS group id hex>","sealed":"<base64>","bundle":"<base64>"}
+//! {"v":1,"from":"<slot hex>","to":"<slot hex>","chat":"<MLS group id hex>","sealed":"<base64>","blossom":["<server>"]}
 //! ```
 //!
-//! `bundle` is the bundle's ciphertext (`history_bundle.rs`), inline. `sealed`
-//! is the bundle's key (32 bytes) then that ciphertext's SHA-256 (32 bytes),
-//! sealed to `to`'s history key with [`delivery_context`]. The context binds
-//! the purpose, both slots and the chat, so a sealed value never opens for
-//! another purpose, sender, receiver or chat. Every sibling reads a delivery;
-//! only `to` can open it. A content is at most
-//! [`MAX_HISTORY_DELIVERY_CONTENT_BYTES`], which a bundle of at most
-//! [`INLINE_BUNDLE_MAX_PLAINTEXT`] fits.
+//! `bundle` is the bundle's ciphertext (`history_bundle.rs`), inline;
+//! `blossom` names one to [`MAX_BLOSSOM_SERVERS`] Blossom servers that hold
+//! it as one blob, at its SHA-256. `sealed` is the bundle's key (32 bytes)
+//! then that ciphertext's SHA-256 (32 bytes), sealed to `to`'s history key
+//! with [`delivery_context`]. The context binds the purpose, both slots and
+//! the chat, so a sealed value never opens for another purpose, sender,
+//! receiver or chat. Every sibling reads a delivery; only `to` can open it.
+//! A content is at most [`MAX_HISTORY_DELIVERY_CONTENT_BYTES`], which a
+//! bundle of at most [`INLINE_BUNDLE_MAX_PLAINTEXT`] fits inline.
+
+use std::collections::BTreeSet;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cgka_traits::app_components::{DeviceSlotId, encode_component_vectors};
+use url::Url;
 use zeroize::Zeroizing;
 
 use crate::AppError;
@@ -35,16 +41,23 @@ pub(crate) const MAX_HISTORY_DELIVERY_CONTENT_BYTES: usize = 32_768;
 /// [`MAX_HISTORY_DELIVERY_CONTENT_BYTES`].
 pub(crate) const INLINE_BUNDLE_MAX_PLAINTEXT: usize = 23_552;
 /// The most inline bundles one chat's history is sent in. A longer history
-/// waits for blob deliveries (4.2c), so one link never floods the device
-/// group.
+/// goes through Blossom, so one link never floods the device group.
 pub(crate) const MAX_INLINE_BUNDLES: usize = 8;
+/// The most Blossom bundles one chat's history is sent in, at most 8 MiB of
+/// plaintext each (D77). A longer history sends its newest bundles.
+pub(crate) const MAX_BLOSSOM_BUNDLES: usize = 16;
+/// The most Blossom servers a delivery names.
+pub(crate) const MAX_BLOSSOM_SERVERS: usize = 4;
+/// The longest Blossom server URL a delivery names, as an encrypted-media
+/// endpoint's base URL may be.
+pub(crate) const MAX_BLOSSOM_SERVER_URL_BYTES: usize = 2_048;
 const DELIVERY_VERSION: u64 = 1;
 /// The context's first part: what a sealed value is for.
 const DELIVERY_PURPOSE: &[u8] = b"marmot history delivery v1";
 /// The longest MLS group id a delivery names, as for bundles.
 const MAX_CHAT_ID_BYTES: usize = 256;
 
-/// One delivery: `bundle` from the device at `from` to the device at `to`,
+/// One delivery: a bundle from the device at `from` to the device at `to`,
 /// for the chat `chat`, with its key and hash in `sealed`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HistoryDelivery {
@@ -52,19 +65,41 @@ pub(crate) struct HistoryDelivery {
     pub(crate) to: DeviceSlotId,
     pub(crate) chat: Vec<u8>,
     pub(crate) sealed: Vec<u8>,
-    pub(crate) bundle: Vec<u8>,
+    pub(crate) bundle: DeliveredBundle,
+}
+
+/// How a delivery carries its bundle's ciphertext.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeliveredBundle {
+    /// The ciphertext itself.
+    Inline(Vec<u8>),
+    /// The base URLs of the Blossom servers that hold it.
+    Blossom(Vec<String>),
 }
 
 impl HistoryDelivery {
-    /// The delivery's content, in the canonical form.
+    /// The delivery's content, in the canonical form. A server URL is
+    /// written as itself: a valid one needs no JSON escape.
     pub(crate) fn encode(&self) -> String {
+        let carried = match &self.bundle {
+            DeliveredBundle::Inline(bundle) => {
+                format!(r#""bundle":"{}""#, BASE64_STANDARD.encode(bundle))
+            }
+            DeliveredBundle::Blossom(servers) => format!(
+                r#""blossom":[{}]"#,
+                servers
+                    .iter()
+                    .map(|server| format!(r#""{server}""#))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        };
         format!(
-            r#"{{"v":{DELIVERY_VERSION},"from":"{}","to":"{}","chat":"{}","sealed":"{}","bundle":"{}"}}"#,
+            r#"{{"v":{DELIVERY_VERSION},"from":"{}","to":"{}","chat":"{}","sealed":"{}",{carried}}}"#,
             hex::encode(self.from),
             hex::encode(self.to),
             hex::encode(&self.chat),
             BASE64_STANDARD.encode(&self.sealed),
-            BASE64_STANDARD.encode(&self.bundle),
         )
     }
 
@@ -83,7 +118,8 @@ impl HistoryDelivery {
             to: String,
             chat: String,
             sealed: String,
-            bundle: String,
+            bundle: Option<String>,
+            blossom: Option<Vec<String>>,
         }
         let wire: Wire = serde_json::from_str(content).map_err(|_| invalid())?;
         let slot = |hex_slot: &str| {
@@ -93,23 +129,58 @@ impl HistoryDelivery {
                 .ok_or_else(invalid)
         };
         let base64 = |value: &str| BASE64_STANDARD.decode(value).map_err(|_| invalid());
+        let bundle = match (wire.bundle, wire.blossom) {
+            (Some(bundle), None) => DeliveredBundle::Inline(base64(&bundle)?),
+            (None, Some(servers)) => DeliveredBundle::Blossom(servers),
+            _ => return Err(invalid()),
+        };
         let delivery = Self {
             from: slot(&wire.from)?,
             to: slot(&wire.to)?,
             chat: hex::decode(&wire.chat).map_err(|_| invalid())?,
             sealed: base64(&wire.sealed)?,
-            bundle: base64(&wire.bundle)?,
+            bundle,
+        };
+        let carried = match &delivery.bundle {
+            DeliveredBundle::Inline(bundle) => !bundle.is_empty(),
+            DeliveredBundle::Blossom(servers) => blossom_servers_are_valid(servers),
         };
         if wire.v != DELIVERY_VERSION
             || delivery.chat.is_empty()
             || delivery.chat.len() > MAX_CHAT_ID_BYTES
-            || delivery.bundle.is_empty()
+            || !carried
             || delivery.encode() != content
         {
             return Err(invalid());
         }
         Ok(delivery)
     }
+}
+
+/// Whether `servers` may be named by a delivery: one to
+/// [`MAX_BLOSSOM_SERVERS`] valid server URLs, none twice.
+pub(crate) fn blossom_servers_are_valid(servers: &[String]) -> bool {
+    (1..=MAX_BLOSSOM_SERVERS).contains(&servers.len())
+        && servers.iter().all(|server| blossom_server_is_valid(server))
+        && servers.iter().collect::<BTreeSet<_>>().len() == servers.len()
+}
+
+/// Whether `server` is a Blossom server URL a delivery may name: a normalized
+/// `http` or `https` URL, its own WHATWG serialization, of at most
+/// [`MAX_BLOSSOM_SERVER_URL_BYTES`], with a host and no query or fragment.
+/// Such a URL holds no `"`, `\` or control character, so it needs no JSON
+/// escape.
+pub(crate) fn blossom_server_is_valid(server: &str) -> bool {
+    if server.is_empty() || server.len() > MAX_BLOSSOM_SERVER_URL_BYTES {
+        return false;
+    }
+    Url::parse(server).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.as_str() == server
+            && url.host_str().is_some()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
 }
 
 /// The context a delivery's key and hash are sealed with: the purpose, the
@@ -152,7 +223,14 @@ mod tests {
             // A sealed key and hash: kem output, then 64 bytes and a tag,
             // the ciphertext's length taking two bytes.
             sealed: vec![7; 1 + 32 + 2 + 64 + 16],
-            bundle: vec![9; bundle_len],
+            bundle: DeliveredBundle::Inline(vec![9; bundle_len]),
+        }
+    }
+
+    fn blossom(servers: &[&str]) -> HistoryDelivery {
+        HistoryDelivery {
+            bundle: DeliveredBundle::Blossom(servers.iter().map(|s| (*s).to_owned()).collect()),
+            ..delivery(16, 1)
         }
     }
 
@@ -179,9 +257,82 @@ mod tests {
             hex::encode(delivery.to),
             hex::encode(&delivery.chat),
             BASE64_STANDARD.encode(&delivery.sealed),
-            BASE64_STANDARD.encode(&delivery.bundle),
+            BASE64_STANDARD.encode([9; 100]),
         );
         assert!(HistoryDelivery::decode(&reordered).is_err());
+    }
+
+    #[test]
+    fn a_delivery_carries_exactly_one_of_an_inline_bundle_and_blossom_servers() {
+        let located = blossom(&["https://blossom.example/", "http://127.0.0.1:3000/"]);
+        let content = located.encode();
+        assert!(
+            content
+                .ends_with(r#","blossom":["https://blossom.example/","http://127.0.0.1:3000/"]}"#)
+        );
+        assert_eq!(HistoryDelivery::decode(&content).unwrap(), located);
+
+        let inline = delivery(16, 1).encode();
+        let bundle_member = &inline[inline.find(r#","bundle""#).unwrap()..inline.len() - 1];
+        for altered in [
+            // Both, or neither.
+            content.replacen(",\"blossom\"", &format!("{bundle_member},\"blossom\""), 1),
+            inline.replacen(bundle_member, "", 1),
+            content.replacen(r#"["https"#, r#"[ "https"#, 1),
+            content.replacen(r#""blossom":["#, r#""blossom":null,"x":["#, 1),
+            content.replacen("example/", "example\\/", 1),
+        ] {
+            assert!(HistoryDelivery::decode(&altered).is_err(), "{altered}");
+        }
+    }
+
+    #[test]
+    fn a_delivery_names_one_to_four_distinct_normalized_server_urls() {
+        let longest = format!("https://{}.example/", "a".repeat(63));
+        let longest = format!(
+            "{longest}{}",
+            "p".repeat(MAX_BLOSSOM_SERVER_URL_BYTES - longest.len())
+        );
+        assert_eq!(longest.len(), MAX_BLOSSOM_SERVER_URL_BYTES);
+        for accepted in [
+            vec!["https://blossom.example/"],
+            vec!["https://blossom.example/media/", "https://b.example:8443/"],
+            vec![
+                "https://a.example/",
+                "https://b.example/",
+                "https://c.example/",
+                &longest,
+            ],
+        ] {
+            let located = blossom(&accepted);
+            assert!(located.encode().len() <= MAX_HISTORY_DELIVERY_CONTENT_BYTES);
+            assert_eq!(HistoryDelivery::decode(&located.encode()).unwrap(), located);
+        }
+        let overlong = format!("{longest}p");
+        for refused in [
+            vec![],
+            vec!["https://a.example/"; 2],
+            vec![
+                "https://a.example/",
+                "https://b.example/",
+                "https://c.example/",
+                "https://d.example/",
+                "https://e.example/",
+            ],
+            vec![overlong.as_str()],
+            vec!["https://blossom.example"],
+            vec!["https://Blossom.example/"],
+            vec!["https://blossom.example/?q=1"],
+            vec!["https://blossom.example/#f"],
+            vec!["wss://blossom.example/"],
+            vec!["file:///blossom"],
+            vec![""],
+        ] {
+            assert!(
+                HistoryDelivery::decode(&blossom(&refused).encode()).is_err(),
+                "{refused:?}"
+            );
+        }
     }
 
     #[test]
