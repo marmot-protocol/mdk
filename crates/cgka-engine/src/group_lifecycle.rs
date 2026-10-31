@@ -1843,9 +1843,13 @@ impl<S: StorageProvider> Engine<S> {
                 self.ciphersuite,
             )?;
 
+            // A sibling offer of another Welcome stays (mdk#2628 3.5b): from
+            // another re-add, it can be the way back after the next removal,
+            // and its own route and carrier decide it then.
             for candidate in storage.list_welcomes()? {
                 if candidate.group_id == group_id
                     && let Some(rejoin) = candidate.rejoin
+                    && (rejoin.sibling.is_none() || rejoin.content_id == content_id)
                 {
                     storage.take_welcome(&candidate.message_id)?;
                     storage.put_ingress_dedup_marker(&candidate.message_id)?;
