@@ -182,6 +182,23 @@ pub enum EngineError {
     #[error("a device entry replacement refused: the entry changed since it was read")]
     DeviceEntryChanged { group_id: GroupId },
 
+    /// A [`SendIntent::ReplaceAccountEntry`](crate::engine::SendIntent::ReplaceAccountEntry)
+    /// refused because the roster no longer holds the account entry the
+    /// replacement was computed from: a commit applied since changed it.
+    /// Nothing was staged. Read the roster again to retry.
+    #[error("an account entry replacement refused: the entry changed since it was read")]
+    AccountEntryChanged { group_id: GroupId },
+
+    /// A [`SendIntent::ReplaceAccountEntry`](crate::engine::SendIntent::ReplaceAccountEntry)
+    /// refused instead of queued, because the device group has a Commit in
+    /// flight, convergence input still unsettled or other work due first.
+    /// Nothing was persisted. A backup change is answered only once it went
+    /// out or was refused (mdk#2628 D75), and a queued one could still be
+    /// refused at drain after the caller took it as sent. Retry once the
+    /// group settles.
+    #[error("an account entry replacement refused while the device group is unsettled")]
+    AccountEntryUnsettled { group_id: GroupId },
+
     /// A Welcome refused because it is not the device-group Welcome a
     /// confirmed device link expects (mdk#2628 D28, D30, D41): it joins a
     /// group that requires the device roster with no link expecting it, it
@@ -331,6 +348,8 @@ impl EngineError {
             EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
             EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
             EngineError::DeviceEntryChanged { .. } => "device_entry_changed",
+            EngineError::AccountEntryChanged { .. } => "account_entry_changed",
+            EngineError::AccountEntryUnsettled { .. } => "account_entry_unsettled",
             EngineError::UnexpectedDeviceGroupWelcome => "unexpected_device_group_welcome",
             EngineError::ForkedEpoch { .. } => "forked_epoch",
             EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",

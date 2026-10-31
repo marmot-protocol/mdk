@@ -11386,6 +11386,11 @@ async fn superseded_profile_edit_is_reissued_when_the_winner_left_the_field_alon
 
     // The winner's own commit is live; nothing to re-issue there.
     assert!(
+        !winner
+            .owes_superseded_own_commit_reissue(&group_id)
+            .unwrap()
+    );
+    assert!(
         winner
             .reissue_superseded_own_commits_from_state()
             .unwrap()
@@ -11400,7 +11405,10 @@ async fn superseded_profile_edit_is_reissued_when_the_winner_left_the_field_alon
 
     // The loser's commit was parked; the winner touched the other field, so
     // the edit is still valid and gets queued again with one attempt spent.
+    // Until that is decided, the commit has not reached its outcome.
+    assert!(loser.owes_superseded_own_commit_reissue(&group_id).unwrap());
     let reports = loser.reissue_superseded_own_commits_from_state().unwrap();
+    assert!(!loser.owes_superseded_own_commit_reissue(&group_id).unwrap());
     assert_eq!(reports.len(), 1, "{reports:?}");
     assert_eq!(reports[0].commit_id, *loser_commit_id);
     assert_eq!(reports[0].kind, SupersededIntentKind::GroupProfile);
