@@ -1460,6 +1460,23 @@ typedef enum MarmotSignInResponse {
   MARMOT_SIGN_IN_RESPONSE_DISMISS,
 } MarmotSignInResponse;
 
+/**
+ * Why something is in the compromise warning. Later releases add
+ * values: show one the host does not know as a generic reason.
+ */
+typedef enum MarmotCompromiseWarningReason {
+  /**
+   * A sign-in the user answered This wasn't me, on this device or
+   * another.
+   */
+  MARMOT_COMPROMISE_WARNING_REASON_REJECTED_SIGN_IN,
+  /**
+   * A KeyPackage one of the account's devices found where they had
+   * not published, and rejected.
+   */
+  MARMOT_COMPROMISE_WARNING_REASON_REJECTED_KEY_PACKAGE,
+} MarmotCompromiseWarningReason;
+
 typedef struct MarmotAccountAttachmentCursor MarmotAccountAttachmentCursor;
 
 typedef struct MarmotAccountAttachmentVersion MarmotAccountAttachmentVersion;
