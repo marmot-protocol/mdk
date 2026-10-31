@@ -4056,6 +4056,20 @@ impl AppClient {
             });
         }
         let effects = ingest?;
+        // A Welcome delivery naming another KeyPackage of this account is a
+        // reason to look for a new sign-in (mdk#2628 3.2): bring the check
+        // forward, as a live KeyPackage of the account does.
+        if matches!(
+            effects.outcome,
+            IngestOutcome::Ignored {
+                category: cgka_traits::InputRejectionCategory::NotAddressedToThisDevice,
+            }
+        ) {
+            client
+                .app
+                .sign_in_nudges
+                .nudge(&hex::encode(client.runtime.self_id().as_slice()));
+        }
         let queued = client.pending_applied_effects.len();
         client.retain_effect_projection(
             &effects.effects,

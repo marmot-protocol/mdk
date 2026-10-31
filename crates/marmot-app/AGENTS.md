@@ -105,7 +105,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   or commit ids. Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots`
   instead, never as device entries.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
-  inviter's rules; a live KeyPackage from the directory subscription only brings a check forward (`SignInNudges`). The
+  inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
+  `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this
+  device already joined), only brings a check forward (`SignInNudges`):
+  a KeyPackage is addressable, so the one a Welcome names is served only as its slot's newest publication. The
   first check's baseline, every slot id its read returned whether or not it counted, never a publication time, separates
   devices that were here first from new sign-ins. Only a complete read changes whether a listed sign-in is still signed
   in, and a slot holding a valid publication that is merely stale (`current_slots`) stays signed in. A read of the

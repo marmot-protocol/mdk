@@ -70,7 +70,10 @@
   3.2): a fresh, valid KeyPackage in a slot neither this device nor its device
   group's roster knows. `answer_sign_in` takes a `SignInResponse` (Not now,
   Reject or Dismiss), and `check_sign_ins` checks now instead of at the next
-  scheduled check. A KeyPackage the roster announced for a device's slot in
+  scheduled check. A Welcome delivery naming another KeyPackage of the
+  account brings the next check forward, as a live one of its KeyPackages
+  does, whether it arrives before or after this device's own delivery of
+  that Welcome. A KeyPackage the roster announced for a device's slot in
   the last 30 days counts as that device's, even after a newer announcement
   or a rewind. `UnrecognizedSignInsChanged` says to re-read the list. All
   are empty and silent in release builds until the roster's spec lands.
@@ -341,7 +344,9 @@
   it records no failed join, never becomes a rejoin offer, and leaves the
   device's KeyPackages as they were, and analytics count it as a duplicate.
   Before, a device already in a group recorded the Welcome for a sibling device
-  added later as a failed join. A rejoin offer stored by an earlier release
+  added later as a failed join. A sibling's delivery of a Welcome this device
+  already joined through its own delivery is ignored the same way; only this
+  device's own Welcome, delivered again, is a duplicate. A rejoin offer stored by an earlier release
   is still decided by its MLS Welcome alone, so one stored under a sibling's
   delivery stays confirmable. KeyPackage lifecycle records now keep the
   publication id of each replaced KeyPackage. Packages replaced before this
