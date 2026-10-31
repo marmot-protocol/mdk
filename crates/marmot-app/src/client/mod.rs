@@ -5751,39 +5751,32 @@ impl AppClient {
             .encrypted_media
             .endpoint_policy()?;
         let version = EncryptedMediaVersion::parse(&reference.version)?;
-        if let Some(key) = self.imported_media_file_key(group_id, &reference)? {
-            return Ok(Some(EncryptedMediaDownloadHttp {
-                reference,
-                key: MediaDownloadKey::File(key),
-                default_blob_endpoints: policy.default_blob_endpoints,
-                allowed_locator_kinds: policy.allowed_locator_kinds,
-                transport: self
-                    .blossom_http_transport
-                    .clone()
-                    .with_download_limit(max_bytes),
-            }));
-        }
         let storage = self.app.account_storage(&self.state.label)?;
-        if !storage
+        let secret = if storage
             .app_storage()
             .encrypted_media_epoch_secret_may_be_served(
                 &hex::encode(group_id.as_slice()),
                 reference.source_epoch,
+            )? {
+            self.cached_encrypted_media_epoch_secret(
+                group_id,
+                version.component_id(),
+                reference.source_epoch,
             )?
-        {
-            return Ok(None);
-        }
-        let Some(secret) = self.cached_encrypted_media_epoch_secret(
-            group_id,
-            version.component_id(),
-            reference.source_epoch,
-        )?
-        else {
-            return Ok(None);
+        } else {
+            None
+        };
+        // A device that imported the message holds its file's key instead.
+        let key = match secret {
+            Some(secret) => MediaDownloadKey::EpochSecret(SecretBytes::new(secret)),
+            None => match self.imported_media_file_key(group_id, &reference)? {
+                Some(key) => MediaDownloadKey::File(key),
+                None => return Ok(None),
+            },
         };
         Ok(Some(EncryptedMediaDownloadHttp {
             reference,
-            key: MediaDownloadKey::EpochSecret(SecretBytes::new(secret)),
+            key,
             default_blob_endpoints: policy.default_blob_endpoints,
             allowed_locator_kinds: policy.allowed_locator_kinds,
             transport: self
@@ -5804,12 +5797,14 @@ impl AppClient {
         reference: &MediaAttachmentReference,
     ) -> Result<(), AppError> {
         self.ensure_group(group_id)?;
-        if self.imported_media_file_key(group_id, reference)?.is_some() {
-            return Ok(());
-        }
         let component_id = EncryptedMediaVersion::parse(&reference.version)?.component_id();
-        self.encrypted_media_secret_for_epoch(group_id, reference.source_epoch, component_id)?;
-        Ok(())
+        match self.encrypted_media_secret_for_epoch(group_id, reference.source_epoch, component_id)
+        {
+            Ok(_) => Ok(()),
+            // A device that imported the message downloads with its file's key.
+            Err(_) if self.imported_media_file_key(group_id, reference)?.is_some() => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// The key a sibling sent for `reference` with this chat's history, when
@@ -5842,13 +5837,16 @@ impl AppClient {
         // row contains its source-epoch exporter. Adopted V1 -> V2 migration
         // deliberately leaves historical V1 references as V1.
         let reference_version = EncryptedMediaVersion::parse(&reference.version)?;
-        let key = match self.imported_media_file_key(group_id, &reference)? {
-            Some(key) => MediaDownloadKey::File(key),
-            None => MediaDownloadKey::EpochSecret(self.encrypted_media_secret_for_epoch(
-                group_id,
-                reference.source_epoch,
-                reference_version.component_id(),
-            )?),
+        let key = match self.encrypted_media_secret_for_epoch(
+            group_id,
+            reference.source_epoch,
+            reference_version.component_id(),
+        ) {
+            Ok(secret) => MediaDownloadKey::EpochSecret(secret),
+            Err(error) => match self.imported_media_file_key(group_id, &reference)? {
+                Some(key) => MediaDownloadKey::File(key),
+                None => return Err(error),
+            },
         };
         Ok(EncryptedMediaDownloadHttp {
             reference,

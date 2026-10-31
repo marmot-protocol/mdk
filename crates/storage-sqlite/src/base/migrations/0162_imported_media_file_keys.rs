@@ -10,9 +10,10 @@
 //!   transport id when `app_event_imports` marks it as imported, so imported
 //!   messages get attachment slots. Such a row uses its app event id in the
 //!   attachment tables' `source_message_id_hex`, which is `NOT NULL` there;
-//!   nothing reads that column back as a transport id. The insert trigger runs
-//!   before the import writes its mark, so the import adds those slots itself;
-//!   slots for messages already imported are added here.
+//!   nothing reads that column back as a transport id. The insert trigger
+//!   takes the same rows, so a timeline rebuild keeps their slots. On the
+//!   first insert the import has not written its mark yet, so the import adds
+//!   those slots itself; slots for messages already imported are added here.
 use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
@@ -38,6 +39,7 @@ CREATE TRIGGER imported_media_file_keys_scrub BEFORE DELETE ON app_events BEGIN
     WHERE group_id_hex = OLD.group_id_hex AND message_id_hex = OLD.message_id_hex;
 END;
 
+DROP TRIGGER attachment_source_insert;
 DROP VIEW attachment_history_source;
 CREATE VIEW attachment_history_source AS
 SELECT t.group_id_hex,t.message_id_hex,CAST(j.key AS INTEGER) AS attachment_index,
@@ -63,6 +65,16 @@ WHERE t.kind=9
       SELECT 1 FROM app_event_imports i
       WHERE i.group_id_hex=t.group_id_hex AND i.message_id_hex=t.message_id_hex))
   AND t.deleted=0 AND t.invalidation_status IS NULL;
+
+CREATE TRIGGER attachment_source_insert AFTER INSERT ON message_timeline
+WHEN NEW.kind=9 AND NEW.media_json IS NOT NULL AND NEW.deleted=0 AND NEW.invalidation_status IS NULL
+ AND (NEW.source_message_id_hex IS NOT NULL OR EXISTS(
+     SELECT 1 FROM app_event_imports i
+     WHERE i.group_id_hex=NEW.group_id_hex AND i.message_id_hex=NEW.message_id_hex)) BEGIN
+    INSERT INTO attachment_history(group_id_hex,message_id_hex,attachment_index,source_message_id_hex,
+        source_epoch,sender,timeline_at,received_at,order_class,order_primary,order_phase,order_at,slot_json,visible)
+    SELECT * FROM attachment_history_source WHERE group_id_hex=NEW.group_id_hex AND message_id_hex=NEW.message_id_hex;
+END;
 
 INSERT OR IGNORE INTO attachment_history(group_id_hex,message_id_hex,attachment_index,source_message_id_hex,
     source_epoch,sender,timeline_at,received_at,order_class,order_primary,order_phase,order_at,slot_json,visible)

@@ -158,11 +158,18 @@ impl SqliteAppStorage {
                         params![group_id_hex, event.message_id_hex],
                     )
                     .storage()?;
+                    // Only one key opens a ciphertext, so a key that differs
+                    // from one the chat already holds for it is not stored.
                     for file_key in &event.file_keys {
                         conn.execute_cached(
                             "INSERT OR IGNORE INTO imported_media_file_keys
                                 (group_id_hex, message_id_hex, ciphertext_sha256, file_key)
-                             VALUES (?1, ?2, ?3, ?4)",
+                             SELECT ?1, ?2, ?3, ?4
+                             WHERE NOT EXISTS (
+                                 SELECT 1 FROM imported_media_file_keys
+                                 WHERE group_id_hex = ?1 AND ciphertext_sha256 = ?3
+                                   AND file_key != ?4
+                             )",
                             params![
                                 group_id_hex,
                                 event.message_id_hex,
@@ -738,6 +745,95 @@ mod tests {
         assert_eq!(removed, vec![vec![0; 32]]);
         assert!(
             s.imported_media_file_keys(GROUP, &new.message_id_hex)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn attachment_slots(s: &SqliteAppStorage) -> Vec<(String, String)> {
+        s.lock()
+            .unwrap()
+            .prepare(
+                "SELECT message_id_hex, source_message_id_hex FROM attachment_history ORDER BY 1",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    // mdk#2628 4.2a: an imported chat message gets attachment slots, under its
+    // app event id, and keeps them when the chat's timeline is rebuilt.
+    #[test]
+    fn an_imported_attachment_keeps_its_slot_through_a_timeline_rebuild() {
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let tags = vec![vec![
+            "imeta".to_owned(),
+            "url https://blossom.example/aa".to_owned(),
+        ]];
+        let event =
+            MarmotAppEvent::new(author(1), 10, MARMOT_APP_EVENT_KIND_CHAT, tags.clone(), "");
+        let photo = StoredAppEvent {
+            message_id_hex: event.id.clone(),
+            tags,
+            plaintext: String::new(),
+            ..chat(1, 1, 10, "")
+        };
+        // A received row without a transport id that no import marks gets no
+        // slot, as before.
+        let unmarked = chat(2, 1, 11, "unmarked");
+        s.record_app_event(&StoredAppEvent {
+            source_message_id_hex: None,
+            tags: photo.tags.clone(),
+            ..unmarked
+        })
+        .unwrap();
+        s.import_app_events(
+            GROUP,
+            &DeviceSlotId::from([0x11; 32]),
+            &[imported(&photo, Vec::new())],
+            NOW,
+        )
+        .unwrap();
+        let expected = vec![(photo.message_id_hex.clone(), photo.message_id_hex.clone())];
+        assert_eq!(attachment_slots(&s), expected);
+
+        s.rebuild_message_timeline_for_group(GROUP).unwrap();
+        assert_eq!(attachment_slots(&s), expected);
+    }
+
+    // mdk#2628 4.2a: only one key opens a ciphertext, so the chat keeps the
+    // first key it imported for one and refuses a different one.
+    #[test]
+    fn a_different_key_for_a_held_ciphertext_is_not_stored() {
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let first = chat(1, 1, 10, "first");
+        let same = chat(1, 1, 11, "same key");
+        let other = chat(1, 2, 12, "other key");
+        s.import_app_events(
+            GROUP,
+            &DeviceSlotId::from([0x11; 32]),
+            &[
+                imported(&first, vec![file_key(0xaa, 1)]),
+                imported(&same, vec![file_key(0xaa, 1)]),
+                imported(&other, vec![file_key(0xaa, 2)]),
+            ],
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(
+            s.imported_media_file_keys(GROUP, &first.message_id_hex)
+                .unwrap(),
+            vec![file_key(0xaa, 1)]
+        );
+        assert_eq!(
+            s.imported_media_file_keys(GROUP, &same.message_id_hex)
+                .unwrap(),
+            vec![file_key(0xaa, 1)]
+        );
+        assert!(
+            s.imported_media_file_keys(GROUP, &other.message_id_hex)
                 .unwrap()
                 .is_empty()
         );
