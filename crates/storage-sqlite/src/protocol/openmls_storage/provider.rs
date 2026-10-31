@@ -292,15 +292,10 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
             // proposals to be re-enqueued. Only deserialization failures are
             // recoverable here; operational SQLite/lock errors still propagate so a
             // transient backend fault is never mistaken for corruption.
-            Err(SqliteOpenMlsStorageError::Serialization(_)) => {
-                tracing::warn!(
-                    target: "storage_sqlite::protocol::openmls_storage::provider",
-                    method = "queued_proposals",
-                    "clearing corrupted OpenMLS proposal queue after undeserializable proposal-queue ref list"
-                );
-                self.delete_group_labels(
+            Err(err) if err.is_undecodable_value() => {
+                self.recover_corrupt_proposal_queue(
                     group_id,
-                    &[QUEUED_PROPOSAL_LABEL, PROPOSAL_QUEUE_REFS_LABEL],
+                    "clearing corrupted OpenMLS proposal queue after undeserializable proposal-queue ref list",
                 )?;
                 return Ok(Vec::new());
             }
@@ -325,8 +320,8 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
                     )?;
                     return Ok(Vec::new());
                 }
-                Err(SqliteOpenMlsStorageError::Serialization(_)) => {
-                    // The ref's entity row is present but its JSON blob fails to
+                Err(err) if err.is_undecodable_value() => {
+                    // The ref's entity row is present but its blob fails to
                     // deserialize (out-of-band corruption, a partial write, or a
                     // storage-format skew). Treat undeserializable queue contents as the
                     // same recoverable corruption as a dangling ref: a partial/garbled
@@ -702,8 +697,8 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
 
 impl SqliteOpenMlsStorage {
     /// Clear the entire OpenMLS proposal queue for `group_id` after detecting
-    /// recoverable corruption (a dangling ref or an undeserializable queued
-    /// proposal blob). Deletes `QUEUED_PROPOSAL_LABEL` and
+    /// recoverable corruption (a dangling ref, or an undeserializable queued
+    /// proposal or ref-list blob). Deletes `QUEUED_PROPOSAL_LABEL` and
     /// `PROPOSAL_QUEUE_REFS_LABEL` atomically via `delete_group_labels` so the
     /// queue cannot be left half-cleared, logs a privacy-safe warning, and lets
     /// the caller return an empty queue. Dropping a pending local proposal is
@@ -730,6 +725,7 @@ impl SqliteOpenMlsStorage {
 
 #[cfg(test)]
 mod tests {
+    use super::super::value_store::VALUE_ENCODING_V2_PREFIX;
     use super::*;
     use crate::SqliteAccountStorage;
     use openmls_traits::storage::{Entity, Key};
@@ -1018,5 +1014,127 @@ mod tests {
             .read_entity(QUEUED_PROPOSAL_LABEL, proposal_key)
             .unwrap();
         assert_eq!(entity, None);
+    }
+
+    /// A row in the current value encoding whose MessagePack body cannot
+    /// decode. The two tests above write unprefixed bytes, which take the
+    /// legacy serde_json path; queue rows are written in this encoding today.
+    fn corrupt_current_encoding_value() -> Vec<u8> {
+        let mut bytes = VALUE_ENCODING_V2_PREFIX.to_vec();
+        // 0xc1 is the one marker MessagePack never assigns.
+        bytes.push(0xc1);
+        bytes
+    }
+
+    #[test]
+    fn queued_proposals_recovers_from_undecodable_current_encoding_blob_by_clearing_queue() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let group_id = TestGroupId(vec![9, 8, 7, 6]);
+        let corrupt_ref = TestProposalRef(vec![0xDD]);
+        let proposal = TestQueuedProposal(vec![0xEE]);
+
+        mls.queue_proposal(&group_id, &corrupt_ref, &proposal)
+            .unwrap();
+
+        let group_key = SqliteOpenMlsStorage::group_key(&group_id).unwrap();
+        let proposal_key = serde_json::to_vec(&(&group_id, &corrupt_ref)).unwrap();
+        mls.write_value(
+            QUEUED_PROPOSAL_LABEL,
+            proposal_key.clone(),
+            Some(group_key),
+            corrupt_current_encoding_value(),
+        )
+        .unwrap();
+
+        let proposals: Vec<(TestProposalRef, TestQueuedProposal)> =
+            mls.queued_proposals(&group_id).unwrap();
+        assert_eq!(proposals, Vec::new());
+
+        let refs: Vec<TestProposalRef> = mls.queued_proposal_refs(&group_id).unwrap();
+        assert_eq!(refs, Vec::new());
+        let entity: Option<TestQueuedProposal> = mls
+            .read_entity(QUEUED_PROPOSAL_LABEL, proposal_key)
+            .unwrap();
+        assert_eq!(entity, None);
+    }
+
+    #[test]
+    fn queued_proposals_recovers_from_undecodable_current_encoding_ref_list_by_clearing_queue() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let group_id = TestGroupId(vec![9, 8, 7, 6]);
+        let valid_ref = TestProposalRef(vec![0x11]);
+        let valid_proposal = TestQueuedProposal(vec![0x22]);
+
+        mls.queue_proposal(&group_id, &valid_ref, &valid_proposal)
+            .unwrap();
+
+        let group_key = SqliteOpenMlsStorage::group_key(&group_id).unwrap();
+        mls.write_value(
+            PROPOSAL_QUEUE_REFS_LABEL,
+            group_key.clone(),
+            Some(group_key),
+            corrupt_current_encoding_value(),
+        )
+        .unwrap();
+
+        let proposals: Vec<(TestProposalRef, TestQueuedProposal)> =
+            mls.queued_proposals(&group_id).unwrap();
+        assert_eq!(proposals, Vec::new());
+
+        let refs: Vec<TestProposalRef> = mls.queued_proposal_refs(&group_id).unwrap();
+        assert_eq!(refs, Vec::new());
+        let proposal_key = serde_json::to_vec(&(&group_id, &valid_ref)).unwrap();
+        let entity: Option<TestQueuedProposal> = mls
+            .read_entity(QUEUED_PROPOSAL_LABEL, proposal_key)
+            .unwrap();
+        assert_eq!(entity, None);
+    }
+
+    #[test]
+    fn queued_proposals_propagates_operational_errors_without_clearing_queue() {
+        // A value stored as TEXT fails the BLOB read with a SQLite error while
+        // deletes still work, so a recovery arm that swallowed it would clear
+        // the queue, and the row counts below would show it.
+        for failing_label in [QUEUED_PROPOSAL_LABEL, PROPOSAL_QUEUE_REFS_LABEL] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            let mls = &store.openmls;
+            let group_id = TestGroupId(vec![9, 8, 7, 6]);
+
+            mls.queue_proposal(
+                &group_id,
+                &TestProposalRef(vec![0x11]),
+                &TestQueuedProposal(vec![0x22]),
+            )
+            .unwrap();
+            mls.lock()
+                .unwrap()
+                .execute(
+                    "UPDATE openmls_values SET value = 'not a blob' WHERE label = ?1",
+                    rusqlite::params![failing_label.as_bytes()],
+                )
+                .unwrap();
+
+            let result: Result<Vec<(TestProposalRef, TestQueuedProposal)>, _> =
+                mls.queued_proposals(&group_id);
+            assert!(
+                matches!(result, Err(SqliteOpenMlsStorageError::Sqlite(_))),
+                "{result:?}"
+            );
+
+            for label in [QUEUED_PROPOSAL_LABEL, PROPOSAL_QUEUE_REFS_LABEL] {
+                let rows: i64 = mls
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM openmls_values WHERE label = ?1",
+                        rusqlite::params![label.as_bytes()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(rows, 1, "an operational read error cleared the queue");
+            }
+        }
     }
 }
