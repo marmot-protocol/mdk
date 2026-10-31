@@ -465,7 +465,9 @@ async fn each_device_joins_only_through_its_own_rumor_in_either_order() {
     );
     assert_eq!(joins(&results), vec![(group_id.clone(), to_phone.id.clone())]);
 
-    // The laptop receives its own rumor first, then both again.
+    // The laptop receives its own rumor first. The phone's, carrying the
+    // Welcome it just joined, is still not addressed to it, and only a rumor
+    // it already took is a duplicate.
     let results = laptop
         .ingest_all(&[to_laptop, to_phone, to_phone, to_laptop])
         .await;
@@ -473,12 +475,33 @@ async fn each_device_joins_only_through_its_own_rumor_in_either_order() {
         outcomes(&results),
         vec![
             cgka_traits::IngestOutcome::Processed,
-            duplicate(),
+            not_addressed(),
             duplicate(),
             duplicate(),
         ]
     );
     assert_eq!(joins(&results), vec![(group_id.clone(), to_laptop.id.clone())]);
+
+    // Sent again in new gift wraps, the laptop's own rumor is a duplicate
+    // and the phone's is still not addressed to it.
+    let (_, welcome_bytes) = rumor(to_laptop, b"alice").await;
+    let own_again = rewrapped(
+        b"bob",
+        b"alice",
+        welcome_bytes.clone(),
+        publication_id(&laptop.key_package),
+    )
+    .await;
+    let phones_again = rewrapped(
+        b"bob",
+        b"alice",
+        welcome_bytes,
+        publication_id(&phone.key_package),
+    )
+    .await;
+    let results = laptop.ingest_all(&[&own_again, &phones_again]).await;
+    assert_eq!(outcomes(&results), vec![duplicate(), not_addressed()]);
+    assert!(joins(&results).is_empty());
 
     // Neither device holds an offer, and each consumed only its own
     // KeyPackage.

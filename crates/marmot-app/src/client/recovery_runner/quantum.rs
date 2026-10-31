@@ -58,6 +58,24 @@ pub(super) enum SinkStop {
     StaleMark,
     /// The worker is gone.
     WorkerGone,
+    /// A valid event routed to nothing: the account's installed
+    /// subscriptions lag its routes. Local, as a failed write is: the slice
+    /// stays owed and the unit waits out a local hold until they catch up.
+    Unrouted,
+}
+
+/// Route a slice's events to the account. `None` when any valid one routes
+/// to nothing yet ([`SinkStop::Unrouted`]).
+pub(super) async fn route_events<H: RunnerHost>(
+    host: &H,
+    relay: &str,
+    events: Vec<Event>,
+) -> Option<Vec<TransportDelivery>> {
+    let mut deliveries = Vec::with_capacity(events.len());
+    for event in events {
+        deliveries.extend(host.deliveries(relay, event).await?);
+    }
+    Some(deliveries)
 }
 
 /// What one quantum did, in aggregate.
@@ -206,10 +224,12 @@ impl<H: RunnerHost> SweepSink for StageSink<'_, H> {
         } else {
             self.meter.bytes.swap(0, Ordering::Relaxed)
         };
-        let mut deliveries = Vec::with_capacity(events.len());
-        for event in events {
-            deliveries.extend(self.host.deliveries(&self.plan.key.relay, event).await);
-        }
+        let Some(deliveries) = route_events(self.host, &self.plan.key.relay, events).await else {
+            // Nothing was written: settlement charges these bytes instead.
+            self.meter.bytes.fetch_add(fetched_bytes, Ordering::Relaxed);
+            self.stop = Some(SinkStop::Unrouted);
+            return Err(SweepSinkError);
+        };
         let key = self.plan.key.clone();
         let mark = self.plan.mark;
         let range = RecoveryCoverageRange {

@@ -4,8 +4,8 @@
 //! error themselves.
 
 use crate::AppError;
-use marmot_observability::app_telemetry::runtime::Outcome;
-use marmot_observability::observer::StorageFailureKind;
+use marmot_observability::Outcome;
+use marmot_observability::StorageFailureKind;
 
 /// The performance outcome of a failed operation: a worker that did not answer in time is a
 /// timeout, a busy worker is not ready, and any other error is a failure.
@@ -38,8 +38,8 @@ mod tests {
         SyncFailureClassification, SyncFailureStage,
     };
     use cgka_traits::StorageError;
-    use marmot_observability::observability_test_support::success_or_failure;
-    use marmot_observability::observer::PerformanceRecorder;
+    use marmot_observability::PerformanceRecorder;
+    use marmot_observability::success_or_failure;
 
     /// The performance recorder's `finish_app` before #2627 PR 1, verbatim but for its receiver.
     fn finish_app_before<T>(result: &Result<T, AppError>) -> Outcome {
@@ -163,7 +163,11 @@ mod tests {
             ),
         ];
         for (label, result, performance, product, storage) in rows {
-            assert_eq!(Outcome::of(&result), performance, "{label}: performance");
+            assert_eq!(
+                Outcome::of_for_test(&result),
+                performance,
+                "{label}: performance"
+            );
             assert_eq!(
                 finish_app_before(&result),
                 performance,
@@ -177,7 +181,7 @@ mod tests {
             assert_eq!(counted, storage, "{label}: storage failure");
             assert_eq!(
                 result.as_ref().err().and_then(storage_failure_before),
-                storage.map(StorageFailureKind::as_str),
+                storage.map(StorageFailureKind::as_str_for_test),
                 "{label}: storage failure before"
             );
 

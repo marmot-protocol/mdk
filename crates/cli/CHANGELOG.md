@@ -71,22 +71,22 @@ versioning through the workspace version in the root `Cargo.toml`.
   item 3.4): `key_package_refresh_overdue` in `marmot-app`, UniFFI and C, and a `KeyPackageRefreshOverdueChanged`
   event to re-read it. It is false in release builds until the roster's spec lands.
 - A device notices new sign-ins on its account (mdk#2628 item 3.2). It reads every KeyPackage slot of the account at
-  open, every six hours and soon after one of the account's KeyPackages arrives live, and keeps what an inviter would
-  add: each slot's newest publication, not deleted, valid and fresh, with no cap on how many. A slot that is neither
-  this device's nor in its device group's roster is an unrecognized sign-in. Slots this device's first check returned,
-  fresh or not, are devices that were there before it; other slots are new sign-ins, whatever their publication times
-  say. Malformed input and client tags never raise one. Rejecting a sign-in records its slot as rejected in the device
-  group's roster in one commit, or keeps it on the device until it has a device group; a device that later creates one
-  founds the roster with it. Each device keeps its rejections until the roster holds the slot as a device, a link the
-  user confirmed, and commits one again whenever the roster has no entry for the slot; it never replaces an entry. The
-  runtime writes them (`AccountDeviceRuntime::reject_device_slots`) behind the gate its other roster updates wait
-  behind. A rejection names the slot alone, never its KeyPackage, which may be a copy of a real device's, and a rejected
-  KeyPackage never makes another slot rejected. A sign-in another device answered keeps its prompt, saying so, until
-  dismissed, and is listed again if the roster loses that answer; one whose slot a complete check finds empty stays
-  listed as no longer signed in. A publication that is only stale never signs a slot out, and a check of fallback
-  relays, when the account lists none, is never complete. Hosts list sign-ins with `unrecognized_sign_ins`, answer one
-  with `answer_sign_in`, and check now with `check_sign_ins`, in `marmot-app`, UniFFI and C, and re-read on the
-  `UnrecognizedSignInsChanged` event. Only test-policy builds run any of it.
+  open, every six hours, and soon after one of the account's KeyPackages arrives live or a Welcome names one this device
+  did not publish, and keeps what an inviter would add: each slot's newest publication, not deleted, valid and fresh,
+  with no cap on how many. A slot that is neither this device's nor in its device group's roster is an unrecognized
+  sign-in. Slots this device's first check returned, fresh or not, are devices that were there before it; other slots
+  are new sign-ins, whatever their publication times say. Malformed input and client tags never raise one. Rejecting a
+  sign-in records its slot as rejected in the device group's roster in one commit, or keeps it on the device until it
+  has a device group; a device that later creates one founds the roster with it. Each device keeps its rejections until
+  the roster holds the slot as a device, a link the user confirmed, and commits one again whenever the roster has no
+  entry for the slot; it never replaces an entry. The runtime writes them (`AccountDeviceRuntime::reject_device_slots`)
+  behind the gate its other roster updates wait behind. A rejection names the slot alone, never its KeyPackage, which
+  may be a copy of a real device's, and a rejected KeyPackage never makes another slot rejected. A sign-in another
+  device answered keeps its prompt, saying so, until dismissed, and is listed again if the roster loses that answer; one
+  whose slot a complete check finds empty stays listed as no longer signed in. A publication that is only stale never
+  signs a slot out, and a check of fallback relays, when the account lists none, is never complete. Hosts list sign-ins
+  with `unrecognized_sign_ins`, answer one with `answer_sign_in`, and check now with `check_sign_ins`, in `marmot-app`,
+  UniFFI and C, and re-read on the `UnrecognizedSignInsChanged` event. Only test-policy builds run any of it.
 - Hosts can warn the user that someone holding the account's signing key published where the account's devices did
   not (mdk#2628 item 3.7a). `compromise_warning`, in `marmot-app`, UniFFI and C, lists each rejected sign-in and
   rejected KeyPackage, from this device or its device group's roster, that the user has not seen on this device, with
@@ -184,8 +184,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
-- `messages send-event` refuses the device-group kinds 457, 459, 460 and 462 with `reserved_app_event_kind`, and one
-  received in a chat makes no timeline row or message (mdk#2628). They are read only in the account's device group.
+- `messages send-event` refuses the device-group kinds 457, 459, 460, 462, 475 and 476 with `reserved_app_event_kind`,
+  and one received in a chat makes no timeline row or message (mdk#2628). They are read only in the account's device
+  group.
 - Creating a group now refuses an initial entry for `marmot.group.account-devices.v1` (0x800d), or any other protocol
   component that carries no data, with `EngineError::NoDataAppComponent` before anything is created or published
   (mdk#2628). Hosts could pass one among the optional initial components and create a GroupContext entry the spec

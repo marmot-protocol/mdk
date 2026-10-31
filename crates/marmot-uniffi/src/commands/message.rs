@@ -226,9 +226,9 @@ impl Marmot {
     /// Send an app-defined event with an arbitrary non-reserved kind. `tags`
     /// and `content` pass through verbatim; kinds MDK owns (chat, reaction,
     /// edit, delete, agent, group system, push token, device group: 457, 459,
-    /// 460, 462) are rejected so an app cannot forge protocol events. Custom
-    /// events appear in the timeline as standalone rows and can be fetched via
-    /// [`Marmot::messages`] with a `kinds` filter.
+    /// 460, 462, 475, 476) are rejected so an app cannot forge protocol events.
+    /// Custom events appear in the timeline as standalone rows and can be
+    /// fetched via [`Marmot::messages`] with a `kinds` filter.
     pub async fn send_custom_event(
         &self,
         account_ref: String,

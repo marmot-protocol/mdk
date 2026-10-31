@@ -93,10 +93,10 @@ fn audit_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
 }
 
 pub struct AuditUploadSnapshot {
-    pub body: Vec<u8>,
-    pub observed_bytes: u64,
-    pub modified_at_ms: Option<u64>,
-    pub complete: bool,
+    pub(crate) body: Vec<u8>,
+    pub(crate) observed_bytes: u64,
+    pub(crate) modified_at_ms: Option<u64>,
+    pub(crate) complete: bool,
 }
 
 impl AuditUploadSnapshot {
@@ -155,6 +155,18 @@ impl AuditUploadSnapshot {
         } else {
             Err(invalid_audit_upload())
         }
+    }
+}
+
+/// Test hooks for `marmot-app`'s audit tests (#2627): what a capture read.
+#[cfg(any(test, feature = "test-support"))]
+impl AuditUploadSnapshot {
+    pub fn body_for_test(&self) -> &[u8] {
+        &self.body
+    }
+
+    pub fn complete_for_test(&self) -> bool {
+        self.complete
     }
 }
 

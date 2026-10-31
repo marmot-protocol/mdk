@@ -18,6 +18,11 @@ receipts, audit files and the other local state, classifies its own errors into 
 through an `Observer` handle, and re-exports the types hosts name at their `marmot_app::` paths. Hosts enable
 `otlp-export` and `product-analytics-export` on `marmot-app`, which forwards them here.
 
+The API is the crate root. Three modules are public because `marmot-app` names them by path: `product_analytics`
+and `audit_otlp_sender`, which hosts reach as `marmot_app::product_analytics` and `marmot_app::audit_otlp_sender`,
+and `wiring`, the collector and exporter controls only `marmot-app` calls. The `test-support` feature adds the
+fixtures and `_for_test` hooks `marmot-app`'s tests use; only a dev-dependency enables it.
+
 What is collected, and when and where it is sent, is described in
 [`docs/marmot-architecture/telemetry.md`](../../docs/marmot-architecture/telemetry.md) and
 [`docs/marmot-architecture/usage-diagnostics.md`](../../docs/marmot-architecture/usage-diagnostics.md).

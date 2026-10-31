@@ -7,8 +7,12 @@
 //!   and a `client` tag only labels one. A check that reached no relay proves
 //!   nothing.
 //! - **When.** At open, every six hours, on a live KeyPackage of this account
-//!   from the directory subscription (a nudge only: the check's read is the
-//!   evidence), and when the host asks.
+//!   from the directory subscription or a Welcome delivery naming another
+//!   KeyPackage of this account (nudges only: the check's read is the
+//!   evidence), and when the host asks. A KeyPackage is addressable, so one
+//!   a Welcome names is still served only as its slot's newest publication,
+//!   which the check reads. A nudge before the first check counts for
+//!   nothing: the first check comes anyway and takes the baseline.
 //! - **Before or after this device.** This device's first check takes a
 //!   baseline: every slot its read returns, whether or not the slot counts
 //!   then, is a device that was here first ("do you still have it?"). Every
@@ -190,14 +194,25 @@ pub(crate) struct SignInSchedule {
     pub(crate) last: Option<Instant>,
 }
 
-/// Live KeyPackages of local accounts, from the directory subscription, that
-/// their clients have not checked yet. Only an account whose client has
-/// checked is tracked, so other accounts' KeyPackages cost nothing.
+#[cfg(all(test, feature = "test-policy-overrides"))]
+impl SignInSchedule {
+    /// Move the schedule back by `by`, as if that much time passed.
+    pub(crate) fn rewind(&mut self, by: Duration) {
+        self.last = self.last.and_then(|last| last.checked_sub(by));
+        self.due = self.due.and_then(|due| due.checked_sub(by));
+    }
+}
+
+/// Live KeyPackages of local accounts, from the directory subscription, and
+/// Welcome deliveries naming another KeyPackage of the account, that their
+/// clients have not checked yet. Only an account whose client has checked is
+/// tracked, so other accounts' KeyPackages cost nothing.
 #[derive(Debug, Default)]
 pub(crate) struct SignInNudges(std::sync::Mutex<BTreeMap<String, bool>>);
 
 impl SignInNudges {
-    /// A KeyPackage `account_id_hex` published arrived live.
+    /// A KeyPackage `account_id_hex` published arrived live, or a Welcome
+    /// named one this device did not publish.
     pub(crate) fn nudge(&self, account_id_hex: &str) {
         if let Ok(mut accounts) = self.0.lock()
             && let Some(nudged) = accounts.get_mut(account_id_hex)

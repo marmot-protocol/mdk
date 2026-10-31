@@ -188,6 +188,11 @@ inputs, draft descriptors, and persisted controls in one deferred read. `Storage
 public storage calls under one deferred transaction, enforcing and restoring SQLite query-only mode even when nested.
 See the [opening contract](../../docs/marmot-architecture/further-context/conversation-opening.md).
 
+A sibling's read position (small state, mdk#2628 item 4.3) advances the read marker as a local read does, but keeps a
+manual-unread reminder. It may name a message this device does not hold yet: unread counts compare canonical order
+keys, not ids. The position this device sends is the furthest delivered message, other than an edit, at or before its
+read marker, so a marker on a synthesized group system row or an undelivered send still has one.
+
 Selected composer reads and revision-checked mutations share the encrypted draft tables; migration 0073 tracks legacy
 writes too, and queued/fanout acceptance clears only its submitted revision atomically. See the
 [draft contract](../../docs/marmot-architecture/further-context/conversation-drafts.md).

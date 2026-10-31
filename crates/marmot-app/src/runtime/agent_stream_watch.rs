@@ -159,7 +159,7 @@ impl MarmotAppRuntime {
             })
         };
         observed
-            .run_async(work, marmot_observability::observer::success_or_failure)
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -416,7 +416,7 @@ struct BrokerWatch {
 async fn watch_broker_candidates(
     watch: BrokerWatch,
     updates_tx: mpsc::Sender<RuntimeAgentStreamUpdate>,
-    product: marmot_observability::observer::ProductRecorder,
+    product: marmot_observability::ProductRecorder,
 ) -> RuntimeAgentStreamUpdate {
     let mut first_preview = product.begin(
         crate::ProductFamily::Stream,

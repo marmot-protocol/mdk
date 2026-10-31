@@ -5,7 +5,7 @@
 //! are no fields for account, group, message, relay, URL, pubkey, payload, or
 //! key material.
 
-pub mod runtime;
+pub(crate) mod runtime;
 pub use runtime::{RuntimePerformanceOperation, RuntimePerformanceSnapshot};
 
 use std::collections::BTreeMap;

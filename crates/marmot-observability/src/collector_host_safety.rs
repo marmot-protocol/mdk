@@ -178,7 +178,6 @@ where
 /// the same name; `new_for_test` builds a pin without resolution, so a fixture can pin an
 /// unresolvable name to a loopback address.
 #[cfg(any(test, feature = "test-support"))]
-#[cfg_attr(not(test), allow(dead_code))]
 impl PinnedCollector {
     pub fn new_for_test(url: Url, addrs: Vec<SocketAddr>) -> Self {
         Self { url, addrs }
@@ -199,7 +198,6 @@ impl PinnedCollector {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn resolve_with_for_test<F, Fut>(
     endpoint: &str,
     resolver: F,
