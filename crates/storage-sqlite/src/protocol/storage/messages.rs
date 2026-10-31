@@ -2648,6 +2648,68 @@ mod tests {
         assert!(store.list_pending_application_events().unwrap().is_empty());
     }
 
+    /// An event stored before its source authority resolved takes that
+    /// authority (and a retention it lacked) in place; any other rewrite of
+    /// the stored event is refused, and an event needs its message row.
+    #[test]
+    fn a_pending_event_takes_a_late_authority_in_place_and_refuses_other_rewrites() {
+        use cgka_traits::app_event::{AppMessageAuthority, AppMessageRetentionDecision};
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let message = sample_message(mid(1), gid(1), 0);
+        store.put_message(&message).unwrap();
+        let unresolved = application_event(message.id.clone());
+        store.put_pending_application_event(&unresolved).unwrap();
+
+        let with = |authority: [u8; 32], payload: &[u8]| {
+            let mut event = unresolved.clone();
+            if let GroupEvent::MessageReceived {
+                authority: slot,
+                retention,
+                payload: body,
+                ..
+            } = &mut event
+            {
+                *slot = Some(AppMessageAuthority {
+                    source_context: authority,
+                    moderation_grant: false,
+                });
+                *retention = Some(AppMessageRetentionDecision::new(10, 60));
+                *body = payload.to_vec();
+            }
+            event
+        };
+        let refused = |rewrite: &GroupEvent| {
+            let result = store.put_pending_application_event(rewrite);
+            assert!(
+                matches!(&result, Err(StorageError::Backend(message))
+                    if message == "pending application event id reused with different content"),
+                "{result:?}"
+            );
+        };
+        refused(&with([1; 32], b"other chat"));
+        let resolved = with([1; 32], b"authenticated chat");
+        store.put_pending_application_event(&resolved).unwrap();
+        store.put_pending_application_event(&resolved).unwrap();
+        assert_eq!(
+            store.list_pending_application_events().unwrap(),
+            vec![resolved.clone()]
+        );
+
+        refused(&with([2; 32], b"authenticated chat"));
+        refused(&unresolved);
+        assert_eq!(
+            store.list_pending_application_events().unwrap(),
+            vec![resolved]
+        );
+
+        assert!(matches!(
+            store.put_pending_application_event(&application_event(mid(2))),
+            Err(StorageError::NotFound)
+        ));
+    }
+
     #[test]
     fn state_filtered_queries_match_the_full_listing() {
         let store = SqliteAccountStorage::in_memory().unwrap();

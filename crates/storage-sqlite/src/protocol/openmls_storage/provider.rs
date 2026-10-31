@@ -1187,4 +1187,52 @@ mod tests {
             }
         }
     }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestKeyPackageRef(Vec<u8>);
+
+    impl Key<CURRENT_VERSION> for TestKeyPackageRef {}
+    impl traits::HashReference<CURRENT_VERSION> for TestKeyPackageRef {}
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestKeyPackage(Vec<u8>);
+
+    impl Entity<CURRENT_VERSION> for TestKeyPackage {}
+    impl traits::KeyPackage<CURRENT_VERSION> for TestKeyPackage {}
+
+    /// The engine retires stored KeyPackage bundles by parsing them as JSON
+    /// and deletes every one it cannot parse, so these rows must stay JSON
+    /// while other labels move to MessagePack, and a deletion by storage key
+    /// must remove that bundle's private material and no other.
+    #[test]
+    fn key_package_bundles_stay_json_and_delete_by_storage_key() {
+        use cgka_traits::storage::KeyPackageBundleStorage;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let (kept, retired) = (TestKeyPackageRef(vec![1]), TestKeyPackageRef(vec![2]));
+        mls.write_key_package(&kept, &TestKeyPackage(vec![7]))
+            .unwrap();
+        mls.write_key_package(&retired, &TestKeyPackage(vec![8]))
+            .unwrap();
+
+        let bundles = store.stored_key_package_bundles().unwrap();
+        let decoded = bundles
+            .iter()
+            .map(|bundle| serde_json::from_slice::<TestKeyPackage>(&bundle.value).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, [TestKeyPackage(vec![7]), TestKeyPackage(vec![8])]);
+
+        store
+            .delete_stored_key_package_bundle(&bundles[1].storage_key)
+            .unwrap();
+        assert_eq!(
+            mls.key_package::<_, TestKeyPackage>(&retired).unwrap(),
+            None
+        );
+        assert_eq!(
+            mls.key_package::<_, TestKeyPackage>(&kept).unwrap(),
+            Some(TestKeyPackage(vec![7]))
+        );
+    }
 }

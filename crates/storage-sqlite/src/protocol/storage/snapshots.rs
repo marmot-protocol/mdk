@@ -994,6 +994,10 @@ mod tests {
             store.rollback_group_to_snapshot(&g1.id, "a-before"),
             Err(StorageError::SnapshotMissing(_))
         ));
+        assert!(matches!(
+            store.release_group_snapshot(&g1.id, "a-before"),
+            Err(StorageError::SnapshotMissing(name)) if name == "a-before"
+        ));
     }
 
     #[cfg(feature = "test-conformance-replay")]

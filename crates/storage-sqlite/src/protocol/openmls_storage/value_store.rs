@@ -913,6 +913,50 @@ mod tests {
         );
     }
 
+    /// OpenMLS writes made inside the engine's transaction take the joined
+    /// branch of each mutation. That branch must clear legacy-key rows as the
+    /// self-owned one does, or a later read falls back to the stale row.
+    #[test]
+    fn mutations_inside_a_callers_transaction_also_clear_legacy_rows() {
+        use cgka_traits::storage::{StorageError, StorageProvider};
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let value_label = OpenMlsValueLabel::test_public(b"LegacyValue");
+        let list_label = OpenMlsValueLabel::test_public(b"LegacyList");
+        let key = b"row".to_vec();
+        let legacy_list_key = build_key_legacy(list_label.as_bytes(), key.clone());
+        insert_raw_row(
+            mls,
+            value_label,
+            &build_key_legacy(value_label.as_bytes(), key.clone()),
+            serde_json::to_vec(&7u8).unwrap(),
+        );
+        let legacy_list = [TestEntity(1), TestEntity(2)].map(|e| serde_json::to_vec(&e).unwrap());
+        insert_raw_row(
+            mls,
+            list_label,
+            &legacy_list_key,
+            serde_json::to_vec(&legacy_list).unwrap(),
+        );
+
+        store
+            .with_transaction(|_| {
+                mls.delete_value(value_label, key.clone()).unwrap();
+                mls.remove_entity(list_label, key.clone(), None, &TestEntity(1))
+                    .unwrap();
+                Ok::<_, StorageError>(())
+            })
+            .unwrap();
+
+        assert_eq!(mls.read_json::<u8>(value_label, key.clone()).unwrap(), None);
+        assert_eq!(
+            mls.read_list::<TestEntity>(list_label, key).unwrap(),
+            vec![TestEntity(2)]
+        );
+        assert_eq!(row_count(mls, &legacy_list_key), 0);
+    }
+
     fn assert_injected_cleanup_failure(result: Result<(), SqliteOpenMlsStorageError>) {
         let error = result.expect_err("the injected cleanup failure must surface");
         assert!(

@@ -477,6 +477,10 @@ mod tests {
             .map(|queued| queued.id)
             .collect();
         assert_eq!(ids, vec![mid(1)]);
+        assert!(matches!(
+            store.delete_queued_outbound_intent(&mid(3)),
+            Err(cgka_traits::storage::StorageError::NotFound)
+        ));
     }
 
     #[test]

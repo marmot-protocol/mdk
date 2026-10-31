@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn disband_request_roundtrips_and_cascades_with_group() {
+    fn disband_request_roundtrips_clears_per_group_and_cascades_with_group() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 3, 0);
         store.put_group(&group).unwrap();
@@ -365,6 +365,40 @@ mod tests {
                 .unwrap()
                 .contains(&hex::encode(group.id.as_slice()))
         );
+
+        let other = sample_group(gid(2), 3, 0);
+        store.put_group(&other).unwrap();
+        let candidate = |group_id: &cgka_traits::GroupId| DisbandCandidate {
+            group_id: group_id.clone(),
+            source_epoch: EpochId(3),
+            commit_id: mid(9),
+            content_commit_id: mid(10),
+            commit_digest: [0xA5; 32],
+            actor: member_id(0),
+            local_was_committer_leaf: false,
+            former_members: Vec::new(),
+        };
+        store
+            .put_disband_request(&DisbandRequest {
+                group_id: other.id.clone(),
+                ..request.clone()
+            })
+            .unwrap();
+        store.put_disband_candidate(&candidate(&group.id)).unwrap();
+        store.put_disband_candidate(&candidate(&other.id)).unwrap();
+        store.clear_disband_request(&other.id).unwrap();
+        store.clear_disband_candidates(&other.id).unwrap();
+        assert_eq!(store.disband_request(&other.id).unwrap(), None);
+        assert!(store.list_disband_candidates(&other.id).unwrap().is_empty());
+        assert_eq!(
+            store.disband_request(&group.id).unwrap(),
+            Some(request.clone())
+        );
+        assert_eq!(
+            store.list_disband_candidates(&group.id).unwrap(),
+            vec![candidate(&group.id)]
+        );
+
         store.delete_group(&group.id).unwrap();
         assert_eq!(store.disband_request(&group.id).unwrap(), None);
     }

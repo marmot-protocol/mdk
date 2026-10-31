@@ -556,6 +556,10 @@ mod tests {
         assert!(state.is_none());
         assert!(store.list_transport_group_routes().unwrap().is_empty());
         assert_eq!(reconciliation_row_counts(&store, [0xCC; 32]), (0, 0));
+        assert!(matches!(
+            store.delete_group(&group.id),
+            Err(StorageError::NotFound)
+        ));
     }
 
     #[test]
