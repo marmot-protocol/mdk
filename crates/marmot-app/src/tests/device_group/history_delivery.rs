@@ -437,3 +437,23 @@ async fn a_sibling_add_a_week_old_is_forgotten_unsent() {
             .is_empty()
     );
 }
+
+/// An add recorded for the device group itself, which the engine skips, owes
+/// nothing: the device group is no chat whose history goes anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_to_the_device_group_owes_no_history() {
+    let (mut devices, group, _chat, _first) = history_devices().await;
+    devices
+        .phone
+        .dev_record_sibling_add(&group, &slot_of(&devices.laptop))
+        .unwrap();
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_deliveries().await;
+    assert_eq!(published_count(&devices.relay), before);
+    assert!(
+        storage(&devices.phone_app)
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}

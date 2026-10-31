@@ -179,8 +179,13 @@ impl AppClient {
         let chat = hex::decode(&owed.group_id_hex)
             .map(GroupId::new)
             .map_err(|_| refused("history_delivery_chat"))?;
-        if self.history_chat(&chat).is_err() {
-            return Err(refused("history_delivery_chat"));
+        match self.history_chat(&chat) {
+            Ok(_) => {}
+            Err(AppError::UnknownGroup(_) | AppError::DeviceGroupRefused(_)) => {
+                return Err(refused("history_delivery_chat"));
+            }
+            // A storage failure is not a refusal: the history stays owed.
+            Err(error) => return Err(error),
         }
         let mut bundles = Vec::new();
         let mut after = None;
