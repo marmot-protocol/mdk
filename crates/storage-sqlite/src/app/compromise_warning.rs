@@ -18,12 +18,15 @@ use rusqlite::params;
 /// How long this device keeps a seen KeyPackage it found in its own slot,
 /// counted from when it found it: the longest a KeyPackage can be valid, so
 /// a relay that serves it again by then serves one that no longer passes. An
-/// unseen one stays until dismissed.
+/// unseen one stays until dismissed, unless the cap drops it.
 pub const COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS: u64 = 7_261_200;
 
 /// The most items this device keeps. Rejected sign-ins each take a user's
 /// answer; only someone publishing KeyPackages into this device's slot many
-/// times over gets near it. Past it, the oldest seen items go first.
+/// times over gets near it. Past it, the oldest items go, seen ones first,
+/// so the warning stays open while any item is unseen. A seen KeyPackage the
+/// cap dropped warns again if the slot serves it again, which tells the user
+/// no more than a new KeyPackage there would.
 pub const COMPROMISE_WARNING_ITEM_CAP: usize = 4096;
 
 /// Why an item is in the warning.
@@ -764,5 +767,29 @@ mod tests {
             None,
             30
         ));
+    }
+
+    /// Past the cap with nothing seen, the oldest unseen item goes and the
+    /// warning stays open with the rest.
+    #[test]
+    fn the_cap_drops_the_oldest_unseen_item_when_none_is_seen() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let refs: Vec<_> = (0..COMPROMISE_WARNING_ITEM_CAP)
+            .map(|index| format!("k{index:05}"))
+            .collect();
+        assert!(
+            store
+                .record_foreign_own_slot_key_packages("own slot", &refs, 10)
+                .unwrap()
+        );
+        assert!(found(&store, "new", 20));
+        let items = open(&store);
+        assert_eq!(items.len(), COMPROMISE_WARNING_ITEM_CAP);
+        assert!(!stored(&store, "k00000"));
+        assert!(stored(&store, "k00001"));
+        assert_eq!(
+            items.last(),
+            Some(&(ForeignOwnSlotKeyPackage, "new".to_owned()))
+        );
     }
 }
