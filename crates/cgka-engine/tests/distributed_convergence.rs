@@ -2328,15 +2328,6 @@ async fn a_host_advance_never_converges_a_removed_copy_again() {
         .join_welcome(welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    carol
-        .set_convergence_policy(CanonicalizationPolicy {
-            convergence: ConvergencePolicy {
-                max_rewind_commits: 1,
-                ..ConvergencePolicy::default()
-            },
-            ..CanonicalizationPolicy::default()
-        })
-        .expect("convergence policy accepted");
     carol.drain_events();
 
     // The rename goes to the committer the tie-break favours, so the removal
@@ -2378,7 +2369,7 @@ async fn a_host_advance_never_converges_a_removed_copy_again() {
 
     // The winning rival is held in stored convergence, as in the test above.
     carol
-        .buffer_openmls_convergence_message_at(&group_id, rename_commit, 1_001_000)
+        .buffer_openmls_convergence_message_at(&group_id, rename_commit.clone(), 1_001_000)
         .expect("sibling rename commit buffered");
     assert!(carol.has_pending_convergence_inputs(&group_id).unwrap());
 
@@ -2410,6 +2401,15 @@ async fn a_host_advance_never_converges_a_removed_copy_again() {
             .any(|event| matches!(event, GroupEvent::LocalGroupCopyRestored { .. })),
         "a removed copy is not restored by a host advance: {events:?}"
     );
+
+    // The rival does win: the stored-convergence call settles on it and clears
+    // the marker, so the host advances above held back a winner.
+    let result = carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("reorg over the superseded removal");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(result.accepted_commits, vec![content_hex(&rename_commit)]);
+    assert!(!carol_storage.get_group(&group_id).unwrap().removed);
 }
 
 /// State-derived inverse of `realize_self_eviction`: a `removed` marker that
