@@ -1817,6 +1817,7 @@ mod tests {
     #[test]
     #[ignore = "explicit encrypted-storage preparation benchmark"]
     fn deferred_metadata_file_backed_benchmark() {
+        crate::base::connection::use_production_storage_for_test_process();
         let mut measurements = Vec::new();
         for processed in [0, 4096] {
             for deferred in [0, 64, 512, 2048] {

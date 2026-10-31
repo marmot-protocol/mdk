@@ -19,7 +19,7 @@ use serde::{Serialize, Serializer};
 /// send. MessagePack is self-describing, which OpenMLS's hand-written
 /// `Deserialize` impls require, so a positional format such as postcard
 /// cannot serve here.
-const VALUE_ENCODING_V2_PREFIX: [u8; 2] = [0x00, 0x02];
+pub(super) const VALUE_ENCODING_V2_PREFIX: [u8; 2] = [0x00, 0x02];
 
 /// Labels whose raw row bytes leave this crate and are parsed by the engine
 /// as serde_json (`cgka_engine::key_package` reads stored bundles through
@@ -59,6 +59,17 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, SqliteOpenMlsStorageEr
     match bytes.strip_prefix(&VALUE_ENCODING_V2_PREFIX) {
         Some(body) => Ok(rmp_serde::from_slice(body)?),
         None => Ok(serde_json::from_slice(bytes)?),
+    }
+}
+
+impl SqliteOpenMlsStorageError {
+    /// Whether this is what [`decode`] returns for a stored value that does
+    /// not deserialize, in either encoding. A read that recovers from corrupt
+    /// rows matches on this rather than one variant, so the current encoding's
+    /// failures recover like legacy JSON ones while SQLite, lock and closed
+    /// store errors still propagate.
+    pub(super) fn is_undecodable_value(&self) -> bool {
+        matches!(self, Self::Serialization(_) | Self::Decode(_))
     }
 }
 
