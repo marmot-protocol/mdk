@@ -418,7 +418,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   with the adapter's fence ticket and held routes; `fence_live_frames` answers with that ticket. Nothing calls
   them or `enable_live_fences` before the switch-over. Logs carry aggregates only.
   An Unrecoverable group's routes are suspended (`RunnerRoute.unrecoverable`, read from the engine's group record
-  each debt turn): never scheduled, charged, broken or noticed, and with the gate on the comparison owner drops their
+  each debt turn): never scheduled, charged, broken or noticed, left out of admission so what they staged is given
+  back as an unlisted route's is, and with the gate on the comparison owner drops their
   epoch-gap obligations from its grant fence (`suspended_epoch_gaps`); gate off, it fetches them as before. A
   retained route's ceiling (`retained_route_goal_until`) caps every debt and re-check read through
   `DebtTurn::owed_until`/`checked_until`; never store it. Route-gone retirement runs only in the runner's debt turn

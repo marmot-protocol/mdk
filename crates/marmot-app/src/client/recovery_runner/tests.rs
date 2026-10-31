@@ -3771,6 +3771,58 @@ async fn recovery_runner_gives_back_what_an_unlisted_route_staged() {
     assert_eq!(blocked(host.survey(policy).await).get(RELAY), Some(&false));
 }
 
+/// A group whose copy froze after a sweep staged its history ingests none of
+/// it: admission gives it back, owed again, so it holds no bound either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_gives_back_what_a_suspended_group_staged() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (frozen, other) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    let events = every([1; 32], floor, t0, 10 * 60);
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    for route in [&frozen, &other] {
+        account.goal(route, floor);
+    }
+    account.swept(&frozen, RELAY, &events, floor, t0 - 1);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![
+            RunnerRoute {
+                unrecoverable: true,
+                ..required(&frozen, &[RELAY])
+            },
+            required(&other, &[RELAY]),
+        ],
+        &[&relay],
+    );
+    for route in [&frozen, &other] {
+        host.tails.stand(route, RELAY, t0);
+    }
+    let mut policy = test_policy();
+    policy.staging.account_bytes = 1;
+    assert_eq!(account.staged_from(std::slice::from_ref(&frozen), RELAY), 6);
+
+    let (mut runner, _handle) = runner(&host, policy);
+    assert!(matches!(
+        runner.admit(None).await,
+        Ok(Drained { due: None, .. })
+    ));
+    assert!(
+        account.admitted().is_empty(),
+        "nothing enters the frozen copy"
+    );
+    assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+    assert!(!account.debt(&frozen, RELAY, t0 - 1).is_empty());
+    assert_eq!(
+        blocked(host.survey(policy).await).get(RELAY),
+        Some(&false),
+        "the other group is not held back by the frozen one's rows"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_holds_a_group_behind_an_event_the_engine_kept_no_trace_of() {
     let account = account();

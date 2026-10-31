@@ -786,9 +786,11 @@ in the window class while the window holds its capture. A reconnect is a relay w
 connection generation in the account's relay pool moved since the runner last looked: it ends
 that relay's cooldown, its caps are read again, and the survey that follows reads fresh tails.
 The runner's first look only records the generations, so a connection made before it ends
-nothing. An Unrecoverable group's routes are suspended: their debt keeps accruing, but their
+nothing. A reconnect that a lag of the pool's notifications skipped still moves the
+generation, and a relay that leaves the pool leaves the feed. An Unrecoverable group's routes are suspended: their debt keeps accruing, but their
 units and re-checks are not scheduled, charged, broken or noticed, since a fetch would only
-fill the frozen copy's deferred input. With the gate on, the comparison owner also leaves their
+fill the frozen copy's deferred input. For the same reason admission gives back what the group
+had staged, owed again, so it holds no staging bound, frontier or fence. With the gate on, the comparison owner also leaves their
 epoch-gap obligations out of its grant, so they stay ready and are never fetched. A retained
 route owes nothing past its switch plus the clock-skew allowance: members that had not applied
 the switch by then still send there, and its live subscription carries that. A relay a route

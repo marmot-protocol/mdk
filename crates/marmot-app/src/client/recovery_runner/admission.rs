@@ -57,7 +57,7 @@ use storage_sqlite::{
 use tokio::time::Instant;
 
 use super::policy::RecoveryStagingBounds;
-use super::select::sweepable;
+use super::select::{suspended, sweepable};
 use super::{
     DebtTurn, RecoveryRunner, RecoveryRunnerPolicy, RunnerHost, RunnerRoute, Step, TARGET, UnitKey,
 };
@@ -194,7 +194,10 @@ impl Group {
 /// The account's groups as one debt turn reads them, each on first use.
 pub(super) struct Admission<'t> {
     turn: &'t DebtTurn<'t>,
-    /// Each group's routes, and the group of each.
+    /// Each group's routes, and the group of each. A suspended group is
+    /// left out, as an unlisted one is: its staged events would only fill
+    /// the frozen copy's deferred input, so they are given back and owed
+    /// again, and it holds no frontier, staging bound or fence.
     groups: BTreeMap<GroupKey, Vec<&'t RunnerRoute>>,
     route_groups: BTreeMap<&'t TransportReconciliationRoute, GroupKey>,
     /// The ranges the turn's live counts left unproven, by (route, relay).
@@ -211,7 +214,7 @@ impl<'t> Admission<'t> {
     pub(super) fn new(turn: &'t DebtTurn<'t>) -> Self {
         let mut groups: BTreeMap<GroupKey, Vec<&RunnerRoute>> = BTreeMap::new();
         let mut route_groups = BTreeMap::new();
-        for route in sweepable(turn.routes) {
+        for route in sweepable(turn.routes).filter(|route| !suspended(route)) {
             let key = group_key(route);
             route_groups.insert(&route.route, key.clone());
             groups.entry(key).or_default().push(route);
@@ -355,8 +358,9 @@ impl<'t> Admission<'t> {
         Ok(())
     }
 
-    /// Give back what routes the runner no longer lists staged: nothing would
-    /// admit it, and it would count against the account's bound for good.
+    /// Give back what routes the runner no longer lists, or has suspended,
+    /// staged: nothing would admit it, and it would count against the
+    /// account's bound for good.
     fn reclaim_unlisted(&mut self) -> StorageResult<()> {
         let app = self.turn.app;
         let unlisted = app

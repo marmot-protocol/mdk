@@ -1154,6 +1154,14 @@ impl SdkNotificationFrontier {
         else {
             return false;
         };
+        // A connection the skipped notifications held still reconnected the
+        // relay. AUTH and the lag itself count no connection.
+        if connections_seen > entry.connections_seen {
+            let connection = SDK_CONNECTION_EPOCH.fetch_add(1, Ordering::SeqCst);
+            self.connections.send_modify(|open| {
+                open.insert(url.to_string(), connection);
+            });
+        }
         entry.connections_seen = connections_seen;
         entry.connected_at = connection_stamp(relay, connections_seen);
         self.cutover_locked(&mut state, skipped);
@@ -1266,6 +1274,8 @@ impl SdkNotificationFrontier {
         if let Some(entry) = state.relays.remove(endpoint) {
             entry.monitor.abort();
         }
+        self.connections
+            .send_if_modified(|open| open.remove(&endpoint.to_string()).is_some());
     }
 
     fn attach(self: &Arc<Self>, relay: &Relay, mode: RelayMonitorAttach) {
@@ -2145,9 +2155,11 @@ impl NostrSdkRelayClient {
 
     /// Each relay of this pool that has connected since its monitor attached,
     /// with the generation of its latest connection: a relay's generation
-    /// changes each time it connects again. A consumer compares generations
-    /// with the ones it last saw to learn which relays reconnected; a change
-    /// carries nothing else. Only relays this transport monitors appear.
+    /// changes each time it connects again, a connection a receiver lag
+    /// skipped included. A consumer compares generations with the ones it
+    /// last saw to learn which relays reconnected; a change carries nothing
+    /// else. Only relays this transport monitors appear, and a relay leaves
+    /// once its monitor detaches.
     #[doc(hidden)]
     pub fn relay_connections(&self) -> watch::Receiver<BTreeMap<String, u64>> {
         self.frontier.connections.subscribe()
@@ -7494,6 +7506,118 @@ mod tests {
         .expect("the live marker follows isolated acquisition replies");
         sdk.shutdown().await;
         relay.shutdown();
+    }
+
+    /// A connected relay, its monitor attached, and the feed's entry for it.
+    async fn connected_feed(
+        wire: &ReplayWire,
+    ) -> (
+        NostrSdkRelayClient,
+        RelayUrl,
+        watch::Receiver<BTreeMap<String, u64>>,
+    ) {
+        let url = RelayUrl::parse(wire.endpoint.as_str()).unwrap();
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        sdk.add_subscription_relay(url.clone(), &SubscriptionId::new("live"))
+            .await
+            .unwrap();
+        sdk.client.relay(&url).await.unwrap().unwrap().connect();
+        let mut connections = sdk.relay_connections();
+        timeout(Duration::from_secs(5), async {
+            while !connections
+                .borrow_and_update()
+                .contains_key(&url.to_string())
+            {
+                connections.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the relay connects");
+        (sdk, url, connections)
+    }
+
+    #[tokio::test]
+    async fn a_detached_relay_leaves_the_connection_feed() {
+        let wire = ReplayWire::new().await;
+        let (sdk, url, connections) = connected_feed(&wire).await;
+        sdk.client().remove_relay(url.clone()).await.unwrap();
+        sdk.frontier.detach(&url);
+        assert!(connections.borrow().is_empty());
+        sdk.shutdown().await;
+    }
+
+    /// The monitor's receiver lags past a reconnect's `Connected`: the lag
+    /// still publishes the new connection. Multi-threaded: the held monitor
+    /// blocks its worker thread on the state lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lag_that_skips_a_reconnect_still_publishes_it() {
+        let wire = ReplayWire::new().await;
+        let (sdk, url, mut connections) = connected_feed(&wire).await;
+        let before = connections.borrow_and_update()[&url.to_string()];
+        let relay = sdk.client.relay(&url).await.unwrap().unwrap();
+        let mut native = relay.notifications_with_gaps();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let frontier = sdk.frontier.clone();
+        // Pause only the monitor at its state lock, as `lose_native` does.
+        let holder = std::thread::spawn(move || {
+            let _state = frontier.state.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = released.blocking_recv();
+        });
+        held_rx.await.unwrap();
+        let status = |wanted: RelayStatus| {
+            move |update: &NotificationUpdate<RelayNotification>| {
+                matches!(
+                    update,
+                    NotificationUpdate::Notification(RelayNotification::RelayStatus { status })
+                        if *status == wanted
+                )
+            }
+        };
+        wire.sender.send(ReplayWireCmd::Disconnect).await.unwrap();
+        let disconnected = status(RelayStatus::Disconnected);
+        timeout(Duration::from_secs(5), async {
+            while !disconnected(&native.next().await.unwrap()) {}
+        })
+        .await
+        .expect("the fixture disconnects the websocket");
+        // End the SDK's automatic backoff before requesting an immediate restart.
+        relay.disconnect();
+        relay.connect();
+        let reconnected = status(RelayStatus::Connected);
+        timeout(Duration::from_secs(5), async {
+            while !reconnected(&native.next().await.unwrap()) {}
+        })
+        .await
+        .expect("the relay reconnects");
+        for _ in 0..SDK_NOTIFICATION_CAPACITY {
+            wire.send(serde_json::json!(["NOTICE", "backlog"])).await;
+        }
+        wire.send(serde_json::json!(["NOTICE", "backlog end"]))
+            .await;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(NotificationUpdate::Notification(RelayNotification::Message { message })) = native.next().await
+                    && matches!(message.as_ref(), RelayMessage::Notice(text) if text == "backlog end") {
+                        break;
+                    }
+            }
+        })
+        .await
+        .expect("the SDK ingests the backlog while the monitor is held");
+        assert_eq!(connections.borrow()[&url.to_string()], before);
+
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        timeout(Duration::from_secs(5), async {
+            while connections.borrow_and_update()[&url.to_string()] == before {
+                connections.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the lag publishes the skipped reconnect");
+        sdk.shutdown().await;
     }
 
     #[tokio::test]
