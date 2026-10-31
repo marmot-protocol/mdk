@@ -264,6 +264,9 @@
 
 ### Added
 
+- The test-only `test-migrated-template` feature adds
+  `SqliteAccountStorage::in_memory_copy`, an in-memory copy of a database as
+  it stands, so a test can take one state down several branches.
 - `settle_recovery_recheck` applies one re-check quantum's outcome to its
   relay and the account's rolling-hour budget, never to its unit's retry
   state (mdk#2660 phase 4). `staged_recovery_items` lists the ids and times a
