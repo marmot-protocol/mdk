@@ -3776,6 +3776,26 @@ mod tests {
         assert_eq!(applied, expected_migrations());
     }
 
+    /// A version the ledger records under another name, such as one a
+    /// different build registered there, refuses the open instead of being
+    /// skipped as applied.
+    #[test]
+    fn a_version_applied_under_another_name_refuses_the_upgrade() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_through(&mut conn, 2).unwrap();
+        conn.execute(
+            "UPDATE cgka_schema_migrations SET name = '0002_other_build' WHERE version = 2",
+            [],
+        )
+        .unwrap();
+        let error = run_through(&mut conn, 3).unwrap_err().to_string();
+        assert!(
+            error.contains("migration 2 was applied as 0002_other_build"),
+            "{error}"
+        );
+        assert_eq!(applied_name(&conn, 3).unwrap(), None);
+    }
+
     #[test]
     fn group_owned_tables_have_cascading_foreign_keys() {
         let store = SqliteAccountStorage::in_memory().unwrap();
