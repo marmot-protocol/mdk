@@ -3,6 +3,7 @@
 //! Validated replacement invitations await explicit local confirmation.
 //! Declining stores durable transport and content deduplication markers.
 
+use crate::ingest::IngestOutcome;
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
 use serde::{Deserialize, Serialize};
 
@@ -26,4 +27,17 @@ pub struct RejoinWelcome {
     pub content_id: MessageId,
     pub welcomer: MemberId,
     pub local_state_token: Vec<u8>,
+}
+
+/// What joining from a sibling Welcome came to (mdk#2628 3.5b).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SiblingWelcomeJoin {
+    /// Settled as an ingested Welcome settles: joined, or refused for a
+    /// reason.
+    Settled(IngestOutcome),
+    /// Into `group_id`, a chat this device still holds an active copy of.
+    /// Nothing was written and the KeyPackage is still held: the caller keeps
+    /// the Welcome and joins it again once that copy reads removed or
+    /// unrecoverable.
+    Held { group_id: GroupId },
 }

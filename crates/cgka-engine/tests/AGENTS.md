@@ -231,9 +231,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `account_devices/device_tag.rs` (test-policy builds only)
   - **Owns:** `marmot.member.device-tag.v1` (0x800f, mdk#2628 item 3.1d) through the engine: a member leaf whose tag
-    verifies under a roster device's key reads as that device, against the current tree only; a tag that doesn't open
-    never invalidates a Commit; another account's leaf is unclaimed; a Commit, standalone proposal or Welcome that
-    requires 0x800f is rejected; a GroupContext entry under it is unknown data the engine never writes. Producing them:
+    verifies under a roster device's key reads as that device, in the current tree only, or, read at an epoch, in the
+    tree of that epoch (a past one from its own retained anchor, writing nothing; one with no anchor reads nothing); a
+    tag that doesn't open never invalidates a Commit; another account's leaf is unclaimed; a Commit, standalone
+    proposal or Welcome that requires 0x800f is rejected; a GroupContext entry under it is unknown data the engine
+    never writes. Producing them:
     a device that sets its own key in a roster update tags that Commit's UpdatePath; every KeyPackage it then builds
     carries a fresh tag, and an untagged or no longer matching one is stale; only the entry at its own slot tags, so
     another entry carrying its key tags nothing and an entry moved off its slot stops it tagging; a founder tags its
@@ -247,7 +249,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     transaction as their records and stay out of the KeyPackage inventory; a request stops earlier records counting
     without deleting their keys, is answered once, and past the per-sibling cap is answered with the newest ones handed over again (D42); records that no longer
     advertise this client's capabilities stop counting; an ordinary Welcome never consumes one; and a hand-off keeps
-    only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only).
+    only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only). A sibling
+    Welcome (3.5b) consumes only the private KeyPackage it names, issued to its sender, and one back into a chat still
+    held active is held, writing nothing, until that copy reads removed or unrecoverable. One carried no later than a
+    local forget is refused for that carrier alone, so the same Welcome in a later carrier joins.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and

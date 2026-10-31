@@ -71,6 +71,16 @@
   `mark_small_state_sent` and `owe_all_small_state_items`, with
   `SmallStateItem`, `SmallStateRule`, `SmallStateSchedule`,
   `SmallStateBroadcast` and their value types.
+- Migration 0160 advances account storage to schema 160 (mdk#2628 item 3.5b).
+  It adds `sibling_welcomes_received`, the sibling Welcomes this device
+  admitted from its device group and has not joined from yet, keyed by the
+  message that carried each, at most `MAX_STASHED_SIBLING_WELCOMES` at once.
+  A row the engine held, because this device still held an active copy of
+  its chat, keeps that chat's id, and a full stash drops its oldest held row
+  to keep a new one. `SqliteAppStorage` gains `stash_sibling_welcome`,
+  `stashed_sibling_welcomes`, `hold_stashed_sibling_welcome` and
+  `delete_stashed_sibling_welcome`, over `StashedSiblingWelcome`. Nothing
+  writes them unless device groups are on.
 - Migration 0137 advances account storage to schema 137 (mdk#2628 item 3.6).
   It adds `device_renames`, one row per device this device renamed in its
   device group's roster: the label its latest rename sets, the rename ids

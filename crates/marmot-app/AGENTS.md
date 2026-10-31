@@ -189,21 +189,33 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
   `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in `observe_device_group_event`
   (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
-  D33). That read sees only the current tree, so a message from an earlier epoch has no readable sender. List every kind
-  sent only in a device group in `is_device_group_kind` (457, 459, 460, 475, 476), the one list: `observe_event`
-  drops one received in any other group before the host summary and the stored projection, the notification preview
-  refuses it, and the custom path rejects it as reserved. The engine withdraws a message by message id alone (an own
-  send's transport id, a received message's content id), so a kind whose withdrawal a feature acts on is listed in
-  `withdrawal_handled` and dispatched in `device_group_message_withdrawn`. Each such message is recorded with its kind
-  in `device_group_messages` when sent (before the send; its message id is filled in from whichever drain's effects
-  publish it, in `retain_effect_projection`) and when read. Records go after a week or past 4,096, so a feature also
-  acts on a withdrawn message with no record, which may be of any kind.
+  D33). A message from an earlier epoch is read from that epoch's retained anchor, so one older than the retained
+  anchors has no readable sender. List every kind sent only in a device group in `is_device_group_kind` (457, 459, 460,
+  461, 475, 476), the one list: `observe_event` drops one received in any other group before the host summary and the
+  stored projection, the notification preview refuses it, and the custom path rejects it as reserved. The engine
+  withdraws a message by message id alone (an own send's transport id, a received message's content id), so a kind
+  whose withdrawal a feature acts on is listed in `withdrawal_handled` and dispatched in
+  `device_group_message_withdrawn`. Each such message is recorded with its kind in `device_group_messages` when sent
+  (before the send; its message id is filled in from whichever drain's effects publish it, in
+  `retain_effect_projection`) and when read. Records go after a week or past 4,096, so a feature also acts on a
+  withdrawn message with no record, which may be of any kind.
 - Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
   Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
   roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
   this account's, single-use, unexpired and tagged as that slot's (mdk#2628 D33, through 3.1d's tag reader; never a
   second one). Never publish one, and never fall back to a public KeyPackage when none is held. A KeyPackage this
   device has used is never kept again if a sibling hands it over again (mdk#2628 D42).
+  Stash a sibling Welcome (461, mdk#2628 3.5b) only after a hand-off's checks, a relay list of one to 16 relay URLs
+  distinct once parsed, and a KeyPackage this device issued to its sender; join from the stash (migration 0160) in
+  the maintenance pass, never in the synchronous dispatch, only while its carrier is still `Processed`, and drain the
+  joins' events as a confirmed rejoin does. A refused or withdrawn 461 is dropped; one whose checks could not be read,
+  or admitted but not stashed, fails the event's projection, which is retried. One into a chat still held active is
+  held, never a rejoin offer (D72): its row keeps the chat's id, and a pass joins it, with no consent asked, only once
+  that copy reads removed or unrecoverable. A held row goes only when its carrier is withdrawn, its KeyPackage is used
+  or expired, the chat is forgotten or disbanded, or a full stash makes room for a new Welcome. A forget refuses only
+  the carriers dated before it, so the same Welcome sent again afterwards joins, whether or not a pass held it first.
+  Every call that can store or retire a rejoin offer (ingest, the retry, a confirmation, a decline, a join from the
+  stash) tells the host which chats' offers changed, even when it fails after a join.
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.

@@ -120,7 +120,9 @@ fn validate_nostr_relay_count(count: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_nostr_relay_url(relay: &str) -> Result<(), String> {
+/// Check one relay URL against the Nostr relay URL profile
+/// (`transports/nostr.md`, "Relay URL profile").
+pub fn validate_nostr_relay_url(relay: &str) -> Result<(), String> {
     if relay.is_empty() {
         return Err("Nostr relay URL must not be empty".into());
     }

@@ -49,10 +49,10 @@ pub use session::{
     application_message_len, durably_owned_key_packages, key_package_metadata,
 };
 pub use session::{
-    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,
-    MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW, PRIVATE_KEY_PACKAGE_STOCK_TARGET,
-    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, private_key_package_stock,
-    validate_received_private_key_package,
+    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
+    MAX_HAND_OFF_KEY_PACKAGES, MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW,
+    PRIVATE_KEY_PACKAGE_STOCK_TARGET, PrivateKeyPackageHandOff, PrivateKeyPackageRequest,
+    SiblingWelcome, private_key_package_stock, validate_received_private_key_package,
 };
 pub use time::{
     MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
