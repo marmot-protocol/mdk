@@ -1200,6 +1200,84 @@ mod tests {
         );
     }
 
+    /// A one-invitee Welcome into a group of about 150 members carries about
+    /// 55 KB of MLS bytes. Its rumor and its seal both reach 65,536 bytes, so
+    /// both NIP-44 layers need the extended length prefix (#2335).
+    #[tokio::test]
+    async fn welcome_wrap_and_peel_round_trip_nip44_extended_length_payloads() {
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
+        let welcome: Vec<u8> = (0..55_176u32).map(|i| i as u8).collect();
+
+        let wrapped = NostrMlsPeeler::new()
+            .with_welcome_signer(sender)
+            .wrap_welcome_with_metadata(
+                &EncryptedPayload {
+                    ciphertext: welcome.clone(),
+                    aad: vec![],
+                },
+                &recipient,
+                &sample_welcome_metadata(),
+            )
+            .await
+            .expect("wrap succeeds");
+
+        let gift_wrap = NostrTransportEvent::from_transport_message(&wrapped)
+            .unwrap()
+            .to_verified_nostr_event()
+            .unwrap();
+        let seal_json = nostr::nips::nip44::decrypt(
+            receiver.secret_key(),
+            &gift_wrap.pubkey,
+            &gift_wrap.content,
+        )
+        .unwrap();
+        assert_nip44_extended_length(&gift_wrap.content, seal_json.len());
+        let seal = Event::from_json(&seal_json).unwrap();
+        let rumor_json =
+            nostr::nips::nip44::decrypt(receiver.secret_key(), &seal.pubkey, &seal.content)
+                .unwrap();
+        assert_nip44_extended_length(&seal.content, rumor_json.len());
+
+        let peeled = NostrMlsPeeler::new()
+            .with_welcome_signer(receiver)
+            .peel_welcome(&wrapped)
+            .await
+            .expect("peel succeeds");
+        assert!(matches!(
+            peeled.content,
+            PeeledContent::Welcome { ref bytes, .. } if *bytes == welcome
+        ));
+    }
+
+    /// `payload` is a NIP-44 v2 payload of a `plaintext_len`-byte plaintext
+    /// with the 6-byte extended length prefix: version, nonce, prefix, padded
+    /// plaintext and MAC.
+    #[track_caller]
+    fn assert_nip44_extended_length(payload: &str, plaintext_len: usize) {
+        assert!(plaintext_len >= 65_536, "{plaintext_len}-byte plaintext");
+        let decoded = BASE64_STANDARD.decode(payload).unwrap();
+        assert_eq!(
+            decoded.len(),
+            1 + 32 + 6 + nip44_padded_len(plaintext_len) + 32
+        );
+    }
+
+    /// NIP-44 v2 `calc_padded_len`.
+    fn nip44_padded_len(len: usize) -> usize {
+        if len <= 32 {
+            return 32;
+        }
+        let next_power = 1usize << (usize::BITS - (len - 1).leading_zeros());
+        let chunk = if next_power <= 256 {
+            32
+        } else {
+            next_power / 8
+        };
+        chunk * ((len - 1) / chunk + 1)
+    }
+
     #[tokio::test]
     async fn welcome_provenance_uses_computed_unsigned_rumor_id() {
         let sender = sender_keys();

@@ -169,7 +169,8 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
   - **Owns:** Repo-wide production tracing privacy audit.
 
 - **File:** `vector_artifacts.rs`
-  - **Owns:** Vector manifest and byte-fixture well-formedness checks.
+  - **Owns:** Vector manifest and byte-fixture well-formedness checks, and the Welcome wire fixture's unwrap through
+    the real peeler with both NIP-44 layers on the extended length prefix (#2335).
 
 ## Rules
 
