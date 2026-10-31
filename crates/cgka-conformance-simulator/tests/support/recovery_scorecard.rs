@@ -424,6 +424,22 @@ fn summarize(relay: &RelayTrafficV1, workload: &Workload) -> Value {
     summary
 }
 
+/// An account recovery status in counts, without group or notice ids, for
+/// printed and saved reports.
+pub(super) fn status_summary(status: &marmot_app::AccountRecoveryStatus) -> Value {
+    let mut notices = BTreeMap::<String, usize>::new();
+    for notice in &status.notices {
+        let cause = serde_json::to_value(notice.cause).ok();
+        let cause = cause.as_ref().and_then(Value::as_str).unwrap_or("unknown");
+        *notices.entry(cause.to_owned()).or_default() += 1;
+    }
+    json!({
+        "catching_up_groups": status.catching_up_group_ids_hex.len(),
+        "inbox_catching_up": status.inbox_catching_up,
+        "notices_by_cause": notices,
+    })
+}
+
 /// Nearest-rank percentiles of millisecond samples.
 pub(super) fn percentiles(samples: impl IntoIterator<Item = f64>) -> Value {
     let mut sorted = samples.into_iter().collect::<Vec<_>>();
@@ -663,7 +679,7 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
         "relays": measured.iter().map(|relay| summarize(relay, workload)).collect::<Vec<_>>(),
         "events_delivered_by_both_relays": both.count(),
         "history_requests": history_requests,
-        "account_recovery_status_at_end": account_status.map_err(|error| error.message),
+        "account_recovery_status_at_end": account_status.as_ref().map(status_summary).map_err(|error| &error.message),
         "idle_window": {"seconds": IDLE_WINDOW.as_secs(), "relays": idle.collect::<Vec<_>>()},
         "telemetry": {"before": telemetry_before, "after": telemetry_after},
     }))

@@ -24,7 +24,7 @@ use cgka_conformance_simulator::{
 use cgka_traits::GroupId;
 use serde_json::{Value, json};
 
-use super::recovery_scorecard::percentiles;
+use super::recovery_scorecard::{percentiles, status_summary};
 use super::{SETTLEMENT, TestResult, journey_artifacts, save};
 
 /// They publish the owed backlog in parallel, so bob is the only account
@@ -607,36 +607,35 @@ async fn holds_exactly(
     Ok(observed == expected)
 }
 
-/// Whether the runner reports nothing left to fetch, read after one of its
-/// attempts since `trace_from` (trace clock). The status lists nothing until
-/// a runner has surveyed, and keeps its last survey's answer across a
-/// reconnect, so a clear status read before such an attempt proves nothing:
-/// the runner surveys before each attempt.
+/// Whether the runner reports nothing left to fetch and nothing parked, read
+/// after one of its attempts since `trace_from` (trace clock). The status
+/// lists nothing until a runner has surveyed, and keeps its last survey's
+/// answer across a reconnect, so a clear status read before such an attempt
+/// proves nothing: the runner surveys before each attempt. A parked unit
+/// leaves the catching-up fields and shows only as a notice.
 async fn caught_up(bob: &AppRuntimeProbe, trace_from: u64) -> TestResult<bool> {
     if runner_trace::since(trace_from).is_empty() {
         return Ok(false);
     }
     let status = bob.account_recovery_status().await?;
-    Ok(status.catching_up_group_ids_hex.is_empty() && !status.inbox_catching_up)
+    Ok(status.catching_up_group_ids_hex.is_empty()
+        && !status.inbox_catching_up
+        && status.notices.is_empty())
 }
 
-/// Run a proof journey under the watchdog, save its report, close every
-/// runtime, and return the report or the journey's error.
-/// Run `journey` with bob in this process, his recovery runner owning debt
-/// from the start or, without `owning_debt`, only once the journey turns it on.
-async fn run_proof<J>(label: &str, owning_debt: bool, journey: J) -> Value
+/// Run a proof journey with bob in this process and his recovery runner
+/// owning debt, under the watchdog; save its report, close every runtime, and
+/// return the report or the journey's error.
+async fn run_proof<J>(label: &str, journey: J) -> Value
 where
     J: AsyncFnOnce(&mut AppRuntimeHarness, &Path) -> TestResult<Value>,
 {
     let artifacts = journey_artifacts(label);
     let clients = clients();
     runner_trace::start().expect("capture the runner's trace");
-    let subject = if owning_debt {
-        AppRuntimeHarness::new_with_relay_pair_owning_debt(&clients, &clients[1..2]).await
-    } else {
-        AppRuntimeHarness::new_with_relay_pair(&clients, &clients[1..2]).await
-    };
-    let mut subject = subject.expect("runner proof harness setup");
+    let mut subject = AppRuntimeHarness::new_with_relay_pair_owning_debt(&clients, &clients[1..2])
+        .await
+        .expect("runner proof harness setup");
     let outcome = tokio::time::timeout(WATCHDOG, journey(&mut subject, artifacts.path()))
         .await
         .unwrap_or_else(|_| {
@@ -679,7 +678,7 @@ where
 /// from the healthy endpoint, live messages must keep arriving, and the
 /// stalled endpoint's attempts must thin out instead of repeating.
 pub(super) async fn stalled_relay_loop() {
-    let report = run_proof("runner-loop", true, async |subject, out| {
+    let report = run_proof("runner-loop", async |subject, out| {
         let started = Instant::now();
         let clients = clients();
         let group = create(subject, "loop", &clients).await?;
@@ -746,7 +745,7 @@ pub(super) async fn stalled_relay_loop() {
                 "second_half_wasted": wasted(&runner[1]),
             },
             "history": history.iter().map(|requests| history_summary(requests, &labels)).collect::<Vec<_>>(),
-            "status_at_end": status,
+            "status_at_end": status_summary(&status),
         });
         save(out, "history.json", &history)?;
         save(out, "runner-trace.json", &runner_trace::since(trace_t0))?;
@@ -781,7 +780,7 @@ pub(super) async fn stalled_relay_loop() {
 ///   quiet group's, which has no event in its live range. Live messages to
 ///   the quiet group are never held behind it.
 pub(super) async fn owed_history() {
-    let report = run_proof("runner-owed-history", true, async |subject, out| {
+    let report = run_proof("runner-owed-history", async |subject, out| {
         let started = Instant::now();
         let clients = clients();
         let pair = clients[..2].to_vec();
@@ -927,7 +926,7 @@ pub(super) async fn owed_history() {
                 "history": summaries(&after_reconnect),
                 "runner": runner_summary(&reconnect_trace),
             },
-            "status_at_end": status,
+            "status_at_end": status_summary(&status),
         });
         save(out, "history.json", &json!({"restart": after_restart, "idle": idle, "reconnect": after_reconnect}))?;
         save(out, "runner-trace.json", &runner_trace::since(trace_restart))?;
