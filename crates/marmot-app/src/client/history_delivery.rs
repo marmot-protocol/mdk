@@ -9,21 +9,25 @@
 //! chat's history in inline bundles, seals each bundle's key and hash to the
 //! receiver's history key, and sends one delivery per bundle. Whether the
 //! sibling asks for history is read then. A send that reached no relay leaves
-//! the history owed; a delivery that branch selection withdraws makes it owed
-//! again. A history longer than [`MAX_INLINE_BUNDLES`] is not sent.
+//! the history owed; a delivery that branch selection withdraws, or whose
+//! queued publish later fails for good, makes it owed again. A history longer
+//! than [`MAX_INLINE_BUNDLES`] is not sent, and an event too large for one
+//! delivery is left out.
 //!
 //! The receiver reads a delivery only from a sibling whose leaf is tagged,
 //! only when it names this device, and only when it opens with this device's
 //! history key. It imports the bundle through 4.2a once it holds the chat
 //! and parks the delivery until then.
 //!
-//! Owed and parked deliveries go after a week.
+//! Owed and parked deliveries go after a week. A history is owed from the
+//! add's confirmation, so one is still sent when branch selection later
+//! withdraws that Commit; the sibling imports it only if it joins the chat.
 
 use cgka_traits::app_components::DeviceSlotId;
 use cgka_traits::app_event::MarmotAppEvent;
 use cgka_traits::storage::SiblingAddStorage as _;
 use cgka_traits::{EpochId, GroupId, MessageId};
-use storage_sqlite::{OwedHistoryDelivery, ParkedHistoryDelivery};
+use storage_sqlite::{HISTORY_DELIVERY_RETENTION_SECS, OwedHistoryDelivery, ParkedHistoryDelivery};
 use zeroize::Zeroizing;
 
 use super::AppClient;
@@ -66,17 +70,21 @@ impl AppClient {
 
     /// Owe each sibling that one of this device's own confirmed Commits added
     /// to a chat the chat's history, counted from the add, then forget the
-    /// add. Owing again what is already owed changes nothing, so a crash
+    /// add. An add a week old is forgotten unowed, as its history would have
+    /// been. Owing again what is already owed changes nothing, so a crash
     /// between the two only owes it again.
     fn owe_added_siblings_history(&self) -> Result<(), AppError> {
         let account = self.app.account_storage(&self.state.label)?;
         let storage = account.app_storage();
+        let expired_before = unix_now_seconds().saturating_sub(HISTORY_DELIVERY_RETENTION_SECS);
         for add in account.sibling_adds()? {
-            storage.owe_history_delivery(
-                &hex::encode(add.group_id.as_slice()),
-                &hex::encode(add.slot),
-                add.added_at,
-            )?;
+            if add.added_at >= expired_before {
+                storage.owe_history_delivery(
+                    &hex::encode(add.group_id.as_slice()),
+                    &hex::encode(add.slot),
+                    add.added_at,
+                )?;
+            }
             account.forget_sibling_add(&add)?;
         }
         Ok(())
@@ -369,11 +377,30 @@ impl AppClient {
         else {
             return Ok(());
         };
-        if storage.owe_withdrawn_history_delivery(&app_event_id)? {
+        if storage.owe_history_delivery_again(&app_event_id)? {
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "history_delivery_withdrawn",
                 "a withdrawn history delivery is owed again"
+            );
+        }
+        Ok(())
+    }
+
+    /// The publish of `app_event_id` failed for good, perhaps in a drain after
+    /// the send that queued it: when it was a history delivery, owe its
+    /// history again.
+    pub(crate) fn history_delivery_failed(&self, app_event_id: &str) -> Result<(), AppError> {
+        if self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .owe_history_delivery_again(app_event_id)?
+        {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                method = "history_delivery_failed",
+                "a failed history delivery is owed again"
             );
         }
         Ok(())

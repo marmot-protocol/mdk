@@ -172,8 +172,8 @@
   its siblings (`owe_history_delivery`, `unsent_history_deliveries`,
   `mark_history_delivery_sent`, `forget_history_delivery`);
   `history_delivery_sends` names the chat and receiver of each delivery sent
-  (`record_history_delivery_send`), so `owe_withdrawn_history_delivery` owes a
-  withdrawn delivery's history again; and `history_deliveries_parked` keeps
+  (`record_history_delivery_send`), so `owe_history_delivery_again` owes the
+  history of a delivery withdrawn or failed for good again; and `history_deliveries_parked` keeps
   deliveries read before this device holds their chat, at most 1,024
   (`park_history_delivery`, `parked_history_delivery_chats`,
   `parked_history_deliveries`, `drop_parked_history_delivery`).

@@ -197,9 +197,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   send's transport id, a received message's content id), so a kind whose withdrawal a feature acts on is listed in
   `withdrawal_handled` and dispatched in `device_group_message_withdrawn`. Each such message is recorded with its kind
   in `device_group_messages` when sent (before the send; its message id is filled in from whichever drain's effects
-  publish it, in `retain_effect_projection`) and, unless only its sender acts on a withdrawal
-  (`recorded_when_read`), when read. Records go after a week or past 4,096, so a feature also acts on a withdrawn
-  message with no record, which may be of any kind.
+  publish it, in `retain_effect_projection`) and when read. Records go after a week or past 4,096, so a feature also
+  acts on a withdrawn message with no record, which may be of any kind.
 - Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
   Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
   roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
@@ -214,7 +213,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   sibling an own confirmed Commit adds (`SiblingAddStorage`), and maintenance owes each its chat's history
   (`owe_added_siblings_history`) before sending anything, never from another trigger. Whether the sibling asks for
   history and carries a history key is read at send time; a history that cannot be sent is forgotten. Record each
-  delivery's chat and receiver by app event id before its send, so a withdrawal owes the history again; keep it owed
+  delivery's chat and receiver by app event id before its send, so a withdrawal or a later terminal publish failure
+  (`history_delivery_failed`, from the retained failed-message bookkeeping) owes the history again; keep it owed
   until every delivery reached a relay. Seal only the bundle's key and hash, to the receiver's history key, with
   `delivery_context` binding the purpose, both slots and the chat. Read a delivery only in the trusted device group,
   addressed to this device, from a sibling through `ensure_sent_by`, and refuse one that does not open rather than

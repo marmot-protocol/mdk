@@ -104,14 +104,17 @@
   inline, with the bundle's key and hash sealed to the receiver's history key
   for that sender, receiver and chat. The sender owes the history from the
   add before sending, keeps it owed until every delivery reached a relay,
-  owes it again when branch selection withdraws a delivery, and forgets it a
-  week after the add, or at once when the history needs more than eight
-  inline bundles or the receiver does not ask for history. The receiver reads
+  owes it again when branch selection withdraws a delivery or its queued
+  publish later fails for good, and forgets it a week after the add, or at
+  once when the history needs more than eight inline bundles or the receiver
+  does not ask for history. An event too large for one delivery is left out. The receiver reads
   a delivery only from a sibling whose leaf is tagged, addressed to it, and
   opening with its own history key; it imports the bundle once it holds the
   chat and parks it for up to a week until then. A delivery read after a
   later device-group commit has no readable sender and is refused, and there
-  are no receipts, so its history is lost. Only behind `dev_device_groups`.
+  are no receipts, so its history is lost. A history is still sent when
+  branch selection later withdraws the adding Commit. Only behind
+  `dev_device_groups`.
 - `MarmotAppConfig::device_platform` (`with_device_platform`) names the
   platform this device runs on. Each device writes it and
   `key_package_client_name` into its own roster entry with its next KeyPackage

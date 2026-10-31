@@ -28,10 +28,9 @@
 //!   only by its message id (an own send's transport id, a received
 //!   message's content id), so each message of a kind in
 //!   [`withdrawal_handled`] is recorded with its kind when this device sends
-//!   it, and also when it reads it unless only the sender acts on a
-//!   withdrawal ([`recorded_when_read`]). A feature adds its kinds to both.
-//!   Records go after a week or past 4,096, so a feature also says what a
-//!   withdrawn message of no recorded kind owes it.
+//!   or reads it. A feature adds its kinds to both. Records go after a week
+//!   or past 4,096, so a feature also says what a withdrawn message of no
+//!   recorded kind owes it.
 
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
 use cgka_traits::app_event::MarmotAppEvent;
@@ -175,7 +174,7 @@ impl AppClient {
             _ => return,
         };
         let result = result.and_then(|()| {
-            if recorded_when_read(message.kind) {
+            if withdrawal_handled(message.kind) {
                 self.record_device_group_message(
                     group_id,
                     &message.id,
@@ -419,10 +418,4 @@ fn withdrawal_handled(kind: u64) -> bool {
         kind,
         KIND_HISTORY_DELIVERY | KIND_SMALL_STATE_UPDATE | KIND_SMALL_STATE_BROADCAST_REQUEST
     )
-}
-
-/// Whether a message of `kind` this device read is recorded too. A withdrawn
-/// history delivery owes only its sender anything, so a reader records none.
-fn recorded_when_read(kind: u64) -> bool {
-    withdrawal_handled(kind) && kind != KIND_HISTORY_DELIVERY
 }

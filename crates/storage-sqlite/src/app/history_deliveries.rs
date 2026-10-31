@@ -18,6 +18,8 @@ pub struct OwedHistoryDelivery {
     pub group_id_hex: String,
     pub receiver_slot_hex: String,
     pub owed_at: u64,
+    /// How many times it was owed again; a later one is a newer obligation.
+    pub revision: u64,
 }
 
 /// A delivery read before this device held its chat, as received.
@@ -49,7 +51,8 @@ impl SqliteAppStorage {
                  VALUES (?1, ?2, ?3, NULL)
                  ON CONFLICT(group_id_hex, receiver_slot_hex) DO UPDATE SET
                      owed_at = excluded.owed_at,
-                     sent_at = NULL",
+                     sent_at = NULL,
+                     revision = revision + 1",
                 params![group_id_hex, receiver_slot_hex, u64_to_i64(now)?],
             )
             .storage()?;
@@ -82,14 +85,15 @@ impl SqliteAppStorage {
         Ok(())
     }
 
-    /// Branch selection withdrew the delivery `app_event_id`: owe its history
-    /// again, as it was first owed. Returns false when this device sent no
-    /// such delivery or no longer owes that history.
-    pub fn owe_withdrawn_history_delivery(&self, app_event_id: &str) -> StorageResult<bool> {
+    /// The delivery `app_event_id` reaches no one, because branch selection
+    /// withdrew it or its publish failed for good: owe its history again, as
+    /// it was first owed. Returns false when this device sent no such
+    /// delivery or no longer owes that history.
+    pub fn owe_history_delivery_again(&self, app_event_id: &str) -> StorageResult<bool> {
         let changed = self
             .lock()?
             .execute_cached(
-                "UPDATE history_deliveries_owed SET sent_at = NULL
+                "UPDATE history_deliveries_owed SET sent_at = NULL, revision = revision + 1
                  WHERE (group_id_hex, receiver_slot_hex) IN (
                      SELECT group_id_hex, receiver_slot_hex FROM history_delivery_sends
                      WHERE app_event_id = ?1
@@ -105,7 +109,7 @@ impl SqliteAppStorage {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT group_id_hex, receiver_slot_hex, owed_at
+                "SELECT group_id_hex, receiver_slot_hex, owed_at, revision
                  FROM history_deliveries_owed WHERE sent_at IS NULL
                  ORDER BY owed_at, group_id_hex, receiver_slot_hex",
             )
@@ -116,24 +120,27 @@ impl SqliteAppStorage {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
         rows.into_iter()
-            .map(|(group_id_hex, receiver_slot_hex, owed_at)| {
+            .map(|(group_id_hex, receiver_slot_hex, owed_at, revision)| {
                 Ok(OwedHistoryDelivery {
                     group_id_hex,
                     receiver_slot_hex,
                     owed_at: i64_to_u64(owed_at)?,
+                    revision: i64_to_u64(revision)?,
                 })
             })
             .collect()
     }
 
     /// Mark `owed` sent at `now`, if it is still owed as it was read: a
-    /// history owed again since stays owed.
+    /// history owed again since, even while its deliveries went out, stays
+    /// owed.
     pub fn mark_history_delivery_sent(
         &self,
         owed: &OwedHistoryDelivery,
@@ -143,11 +150,11 @@ impl SqliteAppStorage {
             .execute_cached(
                 "UPDATE history_deliveries_owed SET sent_at = ?4
                  WHERE group_id_hex = ?1 AND receiver_slot_hex = ?2
-                   AND owed_at = ?3 AND sent_at IS NULL",
+                   AND revision = ?3 AND sent_at IS NULL",
                 params![
                     owed.group_id_hex,
                     owed.receiver_slot_hex,
-                    u64_to_i64(owed.owed_at)?,
+                    u64_to_i64(owed.revision)?,
                     u64_to_i64(now)?
                 ],
             )
@@ -162,11 +169,11 @@ impl SqliteAppStorage {
             .execute_cached(
                 "DELETE FROM history_deliveries_owed
                  WHERE group_id_hex = ?1 AND receiver_slot_hex = ?2
-                   AND owed_at = ?3 AND sent_at IS NULL",
+                   AND revision = ?3 AND sent_at IS NULL",
                 params![
                     owed.group_id_hex,
                     owed.receiver_slot_hex,
-                    u64_to_i64(owed.owed_at)?
+                    u64_to_i64(owed.revision)?
                 ],
             )
             .storage()?;
@@ -350,16 +357,26 @@ mod tests {
         store
             .record_history_delivery_send("e1", "aa", "s1", 30)
             .unwrap();
-        assert!(store.owe_withdrawn_history_delivery("e1").unwrap());
+        assert!(store.owe_history_delivery_again("e1").unwrap());
         let again = store.unsent_history_deliveries().unwrap();
-        assert_eq!(again[0], owed[0]);
+        assert_eq!(
+            (again[0].group_id_hex.as_str(), again[0].owed_at),
+            ("aa", 10),
+            "owed again from the add"
+        );
+        // Owed again while its deliveries went out, as a withdrawal or
+        // failure drained mid-send does: the send's mark leaves it owed.
+        assert!(store.owe_history_delivery_again("e1").unwrap());
+        store.mark_history_delivery_sent(&again[0], 42).unwrap();
+        let again = store.unsent_history_deliveries().unwrap();
+        assert_eq!(again[0].group_id_hex, "aa");
         // Not a delivery this device sent: nothing to owe again.
-        assert!(!store.owe_withdrawn_history_delivery("e9").unwrap());
+        assert!(!store.owe_history_delivery_again("e9").unwrap());
         assert_eq!(store.unsent_history_deliveries().unwrap().len(), 2);
 
         store.forget_history_delivery(&again[0]).unwrap();
         assert_eq!(store.unsent_history_deliveries().unwrap().len(), 1);
-        assert!(!store.owe_withdrawn_history_delivery("e1").unwrap());
+        assert!(!store.owe_history_delivery_again("e1").unwrap());
     }
 
     #[test]
@@ -405,7 +422,7 @@ mod tests {
             .record_history_delivery_send("e1", "aa", "s1", DAY)
             .unwrap();
         assert_eq!(store.expire_history_deliveries(8 * DAY + 1).unwrap(), 3);
-        assert!(!store.owe_withdrawn_history_delivery("e1").unwrap());
+        assert!(!store.owe_history_delivery_again("e1").unwrap());
         assert_eq!(
             store.unsent_history_deliveries().unwrap()[0].group_id_hex,
             "bb"

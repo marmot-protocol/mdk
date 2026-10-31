@@ -149,8 +149,9 @@ mod tests {
             from: [1; 32],
             to: [2; 32],
             chat: vec![0xab; chat_len],
-            // A sealed key and hash: kem output, then 64 bytes and a tag.
-            sealed: vec![7; 1 + 32 + 1 + 64 + 16],
+            // A sealed key and hash: kem output, then 64 bytes and a tag,
+            // the ciphertext's length taking two bytes.
+            sealed: vec![7; 1 + 32 + 2 + 64 + 16],
             bundle: vec![9; bundle_len],
         }
     }

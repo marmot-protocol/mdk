@@ -295,6 +295,17 @@ mod tests {
         // kem_output<V> (32 bytes) then ciphertext<V> (6 + 16 bytes).
         assert_eq!(sealed.len(), 1 + 32 + 1 + 6 + 16);
         assert_eq!(sealed[0], 32);
+        // A history delivery's key and hash: its ciphertext's length takes
+        // two bytes.
+        let delivery = seal_history(
+            &crypto,
+            DEFAULT_CIPHERSUITE,
+            &pair.public,
+            CONTEXT,
+            &[0; 64],
+        )
+        .unwrap();
+        assert_eq!(delivery.len(), 1 + 32 + 2 + 64 + 16);
 
         let mut trailing = sealed.clone();
         trailing.push(0);

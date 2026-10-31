@@ -1,8 +1,8 @@
 //! Sealed history deliveries (mdk#2628 4.2b, D76): a chat's history sent
 //! through the device group to one sibling, by the device whose own Commit
 //! added it. The sender owes the history before it sends anything, and keeps
-//! owing it until every delivery reached a relay; a withdrawn delivery makes
-//! it owed again. The receiver imports a delivery it can open once it holds
+//! owing it until every delivery reached a relay; a delivery withdrawn, or
+//! whose publish fails for good, makes it owed again. The receiver imports a delivery it can open once it holds
 //! the chat, and parks it until then.
 
 use super::*;
@@ -192,8 +192,8 @@ async fn the_device_that_adds_a_sibling_to_a_chat_sends_it_the_history() {
             .device_group_messages()
             .unwrap()
             .iter()
-            .all(|(.., kind)| *kind != KIND_HISTORY_DELIVERY),
-        "only the sender records a delivery"
+            .any(|(.., kind)| *kind == KIND_HISTORY_DELIVERY),
+        "the reader records the delivery, so its withdrawal owes no small state"
     );
     assert!(
         devices
@@ -284,10 +284,11 @@ async fn a_delivery_the_receiver_cannot_open_is_refused() {
 }
 
 /// A history whose delivery reached no relay stays owed and goes at the
-/// next pass. Withdrawing a sent delivery makes it owed again; the receiver
-/// imports the second copy without adding a row twice.
+/// next pass. Withdrawing a sent delivery, or a later drain reporting that
+/// its publish failed for good, makes it owed again; the receiver imports
+/// the copies without adding a row twice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_history_stays_owed_until_it_reaches_a_relay_and_again_once_withdrawn() {
+async fn a_history_stays_owed_until_it_reaches_a_relay_and_again_once_withdrawn_or_failed() {
     let (mut devices, group, chat, first) = history_devices().await;
     let chat_hex = hex::encode(chat.as_slice());
     add_laptop(&mut devices, &chat).await;
@@ -320,6 +321,31 @@ async fn a_history_stays_owed_until_it_reaches_a_relay_and_again_once_withdrawn(
             reason: cgka_traits::engine::AppMessageInvalidationReason::LosingBranch,
             decrypted_payload_ref: None,
         });
+    assert_eq!(phone_storage.unsent_history_deliveries().unwrap().len(), 1);
+    devices.phone.drive_history_deliveries().await;
+    assert!(
+        phone_storage
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+
+    let (_, app_event_id, message_id, _) = phone_storage
+        .device_group_messages()
+        .unwrap()
+        .into_iter()
+        .rfind(|(.., kind)| *kind == KIND_HISTORY_DELIVERY)
+        .expect("the second delivery is recorded");
+    let failed = marmot_session::AccountDeviceEffects {
+        failed_app_messages: vec![marmot_session::FailedApplicationMessage {
+            group_id: group.clone(),
+            app_event_id,
+            message_id: MessageId::new(hex::decode(message_id.unwrap()).unwrap()),
+            reason: "every relay refused it".to_owned(),
+        }],
+        ..Default::default()
+    };
+    let _ = devices.phone.observe_drained_session_events(&failed).await;
     assert_eq!(phone_storage.unsent_history_deliveries().unwrap().len(), 1);
     devices.phone.drive_history_deliveries().await;
     assert!(
@@ -384,6 +410,28 @@ async fn a_history_too_long_to_send_inline_is_forgotten() {
     assert_eq!(published_count(&devices.relay), before);
     assert!(
         phone_storage
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// An add this device recorded a week ago, before it stopped for longer than
+/// that, is forgotten without owing or sending anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_add_a_week_old_is_forgotten_unsent() {
+    let (mut devices, _group, chat, _first) = history_devices().await;
+    let account = devices.phone_app.account_storage("alice").unwrap();
+    let week_old = crate::unix_now_seconds() - storage_sqlite::HISTORY_DELIVERY_RETENTION_SECS - 1;
+    account
+        .record_sibling_adds(&chat, &[slot_of(&devices.laptop)], week_old)
+        .unwrap();
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_deliveries().await;
+    assert_eq!(published_count(&devices.relay), before);
+    assert!(account.sibling_adds().unwrap().is_empty());
+    assert!(
+        storage(&devices.phone_app)
             .unsent_history_deliveries()
             .unwrap()
             .is_empty()

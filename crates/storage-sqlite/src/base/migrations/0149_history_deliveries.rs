@@ -13,7 +13,8 @@
 //!   group id as hex, a sibling its slot as hex. `owed_at` is when it became
 //!   owed, in seconds, and the row goes a week later. `sent_at` is NULL while
 //!   the history is still to be sent, and set once every delivery reached a
-//!   relay.
+//!   relay. `revision` goes up each time the history is owed again, so a send
+//!   that a withdrawal or failure overtook does not mark it sent.
 //! - `history_deliveries_parked`: on the receiving device, each delivery read
 //!   before this device holds its chat, kept until it does. One row per
 //!   delivery's app event id, with the chat, the sending sibling's slot, the
@@ -22,7 +23,8 @@
 //!   all but the newest 1,024 go.
 //! - `history_delivery_sends`: on the sending device, the chat and receiving
 //!   sibling of each delivery it sent, by the delivery's app event id, so a
-//!   delivery branch selection withdraws makes its history owed again.
+//!   delivery branch selection withdraws, or whose publish fails for good,
+//!   makes its history owed again.
 //!   `recorded_at` is in seconds; a row goes a week later.
 //!
 //! No rows are seeded.
@@ -43,6 +45,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             receiver_slot_hex TEXT NOT NULL,
             owed_at INTEGER NOT NULL CHECK(owed_at >= 0),
             sent_at INTEGER CHECK(sent_at IS NULL OR sent_at >= 0),
+            revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
             PRIMARY KEY (group_id_hex, receiver_slot_hex)
         ) WITHOUT ROWID;
         CREATE TABLE history_deliveries_parked (
