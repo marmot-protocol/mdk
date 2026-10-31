@@ -447,6 +447,26 @@ device answered first. Linking one is device pairing's. `MarmotAppEvent::Unrecog
 and also fires once each time the account's worker opens or reconnects. All of it is empty and silent in every release
 build until the roster's spec lands.
 
+`start_fresh` is the answer when the user no longer has the devices the first check found: every sign-in from before
+this device is answered Not now, now and when one is listed later, and nothing is rejected, so one of them can still
+link this device. It is refused before the first check and once this device trusts a device group. `started_fresh`
+says whether it did so and still has no device group, so the app can say that only chats it is invited to from now on
+are here.
+
+## Compromise warning
+
+`MarmotAppRuntime::compromise_warning(account_ref)` lists the account's open compromise warning on this device as
+`CompromiseWarningItem`s (mdk#2628), the earliest gathered first; it is empty when no warning is open. Each item is a
+rejection: a sign-in answered This wasn't me (`RejectedSignIn`), on this device or another, or a KeyPackage one of the
+account's devices found where they had not published (`RejectedKeyPackage`). Someone holding the account's signing key
+published there. The warning gathers this device's rejections and those in its device group's roster; rejections
+already in the first roster this device trusts count as seen, and a rejected sign-in leaves once its slot is linked as
+a device. `dismiss_compromise_warning` marks everything it gathers as seen, on this device only; a rejection that
+branch selection drops and restores stays seen. `CompromiseWarningReason` gains reasons in later releases; show one the
+host does not know as a generic one. `MarmotAppEvent::CompromiseWarningChanged` says to re-read, and also fires once
+each time the account's worker opens. All of it is empty and silent in every release build until the roster's spec
+lands.
+
 ## Linking a new device
 
 Device linking (mdk#2628) runs through the account runtime, and only in builds with `unreleased-device-pairing` and

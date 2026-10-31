@@ -4,6 +4,22 @@
 
 ### Breaking changes
 
+- Migration 0148 advances account storage to schema 148 (mdk#2628 item 3.7a).
+  It adds `account_compromise_warning_items`, one row per rejection the
+  account's compromise warning gathers, keyed by its reason and subject, with
+  when it was made, when this device first gathered it and when the user saw
+  it; a seen row stays, so a rejection that comes back does not warn again.
+  `account_compromise_warning_baseline` names the device group this device
+  first trusted, whose roster's rejections then count as seen, and
+  `account_sign_in_baseline.started_fresh_at` records that the user started
+  this device fresh. `SqliteAppStorage` gains `record_compromise_warning`,
+  `compromise_warning`, `dismiss_compromise_warning`, `start_fresh` and
+  `started_fresh`, and `trust_device_group`, which makes a device group
+  trusted and takes its roster as this device's first in one transaction.
+  `insert_device_group` and `set_device_group_trust` now refuse a trusted
+  state. The numbers below 148 that are not yet used (139, 143, 145 and
+  147) belong to other work, which lands later; the runner applies them in
+  order.
 - Migration 0161 advances account storage to schema 161 (mdk#2628 item 4.3).
   It adds `small_state_items`, one row per chat and item (`read`, `pin`,
   `mute`, `archive`) holding the value the account's devices agree on, what

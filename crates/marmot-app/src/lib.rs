@@ -217,6 +217,7 @@ pub use cgka_traits::{
     PollProjection, PollType, PollVote, PollVotePage,
 };
 pub use client::AppClient;
+pub use client::compromise_warning::{CompromiseWarningItem, CompromiseWarningReason};
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::device_group::ConfirmedDeviceLink;
@@ -2127,6 +2128,8 @@ impl MarmotApp {
             key_package_refresh_overdue_changed: true,
             sign_in_schedule: Default::default(),
             unrecognized_sign_ins_changed: true,
+            compromise_warning_changed: true,
+            compromise_warning_gather_due: true,
             device_link_changed: true,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),

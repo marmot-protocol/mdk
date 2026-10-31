@@ -792,6 +792,9 @@ pub(crate) async fn handle_app_runtime_event(
         // The account's unrecognized sign-ins may have changed; they are read
         // from the runtime.
         marmot_app::MarmotAppEvent::UnrecognizedSignInsChanged { .. } => {}
+        // The account's compromise warning may have changed; it is read from
+        // the runtime.
+        marmot_app::MarmotAppEvent::CompromiseWarningChanged { .. } => {}
 
         // Linking a new device may have changed; the CLI does not link
         // devices.

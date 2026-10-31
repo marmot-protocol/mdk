@@ -131,12 +131,28 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `unrecognized_sign_ins`. A check or answer that changes it, and every roster change (`note_device_roster_changed`),
   sets `unrecognized_sign_ins_changed`, drained at the device-group seams into one payload-free
   `UnrecognizedSignInsChanged`; every client opens with it set.
+  Start fresh (D54, `start_fresh`) answers every before-this-device sign-in Not now, including baseline slots listed
+  later (storage writes them as `not_now` while `started_fresh_at` is set); it never rejects and never warns.
 - The own-slot check (mdk#2628 3.4, `src/client/sign_ins.rs`) rides 3.2's read: `read_account_key_package_slots` also
   reads this device's slot by `d` from every relay (`OwnSlotRead`), keeping each relay's current publication there by
   NIP-01's rule, valid or not. One whose event id is none of this device's current, pending or retained events is
   foreign (`OwnSlotForeign`); an older event of its own is a lagging relay, which fanout retry owns. `check_sign_ins`
   hands foreign ones to `replace_foreign_slot_publications`, which publishes a newer KeyPackage or, for one dated past
   the skew window, asks the relays to delete it by id (D63). An incomplete own-slot read is retried within the hour.
+- The compromise warning (`src/client/compromise_warning.rs`, mdk#2628 3.7a, D53) is storage's
+  (`account_compromise_warning_items`): every `not_me` slot and rejected KeyPackage in the trusted roster, plus this
+  device's own rejected sign-ins, gathered with insert-or-ignore so a seen mark survives branch selection dropping and
+  restoring an item. Never gather `removed` slots. Gathering is lazy: a roster change (`note_device_roster_changed`)
+  or a Reject answer sets `compromise_warning_gather_due`, and the next host read or publication seam gathers once.
+  The first roster this device trusts from a device group goes in seen (D68: the user saw those on the devices that
+  were there); its own rejections still warn. Storage takes that roster in the same transaction that makes the group
+  trusted, so every trust site goes through `AppClient::trust_device_group` (storage refuses any other move into a
+  trusted state): Creating to Created passes no roster rejections (a founding roster holds only the founder's), and
+  AwaitingWelcome to Linked passes the roster the engine holds. Only a group trusted before migration 0148 takes its
+  first gather instead. Dismiss is per
+  device. An unseen rejected sign-in that neither this device nor the roster holds leaves the warning (a link ended
+  it, or a branch dropped it); a seen one stays seen. Keep `CompromiseWarningReason` exhaustive so each binding maps a new reason
+  explicitly; the stored reason is text with no CHECK, and an unknown one is skipped on read.
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
   `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in `observe_device_group_event`
   (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628

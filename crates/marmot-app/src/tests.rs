@@ -4,6 +4,8 @@ mod audit_ownership;
 #[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;
 #[cfg(feature = "test-policy-overrides")]
+mod compromise_warning;
+#[cfg(feature = "test-policy-overrides")]
 mod device_group;
 #[cfg(feature = "test-policy-overrides")]
 mod device_pairing;

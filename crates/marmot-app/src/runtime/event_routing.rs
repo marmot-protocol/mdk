@@ -29,6 +29,7 @@ pub(crate) fn runtime_message_update_from_event(
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
         | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
+        | MarmotAppEvent::CompromiseWarningChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
@@ -51,6 +52,7 @@ pub(crate) fn projection_update_from_event(
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
         | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
+        | MarmotAppEvent::CompromiseWarningChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
@@ -106,6 +108,7 @@ pub(crate) fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str,
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
         | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
+        | MarmotAppEvent::CompromiseWarningChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
@@ -137,6 +140,7 @@ pub(crate) fn chat_list_event_route(event: &MarmotAppEvent) -> Option<(&str, &Gr
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
         | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
+        | MarmotAppEvent::CompromiseWarningChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
@@ -181,6 +185,7 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
         | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
+        | MarmotAppEvent::CompromiseWarningChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }
         | MarmotAppEvent::AccountError(_) => ChatListUpdateTrigger::SnapshotRefresh,
     }
