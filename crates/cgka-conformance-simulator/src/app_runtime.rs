@@ -733,6 +733,36 @@ impl AppRuntimeHarness {
         self.relay_control.traffic(since, events).await
     }
 
+    /// Each endpoint's history requests over `client`'s own connections, from
+    /// connection `since[i]` on: those whose `REQ`s named `client`'s inbox
+    /// and no other participant's.
+    pub async fn client_history_requests(
+        &self,
+        client: &str,
+        since: &[u64],
+    ) -> Result<Vec<Vec<HistoryRequestV1>>, SubjectError> {
+        let own = self.account_identity(client)?;
+        let others = self
+            .participants
+            .iter()
+            .filter(|(label, _)| label.as_str() != client)
+            .map(|(_, participant)| participant.account_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let traffic = self.relay_traffic(since, true).await?;
+        let owned = traffic.into_iter().map(|relay| {
+            let theirs = |inboxes: &BTreeSet<String>| {
+                inboxes.contains(own)
+                    && inboxes.iter().all(|inbox| !others.contains(inbox.as_str()))
+            };
+            let connections = relay.connection_inboxes;
+            let requests = relay.history_requests.into_iter();
+            let owned =
+                requests.filter(|request| connections.get(&request.connection).is_some_and(theirs));
+            owned.collect::<Vec<_>>()
+        });
+        Ok(owned.collect())
+    }
+
     /// Withhold history requests (a `REQ` with an `until`, or a `NEG-OPEN`)
     /// from relay endpoint `endpoint`, or forward them again. Live
     /// subscriptions and publications keep flowing, so the endpoint looks

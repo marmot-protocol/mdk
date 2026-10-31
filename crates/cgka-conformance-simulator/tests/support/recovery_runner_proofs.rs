@@ -15,8 +15,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cgka_conformance_simulator::app_runtime::HistoryRequestV1;
@@ -51,6 +51,9 @@ const BURST_GAP_MS: u64 = 2_000;
 /// made one about every 30 seconds (a 10-second attempt, then the next about
 /// 20 seconds later), about 16 there.
 const LOOP_SECOND_HALF_ATTEMPTS: usize = 4;
+/// Minutes of the loop's eight-minute second half in which the stalled relay
+/// may be asked anything: every other one at most. 0.14.0 asked in each.
+const LOOP_SECOND_HALF_MINUTES: usize = 4;
 /// Runner attempts that asked a relay and ended without progress while the
 /// owed group drains from two healthy endpoints.
 const OWED_WASTED_ATTEMPTS: usize = 4;
@@ -60,7 +63,7 @@ const OWED_BURSTS: usize = 4;
 /// The longest a live message may wait with the runner alone: a fence holds
 /// for at most one 30-second replay deadline. Beside the earlier owner its
 /// capture holds live frames until the whole backlog lands.
-const LIVE_HELD_AT_MOST_MS: f64 = 60_000.0;
+const LIVE_HELD_AT_MOST: Duration = Duration::from_secs(60);
 /// Messages inside the rebuild lookback (120 s) when bob restarts, so the
 /// counted group's live count is non-empty and under the 500-event clamp.
 const COUNTED_MESSAGES: usize = 30;
@@ -210,17 +213,19 @@ async fn relay_clocks(subject: &AppRuntimeHarness) -> TestResult<Vec<u64>> {
     Ok(traffic.iter().map(|relay| relay.now_ms).collect())
 }
 
-/// Every history request each endpoint logged at or after its `from` clock.
+/// Every history request over bob's own connections that each endpoint
+/// logged at or after its `from` clock. The other participants' requests
+/// share the endpoints, and after a relay cut they reconnect too.
 async fn history_since(
     subject: &AppRuntimeHarness,
     from: &[u64],
 ) -> TestResult<Vec<Vec<HistoryRequestV1>>> {
-    let traffic = subject.relay_traffic(&[0, 0], true).await?;
+    let traffic = subject.client_history_requests("bob", &[0, 0]).await?;
     Ok(traffic
         .into_iter()
         .zip(from)
-        .map(|(relay, from)| {
-            let requests = relay.history_requests.into_iter();
+        .map(|(requests, from)| {
+            let requests = requests.into_iter();
             requests.filter(|request| request.at_ms >= *from).collect()
         })
         .collect())
@@ -238,6 +243,36 @@ fn bursts<'a>(requests: impl IntoIterator<Item = &'a HistoryRequestV1>) -> Vec<u
         last = Some(request.at_ms);
     }
     starts
+}
+
+/// Minutes of `[from, to)` on the proxy clock in which `requests` asked
+/// anything. Bursts chain requests that never pause, so a loop that never
+/// stops is one burst; it fills every minute.
+fn minutes_asked<'a>(
+    requests: impl IntoIterator<Item = &'a HistoryRequestV1>,
+    from: u64,
+    to: u64,
+) -> usize {
+    let asked = requests
+        .into_iter()
+        .filter(|request| (from..to).contains(&request.at_ms));
+    asked
+        .map(|request| (request.at_ms - from) / 60_000)
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+/// Whether every live message was sent and arrived, and at least half as
+/// many were sent as the send interval allowed.
+fn live_complete(visibility: &Value) -> bool {
+    let (sends, expected) = (
+        visibility["sends"].as_u64(),
+        visibility["expected_sends"].as_u64(),
+    );
+    let enough = sends
+        .zip(expected)
+        .is_some_and(|(sends, expected)| sends > 0 && sends * 2 >= expected);
+    enough && visibility["not_visible"] == 0 && visibility["failed_sends"] == 0
 }
 
 /// One endpoint's history requests: counts by verb and by route label, and
@@ -465,8 +500,11 @@ fn trace_between(from: u64, to: u64) -> Vec<Value> {
 struct Live {
     stop: Arc<AtomicBool>,
     stop_watch: Arc<AtomicBool>,
+    t0: Instant,
+    every: Duration,
+    seen: Arc<Mutex<BTreeMap<String, f64>>>,
     sends: tokio::task::JoinHandle<Vec<(String, f64, bool)>>,
-    watch: tokio::task::JoinHandle<BTreeMap<String, f64>>,
+    watch: tokio::task::JoinHandle<()>,
 }
 
 impl Live {
@@ -501,38 +539,52 @@ impl Live {
                 sent
             }
         });
+        let seen = Arc::new(Mutex::new(BTreeMap::new()));
         let watch = tokio::spawn({
-            let stop = stop_watch.clone();
+            let (stop, seen) = (stop_watch.clone(), seen.clone());
             async move {
-                let mut seen = BTreeMap::new();
                 while !stop.load(Ordering::Relaxed) {
                     if let Ok((_, chat)) = bob.chat_view(&group, Some(256)).await {
                         let now = t0.elapsed().as_secs_f64();
+                        let mut seen = seen.lock().expect("live visibility lock");
                         for text in chat.into_iter().filter(|t| t.starts_with(prefix)) {
                             seen.entry(text).or_insert(now);
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                seen
             }
         });
         Self {
             stop,
             stop_watch,
+            t0,
+            every,
+            seen,
             sends,
             watch,
         }
     }
 
-    /// Stop sending, let the last sends arrive, and return the payloads that
-    /// were sent and their visibility at bob.
+    /// Stop sending, give the last sends up to one fence's hold
+    /// ([`LIVE_HELD_AT_MOST`]) to arrive, and return the payloads that were
+    /// sent and their visibility at bob.
     async fn finish(self) -> TestResult<(Vec<String>, Value)> {
         self.stop.store(true, Ordering::Relaxed);
         let sent = self.sends.await?;
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        let ticks = self.t0.elapsed().as_millis() / self.every.as_millis().max(1) + 1;
+        let arrived = || {
+            let seen = self.seen.lock().expect("live visibility lock");
+            let mut ok = sent.iter().filter(|(_, _, ok)| *ok);
+            ok.all(|(payload, _, _)| seen.contains_key(payload))
+        };
+        let waiting = Instant::now();
+        while !arrived() && waiting.elapsed() < LIVE_HELD_AT_MOST {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
         self.stop_watch.store(true, Ordering::Relaxed);
-        let seen = self.watch.await?;
+        self.watch.await?;
+        let seen = std::mem::take(&mut *self.seen.lock().expect("live visibility lock"));
         let ok = sent.iter().filter(|(_, _, ok)| *ok);
         let visible = ok.clone().filter_map(|(payload, at, _)| {
             seen.get(payload).map(|seen| (seen - at).max(0.0) * 1e3)
@@ -540,6 +592,7 @@ impl Live {
         let mut summary = percentiles(visible);
         let sent_ok = ok.clone().count() as u64;
         summary["sends"] = json!(sent.len());
+        summary["expected_sends"] = json!(ticks);
         summary["failed_sends"] = json!(sent.len() as u64 - sent_ok);
         summary["not_visible"] = json!(sent_ok - summary["n"].as_u64().unwrap_or(0));
         // The slowest arrivals and when they were sent, to place them in the run.
@@ -592,8 +645,15 @@ async fn holds_exactly(
     Ok(observed == expected)
 }
 
-/// Whether the runner reports nothing left to fetch.
-async fn caught_up(bob: &AppRuntimeProbe) -> TestResult<bool> {
+/// Whether the runner reports nothing left to fetch, read after one of its
+/// attempts since `trace_from` (trace clock). The status lists nothing until
+/// a runner has surveyed, and keeps its last survey's answer across a
+/// reconnect, so a clear status read before such an attempt proves nothing:
+/// the runner surveys before each attempt.
+async fn caught_up(bob: &AppRuntimeProbe, trace_from: u64) -> TestResult<bool> {
+    if runner_trace::since(trace_from).is_empty() {
+        return Ok(false);
+    }
     let status = bob.account_recovery_status().await?;
     Ok(status.catching_up_group_ids_hex.is_empty() && !status.inbox_catching_up)
 }
@@ -702,6 +762,8 @@ pub(super) async fn stalled_relay_loop(owners: Owners) {
             starts.iter().filter(|at| (from..to).contains(at)).count() as f64 / minutes
         };
         let gaps = starts.windows(2).map(|pair| (pair[1] - pair[0]) as f64 / 1e3);
+        let withheld = stalled.iter().filter(|request| request.withheld);
+        let second_half_minutes = minutes_asked(withheld, half, clocks[1] + window_ms);
         let trace_half = trace_t0 + window_ms / 2;
         let runner = [trace_between(trace_t0, trace_half), trace_between(trace_half, trace_t0 + window_ms)];
         let proof = json!({
@@ -715,6 +777,7 @@ pub(super) async fn stalled_relay_loop(owners: Owners) {
                 "second_half": per_minute(half, clocks[1] + window_ms),
             },
             "seconds_between_stalled_bursts": gaps.collect::<Vec<_>>(),
+            "stalled_minutes_asked_in_second_half": second_half_minutes,
             "runner": {
                 "first_half": runner_summary(&runner[0]),
                 "second_half": runner_summary(&runner[1]),
@@ -728,15 +791,16 @@ pub(super) async fn stalled_relay_loop(owners: Owners) {
         if !complete || recovered.is_none() {
             return Err("the backlog did not recover exactly from the healthy endpoint".into());
         }
-        if live_visibility["not_visible"] != 0 {
-            return Err("live messages stopped arriving behind the stalled relay".into());
+        if !live_complete(&live_visibility) {
+            return Err(format!("live messages failed or stopped arriving behind the stalled relay: {proof}").into());
         }
         // The control: something did try the stalled relay.
         if per_minute(clocks[1], half) == 0.0 {
             return Err(format!("nothing attempted the stalled relay: {proof}").into());
         }
-        // 0.14.0 attempted about twice a minute for as long as it ran.
-        if per_minute(half, clocks[1] + window_ms) > 0.5 {
+        // 0.14.0 attempted about twice a minute for as long as it ran. Bursts
+        // alone miss a loop that never pauses, so count asked minutes too.
+        if per_minute(half, clocks[1] + window_ms) > 0.5 || second_half_minutes > LOOP_SECOND_HALF_MINUTES {
             return Err(format!("the stalled relay is still attempted every two minutes or more often: {proof}").into());
         }
         if owners == Owners::Both {
@@ -810,8 +874,14 @@ pub(super) async fn owed_history(owners: Owners) {
         let quiet_after_restart =
             visible_after(&alice, &bob, &quiet, "quiet-after-restart", Duration::from_secs(60)).await?;
         quiet_expected.push("quiet-after-restart".into());
+        // It proves nothing unless the busy group was still owed then.
+        let (_, chat) = bob.chat_view(&busy, None).await?;
+        let busy_held_when_quiet_seen = chat.iter().filter(|text| text.starts_with("owed-")).count();
+        // Beside the earlier owner the runner may make no attempt at all here,
+        // so only the runner-alone mode waits for its report.
+        let wait_for_report = owners == Owners::RunnerAlone;
         let (mut drained, mut reported_caught_up) = (None, None);
-        while drained.is_none() || reported_caught_up.is_none() {
+        while drained.is_none() || (wait_for_report && reported_caught_up.is_none()) {
             if t0.elapsed() >= RECOVERY_DEADLINE {
                 break;
             }
@@ -822,7 +892,7 @@ pub(super) async fn owed_history(owners: Owners) {
                     note(started, "owed backlog visible");
                 }
             }
-            if drained.is_some() && reported_caught_up.is_none() && caught_up(&bob).await? {
+            if drained.is_some() && reported_caught_up.is_none() && caught_up(&bob, trace_restart).await? {
                 reported_caught_up = Some(t0.elapsed().as_secs_f64());
                 note(started, "runner reports caught up");
             }
@@ -852,11 +922,11 @@ pub(super) async fn owed_history(owners: Owners) {
         quiet_expected.push("quiet-after-reconnect".into());
         let reconnected = Instant::now();
         let mut resweep = BTreeSet::new();
-        // Each route asked again on endpoint 0, by either owner.
+        // Each route asked again on endpoint 0, by either of bob's owners.
         let resweeps = async || {
             let history = history_since(subject, &reconnect_clocks).await?;
             resweep = history[0].iter().filter_map(|request| request.route.clone()).collect();
-            Ok(resweep.contains(&busy_route) && resweep.contains(&quiet_route) && caught_up(&bob).await?)
+            Ok(resweep.contains(&busy_route) && resweep.contains(&quiet_route) && caught_up(&bob, trace_reconnect).await?)
         };
         let resweep_result = wait_for("the reconnect's re-sweep", RESWEEP_DEADLINE, resweeps).await;
         let resweep_seconds = reconnected.elapsed().as_secs_f64();
@@ -886,6 +956,7 @@ pub(super) async fn owed_history(owners: Owners) {
                 "busy_timeline_exact": busy_exact,
                 "live_visibility_ms": live_visibility,
                 "quiet_message_visible_ms": quiet_after_restart,
+                "busy_held_when_quiet_seen": busy_held_when_quiet_seen,
                 "busy_swept_per_endpoint": swept(&after_restart, &busy_route),
                 "quiet_swept_per_endpoint": swept(&after_restart, &quiet_route),
                 "repeated_window_requests_per_endpoint": restart_repeats,
@@ -914,11 +985,8 @@ pub(super) async fn owed_history(owners: Owners) {
         if drained.is_none() || !busy_exact {
             return failure("the owed group did not finish exactly within the deadline");
         }
-        if reported_caught_up.is_none() {
-            return failure("the runner never reported the account caught up");
-        }
-        if live_visibility["not_visible"] != 0 {
-            return failure("live messages were lost while the backlog was owed");
+        if !live_complete(&live_visibility) {
+            return failure("live messages failed or were lost while the backlog was owed");
         }
         if restart_repeats.iter().any(|repeats| *repeats > 0) {
             return failure("a history window was asked twice on one endpoint");
@@ -935,10 +1003,14 @@ pub(super) async fn owed_history(owners: Owners) {
         if quiet_after_restart.is_none() || quiet_after_reconnect.is_none() || !quiet_exact {
             return failure("a live message to the quiet group was held back");
         }
+        if busy_held_when_quiet_seen >= OWED_MESSAGES {
+            return failure("the busy group finished before the quiet group's message showed");
+        }
         if resweep_result.is_err() {
             return failure("the reconnect's owed ranges were not swept");
         }
-        if reconnect_trace.is_empty() {
+        // A failed quantum or an inbox re-check alone is no re-proof.
+        if advanced(&reconnect_trace) == 0 {
             return failure("the runner re-proved nothing after the reconnect");
         }
         if owners == Owners::Both {
@@ -949,13 +1021,16 @@ pub(super) async fn owed_history(owners: Owners) {
         if advanced(&restart_trace) < 2 {
             return failure("the runner did not work the debt over successive attempts");
         }
+        if reported_caught_up.is_none() {
+            return failure("the runner never reported the account caught up");
+        }
         if wasted(&restart_trace) > OWED_WASTED_ATTEMPTS {
             return failure("the runner's attempts kept ending without progress");
         }
         if reconnect_repeats.iter().any(|repeats| *repeats > 0) {
             return failure("a history window was asked twice on one endpoint after the reconnect");
         }
-        if live_visibility["max"].as_f64() > Some(LIVE_HELD_AT_MOST_MS) {
+        if live_visibility["max"].as_f64() > Some(LIVE_HELD_AT_MOST.as_secs_f64() * 1e3) {
             return failure("a live message waited longer than one fence");
         }
         Ok(json!({"proof": proof}))
@@ -1048,7 +1123,7 @@ pub(super) async fn fence_control() {
                 && holds_exactly(&bob, &quiet, &quiet_expected).await?)
         })
         .await;
-        let after = watch_until(&bob, &watched, restarted, restarted.elapsed()).await?;
+        let settled_at = restarted.elapsed().as_secs_f64();
         let history = history_since(subject, &clocks).await?;
         let trace = runner_trace::since(trace_from);
         let proof = json!({
@@ -1056,7 +1131,7 @@ pub(super) async fn fence_control() {
             "stall_seconds": FENCE_STALL.as_secs(),
             "live_sent_at_seconds": sent_at,
             "seen_during_stall_at_seconds": during,
-            "seen_by_end_at_seconds": after,
+            "timelines_exact_at_seconds": settled.is_ok().then_some(settled_at),
             "counted_backlog_visible_during_stall": backlog_during,
             "timelines_exact": settled.is_ok(),
             "runner": runner_summary(&trace),
@@ -1134,7 +1209,7 @@ pub(super) async fn upgrade() {
                     drained = Some(t0.elapsed().as_secs_f64());
                 }
             }
-            if drained.is_some() && reported_caught_up.is_none() && caught_up(&bob).await? {
+            if drained.is_some() && reported_caught_up.is_none() && caught_up(&bob, trace_from).await? {
                 reported_caught_up = Some(t0.elapsed().as_secs_f64());
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1173,8 +1248,8 @@ pub(super) async fn upgrade() {
         if drained.is_none() || !exact {
             return failure("the owed group did not finish exactly after the upgrade");
         }
-        if live_visibility["not_visible"] != 0 {
-            return failure("live messages were lost after the upgrade");
+        if !live_complete(&live_visibility) {
+            return failure("live messages failed or were lost after the upgrade");
         }
         if reported_caught_up.is_none() {
             return failure("the runner never reported the account caught up");

@@ -51,6 +51,11 @@ pub struct RelayTrafficV1 {
     /// Client history requests by proxy clock, when events are requested.
     #[serde(default)]
     pub history_requests: Vec<HistoryRequestV1>,
+    /// Each connection's `#p` values across every `REQ` it sent, live ones
+    /// included, when events are requested. An account's connections name
+    /// its inbox, so this tells whose connection a history request came over.
+    #[serde(default)]
+    pub connection_inboxes: BTreeMap<u64, BTreeSet<String>>,
     /// The proxy's clock when this snapshot was taken, on the scale of
     /// [`HistoryRequestV1::at_ms`].
     #[serde(default)]
@@ -75,6 +80,10 @@ pub struct HistoryRequestV1 {
     pub ids: usize,
     /// The proxy withheld it from the relay.
     pub withheld: bool,
+    /// The connection it came over, keyed as in
+    /// [`RelayTrafficV1::connection_inboxes`].
+    #[serde(default)]
+    pub connection: u64,
 }
 
 /// One client connection's counters.
@@ -86,6 +95,7 @@ pub(crate) struct RelayTrafficSessionV1 {
     downstream_messages: BTreeMap<String, u64>,
     events: BTreeMap<String, RelayEventDeliveryV1>,
     history_requests: Vec<HistoryRequestV1>,
+    inboxes: BTreeSet<String>,
     undecoded_frames: u64,
     first_eof: Option<&'static str>,
 }
@@ -277,6 +287,7 @@ fn history_request(
     filter: &serde_json::Value,
     at_ms: u64,
     withheld: bool,
+    connection: u64,
 ) -> HistoryRequestV1 {
     let tag = |name: &str| {
         filter[name]
@@ -294,7 +305,21 @@ fn history_request(
         limit: filter["limit"].as_u64(),
         ids: filter["ids"].as_array().map_or(0, Vec::len),
         withheld,
+        connection,
     }
+}
+
+/// The `#p` values of a client `REQ`'s filters.
+fn named_inboxes(items: &[serde_json::Value]) -> impl Iterator<Item = &str> {
+    let filters = match items.first().and_then(serde_json::Value::as_str) {
+        Some("REQ") => items.get(2..).unwrap_or_default(),
+        _ => &[],
+    };
+    filters
+        .iter()
+        .filter_map(|filter| filter["#p"].as_array())
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
 }
 
 /// Client-to-relay forwarding after the HTTP upgrade. Each frame is
@@ -465,9 +490,11 @@ async fn pump(
                 let verb = items.first().and_then(|verb| verb.as_str()).unwrap_or("?");
                 let held = withheld.contains(message);
                 for filter in history_filters(&items) {
-                    let request = history_request(verb, filter, at_ms, held);
+                    let request = history_request(verb, filter, at_ms, held, index as u64);
                     session.history_requests.push(request);
                 }
+                let inboxes = named_inboxes(&items).map(str::to_owned);
+                session.inboxes.extend(inboxes);
             }
         }
     }
@@ -695,7 +722,7 @@ impl RelayFaultProxy {
                 *into.entry(verb.clone()).or_default() += count;
             }
         };
-        for session in sessions.iter().skip(first) {
+        for (offset, session) in sessions.iter().skip(first).enumerate() {
             total.connections += 1;
             total.upstream_bytes += session.upstream_bytes;
             total.downstream_bytes += session.downstream_bytes;
@@ -709,6 +736,10 @@ impl RelayFaultProxy {
                 total
                     .history_requests
                     .extend(session.history_requests.iter().cloned());
+                let connection = (first + offset) as u64;
+                total
+                    .connection_inboxes
+                    .insert(connection, session.inboxes.clone());
             }
             for (id, delivery) in session.events.iter().filter(|_| events) {
                 let merged = total.events.entry(id.clone()).or_default();
@@ -1079,7 +1110,18 @@ mod tests {
         let mut received = vec![0; live.len()];
         relay.read_exact(&mut received).await.unwrap();
         assert_eq!(received, live);
-        let requests = proxy.traffic_since(0, true).history_requests;
+        // A live inbox subscription names whose connection it is.
+        let inbox = masked(r##"["REQ","inbox",{"kinds":[1059],"#p":["bob"]}]"##);
+        client.write_all(&inbox).await.unwrap();
+        let mut received = vec![0; inbox.len()];
+        relay.read_exact(&mut received).await.unwrap();
+        let traffic = proxy.traffic_since(0, true);
+        let connection = traffic.history_requests[0].connection;
+        assert_eq!(
+            traffic.connection_inboxes[&connection],
+            BTreeSet::from(["bob".to_owned()])
+        );
+        let requests = traffic.history_requests;
         let logged: Vec<_> = requests
             .iter()
             .map(|r| {

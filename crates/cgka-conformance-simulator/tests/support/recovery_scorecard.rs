@@ -595,18 +595,23 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
             labels.insert(route, label.clone());
         }
     }
-    let history_requests = measured.iter().map(|relay| {
-        // Group labels collapse to their kind, so the report stays short.
-        let kinds = labels.iter().map(|(route, label)| {
+    // Group labels collapse to their kind, so the report stays short.
+    let kinds = labels
+        .iter()
+        .map(|(route, label)| {
             let kind = if label.starts_with("history-") {
                 "history-*"
             } else {
                 label
             };
             (route.clone(), kind.to_owned())
-        });
-        history_summary(&relay.history_requests, &kinds.collect())
-    });
+        })
+        .collect();
+    // Bob's own connections only: the others share both endpoints.
+    let bobs = subject.client_history_requests("bob", &mark).await?;
+    let history_requests = bobs
+        .iter()
+        .map(|requests| history_summary(requests, &kinds));
     let history_requests = history_requests.collect::<Vec<_>>();
     let account_status = bob.account_recovery_status().await;
     let (_, mut observed) = bob.chat_view(&gap, None).await?;

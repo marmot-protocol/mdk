@@ -113,16 +113,21 @@ it counts failed status, send and live-send calls.
 
 `public_app_large_account_recovery_scorecard_runner_owns_debt` runs the same workload with bob's recovery runner
 owning history debt (`AppRuntimeHarness::new_with_relay_pair_owning_debt`). Its `scorecard.json` names the history
-owner. Both forms also record each endpoint's history requests (`REQ` filters with `until`, and `NEG-OPEN`s, by verb
-and group kind, with sweep windows asked more than once) and bob's `account_recovery_status` at the end.
+owner. Both forms also record bob's history requests on each endpoint (`REQ` filters with `until`, and `NEG-OPEN`s,
+over his own connections, by verb and group kind, with history windows asked more than once) and bob's
+`account_recovery_status` at the end.
 
 ## Recovery-runner proofs
 
 `tests/support/recovery_runner_proofs.rs` holds the recovery runner's proofs (mdk#2660), ignored journeys run in release
 with production policy. Bob runs in this process with the runner owning debt; alice and three senders run in their
 own processes. Both relay endpoints publish the White Noise relays' NIP-11 shape (NIP-77, `max_limit` 500), which the
-relay proxy serves itself, and the proxy logs every history request. The runner's own attempts come from its
-`quantum` and `recheck` debug events, captured in process; they carry aggregate fields only.
+relay proxy serves itself, and the proxy logs every history request. The proofs count only bob's: requests over
+connections whose `REQ`s named his inbox and nobody else's (`client_history_requests`), since the others share the
+endpoints and reconnect with him after a relay cut. The runner's own attempts come from its `quantum` and `recheck`
+debug events, captured in process; they carry aggregate fields only. A live message counts only when its send
+succeeded, at least half the sends the interval allows must have been made, and none may fail; each has up to 60
+seconds after the last send to arrive.
 
 Until the switch-over (mdk#2660 PR 5g) the earlier owner still runs beside the runner, and in these runs it does the
 startup recovery itself. So the loop and the owed-history journeys run in two modes. Beside the earlier owner, the
@@ -136,26 +141,28 @@ which un-ignores them and drops the both-owners variants.
   1 stays connected but never answers history (`stall_relay_history`), while alice sends a live message every two
   seconds for 16 minutes. It asserts that bob recovers the backlog exactly from endpoint 0, that every live message
   arrives, and that the stalled endpoint, attempted in the first half of the window, sees at most one burst of
-  history requests every two minutes in the second. On 0.14.0 an attempt came about every 30 seconds for as long as
+  history requests every two minutes in the second, and requests in at most four of its eight minutes (requests
+  that never pause make one long burst). On 0.14.0 an attempt came about every 30 seconds for as long as
   the app ran. Alone, the runner must also have attempted the stalled relay in the first half and make at most four
   attempts there that ask a relay and end without progress in the second.
 - `public_app_runner_finishes_tens_of_thousands_of_owed_events` owes 20,000 events in one group, published while bob
   is stopped. A second group stays quiet: its messages are older than the restart's rebuild lookback. After the
   restart alice sends a live message to the busy group every three seconds. It asserts:
-  - both timelines are exact;
-  - the account reports caught up within 30 minutes;
+  - both timelines are exact within 30 minutes;
   - every live message arrives;
   - no history window (a `REQ` without ids, or a `NEG-OPEN`) is asked twice on one endpoint;
   - each endpoint sees at most four bursts of history requests;
   - both groups' routes are asked on both endpoints;
-  - a message to the quiet group arrives while the busy group is still owed.
+  - a message to the quiet group arrives within a minute, while the busy group is still owed.
 
   Then it records a 200-second idle window and cuts endpoint 0 for 10 seconds. With nothing inside the rebuild
   lookback, every route's new live count there is empty. The journey asserts that both routes are asked again on
-  endpoint 0, that the runner re-proves after the reconnect, that the account reports caught up again within five
-  minutes, and that a quiet-group message sent after the reconnect arrives. Alone, the runner must also advance at
-  least twice after the restart with at most four attempts that end without progress, ask no window twice after the
-  reconnect either, and hold no live message longer than 60 seconds (a fence holds for one 30-second replay
+  endpoint 0, that a runner quantum newly covers part of a route after the reconnect, that the account reports
+  caught up within five minutes (read after a runner attempt since the reconnect: until a runner surveys, the status
+  lists nothing, and across a reconnect it keeps its last answer), and that a quiet-group message sent after the
+  reconnect arrives. Alone, the runner must also advance at least twice after the restart with at most four
+  attempts that end without progress, report the account caught up after the restart, ask no window twice after
+  the reconnect either, and hold no live message longer than 60 seconds (a fence holds for one 30-second replay
   deadline; beside the earlier owner, its capture holds live frames until the backlog lands).
 - `public_app_runner_fences_a_counted_group_and_not_a_quiet_one` is the positive control for "never fenced", ignored
   until 5g wires live fences. Bob restarts with 30 messages inside the rebuild lookback in one group and none in the
