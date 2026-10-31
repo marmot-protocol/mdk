@@ -886,6 +886,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             &account,
             &outcome.records,
             outcome.complete,
+            &outcome.complete_endpoints,
             self.directory_freshness(),
             own_slot,
         ))

@@ -1258,7 +1258,7 @@ fn publish_into_slot(account: &Account, slot: &str, content: &str, created_at: u
     id
 }
 
-fn published_at(client: &AppClient) -> u64 {
+pub(super) fn published_at(client: &AppClient) -> u64 {
     client
         .runtime
         .key_package_maintenance_status()
@@ -1373,6 +1373,232 @@ async fn a_foreign_publication_dated_far_ahead_is_deleted_by_id() {
         lifecycle.phase,
         cgka_traits::MaintenancePhase::ClockSkewBlocked
     );
+}
+
+/// The relay stops serving anything in `slot`, as one that honored a
+/// deletion there does, whether or not it said so.
+pub(super) fn relay_empties_slot(relay: &ScriptedPushRelayClient, slot: &str) {
+    relay.published_events.lock().unwrap().retain(|event| {
+        event.kind != KIND_MARMOT_KEY_PACKAGE || event.tag_value("d") != Some(slot)
+    });
+}
+
+/// Whether the relay serves a publication in `slot`.
+pub(super) fn relay_serves_slot(relay: &ScriptedPushRelayClient, slot: &str) -> bool {
+    relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == KIND_MARMOT_KEY_PACKAGE && event.tag_value("d") == Some(slot))
+}
+
+/// Record this device's current publication as made two days ago: a slot
+/// emptied of one less than a day old waits. Returns its new time.
+pub(super) fn publish_two_days_ago(client: &AppClient) -> u64 {
+    let storage = client.app.account_storage(&client.state.label).unwrap();
+    let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
+    let published = lifecycle.authored_event_created_at.as_mut().unwrap();
+    published.0 -= 2 * 24 * 60 * 60;
+    let aged = published.0;
+    storage.put_key_package_lifecycle(&lifecycle).unwrap();
+    aged
+}
+
+/// A deletion by id that the relay honored but never acknowledged leaves it
+/// serving nothing in this device's slot, though it accepted the device's
+/// KeyPackage. The next check reads the slot empty there and publishes a new
+/// KeyPackage (mdk#2628 3.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unacknowledged_deletion_that_emptied_the_slot_is_refilled() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let published = publish_two_days_ago(&phone);
+    publish_into_slot(
+        &account,
+        &slot,
+        "not a key package",
+        unix_now_seconds() + 864_000,
+    );
+
+    account.relay.zero_ack_next_publish();
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!((report.foreign.beyond_skew, report.foreign.deleted), (1, 0));
+    assert!(!report.refilling);
+    assert!(
+        !phone.runtime.key_package_network_maintenance_due().unwrap(),
+        "no relay said it deleted"
+    );
+
+    relay_empties_slot(&account.relay, &slot);
+    let report = phone.check_sign_ins().await.unwrap();
+    assert!(report.own_slot_complete);
+    assert_eq!(report.foreign, Default::default());
+    assert!(report.refilling);
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > published);
+    assert!(relay_serves_slot(&account.relay, &slot));
+}
+
+/// A slot withdrawal no relay acknowledged rolls back, though a relay may
+/// have honored it and emptied the slot. The withdrawing runtime publishes
+/// nothing more; the account's next one reads the slot empty there and
+/// publishes a new KeyPackage, since the withdrawal covers the current one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawal_that_rolled_back_is_refilled_by_the_next_runtime() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let published = publish_two_days_ago(&phone);
+
+    account.relay.zero_ack_next_publish();
+    phone.withdraw_key_package_slot().await.unwrap_err();
+    relay_empties_slot(&account.relay, &slot);
+    assert!(!phone.check_sign_ins().await.unwrap().refilling);
+    drop(phone);
+
+    let mut phone = account.open(0).await;
+    assert_eq!(
+        published_at(&phone),
+        published,
+        "the withdrawal rolled back"
+    );
+    let report = phone.check_sign_ins().await.unwrap();
+    assert!(report.refilling);
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > published);
+    assert!(relay_serves_slot(&account.relay, &slot));
+}
+
+/// Whoever holds the account key can delete this device's slot by its
+/// address. A relay that honors that serves nothing there and refuses any
+/// publication in the slot dated up to the deletion, the device's current
+/// one included, so the device publishes a new KeyPackage dated after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_deletion_of_its_own_slot_is_refilled() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let deleted_at = publish_two_days_ago(&phone) + 60;
+    let address = format!("{KIND_MARMOT_KEY_PACKAGE}:{}:{slot}", account.alice_id);
+    let deletion = EventBuilder::new(Kind::Custom(5), "")
+        .tags([
+            Tag::parse(["a", address.as_str()]).unwrap(),
+            Tag::parse(["k", "30443"]).unwrap(),
+        ])
+        .custom_created_at(Timestamp::from_secs(deleted_at))
+        .finalize(&account.keys)
+        .unwrap();
+    account
+        .relay
+        .published_events
+        .lock()
+        .unwrap()
+        .push(NostrTransportEvent::from_nostr_event(&deletion).unwrap());
+    relay_empties_slot(&account.relay, &slot);
+
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!(report.foreign, Default::default());
+    assert!(report.refilling);
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > deleted_at);
+    assert!(relay_serves_slot(&account.relay, &slot));
+}
+
+/// Only a relay's finished read shows the slot empty. A read that reached no
+/// relay, or one that stopped short, never refills it: the slot may hold
+/// what the read missed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unfinished_read_never_refills_the_slot() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let published = publish_two_days_ago(&phone);
+    relay_empties_slot(&account.relay, &slot);
+    account.relay.unfinished_directory_reads.store(true, SeqCst);
+
+    phone.check_sign_ins().await.unwrap_err();
+    // Another slot's publication shows the read reached the relay, though it
+    // did not finish.
+    publish_into_slot(
+        &account,
+        &"ab".repeat(32),
+        "not a key package",
+        unix_now_seconds(),
+    );
+    let report = phone.check_sign_ins().await.unwrap();
+    assert!(!report.own_slot_complete);
+    assert!(!report.refilling);
+    phone.run_due_maintenance().await.unwrap();
+    assert_eq!(published_at(&phone), published);
+    assert!(!relay_serves_slot(&account.relay, &slot));
+
+    account
+        .relay
+        .unfinished_directory_reads
+        .store(false, SeqCst);
+    assert!(phone.check_sign_ins().await.unwrap().refilling);
+}
+
+/// A relay whose own read finished shows the slot empty even while another
+/// relay is down and no relay returned any of the account's publications:
+/// the check cannot count sign-ins then, but it still refills the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_empty_relay_is_refilled_while_another_is_down() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let published = publish_two_days_ago(&phone);
+    relay_empties_slot(&account.relay, &slot);
+    account
+        .relay
+        .other_directory_relays_down
+        .store(true, SeqCst);
+
+    let result = phone.check_sign_ins().await;
+    assert!(
+        matches!(
+            result,
+            Err(AppError::DeviceGroupRefused("key_packages_unreachable"))
+        ),
+        "{result:?}"
+    );
+    assert!(phone.runtime.key_package_network_maintenance_due().unwrap());
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > published);
+    assert!(relay_serves_slot(&account.relay, &slot));
+}
+
+/// Only a publication at least a day old is refilled. A refill is a new
+/// publication, so a relay that accepts this device's KeyPackages and keeps
+/// none costs one a day, not one per check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_that_keeps_nothing_is_refilled_once_a_day() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    publish_two_days_ago(&phone);
+    relay_empties_slot(&account.relay, &slot);
+    assert!(phone.check_sign_ins().await.unwrap().refilling);
+    phone.run_due_maintenance().await.unwrap();
+    let refilled = published_at(&phone);
+
+    relay_empties_slot(&account.relay, &slot);
+    assert!(!phone.check_sign_ins().await.unwrap().refilling);
+    phone.run_due_maintenance().await.unwrap();
+    assert_eq!(published_at(&phone), refilled);
+    assert!(!relay_serves_slot(&account.relay, &slot));
 }
 
 /// A device with no slot yet, as a Welcome join records it before the
