@@ -284,6 +284,7 @@ fn chat_preview_retention_finalization_is_visible_without_rebuilding_chat_rows()
 #[test]
 #[ignore = "file-backed chat startup performance investigation"]
 fn chat_startup_benchmark() {
+    crate::base::connection::use_production_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("synthetic chat benchmark").unwrap();
     let store =
@@ -571,6 +572,7 @@ fn created_group_projection_and_chat_list_row_commit_atomically() {
 #[test]
 #[ignore = "operational file-backed SQLCipher benchmark"]
 fn file_backed_create_group_tail_benchmark_matrix() {
+    crate::base::connection::use_production_storage_for_test_process();
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let samples = std::env::var("MDK_CREATE_TAIL_SAMPLES")
         .ok()

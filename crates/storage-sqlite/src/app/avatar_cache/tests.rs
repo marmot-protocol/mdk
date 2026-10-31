@@ -988,6 +988,7 @@ fn avatar_identity_placeholder_updates_are_fenced_and_eviction_stops_maintenance
 #[test]
 #[ignore = "host timing evidence; not a device latency gate"]
 fn avatar_local_read_timing_by_encoded_size() {
+    crate::base::connection::use_production_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let key = crate::SqlCipherKey::new("avatar timing fixture").unwrap();
     let store = SqliteAccountStorage::open_encrypted(dir.path().join("account.db"), &key)

@@ -21,12 +21,13 @@ use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags};
 use std::ffi::c_int;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 /// The values a fresh database draws for itself while migrating, as
 /// (table, column, the statement that draws a new one). A migration that adds
 /// one needs a line here; `two_fresh_databases_differ_only_in_renewed_values`
-/// finds it.
+/// finds it, including values drawn from the clock.
 const RENEWED_PER_DATABASE: &[(&str, &str, &str)] = &[
     (
         "chat_presentation_meta",
@@ -53,19 +54,20 @@ pub(crate) fn open(options: SqliteStorageOptions) -> StorageResult<OpenedAccount
 }
 
 /// Copy `template`, or replay the migrations and publish the result as
-/// `template` when there is none yet.
+/// `template` when there is none yet or it cannot be copied.
 fn open_with_template(
     template: &Path,
     options: SqliteStorageOptions,
 ) -> StorageResult<OpenedAccount> {
-    if !template.exists() {
-        let opened = open_account_in_memory(options)?;
-        publish(&opened, template);
+    if template.exists()
+        && let Ok(opened) = copy(template, &options)
+            .and_then(|connection| finish_account_open(connection, options.clone(), None))
+    {
         return Ok(opened);
     }
-    copy(template, &options)
-        .and_then(|connection| finish_account_open(connection, options.clone(), None))
-        .or_else(|_| open_account_in_memory(options))
+    let opened = open_account_in_memory(options)?;
+    publish(&opened, template);
+    Ok(opened)
 }
 
 /// The template's path: beside the test binary, named for this build of it,
@@ -87,11 +89,12 @@ fn template_path() -> Option<PathBuf> {
 }
 
 /// Write `opened`, a freshly migrated database, as the template, then remove
-/// the templates of earlier builds of this binary. Processes that start
-/// together may each write one; every one is complete, and a rename that
-/// loses the race leaves the winner in place.
+/// what earlier builds of this binary left. Threads and processes that start
+/// together may each write one: every attempt stages its own file and renames
+/// it into place only once it is complete, so a reader sees a whole template
+/// and the last rename wins.
 fn publish(opened: &OpenedAccount, template: &Path) {
-    let staging = template.with_extension(format!("{}.staging", std::process::id()));
+    let staging = staging_path(template);
     let written = (|| -> StorageResult<()> {
         let source = opened.connection.lock()?;
         ensure_private_db_files(&staging)?;
@@ -105,20 +108,35 @@ fn publish(opened: &OpenedAccount, template: &Path) {
         let _ = std::fs::remove_file(&staging);
         return;
     }
-    remove_earlier_templates(template);
+    remove_earlier_builds(template);
 }
 
-fn remove_earlier_templates(current: &Path) {
+/// A staging path that no other publish, in this process or another, writes.
+fn staging_path(template: &Path) -> PathBuf {
+    static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    let attempt = ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    template.with_extension(format!("{}-{attempt}.staging", std::process::id()))
+}
+
+/// Remove the templates and staging leftovers of earlier builds of this
+/// binary. The current build's staging files may still be written, so they
+/// stay. Other binaries' templates, including this crate's tests built with
+/// other features, stay until `cargo clean`, like those binaries.
+fn remove_earlier_builds(current: &Path) {
     let (Some(directory), Some(current_name)) = (
         current.parent(),
         current.file_name().and_then(|name| name.to_str()),
     ) else {
         return;
     };
-    let Some(prefix) = current_name
-        .find(TEMPLATE_INFIX)
-        .map(|at| &current_name[..at + TEMPLATE_INFIX.len()])
-    else {
+    let (Some(binary), Some(build)) = (
+        current_name
+            .find(TEMPLATE_INFIX)
+            .map(|at| &current_name[..at + TEMPLATE_INFIX.len()]),
+        current_name
+            .strip_suffix(".sqlite")
+            .map(|stem| format!("{stem}.")),
+    ) else {
         return;
     };
     let Ok(entries) = std::fs::read_dir(directory) else {
@@ -129,7 +147,7 @@ fn remove_earlier_templates(current: &Path) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name != current_name && name.starts_with(prefix) && name.ends_with(".sqlite") {
+        if name.starts_with(binary) && !name.starts_with(&build) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -138,6 +156,7 @@ fn remove_earlier_templates(current: &Path) {
 /// Copy the template into a new in-memory connection and draw its
 /// per-database values.
 fn copy(template: &Path, options: &SqliteStorageOptions) -> StorageResult<Connection> {
+    ensure_private_db_files(template)?;
     let source = Connection::open_with_flags(
         template,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -248,15 +267,28 @@ mod tests {
             .collect()
     }
 
+    /// Wait until the wall clock is past the second it reads now, so values
+    /// drawn from `strftime('%s', 'now')` before and after the call differ.
+    fn wait_for_the_next_second() {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap();
+        std::thread::sleep(
+            Duration::from_secs(1) - Duration::from_nanos(u64::from(now.subsec_nanos()))
+                + Duration::from_millis(5),
+        );
+    }
+
     #[test]
     fn two_fresh_databases_differ_only_in_renewed_values() {
-        let differing = differing_columns(&replayed(), &replayed());
-        assert!(
-            differing.is_subset(&renewed()),
-            "a migration draws a per-database value; renew it in RENEWED_PER_DATABASE: {:?}",
-            differing.difference(&renewed()).collect::<Vec<_>>()
+        let first = replayed();
+        wait_for_the_next_second();
+        let second = replayed();
+        assert_eq!(
+            differing_columns(&first, &second),
+            renewed(),
+            "every value a fresh database draws, and only those, belongs in RENEWED_PER_DATABASE"
         );
-        assert!(differing.contains(&("chat_presentation_meta".into(), "store_epoch".into())));
     }
 
     #[test]
@@ -266,11 +298,23 @@ mod tests {
         let replay = replayed();
         assert_eq!(copy.migration_summary().0, 0, "the copy needs no migration");
         assert_eq!(schema(&copy), schema(&replay));
-        for pragma in ["auto_vacuum", "page_size", "user_version", "application_id"] {
+        for pragma in [
+            "auto_vacuum",
+            "page_size",
+            "user_version",
+            "application_id",
+            "foreign_keys",
+            "secure_delete",
+            "trusted_schema",
+            "temp_store",
+            "busy_timeout",
+            "synchronous",
+            "journal_mode",
+        ] {
             let sql = format!("PRAGMA {pragma}");
             assert_eq!(
-                query::<i64>(&copy, &sql),
-                query::<i64>(&replay, &sql),
+                query::<rusqlite::types::Value>(&copy, &sql),
+                query::<rusqlite::types::Value>(&replay, &sql),
                 "{pragma}"
             );
         }
@@ -281,8 +325,9 @@ mod tests {
     fn copies_draw_their_own_values_and_share_no_pages() {
         let dir = tempfile::tempdir().unwrap();
         let (template, first) = template_in(&dir);
+        wait_for_the_next_second();
         let second = from_template(&template);
-        assert_ne!(store_epoch(&first), store_epoch(&second));
+        assert_eq!(differing_columns(&first, &second), renewed());
 
         first
             .lock()
@@ -305,22 +350,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_template_falls_back_to_a_replay() {
+    fn an_unreadable_template_falls_back_to_a_replay_and_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let template = dir.path().join(format!("binary{TEMPLATE_INFIX}1-1.sqlite"));
         std::fs::write(&template, b"not a database").unwrap();
         let store = from_template(&template);
         assert!(store.migration_summary().0 > 0);
         assert_eq!(schema(&store), schema(&replayed()));
+        assert_eq!(from_template(&template).migration_summary().0, 0);
     }
 
     #[test]
-    fn publishing_removes_only_earlier_templates_of_the_same_binary() {
+    fn concurrent_publishes_stage_to_their_own_files() {
+        let template = Path::new("binary.migrated-template-1-1.sqlite");
+        assert_ne!(staging_path(template), staging_path(template));
+    }
+
+    #[test]
+    fn publishing_removes_only_what_earlier_builds_of_the_binary_left() {
         let dir = tempfile::tempdir().unwrap();
         let file = |name: &str| dir.path().join(name);
         for name in [
             "binary.migrated-template-1-1.sqlite",
-            "binary.migrated-template-1-1.42.staging",
+            "binary.migrated-template-1-1.42-0.staging",
+            "binary.migrated-template-1-1.42-0.staging-journal",
+            "binary.migrated-template-2-22.sqlite",
+            "binary.migrated-template-2-2.42-0.staging",
             "other.migrated-template-1-1.sqlite",
             "binary",
         ] {
@@ -329,9 +384,16 @@ mod tests {
         let current = file("binary.migrated-template-2-2.sqlite");
         let _ = from_template(&current);
         assert!(current.exists());
-        assert!(!file("binary.migrated-template-1-1.sqlite").exists());
+        for removed in [
+            "binary.migrated-template-1-1.sqlite",
+            "binary.migrated-template-1-1.42-0.staging",
+            "binary.migrated-template-1-1.42-0.staging-journal",
+            "binary.migrated-template-2-22.sqlite",
+        ] {
+            assert!(!file(removed).exists(), "{removed}");
+        }
         for kept in [
-            "binary.migrated-template-1-1.42.staging",
+            "binary.migrated-template-2-2.42-0.staging",
             "other.migrated-template-1-1.sqlite",
             "binary",
         ] {
@@ -356,15 +418,17 @@ mod tests {
         assert!(!template.exists());
     }
 
-    /// Beside a binary whose directory takes no template, both stores are
+    /// Beside a binary whose directory takes no files, both stores are
     /// replays; otherwise the second is a copy.
     #[test]
     fn in_memory_for_test_copies_this_binarys_template_when_it_can() {
+        let template = template_path().expect("a test binary has a path and a build time");
         let first = SqliteAccountStorage::in_memory_for_test().unwrap();
         let second = SqliteAccountStorage::in_memory_for_test().unwrap();
         assert_eq!(schema(&second), schema(&replayed()));
         assert_ne!(store_epoch(&first), store_epoch(&second));
-        if template_path().is_some_and(|template| template.exists()) {
+        if tempfile::tempfile_in(template.parent().unwrap()).is_ok() {
+            assert!(template.exists());
             assert_eq!(second.migration_summary().0, 0);
         }
     }

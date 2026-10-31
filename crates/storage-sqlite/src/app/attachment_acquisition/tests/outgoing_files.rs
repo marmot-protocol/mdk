@@ -824,6 +824,7 @@ fn file_staging_rolls_back_short_growing_mismatched_cancelled_and_over_quota_sou
 #[test]
 #[ignore = "opt-in 758 MB SQLCipher retention measurement; generated bounded input"]
 fn generated_758_mb_reader_retention_is_available_above_legacy_array_limit() {
+    crate::base::connection::use_production_storage_for_test_process();
     const LEN: u64 = 758_000_000;
     let directory = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::open_encrypted(

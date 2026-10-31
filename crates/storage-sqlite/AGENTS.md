@@ -111,7 +111,8 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
   `relax_storage_for_test_process()` (this crate's own unit tests start relaxed; see README). Keep `test-support`
   inert: nothing changes until a test calls a helper. Never call them from non-test code. The tests that pin the
   production settings (`encrypted_connection_applies_operational_defaults`, the `pins_cipher_pragmas_before_keying`
-  tests) call `use_production_storage_for_test_process()` before opening anything; a new one must too.
+  tests) and the ignored benchmarks of file-backed storage call `use_production_storage_for_test_process()` before
+  opening anything; a new one must too.
 - Keep invalidated message records. Applications decide whether to show them.
 - Prepare every database file with `fs_private::ensure_private_db_files` before `Connection::open`, and never open,
   read or copy a database or `-wal`/`-shm`/`-journal` sidecar through `std::fs` while this process may hold a

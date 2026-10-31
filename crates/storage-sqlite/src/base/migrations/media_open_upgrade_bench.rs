@@ -5,6 +5,7 @@ mod max_startup_investigation {
     #[test]
     #[ignore = "explicit investigation benchmark, synthetic data only"]
     fn encrypted_retention_upgrade_measurement() {
+        crate::base::connection::use_production_storage_for_test_process();
         use crate::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
         use std::time::Instant;
         let _trace = tracing::subscriber::set_default(
@@ -115,6 +116,7 @@ mod max_partial_investigation {
     #[test]
     #[ignore = "explicit investigation benchmark"]
     fn encrypted_partial_upgrade_measurement() {
+        crate::base::connection::use_production_storage_for_test_process();
         use crate::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
         use std::time::Instant;
         let _trace = tracing::subscriber::set_default(
