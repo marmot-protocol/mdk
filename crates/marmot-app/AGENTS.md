@@ -118,7 +118,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   action answers "nothing to send" while a change of this device's may still land. Never send a backup change again
   from here, and never store what became of one (D75): the engine's re-issue and the runtime's retry are the only
   paths that commit one again, and a change whose re-issue is refused stays lost. `backup_settings` reads the roster's
-  account entry as it is now, so the user sees a lost change and can make it again.
+  account entry as it is now, so the user sees a lost change and can make it again. The backup spec leaves the rest
+  of a device's own handling local; MDK's is this. A confirm refused as `device_group_busy` (the group can't take
+  the commit, its entry changed, or the engine would only queue the send: `AccountEntryUnsettled`), or failing with
+  any other error, keeps the words in memory for another try with the same words from a fresh read, which finds their
+  key in place if the commit went out after all; a cancel or a restart drops them, and the user starts again with new
+  words. A turn-off refused as `device_group_busy` changes nothing. An
+  update this device committed ends when its publication fails and the engine discards it, when branch selection
+  drops it onto another account entry (its re-issue is a conflict, so it is refused at the drop), or once branch
+  selection can no longer drop it. Until its publication has an outcome, and from a drop until its re-issue is
+  committed or refused, the gate answers another change with `device_group_busy`.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
   `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this
