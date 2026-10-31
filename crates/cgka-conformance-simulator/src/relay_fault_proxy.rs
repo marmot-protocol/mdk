@@ -325,9 +325,10 @@ fn named_inboxes(items: &[serde_json::Value]) -> impl Iterator<Item = &str> {
 /// Client-to-relay forwarding after the HTTP upgrade. Each frame is
 /// forwarded unchanged once it is complete. While the stall is on, a data
 /// message that starts is held until its last frame; a history `REQ` or
-/// `NEG-OPEN` is then withheld, as are later `CLOSE`, `NEG-MSG` and
-/// `NEG-CLOSE` messages for its subscription. Control frames always pass at
-/// once. A frame the gate cannot parse ends withholding for the connection.
+/// `NEG-OPEN` is then withheld if the stall is still on, as are later
+/// `CLOSE`, `NEG-MSG` and `NEG-CLOSE` messages for its subscription. Control
+/// frames always pass at once. A frame the gate cannot parse ends withholding
+/// for the connection.
 #[derive(Default)]
 struct RequestGate {
     passthrough: bool,
@@ -381,7 +382,9 @@ impl RequestGate {
             if first & 0x80 != 0
                 && let Some(Some((frames, message))) = self.current.take()
             {
-                if self.withholds(&message) {
+                // A message held while the stall was on goes through if it
+                // was lifted before the message ended.
+                if stall && self.withholds(&message) {
                     withheld.push(message);
                 } else {
                     forward.extend(frames);
@@ -1061,6 +1064,16 @@ mod tests {
         withheld.extend(follow_ups);
         let withheld = withheld.into_iter().map(str::to_owned).collect();
         assert_eq!(run(true), (expected, withheld));
+
+        // A history request held when the stall is lifted mid-message goes
+        // through once it ends.
+        let mut gate = RequestGate::default();
+        let start = frame(0x01, &history.as_bytes()[..9], Some([1, 2, 3, 4]));
+        let end = frame(0x80, &history.as_bytes()[9..], Some([5, 6, 7, 8]));
+        assert_eq!(gate.feed(&start, true), (Vec::new(), Vec::new()));
+        let mut both = start.clone();
+        both.extend(&end);
+        assert_eq!(gate.feed(&end, false), (both, Vec::new()));
     }
 
     #[test]

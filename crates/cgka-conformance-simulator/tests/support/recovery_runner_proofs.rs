@@ -885,18 +885,21 @@ pub(super) async fn owed_history() {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
         let idle = history_since(subject, &idle_clocks).await?;
-        let trace_reconnect = runner_trace::now_ms();
-        let idle_trace = trace_between(trace_idle, trace_reconnect);
+        let trace_cut = runner_trace::now_ms();
+        let idle_trace = trace_between(trace_idle, trace_cut);
 
         // Reconnect: endpoint 0's live generations end. Their ranges were only
         // provisional, and with no event inside the rebuild lookback every
-        // route's new live count is empty, so each is owed again there.
+        // route's new live count is empty, so each is owed again there. The
+        // interruption returns once the relay is back; only what follows
+        // counts as the reconnect's re-proof.
         let reconnect_clocks = relay_clocks(subject).await?;
         subject.interrupt_relay("reconnect", "relay:shared", OUTAGE_MS).await?;
+        let reconnected = Instant::now();
+        let trace_reconnect = runner_trace::now_ms();
         let quiet_after_reconnect =
             visible_after(&alice, &bob, &quiet, "quiet-after-reconnect", Duration::from_secs(60)).await?;
         quiet_expected.push("quiet-after-reconnect".into());
-        let reconnected = Instant::now();
         let mut resweep = BTreeSet::new();
         // Each route asked again on endpoint 0, by either of bob's owners.
         let resweeps = async || {
@@ -904,10 +907,12 @@ pub(super) async fn owed_history() {
             resweep = history[0].iter().filter_map(|request| request.route.clone()).collect();
             Ok(resweep.contains(&busy_route) && resweep.contains(&quiet_route) && caught_up(&bob, trace_reconnect).await?)
         };
-        let resweep_result = wait_for("the reconnect's re-sweep", RESWEEP_DEADLINE, resweeps).await;
+        let left = RESWEEP_DEADLINE.saturating_sub(reconnected.elapsed());
+        let resweep_result = wait_for("the reconnect's re-sweep", left, resweeps).await;
         let resweep_seconds = reconnected.elapsed().as_secs_f64();
         let after_reconnect = history_since(subject, &reconnect_clocks).await?;
         let reconnect_trace = runner_trace::since(trace_reconnect);
+        let outage_trace = trace_between(trace_cut, trace_reconnect);
         let quiet_exact = holds_exactly(&bob, &quiet, &quiet_expected).await?;
         let status = bob.account_recovery_status().await?;
         let summaries = |history: &[Vec<HistoryRequestV1>]| {
@@ -952,6 +957,7 @@ pub(super) async fn owed_history() {
                 "repeated_window_requests_per_endpoint": reconnect_repeats,
                 "history": summaries(&after_reconnect),
                 "runner": runner_summary(&reconnect_trace),
+                "runner_during_outage": runner_summary(&outage_trace),
             },
             "status_at_end": status_summary(&status),
         });
