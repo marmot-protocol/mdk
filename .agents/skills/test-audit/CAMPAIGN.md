@@ -55,10 +55,10 @@ delete them once merged.
 
 Run one crate at a time: other agents build on the same machine. Keep
 baseline failures in their own list. Each is a product bug until shown
-otherwise (step 8).
+otherwise (step 9).
 
 When shared setup is a large share of the time, fix the harness before the
-ledger, in its own change (step 5). In `storage-sqlite`, the migration replay
+ledger, in its own change (step 6). In `storage-sqlite`, the migration replay
 and SQLCipher settings of each test store were about 70% of the crate's and
 the engine's test time. Fixing them first means the ledger judges each test by
 what it asserts, not by setup cost no single test can remove.
@@ -108,10 +108,11 @@ Prefer the cheapest layer that runs real production code over a fake network
 higher-layer journey per user-visible flow for the risks that layer adds.
 
 Coverage finds candidates. Run the suspect suite and its keeper alone with
-the step 1 coverage build and compare the production owner's covered lines. A suite
-whose covered lines are a subset of the keeper's, and whose assertions the
-keeper already makes, is a `C` or `D` candidate. Equal coverage is necessary,
-not sufficient: the mutation check in step 6 is the proof.
+the step 1 coverage build and compare the production owner's covered lines.
+A suite whose covered lines are a subset of the keeper's, and whose
+assertions the keeper already makes, is a `C` or `D` candidate. Equal
+coverage is necessary, not sufficient: the mutation check in step 7 is the
+proof.
 
 Plan the cost work too: binaries to merge, sleeps to replace with awaited
 state or paused time, tests to move to a cheaper layer, and the seams each
@@ -121,18 +122,45 @@ Done when each lane plan names its retired tests and files, the keeper for
 each contract, the assertions to carry into keepers, the binaries to merge
 and the seams to delete.
 
-## 5. Cutover
+## 5. Gaps
+
+Trimming is half of a campaign; the other half is the owner's contracts that
+no test proves. From the step 1 report, list the production lines that no
+test reaches, grouped by function, and read each group with its callers. Mark
+each group:
+
+- `T` test: a reachable contract with no proof, such as a persisted format,
+  an error or rollback path with a visible effect, or an edge case of a public
+  method. Add a test at the owning layer and show it fail under a matching
+  mutation.
+- `X` dead: no production caller. File an issue or delete it in its own
+  change, not in a lane.
+- `U` unreachable: defensive code that cannot run, such as an impossible
+  match arm or an invariant `expect`. Leave it untested.
+
+Coverage cannot see a line that runs while nothing asserts its result: a
+persisted integer no test pins, or a trigger whose only probe fails first on
+a `CHECK`. The ledger reads find these; list them with the `T` groups.
+
+Rank the `T` groups by what a regression would cost. Add the top ones with the
+lane and list the rest on the tracking issue. Each added test passes the
+authoring gate in [SKILL.md](SKILL.md).
+
+Done when every uncovered group in the owner has a mark and every added test
+has a caught mutation.
+
+## 6. Cutover
 
 Edit one lane at a time. Change shared harnesses and support modules first,
-on their own, so lanes do not collide. With each lane, delete the seams it
-unlocks, update the routing listed in SKILL.md's validation section, and
-update the crate's `tests/AGENTS.md` file map. Put durable test-ownership
-rules that came from real mistakes in this campaign into the nearest
-`AGENTS.md`.
+on their own, so lanes do not collide. With each lane, add its step 5 tests,
+delete the seams it unlocks, update the routing listed in SKILL.md's
+validation section, and update the crate's `tests/AGENTS.md` file map. Put
+durable test-ownership rules that came from real mistakes in this campaign
+into the nearest `AGENTS.md`.
 
 Done when the lane's keepers and siblings pass.
 
-## 6. Preservation review
+## 7. Preservation review
 
 Before a lane leaves your machine, have an independent read-only reviewer
 compare the deleted tests with the keepers. It looks for contracts that lost
@@ -148,7 +176,7 @@ production line that lost coverage.
 Done when every reported gap is restored or rejected with source evidence,
 and every consolidated contract has a caught mutation.
 
-## 7. Land
+## 8. Land
 
 One lane per PR, through `.agents/skills/land-change`. A lane is a diff a
 reviewer can read whole; a crate-wide diff is not. The queue squashes, so
@@ -157,7 +185,7 @@ previous one merges.
 
 Done when every lane PR is merged.
 
-## 8. Product defects
+## 9. Product defects
 
 A baseline failure that survives into a keeper is a bug. Fix it at its owner
 in its own PR and its own session, not inside a lane. Prove the fix through
@@ -167,7 +195,7 @@ fixing them in the campaign.
 
 Done when each repaired defect has a failing control and a passing fix.
 
-## 9. Report
+## 10. Report
 
 Post the [SKILL.md](SKILL.md) report on the tracking issue, plus:
 
@@ -177,4 +205,6 @@ Post the [SKILL.md](SKILL.md) report on the tracking issue, plus:
   explained;
 - lanes, retired layers and their keepers;
 - preservation gaps found and the mutations that proved them closed;
+- coverage gaps: the tests added and the mutations that proved them, the dead
+  and unreachable code recorded, and the gaps left on the tracking issue;
 - product defects with their control and fix.

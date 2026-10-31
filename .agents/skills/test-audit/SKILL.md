@@ -1,13 +1,13 @@
 ---
 name: test-audit
 description: >-
-  Gate every new or changed mdk test and prune existing ones: name the
-  contract and the regression a test catches, give each contract one owner at
-  the cheapest layer that runs the real production code, reject duplicate or
-  implementation-coupled proof, and retire test-only production seams. Use
-  when writing, changing, reviewing or deleting tests, or when asked to audit,
-  trim, consolidate or speed up tests. For a whole crate or subsystem, also
-  read CAMPAIGN.md.
+  Gate every new or changed mdk test, prune existing ones and fill coverage
+  gaps: name the contract and the regression a test catches, give each
+  contract one owner at the cheapest layer that runs the real production code,
+  reject duplicate or implementation-coupled proof, and retire test-only
+  production seams. Use when writing, changing, reviewing or deleting tests,
+  or when asked to audit, trim, consolidate, speed up or add missing tests.
+  For a whole crate or subsystem, also read CAMPAIGN.md.
 ---
 
 # Test audit
@@ -20,7 +20,8 @@ places:
 - **Authoring.** The gate below applies to every test you add or change, in
   any crate.
 - **Auditing.** Remove low-value proof in coherent batches, one production
-  owner at a time. Never chase deletion counts, line counts or coverage
+  owner at a time, and add proof for the owner's contracts that no test
+  reaches. Never chase deletion counts, line counts or coverage
   percentages: they are measurements, not goals.
 
 For a whole crate or subsystem, read [CAMPAIGN.md](CAMPAIGN.md) before
