@@ -890,23 +890,73 @@ mod tests {
             ))
             .unwrap();
 
+        let error = mls
+            .queue_proposal(&group_id, &proposal_ref, &proposal)
+            .expect_err("the injected ref failure must surface");
         assert!(
-            mls.queue_proposal(&group_id, &proposal_ref, &proposal)
-                .is_err()
+            error.to_string().contains("injected proposal-ref failure"),
+            "{error}"
         );
-        let queued_entity_count: i64 = mls
-            .lock()
+        assert_eq!(
+            label_row_count(mls, QUEUED_PROPOSAL_LABEL),
+            0,
+            "the proposal entity must roll back with the failed ref append"
+        );
+    }
+
+    /// `clear_proposal_queue` deletes the queued proposals and their refs in
+    /// one transaction (#148): when the refs delete fails, the proposals stay
+    /// too, so a crash between the deletes cannot leave refs to missing
+    /// entities.
+    #[test]
+    fn clear_proposal_queue_keeps_the_proposals_when_the_refs_delete_fails() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let group_id = TestGroupId(vec![1, 2, 3, 4]);
+        mls.queue_proposal(
+            &group_id,
+            &TestProposalRef(vec![0xAA]),
+            &TestQueuedProposal(vec![0xCC]),
+        )
+        .unwrap();
+        let refs_label_hex = hex::encode_upper(PROPOSAL_QUEUE_REFS_LABEL.as_bytes());
+        mls.lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_proposal_refs_delete
+                 BEFORE DELETE ON openmls_values
+                 WHEN hex(OLD.label) = '{refs_label_hex}'
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected proposal-refs delete failure');
+                 END;"
+            ))
+            .unwrap();
+
+        let error = mls
+            .clear_proposal_queue::<TestGroupId, TestProposalRef>(&group_id)
+            .expect_err("the injected refs delete failure must surface");
+        assert!(
+            error
+                .to_string()
+                .contains("injected proposal-refs delete failure"),
+            "{error}"
+        );
+        assert_eq!(
+            label_row_count(mls, QUEUED_PROPOSAL_LABEL),
+            1,
+            "the proposal delete must roll back with the failed refs delete"
+        );
+    }
+
+    fn label_row_count(mls: &SqliteOpenMlsStorage, label: OpenMlsValueLabel) -> i64 {
+        mls.lock()
             .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM openmls_values WHERE label = ?1",
-                rusqlite::params![QUEUED_PROPOSAL_LABEL.as_bytes()],
+                rusqlite::params![label.as_bytes()],
                 |row| row.get(0),
             )
-            .unwrap();
-        assert_eq!(
-            queued_entity_count, 0,
-            "the proposal entity must roll back with the failed ref append"
-        );
+            .unwrap()
     }
 
     #[test]
@@ -1136,5 +1186,59 @@ mod tests {
                 assert_eq!(rows, 1, "an operational read error cleared the queue");
             }
         }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestKeyPackageRef(Vec<u8>);
+
+    impl Key<CURRENT_VERSION> for TestKeyPackageRef {}
+    impl traits::HashReference<CURRENT_VERSION> for TestKeyPackageRef {}
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestKeyPackage(Vec<u8>);
+
+    impl Entity<CURRENT_VERSION> for TestKeyPackage {}
+    impl traits::KeyPackage<CURRENT_VERSION> for TestKeyPackage {}
+
+    /// The engine retires stored KeyPackage bundles by parsing them as JSON
+    /// and deletes every one it cannot parse, so these rows must stay JSON
+    /// while other labels move to MessagePack, and a deletion by storage key
+    /// must remove that bundle's private material and no other.
+    #[test]
+    fn key_package_bundles_stay_json_and_delete_by_storage_key() {
+        use cgka_traits::storage::KeyPackageBundleStorage;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let (kept, retired) = (TestKeyPackageRef(vec![1]), TestKeyPackageRef(vec![2]));
+        mls.write_key_package(&kept, &TestKeyPackage(vec![7]))
+            .unwrap();
+        mls.write_key_package(&retired, &TestKeyPackage(vec![8]))
+            .unwrap();
+
+        let bundles = store.stored_key_package_bundles().unwrap();
+        let decode = |value: &[u8]| serde_json::from_slice::<TestKeyPackage>(value).unwrap();
+        let mut decoded = bundles
+            .iter()
+            .map(|bundle| decode(&bundle.value))
+            .collect::<Vec<_>>();
+        decoded.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(decoded, [TestKeyPackage(vec![7]), TestKeyPackage(vec![8])]);
+
+        let retired_bundle = bundles
+            .iter()
+            .find(|bundle| decode(&bundle.value) == TestKeyPackage(vec![8]))
+            .unwrap();
+        store
+            .delete_stored_key_package_bundle(&retired_bundle.storage_key)
+            .unwrap();
+        assert_eq!(
+            mls.key_package::<_, TestKeyPackage>(&retired).unwrap(),
+            None
+        );
+        assert_eq!(
+            mls.key_package::<_, TestKeyPackage>(&kept).unwrap(),
+            Some(TestKeyPackage(vec![7]))
+        );
     }
 }

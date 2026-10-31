@@ -31,6 +31,9 @@ Map for Marmot engine-side SQLite tables (the `cgka_traits` storage traits). App
 ## Rules
 
 - Keep tests beside the module they exercise.
+- Prove that a write joins or owns its transaction by behavior, never by reading source: hold the write lock on a
+  second connection (`write_contention::SharedDatabase` in `mod.rs`) or inject a trigger failure, and match the
+  injected error's text. `StorageError::Backend(_)` alone also matches the error a nested `BEGIN` raises.
 - Message rows follow storage format 2 (`docs/marmot-architecture/storage-format-v2.md`): scalar columns, `payload`,
   and `deferred_peel` are authoritative and `record` is `NULL`; legacy format-1 rows stay readable and promote
   atomically on mutation. Other Marmot records (for example groups) are serialized `record` blobs so trait shapes can

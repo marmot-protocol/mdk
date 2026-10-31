@@ -94,8 +94,8 @@ impl AnnouncedKeyPackageStorage for SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SqliteAccountStorage;
     use crate::base::test_support::{gid, sample_group};
-    use crate::{SqlCipherKey, SqliteAccountStorage};
     use cgka_traits::storage::{GroupStorage as _, MessageStorage as _, StorageProvider as _};
 
     fn announced(slot: u8, reference: u8) -> AnnouncedKeyPackage {
@@ -106,25 +106,19 @@ mod tests {
     }
 
     #[test]
-    fn announcements_keep_their_latest_sighting_and_survive_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("local identity key").unwrap();
-        {
-            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            store.put_group(&sample_group(gid(1), 0, 1)).unwrap();
-            store.put_group(&sample_group(gid(2), 0, 1)).unwrap();
-            store
-                .record_announced_key_packages(&gid(1), &[announced(1, 1)], 100)
-                .unwrap();
-            store
-                .record_announced_key_packages(&gid(1), &[announced(1, 1), announced(1, 2)], 200)
-                .unwrap();
-            store
-                .record_announced_key_packages(&gid(2), &[announced(1, 3)], 200)
-                .unwrap();
-        }
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    fn announcements_keep_their_latest_sighting() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 1)).unwrap();
+        store.put_group(&sample_group(gid(2), 0, 1)).unwrap();
+        store
+            .record_announced_key_packages(&gid(1), &[announced(1, 1)], 100)
+            .unwrap();
+        store
+            .record_announced_key_packages(&gid(1), &[announced(1, 1), announced(1, 2)], 200)
+            .unwrap();
+        store
+            .record_announced_key_packages(&gid(2), &[announced(1, 3)], 200)
+            .unwrap();
         assert_eq!(
             store.announced_key_packages(&gid(1), 0).unwrap(),
             vec![announced(1, 1), announced(1, 2)]

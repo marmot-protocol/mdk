@@ -92,42 +92,42 @@ mod tests {
     use crate::SqliteAccountStorage;
 
     #[test]
-    fn feature_registry_roundtrip() {
+    fn feature_requirements_round_trip_and_reuse_one_description_allocation() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        let feature = Feature("self-remove");
-        let requirement = CapabilityRequirement {
-            requires: Capability::Proposal(10),
-            level: RequirementLevel::Required,
-            description: "MIP-03",
-        };
-        store
-            .register_feature(feature.clone(), requirement.clone())
-            .unwrap();
-        assert_eq!(
-            store.feature_requirement(&feature).unwrap(),
-            Some(requirement)
+        let required = (
+            Feature("self-remove"),
+            CapabilityRequirement {
+                requires: Capability::Proposal(10),
+                level: RequirementLevel::Required,
+                description: "self remove proposal",
+            },
         );
-    }
+        let optional = (
+            Feature("agent-text-stream"),
+            CapabilityRequirement {
+                requires: Capability::AppComponent(0x8006),
+                level: RequirementLevel::Optional,
+                description: "agent text stream over QUIC",
+            },
+        );
+        for (feature, requirement) in [&required, &optional] {
+            store
+                .register_feature(feature.clone(), requirement.clone())
+                .unwrap();
+        }
+        for (feature, requirement) in [&required, &optional] {
+            assert_eq!(
+                store.feature_requirement(feature).unwrap().as_ref(),
+                Some(requirement)
+            );
+        }
+        assert_eq!(
+            store.feature_requirement(&Feature("unknown")).unwrap(),
+            None
+        );
 
-    #[test]
-    fn feature_requirement_reuses_description_allocation_across_reads() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let feature = Feature("agent-text-stream");
-        store
-            .register_feature(
-                feature.clone(),
-                CapabilityRequirement {
-                    requires: Capability::AppComponent(0x8006),
-                    level: RequirementLevel::Optional,
-                    description: "agent text stream over QUIC",
-                },
-            )
-            .unwrap();
-
-        let first = store.feature_requirement(&feature).unwrap().unwrap();
-        let second = store.feature_requirement(&feature).unwrap().unwrap();
-
-        assert_eq!(first.description, second.description);
+        let first = store.feature_requirement(&optional.0).unwrap().unwrap();
+        let second = store.feature_requirement(&optional.0).unwrap().unwrap();
         assert_eq!(
             first.description.as_ptr(),
             second.description.as_ptr(),
