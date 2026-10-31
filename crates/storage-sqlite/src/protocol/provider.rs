@@ -59,6 +59,10 @@ impl StorageProvider for SqliteAccountStorage {
         Some(self)
     }
 
+    fn sibling_add_storage(&self) -> Option<&dyn cgka_traits::storage::SiblingAddStorage> {
+        Some(self)
+    }
+
     fn group_replay_state_fingerprint(
         &self,
         group_id: &cgka_traits::types::GroupId,

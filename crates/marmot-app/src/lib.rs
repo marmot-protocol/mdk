@@ -102,6 +102,7 @@ pub mod error_kind_table;
 mod external_signer;
 mod groups;
 mod history_bundle;
+mod history_delivery;
 mod history_notices;
 pub use history_notices::{AccountRecoveryStatus, HistoryNotice, HistoryNoticeCause};
 mod ids;

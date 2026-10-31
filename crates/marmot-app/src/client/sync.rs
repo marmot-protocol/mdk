@@ -2604,6 +2604,7 @@ impl AppClient {
             .get(pending.failed_message_cursor)
         {
             if pending.failed_message_update.is_none() {
+                self.history_delivery_failed(&failed.app_event_id)?;
                 pending.failed_message_update = Some(
                     self.app
                         .account_storage(&self.state.label)?

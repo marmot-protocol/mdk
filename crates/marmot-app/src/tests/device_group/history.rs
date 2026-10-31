@@ -5,7 +5,9 @@
 //! device group gives or takes history.
 
 use super::*;
-use crate::history_bundle::{BundledEvent, ChatPosition, HistoryBundle, seal_history_bundle};
+use crate::history_bundle::{
+    BundledEvent, ChatPosition, HISTORY_BUNDLE_MAX_PLAINTEXT, HistoryBundle, seal_history_bundle,
+};
 use crate::messages::AppMessageIntent;
 use cgka_traits::MarmotAppEvent;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
@@ -310,7 +312,10 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
             .is_err()
     );
 
-    let mut bundle = alice.export_chat_history(&chat, None).unwrap().unwrap();
+    let mut bundle = alice
+        .export_chat_history(&chat, None, HISTORY_BUNDLE_MAX_PLAINTEXT)
+        .unwrap()
+        .unwrap();
     let event = bundle
         .events
         .iter_mut()
@@ -404,7 +409,10 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         .unwrap();
     assert!(!prepared.opens_with_imported_key());
 
-    let passed_on = bob.export_chat_history(&chat, None).unwrap().unwrap();
+    let passed_on = bob
+        .export_chat_history(&chat, None, HISTORY_BUNDLE_MAX_PLAINTEXT)
+        .unwrap()
+        .unwrap();
     let event = passed_on
         .events
         .iter()

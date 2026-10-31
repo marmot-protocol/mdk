@@ -308,6 +308,8 @@ mod migration_0146_device_removals;
 mod migration_0147_device_removed_membership;
 #[path = "migrations/0148_compromise_warning.rs"]
 mod migration_0148_compromise_warning;
+#[path = "migrations/0149_history_deliveries.rs"]
+mod migration_0149_history_deliveries;
 #[path = "migrations/0160_sibling_welcomes.rs"]
 mod migration_0160_sibling_welcomes;
 #[path = "migrations/0161_small_state.rs"]
@@ -1218,6 +1220,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0148_compromise_warning",
         suspend_foreign_keys: &[],
         apply: migration_0148_compromise_warning::apply,
+    },
+    Migration {
+        version: 149,
+        name: "0149_history_deliveries",
+        suspend_foreign_keys: &[],
+        apply: migration_0149_history_deliveries::apply,
     },
     Migration {
         version: 160,

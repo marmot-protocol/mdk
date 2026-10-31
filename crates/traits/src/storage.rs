@@ -1055,6 +1055,42 @@ pub trait AnnouncedKeyPackageStorage {
     ) -> StorageResult<Vec<AnnouncedKeyPackage>>;
 }
 
+// ── SiblingAddStorage ──────────────────────────────────────────────────────
+
+/// A sibling device this device's own confirmed Commit added to a group
+/// (mdk#2628 D76): the slot the added leaf's device tag read as, against the
+/// device group's roster when the Commit was confirmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiblingAdd {
+    pub group_id: GroupId,
+    pub slot: [u8; 32],
+    pub added_at: u64,
+}
+
+/// How long a sibling add is kept: as long as the history it owes.
+pub const SIBLING_ADD_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The sibling devices this device's own confirmed Commits added to groups
+/// (mdk#2628 D76). The engine records each in the transaction that confirms
+/// its Commit and never reads them; the app owes each the group's history
+/// and then forgets it.
+pub trait SiblingAddStorage {
+    /// Record that a Commit confirmed at `added_at` added the siblings at
+    /// `slots` to `group_id`, and drop every add recorded before
+    /// `added_at - SIBLING_ADD_RETENTION_SECS`. A pair already recorded takes
+    /// the later time.
+    fn record_sibling_adds(
+        &self,
+        group_id: &GroupId,
+        slots: &[[u8; 32]],
+        added_at: u64,
+    ) -> StorageResult<()>;
+    /// Every recorded add, oldest first.
+    fn sibling_adds(&self) -> StorageResult<Vec<SiblingAdd>>;
+    /// Forget `add`, unless the pair was recorded again since.
+    fn forget_sibling_add(&self, add: &SiblingAdd) -> StorageResult<()>;
+}
+
 // ── MaintenanceStorage ─────────────────────────────────────────────────────
 
 /// Account-device-local maintenance and immutable publication recovery.
@@ -1253,6 +1289,12 @@ pub trait StorageProvider:
     /// Optional store of the KeyPackages device-group rosters announced
     /// (mdk#2628 D31 item 7). A backend without one records none.
     fn announced_key_package_storage(&self) -> Option<&dyn AnnouncedKeyPackageStorage> {
+        None
+    }
+
+    /// Optional store of the sibling devices this device's own Commits added
+    /// (mdk#2628 D76). A backend without one records none.
+    fn sibling_add_storage(&self) -> Option<&dyn SiblingAddStorage> {
         None
     }
 
