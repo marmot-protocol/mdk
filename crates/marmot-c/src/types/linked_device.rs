@@ -21,6 +21,8 @@ c_mirror! {
     /// characters) is the handle actions on the device take. `label`,
     /// `client` and `platform` are empty until set. `linked_at` is in Unix
     /// seconds. `linked_by_slot_id_hex` is NULL for the founder.
+    /// `removal_pending` is set while a removal decided on this device waits
+    /// for the device group.
     MarmotLinkedDevice from LinkedDeviceFfi,
     list(MarmotLinkedDeviceList, marmot_linked_device_list_free) {
         str slot_id_hex,
@@ -34,6 +36,7 @@ c_mirror! {
         copy add_to_all_chats: bool,
         copy bring_history: bool,
         copy keep_while_inactive: bool,
+        copy removal_pending: bool,
     }
 }
 
@@ -59,6 +62,7 @@ mod tests {
                 add_to_all_chats: false,
                 bring_history: false,
                 keep_while_inactive: false,
+                removal_pending: false,
             },
             LinkedDeviceFfi {
                 slot_id_hex: "cd".repeat(32),
@@ -72,6 +76,7 @@ mod tests {
                 add_to_all_chats: true,
                 bring_history: false,
                 keep_while_inactive: true,
+                removal_pending: true,
             },
         ]));
         unsafe {
@@ -97,6 +102,8 @@ mod tests {
             assert!(second.add_to_all_chats);
             assert!(!second.bring_history);
             assert!(second.keep_while_inactive);
+            assert!(!first.removal_pending);
+            assert!(second.removal_pending);
             marmot_linked_device_list_free(list);
             marmot_linked_device_list_free(std::ptr::null_mut());
         }

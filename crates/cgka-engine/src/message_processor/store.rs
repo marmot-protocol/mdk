@@ -1292,7 +1292,7 @@ mod tests {
         crate::engine::Engine<SqliteAccountStorage>,
         GroupId,
     ) {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let signing_key = test_signing_key();
         let identity = signing_key.verifying_key().to_bytes().to_vec();
         let engine = EngineBuilder::new(storage.clone())

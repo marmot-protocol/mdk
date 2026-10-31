@@ -13,9 +13,15 @@ The code that ships diagnostics off the device (step 6 of the 2026-10 architectu
 - **Recording never names `AppError`.** Recording methods take this crate's outcome values: the performance outcome,
   the closed set of product outcomes and a storage-failure kind. `marmot-app` classifies its own errors into them
   (its `app_outcome.rs`).
-- **`marmot-app` reaches the crate through `observer` and `wiring`.** Hosts name `ProductAnalytics`,
-  `AppPerformanceTelemetry`, `ProductObservation`, `DiagnosticsPermit` and `AuditOtlpSender` through `marmot-app`'s
-  re-exports, so those types gain no new `pub` method. A recording method goes on an `observer` view
+- **The surface is the crate root.** `marmot-app` is the only crate that depends on this one. Every module is private
+  except three whose path is part of the surface: `product_analytics` and `audit_otlp_sender`, which `marmot-app`
+  re-exports as modules hosts name, and `wiring`, whose functions read only qualified. (`metric_names`, a module of
+  constants, is re-exported at the root for the same reason.) An item another crate's production code needs is `pub`
+  on its module and re-exported at the root, with every type its signature names; anything else is `pub(crate)`. Do
+  not make another module public.
+- **`marmot-app` records through `Observer`'s views and runs the collectors through `wiring`.** Hosts name
+  `ProductAnalytics`, `AppPerformanceTelemetry`, `ProductObservation`, `DiagnosticsPermit` and `AuditOtlpSender`
+  through `marmot-app`'s re-exports, so those types gain no new `pub` method. A recording method goes on a view
   (`ProductRecorder`, `PerformanceRecorder`, `ProductOperation`); starting workers, consent receipts, silencing, the
   telemetry origin, the exporters' runtime config and the audit destination go on `wiring`.
 - **No files.** Production code creates and opens no files. `marmot-app` keeps every audit, checkpoint and id file on
@@ -37,7 +43,7 @@ The code that ships diagnostics off the device (step 6 of the 2026-10 architectu
 
 | Path | Owns |
 | --- | --- |
-| `src/lib.rs` | Module declarations and the root re-exports `marmot-app` re-exports to hosts. |
+| `src/lib.rs` | Module declarations and the root re-exports, which are the surface: what hosts name through `marmot-app`, what `marmot-app`'s production code calls, and the `test-support` fixtures. |
 | `src/observer.rs` | `Observer`, the runtime's recording handle (the app's shared collector plus the runtime's own performance recorder), and its recorder views. |
 | `src/wiring.rs` | What `marmot-app` runs the collectors and exporters through: consent receipts and the consent lock, silencing, the telemetry origin, collector configuration, the product delivery worker, the exporters' runtime config and the audit sender's destination. |
 | `src/product_analytics/` | Product analytics: the event catalogue and schemas (`catalogue.rs`, `builtins.rs`), the in-memory collector and its permits (`mod.rs`), the consent state (`consent.rs`), recording outcomes (`recording.rs`, `observed.rs`), Aptabase delivery (`delivery.rs`, behind `product-analytics-export`) and the collector fixtures (`fixtures.rs`). |
@@ -47,7 +53,6 @@ The code that ships diagnostics off the device (step 6 of the 2026-10 architectu
 | `src/audit_upload.rs` | The v4 audit upload's HTTP half: snapshot capture, the checkpoint record, endpoint validation, the request, the response handling and `AuditUploadError`. |
 | `src/collector_host_safety.rs` | The collector dial-safety helper and the injected HTTP builder slot. |
 | `src/export_config.rs` | The exporters' resolved config and the collector endpoint parsers. |
-| `src/observability_test_support.rs` | The fixtures `marmot-app`'s tests use; built only with `test-support`. |
 
 ## Rules
 
@@ -61,7 +66,10 @@ The code that ships diagnostics off the device (step 6 of the 2026-10 architectu
   `marmot-app`'s `src/observability_tests/`. A test here that dials a loopback collector hands in a direct builder
   (`hand_in_direct_http_builder`).
 - What only `marmot-app`'s tests reach is built only with `test-support`, gated `cfg(any(test, feature =
-  "test-support"))`, and reaches state through methods, never fields. Never widen an item for a test alone.
+  "test-support"))`, and reaches state through methods, never fields. Free items (the collector fixtures, the
+  resolver hook and the collector timeouts) are re-exported from the root's gated block; methods and fields get a
+  `_for_test` hook beside their type. A hook only this crate's own tests use is `cfg(test)`. Never widen an item for a
+  test alone.
 
 ## Features
 

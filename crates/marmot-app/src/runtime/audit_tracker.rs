@@ -15,9 +15,9 @@ use crate::{
     AppError, AuditLogFile, AuditLogTrackerConfig, AuditLogTrackerUpdateResult, MarmotApp,
 };
 use marmot_forensics::local_delivery::DeliveryStep;
-use marmot_observability::audit_otlp_sender::AuditOtlpSendResult;
-use marmot_observability::audit_otlp_sender::AuditOtlpSender;
-use marmot_observability::audit_upload::{AUDIT_LOG_UPLOAD_MAX_BYTES, AuditUploadOutcome};
+use marmot_observability::AuditOtlpSendResult;
+use marmot_observability::AuditOtlpSender;
+use marmot_observability::{AUDIT_LOG_UPLOAD_MAX_BYTES, AuditUploadOutcome};
 
 /// Only one follow-up batch is queued while a pass is in flight.
 const APP_RUNTIME_AUDIT_TRACKER_QUEUE: usize = 1;

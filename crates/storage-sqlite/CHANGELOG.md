@@ -78,12 +78,29 @@
   `AnnouncedKeyPackageStorage`. Rows survive a branch-selection rewind, go
   with their group, and are pruned after 30 days or past 16 per slot. Nothing
   writes them unless device groups are on.
+- Migration 0146 advances account storage to schema 146 (mdk#2628 item 3.6b).
+  It adds `device_removals`, one row per device this device's user removed
+  from the account's device group, written before anything is committed, with
+  when the user decided and when the removed device's slot deletion was
+  accepted. A row lasts as long as this device trusts the device group:
+  forgetting the group removes its rows, with its trust row, and nothing else
+  does. `SqliteAppStorage` gains `record_device_removal`, which keeps a
+  decision already recorded, `device_removals` and
+  `set_device_removal_slot_withdrawn`. No rows are seeded.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`
   would, so the generation stays routed, and lowers the generation's floor to
   the lowest bound they list; `None` makes it account-wide, as every such
   observation did before.
+- Migration 0138 (mdk#2628 item 4.1) runs on every account database that
+  lacks it, including one already at schema 140. It adds
+  `cgka_account_device_history_keys`: this device's HPKE history key
+  pair, one per account-device identity, next to its MLS signer's binding.
+  `SqliteAccountStorage` implements the new
+  `cgka_traits::storage::AccountDeviceHistoryKeyStorage`, which
+  `StorageProvider` now requires; `put_account_device_history_key_if_absent`
+  never replaces a stored key.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it

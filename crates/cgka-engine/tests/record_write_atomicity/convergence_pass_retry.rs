@@ -172,7 +172,7 @@ async fn failing_catch_up_with(label: &str, frank_leaves: Option<FrankLeaves>) -
     let fault = PutGroupFault::default();
     let preparation = PreparationDelay::default();
     let clock = ManualConvergenceClock::new(1_000_000, 1_700_000_000_000);
-    let handle = SqliteAccountStorage::in_memory().unwrap();
+    let handle = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut carol = build_carol(
         label,
         handle.clone(),

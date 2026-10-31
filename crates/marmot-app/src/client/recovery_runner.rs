@@ -2,10 +2,12 @@
 //! history recovery scheduling over the coverage ledger and its durable retry
 //! state.
 //!
-//! It is built but not started. No production path constructs, wakes or reads
-//! it until the switch-over (PR 5), so the comparison owner in `recovery.rs`
-//! keeps every behavior and the ledger stays in shadow mode. Tests construct
-//! and drive it.
+//! It runs only behind the internal `runner_owns_debt` gate, off until the
+//! switch-over turns it on (PR 5g). With the gate on, the account worker
+//! spawns it and stops it with the worker, and a directly owned client runs it
+//! in place for one pass from `sync()` and `next_event()` ([`host`]). With the
+//! gate off nothing constructs it, so the comparison owner in `recovery.rs`
+//! keeps every behavior and the ledger stays in shadow mode.
 //!
 //! One step:
 //!
@@ -48,6 +50,8 @@
 
 mod admission;
 mod compare;
+pub(crate) mod host;
+mod open_attempts;
 mod policy;
 mod quantum;
 mod recheck;
@@ -67,7 +71,7 @@ use nostr::prelude::Event;
 use storage_sqlite::{
     RecoveryRelayCaps, RecoveryUnitOutcome, SqliteAppStorage, TransportReconciliationRoute,
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::compare::CompareRelay;
@@ -79,6 +83,8 @@ pub(crate) use tails::LiveTailRead;
 
 use crate::AppError;
 use crate::runtime::account_worker::recovery_credits::{self, RecoveryCreditPool};
+use open_attempts::AttemptKind;
+pub(crate) use open_attempts::OpenAttempts;
 use select::{Candidate, Memory, Pick};
 
 const TARGET: &str = "marmot_app::recovery_runner";
@@ -151,9 +157,10 @@ pub(crate) struct DebtTurn<'a> {
     pub(crate) live_counts: &'a [LiveCount],
 }
 
-/// What one account gives its runner. Turns run on the account worker (PR 5
-/// sends each as a worker command) and must stay short: storage reads and
-/// writes, no awaiting. Everything else runs off the worker.
+/// What one account gives its runner. Turns run on whoever owns the account's
+/// client, the account worker or a directly owned client's pass ([`host`]),
+/// and must stay short: storage reads and writes, no awaiting. Everything else
+/// runs off the worker.
 #[async_trait]
 pub(crate) trait RunnerHost: Send + Sync + 'static {
     /// Run `turn` on the worker. `None` once the worker is gone.
@@ -192,8 +199,10 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
     ) -> Option<Box<dyn CompareRelay>>;
 
     /// Route one fetched event to this account (the adapter's
-    /// `reconciled_deliveries`); nothing when it routes nowhere or is invalid.
-    async fn deliveries(&self, relay: &str, event: Event) -> Vec<TransportDelivery>;
+    /// `reconciled_deliveries`). An invalid event routes nowhere and is
+    /// dropped. `None` when a valid event routes to nothing yet: the account's
+    /// installed subscriptions lag its routes, so its slice stays owed.
+    async fn deliveries(&self, relay: &str, event: Event) -> Option<Vec<TransportDelivery>>;
 
     /// Hand one staged delivery to the account's recovered-ingest path, as
     /// one worker command. `None` once the worker is gone; an error is its
@@ -247,10 +256,22 @@ struct Signals {
     late_findings: AtomicU64,
 }
 
-/// The caller's side of a runner: wake it, steer it, stop it.
+/// One explicit pass a spawned runner owes a caller.
+struct PassRequest {
+    budget: Duration,
+    reply: oneshot::Sender<PassReport>,
+}
+
+/// Pass requests a spawned runner holds before it serves them.
+const PASS_REQUESTS: usize = 4;
+
+/// The caller's side of a runner: wake it, steer it, ask it for a pass, stop
+/// it.
+#[derive(Clone)]
 pub(crate) struct RecoveryRunnerHandle {
     wake: watch::Sender<u64>,
     hints: watch::Sender<PriorityHints>,
+    passes: mpsc::Sender<PassRequest>,
     signals: Arc<Signals>,
     cancel: CancellationToken,
 }
@@ -285,6 +306,16 @@ impl RecoveryRunnerHandle {
         self.cancel.cancel();
     }
 
+    /// Have the spawned task run one explicit pass ([`RecoveryRunner::run_pass`])
+    /// once its current step ends, and wait for its report. `None` once the
+    /// runner has stopped. Never await this on the account worker: the pass
+    /// runs worker turns.
+    pub(crate) async fn run_pass(&self, budget: Duration) -> Option<PassReport> {
+        let (reply, report) = oneshot::channel();
+        self.passes.send(PassRequest { budget, reply }).await.ok()?;
+        report.await.ok()
+    }
+
     /// Events re-checks have found inside ranges already covered, since the
     /// runner was built. An aggregate count, privacy-safe.
     pub(crate) fn late_findings(&self) -> u64 {
@@ -300,6 +331,7 @@ pub(crate) struct RecoveryRunner<H> {
     signals: Arc<Signals>,
     wake: watch::Receiver<u64>,
     hints: watch::Receiver<PriorityHints>,
+    passes: mpsc::Receiver<PassRequest>,
     cancel: CancellationToken,
     memory: Memory,
     admission: admission::Memory,
@@ -309,6 +341,8 @@ pub(crate) struct RecoveryRunner<H> {
     reconnect_failures: u32,
     /// The account breaker's pause last reported, so each pause logs once.
     reported_pause: Option<u64>,
+    /// Attempts begun and not settled, for its owner to refund on a stop.
+    open: OpenAttempts,
 }
 
 impl<H: RunnerHost> RecoveryRunner<H> {
@@ -317,8 +351,19 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         policy: RecoveryRunnerPolicy,
         credits: Arc<RecoveryCreditPool>,
     ) -> (Self, RecoveryRunnerHandle) {
-        let (wake_tx, wake) = watch::channel(0);
+        Self::waking_on(host, policy, credits, watch::channel(0).0)
+    }
+
+    /// As [`Self::new`], also woken by every bump of `wake`: the account's
+    /// chokepoints bump the sender its routing holds, whoever owns the runner.
+    pub(crate) fn waking_on(
+        host: Arc<H>,
+        policy: RecoveryRunnerPolicy,
+        credits: Arc<RecoveryCreditPool>,
+        wake: watch::Sender<u64>,
+    ) -> (Self, RecoveryRunnerHandle) {
         let (hints_tx, hints) = watch::channel(PriorityHints::default());
+        let (passes_tx, passes) = mpsc::channel(PASS_REQUESTS);
         let signals = Arc::new(Signals::default());
         let cancel = CancellationToken::new();
         let runner = Self {
@@ -326,22 +371,31 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             policy,
             credits,
             signals: signals.clone(),
-            wake,
+            wake: wake.subscribe(),
             hints,
+            passes,
             cancel: cancel.clone(),
             memory: Memory::default(),
             admission: admission::Memory::default(),
             survey_failures: 0,
             reconnect_failures: 0,
             reported_pause: None,
+            open: OpenAttempts::default(),
         };
         let handle = RecoveryRunnerHandle {
-            wake: wake_tx,
+            wake,
             hints: hints_tx,
+            passes: passes_tx,
             signals,
             cancel,
         };
         (runner, handle)
+    }
+
+    /// The attempts it has begun and not settled, for its owner to refund
+    /// once it has stopped ([`OpenAttempts::refund`]).
+    pub(crate) fn open_attempts(&self) -> OpenAttempts {
+        self.open.clone()
     }
 
     /// Run the account's task until it is shut down or its worker is gone.
@@ -351,6 +405,10 @@ impl<H: RunnerHost> RecoveryRunner<H> {
 
     async fn run(mut self) {
         loop {
+            if let Ok(request) = self.passes.try_recv() {
+                self.serve_pass(request).await;
+                continue;
+            }
             self.wake.borrow_and_update();
             self.hints.borrow_and_update();
             let next_due = match self.step().await {
@@ -363,12 +421,19 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => break,
+                Some(request) = self.passes.recv() => self.serve_pass(request).await,
                 changed = self.wake.changed() => if changed.is_err() { break },
                 changed = self.hints.changed() => if changed.is_err() { break },
                 () = sleep_for(sleep) => {}
             }
         }
         tracing::debug!(target: TARGET, method = "run", "recovery runner stopped");
+    }
+
+    /// One caller's explicit pass on the spawned task.
+    async fn serve_pass(&mut self, request: PassRequest) {
+        let report = self.run_pass(request.budget).await;
+        let _ = request.reply.send(report);
     }
 
     /// One step: admit, then select, credit, begin, quantum, stage, settle.
@@ -478,9 +543,19 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let key = candidate.key.clone();
         let best_effort = candidate.best_effort;
         let compares = self.memory.compares(&key.relay);
+        let open = self.open.clone();
         let plan = match self
             .host
-            .debt_turn(move |turn| select::begin(turn, &key, best_effort, caps, compares, &policy))
+            .debt_turn(move |turn| {
+                let plan = select::begin(turn, &key, best_effort, caps, compares, &policy);
+                // A best-effort relay is charged nothing.
+                if let Ok(Some(plan)) = &plan
+                    && !plan.best_effort
+                {
+                    open.begun(&plan.key, AttemptKind::Debt);
+                }
+                plan
+            })
             .await
         {
             None => return Step::Stopped,
@@ -535,9 +610,17 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         if facts.is_some_and(|facts| compare::would_not_compare(facts.end)) {
             self.memory.would_not_compare(&candidate.key.relay);
         }
+        let open = self.open.clone();
         let outcome = match self
             .host
-            .turn(move |turn| quantum::settle(turn, &plan, &report, &policy))
+            .turn(move |turn| {
+                let outcome = quantum::settle(turn, &plan, &report, &policy);
+                // A settle that failed left its charge for a stop to refund.
+                if outcome.is_ok() {
+                    open.settled(&plan.key);
+                }
+                outcome
+            })
             .await
         {
             None => return Step::Stopped,
@@ -583,9 +666,16 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             Err(step) => return step,
         };
         let key = candidate.key.clone();
+        let open = self.open.clone();
         let plan = match self
             .host
-            .debt_turn(move |turn| recheck::begin(turn, &key, caps, &policy))
+            .debt_turn(move |turn| {
+                let plan = recheck::begin(turn, &key, caps, &policy);
+                if let Ok(Some(plan)) = &plan {
+                    open.begun(&plan.compare.key, AttemptKind::Recheck);
+                }
+                plan
+            })
             .await
         {
             None => return Step::Stopped,
@@ -622,9 +712,19 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         if compare::would_not_compare(facts.end) {
             self.memory.would_not_compare(&candidate.key.relay);
         }
+        let open = self.open.clone();
         let settled = match self
             .host
-            .turn(move |turn| recheck::settle(turn, &plan, &report, &facts, &policy))
+            .turn(move |turn| {
+                let settled = recheck::settle(turn, &plan, &report, &facts, &policy);
+                // A failed progress write after a committed settle leaves the
+                // key open too; its refund finds the attempt settled and
+                // changes nothing.
+                if settled.is_ok() {
+                    open.settled(&plan.compare.key);
+                }
+                settled
+            })
             .await
         {
             None => return Step::Stopped,

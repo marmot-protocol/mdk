@@ -68,7 +68,7 @@ impl TransportPeeler for StubPeeler {
 
 #[test]
 fn builder_rejects_missing_identity() {
-    let res = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let res = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .peeler(Box::new(StubPeeler))
         .build();
     assert!(matches!(res, Err(EngineError::Other(_))));
@@ -76,7 +76,7 @@ fn builder_rejects_missing_identity() {
 
 #[test]
 fn builder_rejects_missing_peeler() {
-    let res = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let res = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(b"id".to_vec())
         .build();
     assert!(matches!(res, Err(EngineError::Other(_))));
@@ -86,7 +86,7 @@ fn builder_rejects_missing_peeler() {
 fn builder_rejects_non_mandatory_ciphersuite() {
     // spec/foundation/mls-protocol.md:11-15 — only
     // MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 (0x0001) is permitted.
-    let res = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let res = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(valid_identity(b"self-identity"))
         .account_identity_proof_signer(proof_signer(b"self-identity"))
@@ -104,7 +104,7 @@ fn builder_rejects_non_mandatory_ciphersuite() {
 
 #[tokio::test]
 async fn empty_engine_methods_return_typed_results() {
-    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(valid_identity(b"id"))
         .account_identity_proof_signer(proof_signer(b"id"))

@@ -206,6 +206,7 @@ impl SqliteAccountStorage {
                         "local_group_deletion_frontiers",
                         "device_groups",
                         "device_links",
+                        "device_removals",
                         "device_group_joins",
                         "device_group_messages",
                         "app_pending_welcome_delivery",

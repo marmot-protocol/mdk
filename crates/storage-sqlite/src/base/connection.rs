@@ -1447,6 +1447,35 @@ fn apply_sqlcipher_key(connection: &rusqlite::Connection, key: &SqlCipherKey) ->
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
+static TEST_PROCESS_STORAGE_RELAXED: AtomicBool = AtomicBool::new(false);
+
+/// Skip SQLCipher's memory security and full fsync for every database this
+/// process opens from now on, whatever options the open passes. Test support
+/// only: call it before the process opens its first database, since SQLCipher
+/// keeps memory security on once any connection has enabled it.
+///
+/// Memory security is a process-wide allocator that makes every SQLite
+/// allocation a `mlock` and every free a scrub and `munlock`. Together with a
+/// full fsync per commit it was most of the workspace test lane's run time
+/// (mdk#2738). Neither changes what a test observes, except a test of those
+/// settings: the tests that pin them never call this.
+#[cfg(any(test, feature = "test-support"))]
+pub fn relax_storage_for_test_process() {
+    TEST_PROCESS_STORAGE_RELAXED.store(true, Ordering::Release);
+}
+
+fn test_process_storage_relaxed() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        TEST_PROCESS_STORAGE_RELAXED.load(Ordering::Acquire)
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        false
+    }
+}
+
 fn apply_cipher_pragmas(
     connection: &rusqlite::Connection,
     options: &SqliteStorageOptions,
@@ -1458,7 +1487,7 @@ fn apply_cipher_pragmas(
             i64::from(options.cipher_compatibility),
         )
         .storage()?;
-    if options.cipher_memory_security {
+    if options.cipher_memory_security && !test_process_storage_relaxed() {
         connection
             .execute_batch("PRAGMA cipher_memory_security = ON;")
             .storage()?;
@@ -1489,8 +1518,13 @@ fn apply_operational_pragmas(
             .pragma_update(None, "temp_store", "MEMORY")
             .storage()?;
     }
+    let synchronous = if test_process_storage_relaxed() {
+        SqliteSynchronous::Normal
+    } else {
+        options.synchronous
+    };
     connection
-        .pragma_update(None, "synchronous", options.synchronous.as_pragma())
+        .pragma_update(None, "synchronous", synchronous.as_pragma())
         .storage()?;
     let journal_mode = format!("PRAGMA journal_mode = {}", options.journal_mode.as_pragma());
     let _: String = connection
@@ -3368,6 +3402,71 @@ mod tests {
         assert_eq!(pragma_i64(&conn, "secure_delete"), 0);
         assert_eq!(pragma_i64(&conn, "trusted_schema"), 1);
         assert_eq!(pragma_i64(&conn, "synchronous"), 1);
+    }
+
+    /// Set in the child process that runs
+    /// `relaxed_test_process_skips_memory_security_and_full_fsync`.
+    const RELAXED_STORAGE_CHILD: &str = "STORAGE_SQLITE_RELAXED_STORAGE_CHILD";
+
+    /// The relaxation is process-wide, so the checks run in a child process
+    /// of this test binary and leave the tests beside it on the defaults.
+    #[test]
+    fn relaxed_test_process_skips_memory_security_and_full_fsync() {
+        if std::env::var_os(RELAXED_STORAGE_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "base::connection::tests::relaxed_test_process_skips_memory_security_and_full_fsync",
+                    "--nocapture",
+                ])
+                .env(RELAXED_STORAGE_CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+
+        relax_storage_for_test_process();
+        let key = SqlCipherKey::raw([0x42; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
+        let connection = rusqlite::Connection::open(dir.path().join("marmot.sqlite")).unwrap();
+        connection.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_sqlcipher_setup_event),
+        );
+        let store = SqliteAccountStorage::from_unkeyed_encrypted_connection_with_options(
+            connection,
+            &key,
+            SqliteStorageOptions::default(),
+        )
+        .unwrap();
+        let hardened = rusqlite::Connection::open(dir.path().join("hardened.sqlite")).unwrap();
+        hardened.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_sqlcipher_setup_event),
+        );
+        open_hardened_sqlcipher(&hardened, &key, SqlCipherHardening::live_cache()).unwrap();
+
+        let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
+        assert_eq!(
+            statements.iter().filter(|step| **step == "key").count(),
+            2,
+            "{statements:?}"
+        );
+        assert!(
+            !statements.contains(&"cipher_memory_security"),
+            "{statements:?}"
+        );
+        let conn = store.lock().unwrap();
+        assert_eq!(pragma_i64(&conn, "synchronous"), 1);
+        assert_eq!(pragma_string(&conn, "cipher_memory_security"), "0");
     }
 
     #[test]

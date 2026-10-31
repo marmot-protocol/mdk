@@ -2468,6 +2468,39 @@ impl MarmotRelayPlane {
         );
     }
 
+    /// The SDK relay client whose pool carries `account_id`'s REQs, for the
+    /// recovery runner's sweeps and comparisons (mdk#2660). `None` without an
+    /// SDK client or an account context. It dials nothing: its pool admits
+    /// relays only through the dial-safety chokepoint.
+    #[doc(hidden)]
+    pub async fn account_history_relay_client(
+        &self,
+        account_id: &MemberId,
+    ) -> Option<NostrSdkRelayClient> {
+        self.inner
+            .transport
+            .sdk_relay_client
+            .as_ref()?
+            .account_relay_client(account_id)
+            .await
+    }
+
+    /// `account_id`'s deliveries for one fetched history event, as the
+    /// account adapter's `recovered_deliveries` gives them. The caller admits
+    /// them directly, never through the live queue.
+    #[doc(hidden)]
+    pub async fn recovered_deliveries_for_account(
+        &self,
+        account_id: &MemberId,
+        event: transport_nostr_adapter::NostrRelayEvent,
+    ) -> Result<Vec<TransportDelivery>, TransportAdapterError> {
+        self.inner
+            .transport
+            .adapter
+            .reconciled_deliveries(account_id, event)
+            .await
+    }
+
     /// The SDK relay client the plane runs on, for tests that build a whole
     /// app and so cannot reach the plane's private state.
     #[cfg(any(test, feature = "test-support"))]

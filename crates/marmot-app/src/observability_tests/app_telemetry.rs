@@ -12,8 +12,8 @@ use crate::{
     AccountCatchUpFailure, AppError, ClassifiedSyncFailure, SyncErrorClass,
     SyncFailureClassification, SyncFailureStage, SyncSummary,
 };
-use marmot_observability::app_telemetry::AppPerformanceOperation;
-use marmot_observability::observer::PerformanceRecorder;
+use marmot_observability::AppPerformanceOperation;
+use marmot_observability::PerformanceRecorder;
 
 mod runtime;
 
