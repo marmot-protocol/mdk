@@ -24,7 +24,9 @@
 //!   what is left lies below the window, where no pass can search. The repair
 //!   never succeeds outright, as today. Otherwise the caller or the budget
 //!   ends it (`Cancelled`, `Deadline`), or a pass that served nothing within
-//!   the bound means the runner can do no more now (`CoverageUnproven`). The
+//!   the bound means the runner can do no more now (`CoverageUnproven`). As
+//!   today, the caller's cancel wins even over a covered window, and a
+//!   covered window over the deadline ([`verdict_end`]). The
 //!   repair keeps no request of its own: the re-arm and the goals are what
 //!   the runner serves.
 
@@ -135,8 +137,11 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     /// wait until the repair ends. A repair taken after its bound ended
     /// re-arms nothing.
     pub(crate) async fn repair(&mut self, bound: &PassBound) -> RepairEnd {
-        if let Some(ended) = bound_end(bound) {
-            return ended;
+        if bound.stop.is_cancelled() {
+            return RepairEnd::Cancelled;
+        }
+        if Instant::now() >= bound.deadline {
+            return RepairEnd::Deadline;
         }
         let requested = match self.host.debt_turn(rearm).await {
             None => return RepairEnd::Stopped,
@@ -145,37 +150,39 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         };
         self.memory.rearmed();
         loop {
-            if let Some(ended) = bound_end(bound) {
-                return ended;
-            }
             let report = self.run_pass_within(bound).await;
             if self.cancel.is_cancelled() {
                 return RepairEnd::Stopped;
             }
-            match self
+            let covered = match self
                 .host
                 .debt_turn(move |turn| repaired(turn, requested))
                 .await
             {
                 None => return RepairEnd::Stopped,
                 Some(Err(error)) => return RepairEnd::Failed(error),
-                Some(Ok(true)) => return RepairEnd::Covered,
-                // The loop's top ends a pass the bound cut.
-                Some(Ok(false)) if report.quanta == 0 && !bound.ended() => {
-                    return RepairEnd::Unproven;
-                }
-                Some(Ok(false)) => {}
+                Some(Ok(covered)) => covered,
+            };
+            if let Some(end) = verdict_end(bound, covered, report.quanta > 0) {
+                return end;
             }
         }
     }
 }
 
-/// How a repair ends once `bound` has: a stop first, then the deadline.
-fn bound_end(bound: &PassBound) -> Option<RepairEnd> {
+/// How a repair ends after a pass and its verdict, in today's order: the
+/// caller's cancel, even over a covered window; then a covered window, even
+/// past the deadline, as a pass that finished is judged on its routes; then
+/// the deadline; then a pass that served nothing. `None` runs another pass.
+fn verdict_end(bound: &PassBound, covered: bool, served: bool) -> Option<RepairEnd> {
     if bound.stop.is_cancelled() {
         Some(RepairEnd::Cancelled)
+    } else if covered {
+        Some(RepairEnd::Covered)
     } else if Instant::now() >= bound.deadline {
         Some(RepairEnd::Deadline)
+    } else if !served {
+        Some(RepairEnd::Unproven)
     } else {
         None
     }

@@ -242,6 +242,46 @@ async fn recovery_runner_never_rechecks_a_cap_only_relay() {
     );
 }
 
+/// An explicit repair asks a relay to compare again: one that would not
+/// earlier in this process, on a connection still up, is re-checked once the
+/// repair re-arms it, so the repair can end with its window covered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_repair_rechecks_a_relay_that_would_not_compare_before() {
+    use super::super::{PassBound, RepairEnd};
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let events = every([1; 32], floor, t0, HOUR);
+    account.hold(&route, &events);
+    let compares = ModelRelay::new(OTHER_RELAY, caps(500, true))
+        .with_events(events)
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[OTHER_RELAY])],
+        &[&compares],
+    );
+    account.goal(&route, floor);
+    account.live_boundary(&route, OTHER_RELAY, floor, t0 - 1);
+    host.tails.stand(&route, OTHER_RELAY, t0);
+    account.record_caps(OTHER_RELAY, caps(500, true), t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+    // As an earlier group comparison it refused leaves it.
+    runner.memory.would_not_compare(OTHER_RELAY);
+
+    let end = runner
+        .repair(&PassBound::within(Duration::from_secs(60)))
+        .await;
+    assert!(
+        matches!(end, RepairEnd::Covered),
+        "the repair re-checked the relay"
+    );
+    assert!(!compares.comparisons().is_empty());
+}
+
 /// A full pass is due again six hours after it finished, and at once after an
 /// epoch gap, from the gap's bound. What it finds inside covered ranges
 /// arrived late: it is staged and counted.

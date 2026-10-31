@@ -368,9 +368,10 @@ impl Connections {
 }
 
 /// When an explicit pass or repair must end: at its deadline, counted from
-/// the caller's request, or once the caller trips `stop`. The runner ends on
-/// it wherever it would end on its pass deadline, preempting a quantum in
-/// flight, and settles what it ran.
+/// the caller's request, or once the caller trips `stop`, which only its
+/// cancel does, so the two ends stay apart. The runner ends on it wherever
+/// it would end on its pass deadline, preempting a quantum in flight, and
+/// settles what it ran.
 #[derive(Clone)]
 pub(crate) struct PassBound {
     pub(crate) deadline: Instant,

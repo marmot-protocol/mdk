@@ -1,6 +1,6 @@
 //! The runner host over a real account: a directly owned client's in-place
-//! pass, a spawned runner's stop, and the chokepoints that wake the account's
-//! runner.
+//! pass, a spawned runner's stop, a repair caller's cancel and deadline, and
+//! the chokepoints that wake the account's runner.
 
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::MessageStorage;
@@ -16,8 +16,10 @@ use tokio::sync::watch;
 
 use super::super::RecoveryRunner;
 use super::super::open_attempts::AttemptKind;
-use super::super::{RecoveryRunnerPolicy, RunnerHost, UnitKey};
-use super::{AccountRunner, AccountRunnerHost, RunnerSeat, SpawnedRunner};
+use super::super::{PassBound, RecoveryRunnerPolicy, RepairEnd, RunnerHost, UnitKey};
+use super::{
+    AccountRunner, AccountRunnerHost, RunnerSeat, RunnerTurn, SpawnedRunner, serve_repair,
+};
 use crate::client::AppClient;
 use crate::client::audit_recovery::recorded_v5_rows;
 use crate::client::history_notices::park_recovery_for_test;
@@ -754,4 +756,65 @@ async fn no_route_changes_are_kept_with_the_gate_off() {
     let group = client.create_group("untracked", &[]).await.unwrap();
     client.routing.replace_group_routes(&group, Vec::new());
     assert!(client.routing.take_route_changes().is_none());
+}
+
+/// A repair whose request settles well past its deadline, as an interrupted
+/// one may for its grace, ends on the deadline: its caller never trips the
+/// stop that only a cancel may, so it is not `Cancelled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repair_past_its_deadline_is_never_cancelled_by_its_caller() {
+    let (_dir, _relay, _app, mut client) = direct_client(false).await;
+    let bound = PassBound::within(Duration::from_millis(100));
+    let (_sender, mut turns) = tokio::sync::mpsc::channel::<RunnerTurn>(1);
+    let ends = bound.clone();
+    let repair = async move {
+        tokio::time::sleep_until(ends.deadline + Duration::from_millis(400)).await;
+        Some(if ends.stop.is_cancelled() {
+            RepairEnd::Cancelled
+        } else {
+            RepairEnd::Deadline
+        })
+    };
+    let end = serve_repair(&mut client, repair, &mut turns, &bound, &|| false).await;
+    assert!(matches!(end, Some(RepairEnd::Deadline)));
+    assert!(!bound.stop.is_cancelled());
+}
+
+/// A runner whose turns come back to back, each waiting for the last, as
+/// admission's do, keeps its caller's turn arm ready; its cancel is still
+/// seen, and the runner ends on the stop it trips.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_of_turns_never_starves_a_repairs_cancel() {
+    let (_dir, _relay, _app, mut client) = direct_client(false).await;
+    let bound = PassBound::within(Duration::from_secs(60));
+    let (sender, mut turns) = tokio::sync::mpsc::channel(1);
+    let stop = bound.stop.clone();
+    let repair = async move {
+        while !stop.is_cancelled() {
+            let (done, served) = tokio::sync::oneshot::channel();
+            let turn = RunnerTurn {
+                run: Box::new(move |_| {
+                    Box::pin(async move {
+                        let _ = done.send(());
+                    })
+                }),
+                ingests: false,
+            };
+            if sender.send(turn).await.is_err() || served.await.is_err() {
+                return None;
+            }
+        }
+        Some(RepairEnd::Cancelled)
+    };
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let end = tokio::time::timeout(Duration::from_secs(10), async {
+        cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        serve_repair(&mut client, repair, &mut turns, &bound, &|| {
+            cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await
+    })
+    .await
+    .expect("the cancel is seen between turns");
+    assert!(matches!(end, Some(RepairEnd::Cancelled)));
 }

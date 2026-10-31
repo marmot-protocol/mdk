@@ -652,6 +652,42 @@ async fn a_worker_repair_re_arms_after_the_quantum_in_flight_settles() {
     spawned.stop(&mut client).await;
 }
 
+/// The verdict's precedence is today's: the caller's cancel, even over a
+/// covered window (one it accepted while the last settle or the verdict was
+/// served); a covered window, even past the deadline; then the deadline;
+/// then a pass that served nothing.
+#[test]
+fn a_cancel_wins_over_a_covered_window_and_a_covered_window_over_the_deadline() {
+    use super::super::{PassBound, RepairEnd};
+    use super::verdict_end;
+    let _runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .enter();
+    let cancelled = PassBound::within(Duration::from_secs(60));
+    cancelled.stop.cancel();
+    assert!(matches!(
+        verdict_end(&cancelled, true, true),
+        Some(RepairEnd::Cancelled)
+    ));
+    let late = PassBound::within(Duration::ZERO);
+    assert!(matches!(
+        verdict_end(&late, true, true),
+        Some(RepairEnd::Covered)
+    ));
+    assert!(matches!(
+        verdict_end(&late, false, true),
+        Some(RepairEnd::Deadline)
+    ));
+    let open = PassBound::within(Duration::from_secs(60));
+    assert!(matches!(
+        verdict_end(&open, false, false),
+        Some(RepairEnd::Unproven)
+    ));
+    assert!(verdict_end(&open, false, true).is_none());
+}
+
 /// A caller already cancelled re-arms nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repair_cancelled_before_it_starts_re_arms_nothing() {

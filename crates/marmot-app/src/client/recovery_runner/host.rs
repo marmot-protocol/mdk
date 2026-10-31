@@ -51,9 +51,9 @@ const STOP_WAIT: Duration = Duration::from_secs(1);
 /// cancellation.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 
-/// How long a caller waits for a repair it stopped: its request's interrupt
-/// grace, then a stop's wait for the settle. Only a guard: the runner ends
-/// on the stop by itself.
+/// How long a caller waits for a repair past its cancel or deadline: its
+/// request's interrupt grace, then a stop's wait for the settle. Only a
+/// guard: the runner ends on its bound by itself.
 const CANCEL_WAIT: Duration = INTERRUPT_GRACE.saturating_add(STOP_WAIT);
 
 type ClientFuture<'c, T> = Pin<Box<dyn Future<Output = T> + Send + 'c>>;
@@ -498,10 +498,10 @@ impl AppClient {
     /// Have the account's runner serve one explicit repair under `bound`
     /// ([`RecoveryRunner::repair`]): `spawned`, the worker's, once its
     /// current step ends, or else this client's in-place one. Its turns run
-    /// on this client meanwhile. Once `cancelled` says so, or the deadline
-    /// passes, the bound's stop is tripped and the runner ends on it, its
-    /// quantum in flight interrupting and settling on a turn served here.
-    /// `Stopped` without a runner.
+    /// on this client meanwhile. Once `cancelled` says so the bound's stop is
+    /// tripped; on it, or at the deadline, the runner ends, its quantum in
+    /// flight interrupting and settling on a turn served here. `Stopped`
+    /// without a runner.
     pub(crate) async fn repair_through_recovery_runner(
         &mut self,
         spawned: Option<&mut SpawnedRunner>,
@@ -672,11 +672,13 @@ impl Drop for SpawnedRunner {
     }
 }
 
-/// Serve `turns` on `client` until `repair` answers. Once `cancelled` says so
-/// or `bound`'s deadline passes, trip its stop, and give up after
-/// [`CANCEL_WAIT`] more. What the runner sent by then is still served, so a
-/// settle that came in time keeps its verdict and its bytes. `None` once it
-/// gives up; an answer of `None`, the runner gone, is `Stopped`.
+/// Serve `turns` on `client` until `repair` answers. Once `cancelled` says so,
+/// trip `bound`'s stop; then, or once its deadline passes, on which the
+/// runner ends by itself, give up after [`CANCEL_WAIT`] more. Only the
+/// caller's cancel trips the stop, so a repair the clock ended is never
+/// `Cancelled`. What the runner sent by then is still served, so a settle
+/// that came in time keeps its verdict and its bytes. `None` once it gives
+/// up; an answer of `None`, the runner gone, is `Stopped`.
 async fn serve_repair(
     client: &mut AppClient,
     repair: impl Future<Output = Option<RepairEnd>>,
@@ -685,8 +687,6 @@ async fn serve_repair(
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Option<RepairEnd> {
     tokio::pin!(repair);
-    // An interval, not a sleep per loop: turns served in a row never put the
-    // next look off.
     let mut poll = tokio::time::interval(CANCEL_POLL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut stopping_by = None;
@@ -695,15 +695,22 @@ async fn serve_repair(
             biased;
             end = &mut repair => return Some(end.unwrap_or(RepairEnd::Stopped)),
             Some(turn) = turns.recv() => turn.serve(client).await,
-            () = tokio::time::sleep_until(
-                stopping_by.unwrap_or_else(tokio::time::Instant::now)
-            ), if stopping_by.is_some() => break,
-            _ = poll.tick(), if stopping_by.is_none() => {
-                if cancelled() || tokio::time::Instant::now() >= bound.deadline {
+            _ = poll.tick() => {}
+        }
+        // After every arm: a runner whose turns come back to back keeps the
+        // turn arm ready, so the tick alone could wait forever.
+        let now = tokio::time::Instant::now();
+        match stopping_by {
+            None => {
+                if cancelled() {
                     bound.stop.cancel();
-                    stopping_by = Some(tokio::time::Instant::now() + CANCEL_WAIT);
+                } else if now < bound.deadline {
+                    continue;
                 }
+                stopping_by = Some(now + CANCEL_WAIT);
             }
+            Some(by) if now >= by => break,
+            Some(_) => {}
         }
     }
     while let Ok(turn) = turns.try_recv() {

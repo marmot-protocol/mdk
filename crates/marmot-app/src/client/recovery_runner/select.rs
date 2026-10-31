@@ -107,10 +107,12 @@ impl Memory {
     }
 
     /// An explicit repair re-armed every unit: what this runner holds back
-    /// on its own is due again too.
+    /// on its own is due again too, and a relay that would not compare is
+    /// asked again, as after a reconnect.
     pub(super) fn rearmed(&mut self) {
         self.local.clear();
         self.best_effort.clear();
+        self.uncomparable.clear();
         self.recheck_holds.clear();
     }
 
