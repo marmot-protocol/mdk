@@ -3,7 +3,8 @@
 //! route is a notice in that group's status, an inbox park only in the
 //! account's list, a remainder only once nothing on its route catches up,
 //! and dismissal retires the park, each shown and dismissed notice audited.
-//! With the gate off none of it shows.
+//! A suspended (Unrecoverable) group's routes give none. With the gate off
+//! none of it shows.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -330,6 +331,57 @@ async fn a_remainder_is_a_notice_once_nothing_on_its_route_catches_up() {
     );
     assert!(app.recovery_coverage_remainders().unwrap().is_empty());
     assert!(client.history_notices().unwrap().is_empty());
+}
+
+/// A suspended (Unrecoverable) group's park and remainder are no notices:
+/// its recovery waits for the group's repair. Once the copy is repaired they
+/// show again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_suspended_groups_park_and_remainder_are_no_notices() {
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut client, app, group, route) = fixture(&dir, true).await;
+    let storage = client.app.account_storage("alice").unwrap();
+    let suspend = |unrecoverable: bool| {
+        let mut record = storage.get_group(&group).unwrap();
+        record.unrecoverable = unrecoverable;
+        storage.put_group(&record).unwrap();
+    };
+    let shown = |client: &AppClient| {
+        let notices = client.history_notices().unwrap();
+        assert_eq!(
+            client
+                .group_recovery_status(&group)
+                .unwrap()
+                .history_notice_ids,
+            notices
+                .iter()
+                .map(|notice| notice.notice_id.clone())
+                .collect::<Vec<_>>()
+        );
+        notices
+    };
+
+    park(&app, &route);
+    assert_eq!(shown(&client).len(), 1);
+    suspend(true);
+    assert!(shown(&client).is_empty(), "a suspended park");
+    suspend(false);
+    let parked = shown(&client);
+    assert_eq!(parked.len(), 1);
+    assert!(client.dismiss_history_notice(&parked[0].notice_id).unwrap());
+
+    let now = crate::unix_now_seconds();
+    app.widen_recovery_coverage_goals(std::slice::from_ref(&route), now - 2 * DAY)
+        .unwrap();
+    app.prune_recovery_coverage(now - DAY, &[(route.clone(), vec![RELAY.to_owned()])])
+        .unwrap();
+    catching_up(&client, &[]);
+    assert_eq!(shown(&client).len(), 1);
+    suspend(true);
+    assert!(shown(&client).is_empty(), "a suspended remainder");
+    suspend(false);
+    assert_eq!(shown(&client).len(), 1);
 }
 
 /// The status reports the groups and inbox the runner's last survey found

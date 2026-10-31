@@ -18,9 +18,10 @@
 //!   ends. Its end preempts a quantum in flight as the pass deadline does: the
 //!   request interrupts and settles, so what it read is charged.
 //! - **The verdict**, a debt turn after each pass: every current route's
-//!   window covered and admitted on each of its required relays, none of
-//!   whose units broke or was dismissed since, and re-checked since the
-//!   re-arm on each that compares ([`repaired`]), is `BelowRetentionWindow`:
+//!   window, a suspended group's left out, covered and admitted on each of
+//!   its required relays, none of whose units broke or was dismissed since,
+//!   and re-checked since the re-arm on each that compares ([`repaired`]), is
+//!   `BelowRetentionWindow`:
 //!   what is left lies below the window, where no pass can search. The repair
 //!   never succeeds outright, as today. Otherwise the caller or the budget
 //!   ends it (`Cancelled`, `Deadline`), or a pass that served nothing within
@@ -39,6 +40,7 @@ use tokio::time::Instant;
 
 use super::compare::recorded_caps;
 use super::host::SpawnedRunner;
+use super::select::suspended;
 use super::{DebtTurn, PassBound, RecoveryRunner, RepairEnd, RunnerHost, TARGET};
 use crate::client::AppClient;
 use crate::client::sync::incomplete_full_history_repair;
@@ -214,18 +216,19 @@ fn rearm(turn: &DebtTurn<'_>) -> StorageResult<u64> {
 }
 
 /// Whether every current route's window is covered on each of its required
-/// relays, up to their live tails, and re-checked since `requested` on each
-/// whose recorded caps show NIP-77. A cap-only relay's count proofs cover,
+/// relays, up to their live tails (and a retained route's goal end), and
+/// re-checked since `requested` on each whose recorded caps show NIP-77. A cap-only relay's count proofs cover,
 /// but it is never re-checked (decision 2). A unit that broke or was
 /// dismissed since the re-arm never is: its parked and retired spans are left
 /// out of its debt, not covered. Nor is a route with staged events: staging
 /// covers what it fetched, but the engine has not admitted them (each step
 /// admits first, so a finished pass left them staged only because the engine
-/// kept no trace of one).
+/// kept no trace of one). A suspended group's routes are left out, as their
+/// notices are: the runner serves none of their debt.
 pub(super) fn repaired(turn: &DebtTurn<'_>, requested: u64) -> StorageResult<bool> {
     let app = turn.app;
     let staged = app.staged_recovery_routes()?;
-    for route in turn.routes {
+    for route in turn.routes.iter().filter(|route| !suspended(route)) {
         if staged.contains(&route.route) {
             return Ok(false);
         }
@@ -237,7 +240,7 @@ pub(super) fn repaired(turn: &DebtTurn<'_>, requested: u64) -> StorageResult<boo
             {
                 return Ok(false);
             }
-            let owed_until = turn.tails.owed_until(&route.route, relay, turn.now);
+            let owed_until = turn.owed_until(route, relay);
             if !app
                 .recovery_unit_debt(&route.route, relay, owed_until)?
                 .is_empty()

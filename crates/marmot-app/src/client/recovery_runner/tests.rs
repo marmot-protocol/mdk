@@ -4224,3 +4224,74 @@ async fn recovery_runner_owes_a_retained_route_nothing_past_its_goal() {
     assert!(matches!(runner.step().await, Step::Idle { .. }));
     assert_eq!(relay.requests(), requests);
 }
+
+/// An explicit repair's verdict leaves a suspended group's route out, as its
+/// notices do: the runner serves none of its debt, so the repair still ends
+/// with the other routes' windows covered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_repair_leaves_a_suspended_groups_route_out_of_its_verdict() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (served, frozen) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    let relay = ModelRelay::new(RELAY, caps(500, false))
+        .with_events(every([1; 32], floor, t0, 60))
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![
+            required(&served, &[RELAY]),
+            RunnerRoute {
+                unrecoverable: true,
+                ..required(&frozen, &[RELAY])
+            },
+        ],
+        &[&relay],
+    );
+    for route in [&served, &frozen] {
+        account.goal(route, floor);
+        host.tails.stand(route, RELAY, t0);
+    }
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    let end = runner
+        .repair(&super::PassBound::within(Duration::from_secs(60)))
+        .await;
+    assert!(matches!(end, super::RepairEnd::Covered));
+    assert!(!account.debt(&frozen, RELAY, t0 - 1).is_empty());
+}
+
+/// An explicit repair judges a retained route's window only through its
+/// goal's end, where the runner stops serving it, so the repair ends with
+/// it covered though no live tail stands after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_repair_judges_a_retained_route_through_its_goal() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let ceiling = t0 - HOUR / 2;
+    let relay = ModelRelay::new(RELAY, caps(500, false))
+        .with_events(every([1; 32], floor, t0, 60))
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![RunnerRoute {
+            goal_until: Some(ceiling),
+            ..required(&route, &[RELAY])
+        }],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    let end = runner
+        .repair(&super::PassBound::within(Duration::from_secs(60)))
+        .await;
+    assert!(matches!(end, super::RepairEnd::Covered));
+    assert_eq!(account.covered_through(&route, RELAY), ceiling);
+}
