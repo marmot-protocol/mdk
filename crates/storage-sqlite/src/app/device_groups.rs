@@ -1,6 +1,7 @@
 //! The device groups this device knows of, and how it came to know each
 //! (mdk#2628 item 3.1). See migration 0125 for the states.
 
+use crate::app::backup_recovery_key::forget_kept_recovery_key;
 use crate::app::compromise_warning::{FirstTrustedRoster, record_first_trusted_roster};
 use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
@@ -171,8 +172,9 @@ impl SqliteAppStorage {
     /// [`Self::set_device_group_trust`] does, and in the same transaction
     /// take `first` as the roster this device first trusts: the compromise
     /// warning counts its rejections as seen and this device's own as unseen
-    /// (mdk#2628 3.7a, D68). Returns `None` if the row did not move, otherwise
-    /// whether the open warning changed.
+    /// (mdk#2628 3.7a, D68), and the recovery key this device kept with no
+    /// device group is forgotten (4.4a). Returns `None` if the row did not
+    /// move, otherwise whether the open warning changed.
     pub fn trust_device_group(
         &self,
         group_id_hex: &str,
@@ -200,6 +202,7 @@ impl SqliteAppStorage {
             return Ok(None);
         }
         let changed = record_first_trusted_roster(&tx, group_id_hex, first)?;
+        forget_kept_recovery_key(&tx)?;
         tx.commit().storage()?;
         Ok(Some(changed))
     }
@@ -425,6 +428,28 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(store.device_group("aa").unwrap().unwrap().trust, Creating);
+    }
+
+    #[test]
+    fn trusting_a_device_group_forgets_the_kept_recovery_key() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        store.keep_recovery_key(&[7; 32]).unwrap();
+        assert!(store.insert_device_group(&record("aa", Creating)).unwrap());
+        // A move that does not happen keeps it.
+        assert_eq!(
+            store
+                .trust_device_group("aa", Untrusted, Linked, Some("ab"), 2, &NO_ROSTER)
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.kept_recovery_key().unwrap(), Some(vec![7; 32]));
+        assert!(
+            store
+                .trust_device_group("aa", Creating, Created, None, 2, &NO_ROSTER)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.kept_recovery_key().unwrap(), None);
     }
 
     #[test]

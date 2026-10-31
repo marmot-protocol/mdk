@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- Migration 0163 advances account storage to schema 163 (mdk#2628 item 4.4a).
+  It adds `backup_recovery_key`, at most one row: the public half of the
+  recovery key that words confirmed while this device trusts no device group
+  derive. `trust_device_group` deletes it in the same transaction, since the
+  roster's account entry is then the account's. The words and the private
+  half are never stored. `SqliteAppStorage` gains `kept_recovery_key`,
+  `keep_recovery_key` and `forget_kept_recovery_key`.
 - `CompromiseWarningReason::RejectedKeyPackage` is now
   `ForeignOwnSlotKeyPackage`, stored as `foreign_own_slot_key_package`
   (mdk#2628 D74, 3.7b), and `record_foreign_own_slot_key_packages` records
@@ -11,7 +18,6 @@
   seen one goes 7,261,200 seconds after it was found, an unseen one stays
   until dismissed or the 4,096-row cap drops it. No migration: the reason
   is text, and no build wrote the old one.
-
 - Migration 0143 advances account storage to schema 143 (mdk#2628 item 3.6).
   It adds `device_activity`, one row per sibling the trusted device group's
   roster lists (that entry's `linked_at`, when this device first found it

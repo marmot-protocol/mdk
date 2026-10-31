@@ -2550,6 +2550,7 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::AppMessageEpochUnsettled { .. }
         | EngineError::LinkDeviceUnsettled { .. }
         | EngineError::DeviceEntryChanged { .. }
+        | EngineError::AccountEntryChanged { .. }
         | EngineError::UnexpectedDeviceGroupWelcome
         | EngineError::InvalidWelcome
         | EngineError::MissingWelcomeKeyPackage
@@ -2622,6 +2623,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
         EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
         EngineError::DeviceEntryChanged { .. } => "device_entry_changed",
+        EngineError::AccountEntryChanged { .. } => "account_entry_changed",
         EngineError::UnexpectedDeviceGroupWelcome => "unexpected_device_group_welcome",
         // Every decode failure the engine can reach, not an admin-policy
         // verdict: `audit_helpers::engine_error_kind` names it the same way.

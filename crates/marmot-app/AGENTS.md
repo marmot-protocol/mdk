@@ -107,6 +107,18 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   founding Add's and every later link's), so a kept id shows up again only when a fork brings back an earlier state.
   Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots` instead, never as
   device entries.
+- Recovery words for backups (`src/client/backups.rs`, mdk#2628 4.4a) live only in `AppClient::pending_recovery_words`
+  as zeroized entropy, until confirmed or cancelled: never write or log the words, their entropy or the private half.
+  A device that trusts no device group keeps only the key's public half (`backup_recovery_key`), and
+  `create_device_group` founds the roster with it and this device writing; trusting any device group, founded or
+  joined, forgets it in the trust write (`trust_device_group`), so a device that joins one leaves the group's backups
+  as they are. In a device group, write the roster's account entry only through the runtime's
+  `edit_roster_account_entry` (`ReplaceAccountEntry`, a compare-and-set over the entry this device read), and only
+  while the device group takes a commit from this device. That gate stays closed while a re-issue is owed, so neither
+  action answers "nothing to send" while a change of this device's may still land. Never send a backup change again
+  from here, and never store what became of one (D75): the engine's re-issue and the runtime's retry are the only
+  paths that commit one again, and a change whose re-issue is refused stays lost. `backup_settings` reads the roster's
+  account entry as it is now, so the user sees a lost change and can make it again.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
   `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this

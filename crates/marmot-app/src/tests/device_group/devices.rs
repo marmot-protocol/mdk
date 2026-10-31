@@ -23,7 +23,7 @@ fn label_of(reader: &mut AppClient, slot: &str) -> String {
         .label
 }
 
-fn published_count(relay: &ScriptedPushRelayClient) -> usize {
+pub(super) fn published_count(relay: &ScriptedPushRelayClient) -> usize {
     relay.published_events.lock().unwrap().len()
 }
 
@@ -42,7 +42,7 @@ fn renames(device: &AppClient) -> Vec<storage_sqlite::DeviceRenameRecord> {
         .unwrap()
 }
 
-fn refusal(error: AppError) -> &'static str {
+pub(super) fn refusal(error: AppError) -> &'static str {
     match error {
         AppError::DeviceGroupRefused(reason) => reason,
         other => panic!("expected a device-group refusal, got {other:?}"),
@@ -276,7 +276,7 @@ async fn a_rename_while_a_commit_is_in_flight_is_refused() {
 /// again: each has seen the other's answer to what it got. The device group
 /// is hidden, so convergence runs through the runtime. A pass can take more
 /// than one advance on a loaded machine, so the rounds are not counted.
-async fn exchange(
+pub(super) async fn exchange(
     phone: &mut AppClient,
     laptop: &mut AppClient,
     relay: &ScriptedPushRelayClient,
@@ -358,7 +358,7 @@ async fn another_rename_of_the_same_device_stands() {
 
 /// `device` changes its own roster entry once per platform, each its own
 /// commit, without renaming itself.
-async fn edit_own_entry(device: &mut AppClient, group: &GroupId, platforms: &[&str]) {
+pub(super) async fn edit_own_entry(device: &mut AppClient, group: &GroupId, platforms: &[&str]) {
     let slot: [u8; 32] = hex::decode(own_slot(device)).unwrap().try_into().unwrap();
     for platform in platforms {
         let edit = device

@@ -525,6 +525,22 @@ pub(crate) enum AccountWorkerCommand {
     RemovedDeviceLeftoverChats {
         respond: oneshot::Sender<Result<u32, AppError>>,
     },
+    BeginRecoveryWords {
+        respond: oneshot::Sender<Result<crate::RecoveryWords, AppError>>,
+    },
+    ConfirmRecoveryWords {
+        answers: Vec<String>,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    CancelRecoveryWords {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    TurnOffBackups {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    BackupSettings {
+        respond: oneshot::Sender<Result<crate::BackupSettings, AppError>>,
+    },
     DismissHistoryNotice {
         notice_id: String,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -5968,6 +5984,39 @@ fn account_worker_command_future<'a>(
                 storage_permit.as_ref(),
                 respond,
                 client.removed_device_leftover_chats(),
+            );
+            true
+        }),
+        AccountWorkerCommand::BeginRecoveryWords { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.begin_recovery_words(),
+            );
+            true
+        }),
+        AccountWorkerCommand::ConfirmRecoveryWords { answers, respond } => Box::pin(async move {
+            let result = client.confirm_recovery_words(&answers).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::CancelRecoveryWords { respond } => Box::pin(async move {
+            client.cancel_recovery_words();
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Ok(()));
+            true
+        }),
+        AccountWorkerCommand::TurnOffBackups { respond } => Box::pin(async move {
+            let result = client.turn_off_backups().await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::BackupSettings { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.backup_settings(),
             );
             true
         }),
