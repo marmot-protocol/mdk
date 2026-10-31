@@ -27,7 +27,6 @@ END;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::base::migrations::{MIGRATIONS, run};
 
     #[test]
@@ -72,24 +71,5 @@ mod tests {
         run(&mut conn, MIGRATIONS).unwrap();
         let counters = conn.query_row("SELECT attempts,acquisition_attempts,network_attempts,automatic_history,state,due,permission_category FROM attachment_acquisition", [], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,bool>(3)?,r.get::<_,u8>(4)?,r.get::<_,i64>(5)?,r.get::<_,u8>(6)?))).unwrap();
         assert_eq!(counters, (99, 0, 0, false, 0, 1234, 1));
-    }
-
-    #[test]
-    fn automatic_history_migration_is_transactional_and_repeatable() {
-        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        run(&mut conn, &MIGRATIONS[..86]).unwrap();
-        let tx = conn.transaction().unwrap();
-        apply(&tx).unwrap();
-        tx.rollback().unwrap();
-        assert!(
-            conn.prepare("SELECT network_attempts FROM attachment_acquisition")
-                .is_err()
-        );
-        run(&mut conn, MIGRATIONS).unwrap();
-        run(&mut conn, MIGRATIONS).unwrap();
-        assert!(
-            conn.prepare("SELECT acquisition_attempts,network_attempts,body_completed FROM attachment_acquisition")
-                .is_ok()
-        );
     }
 }

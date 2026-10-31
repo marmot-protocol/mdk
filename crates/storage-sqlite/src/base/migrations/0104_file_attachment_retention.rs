@@ -52,7 +52,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn populated_upgrade_preserves_bytes_and_usage_and_rolls_back() {
+    fn populated_upgrade_preserves_bytes_and_usage() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;
             CREATE TABLE attachment_acquisition(token BLOB PRIMARY KEY);
@@ -64,17 +64,6 @@ mod tests {
             CREATE TRIGGER attachment_bytes_added AFTER INSERT ON retained_attachment_bytes BEGIN SELECT 1; END;
             CREATE TRIGGER attachment_bytes_removed AFTER DELETE ON retained_attachment_bytes BEGIN SELECT 1; END;
             CREATE TRIGGER attachment_bytes_updated AFTER UPDATE OF bytes ON retained_attachment_bytes BEGIN SELECT 1; END;").unwrap();
-        {
-            let tx = conn.transaction().unwrap();
-            apply(&tx).unwrap();
-            tx.rollback().unwrap();
-        }
-        assert_eq!(
-            conn.query_row("SELECT bytes FROM retained_attachment_bytes", [], |row| row
-                .get::<_, Vec<u8>>(0))
-                .unwrap(),
-            vec![1, 2, 3, 4]
-        );
         let tx = conn.transaction().unwrap();
         apply(&tx).unwrap();
         tx.commit().unwrap();

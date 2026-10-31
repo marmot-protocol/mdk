@@ -96,6 +96,24 @@ mod tests {
             "INSERT INTO account_recovery_obligations(demand_key,cause,predicate,created_at_ms,updated_at_ms)
              VALUES('replay:second',7,3,1,1)", [],
         ).is_err());
+        // The rebuild keeps 0093's single explicit demand.
+        conn.execute(
+            "INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms)
+             VALUES('explicit:first',3,1,1)",
+            [],
+        )
+        .unwrap();
+        let duplicate = conn
+            .execute(
+                "INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms)
+                 VALUES('explicit:second',3,1,1)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            duplicate.to_string().contains("UNIQUE constraint failed"),
+            "{duplicate}"
+        );
         conn.execute("DELETE FROM account_recovery_obligations WHERE cause=5", [])
             .unwrap();
         let scopes: i64 = conn

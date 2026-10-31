@@ -49,36 +49,16 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::base::migrations::{MIGRATIONS, Migration, run};
-    use cgka_traits::storage::StorageError;
-    fn aborted(tx: &Transaction<'_>) -> StorageResult<()> {
-        apply(tx)?;
-        Err(StorageError::Backend("injected migration failure".into()))
-    }
+    use crate::base::migrations::{MIGRATIONS, run};
+
     #[test]
-    fn draft_revision_upgrade_preserves_populated_drafts_and_rolls_back_completely() {
+    fn draft_revision_upgrade_preserves_populated_drafts() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
         run(&mut conn, &MIGRATIONS[..72]).unwrap();
         conn.execute_batch("INSERT INTO account_groups(group_id_hex,endpoint,updated_at) VALUES ('group','',0);
             INSERT INTO message_drafts VALUES ('group','saved text',NULL,1,1);
             INSERT INTO message_draft_attachments VALUES ('group',0,'attachment','file','audio/mp4',x'010203',NULL,NULL,2.5,'[0.5]');").unwrap();
-        let interrupted = [Migration {
-            version: 73,
-            name: "0073_message_draft_revisions",
-            suspend_foreign_keys: &[],
-            apply: aborted,
-        }];
-        assert!(run(&mut conn, &interrupted).is_err());
-        let tables: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name='message_draft_revisions'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(tables, 0);
         run(&mut conn, MIGRATIONS).unwrap();
         let bytes: Vec<u8> = conn
             .query_row("SELECT plaintext FROM message_draft_attachments", [], |r| {

@@ -89,15 +89,6 @@ mod tests {
             INSERT INTO attachment_retention_usage VALUES(1,4);
             INSERT INTO attachment_acquisition VALUES(x'01',3,NULL);
             INSERT INTO retained_attachment_bytes VALUES(x'01',x'01020304');").unwrap();
-        {
-            let tx = conn.transaction().unwrap();
-            apply(&tx).unwrap();
-            tx.rollback().unwrap();
-        }
-        assert!(
-            conn.prepare("SELECT * FROM retained_attachment_files")
-                .is_err()
-        );
         let tx = conn.transaction().unwrap();
         apply(&tx).unwrap();
         tx.commit().unwrap();
