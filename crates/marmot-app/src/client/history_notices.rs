@@ -70,7 +70,11 @@ impl AppClient {
     /// the route's units. A broken unit on a relay the route carries only as
     /// best effort, or no longer, owes nothing, so it shows nowhere, moves no
     /// revision and is never dismissed. The revision is the newest park in
-    /// the set. A group route's notice names its group; one that is no
+    /// the set. A park hidden that way keeps its revision, so once its relay
+    /// is required again it joins the set: on a route with no other visible
+    /// park it shows as a fresh notice, and beside a newer one it joins that
+    /// notice without moving its revision, and dismissing the notice
+    /// dismisses it too. A group route's notice names its group; one that is no
     /// current route's, a suspended group's, or one the host may not see, is
     /// left out.
     pub(crate) fn ledger_notices(

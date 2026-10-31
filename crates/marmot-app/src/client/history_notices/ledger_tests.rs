@@ -392,7 +392,8 @@ async fn a_suspended_groups_park_and_remainder_are_no_notices() {
 
 /// A broken unit on a relay the route carries only as best effort owes
 /// nothing, so it raises no notice; one on the relay the route requires
-/// does, and that notice is the route's.
+/// does, and that notice is the route's. Its dismissal leaves the hidden
+/// park, which shows as a fresh notice once its relay is required again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_park_on_a_relay_the_route_carries_only_as_best_effort_is_no_notice() {
     const OPERATED: &str = "wss://operated.example";
@@ -448,6 +449,26 @@ async fn a_park_on_a_relay_the_route_carries_only_as_best_effort_is_no_notice() 
     let parked = storage.parked_recovery_routes().unwrap();
     assert_eq!(parked.len(), 1);
     assert_eq!(parked[0].relays, vec![BEST_EFFORT.to_owned()]);
+
+    // Once the route drops its operated relay, the one it keeps is required,
+    // and the park left behind shows as a fresh notice.
+    for entry in &mut client.routing.write().group_routes {
+        if entry.group_id.as_slice() == group.as_slice() {
+            entry.endpoints.retain(|endpoint| endpoint.0 != OPERATED);
+        }
+    }
+    let route = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
+        .unwrap();
+    assert_eq!(route.required, vec![BEST_EFFORT.to_owned()]);
+    let fresh = client.history_notices().unwrap();
+    assert_eq!(fresh.len(), 1);
+    assert_ne!(fresh[0].notice_id, notices[0].notice_id);
+    assert!(client.dismiss_history_notice(&fresh[0].notice_id).unwrap());
+    assert!(client.history_notices().unwrap().is_empty());
+    assert!(storage.parked_recovery_routes().unwrap().is_empty());
 }
 
 /// A newer park on a relay the route carries only as best effort is outside
