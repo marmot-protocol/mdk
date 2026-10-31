@@ -25,8 +25,9 @@ use std::collections::BTreeSet;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use cgka_traits::app_components::{DeviceSlotId, encode_component_vectors};
-use url::Url;
+use cgka_traits::app_components::{
+    DeviceSlotId, encode_component_vectors, validate_and_normalize_blob_endpoint_url_v2,
+};
 use zeroize::Zeroizing;
 
 use crate::AppError;
@@ -48,9 +49,6 @@ pub(crate) const MAX_INLINE_BUNDLES: usize = 8;
 pub(crate) const MAX_BLOSSOM_BUNDLES: usize = 16;
 /// The most Blossom servers a delivery names.
 pub(crate) const MAX_BLOSSOM_SERVERS: usize = 4;
-/// The longest Blossom server URL a delivery names, as an encrypted-media
-/// endpoint's base URL may be.
-pub(crate) const MAX_BLOSSOM_SERVER_URL_BYTES: usize = 2_048;
 const DELIVERY_VERSION: u64 = 1;
 /// The context's first part: what a sealed value is for.
 const DELIVERY_PURPOSE: &[u8] = b"marmot history delivery v1";
@@ -165,22 +163,11 @@ pub(crate) fn blossom_servers_are_valid(servers: &[String]) -> bool {
         && servers.iter().collect::<BTreeSet<_>>().len() == servers.len()
 }
 
-/// Whether `server` is a Blossom server URL a delivery may name: a normalized
-/// `http` or `https` URL, its own WHATWG serialization, of at most
-/// [`MAX_BLOSSOM_SERVER_URL_BYTES`], with a host and no query or fragment.
-/// Such a URL holds no `"`, `\` or control character, so it needs no JSON
-/// escape.
+/// Whether `server` is a Blossom server URL a delivery may name: a base URL
+/// an encrypted-media endpoint may carry, already normalized. Such a URL
+/// holds no `"`, `\` or control character, so it needs no JSON escape.
 pub(crate) fn blossom_server_is_valid(server: &str) -> bool {
-    if server.is_empty() || server.len() > MAX_BLOSSOM_SERVER_URL_BYTES {
-        return false;
-    }
-    Url::parse(server).is_ok_and(|url| {
-        matches!(url.scheme(), "http" | "https")
-            && url.as_str() == server
-            && url.host_str().is_some()
-            && url.query().is_none()
-            && url.fragment().is_none()
-    })
+    validate_and_normalize_blob_endpoint_url_v2(server).is_ok_and(|normalized| normalized == server)
 }
 
 /// The context a delivery's key and hash are sealed with: the purpose, the
@@ -213,6 +200,8 @@ pub(crate) fn opened_key_and_hash(opened: &[u8]) -> Option<(Zeroizing<[u8; 32]>,
 
 #[cfg(test)]
 mod tests {
+    use cgka_traits::app_components::ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN;
+
     use super::*;
 
     fn delivery(chat_len: usize, bundle_len: usize) -> HistoryDelivery {
@@ -291,9 +280,9 @@ mod tests {
         let longest = format!("https://{}.example/", "a".repeat(63));
         let longest = format!(
             "{longest}{}",
-            "p".repeat(MAX_BLOSSOM_SERVER_URL_BYTES - longest.len())
+            "p".repeat(ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN - longest.len())
         );
-        assert_eq!(longest.len(), MAX_BLOSSOM_SERVER_URL_BYTES);
+        assert_eq!(longest.len(), ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN);
         for accepted in [
             vec!["https://blossom.example/"],
             vec!["https://blossom.example/media/", "https://b.example:8443/"],
@@ -324,6 +313,8 @@ mod tests {
             vec!["https://Blossom.example/"],
             vec!["https://blossom.example/?q=1"],
             vec!["https://blossom.example/#f"],
+            vec!["https://user:pass@blossom.example/"],
+            vec![" https://blossom.example/"],
             vec!["wss://blossom.example/"],
             vec!["file:///blossom"],
             vec![""],

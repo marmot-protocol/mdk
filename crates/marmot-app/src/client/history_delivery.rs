@@ -508,8 +508,22 @@ impl AppClient {
                 }
                 Err(error) => return Err(error),
             };
-            let summary = self.app.account_home().account(&self.state.label)?;
-            let signer = self.app.account_signer_for_summary(&summary)?;
+            // A signer that is not available yet, such as an external one not
+            // registered again since launch, backs off as a failed upload does.
+            let signer = self
+                .app
+                .account_home()
+                .account(&self.state.label)
+                .map_err(AppError::from)
+                .and_then(|summary| self.app.account_signer_for_summary(&summary));
+            let signer = match signer {
+                Ok(signer) => signer,
+                Err(error) => {
+                    let retry_at = blossom_retry_at(unix_now_seconds(), owed.blossom_attempts);
+                    storage.defer_blossom_history_delivery(&owed, retry_at)?;
+                    return Err(error);
+                }
+            };
             return Ok(Some(HistoryUpload {
                 owed,
                 storage: account,
