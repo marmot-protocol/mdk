@@ -857,8 +857,7 @@ fn build_memory_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAcco
     // The peers are plain fixtures; the file-backed database is what crashes.
     // Copying a migrated template keeps their setup from dominating the time a
     // child needs to reach its pause point.
-    let storage = SqliteAccountStorage::in_memory_from_migrated_template(Default::default())
-        .expect("in-memory storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("in-memory storage");
     let engine = build_client_with_storage(seed, storage.clone());
     (engine, storage)
 }
