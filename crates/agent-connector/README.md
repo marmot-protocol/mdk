@@ -296,6 +296,14 @@ missing. Do not enable either development option in production.
 
 ## Outbound media paths
 
+Historical inbound attachments use the additive `attachment_get`,
+`download_attachment` and `release_attachment` socket operations. They resolve one
+current message/source slot, reuse native acquisition and retained bytes, and lend
+a private plaintext file under an explicit lease. Downloads return native status
+while work is pending; no media locators or keys are exported. See the
+[protocol contract](../agent-control/README.md#historical-attachment-recovery) for
+slot numbering, digest verification, polling, failure states and release requirements.
+
 Path-based media sends are denied unless `wn-agent` starts with one or more `--media-allowed-root PATH` options. The
 connector opens each root at startup, then accepts only regular files reached beneath that directory handle without
 following symlinks. Hermes and OpenClaw validate their original media source, stage a short-lived copy under

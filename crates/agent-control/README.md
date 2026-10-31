@@ -33,6 +33,56 @@ Invite-policy values serialize on the wire as `deny`, `allowlist`, `any_authenti
 `any_authenticated`. Deserialization also accepts the CLI spellings `any-authenticated-direct` and
 `any-authenticated`.
 
+## Historical attachment recovery
+
+Three additive v2 operations use MDK's native attachment pipeline:
+
+- `attachment_get { account_id_hex, group_id_hex, message_id_hex, attachment_index }`
+  inspects one current source slot locally. It does not request acquisition or start network work.
+- `download_attachment` takes the same fields. It requests explicit native acquisition,
+  then returns immediately with native transfer status when bytes are not retained.
+  Poll with backoff; another download request joins the existing work without resetting
+  retries, deadlines, cancellation, removal suppression or permission policy.
+- `release_attachment { lease }` removes the private plaintext handoff and replies
+  `attachment_released`. Releasing an unknown or already released lease succeeds.
+
+Both reads reply with `attachment { attachment: ... }`. A null attachment means the
+current message/source/slot is unavailable, including deletion, invalidation and expiry.
+Native acquisition admission refusal also returns a null attachment, not pending work.
+The zero-based index counts **all original `imeta` tags**, including rejected slots;
+it is not an index into a filtered list of attachment summaries. Each call resolves
+the current authenticated source again. An old response does not authorize a later read.
+
+Identity fields are `source_message_id_hex`, `attachment_index`, `source_epoch`,
+`plaintext_sha256` and `ciphertext_sha256`. These describe the authenticated reference,
+not verified downloaded bytes or recipient-download proof. No locators, nonces, keys,
+peer size hints or native asset handles cross the socket. Unknown epochs fail with
+`attachment_epoch_unavailable`; malformed or unsupported references fail with
+`attachment_rejected`. Native failed/blocked states include an actionable `failure_hint`;
+this API cannot reconstruct a missing old epoch key or clear a native retry limit.
+
+`state`, `retry_at` and advisory `locally_available` report native transfer state.
+Only a successful download includes `handoff { lease, path, size_bytes }`: a private
+host-local file copied by `open_attachment_handoff`, with a verified byte count.
+Hash those bytes and compare with `plaintext_sha256` to verify the expected artifact;
+filenames and MIME agreement are not artifact identity. A later poll may resolve a
+changed source, so compare the returned source and digest too.
+
+Release each handoff when finished, including on client errors. A release failure
+with code `attachment_release_failed` is retryable. Keep the lease and retry the
+same release until cleanup succeeds. Malformed leases are not retryable. Each successful
+download call can create a new lease. A leased copy is a snapshot: later source
+removal does not revoke an already delivered file. Copies last until release,
+account removal, or stale-copy cleanup when an account worker starts in a new
+process. They are not a durable cache. Undelivered replies release their leases.
+Local operations have the connector's 15-second deadline; acquisition has native
+budgets/deadlines and continues independently. Plaintext bytes never enter a control
+frame, and existing timeline reads remain network-free and unchanged.
+
+Older connectors do not support these new request types. Do not fall back to a saved
+raw `download_media` reference for historical recovery: that does not provide these
+source checks or native acquisition controls.
+
 ## Stream sessions
 
 A successful `StreamBegin` returns a random 32-byte `stream_capability` encoded as 64 lowercase hex characters. Every
