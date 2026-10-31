@@ -67,6 +67,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::TransportDelivery;
+use cgka_traits::storage::StorageError;
+use marmot_forensics::{AuditEventKind, RecoveryRunnerCap};
 use nostr::prelude::Event;
 use storage_sqlite::{
     RecoveryRelayCaps, RecoveryUnitOutcome, SqliteAppStorage, TransportReconciliationRoute,
@@ -158,6 +160,9 @@ pub(crate) struct WorkerTurn<'a> {
     pub(crate) app: &'a SqliteAppStorage,
     /// Unix seconds, as of this turn.
     pub(crate) now: u64,
+    /// Records one account-scoped row into the account's audit recorder,
+    /// which drops it unless it records v5.
+    pub(crate) audit: &'a dyn Fn(AuditEventKind),
 }
 
 /// What a turn that reads debt sees: the account's current routes, and the
@@ -285,13 +290,34 @@ pub(crate) struct PassReport {
     pub(crate) advanced: u32,
 }
 
+/// Account breaker pauses since the process started, across its accounts.
+static ACCOUNT_PAUSES: AtomicU64 = AtomicU64::new(0);
+/// Events re-checks have found inside history already covered, likewise.
+static LATE_FINDINGS: AtomicU64 = AtomicU64::new(0);
+
+/// The runners' aggregate counts since the process started, across its
+/// accounts. Counts only, privacy-safe. The breaker's audit row carries them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RecoveryRunnerCounts {
+    pub(crate) account_pauses: u64,
+    pub(crate) late_findings: u64,
+}
+
+pub(crate) fn recovery_runner_counts() -> RecoveryRunnerCounts {
+    RecoveryRunnerCounts {
+        account_pauses: ACCOUNT_PAUSES.load(Ordering::Relaxed),
+        late_findings: LATE_FINDINGS.load(Ordering::Relaxed),
+    }
+}
+
 /// Wake signals other than the coalescing watch, and the runner's aggregate
 /// counts.
 #[derive(Default)]
 struct Signals {
     /// Relays that reconnected since the runner last looked.
     reconnected: Mutex<BTreeSet<String>>,
-    /// Events re-checks found inside ranges already covered (PR 5 exports it).
+    /// Events re-checks found inside ranges already covered by this runner.
+    /// The process total is [`recovery_runner_counts`].
     late_findings: AtomicU64,
 }
 
@@ -579,7 +605,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             }
         };
         let now = self.host.now_seconds();
-        self.report_pause(survey.paused_until, now);
+        if let Some(step) = self.report_pause(survey.paused_until, now).await {
+            return step;
+        }
         let mut hints = self.hints.borrow().clone();
         hints.held.append(&mut survey.fenced);
         hints.window.append(&mut survey.window);
@@ -825,6 +853,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         self.signals
             .late_findings
             .fetch_add(facts.late, Ordering::Relaxed);
+        LATE_FINDINGS.fetch_add(facts.late, Ordering::Relaxed);
         tracing::debug!(
             target: TARGET,
             method = "recheck",
@@ -957,20 +986,62 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     }
 
     /// The account breaker: a cap pauses the runner until the window rolls,
-    /// and changes no unit. Each pause is reported once, as a bug signal.
-    fn report_pause(&mut self, paused_until: Option<u64>, now: u64) {
-        match paused_until {
-            Some(until) if self.reported_pause != Some(until) => {
-                self.reported_pause = Some(until);
-                tracing::warn!(
-                    target: TARGET,
-                    method = "account_breaker",
-                    paused_for_seconds = until.saturating_sub(now),
-                    "recovery paused at the account's hourly cap"
-                );
+    /// and changes no unit. Each pause is reported once, as a bug signal: a
+    /// warning, the process count, and an audit row with the hour's usage
+    /// read in a worker turn. A failed turn loses only the row. Returns the
+    /// step to end with, if any.
+    async fn report_pause(&mut self, paused_until: Option<u64>, now: u64) -> Option<Step> {
+        let Some(until) = paused_until else {
+            self.reported_pause = None;
+            return None;
+        };
+        if self.reported_pause == Some(until) {
+            return None;
+        }
+        self.reported_pause = Some(until);
+        let pauses = ACCOUNT_PAUSES
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let paused_for_secs = until.saturating_sub(now);
+        tracing::warn!(
+            target: TARGET,
+            method = "account_breaker",
+            paused_for_seconds = paused_for_secs,
+            "recovery paused at the account's hourly cap"
+        );
+        let unit = self.policy.unit;
+        let recorded = self
+            .host
+            .turn(move |turn| {
+                let usage = turn.app.recovery_account_usage(turn.now)?;
+                let cap = match (
+                    usage.attempts >= unit.max_attempts_per_hour,
+                    usage.event_bytes >= unit.max_event_bytes_per_hour,
+                ) {
+                    (true, true) => RecoveryRunnerCap::Both,
+                    (true, false) => RecoveryRunnerCap::Attempts,
+                    (false, true) => RecoveryRunnerCap::EventBytes,
+                    // A refund since the survey lifted the pause already.
+                    (false, false) => return Ok(()),
+                };
+                (turn.audit)(AuditEventKind::RecoveryRunnerPaused {
+                    cap,
+                    attempts: usage.attempts,
+                    event_bytes: usage.event_bytes,
+                    paused_for_secs,
+                    pauses,
+                    late_findings: LATE_FINDINGS.load(Ordering::Relaxed),
+                });
+                Ok::<_, StorageError>(())
+            })
+            .await;
+        match recorded {
+            None => Some(Step::Stopped),
+            Some(Err(error)) => {
+                log_failure("account_breaker", error);
+                None
             }
-            Some(_) => {}
-            None => self.reported_pause = None,
+            Some(Ok(())) => None,
         }
     }
 }
@@ -1017,7 +1088,7 @@ fn outcome_label(outcome: RecoveryUnitOutcome) -> &'static str {
     }
 }
 
-fn log_failure(method: &'static str, error: cgka_traits::storage::StorageError) {
+fn log_failure(method: &'static str, error: StorageError) {
     tracing::warn!(
         target: TARGET,
         method = method,

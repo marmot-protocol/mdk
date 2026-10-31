@@ -915,6 +915,8 @@ struct TestHost {
     closed: OnceLock<Account>,
     /// The relay pool's connection generations, by relay.
     connections: watch::Sender<BTreeMap<String, u64>>,
+    /// Audit rows the runner's worker turns recorded.
+    audited: Mutex<Vec<AuditEventKind>>,
 }
 
 impl TestHost {
@@ -984,6 +986,7 @@ impl TestHost {
             failing_turns: AtomicUsize::new(0),
             closed: OnceLock::new(),
             connections: watch::channel(BTreeMap::new()).0,
+            audited: Mutex::default(),
         })
     }
 
@@ -1053,9 +1056,11 @@ impl RunnerHost for TestHost {
         } else {
             &self.app
         };
+        let audit = |kind| self.audited.lock().unwrap().push(kind);
         Some(turn(&WorkerTurn {
             app,
             now: self.clock.now(),
+            audit: &audit,
         }))
     }
 
@@ -1913,6 +1918,26 @@ async fn recovery_runner_pauses_the_account_at_its_hourly_cap() {
     assert_eq!(idle(runner.step().await), Some(until));
     assert_eq!(runner.reported_pause, Some(until));
     assert_eq!(relay.requests(), requests);
+    // Once per pause: the next step while paused records nothing more.
+    assert_eq!(idle(runner.step().await), Some(until));
+    let audited = std::mem::take(&mut *host.audited.lock().unwrap());
+    let [
+        AuditEventKind::RecoveryRunnerPaused {
+            cap,
+            attempts,
+            paused_for_secs,
+            pauses,
+            ..
+        },
+    ] = audited.as_slice()
+    else {
+        panic!("one pause row");
+    };
+    assert_eq!(
+        (*cap, *attempts, *paused_for_secs),
+        (RecoveryRunnerCap::Attempts, 2, until - clock.now())
+    );
+    assert!(*pauses >= 1 && recovery_runner_counts().account_pauses >= *pauses);
     let waiting = groups
         .iter()
         .find(|route| served.iter().all(|summary| summary.key.route != **route))

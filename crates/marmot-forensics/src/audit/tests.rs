@@ -1075,6 +1075,14 @@ fn sample_v5_only_kinds() -> Vec<AuditEventKind> {
             }],
             dropped: 0,
         },
+        AuditEventKind::RecoveryRunnerPaused {
+            cap: RecoveryRunnerCap::EventBytes,
+            attempts: 12,
+            event_bytes: 64 * 1024 * 1024,
+            paused_for_secs: 1_740,
+            pauses: 1,
+            late_findings: 3,
+        },
         AuditEventKind::TransportCursorAdvanced {
             trigger: TransportCursorTrigger::LivePromotion,
             cursor_before_secs: Some(1_700_000_000),

@@ -42,7 +42,8 @@ pub use recovery::{
     EoseRepairReceiver, EoseRepairTrigger, RECOVERY_AUDIT_MAX_ENDPOINTS,
     RECOVERY_AUDIT_MAX_OBLIGATIONS, RecoveryAttemptScope, RecoveryGoalBound, RecoveryNeedChange,
     RecoveryNextAttempt, RecoveryObligationCause, RecoveryObligationVerdict, RecoveryPassOutcome,
-    RecoveryRelayFailure, RecoveryRelayOutcome, RecoveryScopeProgress, TransportCursorTrigger,
+    RecoveryRelayFailure, RecoveryRelayOutcome, RecoveryRunnerCap, RecoveryScopeProgress,
+    TransportCursorTrigger,
 };
 pub use refusal::{
     SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES, SubscriptionRefusalCategory, SubscriptionRefusalEntry,
@@ -1440,6 +1441,24 @@ pub enum AuditEventKind {
         refusals: Vec<SubscriptionRefusalEntry>,
         dropped: u64,
     },
+    /// The recovery runner's account breaker paused the account's history
+    /// fetches at a rolling-hour cap. Account-scoped, recorded once per pause.
+    /// A pause is a bug signal: the per-unit and per-relay limits should
+    /// stop well before the account's caps.
+    ///
+    /// `cap` names the cap reached; `attempts` and `event_bytes` are what
+    /// the rolling hour holds as it pauses, and `paused_for_secs` how long
+    /// until enough of it rolls off. `pauses` and `late_findings` are process
+    /// totals since start across every account: pauses including this one,
+    /// and events re-checks found inside history already covered. v5 only.
+    RecoveryRunnerPaused {
+        cap: RecoveryRunnerCap,
+        attempts: u64,
+        event_bytes: u64,
+        paused_for_secs: u64,
+        pauses: u64,
+        late_findings: u64,
+    },
 }
 
 impl AuditEventKind {
@@ -1502,6 +1521,7 @@ impl AuditEventKind {
             AuditEventKind::TransportCursorAdvanced { .. } => "transport_cursor_advanced",
             AuditEventKind::SubscriptionEoseRepaired { .. } => "subscription_eose_repaired",
             AuditEventKind::SubscriptionRefused { .. } => "subscription_refused",
+            AuditEventKind::RecoveryRunnerPaused { .. } => "recovery_runner_paused",
         }
     }
 
@@ -1548,6 +1568,7 @@ impl AuditEventKind {
                 | AuditEventKind::TransportCursorAdvanced { .. }
                 | AuditEventKind::SubscriptionEoseRepaired { .. }
                 | AuditEventKind::SubscriptionRefused { .. }
+                | AuditEventKind::RecoveryRunnerPaused { .. }
         )
     }
 }

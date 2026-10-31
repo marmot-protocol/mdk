@@ -146,9 +146,11 @@ impl RunnerHost for AccountRunnerHost {
         self.on_client(false, move |client| {
             Box::pin(async move {
                 let app = runner_storage(client)?;
+                let audit = |kind| client.record_audit_event(None, None, kind);
                 Some(turn(&WorkerTurn {
                     app: &app,
                     now: unix_now(),
+                    audit: &audit,
                 }))
             })
         })
