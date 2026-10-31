@@ -931,6 +931,65 @@ async fn a_slot_linked_again_keeps_its_new_label_over_an_earlier_rename() {
 
 /// Closes `device`'s client and opens it again, as a restart does: pairing
 /// keeps nothing across it.
+/// A new device applies its failed link's removal and closes before it
+/// forgets its copy. The next process finds that removal stored and stops
+/// the account's publishing until a client tells it apart; the client's
+/// open finds a failed link, which stops nothing (D40), and lifts the stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_links_removal_found_after_a_restart_stops_nothing() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    choose_link(&relay, &mut phone, &mut laptop).await;
+    laptop.op(DeviceLinkOp::ConfirmMatch).await;
+    laptop.step(&relay).await; // phone's confirm in, laptop's out
+    phone.step(&relay).await; // laptop's confirm in: the group
+    let group = phone.client.trusted_device_group().unwrap().unwrap();
+    phone
+        .client
+        .drive_device_pairing_at(crate::unix_now_seconds() + LINK_DEADLINE_SECS + 1)
+        .await;
+    phone.step(&relay).await; // the removal
+    // The Welcome, then its removal, with no drive to forget the copy.
+    deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+    assert!(laptop.client.runtime.group_record(&group).unwrap().removed);
+    assert!(!laptop.client.device_unlinked());
+    let Device {
+        _dir, app, client, ..
+    } = laptop;
+    drop((client, app));
+
+    let app = MarmotApp::with_relay_and_config(
+        _dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_dev_device_groups(true),
+    )
+    .with_test_relay_client(relay.clone());
+    let bootstrap = || {
+        AccountRelayListBootstrap::new(
+            vec![TransportEndpoint("wss://relay.example".into())],
+            vec![TransportEndpoint("wss://relay.example".into())],
+        )
+    };
+    let attempted = relay.attempted_events().len();
+    app.publish_user_profile("alice", UserProfileMetadata::default(), bootstrap())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        relay.attempted_events().len(),
+        attempted,
+        "stopped until a client tells the removal apart"
+    );
+    let client = app.client("alice").await.unwrap();
+    assert!(!client.device_unlinked());
+    assert!(!app.account_home().account("alice").unwrap().unlinked);
+    app.publish_user_profile("alice", UserProfileMetadata::default(), bootstrap())
+        .await
+        .unwrap();
+    drop(client);
+}
+
 async fn reopen(device: Device) -> Device {
     let Device {
         _dir,

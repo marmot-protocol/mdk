@@ -612,6 +612,11 @@ fn account_home_error_json(err: &AccountHomeError) -> Value {
             "message": err.to_string(),
             "account_ref": account,
         }),
+        AccountHomeError::AccountUnlinked(account) => json!({
+            "code": "account_unlinked",
+            "message": err.to_string(),
+            "account_ref": account,
+        }),
         AccountHomeError::InvalidSecretKey => json!({
             "code": "invalid_secret_key",
             "message": err.to_string(),

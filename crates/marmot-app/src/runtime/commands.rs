@@ -32,6 +32,17 @@ use marmot_observability::AppPerformanceOperation;
 
 impl AccountManager {
     #[cfg(test)]
+    pub(super) async fn unlink_device_for_test(&self, account_ref: &str) -> Result<(), AppError> {
+        let commands = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::UnlinkDeviceForTest { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        response.await.map_err(|_| AppError::TransportClosed)?
+    }
+
+    #[cfg(test)]
     pub(super) async fn unhydrated_group_count_for_test(
         &self,
         account_ref: &str,

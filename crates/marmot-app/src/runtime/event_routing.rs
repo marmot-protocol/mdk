@@ -32,6 +32,7 @@ pub(crate) fn runtime_message_update_from_event(
         | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::CompromiseWarningChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }
+        | MarmotAppEvent::DeviceUnlinked { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -56,6 +57,7 @@ pub(crate) fn projection_update_from_event(
         | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::CompromiseWarningChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }
+        | MarmotAppEvent::DeviceUnlinked { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -113,6 +115,7 @@ pub(crate) fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str,
         | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::CompromiseWarningChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }
+        | MarmotAppEvent::DeviceUnlinked { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -146,6 +149,7 @@ pub(crate) fn chat_list_event_route(event: &MarmotAppEvent) -> Option<(&str, &Gr
         | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::CompromiseWarningChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }
+        | MarmotAppEvent::DeviceUnlinked { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -192,6 +196,7 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
         | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
         | MarmotAppEvent::CompromiseWarningChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }
+        | MarmotAppEvent::DeviceUnlinked { .. }
         | MarmotAppEvent::AccountError(_) => ChatListUpdateTrigger::SnapshotRefresh,
     }
 }

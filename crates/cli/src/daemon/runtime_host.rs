@@ -802,6 +802,9 @@ pub(crate) async fn handle_app_runtime_event(
         // Linking a new device may have changed; the CLI does not link
         // devices.
         marmot_app::MarmotAppEvent::DeviceLinkChanged { .. } => {}
+        // The runtime has already stopped the account; the CLI does not link
+        // devices.
+        marmot_app::MarmotAppEvent::DeviceUnlinked { .. } => {}
     }
 }
 

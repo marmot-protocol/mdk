@@ -863,6 +863,59 @@ async fn signed_out_account_cannot_report() {
     assert!(fixture.publisher.publishes().is_empty());
 }
 
+/// A device its device group unlinked publishes no report for the account,
+/// neither a new one nor one already queued, even before its account record
+/// says signed out, as when that mark failed. Reports go out through an
+/// anonymous publisher, so the account's publish stop is checked there
+/// (mdk#2628 D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unlinked_account_publishes_no_report() {
+    let fixture = Fixture::configured(Mode::Refuse);
+    fixture
+        .submit(
+            &Keys::generate().public_key().to_hex(),
+            ReportReason::Spam,
+            "",
+            ModerationReportOrigin::Report,
+        )
+        .await
+        .unwrap();
+    let attempts = fixture.publisher.publishes().len();
+    let account_id_hex = fixture
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    fixture
+        .app
+        .stop_unlinked_account_publishing(&account_id_hex);
+    fixture.publisher.set_mode(Mode::Accept);
+
+    let outcome = fixture
+        .submit(
+            &Keys::generate().public_key().to_hex(),
+            ReportReason::Spam,
+            "",
+            ModerationReportOrigin::Report,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, ModerationReportStatus::AcceptedPending);
+    let summary = fixture
+        .app
+        .retry_pending_moderation_reports("alice", None)
+        .await
+        .unwrap();
+    assert_eq!(summary.published, 0);
+    assert_eq!(fixture.pending().len(), 2);
+    assert_eq!(
+        fixture.publisher.publishes().len(),
+        attempts,
+        "nothing reaches a relay"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn purge_cancels_an_in_flight_publish_and_removes_queued_reports() {
     let fixture = Arc::new(Fixture::configured(Mode::Refuse));

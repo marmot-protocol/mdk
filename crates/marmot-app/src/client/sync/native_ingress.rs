@@ -82,7 +82,10 @@ impl AppClient {
         let mut progressed = false;
         let mut inventory = super::InventoryBatch::default();
         for _ in 0..MAX_COMPARISON_ADMISSION_PER_TURN {
-            if !matches!(self.take_native_batch(None).await, NativeFrontier::Ready) {
+            // An unlinked account admits nothing more (mdk#2628 D67).
+            if self.device_unlinked
+                || !matches!(self.take_native_batch(None).await, NativeFrontier::Ready)
+            {
                 break;
             }
             #[cfg(feature = "test-policy-overrides")]

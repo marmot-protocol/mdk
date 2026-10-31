@@ -23,6 +23,7 @@ c_mirror! {
         copy external_signing: bool,
         copy signed_out: bool,
         copy running: bool,
+        copy unlinked: bool,
     }
 }
 
