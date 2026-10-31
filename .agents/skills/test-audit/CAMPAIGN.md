@@ -18,19 +18,50 @@ Pin an `origin/master` SHA and record for the scope:
 - each test's result and wall time from one run with the features CI uses
   for the crate (the crate `AGENTS.md` names them; many need
   `test-policy-overrides`);
+- what the shared setup costs: time one store open, fixture or process start
+  alone, and count how many each test pays for. nextest runs every test in
+  its own process, so anything a test binary builds once per process is built
+  again by every test;
 - line coverage of the production owner, saved for later diffs.
 
 ```sh
 cargo nextest run -p <crate> --locked --no-fail-fast --features <ci-features> \
   2>&1 | tee "$SCRATCH/<crate>-baseline.log"          # PASS [ 1.234s] lines carry wall time
-cargo llvm-cov nextest -p <crate> --locked --features <ci-features> \
-  --lcov --output-path "$SCRATCH/<crate>-baseline.lcov"
 ```
 
-Run one crate at a time: other agents build on the same machine, and
-`cargo llvm-cov` builds a second instrumented target directory (`cargo
-llvm-cov clean` when done). Keep baseline failures in their own list. Each
-is a product bug until shown otherwise (step 8).
+For coverage, build instrumented into a target directory of its own and run
+plain nextest. `cargo llvm-cov nextest` rebuilt the workspace for every
+package in this repository.
+
+```sh
+export CARGO_TARGET_DIR="$PWD/target/coverage"
+export RUSTFLAGS='-C instrument-coverage --cfg=coverage --cfg=trybuild_no_target'
+export LLVM_PROFILE_FILE="$SCRATCH/profraw/%p-%14m.profraw"
+cargo nextest run -p <crate> --locked --no-fail-fast --features <ci-features>
+TOOLS="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
+find "$SCRATCH/profraw" -name '*.profraw' > "$SCRATCH/profraw.list"
+"$TOOLS/llvm-profdata" merge -sparse -f "$SCRATCH/profraw.list" -o "$SCRATCH/<crate>.profdata"
+set -- $(cargo nextest list -p <crate> --locked --features <ci-features> --message-format json |
+  jq -r '.["rust-suites"][]["binary-path"]')
+first=$1; shift
+"$TOOLS/llvm-cov" export -format=lcov -instr-profile "$SCRATCH/<crate>.profdata" "$first" \
+  $(printf -- '-object %s ' "$@") -ignore-filename-regex='/\.cargo/registry/|/rustc/|/target/' \
+  > "$SCRATCH/<crate>-baseline.lcov"
+```
+
+Check each step's exit status rather than piping it: a pipeline hides a
+failed merge. Raw profiles grow fast (about 100 GB for the workspace), so
+delete them once merged.
+
+Run one crate at a time: other agents build on the same machine. Keep
+baseline failures in their own list. Each is a product bug until shown
+otherwise (step 8).
+
+When shared setup is a large share of the time, fix the harness before the
+ledger, in its own change (step 5). In `storage-sqlite`, the migration replay
+and SQLCipher settings of each test store were about 70% of the crate's and
+the engine's test time. Fixing them first means the ledger judges each test by
+what it asserts, not by setup cost no single test can remove.
 
 Done when every test in scope has a recorded result and the coverage report
 is saved.
@@ -76,8 +107,8 @@ Prefer the cheapest layer that runs real production code over a fake network
 (the in-memory relay, `TransportBus`) to a mocked collaborator, and keep one
 higher-layer journey per user-visible flow for the risks that layer adds.
 
-Coverage finds candidates. Run the suspect suite and its keeper alone under
-`cargo llvm-cov` and compare the production owner's covered lines. A suite
+Coverage finds candidates. Run the suspect suite and its keeper alone with
+the step 1 coverage build and compare the production owner's covered lines. A suite
 whose covered lines are a subset of the keeper's, and whose assertions the
 keeper already makes, is a `C` or `D` candidate. Equal coverage is necessary,
 not sufficient: the mutation check in step 6 is the proof.
