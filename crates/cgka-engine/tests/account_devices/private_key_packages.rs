@@ -6,7 +6,9 @@
 //! keys, and is answered once. An ordinary Welcome never consumes one. A hand-off round-trips, and
 //! the receiver accepts only this account's single-use KeyPackages whose
 //! device tag reads as the sender's slot. A sibling Welcome (mdk#2628 3.5)
-//! consumes only the private KeyPackage it names, issued to its sender.
+//! consumes only the private KeyPackage it names, issued to its sender, and
+//! one back into a chat still held active is held, writing nothing, until
+//! that copy reads removed or unrecoverable.
 
 use super::*;
 use cgka_engine::key_package::{durably_owned_key_packages, key_package_metadata};
@@ -15,7 +17,8 @@ use cgka_engine::private_key_packages::{
     validate_received_private_key_package,
 };
 use cgka_traits::app_components::{DeviceEntryV1, DeviceRosterV1};
-use cgka_traits::storage::KeyPackageBundleStorage as _;
+use cgka_traits::storage::{GroupStorage as _, KeyPackageBundleStorage as _};
+use cgka_traits::welcome::SiblingWelcomeJoin::{self, Settled};
 
 const NOW: u64 = 1_000;
 const SLOT: [u8; 32] = [7; 32];
@@ -329,7 +332,7 @@ async fn join_sibling(
     device: &mut Device,
     carrier: &[u8],
     welcome: &SiblingWelcome,
-) -> IngestOutcome {
+) -> SiblingWelcomeJoin {
     device
         .engine
         .join_sibling_welcome(&hash_id(carrier), welcome, None)
@@ -376,7 +379,7 @@ async fn a_sibling_welcome_joins_with_the_private_key_package_issued_to_its_send
     ] {
         assert_eq!(
             join_sibling(&mut laptop, carrier, &refusal).await,
-            refused(InputRejectionCategory::NotAddressedToThisDevice)
+            Settled(refused(InputRejectionCategory::NotAddressedToThisDevice))
         );
     }
     assert_eq!(
@@ -392,7 +395,7 @@ async fn a_sibling_welcome_joins_with_the_private_key_package_issued_to_its_send
     let sibling = SiblingWelcome::decode(&sibling.encode().unwrap()).unwrap();
     assert_eq!(
         join_sibling(&mut laptop, b"461", &sibling).await,
-        IngestOutcome::Processed
+        Settled(IngestOutcome::Processed)
     );
     assert!(laptop.engine.epoch(&gid).is_ok());
     let joined: Vec<_> = laptop
@@ -419,7 +422,7 @@ async fn a_sibling_welcome_joins_with_the_private_key_package_issued_to_its_send
     // Welcome for the used KeyPackage finds no key.
     assert_eq!(
         join_sibling(&mut laptop, b"461 again", &sibling).await,
-        refused(InputRejectionCategory::Duplicate)
+        Settled(refused(InputRejectionCategory::Duplicate))
     );
     let (_, again) = create(&mut phone, vec![private], vec![]).await.unwrap();
     assert_eq!(
@@ -429,7 +432,7 @@ async fn a_sibling_welcome_joins_with_the_private_key_package_issued_to_its_send
             &sibling_welcome(&again[0], SLOT, &reference)
         )
         .await,
-        refused(InputRejectionCategory::MissingWelcomeKeyPackage)
+        Settled(refused(InputRejectionCategory::MissingWelcomeKeyPackage))
     );
 
     // A sibling Welcome for a published KeyPackage consumes nothing; its
@@ -445,13 +448,186 @@ async fn a_sibling_welcome_joins_with_the_private_key_package_issued_to_its_send
             &sibling_welcome(&welcomes[0], SLOT, &public_ref)
         )
         .await,
-        refused(InputRejectionCategory::NotAddressedToThisDevice)
+        Settled(refused(InputRejectionCategory::NotAddressedToThisDevice))
     );
     assert_eq!(
         join_outcome(&mut laptop, &welcomes[0]).await,
         IngestOutcome::Processed
     );
     assert!(laptop.engine.epoch(&other).is_ok());
+}
+
+/// The phone removes the laptop from `gid` and adds it back with
+/// `key_package`: the removal commit and the laptop's new Welcome.
+async fn remove_and_add_back(
+    phone: &mut Device,
+    laptop: &Device,
+    gid: &GroupId,
+    key_package: KeyPackage,
+) -> (TransportMessage, TransportMessage) {
+    let remove = send_commit(
+        phone,
+        SendIntent::RemoveOwnAccountDevices {
+            group_id: gid.clone(),
+            leaf_signature_keys: vec![signature_key(laptop, gid)],
+        },
+        gid,
+    )
+    .await;
+    let SendResult::GroupEvolution {
+        welcomes, pending, ..
+    } = phone
+        .engine
+        .send(SendIntent::AddOwnAccountDevices {
+            group_id: gid.clone(),
+            key_packages: vec![key_package],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected GroupEvolution")
+    };
+    phone.engine.confirm_published(pending).await.unwrap();
+    (remove, welcomes.into_iter().next().unwrap())
+}
+
+/// The laptop takes in the commit removing it from `gid`.
+async fn remove_laptop(laptop: &mut Device, gid: &GroupId, remove: TransportMessage) {
+    laptop.engine.ingest(remove).await.unwrap();
+    laptop
+        .engine
+        .converge_stored_openmls_messages_at(gid, 1_000_000)
+        .unwrap();
+    assert!(laptop.engine.group_record(gid).unwrap().removed);
+}
+
+/// What a held sibling Welcome must leave as it was: no rejoin offer, its
+/// KeyPackage still issued and its key kept, and the chat's copy untouched.
+/// Being held again, and joining later, shows it marked nothing either.
+fn assert_held_wrote_nothing(
+    laptop: &Device,
+    gid: &GroupId,
+    welcome: &SiblingWelcome,
+    before: &cgka_traits::group::Group,
+    keys: usize,
+) {
+    assert!(
+        laptop
+            .engine
+            .pending_group_rejoins_for(None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        laptop
+            .engine
+            .issued_private_key_packages()
+            .unwrap()
+            .iter()
+            .any(|issued| issued.key_package_ref == welcome.key_package_ref)
+    );
+    assert_eq!(laptop.storage.stored_key_package_bundles().unwrap().len(), keys);
+    assert_eq!(&laptop.engine.group_record(gid).unwrap(), before);
+}
+
+/// A sibling Welcome back into a chat whose copy the laptop still holds
+/// active, such as one that reaches it before the removal it follows, is
+/// held: it names the chat and writes nothing, however often it is tried.
+/// Once the copy reads removed, the same Welcome joins and consumes its
+/// KeyPackage, and another carrier of it is a duplicate.
+#[tokio::test]
+async fn a_sibling_welcome_into_a_chat_still_held_waits_for_its_removal() {
+    let mut phone = device(b"alice", true);
+    let mut laptop = device(b"alice", true);
+    laptop
+        .engine
+        .issue_private_key_packages(&SLOT, 2, None, NOW)
+        .unwrap();
+    let issued = laptop.engine.issued_private_key_packages().unwrap();
+    let private = |index: usize| current(issued[index].key_package.clone());
+    let (gid, welcomes) = create(&mut phone, vec![private(0)], vec![]).await.unwrap();
+    assert_eq!(
+        join_sibling(
+            &mut laptop,
+            b"first",
+            &sibling_welcome(&welcomes[0], SLOT, &issued[0].key_package_ref)
+        )
+        .await,
+        Settled(IngestOutcome::Processed)
+    );
+
+    let (remove, welcome) = remove_and_add_back(&mut phone, &laptop, &gid, private(1)).await;
+    let sibling = sibling_welcome(&welcome, SLOT, &issued[1].key_package_ref);
+    let before = laptop.engine.group_record(&gid).unwrap();
+    let keys = laptop.storage.stored_key_package_bundles().unwrap().len();
+    for _ in 0..2 {
+        assert_eq!(
+            join_sibling(&mut laptop, b"held", &sibling).await,
+            SiblingWelcomeJoin::Held {
+                group_id: gid.clone()
+            }
+        );
+        assert_held_wrote_nothing(&laptop, &gid, &sibling, &before, keys);
+    }
+
+    remove_laptop(&mut laptop, &gid, remove).await;
+    assert_eq!(
+        join_sibling(&mut laptop, b"held", &sibling).await,
+        Settled(IngestOutcome::Processed)
+    );
+    assert!(!laptop.engine.group_record(&gid).unwrap().removed);
+    assert_eq!(
+        laptop.engine.epoch(&gid).unwrap(),
+        phone.engine.epoch(&gid).unwrap()
+    );
+    assert!(laptop.engine.issued_private_key_packages().unwrap().is_empty());
+    assert_eq!(
+        join_sibling(&mut laptop, b"another carrier", &sibling).await,
+        Settled(refused(InputRejectionCategory::Duplicate))
+    );
+}
+
+/// A copy branch selection found unrecoverable lets go of a held sibling
+/// Welcome too: it joins as the repair, as any valid Welcome does.
+#[tokio::test]
+async fn a_held_sibling_welcome_joins_a_chat_whose_copy_is_unrecoverable() {
+    let mut phone = device(b"alice", true);
+    let mut laptop = device(b"alice", true);
+    laptop
+        .engine
+        .issue_private_key_packages(&SLOT, 2, None, NOW)
+        .unwrap();
+    let issued = laptop.engine.issued_private_key_packages().unwrap();
+    let private = |index: usize| current(issued[index].key_package.clone());
+    let (gid, welcomes) = create(&mut phone, vec![private(0)], vec![]).await.unwrap();
+    join_sibling(
+        &mut laptop,
+        b"first",
+        &sibling_welcome(&welcomes[0], SLOT, &issued[0].key_package_ref),
+    )
+    .await;
+    let (_, welcome) = remove_and_add_back(&mut phone, &laptop, &gid, private(1)).await;
+    let sibling = sibling_welcome(&welcome, SLOT, &issued[1].key_package_ref);
+    assert_eq!(
+        join_sibling(&mut laptop, b"held", &sibling).await,
+        SiblingWelcomeJoin::Held {
+            group_id: gid.clone()
+        }
+    );
+
+    let mut record = laptop.storage.get_group(&gid).unwrap();
+    record.unrecoverable = true;
+    laptop.storage.put_group(&record).unwrap();
+    assert_eq!(
+        join_sibling(&mut laptop, b"held", &sibling).await,
+        Settled(IngestOutcome::Processed)
+    );
+    let record = laptop.engine.group_record(&gid).unwrap();
+    assert!(!record.unrecoverable && !record.removed);
+    assert_eq!(
+        laptop.engine.epoch(&gid).unwrap(),
+        phone.engine.epoch(&gid).unwrap()
+    );
 }
 
 /// A sibling Welcome decodes only from its exact encoding.

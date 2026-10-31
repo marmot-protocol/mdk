@@ -248,11 +248,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     advertise this client's capabilities stop counting; an ordinary Welcome never consumes one; and a hand-off keeps
     only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only). A sibling
     Welcome (3.5b) consumes only the private KeyPackage it names, issued to its sender, and one back into a chat still
-    held active is one rejoin offer per Welcome, holding its carriers. `sibling_offers_are_lost_only_to_a_decline_or_the_size_limit`
-    walks every sequence of up to four steps (an arrival, a withdrawn carrier, a lost KeyPackage, eviction, the removal
-    landing, consent, decline) over two Welcomes and two carriers each, checking each confirmation's result, branching
-    from in-memory database copies (`SqliteAccountStorage::in_memory_copy`). It is the slowest test in the file, and
-    one more step of depth multiplies its run time by about seven.
+    held active is held, writing nothing, until that copy reads removed or unrecoverable.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and

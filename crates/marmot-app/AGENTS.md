@@ -159,11 +159,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Stash a sibling Welcome (461, mdk#2628 3.5b) only after a hand-off's checks, a relay list of one to 16 relay URLs
   distinct once parsed, and a KeyPackage this device issued to its sender; join from the stash (migration 0160) in
   the maintenance pass, never in the synchronous dispatch, only while its carrier is still `Processed`, and drain the
-  joins' events as a confirmed rejoin does. A refused or withdrawn 461 is dropped; one into a chat still held active
-  is the engine's rejoin offer, which the host is told about as for a delivered one and which the invite-recovery seam
-  retries once the removal lands; one whose checks could not be read, or admitted but not stashed, fails the event's
-  projection, which is retried. Every call that can store or retire a rejoin offer (ingest, the stash joins, the
-  retry, a confirmation, a decline) tells the host which chats' offers changed.
+  joins' events as a confirmed rejoin does. A refused or withdrawn 461 is dropped; one whose checks could not be read,
+  or admitted but not stashed, fails the event's projection, which is retried. One into a chat still held active is
+  held, never a rejoin offer (D72): its row keeps the chat's id, and a pass joins it, with no consent asked, only once
+  that copy reads removed or unrecoverable. A held row goes only when its carrier is withdrawn, its KeyPackage is used
+  or expired, the chat is forgotten or disbanded, or a full stash makes room for a new Welcome. Every call that can
+  store or retire a rejoin offer (ingest, the retry, a confirmation, a decline) tells the host which chats' offers
+  changed.
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.
