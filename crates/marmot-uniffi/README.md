@@ -854,7 +854,7 @@ also carry their ordered `tags`, so clients can render app-defined event types w
 raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows.
 MDK-owned kinds continue to use prepared fields and references there. Custom-event tag changes invalidate
 the conversion cache. Custom events do not change chat-list activity or notification policy.
-`sendCustomEvent` refuses every kind MDK owns, the device-group kinds 457, 459, 460, 461, 475 and 476 included. Those
+`sendCustomEvent` refuses every kind MDK owns, the device-group kinds 457, 459, 460, 461, 473, 475 and 476 included. Those
 are read only in the account's own device group, so a chat never shows one, as a row, a message or a notification.
 
 

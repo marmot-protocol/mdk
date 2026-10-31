@@ -83,6 +83,7 @@ pub(crate) mod device_pairing;
 mod device_removal;
 mod device_renames;
 pub(crate) mod epoch_stall;
+mod history_delivery;
 pub(crate) mod history_notices;
 mod invite_recovery;
 mod private_key_packages;
@@ -1541,6 +1542,7 @@ impl AppClient {
         );
         self.drive_sign_ins().await;
         self.drive_small_state().await;
+        self.drive_history_deliveries().await;
         self.drive_device_removals().await;
         self.device_rename_upkeep().await;
         let held = self.epoch_gap_held_groups()?;

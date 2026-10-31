@@ -439,7 +439,7 @@ or `failed`), counts, `media_ciphertext_sha256` purge hints, and a privacy-safe
 
 **Custom events.** `messages send-event <group-hex> <kind> [content]` sends an app-defined event. Kind, tags, and content
 pass through verbatim into the encrypted group message. Kinds MDK owns (chat, reactions, edits, deletes, agent activity,
-agent stream anchors, group system rows, push token records, and the device-group kinds 457, 459, 460, 461, 475 and 476) are rejected with `reserved_app_event_kind`. Each `--tag`
+agent stream anchors, group system rows, push token records, and the device-group kinds 457, 459, 460, 461, 473, 475 and 476) are rejected with `reserved_app_event_kind`. Each `--tag`
 takes a JSON array of strings and is repeatable; a malformed tag fails with `invalid_event_tag`. Custom events project as
 standalone rows with their own kind and tags and never fold onto a target message. `messages list` and
 `messages subscribe` accept repeatable `--kind <KIND>` filters and return every kind without one. On the subscribe feed

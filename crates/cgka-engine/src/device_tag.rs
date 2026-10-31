@@ -27,7 +27,7 @@ use cgka_traits::app_components::{
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::types::GroupId;
-use openmls::group::MlsGroup;
+use openmls::group::{MlsGroup, StagedCommit};
 use openmls::messages::proposals::Proposal;
 use openmls::prelude::LeafNode;
 use openmls_basic_credential::SignatureKeyPair;
@@ -267,6 +267,65 @@ impl<S: StorageProvider> Engine<S> {
             self.own_device_tag(&self.storage).ok().flatten()
         };
         own.filter(|own| !own.reads_as_own(leaf))
+    }
+
+    /// The roster slots of this account's other devices whose leaves `staged`
+    /// adds to `group_id`, as each leaf's device tag reads against the device
+    /// group's current roster, read through `storage` (mdk#2628 D76). Empty
+    /// in the device group itself, while this device names no device group,
+    /// and while that group is not live or its roster does not read, so a
+    /// confirmation never fails on it.
+    pub(crate) fn sibling_slots_added(
+        &self,
+        storage: &S,
+        group_id: &GroupId,
+        staged: &StagedCommit,
+    ) -> Vec<DeviceSlotId> {
+        let Some(device_group_id) = self
+            .device_tag_group
+            .as_ref()
+            .filter(|device_group_id| *device_group_id != group_id)
+        else {
+            return Vec::new();
+        };
+        let own_leaves: Vec<LeafNode> = staged
+            .add_proposals()
+            .map(|proposal| proposal.add_proposal().key_package().leaf_node().clone())
+            .filter(|leaf| {
+                crate::identity::validated_member_id_of_leaf(leaf)
+                    .is_ok_and(|member| member == *self.identity.self_id())
+            })
+            .collect();
+        if own_leaves.is_empty() || self.ensure_group_live(device_group_id).is_err() {
+            return Vec::new();
+        }
+        let Some(roster) = MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(device_group_id.as_slice()),
+        )
+        .ok()
+        .flatten()
+        .filter(|device_group| {
+            crate::app_components::group_requires_device_roster(device_group).unwrap_or(false)
+        })
+        .and_then(|device_group| {
+            crate::app_components::app_component_data_of_group(
+                &device_group,
+                DEVICE_ROSTER_COMPONENT_ID,
+            )
+        })
+        .and_then(|roster| decode_device_roster_v1(&roster).ok()) else {
+            return Vec::new();
+        };
+        let mut slots = Vec::new();
+        for leaf in own_leaves {
+            if let DeviceTagClaim::Device(slot) = device_tag_claim(&leaf, &roster)
+                && !slots.contains(&slot)
+            {
+                slots.push(slot);
+            }
+        }
+        slots
     }
 }
 

@@ -21,9 +21,8 @@
 //! ChaCha20-Poly1305 under a fresh one-use key, an all-zero nonce, and
 //! [`HISTORY_BUNDLE_AAD`].
 //!
-//! Nothing sends bundles until the transport through the device group lands;
-//! until then only the `test-policy-overrides` hooks reach this module.
-#![cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+//! `history_delivery.rs` carries bundles to a sibling through the device
+//! group.
 
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};

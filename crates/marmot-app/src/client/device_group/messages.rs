@@ -6,7 +6,9 @@
 //! shares these pieces:
 //!
 //! - [`AppClient::send_device_group_message`] sends one and says whether it
-//!   reached a relay.
+//!   reached a relay. [`AppClient::send_device_group_event`] sends one a
+//!   feature built with [`AppClient::device_group_event`], for a feature that
+//!   records the event's id first.
 //! - [`AppClient::observe_device_group_event`] takes each device-group event
 //!   and hands a message to the feature that owns its kind. A feature adds its
 //!   kinds to that one match.
@@ -42,6 +44,7 @@ use marmot_session::{
 use super::device_slot;
 use crate::client::AppClient;
 use crate::client::private_key_packages::SiblingWelcomeAdmission;
+use crate::history_delivery::KIND_HISTORY_DELIVERY;
 use crate::small_state::{KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE};
 use crate::{AppError, unix_now_seconds};
 
@@ -51,10 +54,10 @@ const TRACE_TARGET: &str = "marmot_app::client::device_group::messages";
 pub(crate) const KIND_DEVICE_HEARTBEAT: u64 = 457;
 
 /// True for a kind sent only in a device group: a heartbeat, a private
-/// KeyPackage request or hand-off, a sibling Welcome, or a small-state update
-/// or broadcast request. A device reads these only in the device group it
-/// trusts and ignores them in any other group. Whatever kind a device-group
-/// feature adds goes here too.
+/// KeyPackage request or hand-off, a sibling Welcome, a history delivery, or a
+/// small-state update or broadcast request. A device reads these only in the
+/// device group it trusts and ignores them in any other group. Whatever kind a
+/// device-group feature adds goes here too.
 pub(crate) fn is_device_group_kind(kind: u64) -> bool {
     matches!(
         kind,
@@ -62,6 +65,7 @@ pub(crate) fn is_device_group_kind(kind: u64) -> bool {
             | KIND_PRIVATE_KEY_PACKAGE_REQUEST
             | KIND_PRIVATE_KEY_PACKAGE_HAND_OFF
             | KIND_SIBLING_WELCOME
+            | KIND_HISTORY_DELIVERY
             | KIND_SMALL_STATE_UPDATE
             | KIND_SMALL_STATE_BROADCAST_REQUEST
     )
@@ -183,6 +187,9 @@ impl AppClient {
                 SiblingWelcomeAdmission::NotAddressed => Ok(()),
                 SiblingWelcomeAdmission::Refused(refused) => Err(refused),
             },
+            KIND_HISTORY_DELIVERY => {
+                self.receive_history_delivery(group_id, &message.id, sender, &message.content)
+            }
             KIND_SMALL_STATE_UPDATE => self.receive_small_state_update(group_id, &message.content),
             KIND_SMALL_STATE_BROADCAST_REQUEST => {
                 self.receive_small_state_broadcast_request(group_id, &message.content)
@@ -248,14 +255,34 @@ impl AppClient {
         kind: u64,
         content: String,
     ) -> Result<bool, AppError> {
+        let event = self.device_group_event(kind, content)?;
+        self.send_device_group_event(group_id, event).await
+    }
+
+    /// A device-group message of `kind` from this device, not yet sent.
+    pub(crate) fn device_group_event(
+        &self,
+        kind: u64,
+        content: String,
+    ) -> Result<MarmotAppEvent, AppError> {
         let account = self.app.account_home().account(&self.state.label)?;
-        let event = MarmotAppEvent::new(
+        Ok(MarmotAppEvent::new(
             account.account_id_hex,
             unix_now_seconds(),
             kind,
             Vec::new(),
             content,
-        );
+        ))
+    }
+
+    /// Send `event`, built with [`Self::device_group_event`], as
+    /// [`Self::send_device_group_message`] does.
+    pub(crate) async fn send_device_group_event(
+        &mut self,
+        group_id: &GroupId,
+        event: MarmotAppEvent,
+    ) -> Result<bool, AppError> {
+        let kind = event.kind;
         let payload = event
             .encode()
             .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
@@ -308,6 +335,9 @@ impl AppClient {
             .and_then(|kind| match kind {
                 Some(kind @ (KIND_SMALL_STATE_UPDATE | KIND_SMALL_STATE_BROADCAST_REQUEST)) => {
                     self.small_state_message_withdrawn(group_id, kind)
+                }
+                Some(KIND_HISTORY_DELIVERY) => {
+                    self.history_delivery_withdrawn(group_id, message_id)
                 }
                 Some(_) => Ok(()),
                 None => self.unrecorded_device_group_message_withdrawn(group_id),
@@ -410,6 +440,6 @@ impl AppClient {
 fn withdrawal_handled(kind: u64) -> bool {
     matches!(
         kind,
-        KIND_SMALL_STATE_UPDATE | KIND_SMALL_STATE_BROADCAST_REQUEST
+        KIND_HISTORY_DELIVERY | KIND_SMALL_STATE_UPDATE | KIND_SMALL_STATE_BROADCAST_REQUEST
     )
 }
