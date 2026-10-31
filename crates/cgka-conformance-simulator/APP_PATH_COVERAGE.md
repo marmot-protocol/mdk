@@ -127,8 +127,10 @@ relay proxy serves itself, and the proxy logs every history request. The runner'
 Until the switch-over (mdk#2660 PR 5g) the earlier owner still runs beside the runner, and in these runs it does the
 startup recovery itself. So the loop and the owed-history journeys run in two modes. Beside the earlier owner, the
 bounds count both owners' requests on the wire and the runner's numbers are recorded only. The `runner_alone`
-variants also assert the runner's own bounds, each with a control that an idle runner fails; they are ignored with a
-reason naming 5g, which un-ignores them and drops the both-owners variants.
+variants also assert the runner's own bounds, each with a control that an idle runner fails. A runner attempt ends
+without progress when it asked a relay and neither advanced nor found nothing owed; a re-check that finishes is an
+answer. Beside the earlier owner these bounds need not hold, so the variants are ignored with a reason naming 5g,
+which un-ignores them and drops the both-owners variants.
 
 - `public_app_runner_stalled_relay_does_not_loop` reproduces the 0.14.0 loop's shape. Bob owes 3,000 events. Endpoint
   1 stays connected but never answers history (`stall_relay_history`), while alice sends a live message every two

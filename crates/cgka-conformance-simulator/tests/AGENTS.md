@@ -37,8 +37,8 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     `support/recovery_runner_proofs.rs` holds the explicit slow recovery-runner proofs (mdk#2660): a stalled relay
     that never answers history, and tens of thousands of owed events through a restart, an idle window and a
     reconnect. Bob runs in process with the runner owning debt. While the earlier owner still runs beside it, the
-    both-owners variants bound the wire; the `runner_alone` variants, the fence control and the upgrade journey fail
-    until PR 5g and stay ignored with reasons naming it. Give any bound that an idle runner would meet a control
+    both-owners variants bound the wire. The `runner_alone` variants need not hold and the fence control and the
+    upgrade journey fail until PR 5g; all stay ignored with reasons naming it. Give any bound that an idle runner would meet a control
     that it fails.
 
 - **File:** `app_runtime_interaction_journeys.rs`

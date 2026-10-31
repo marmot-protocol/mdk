@@ -722,7 +722,7 @@ async fn public_app_runner_stalled_relay_does_not_loop() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fails until mdk#2660 PR 5g, when the runner works history debt alone"]
+#[ignore = "runner-alone bounds for mdk#2660 PR 5g; until then the earlier owner shares the attempts, so they need not hold"]
 async fn public_app_runner_alone_stalled_relay_does_not_loop() {
     recovery_runner_proofs::stalled_relay_loop(Owners::RunnerAlone).await;
 }
@@ -734,7 +734,7 @@ async fn public_app_runner_finishes_tens_of_thousands_of_owed_events() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fails until mdk#2660 PR 5g, when the runner works history debt alone"]
+#[ignore = "runner-alone bounds for mdk#2660 PR 5g; until then the earlier owner shares the attempts, so they need not hold"]
 async fn public_app_runner_alone_finishes_tens_of_thousands_of_owed_events() {
     recovery_runner_proofs::owed_history(Owners::RunnerAlone).await;
 }

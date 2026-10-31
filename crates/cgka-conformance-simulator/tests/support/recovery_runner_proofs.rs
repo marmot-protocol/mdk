@@ -248,17 +248,13 @@ pub(super) fn history_summary(
 ) -> Value {
     let mut by_verb = BTreeMap::<&str, u64>::new();
     let mut by_route = BTreeMap::<&str, u64>::new();
-    let mut windows = BTreeMap::<(&str, (&str, Option<u64>, Option<u64>, Option<u64>)), u64>::new();
     for request in requests {
         *by_verb.entry(&request.verb).or_default() += 1;
         let route = request.route.as_deref().unwrap_or("none");
         let label = labels.get(route).map_or("other", String::as_str);
         *by_route.entry(label).or_default() += 1;
-        if request.ids == 0 {
-            let window = (label, request.since, request.until, request.limit);
-            *windows.entry((request.verb.as_str(), window)).or_default() += 1;
-        }
     }
+    let windows = window_counts(requests);
     let repeated = windows.values().filter(|count| **count > 1);
     let repeats = repeated.clone().map(|count| count - 1).sum::<u64>();
     json!({
@@ -272,16 +268,25 @@ pub(super) fn history_summary(
     })
 }
 
-/// Requests on one endpoint that repeat a history window (a `REQ` without
-/// ids, or a `NEG-OPEN`, by route, bounds and limit) asked before.
-fn repeated_windows(requests: &[HistoryRequestV1]) -> u64 {
+/// How often one endpoint was asked each history window: a `REQ` without
+/// ids, or a `NEG-OPEN`, by route (not label, which several routes may
+/// share), bounds and limit.
+fn window_counts(requests: &[HistoryRequestV1]) -> BTreeMap<impl Ord + '_, u64> {
     let mut windows = BTreeMap::<_, u64>::new();
     for request in requests.iter().filter(|request| request.ids == 0) {
         let route = request.route.as_deref();
         let window = (route, request.since, request.until, request.limit);
         *windows.entry((request.verb.as_str(), window)).or_default() += 1;
     }
-    windows.values().map(|count| count - 1).sum()
+    windows
+}
+
+/// Requests on one endpoint that repeat a history window asked before.
+fn repeated_windows(requests: &[HistoryRequestV1]) -> u64 {
+    window_counts(requests)
+        .values()
+        .map(|count| count - 1)
+        .sum()
 }
 
 /// Who works history debt in a run.
@@ -425,11 +430,15 @@ fn runner_summary(events: &[Value]) -> Value {
     })
 }
 
-/// Runner attempts that asked a relay and ended without progress.
+/// Runner attempts that asked a relay and ended without progress. A re-check
+/// owes nothing, so one that finished is an answer, whatever it found (the
+/// runner reports it as `no_progress`).
 fn wasted(events: &[Value]) -> usize {
     let asked = |event: &&Value| event["requests"].as_u64() > Some(0);
-    let progress =
-        |event: &&Value| matches!(event["outcome"].as_str(), Some("advanced" | "nothing_owed"));
+    let progress = |event: &&Value| {
+        let answered = event["method"] == "recheck" && event["end"] == "finished";
+        answered || matches!(event["outcome"].as_str(), Some("advanced" | "nothing_owed"))
+    };
     events
         .iter()
         .filter(asked)
