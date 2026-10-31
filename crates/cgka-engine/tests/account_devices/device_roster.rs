@@ -1293,13 +1293,6 @@ fn account(writer: u8, key: u8) -> AccountEntryV1 {
     }
 }
 
-fn refused_account_replacement(events: &[GroupEvent]) -> bool {
-    events.iter().any(|event| {
-        matches!(event, GroupEvent::QueuedIntentRefused { intent_kind, reason, .. }
-            if intent_kind == "replace_account_entry" && reason == "account_entry_changed")
-    })
-}
-
 /// An account entry replacement is one `SetAccount`: every member reads the
 /// new account entry, and every device entry stays as it was.
 #[tokio::test]
@@ -1325,13 +1318,13 @@ async fn an_account_entry_replacement_sets_only_the_account_entry() {
     }
 }
 
-/// An account entry replacement names the entry it was computed from, as a
-/// device entry replacement does. A sibling's replacement is still buffered
-/// when this one is sent, so it waits in the queue; the drain applies the
-/// sibling's first and then refuses this one, which is retired and
-/// announced. Computed again from the new entry, it goes out.
+/// An account entry replacement never waits in the queue: a sibling's
+/// replacement is still buffered when this one is sent, so it is refused and
+/// nothing is kept, and the caller is not told a change was made that the
+/// drain could still refuse. Once the sibling's settles, one computed from
+/// the old entry is refused as stale, and one computed again goes out.
 #[tokio::test]
-async fn a_queued_account_entry_replacement_never_lands_on_a_changed_entry() {
+async fn an_account_entry_replacement_is_refused_rather_than_queued() {
     let clock = ManualConvergenceClock::new(1_000_000, now_wall_ms());
     let mut phone = clocked_roster_device(b"alice", &clock);
     let mut laptop = roster_device(b"alice");
@@ -1345,20 +1338,22 @@ async fn a_queued_account_entry_replacement_never_lands_on_a_changed_entry() {
     let laptop_commit = send_commit(&mut laptop, by_laptop, &gid).await;
     buffer_unsettled(&mut phone, &laptop_commit).await;
 
-    let queued = phone
-        .engine
-        .send(set_account(&phone, &gid, 1, 8))
-        .await
-        .unwrap();
-    assert!(matches!(queued, SendResult::Queued { .. }), "{queued:?}");
-    phone.engine.drain_events();
-
-    clock.advance_ms(30_000);
-    let drained = phone.engine.advance_convergence(&gid).await.unwrap();
-    assert!(drained.is_empty(), "{drained:?}");
+    let refused = phone.engine.send(set_account(&phone, &gid, 1, 8)).await;
+    assert!(
+        matches!(&refused, Err(EngineError::AccountEntryUnsettled { group_id }) if *group_id == gid),
+        "{refused:?}"
+    );
     assert!(queued_intents(&phone, &gid).is_empty());
-    assert!(refused_account_replacement(&phone.engine.drain_events()));
+
+    let read_before = set_account(&phone, &gid, 1, 8);
+    clock.advance_ms(30_000);
+    phone.engine.advance_convergence(&gid).await.unwrap();
     assert_eq!(roster_of(&phone, &gid).account, account(2, 7));
+    let stale = phone.engine.send(read_before).await;
+    assert!(
+        matches!(&stale, Err(EngineError::AccountEntryChanged { group_id }) if *group_id == gid),
+        "{stale:?}"
+    );
 
     let SendResult::GroupEvolution { pending, .. } = phone
         .engine

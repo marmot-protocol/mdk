@@ -188,7 +188,9 @@ where
         };
         let staged = match self.session.send(intent).await {
             Ok(staged) => staged,
-            Err(SessionError::Engine(EngineError::AccountEntryChanged { .. })) => {
+            Err(SessionError::Engine(
+                EngineError::AccountEntryChanged { .. } | EngineError::AccountEntryUnsettled { .. },
+            )) => {
                 return Ok(DeviceRosterEdit::Blocked(DeviceRosterEditBlocked::Busy));
             }
             Err(error) => return Err(error.into()),

@@ -124,7 +124,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   overwrites it.
 - New `SendIntent::ReplaceAccountEntry` replaces the account entry of a device group's roster (its backup writer and
   recovery key) while the roster still holds the entry it was computed from (mdk#2628 item 4.4a), compared as
-  `ReplaceDeviceEntry` compares a device entry; otherwise the new `EngineError::AccountEntryChanged` refuses it.
+  `ReplaceDeviceEntry` compares a device entry; otherwise the new `EngineError::AccountEntryChanged` refuses it. It is
+  never queued: while the device group settles, the new `EngineError::AccountEntryUnsettled` refuses it.
   `Engine::recovery_public_key`, `seal_to_recovery_key` and `open_with_recovery_key` derive the X25519 recovery key
   pair from the 128 bits of entropy 12 recovery words carry and seal to it under the label "Marmot Backup". Like the
   roster, reachable only behind `dev_device_groups` until the backup spec is adopted.

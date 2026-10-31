@@ -909,6 +909,15 @@ impl<S: StorageProvider> Engine<S> {
             ) {
                 return Err(EngineError::LinkDeviceUnsettled { group_id });
             }
+            // Nor does an account entry replacement: the app answers a backup
+            // change only once it went out or was refused (D75), and a queued
+            // one could be refused at drain after the user was told it was
+            // made, with the words already forgotten. The caller retries. A
+            // re-issue after a lost fork is queued by the engine itself, not
+            // here.
+            if matches!(&intent, SendIntent::ReplaceAccountEntry { .. }) {
+                return Err(EngineError::AccountEntryUnsettled { group_id });
+            }
             // An activation the current state already refuses is answered now,
             // not accepted and then refused at drain.
             if matches!(&intent, SendIntent::EnableAccountDevices { .. }) {

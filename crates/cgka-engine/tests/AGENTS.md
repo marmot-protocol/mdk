@@ -203,7 +203,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     replacement (`ReplaceDeviceEntry`) never lands on an entry that changed since it was read: not from its own
     send's settlement, a rival branch at the same epoch, or the drain, and a lost one is re-issued only while its
     entry is untouched (`DeviceEntryChanged`). An account entry replacement (`ReplaceAccountEntry`, 4.4a) holds to
-    the same rules for the account entry (`AccountEntryChanged`). The
+    the same rules for the account entry (`AccountEntryChanged`), and a send of one is refused rather than queued
+    while the group settles (`AccountEntryUnsettled`). The
     `Parts::app_data_state` override in `account_devices.rs` lets a crafted Commit write resulting bytes of its own.
 
 - **File:** `account_devices/link_device.rs` (test-policy builds only)

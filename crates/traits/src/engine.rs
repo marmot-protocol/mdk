@@ -270,9 +270,10 @@ pub enum SendIntent {
     ///
     /// `SetAccount` replaces the entry whole, so it is compared like
     /// [`Self::ReplaceDeviceEntry`]: each time the engine prepares the Commit,
-    /// on a direct send, a drained queued copy or a re-issue after a lost
-    /// fork. Any other entry refuses it with
-    /// [`EngineError::AccountEntryChanged`] and nothing is staged.
+    /// on a direct send or a re-issue after a lost fork. Any other entry
+    /// refuses it with [`EngineError::AccountEntryChanged`] and nothing is
+    /// staged. A send is never queued: while the group would queue it,
+    /// [`EngineError::AccountEntryUnsettled`] refuses it and nothing is kept.
     ReplaceAccountEntry {
         group_id: GroupId,
         expected: Box<AccountEntryV1>,

@@ -51,7 +51,7 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     history key (4.1) into its own entry; the tag-key commit carries the history key too. Only this device's own
     entry ever gets its history key. The account entry (backup writer and recovery key, 4.4a) has one write path
     too, `edit_roster_account_entry`, sent as `SendIntent::ReplaceAccountEntry` naming the entry it read
-    (`AccountEntryChanged` maps to `Busy`).
+    (`AccountEntryChanged` and `AccountEntryUnsettled` map to `Busy`).
     `send_device_roster_update` carries rejected-slot operations only.
   - `runtime/device_tag_key.rs` — this device's tag signature key (mdk#2628 3.1d): the host names the device group to
     tag from (`set_device_tag_group`). Maintenance, and the host before each KeyPackage publication
