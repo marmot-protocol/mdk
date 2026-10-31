@@ -246,7 +246,12 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     transaction as their records and stay out of the KeyPackage inventory; a request stops earlier records counting
     without deleting their keys, is answered once, and past the per-sibling cap is answered with the newest ones handed over again (D42); records that no longer
     advertise this client's capabilities stop counting; an ordinary Welcome never consumes one; and a hand-off keeps
-    only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only).
+    only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only). A sibling
+    Welcome (3.5b) consumes only the private KeyPackage it names, issued to its sender, and one back into a chat still
+    held active is a rejoin offer per carrier. `sibling_offers_are_lost_only_to_a_decline_or_the_size_limit` walks
+    every sequence of up to four steps over two Welcomes and two carriers each, branching from in-memory database
+    copies (`SqliteAccountStorage::in_memory_copy`). It is the slowest test in the file, and one more step of depth
+    multiplies its run time by about seven.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and
