@@ -2930,6 +2930,7 @@ mod tests {
     #[test]
     #[ignore = "large file-backed storage-format benchmark; run via `just bench-storage-upgrade`"]
     fn storage_format_upgrade_benchmark() {
+        crate::base::connection::use_production_storage_for_test_process();
         let message_count = std::env::var("MDK_STORAGE_OPS_ROWS")
             .ok()
             .map(|value| value.parse::<usize>().expect("MDK_STORAGE_OPS_ROWS usize"))

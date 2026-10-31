@@ -46,6 +46,7 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 | `src/base/codec.rs` | JSON serialization helpers and SQLite error mapping. |
 | `src/base/migrations.rs` | Rust migration runner and migration tests. |
 | `src/base/test_support.rs` | Shared storage test fixtures for both sides' tests. |
+| `src/cross/migrated_template.rs` | Test support: `in_memory_for_test()` copies a migrated template that a test binary's processes share instead of replaying every migration; a copy draws its own per-database values. |
 | `src/base/table_owners.rs`, `src/base/boundary_tests.rs`, `src/cross/allow-list.txt` | The owning side of every table; the boundary tests and the crossings that stay. |
 | `src/base/migrations/` | Numbered Rust migration bodies plus upgrade/query-work tests; see its local `AGENTS.md`. |
 | `src/protocol/storage/` | Marmot engine storage tables by concern; see its local `AGENTS.md`. |
@@ -108,9 +109,11 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 - Accept raw SQLCipher keys only. Key derivation and recovery live above this crate.
 - Apply privacy/durability defaults unless callers opt out with `SqliteStorageOptions`. The only exceptions are the
   test helpers `in_memory_for_test()` (which this crate's own unit tests get from `in_memory()`) and
-  `relax_storage_for_test_process()` (see README). Keep `test-support` inert: nothing changes until a test calls a
-  helper. Never call them from non-test code, and keep the tests that pin the production settings
-  (`encrypted_connection_applies_operational_defaults`, the `pins_cipher_pragmas_before_keying` tests) away from them.
+  `relax_storage_for_test_process()` (this crate's own unit tests start relaxed; see README). Keep `test-support`
+  inert: nothing changes until a test calls a helper. Never call them from non-test code. The tests that pin the
+  production settings (`encrypted_connection_applies_operational_defaults`, the `pins_cipher_pragmas_before_keying`
+  tests) and the ignored benchmarks of file-backed storage call `use_production_storage_for_test_process()` before
+  opening anything; a new one must too.
 - Keep invalidated message records. Applications decide whether to show them.
 - Prepare every database file with `fs_private::ensure_private_db_files` before `Connection::open`, and never open,
   read or copy a database or `-wal`/`-shm`/`-journal` sidecar through `std::fs` while this process may hold a
