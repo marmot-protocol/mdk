@@ -2812,6 +2812,11 @@ typedef struct MarmotHistoryNoticeList {
  * characters) is the handle actions on the device take. `label`,
  * `client` and `platform` are empty until set. `linked_at` is in Unix
  * seconds. `linked_by_slot_id_hex` is NULL for the founder.
+ * `last_active_at` (Unix seconds, valid when `has_last_active_at`) is
+ * when a heartbeat last showed the device running; never set for this
+ * device. `inactive` is this device's own judgement, 30 days after the
+ * later of that and when it first found the device in the roster; the
+ * roster's mark is `status` `Inactive`.
  * `removal_pending` is set while a removal decided on this device waits
  * for the device group.
  */
@@ -2827,6 +2832,12 @@ typedef struct MarmotLinkedDevice {
   bool add_to_all_chats;
   bool bring_history;
   bool keep_while_inactive;
+  bool has_last_active_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t last_active_at;
+  bool inactive;
   bool removal_pending;
 } MarmotLinkedDevice;
 

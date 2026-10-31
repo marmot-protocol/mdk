@@ -480,6 +480,18 @@
       "next": "Add unsorted, malformed URL, and oversized relay-list vectors."
     },
     {
+      "id": "marmot.transport.nostr.welcome/nip44-extended-length/v1",
+      "kind": "byte_fixture",
+      "status": "portable",
+      "artifact": "byte-fixtures/nostr-welcome-nip44-extended-length.v1.json",
+      "coverage": [
+        "NIP-59 Welcome gift wrap unwrap",
+        "NIP-44 v2 extended length prefix in the seal and the gift wrap",
+        "seal plaintext at the 65,536-byte prefix boundary"
+      ],
+      "next": "Unwrap it with every Marmot implementation's own Welcome path, including its account-signer paths."
+    },
+    {
       "id": "conversation/v1",
       "kind": "scenario_vector",
       "status": "portable",

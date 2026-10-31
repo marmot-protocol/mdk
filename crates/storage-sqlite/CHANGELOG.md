@@ -4,6 +4,16 @@
 
 ### Breaking changes
 
+- Migration 0143 advances account storage to schema 143 (mdk#2628 item 3.6).
+  It adds `device_activity`, one row per sibling the trusted device group's
+  roster lists (that entry's `linked_at`, when this device first found it
+  there and the newest time one of its heartbeats counted for), and
+  `device_heartbeat_sent`, the
+  device group this device last sent its own heartbeat in and when.
+  `SqliteAppStorage` gains `device_activity`, `track_device_activity`,
+  `note_device_active`, `device_heartbeat_sent` and
+  `put_device_heartbeat_sent`, with `DeviceActivityRecord` and
+  `DeviceHeartbeatSent`.
 - Migration 0148 advances account storage to schema 148 (mdk#2628 item 3.7a).
   It adds `account_compromise_warning_items`, one row per rejection the
   account's compromise warning gathers, keyed by its reason and subject, with
@@ -17,8 +27,8 @@
   `started_fresh`, and `trust_device_group`, which makes a device group
   trusted and takes its roster as this device's first in one transaction.
   `insert_device_group` and `set_device_group_trust` now refuse a trusted
-  state. The numbers below 148 that are not yet used (139, 143 and 145)
-  belong to other work, which lands later; the runner applies them in order.
+  state. The numbers below 148 that are not yet used (139 and 145) belong to
+  other work, which lands later; the runner applies them in order.
 - Migration 0147 advances account storage to schema 147 (mdk#2628 item
   3.6b). `SelfMembership` adds `DeviceRemoved`, stored as `device_removed`:
   this device's leaf was removed from a chat the account stays in. The

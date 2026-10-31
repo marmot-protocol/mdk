@@ -26,9 +26,9 @@ use super::codec::{decode_var_bytes, encode_var_bytes};
 /// of the KeyPackage event's `d` value.
 pub type DeviceSlotId = [u8; 32];
 
-/// A rename id: 16 random bytes that every rename of a device writes next to
-/// its label, so a device can tell its own rename from another one after a
-/// fork. No other update changes it.
+/// A rename id: 16 random bytes that every entry is created with and every
+/// rename of a device writes next to its label, so a device can tell its own
+/// rename from another one after a fork. No other update changes it.
 pub type DeviceRenameId = [u8; 16];
 
 /// Largest label, client name or platform string, in UTF-8 bytes.
@@ -58,8 +58,8 @@ pub struct DeviceRosterV1 {
 pub struct DeviceEntryV1 {
     /// The name the user gave the device. UTF-8.
     pub label: String,
-    /// The id the device's latest rename wrote, absent until it is first
-    /// renamed.
+    /// The id the entry was created with or its latest rename wrote. Every
+    /// entry is created with one; the field stays optional in the encoding.
     pub rename_id: Option<DeviceRenameId>,
     /// The device's client name. UTF-8.
     pub client: String,
