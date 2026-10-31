@@ -4358,8 +4358,11 @@ fn system_preview_provenance_does_not_trust_member_claims_or_stale_payloads() {
 }
 
 #[test]
-fn system_preview_revalidation_keeps_exact_multisubject_selection() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+fn system_preview_survives_restart_and_revalidation_with_exact_multisubject_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("systems.db");
+    let key = SqlCipherKey::new("system preview test key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     store
         .app_storage()
         .save_account_projection_state(
@@ -4422,7 +4425,19 @@ fn system_preview_revalidation_keeps_exact_multisubject_selection() {
         .unwrap()
         .last_message
         .unwrap();
-    let store = store.app_storage();
+    drop(store);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key)
+        .unwrap()
+        .app_storage();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .unwrap()
+            .last_message
+            .unwrap(),
+        before
+    );
     store
         .invalidate_app_event_by_message_id(GROUP, "4-dd", "SupersededByBranchSelection")
         .unwrap();

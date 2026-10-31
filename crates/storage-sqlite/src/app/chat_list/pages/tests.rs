@@ -177,6 +177,33 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
     }
 }
 
+/// A queued leave keeps an archived chat in Left across a restart.
+#[test]
+fn a_queued_leave_still_lists_as_left_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite3");
+    let key = crate::SqlCipherKey::new("07".repeat(32)).unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    seed(&store, "01", true, "member", 3, false);
+    let group = engine_group(&store, "01");
+    store
+        .put_leave_request(&LeaveRequest {
+            group_id: group,
+            requested_at_ms: 123,
+            last_proposed_epoch: None,
+        })
+        .unwrap();
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key)
+        .unwrap()
+        .app_storage();
+    assert!(page(&store, ChatListView::Archived).rows.is_empty());
+    assert_eq!(
+        page(&store, ChatListView::Left).rows[0].leave_requested_at_ms,
+        Some(123)
+    );
+}
+
 #[test]
 fn pins_filter_before_paging_and_keep_normalized_positions_with_gaps() {
     let store = SqliteAccountStorage::in_memory().unwrap();
