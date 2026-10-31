@@ -30,7 +30,7 @@ use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::private_key_packages::SiblingWelcome;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::DeviceSlotId;
-use cgka_traits::engine::{KeyPackage, SendResult, SiblingKeyPackage};
+use cgka_traits::engine::{KeyPackage, SendIntent, SendResult, SiblingKeyPackage};
 use cgka_traits::engine_state::{EpochState, InvalidTransition, StagedCommitHandle};
 use cgka_traits::error::EngineError;
 use cgka_traits::message::{MessageState, StoredMessagePayload};
@@ -106,6 +106,29 @@ impl<S: StorageProvider> Engine<S> {
         }
         self.do_send_own_account_devices(group_id, siblings, Vec::new(), ADD)
             .await
+    }
+
+    /// Refuse now a same-account Add whose siblings a direct send would
+    /// refuse now. Run before it is queued, so the sender is answered at
+    /// once with nothing written; the drain checks a queued one again when
+    /// it prepares it, and refuses it there as `QueuedIntentRefused`.
+    pub(crate) fn check_queued_sibling_add(&self, intent: &SendIntent) -> Result<(), EngineError> {
+        let SendIntent::AddOwnAccountDevices { group_id, siblings } = intent else {
+            return Ok(());
+        };
+        if siblings.is_empty() {
+            return Err(EngineError::Other(
+                "adding own account devices requires at least one KeyPackage".into(),
+            ));
+        }
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mls_group = MlsGroup::load(
+            provider.storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        self.sibling_welcome_plan(&mls_group, siblings).map(|_| ())
     }
 
     pub(crate) async fn do_send_remove_own_account_devices(
@@ -399,14 +422,20 @@ impl<S: StorageProvider> Engine<S> {
     /// Every sibling Welcome this device owes at `now`, in its live groups
     /// (device-group.md, "Sending a sibling Welcome"). The host sends each as
     /// a kind-461 message in the device group. One with a `carrier` already
-    /// has a 461 on its way, and gets another only once that one failed.
+    /// has a 461 on its way, and gets another only once that one failed. A
+    /// disbanded chat owes none: its sibling would join a group every other
+    /// member has left.
     pub fn owed_sibling_welcomes(
         &self,
         now: Timestamp,
     ) -> Result<Vec<OwedSiblingWelcome>, EngineError> {
         let mut owed = Vec::new();
         for group_id in self.storage.list_groups()? {
-            if self.ensure_group_live(&group_id).is_err() {
+            if self.ensure_group_live(&group_id).is_err()
+                || self
+                    .stored_group_record(&group_id)?
+                    .is_none_or(|group| group.disbanded.is_some())
+            {
                 continue;
             }
             for record in self.storage.list_messages_in_states(

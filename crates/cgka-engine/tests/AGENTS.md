@@ -268,8 +268,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `account_devices/sibling_welcomes.rs` (test-policy builds only)
   - **Owns:** The sibling Welcome a same-account Add owes (mdk#2628 3.5b-2): owed only once its Commit confirms, and
     failed by a rollback or a restart before it; one carrier at a time, and only that carrier delivers or fails it;
-    settled unsent once its KeyPackage expires; and every refusal (a published KeyPackage, this device's own slot, a
-    slot named twice, a tag that reads as another slot, an untagged adder, a chat that names no relays) writes nothing.
+    owed no more once its KeyPackage expires or its chat is disbanded; every refusal (a published KeyPackage, this
+    device's own slot, a slot named twice, a tag that reads as another slot, a last-resort KeyPackage, an untagged
+    adder, a chat that names no relays) writes nothing; and an Add sent while convergence is pending is refused before
+    the queue when its sibling checks fail, and refused at drain as `QueuedIntentRefused` when they fail by then.
 
 - **File:** `account_devices/tagged_siblings.rs` (test-policy builds only)
   - **Owns:** No tests. Its fixtures (`tagged_devices`, `found_routed_group`, `handed`, `assert_joins_from`) are how

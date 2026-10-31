@@ -5,11 +5,12 @@
 //! that handed it over. Its Commit stages one sibling Welcome row per
 //! KeyPackage instead of a transport Welcome: the encoded `SiblingWelcome`
 //! the host sends as a kind-461 message in the device group. The row is owed
-//! once the Commit confirms, fails with a Commit that rolls back, and settles
-//! unsent when its KeyPackage expires. The host records each 461's app event
-//! id on the row before the send, marks the row delivered by that carrier,
-//! and clears a failed carrier so the row is owed again. Every refusal comes
-//! before anything is written.
+//! once the Commit confirms, fails with a Commit that rolls back, and is owed
+//! no more once its KeyPackage expires or its chat is disbanded. The host
+//! records each 461's app event id on the row before the send, marks the row
+//! delivered by that carrier, and clears a failed carrier so the row is owed
+//! again. A direct send's refusal comes before anything is written; so does a
+//! queued one's, checked before the queue, and the drain checks it again.
 
 use super::device_roster::{key_package_ref, slot};
 use super::device_tag::hold_slot;
@@ -19,6 +20,7 @@ use super::*;
 use cgka_engine::private_key_packages::SiblingWelcome;
 use cgka_traits::engine::KeyPackageSource;
 use cgka_traits::message::{MessageRecord, MessageState};
+use cgka_traits::storage::{GroupStorage as _, OutboundIntentStorage as _};
 use cgka_traits::types::EpochId;
 
 /// `device`'s sibling Welcome rows in `gid`.
@@ -156,6 +158,43 @@ async fn a_sibling_welcome_is_owed_until_its_key_package_expires() {
     let owed_at = |now| m.bob.engine.owed_sibling_welcomes(Timestamp(now)).unwrap();
     assert_eq!(owed_at(not_after - 1).len(), 1);
     assert!(owed_at(not_after).is_empty());
+}
+
+/// A disbanded chat owes no sibling Welcome: its sibling would join a group
+/// every other member has left.
+#[tokio::test]
+async fn a_disbanded_chat_owes_no_sibling_welcome() {
+    let (mut m, mut new) = siblings(1).await;
+    let gid = m.gid.clone();
+    let sibling = handed(&mut new[0], slot(2), slot(1));
+    let add = send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
+    assert_eq!(owed(&m.bob).len(), 1);
+    assert_accepted(&mut m.alice, &add, &gid).await;
+    let SendResult::DisbandRequested { .. } = m
+        .alice
+        .engine
+        .send(SendIntent::Disband {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a disband request")
+    };
+    let [SendResult::GroupEvolution { msg, pending, .. }] =
+        &m.alice.engine.advance_convergence(&gid).await.unwrap()[..]
+    else {
+        panic!("expected the disband commit")
+    };
+    m.alice.engine.confirm_published(*pending).await.unwrap();
+    let disband = route_to_group(msg, &gid);
+    m.bob.engine.ingest(disband).await.unwrap();
+    m.bob
+        .engine
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    assert!(m.bob.storage.get_group(&gid).unwrap().disbanded.is_some());
+    assert!(owed(&m.bob).is_empty());
 }
 
 /// A sibling Welcome fails with its Commit: when the publish fails, and when
@@ -311,4 +350,96 @@ async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
     )
     .await;
     assert_eq!(owed(&m.bob).len(), 2);
+}
+
+/// A same-account Add sent while the chat's convergence is pending is
+/// checked as a direct send would be before it is queued, so one a direct
+/// send would refuse is refused at once, with nothing written or queued.
+/// One that passes is queued and checked again when the drain prepares it:
+/// with bob's tag gone by then, the drain refuses it as `QueuedIntentRefused`
+/// and retires it with its KeyPackage, staging no sibling Welcome.
+#[tokio::test]
+async fn a_queued_sibling_add_is_checked_before_the_queue_and_at_drain() {
+    let (mut m, mut new) = siblings(1).await;
+    let gid = m.gid.clone();
+    let laptop = handed(&mut new[0], slot(2), slot(1));
+    let published = SiblingKeyPackage {
+        key_package: KeyPackage {
+            source: Some(KeyPackageSource {
+                event_id: hash_id(b"published"),
+            }),
+            ..laptop.key_package.clone()
+        },
+        ..laptop.clone()
+    };
+    let carol_update = send_commit(
+        &mut m.carol,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    m.bob
+        .engine
+        .buffer_openmls_convergence_message_at(&gid, carol_update, 1_000)
+        .unwrap();
+    let queued = |bob: &Device| bob.storage.list_queued_outbound_intents(&gid).unwrap();
+    let before = (Untouched::of(&m.bob, &gid), rows(&m.bob, &gid));
+
+    assert_refused(
+        m.bob
+            .engine
+            .send(add_own_devices(&gid, vec![published]))
+            .await,
+        "a published KeyPackage never adds a sibling",
+    );
+    assert_eq!((Untouched::of(&m.bob, &gid), rows(&m.bob, &gid)), before);
+    assert!(queued(&m.bob).is_empty());
+
+    let SendResult::Queued { intent_id, .. } = m
+        .bob
+        .engine
+        .send(add_own_devices(&gid, vec![laptop]))
+        .await
+        .unwrap()
+    else {
+        panic!("expected the Add to queue")
+    };
+    assert_eq!(queued(&m.bob).len(), 1);
+
+    m.bob.engine.set_device_tag_group(None).unwrap();
+    m.bob
+        .engine
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    m.bob.engine.drain_events();
+    let prepared = m
+        .bob
+        .engine
+        .converge_and_drain_queued_outbound_intents(&gid, 1_000_100)
+        .await
+        .unwrap();
+    assert!(prepared.is_empty(), "{prepared:?}");
+    let refusals: Vec<_> = m
+        .bob
+        .engine
+        .drain_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            GroupEvent::QueuedIntentRefused {
+                intent_id,
+                intent_kind,
+                ..
+            } => Some((intent_id, intent_kind)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        refusals,
+        vec![(intent_id, "add_own_account_devices".to_string())]
+    );
+    assert!(queued(&m.bob).is_empty());
+    assert!(sibling_rows(&m.bob, &gid).is_empty());
+    assert!(owed(&m.bob).is_empty());
 }

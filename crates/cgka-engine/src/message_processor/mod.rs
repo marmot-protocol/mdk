@@ -925,6 +925,8 @@ impl<S: StorageProvider> Engine<S> {
             }
             // So is a KeyPackage it carries; see `check_queued_key_packages`.
             self.check_queued_key_packages(&intent)?;
+            // And a same-account Add's siblings; see `check_queued_sibling_add`.
+            self.check_queued_sibling_add(&intent)?;
             let queued = self.queue_outbound_intent(group_id, intent, 0)?;
             reason.trace();
             return Ok(queued);

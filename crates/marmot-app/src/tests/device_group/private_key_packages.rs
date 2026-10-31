@@ -1428,13 +1428,13 @@ async fn a_sibling_welcome_whose_settling_fails_is_sent_again() {
     assert!(devices.phone.state_group_record(&chat).is_some());
 }
 
-/// A 461 goes out only while the device group would take a commit from the
-/// laptop, so it never queues behind a commit that may change the tag it
-/// was sent under: a pass while the laptop's own device-group Commit waits
-/// on its publication sends nothing and leaves the Welcome uncarried, and
-/// the pass after that Commit fails sends it.
+/// A 461 is pinned to the epoch whose tag was read, so the engine refuses
+/// it rather than queue it behind a commit that may change that tag: a pass
+/// while the laptop's own device-group Commit waits on its publication
+/// queues nothing, leaves the Welcome owed with no carrier, and the pass
+/// after that Commit fails sends it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_sibling_welcome_waits_while_the_device_group_is_busy() {
+async fn a_refused_pinned_sibling_welcome_is_sent_by_the_next_pass() {
     let (mut devices, group) = tagging_devices().await;
     let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
     add_the_phone_unpublished(&mut devices, &chat).await;
@@ -1442,7 +1442,9 @@ async fn a_sibling_welcome_waits_while_the_device_group_is_busy() {
         .laptop
         .runtime
         .session_mut()
-        .send(SendIntent::SelfUpdate { group_id: group })
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
         .await
         .unwrap();
     let Some(PublishWork::GroupEvolution { pending, .. }) = effects.publish.into_iter().next()
@@ -1453,6 +1455,14 @@ async fn a_sibling_welcome_waits_while_the_device_group_is_busy() {
     devices.laptop.send_owed_sibling_welcomes(&[]).await;
     let [waiting] = <[_; 1]>::try_from(owed(&devices.laptop)).unwrap();
     assert_eq!(waiting.carrier, None);
+    assert!(devices.laptop.sibling_welcome_carriers.is_empty());
+    assert!(
+        !devices
+            .laptop
+            .runtime
+            .has_queued_outbound_intents(&group)
+            .unwrap()
+    );
     deliver_all(&mut devices.phone, &devices.relay).await;
     assert_eq!(stashed(&devices.phone), 0);
 
@@ -1471,12 +1481,14 @@ async fn a_sibling_welcome_waits_while_the_device_group_is_busy() {
 
 /// A sibling Welcome goes out only once its Add's Commit is published: an
 /// Add whose Commit every relay refused fails, and neither it nor a later
-/// pass sends the Welcome. Adding the phone again goes through.
+/// pass sends the Welcome. The failed Add spent its KeyPackage, which is not
+/// handed back. Adding the phone again goes through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_waits_for_its_commit() {
     let (mut devices, _) = tagging_devices().await;
     let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
     let phone_slot = slot(&devices.phone);
+    let stock = received_from(&devices.laptop, &phone_slot).len();
     devices.relay.reject_next_publish();
     let error = devices
         .laptop
@@ -1484,6 +1496,7 @@ async fn a_sibling_welcome_waits_for_its_commit() {
         .await
         .unwrap_err();
     assert_eq!(error.privacy_safe_kind(), "publish");
+    assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
     devices.laptop.run_due_maintenance().await.unwrap();
     deliver_all(&mut devices.phone, &devices.relay).await;
     assert_eq!(stashed(&devices.phone), 0);

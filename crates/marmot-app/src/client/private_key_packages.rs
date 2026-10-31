@@ -63,6 +63,7 @@ use cgka_traits::app_components::{
     DeviceSlotId, NOSTR_ROUTING_MAX_RELAYS, validate_nostr_relay_url,
 };
 use cgka_traits::engine::{SendIntent, SiblingKeyPackage};
+use cgka_traits::error::EngineError;
 use cgka_traits::storage::{IssuedPrivateKeyPackage, MessageStorage as _};
 use cgka_traits::welcome::SiblingWelcomeJoin;
 use cgka_traits::{
@@ -672,10 +673,12 @@ impl AppClient {
     /// this device, then send the sibling Welcome the Add leaves owed once
     /// its Commit is published. The engine refuses the Add, writing nothing,
     /// unless both devices are tagged in the trusted device group and the
-    /// chat names its relays. The KeyPackage is spent either way: an error
-    /// after the engine took the Add reads the same as a refusal, and a
-    /// KeyPackage returned then could reach two Welcomes. Upkeep asks the
-    /// sibling for more.
+    /// chat names its relays; it checks a queued Add again at drain, and a
+    /// refusal there retires the queued Add with its KeyPackage. The
+    /// KeyPackage is spent either way and never handed back: an error after
+    /// the engine took the Add reads the same as a refusal, and a KeyPackage
+    /// returned then could reach two Welcomes. Upkeep asks the sibling for
+    /// more.
     // 3.5c calls this; until then only tests do.
     #[cfg_attr(not(all(test, feature = "test-policy-overrides")), allow(dead_code))]
     pub(crate) async fn add_sibling_to_chat(
@@ -729,19 +732,20 @@ impl AppClient {
     }
 
     /// Nothing goes out until this device's own leaf is tagged, since its
-    /// sibling would refuse it. Each 461 goes out only while the device group
-    /// would take a commit from this device, so the send publishes at the
-    /// epoch whose tag was read and never queues behind a commit that may
-    /// change it. A Welcome carried by a 461 this process sent waits for that
-    /// 461's outcome; one carried before the app last stopped is sent again,
-    /// since its 461 may never have left. One from a slot other than this
-    /// device's, or to a device the roster no longer lists, waits until it
-    /// expires.
+    /// sibling would refuse it. Each 461 is pinned to the epoch whose tag was
+    /// read: the engine encrypts it under that epoch or refuses it before
+    /// writing anything, and never queues it behind a commit that may change
+    /// the tag. A refused one leaves its Welcome owed, with no carrier, and
+    /// the pass stops there; the next pass reads the tag again. A Welcome
+    /// carried by a 461 this process sent waits for that 461's outcome; one
+    /// carried before the app last stopped is sent again, since its 461 may
+    /// never have left. One from a slot other than this device's, or to a
+    /// device the roster no longer lists, waits until it expires.
     async fn try_send_owed_sibling_welcomes(&mut self, held: &[GroupId]) -> Result<(), AppError> {
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
-        if !exchange.tagged {
+        if held.contains(&exchange.group_id) || !exchange.tagged {
             return Ok(());
         }
         let mut sent = 0usize;
@@ -749,12 +753,6 @@ impl AppClient {
             .runtime
             .owed_sibling_welcomes(Timestamp(unix_now_seconds()))?
         {
-            if !self
-                .runtime
-                .device_group_takes_commit(&exchange.group_id, held)?
-            {
-                break;
-            }
             if let Some(carrier) = &owed.carrier
                 && (self.sibling_welcome_carriers.contains(carrier)
                     || !self
@@ -782,7 +780,7 @@ impl AppClient {
             // error, leaves the Welcome owed again: a second 461 for it
             // joins nothing twice.
             let result = self
-                .send_device_group_event(&exchange.group_id, event)
+                .send_device_group_event_at(&exchange.group_id, event, Some(exchange.epoch))
                 .await;
             if matches!(result, Ok(true)) {
                 sent += 1;
@@ -791,6 +789,19 @@ impl AppClient {
             self.sibling_welcome_carriers.remove(&carrier);
             self.runtime
                 .sibling_welcome_send_failed(&owed.id, &carrier)?;
+            // Refused before anything was encrypted: the epoch moved or is
+            // about to, so the tag read is stale; the next pass reads it again.
+            if let Err(error) = &result
+                && matches!(
+                    error.as_engine_error(),
+                    Some(
+                        EngineError::AppMessageEpochUnsettled { .. }
+                            | EngineError::AppMessageEpochMismatch { .. }
+                    )
+                )
+            {
+                break;
+            }
             result?;
         }
         if sent > 0 {

@@ -73,13 +73,15 @@ pub(crate) fn is_device_group_kind(kind: u64) -> bool {
 
 /// The trusted device group this device talks to its siblings in, its
 /// roster, this device's slot there, and whether this device's own leaf
-/// carries a device tag that reads as that slot. Siblings read nothing this
-/// device sends until it does.
+/// carries a device tag that reads as that slot at `epoch`, the group's
+/// epoch when it was read. Siblings read nothing this device sends until it
+/// does.
 pub(crate) struct Exchange {
     pub(crate) group_id: GroupId,
     pub(crate) roster: DeviceRosterV1,
     pub(crate) own_slot: DeviceSlotId,
     pub(crate) tagged: bool,
+    pub(crate) epoch: EpochId,
 }
 
 impl Exchange {
@@ -127,6 +129,7 @@ impl AppClient {
             roster,
             own_slot,
             tagged,
+            epoch,
         }))
     }
 
@@ -291,6 +294,19 @@ impl AppClient {
         group_id: &GroupId,
         event: MarmotAppEvent,
     ) -> Result<bool, AppError> {
+        self.send_device_group_event_at(group_id, event, None).await
+    }
+
+    /// [`Self::send_device_group_event`], pinned to `expected_epoch` when
+    /// one is given: the engine encrypts `event` under that epoch or refuses
+    /// it (`AppMessageEpochUnsettled`, `AppMessageEpochMismatch`) before
+    /// writing anything, and never queues it.
+    pub(crate) async fn send_device_group_event_at(
+        &mut self,
+        group_id: &GroupId,
+        event: MarmotAppEvent,
+        expected_epoch: Option<EpochId>,
+    ) -> Result<bool, AppError> {
         let kind = event.kind;
         let payload = event
             .encode()
@@ -305,7 +321,7 @@ impl AppClient {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload,
-                expected_epoch: None,
+                expected_epoch,
             })
             .await?;
         let reached = !effects
