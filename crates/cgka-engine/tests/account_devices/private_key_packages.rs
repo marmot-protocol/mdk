@@ -8,7 +8,8 @@
 //! device tag reads as the sender's slot. A sibling Welcome (mdk#2628 3.5)
 //! consumes only the private KeyPackage it names, issued to its sender, and
 //! one back into a chat still held active is held, writing nothing, until
-//! that copy reads removed or unrecoverable.
+//! that copy reads removed or unrecoverable. One carried before a forget is
+//! refused for that carrier alone.
 
 use super::*;
 use cgka_engine::key_package::{durably_owned_key_packages, key_package_metadata};

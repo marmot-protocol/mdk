@@ -186,9 +186,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   or admitted but not stashed, fails the event's projection, which is retried. One into a chat still held active is
   held, never a rejoin offer (D72): its row keeps the chat's id, and a pass joins it, with no consent asked, only once
   that copy reads removed or unrecoverable. A held row goes only when its carrier is withdrawn, its KeyPackage is used
-  or expired, the chat is forgotten or disbanded, or a full stash makes room for a new Welcome. Every call that can
-  store or retire a rejoin offer (ingest, the retry, a confirmation, a decline) tells the host which chats' offers
-  changed.
+  or expired, the chat is forgotten or disbanded, or a full stash makes room for a new Welcome. A forget refuses only
+  the carriers dated before it, so the same Welcome sent again afterwards joins, whether or not a pass held it first.
+  Every call that can store or retire a rejoin offer (ingest, the retry, a confirmation, a decline) tells the host
+  which chats' offers changed.
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.

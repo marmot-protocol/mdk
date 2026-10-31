@@ -248,7 +248,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     advertise this client's capabilities stop counting; an ordinary Welcome never consumes one; and a hand-off keeps
     only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only). A sibling
     Welcome (3.5b) consumes only the private KeyPackage it names, issued to its sender, and one back into a chat still
-    held active is held, writing nothing, until that copy reads removed or unrecoverable.
+    held active is held, writing nothing, until that copy reads removed or unrecoverable. One carried no later than a
+    local forget is refused for that carrier alone, so the same Welcome in a later carrier joins.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and
