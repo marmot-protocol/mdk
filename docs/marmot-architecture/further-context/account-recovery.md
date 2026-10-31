@@ -903,8 +903,10 @@ caller or the budget ends it. Otherwise `CoverageUnproven` after a pass that ser
 route the ledger parks on a relay it requires is one "history may be incomplete" notice with
 the cause `UnprovenHistory`, whose id is a hash of the route with its park revision; a group
 route's also shows in that group's status. A park on a relay the route now carries only as best
-effort, or no longer, raises none. A remainder is a notice only once the runner has surveyed and
-catches up nothing on its route. A suspended (Unrecoverable) group's routes give no notice. Each survey
+effort, or no longer, raises none. What a notice shows, its revision (the newest park among
+them) and what dismissing it retires are one set, so such a park moves no revision and is never
+dismissed. A remainder is a notice only once the runner has surveyed and catches up nothing on
+its route. A suspended (Unrecoverable) group's routes give no notice. Each survey
 publishes the required units still catching up; the account's recovery status reads that, and
 a change in it or in the notices is one `RecoveryStatusChanged`. With the gate off none of this
 shows.

@@ -437,13 +437,25 @@ async fn a_park_on_a_relay_the_route_carries_only_as_best_effort_is_no_notice() 
     let notices = client.history_notices().unwrap();
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].group_id_hex, Some(hex::encode(group.as_slice())));
+
+    // Dismissal retires what the notice showed, and only that.
+    assert!(
+        client
+            .dismiss_history_notice(&notices[0].notice_id)
+            .unwrap()
+    );
+    assert!(client.history_notices().unwrap().is_empty());
+    let parked = storage.parked_recovery_routes().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].relays, vec![BEST_EFFORT.to_owned()]);
 }
 
-/// A remainder's notice carries its route's whole park revision, a newer park
-/// on a best-effort relay that shows no notice of its own included, so
-/// dismissing it works and clears both.
+/// A newer park on a relay the route carries only as best effort is outside
+/// what a notice shows: it moves no notice's revision, so the remainder's
+/// notice keeps its id and stays dismissable, and dismissing it leaves that
+/// park as it is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_remainder_notice_behind_a_best_effort_park_is_dismissable() {
+async fn a_hidden_park_moves_no_notice_revision_and_is_never_dismissed() {
     const OPERATED: &str = "wss://operated.example";
     const BEST_EFFORT: &str = "wss://best-effort.example";
     let dir = tempfile::tempdir().unwrap();
@@ -485,18 +497,26 @@ async fn a_remainder_notice_behind_a_best_effort_park_is_dismissable() {
     storage
         .prune_recovery_coverage(now - DAY, &[(route.clone(), vec![OPERATED.to_owned()])])
         .unwrap();
-    park_on(&storage, &route, BEST_EFFORT);
     catching_up(&client, &[]);
-
     let notices = client.history_notices().unwrap();
     assert_eq!(notices.len(), 1, "the remainder's notice");
+
+    park_on(&storage, &route, BEST_EFFORT);
+    assert_eq!(
+        client.history_notices().unwrap(),
+        notices,
+        "the hidden park moves nothing"
+    );
     assert!(
         client
             .dismiss_history_notice(&notices[0].notice_id)
             .unwrap()
     );
     assert!(client.history_notices().unwrap().is_empty());
-    assert!(storage.parked_recovery_routes().unwrap().is_empty());
+    assert!(storage.recovery_coverage_remainders().unwrap().is_empty());
+    let parked = storage.parked_recovery_routes().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].relays, vec![BEST_EFFORT.to_owned()]);
 }
 
 /// The status reports the groups and inbox the runner's last survey found

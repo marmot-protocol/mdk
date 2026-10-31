@@ -18,11 +18,14 @@ use crate::history_notices::{
 use crate::{AccountRecoveryStatus, AppError, HistoryNotice, HistoryNoticeCause};
 
 /// One route the coverage ledger parks: one `UnprovenHistory` notice, whose
-/// ticket is the route's tag and its park revision (the newest among its
-/// broken units' parks and its remainder). Not `Debug`: it carries its route.
+/// ticket is the route's tag and its park revision (the newest among the
+/// parks it shows and its remainder). Not `Debug`: it carries its route.
 pub(crate) struct LedgerNotice {
     route: TransportReconciliationRoute,
     ticket: RecoveryDemandTicket,
+    /// The relays whose broken units it shows: the ones its dismissal
+    /// retires, with the route's remainder.
+    relays: Vec<String>,
     /// The route's MLS group; `None` for the inbox.
     group_id: Option<Vec<u8>>,
     parked_at_seconds: u64,
@@ -59,16 +62,17 @@ impl AppClient {
     }
 
     /// The routes the coverage ledger parks, one notice each, oldest first,
-    /// behind the internal `runner_owns_debt` gate: a route with a broken
-    /// unit on a relay it now requires, or with a parked remainder once the
-    /// window above it is covered, that is once the runner has surveyed and
-    /// catches up none of the route's units. A broken unit on a relay the
-    /// route carries only as best effort, or no longer, owes nothing, so it
-    /// raises none; a remainder is the route's, and its notice carries the
-    /// route's whole park revision, so dismissing it also dismisses such a
-    /// unit. A group route's notice names
-    /// its group; one that is no current route's, a suspended group's, or one
-    /// the host may not see, is left out.
+    /// behind the internal `runner_owns_debt` gate. What a notice shows, its
+    /// revision and what dismissing it retires are one set: the route's
+    /// broken units on relays it now requires, and its remainder. A remainder
+    /// shows with a broken unit's notice, or alone once the window above it is
+    /// covered, that is once the runner has surveyed and catches up none of
+    /// the route's units. A broken unit on a relay the route carries only as
+    /// best effort, or no longer, owes nothing, so it shows nowhere, moves no
+    /// revision and is never dismissed. The revision is the newest park in
+    /// the set. A group route's notice names its group; one that is no
+    /// current route's, a suspended group's, or one the host may not see, is
+    /// left out.
     pub(crate) fn ledger_notices(
         &self,
         app: &SqliteAppStorage,
@@ -83,37 +87,53 @@ impl AppClient {
             .map(|route| (route.route, (route.group_id, route.required)))
             .collect::<BTreeMap<_, _>>();
         let catching_up = self.routing.recovery_runner_catching_up_now();
-        // Every notice carries its route's whole park revision, a park it
-        // does not show included, as dismissal checks that.
-        let mut revisions = BTreeMap::new();
-        let mut parked = BTreeMap::new();
-        for park in app.parked_recovery_routes()? {
-            let shown = routes.get(&park.route).is_some_and(|(_, required)| {
-                park.relays.iter().any(|relay| required.contains(relay))
-            });
-            if shown {
-                parked.insert(park.route.clone(), (park.revision, park.parked_at_seconds));
+        // Per route: the relays shown, the newest park, the oldest park time.
+        let mut shown = BTreeMap::<TransportReconciliationRoute, (Vec<String>, u64, u64)>::new();
+        for parked in app.parked_recovery_routes()? {
+            let Some((_, required)) = routes.get(&parked.route) else {
+                continue;
+            };
+            for relay in parked
+                .relays
+                .iter()
+                .filter(|relay| required.contains(relay))
+            {
+                let Some(park) = app
+                    .recovery_unit(&parked.route, relay)?
+                    .and_then(|unit| unit.park)
+                else {
+                    continue;
+                };
+                let (relays, revision, parked_at) = shown.entry(parked.route.clone()).or_insert((
+                    Vec::new(),
+                    park.revision,
+                    park.parked_at_seconds,
+                ));
+                relays.push(relay.clone());
+                *revision = (*revision).max(park.revision);
+                *parked_at = (*parked_at).min(park.parked_at_seconds);
             }
-            revisions.insert(park.route, park.revision);
         }
         for remainder in app.recovery_coverage_remainders()? {
-            if let Some((_, parked_at)) = parked.get_mut(&remainder.route) {
-                // Its revision already counts the remainder's.
+            if !routes.contains_key(&remainder.route) {
+                continue;
+            }
+            if let Some((_, revision, parked_at)) = shown.get_mut(&remainder.route) {
+                *revision = (*revision).max(remainder.revision);
                 *parked_at = (*parked_at).min(remainder.parked_at_seconds);
             } else if catching_up
                 .as_ref()
                 .is_some_and(|units| !units.iter().any(|unit| unit.route == remainder.route))
             {
-                let revision = revisions
-                    .get(&remainder.route)
-                    .copied()
-                    .unwrap_or(remainder.revision);
-                parked.insert(remainder.route, (revision, remainder.parked_at_seconds));
+                shown.insert(
+                    remainder.route,
+                    (Vec::new(), remainder.revision, remainder.parked_at_seconds),
+                );
             }
         }
-        let mut notices = parked
+        let mut notices = shown
             .into_iter()
-            .filter_map(|(route, (revision, parked_at_seconds))| {
+            .filter_map(|(route, (relays, revision, parked_at_seconds))| {
                 let group_id = match route {
                     TransportReconciliationRoute::Inbox => None,
                     TransportReconciliationRoute::Group(_) => Some(routes.get(&route)?.0.clone()?),
@@ -127,6 +147,7 @@ impl AppClient {
                         revision,
                     },
                     route,
+                    relays,
                     group_id,
                     parked_at_seconds,
                 })
@@ -306,10 +327,11 @@ impl AppClient {
     }
 
     /// Dismiss a ledger-parked route's notice: storage retires the parked
-    /// spans of the route's broken units and its remainder, never as
-    /// coverage. Returns false, changing nothing, when the notice is stale:
-    /// the route re-armed, parked again under a newer revision, or was
-    /// dismissed already.
+    /// spans of the broken units it shows and the route's remainder, never as
+    /// coverage, and checks the notice's revision against exactly those
+    /// ([`Self::ledger_notices`]). Returns false, changing nothing, when the
+    /// notice is stale: the route re-armed, parked again under a newer
+    /// revision, or was dismissed already.
     fn dismiss_ledger_notice(
         &mut self,
         app: &SqliteAppStorage,
@@ -320,7 +342,9 @@ impl AppClient {
             .into_iter()
             .find(|notice| notice.ticket == ticket);
         let dismissed = match &notice {
-            Some(notice) => app.dismiss_recovery_route_park(&notice.route, ticket.revision)?,
+            Some(notice) => {
+                app.dismiss_recovery_route_park_on(&notice.route, &notice.relays, ticket.revision)?
+            }
             None => false,
         };
         if !dismissed {

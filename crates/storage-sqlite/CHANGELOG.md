@@ -326,6 +326,9 @@
 
 ### Added
 
+- `dismiss_recovery_route_park_on` dismisses a route's broken units on the
+  given relays and its remainder, checking the revision against them only;
+  a broken unit on any other relay stays as it is (mdk#2660 phase 4).
 - `settle_recovery_recheck` applies one re-check quantum's outcome to its
   relay and the account's rolling-hour budget, never to its unit's retry
   state (mdk#2660 phase 4). `staged_recovery_items` lists the ids and times a

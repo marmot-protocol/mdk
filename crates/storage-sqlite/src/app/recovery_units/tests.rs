@@ -615,6 +615,39 @@ fn explicit_repair_rearms_everything() {
     }
 }
 
+/// A dismissal scoped to some relays checks its revision against their parks
+/// and the remainder only, and leaves a broken unit on any other relay as it
+/// is.
+#[test]
+fn a_dismissal_on_some_relays_leaves_the_others_broken() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    let first = break_unit(&app, &route, NOW).park.unwrap().revision;
+    let second = settle(&app, &route, OTHER, RecoveryUnitOutcome::Refused, NOW + 5)
+        .park
+        .unwrap()
+        .revision;
+    let relay = [RELAY.to_owned()];
+    assert!(
+        !app.dismiss_recovery_route_park_on(&route, &relay, second)
+            .unwrap()
+    );
+    assert!(
+        app.dismiss_recovery_route_park_on(&route, &relay, first)
+            .unwrap()
+    );
+    assert_eq!(unit(&app, &route, RELAY).state, RecoveryUnitState::Retired);
+    assert!(matches!(
+        unit(&app, &route, OTHER).state,
+        RecoveryUnitState::Broken(_)
+    ));
+    let notices = app.parked_recovery_routes().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].relays, vec![OTHER.to_owned()]);
+}
+
 /// Dismissal checks the route's newest park: a stale revision does nothing.
 /// The current one retires the route's broken units and their parked spans,
 /// which never become coverage.

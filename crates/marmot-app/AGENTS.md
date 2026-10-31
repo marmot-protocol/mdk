@@ -464,8 +464,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`RunnerHost::surveyed`) into `AppTransportRouting`'s catching-up watch: the only source of the account recovery
   status, the worker's `RecoveryStatusChanged` cue, and the condition for a remainder's notice. Ledger notices
   (`HistoryNoticeCause::UnprovenHistory`, ids from `ledger_route_tag` and the park revision) skip a suspended group's
-  routes (`RunnerRoute::suspended`) and a broken unit on a relay its route no longer requires; they, the status and
-  its event show nothing with the gate off.
+  routes (`RunnerRoute::suspended`) and a broken unit on a relay its route no longer requires. A notice's revision and
+  its dismissal (`dismiss_recovery_route_park_on`) cover exactly what it shows. They, the status and its event show
+  nothing with the gate off.
   An Unrecoverable group's routes are suspended (`RunnerRoute.unrecoverable`, read from the engine's group record
   each debt turn): never scheduled, charged, broken or noticed, left out of admission so what they staged is given
   back as an unlisted route's is, and with the gate on the comparison owner drops their
