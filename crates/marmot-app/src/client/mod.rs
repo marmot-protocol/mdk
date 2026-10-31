@@ -1049,6 +1049,10 @@ pub struct AppClient {
     /// Welcomes already announced as pending by this process, so a Welcome
     /// that keeps failing on each maintenance pass is announced once.
     pub(crate) announced_welcome_failures: HashSet<MessageId>,
+    /// The 461s this process sent to carry sibling Welcomes, until each
+    /// settles. A carrier the engine holds that is not here was in flight
+    /// when the app last stopped, so its Welcome is owed again.
+    pub(crate) sibling_welcome_carriers: HashSet<Vec<u8>>,
     /// Durable failure level from the last successful maintenance summary read.
     pub(crate) maintenance_failed_backlog: u32,
     /// Superseded own commits awaiting a `GroupChangeSuperseded` runtime event
@@ -1565,6 +1569,7 @@ impl AppClient {
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;
         self.join_stashed_sibling_welcomes().await;
+        self.send_owed_sibling_welcomes(&held).await;
         self.sibling_key_package_upkeep(&held).await;
         self.device_heartbeat_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;

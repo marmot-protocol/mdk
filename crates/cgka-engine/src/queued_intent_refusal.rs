@@ -118,10 +118,13 @@ impl<S: StorageProvider> Engine<S> {
     /// Run before it is queued, so the sender is answered at once rather than
     /// by a later [`GroupEvent::QueuedIntentRefused`].
     pub(crate) fn check_queued_key_packages(&self, intent: &SendIntent) -> Result<(), EngineError> {
-        let (SendIntent::Invite { key_packages, .. }
-        | SendIntent::AddOwnAccountDevices { key_packages, .. }) = intent
-        else {
-            return Ok(());
+        let key_packages: Vec<_> = match intent {
+            SendIntent::Invite { key_packages, .. } => key_packages.iter().collect(),
+            SendIntent::AddOwnAccountDevices { siblings, .. } => siblings
+                .iter()
+                .map(|sibling| &sibling.key_package)
+                .collect(),
+            _ => return Ok(()),
         };
         for key_package in key_packages {
             self.parse_key_package(key_package)?;

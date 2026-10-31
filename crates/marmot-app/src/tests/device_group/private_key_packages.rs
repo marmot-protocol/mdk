@@ -8,10 +8,8 @@ use super::*;
 use crate::tests::canonical_membership::deliver_events;
 use base64::Engine as _;
 use cgka_traits::app_components::DeviceSlotId;
-use cgka_traits::app_components::{
-    AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NOSTR_ROUTING_MAX_RELAYS, encode_nostr_routing_v1,
-};
-use cgka_traits::engine::{CreateGroupRequest, SendIntent};
+use cgka_traits::app_components::NOSTR_ROUTING_MAX_RELAYS;
+use cgka_traits::engine::{SendIntent, SiblingKeyPackage};
 use cgka_traits::storage::IssuedPrivateKeyPackage;
 use marmot_session::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
@@ -466,86 +464,80 @@ async fn expired_private_key_packages_go_while_maintenance_is_paused_or_frozen()
     assert!(received_from(&phone, &laptop_slot).is_empty());
 }
 
-/// A chat the laptop makes with one of the phone's private KeyPackages, and
-/// the sibling Welcome that adds the phone to it, built by hand until the
-/// laptop sends one itself (3.5b-2). Until then the laptop wraps every
-/// Welcome for the transport, so the KeyPackage names a stand-in event and
-/// the test unwraps the Welcome from a gift wrap it never publishes.
+/// A chat the laptop makes and adds the phone to, and the sibling Welcome
+/// that Add leaves owed.
 async fn chat_adding_the_phone(devices: &mut Devices) -> (GroupId, SiblingWelcome) {
-    let (phone_slot, laptop_slot) = (slot(&devices.phone), slot(&devices.laptop));
-    let private = devices
+    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    let welcome = adding_the_phone(devices, &chat).await;
+    (chat, welcome)
+}
+
+/// The laptop adds the phone to `chat` with one of the phone's private
+/// KeyPackages, and the test takes the sibling Welcome that leaves owed off
+/// the laptop's list, so only the test sends it.
+async fn adding_the_phone(devices: &mut Devices, chat: &GroupId) -> SiblingWelcome {
+    add_the_phone_unpublished(devices, chat).await;
+    take_owed_sibling_welcome(&devices.laptop)
+}
+
+/// The laptop adds the phone to `chat` with one of the phone's private
+/// KeyPackages, confirming a Commit it never publishes, which leaves the
+/// sibling Welcome owed.
+async fn add_the_phone_unpublished(devices: &mut Devices, chat: &GroupId) {
+    let phone_slot = slot(&devices.phone);
+    let key_package = devices
         .laptop
         .take_private_key_package(&phone_slot)
         .unwrap()
         .unwrap();
-    let key_package_ref = issued(&devices.phone)
-        .into_iter()
-        .find(|record| record.key_package == private.bytes())
-        .unwrap()
-        .key_package_ref;
-    let private = KeyPackage {
-        source: Some(cgka_traits::engine::KeyPackageSource {
-            event_id: MessageId::new(vec![0x42; 32]),
-        }),
-        ..private
-    };
-    let routing = devices.laptop.app.new_nostr_routing(None).unwrap();
-    let created = devices
-        .laptop
-        .runtime
-        .session_mut()
-        .create_group(CreateGroupRequest {
-            name: "chat".into(),
-            description: String::new(),
-            members: vec![private],
-            required_features: Vec::new(),
-            app_components: vec![AppComponentData {
-                component_id: NOSTR_ROUTING_COMPONENT_ID,
-                data: encode_nostr_routing_v1(&routing).unwrap(),
+    confirm_unpublished(
+        &mut devices.laptop,
+        SendIntent::AddOwnAccountDevices {
+            group_id: chat.clone(),
+            siblings: vec![SiblingKeyPackage {
+                slot: phone_slot,
+                key_package,
             }],
-            initial_admins: Vec::new(),
-        })
-        .await
-        .unwrap();
-    let wrap = created
-        .effects
-        .publish
-        .iter()
-        .find_map(|work| match work {
-            PublishWork::GroupCreated { welcomes, .. }
-            | PublishWork::FoundingGroupCreated { welcomes } => welcomes.first().cloned(),
-            _ => None,
-        })
-        .unwrap();
-    (
-        created.group_id,
-        SiblingWelcome {
-            from: laptop_slot,
-            to: phone_slot,
-            key_package_ref,
-            welcome: unwrapped_welcome(devices, &wrap),
-            relays: vec!["wss://relay.example".into()],
         },
     )
+    .await;
 }
 
-/// The Welcome in a gift wrap the laptop made.
-fn unwrapped_welcome(devices: &Devices, wrap: &TransportMessage) -> Vec<u8> {
-    let keys = devices
-        .laptop_app
-        .account_home()
-        .load_signing_keys("alice")
-        .unwrap();
-    let wrap = transport_nostr_peeler::NostrTransportEvent::from_transport_message(wrap)
-        .unwrap()
-        .to_verified_nostr_event()
-        .unwrap();
-    let rumor = nostr::nips::nip59::extract_rumor(&keys, &wrap)
-        .unwrap()
-        .rumor;
-    base64::engine::general_purpose::STANDARD
-        .decode(&rumor.content)
-        .unwrap()
+fn owed(client: &AppClient) -> Vec<marmot_session::OwedSiblingWelcome> {
+    client.runtime.owed_sibling_welcomes(Timestamp(0)).unwrap()
+}
+
+/// Send `intent` through `client`'s session and confirm the Commit it
+/// makes without publishing it: that Commit.
+async fn confirm_unpublished(client: &mut AppClient, intent: SendIntent) -> TransportMessage {
+    let session = client.runtime.session_mut();
+    let effects = session.send(intent).await.unwrap();
+    let Some(PublishWork::GroupEvolution { msg, pending, .. }) = effects.publish.into_iter().next()
+    else {
+        panic!("expected a group evolution")
+    };
+    session.confirm_published(pending).await.unwrap();
+    msg
+}
+
+/// The one sibling Welcome `client` owes, settled as though a 461 had
+/// delivered it.
+fn take_owed_sibling_welcome(client: &AppClient) -> SiblingWelcome {
+    let [owed] = <[_; 1]>::try_from(owed(client)).unwrap();
+    let carrier = [0xfe; 32];
+    assert!(
+        client
+            .runtime
+            .carry_sibling_welcome(&owed.id, &carrier)
+            .unwrap()
+    );
+    assert!(
+        client
+            .runtime
+            .sibling_welcome_delivered(&owed.id, &carrier)
+            .unwrap()
+    );
+    SiblingWelcome::decode(&owed.content).unwrap()
 }
 
 /// The laptop removes the phone from `chat` and adds it back with another
@@ -555,58 +547,18 @@ async fn re_adding_the_phone(
     devices: &mut Devices,
     chat: &GroupId,
 ) -> (SiblingWelcome, NostrTransportEvent) {
-    let (phone_slot, laptop_slot) = (slot(&devices.phone), slot(&devices.laptop));
-    let private = devices
-        .laptop
-        .take_private_key_package(&phone_slot)
-        .unwrap()
-        .unwrap();
-    let key_package_ref = issued(&devices.phone)
-        .into_iter()
-        .find(|record| record.key_package == private.bytes())
-        .unwrap()
-        .key_package_ref;
-    let private = KeyPackage {
-        source: Some(cgka_traits::engine::KeyPackageSource {
-            event_id: MessageId::new(vec![0x43; 32]),
-        }),
-        ..private
-    };
     let phone_key = devices.phone.runtime.own_signature_key();
-    let session = devices.laptop.runtime.session_mut();
-    let (mut removal, mut welcome) = (None, None);
-    for intent in [
+    let removal = confirm_unpublished(
+        &mut devices.laptop,
         SendIntent::RemoveOwnAccountDevices {
             group_id: chat.clone(),
             leaf_signature_keys: vec![phone_key],
         },
-        SendIntent::AddOwnAccountDevices {
-            group_id: chat.clone(),
-            key_packages: vec![private.clone()],
-        },
-    ] {
-        let effects = session.send(intent).await.unwrap();
-        let Some(PublishWork::GroupEvolution {
-            msg,
-            welcomes,
-            pending,
-        }) = effects.publish.into_iter().next()
-        else {
-            panic!("expected a group evolution")
-        };
-        session.confirm_published(pending).await.unwrap();
-        removal = removal.or(Some(msg));
-        welcome = welcomes.into_iter().next().or(welcome);
-    }
+    )
+    .await;
     (
-        SiblingWelcome {
-            from: laptop_slot,
-            to: phone_slot,
-            key_package_ref,
-            welcome: unwrapped_welcome(devices, &welcome.unwrap()),
-            relays: vec!["wss://relay.example".into()],
-        },
-        NostrTransportEvent::from_transport_message(&removal.unwrap()).unwrap(),
+        adding_the_phone(devices, chat).await,
+        NostrTransportEvent::from_transport_message(&removal).unwrap(),
     )
 }
 
@@ -1303,4 +1255,127 @@ async fn a_sibling_welcome_whose_stash_write_fails_is_kept_on_retry() {
             .count(),
         1
     );
+}
+
+/// Adding the phone to a chat publishes the Add's Commit and then sends the
+/// sibling Welcome it leaves owed as a 461, which settles it delivered: no
+/// later pass sends it again. The phone stashes it and joins the chat,
+/// consuming the KeyPackage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adding_a_sibling_sends_its_welcome_once_the_commit_is_published() {
+    let (mut devices, _) = tagging_devices().await;
+    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    let phone_slot = slot(&devices.phone);
+    let before = devices.relay.published_events.lock().unwrap().len();
+    devices
+        .laptop
+        .add_sibling_to_chat(&chat, &phone_slot)
+        .await
+        .unwrap();
+    assert_eq!(group_messages_since(&devices.relay, before), 2);
+    assert!(owed(&devices.laptop).is_empty());
+    devices.laptop.run_due_maintenance().await.unwrap();
+
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    let [stashed] = <[_; 1]>::try_from(
+        devices_storage(&devices.phone)
+            .stashed_sibling_welcomes()
+            .unwrap(),
+    )
+    .unwrap();
+    let welcome = SiblingWelcome::decode(&stashed.content).unwrap();
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert!(devices.phone.state_group_record(&chat).is_some());
+    assert!(!key_package_issued(&devices.phone, &welcome));
+}
+
+/// A sibling Welcome whose 461 every relay refused stays owed, never
+/// delivered, and the next pass sends it in a new 461, which the phone
+/// joins from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_whose_461_reached_no_one_is_sent_again() {
+    let (mut devices, _) = tagging_devices().await;
+    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    add_the_phone_unpublished(&mut devices, &chat).await;
+
+    devices.relay.reject_next_publish();
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    let [refused] = <[_; 1]>::try_from(owed(&devices.laptop)).unwrap();
+    assert_eq!(refused.carrier, None);
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 0);
+
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert!(owed(&devices.laptop).is_empty());
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 1);
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert!(devices.phone.state_group_record(&chat).is_some());
+}
+
+/// A sibling Welcome left owed when the app stops is sent once after the
+/// restart, and so is one whose 461 was still in flight: a carrier this run
+/// never sent is dropped, and the Welcome goes in a new 461.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_owed_across_a_restart_is_sent_once() {
+    let (mut devices, _) = tagging_devices().await;
+    let (owed_chat, carried_chat) = (
+        devices.laptop.create_group("owed", &[]).await.unwrap(),
+        devices.laptop.create_group("carried", &[]).await.unwrap(),
+    );
+    add_the_phone_unpublished(&mut devices, &owed_chat).await;
+    add_the_phone_unpublished(&mut devices, &carried_chat).await;
+    let carried = owed(&devices.laptop)
+        .into_iter()
+        .find(|owed| owed.group_id == carried_chat)
+        .unwrap();
+    assert!(
+        devices
+            .laptop
+            .runtime
+            .carry_sibling_welcome(&carried.id, &[0xfe; 32])
+            .unwrap()
+    );
+
+    drop(devices.laptop);
+    let mut laptop = devices.laptop_app.client("alice").await.unwrap();
+    laptop.run_due_maintenance().await.unwrap();
+    assert!(owed(&laptop).is_empty());
+    laptop.run_due_maintenance().await.unwrap();
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 2);
+    devices.phone.run_due_maintenance().await.unwrap();
+    for chat in [owed_chat, carried_chat] {
+        assert!(devices.phone.state_group_record(&chat).is_some());
+    }
+}
+
+/// A sibling Welcome goes out only once its Add's Commit is published: an
+/// Add whose Commit every relay refused fails, and neither it nor a later
+/// pass sends the Welcome. Adding the phone again goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_waits_for_its_commit() {
+    let (mut devices, _) = tagging_devices().await;
+    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    let phone_slot = slot(&devices.phone);
+    devices.relay.reject_next_publish();
+    let error = devices
+        .laptop
+        .add_sibling_to_chat(&chat, &phone_slot)
+        .await
+        .unwrap_err();
+    assert_eq!(error.privacy_safe_kind(), "publish");
+    devices.laptop.run_due_maintenance().await.unwrap();
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 0);
+
+    devices
+        .laptop
+        .add_sibling_to_chat(&chat, &phone_slot)
+        .await
+        .unwrap();
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 1);
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert!(devices.phone.state_group_record(&chat).is_some());
 }

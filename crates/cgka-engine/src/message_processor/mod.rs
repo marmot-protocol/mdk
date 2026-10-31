@@ -1075,8 +1075,8 @@ impl<S: StorageProvider> Engine<S> {
         // adds a leaf there; this answers an Invite or a same-account Add
         // before anything is queued, with a reason that names it.
         let adds_devices = match intent {
-            SendIntent::Invite { key_packages, .. }
-            | SendIntent::AddOwnAccountDevices { key_packages, .. } => !key_packages.is_empty(),
+            SendIntent::Invite { key_packages, .. } => !key_packages.is_empty(),
+            SendIntent::AddOwnAccountDevices { siblings, .. } => !siblings.is_empty(),
             _ => false,
         };
         if adds_devices

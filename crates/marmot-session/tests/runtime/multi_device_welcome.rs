@@ -92,9 +92,6 @@ impl TransportRoutingPolicy for SharedRouting {
 /// KeyPackage.
 struct Device {
     runtime: AccountDeviceRuntime<RecordingAdapter, SharedRouting, RecordingKeyPackages>,
-    /// What the runtime publishes, and where.
-    adapter: RecordingAdapter,
-    routing: SharedRouting,
     /// The device's current KeyPackage as an inviter fetches it, carrying the
     /// id of its publication for the inviter to name in the rumor.
     key_package: cgka_traits::engine::KeyPackage,
@@ -122,12 +119,10 @@ impl Device {
         Self {
             runtime: AccountDeviceRuntime::new(
                 session,
-                adapter.clone(),
-                routing.clone(),
+                adapter,
+                routing,
                 RecordingKeyPackages::default(),
             ),
-            adapter,
-            routing,
             key_package,
         }
     }
@@ -1009,54 +1004,25 @@ mod same_account_welcome {
     #[tokio::test]
     async fn a_device_joins_through_its_siblings_welcome_once_required() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut phone, _, mut laptop, group_id) = phone_in_bobs_group(&dir, true).await;
-        let (phone_before, laptop_before) = (phone.lifecycle(), laptop.lifecycle());
+        let (phone, phone_storage, mut laptop, group_id) = phone_in_bobs_group(&dir, true).await;
+        let laptop_before = laptop.lifecycle();
         let phone_epoch = phone.runtime.session().epoch(&group_id).unwrap();
 
-        // The phone, not an admin, adds the laptop through the runtime and
-        // publishes the Welcome as any inviter does: one rumor, gift-wrapped
-        // to the account and naming the laptop's KeyPackage.
-        let alice = phone.runtime.self_id();
-        phone.routing.update(|routing| {
-            routing
-                .with_group_route(
-                    group_id.clone(),
-                    vec![0x5a; 32],
-                    vec![TransportEndpoint("wss://group.example".into())],
-                )
-                .with_inbox_route(alice, vec![TransportEndpoint("wss://inbox.example".into())])
-        });
-        let effects = phone
-            .runtime
-            .send(SendIntent::AddOwnAccountDevices {
-                group_id: group_id.clone(),
-                key_packages: vec![laptop.key_package.clone()],
-            })
-            .await
-            .unwrap();
-        assert!(effects.failures.is_empty(), "{:?}", effects.failures);
-        assert_eq!(
-            phone.runtime.session().epoch(&group_id).unwrap().0,
-            phone_epoch.0 + 1
-        );
-        let welcomes: Vec<_> = phone
-            .adapter
-            .publishes()
-            .into_iter()
-            .map(|publish| publish.message)
-            .filter(|message| matches!(message.envelope, TransportEnvelope::Welcome { .. }))
-            .collect();
-        let [to_laptop] = &rumors_for(&welcomes, b"alice", &[&laptop.key_package]).await[..] else {
-            unreachable!()
-        };
+        // The phone, not an admin, adds the laptop. The runtime carries a
+        // same-account Add's Welcome only as a sibling Welcome in the device
+        // group (mdk#2628 3.5b), so this one is built with raw OpenMLS and
+        // delivered as any Welcome is: one rumor, gift-wrapped to the account
+        // and naming the laptop's KeyPackage.
+        let welcome = same_account_add(&phone, &phone_storage, &group_id, &laptop.key_package);
+        let to_laptop = rewrapped(
+            b"alice",
+            b"alice",
+            welcome,
+            publication_id(&laptop.key_package),
+        )
+        .await;
 
-        // The committing phone receives the rumor back from its account's
-        // inbox, knows it as its own, and leaves it alone.
-        let results = phone.ingest_all(&[to_laptop]).await;
-        assert_eq!(outcomes(&results), vec![duplicate()]);
-        assert_eq!(phone.lifecycle(), phone_before);
-
-        let results = laptop.ingest_all(&[to_laptop]).await;
+        let results = laptop.ingest_all(&[&to_laptop]).await;
         assert_eq!(joins(&results), vec![(group_id.clone(), to_laptop.id.clone())]);
         let welcomers: Vec<_> = results
             .iter()

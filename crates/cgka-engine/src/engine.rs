@@ -12,6 +12,7 @@ use crate::bounded_id_set::{BoundedIdSet, DEDUP_CACHE_CAPACITY};
 use crate::convergence_clock::{ConvergenceClock, ConvergenceTime, SystemConvergenceClock};
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
+pub use crate::own_account_devices::OwedSiblingWelcome;
 use async_trait::async_trait;
 use cgka_traits::OutboundFanout;
 use cgka_traits::app_components::{
@@ -3377,7 +3378,9 @@ impl<S: StorageProvider> Engine<S> {
             StoredMessagePayload::StagedInviteWelcome { .. }
             | StoredMessagePayload::OpenMlsWire(_)
             | StoredMessagePayload::SignedOpenMlsWire { .. }
-            | StoredMessagePayload::OwnCommitWire { .. } => None,
+            | StoredMessagePayload::OwnCommitWire { .. }
+            | StoredMessagePayload::StagedSiblingWelcome { .. }
+            | StoredMessagePayload::OutboundSiblingWelcome { .. } => None,
         }
         .ok_or_else(|| {
             EngineError::Backend(
@@ -3636,7 +3639,9 @@ impl<S: StorageProvider> Engine<S> {
             StoredMessagePayload::RawTransport(_)
             | StoredMessagePayload::OpenMlsWire(_)
             | StoredMessagePayload::SignedOpenMlsWire { .. }
-            | StoredMessagePayload::OwnCommitWire { .. } => None,
+            | StoredMessagePayload::OwnCommitWire { .. }
+            | StoredMessagePayload::StagedSiblingWelcome { .. }
+            | StoredMessagePayload::OutboundSiblingWelcome { .. } => None,
         };
         if !message
             .is_some_and(|message| matches!(message.envelope, TransportEnvelope::Welcome { .. }))
@@ -3731,9 +3736,13 @@ impl<S: StorageProvider> Engine<S> {
             | StoredMessagePayload::RawTransport(message) => {
                 matches!(message.envelope, TransportEnvelope::Welcome { .. })
             }
+            // A sibling Welcome is never a transport message, so no
+            // transport publish names its id.
             StoredMessagePayload::OpenMlsWire(_)
             | StoredMessagePayload::SignedOpenMlsWire { .. }
-            | StoredMessagePayload::OwnCommitWire { .. } => false,
+            | StoredMessagePayload::OwnCommitWire { .. }
+            | StoredMessagePayload::StagedSiblingWelcome { .. }
+            | StoredMessagePayload::OutboundSiblingWelcome { .. } => false,
         })
     }
 
