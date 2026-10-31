@@ -1320,4 +1320,55 @@ mod tests {
             .unwrap();
         assert!(s.timeline_message(&id(99), &id(1)).unwrap().is_none());
     }
+    fn imported(e: &StoredAppEvent, grant: Option<bool>) -> crate::ImportedAppEvent {
+        crate::ImportedAppEvent {
+            message_id_hex: e.message_id_hex.clone(),
+            source_epoch: 1,
+            sender: e.sender.clone(),
+            plaintext: e.plaintext.clone(),
+            kind: e.kind,
+            tags: e.tags.clone(),
+            created_at: e.recorded_at,
+            retention: None,
+            moderation_grant: grant,
+        }
+    }
+    // mdk#2628 4.2a: an imported control takes the sending device's verdict,
+    // and has no authority without one.
+    #[test]
+    fn an_imported_removal_or_dismissal_takes_the_senders_verdict() {
+        for (grant, applies) in [(None, false), (Some(false), false), (Some(true), true)] {
+            let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
+            record(&s, &target());
+            record(&s, &report(2));
+            s.import_app_events(
+                &id(99),
+                &[7; 32],
+                &[
+                    imported(&removal(3, 1), grant),
+                    imported(&dismiss(4, &[2]), grant),
+                ],
+                100,
+            )
+            .unwrap();
+            for rebuild in [false, true] {
+                if rebuild {
+                    s.rebuild_message_timeline_for_group(&id(99)).unwrap();
+                }
+                let m = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+                assert_eq!(m.deleted, applies);
+                assert_eq!(page(&s).reports[0].dismissed, applies);
+            }
+            // A live copy that arrives later with its own verdict settles only a
+            // removal imported without one.
+            record(&s, &removal(3, 1));
+            assert_eq!(
+                s.timeline_message(&id(99), &id(1))
+                    .unwrap()
+                    .unwrap()
+                    .deleted,
+                grant.unwrap_or(true)
+            );
+        }
+    }
 }

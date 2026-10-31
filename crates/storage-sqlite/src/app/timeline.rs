@@ -4,9 +4,11 @@ use cgka_traits::app_event::{
 };
 mod capture;
 pub use capture::ConversationAccountSnapshot;
+mod chat_history;
 mod edits;
 mod opening;
 mod presentation;
+pub use chat_history::{AppEventImport, HistoryExportEvent, HistoryExportRow, ImportedAppEvent};
 pub use edits::{TimelineEditHistoryPage, TimelineEditSummary, TimelineEditVersion};
 pub use opening::{
     ConversationAnchor, ConversationOpenAnchorOutcome, ConversationOpenError,
