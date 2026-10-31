@@ -34,7 +34,20 @@ pub(super) fn roster_device(account: &[u8]) -> Device {
 /// [`roster_device`] over `storage`, as a reopened session builds it. The
 /// caller hydrates its groups.
 pub(super) fn roster_device_on(storage: SqliteAccountStorage, account: &[u8]) -> Device {
-    build_roster_device(storage, account, None)
+    build_roster_device(storage, account, None, Box::<MockPeeler>::default())
+}
+
+/// [`roster_device`] with `peeler` in place of the [`MockPeeler`].
+pub(super) fn roster_device_with_peeler(
+    account: &[u8],
+    peeler: Box<dyn TransportPeeler>,
+) -> Device {
+    build_roster_device(
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        account,
+        None,
+        peeler,
+    )
 }
 
 /// [`roster_device`] on a manual convergence clock.
@@ -43,6 +56,7 @@ fn clocked_roster_device(account: &[u8], clock: &ManualConvergenceClock) -> Devi
         SqliteAccountStorage::in_memory_for_test().unwrap(),
         account,
         Some(clock),
+        Box::<MockPeeler>::default(),
     )
 }
 
@@ -50,6 +64,7 @@ fn build_roster_device(
     storage: SqliteAccountStorage,
     account: &[u8],
     clock: Option<&ManualConvergenceClock>,
+    peeler: Box<dyn TransportPeeler>,
 ) -> Device {
     let mut supported: Vec<_> = default_group_components().into_iter().collect();
     supported.extend([ACCOUNT_DEVICES_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID]);
@@ -59,7 +74,7 @@ fn build_roster_device(
         .protocol_profile(ProtocolProfile::Current)
         .feature_registry(registry())
         .supported_app_components(supported)
-        .peeler(Box::<MockPeeler>::default());
+        .peeler(peeler);
     if let Some(clock) = clock {
         builder = builder.convergence_clock(std::sync::Arc::new(clock.clone()));
     }

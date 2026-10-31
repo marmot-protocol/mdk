@@ -8,7 +8,8 @@
 use super::activation::{buffer_unsettled, queued_intents};
 use super::device_roster::{
     NO_WELCOME_DEADLINE, create_under, entry, expect_link_welcome, found_device_group,
-    key_package_ref, phone_and_laptop, roster, roster_device, roster_of, roster_update, slot,
+    key_package_ref, phone_and_laptop, roster, roster_device, roster_device_with_peeler, roster_of,
+    roster_update, slot,
 };
 use super::send_intents::{pending_proposals, store_pending_add};
 use super::*;
@@ -304,6 +305,51 @@ async fn a_refused_link_leaves_the_group_as_it_was() {
         &gid,
     )
     .await;
+}
+
+/// A link whose Welcome cannot be wrapped is refused before anything is
+/// written. The KeyPackage names no publication, so a peeler that wraps a
+/// Welcome only for a published KeyPackage cannot wrap it. The device group
+/// keeps every row and its record, and no commit is left pending.
+#[tokio::test]
+async fn a_link_whose_welcome_cannot_be_wrapped_writes_nothing() {
+    let mut phone = roster_device_with_peeler(b"alice", Box::<PublishedWelcomesOnly>::default());
+    let gid = found_device_group(&mut phone, &roster(&[(1, "Phone")]), &mut []).await;
+    let key_package = roster_device(b"alice")
+        .engine
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let rows = phone
+        .storage
+        .list_messages(&gid, cgka_traits::types::EpochId(0))
+        .unwrap();
+    let record = phone.engine.group_record(&gid).unwrap();
+
+    let refused = phone
+        .engine
+        .send(link(
+            &gid,
+            &key_package,
+            vec![DeviceRosterOperationV1::SetDevice(
+                slot(2),
+                linked_entry("Laptop", &key_package),
+            )],
+        ))
+        .await;
+    assert!(
+        matches!(refused, Err(EngineError::Peeler(_))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        phone
+            .storage
+            .list_messages(&gid, cgka_traits::types::EpochId(0))
+            .unwrap(),
+        rows
+    );
+    assert_eq!(phone.engine.group_record(&gid).unwrap(), record);
+    assert!(load_group(&phone, &gid).pending_commit().is_none());
 }
 
 #[tokio::test]
