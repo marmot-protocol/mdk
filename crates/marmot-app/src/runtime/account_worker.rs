@@ -501,6 +501,18 @@ pub(crate) enum AccountWorkerCommand {
     CheckSignIns {
         respond: oneshot::Sender<Result<Vec<crate::UnrecognizedSignIn>, AppError>>,
     },
+    StartFresh {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    StartedFresh {
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
+    CompromiseWarning {
+        respond: oneshot::Sender<Result<Vec<crate::CompromiseWarningItem>, AppError>>,
+    },
+    DismissCompromiseWarning {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     RenameLinkedDevice {
         slot_id_hex: String,
         label: String,
@@ -5905,6 +5917,34 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
+        AccountWorkerCommand::StartFresh { respond } => Box::pin(async move {
+            let result = client.start_fresh();
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::StartedFresh { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.started_fresh(),
+            );
+            true
+        }),
+        AccountWorkerCommand::CompromiseWarning { respond } => Box::pin(async move {
+            let result = client.compromise_warning();
+            // A read that gathered announces what it found.
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::DismissCompromiseWarning { respond } => Box::pin(async move {
+            let result = client.dismiss_compromise_warning();
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::RenameLinkedDevice {
             slot_id_hex,
             label,
@@ -8127,7 +8167,8 @@ fn publish_device_group_changes(
 }
 
 /// One `UnrecognizedSignInsChanged` for a check or answer that changed the
-/// unrecognized sign-ins, or a roster change, since the last call. Drained
+/// unrecognized sign-ins, or a roster change, since the last call, and one
+/// `CompromiseWarningChanged` when the compromise warning changed. Drained
 /// at the same seams as [`publish_device_group_changes`].
 fn publish_sign_in_changes(
     client: &mut AppClient,
@@ -8137,6 +8178,12 @@ fn publish_sign_in_changes(
 ) {
     if client.take_unrecognized_sign_ins_changed() {
         let _ = events.send(MarmotAppEvent::UnrecognizedSignInsChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+    if client.take_compromise_warning_changed() {
+        let _ = events.send(MarmotAppEvent::CompromiseWarningChanged {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
         });

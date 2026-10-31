@@ -90,6 +90,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   signs a slot out, and a check of fallback relays, when the account lists none, is never complete. Hosts list sign-ins
   with `unrecognized_sign_ins`, answer one with `answer_sign_in`, and check now with `check_sign_ins`, in `marmot-app`,
   UniFFI and C, and re-read on the `UnrecognizedSignInsChanged` event. Only test-policy builds run any of it.
+- Hosts can warn the user that someone holding the account's signing key published where the account's devices did
+  not (mdk#2628 item 3.7a). `compromise_warning`, in `marmot-app`, UniFFI and C, lists each rejected sign-in and
+  rejected KeyPackage, from this device or its device group's roster, that the user has not seen on this device, with
+  a `CompromiseWarningChanged` event to re-read it. `dismiss_compromise_warning` marks them seen on this device only;
+  a rejection branch selection drops and restores stays seen, and rejections already in a device's first roster count
+  as seen. `start_fresh` lets the user start a device without the devices its first check found, answering each Not
+  now without rejecting it, and `started_fresh` says whether it did. Only test-policy builds run any of it.
 - Hosts can link a new device of the account through pairing (mdk#2628 item 3.3b): `start_device_link`,
   `confirm_device_link_match` and `cancel_device_link` on the new device, `link_device` and `decline_device_link` on a
   device already signed in, and `device_link_snapshot`, in `marmot-app`, UniFFI and C, with a `DeviceLinkChanged`

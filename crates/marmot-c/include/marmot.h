@@ -1464,6 +1464,23 @@ typedef enum MarmotSignInResponse {
   MARMOT_SIGN_IN_RESPONSE_DISMISS,
 } MarmotSignInResponse;
 
+/**
+ * Why something is in the compromise warning. Later releases add
+ * values: show one the host does not know as a generic reason.
+ */
+typedef enum MarmotCompromiseWarningReason {
+  /**
+   * A sign-in the user answered This wasn't me, on this device or
+   * another.
+   */
+  MARMOT_COMPROMISE_WARNING_REASON_REJECTED_SIGN_IN,
+  /**
+   * A KeyPackage one of the account's devices found where they had
+   * not published, and rejected.
+   */
+  MARMOT_COMPROMISE_WARNING_REASON_REJECTED_KEY_PACKAGE,
+} MarmotCompromiseWarningReason;
+
 typedef struct MarmotAccountAttachmentCursor MarmotAccountAttachmentCursor;
 
 typedef struct MarmotAccountAttachmentVersion MarmotAccountAttachmentVersion;
@@ -2848,6 +2865,30 @@ typedef struct MarmotUnrecognizedSignInList {
   struct MarmotUnrecognizedSignIn *items;
   uintptr_t len;
 } MarmotUnrecognizedSignInList;
+
+/**
+ * One thing the open compromise warning gathers. `reason` is a
+ * `MarmotCompromiseWarningReason` discriminant carried as `uint32_t`, so
+ * a host can show a value it does not know as a generic reason.
+ * `slot_id_hex` is the KeyPackage slot the rejection names.
+ * `key_package_ref_hex` is set only for `RejectedKeyPackage`.
+ * `occurred_at` is when the rejection was made, in Unix seconds, as the
+ * device that made it wrote it.
+ */
+typedef struct MarmotCompromiseWarningItem {
+  uint32_t reason;
+  char *slot_id_hex;
+  char *key_package_ref_hex;
+  uint64_t occurred_at;
+} MarmotCompromiseWarningItem;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotCompromiseWarningItemList {
+  struct MarmotCompromiseWarningItem *items;
+  uintptr_t len;
+} MarmotCompromiseWarningItemList;
 
 /**
  * One emoji of the code. `description` is its English description, for
@@ -5792,6 +5833,13 @@ typedef enum MarmotEvent_Tag {
    */
   MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED,
   /**
+   * The account's compromise warning may have changed; re-read
+   * `marmot_compromise_warning`. Also fires once each time the account's
+   * worker opens or reconnects. Carries no slots, and may fire with no
+   * visible change.
+   */
+  MARMOT_EVENT_COMPROMISE_WARNING_CHANGED,
+  /**
    * Linking a new device may have changed as this device shows it;
    * re-read `marmot_device_link_snapshot`. Also fires once each time the
    * account's worker opens or reconnects, which ends any link in
@@ -5885,6 +5933,11 @@ typedef struct MarmotEvent_UnrecognizedSignInsChanged_Body {
   char *account_label;
 } MarmotEvent_UnrecognizedSignInsChanged_Body;
 
+typedef struct MarmotEvent_CompromiseWarningChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_CompromiseWarningChanged_Body;
+
 typedef struct MarmotEvent_DeviceLinkChanged_Body {
   char *account_id_hex;
   char *account_label;
@@ -5907,6 +5960,7 @@ typedef struct MarmotEvent {
     MarmotEvent_LinkedDevicesChanged_Body LINKED_DEVICES_CHANGED;
     MarmotEvent_KeyPackageRefreshOverdueChanged_Body KEY_PACKAGE_REFRESH_OVERDUE_CHANGED;
     MarmotEvent_UnrecognizedSignInsChanged_Body UNRECOGNIZED_SIGN_INS_CHANGED;
+    MarmotEvent_CompromiseWarningChanged_Body COMPROMISE_WARNING_CHANGED;
     MarmotEvent_DeviceLinkChanged_Body DEVICE_LINK_CHANGED;
   };
 } MarmotEvent;
@@ -8023,6 +8077,69 @@ MarmotStatus marmot_unrecognized_sign_ins(const struct MarmotClient *client,
 MarmotStatus marmot_check_sign_ins(const struct MarmotClient *client,
                                    const char *account_ref,
                                    struct MarmotUnrecognizedSignInList **out);
+
+/**
+ * Start this device without the devices its first check found ("No,
+ * start fresh"): each sign-in from before this device is answered Not
+ * now, now and when one is listed later. It rejects nothing and raises
+ * no warning, so one of those devices can still link this one. Fails
+ * before the first check and once this device trusts a device group.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_start_fresh(const struct MarmotClient *client, const char *account_ref);
+
+/**
+ * Whether this device started fresh and still has no device group, so
+ * the host can say that only chats it is invited to from now on are
+ * here. Always false in release builds until the roster's spec lands.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_started_fresh(const struct MarmotClient *client,
+                                  const char *account_ref,
+                                  bool *out);
+
+/**
+ * List the account's open compromise warning on this device: each
+ * rejection the user has not seen here, the earliest gathered first.
+ * Empty when no warning is open. The host writes the wording, and never
+ * says the account's devices stopped whoever holds the key. Always empty
+ * in release builds until the roster's spec lands. Re-read on the
+ * `CompromiseWarningChanged` event. Free with
+ * `marmot_compromise_warning_item_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_compromise_warning(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       struct MarmotCompromiseWarningItemList **out);
+
+/**
+ * Dismiss the compromise warning on this device: everything it gathers
+ * now is seen here, and it stays closed until something new arrives.
+ * Other devices' warnings are unchanged.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_dismiss_compromise_warning(const struct MarmotClient *client,
+                                               const char *account_ref);
 
 /**
  * On a new device: ask a device of this account already signed in to
@@ -13013,6 +13130,15 @@ void marmot_string_list_free(struct MarmotStringList *list);
  * this library.
  */
 void marmot_message_tag_free(struct MarmotMessageTag *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_compromise_warning_item_list_free(struct MarmotCompromiseWarningItemList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

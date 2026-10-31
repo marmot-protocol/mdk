@@ -1491,6 +1491,54 @@ async fn send_checkpoints_are_query_scoped_coherent_and_released_on_close() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_window_hints_its_groups_recovery_routes() {
+    let f = Fixture::new(1).await;
+    let worker = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap();
+    worker.shutdown().await;
+    let mut client = f.app.client("alice").await.unwrap();
+    let group = f.group.as_slice().to_vec();
+    let hinted = |client: &AppClient| {
+        let routes: Vec<_> = client
+            .recovery_runner_routes()
+            .into_iter()
+            .filter(|route| route.group_id.as_ref() == Some(&group))
+            .collect();
+        assert!(!routes.is_empty(), "the group has a route");
+        routes.iter().all(|route| route.window)
+    };
+    assert!(!hinted(&client));
+
+    let capture = Arc::new(SendCapture::new(
+        f.group.clone(),
+        f.store
+            .app_storage()
+            .chat_presentation_version()
+            .unwrap()
+            .store_epoch,
+        ConversationWindowQuery {
+            opening: ConversationOpenQuery {
+                target: ConversationOpenTarget::Latest,
+                limit: 5,
+            },
+            before_anchor: None,
+        },
+    ));
+    client.register_conversation_capture(Some(Arc::downgrade(&capture)));
+    assert!(hinted(&client));
+    drop(capture);
+    assert!(!hinted(&client), "a closed window hints nothing");
+    drop(client);
+    f.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh_read() {
     let f = Fixture::new(5).await;
     let initial = f.open(ConversationOpenTarget::Latest, 5).await.snapshot;

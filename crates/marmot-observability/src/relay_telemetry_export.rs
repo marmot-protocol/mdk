@@ -1907,7 +1907,7 @@ impl RelayTelemetryExporter {
                 // closed rather than push relay identities without the collector
                 // contract.
                 tracing::warn!(
-                    target: "marmot_app::relay_telemetry_export",
+                    target: "marmot_observability::relay_telemetry_export",
                     method = "new",
                     "relay telemetry export disabled: url, authorization, or resource metadata missing",
                 );
@@ -2688,7 +2688,7 @@ impl RelayTelemetryExporter {
             }
         })?;
         tracing::debug!(
-            target: "marmot_app::relay_telemetry_export",
+            target: "marmot_observability::relay_telemetry_export",
             method = "export_once",
             point_count = count,
             "pushed relay telemetry export batch"
@@ -2785,7 +2785,7 @@ impl RelayTelemetryExporter {
                 .is_err()
         {
             tracing::warn!(
-                target: "marmot_app::relay_telemetry_export",
+                target: "marmot_observability::relay_telemetry_export",
                 method = "run",
                 "relay telemetry export push failed"
             );
@@ -2812,7 +2812,7 @@ impl RelayTelemetryExporter {
                         .is_err()
                     {
                         tracing::warn!(
-                            target: "marmot_app::relay_telemetry_export",
+                            target: "marmot_observability::relay_telemetry_export",
                             method = "run",
                             "relay telemetry export push failed"
                         );

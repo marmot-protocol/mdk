@@ -68,6 +68,17 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   discriminant. The new `MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED` event says
   to re-read the list. It is empty in release builds until the roster's spec
   lands. Use matching regenerated headers and libraries.
+- `marmot_compromise_warning` writes the account's open compromise warning on
+  this device as a `MarmotCompromiseWarningItemList` (free with
+  `marmot_compromise_warning_item_list_free`) (mdk#2628 item 3.7a), whose
+  `reason` is a `MarmotCompromiseWarningReason` discriminant as `uint32_t`.
+  `marmot_dismiss_compromise_warning` closes it on this device, and the new
+  `MARMOT_EVENT_COMPROMISE_WARNING_CHANGED` event says to re-read it.
+  `marmot_start_fresh` answers every sign-in from before this device Not now
+  without rejecting any, and `marmot_started_fresh` writes whether the device
+  did so and still has no device group. All are empty or false in release
+  builds until the roster's spec lands. Use matching regenerated headers and
+  libraries.
 - `marmot_account_devices_activation` and `marmot_enable_account_devices` let
   an admin turn on account-devices in an existing group, only when the user
   asks (mdk#2628). The first writes a `MarmotAccountDevicesActivation` that

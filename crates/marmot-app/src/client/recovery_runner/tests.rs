@@ -82,6 +82,9 @@ fn required(route: &Route, relays: &[&str]) -> RunnerRoute {
         group_id: None,
         required: relays.iter().map(|relay| (*relay).to_owned()).collect(),
         best_effort: Vec::new(),
+        unrecoverable: false,
+        window: false,
+        goal_until: None,
     }
 }
 
@@ -907,9 +910,15 @@ struct TestHost {
     debt_turns: AtomicUsize,
     /// How long a NIP-11 read takes.
     caps_latency: Mutex<Duration>,
+    /// Every NIP-11 read is unknown, as a relay that serves no document.
+    caps_unknown: AtomicBool,
     /// Worker turns still to fail, against `closed`.
     failing_turns: AtomicUsize,
     closed: OnceLock<Account>,
+    /// The relay pool's connection generations, by relay.
+    connections: watch::Sender<BTreeMap<String, u64>>,
+    /// Audit rows the runner's worker turns recorded.
+    audited: Mutex<Vec<AuditEventKind>>,
 }
 
 impl TestHost {
@@ -976,8 +985,11 @@ impl TestHost {
                 .collect(),
             debt_turns: AtomicUsize::new(0),
             caps_latency: Mutex::new(Duration::ZERO),
+            caps_unknown: AtomicBool::new(false),
             failing_turns: AtomicUsize::new(0),
             closed: OnceLock::new(),
+            connections: watch::channel(BTreeMap::new()).0,
+            audited: Mutex::default(),
         })
     }
 
@@ -1010,6 +1022,13 @@ impl TestHost {
             .unwrap()
     }
 
+    /// The pool's `relay` connects again (or for the first time).
+    fn connect(&self, relay: &str) {
+        self.connections.send_modify(|open| {
+            *open.entry(relay.to_owned()).or_default() += 1;
+        });
+    }
+
     /// The next `turns` worker turns (not debt turns) run on a closed
     /// database, so every storage call in them fails.
     fn fail_next_turns(&self, turns: usize) {
@@ -1040,9 +1059,11 @@ impl RunnerHost for TestHost {
         } else {
             &self.app
         };
+        let audit = |kind| self.audited.lock().unwrap().push(kind);
         Some(turn(&WorkerTurn {
             app,
             now: self.clock.now(),
+            audit: &audit,
         }))
     }
 
@@ -1075,6 +1096,9 @@ impl RunnerHost for TestHost {
         let latency = *self.caps_latency.lock().unwrap();
         if !latency.is_zero() {
             tokio::time::sleep(latency).await;
+        }
+        if self.caps_unknown.load(Ordering::SeqCst) {
+            return None;
         }
         self.relays.get(relay).and_then(|relay| relay.published)
     }
@@ -1163,6 +1187,10 @@ impl RunnerHost for TestHost {
 
     fn now_seconds(&self) -> u64 {
         self.clock.now()
+    }
+
+    fn relay_connections(&self) -> Option<watch::Receiver<BTreeMap<String, u64>>> {
+        Some(self.connections.subscribe())
     }
 }
 
@@ -1638,6 +1666,33 @@ async fn recovery_runner_serves_held_groups_first_then_small_debts_and_every_gro
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_serves_an_open_conversation_before_smaller_debts() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (open, closed) = (group(1), group(2));
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    account.goal(&open, t0 - DAY);
+    account.goal(&closed, t0 - HOUR);
+    let routes = vec![
+        RunnerRoute {
+            window: true,
+            ..required(&open, &[RELAY])
+        },
+        required(&closed, &[RELAY]),
+    ];
+    let host = TestHost::new(&account, &clock, routes, &[&relay]);
+    for route in [&open, &closed] {
+        host.tails.stand(route, RELAY, t0);
+    }
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    // Without the window the hour would go first, as the smaller debt.
+    assert_eq!(ran(runner.step().await).key.route, open);
+    assert_eq!(ran(runner.step().await).key.route, closed);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_accounts_share_two_credits() {
     let clock = Clock::new();
@@ -1793,6 +1848,50 @@ async fn recovery_runner_breaks_a_unit_after_six_answers_without_progress() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_rearms_nothing_on_an_unknown_caps_read() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let relay = stalling_relay([1; 32], floor).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, handle) = runner(&host, test_policy());
+    let broken = RecoveryUnitState::Broken(RecoveryUnitBreak::NoProgress);
+    let state = || {
+        let unit = account.app.recovery_unit(&route, RELAY).unwrap();
+        unit.map(|unit| unit.state)
+    };
+    while state() != Some(broken) {
+        match runner.step().await {
+            Step::Ran(summary) => assert_eq!(summary.outcome, Outcome::NoProgress),
+            Step::Idle { next_due } => clock.advance_to(next_due.unwrap()),
+            Step::Raced | Step::Stopped => panic!("the unit runs until it breaks"),
+        }
+    }
+    let requests = relay.requests();
+
+    // The relay reconnects without a document: no evidence its caps changed.
+    host.caps_unknown.store(true, Ordering::SeqCst);
+    handle.relay_reconnected(RELAY);
+    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(account.unit(&route, RELAY).state, broken);
+    // Nor is reading the caps it was planned with.
+    host.caps_unknown.store(false, Ordering::SeqCst);
+    handle.relay_reconnected(RELAY);
+    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(account.unit(&route, RELAY).state, broken);
+    assert_eq!(relay.requests(), requests, "a broken unit fetches nothing");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_cools_a_relay_after_three_unreachable_answers() {
     let account = account();
     let clock = Clock::new();
@@ -1869,6 +1968,26 @@ async fn recovery_runner_pauses_the_account_at_its_hourly_cap() {
     assert_eq!(idle(runner.step().await), Some(until));
     assert_eq!(runner.reported_pause, Some(until));
     assert_eq!(relay.requests(), requests);
+    // Once per pause: the next step while paused records nothing more.
+    assert_eq!(idle(runner.step().await), Some(until));
+    let audited = std::mem::take(&mut *host.audited.lock().unwrap());
+    let [
+        AuditEventKind::RecoveryRunnerPaused {
+            cap,
+            attempts,
+            paused_for_secs,
+            pauses,
+            ..
+        },
+    ] = audited.as_slice()
+    else {
+        panic!("one pause row");
+    };
+    assert_eq!(
+        (*cap, *attempts, *paused_for_secs),
+        (RecoveryRunnerCap::Attempts, 2, until - clock.now())
+    );
+    assert!(*pauses >= 1 && recovery_runner_counts().account_pauses >= *pauses);
     let waiting = groups
         .iter()
         .find(|route| served.iter().all(|summary| summary.key.route != **route))
@@ -2259,6 +2378,60 @@ async fn recovery_runner_retries_a_failed_reconnect_before_the_cooldown_ends() {
     task.await.unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_hears_the_pools_reconnects() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, t0 - HOUR);
+    host.tails.stand(&route, RELAY, t0);
+    let mut policy = test_policy();
+    policy.unit.cooldown_base_seconds = HOUR;
+    for _ in 0..policy.unit.cooldown_after_unreachable {
+        account
+            .app
+            .settle_recovery_unit(&route, RELAY, Outcome::Unreachable, &policy.unit, t0)
+            .unwrap();
+    }
+    let cooling = || {
+        account
+            .app
+            .recovery_relay_health(RELAY)
+            .unwrap()
+            .unwrap()
+            .cooldown
+            .is_some()
+    };
+    // The pool publishes the relay's URL as it parsed it, with a slash.
+    let published = format!("{RELAY}/");
+    // A connection made before the runner first looks ends nothing.
+    host.connect(&published);
+    let (runner, handle) = runner(&host, policy);
+    let task = runner.spawn();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(cooling());
+    assert_eq!(relay.requests(), 0, "every unit is cooling");
+
+    // The pool connects it again: the idle task wakes, ends the cooldown,
+    // and the survey that follows reads the tails.
+    let turns = host.debt_turns();
+    host.connect(&published);
+    wait_until("the reconnect", WAIT, || !cooling()).await;
+    wait_until("the sweep", WAIT, || relay.requests() > 0).await;
+    assert!(host.debt_turns() > turns);
+
+    handle.shutdown();
+    task.await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_counts_a_best_effort_attempt_only_when_it_reached_the_relay() {
     let account = account();
@@ -2372,6 +2545,7 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
         rechecks: Vec::new(),
         paused_until: None,
         fenced: BTreeSet::new(),
+        window: BTreeSet::new(),
     };
     let select::Pick::Unit(first) =
         select::pick(survey, &mut memory, &PriorityHints::default(), 0, true)
@@ -3597,6 +3771,58 @@ async fn recovery_runner_gives_back_what_an_unlisted_route_staged() {
     assert_eq!(blocked(host.survey(policy).await).get(RELAY), Some(&false));
 }
 
+/// A group whose copy froze after a sweep staged its history ingests none of
+/// it: admission gives it back, owed again, so it holds no bound either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_gives_back_what_a_suspended_group_staged() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (frozen, other) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    let events = every([1; 32], floor, t0, 10 * 60);
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    for route in [&frozen, &other] {
+        account.goal(route, floor);
+    }
+    account.swept(&frozen, RELAY, &events, floor, t0 - 1);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![
+            RunnerRoute {
+                unrecoverable: true,
+                ..required(&frozen, &[RELAY])
+            },
+            required(&other, &[RELAY]),
+        ],
+        &[&relay],
+    );
+    for route in [&frozen, &other] {
+        host.tails.stand(route, RELAY, t0);
+    }
+    let mut policy = test_policy();
+    policy.staging.account_bytes = 1;
+    assert_eq!(account.staged_from(std::slice::from_ref(&frozen), RELAY), 6);
+
+    let (mut runner, _handle) = runner(&host, policy);
+    assert!(matches!(
+        runner.admit(None).await,
+        Ok(Drained { due: None, .. })
+    ));
+    assert!(
+        account.admitted().is_empty(),
+        "nothing enters the frozen copy"
+    );
+    assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+    assert!(!account.debt(&frozen, RELAY, t0 - 1).is_empty());
+    assert_eq!(
+        blocked(host.survey(policy).await).get(RELAY),
+        Some(&false),
+        "the other group is not held back by the frozen one's rows"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_holds_a_group_behind_an_event_the_engine_kept_no_trace_of() {
     let account = account();
@@ -3780,4 +4006,107 @@ async fn recovery_runner_fetches_nothing_while_admission_waits_after_a_local_fai
     let resumed = ran(runner.step().await);
     assert_eq!((&resumed.key.route, resumed.recheck), (&other, false));
     assert_eq!(account.admitted_events(), failing_events.len() as u64);
+}
+
+/// An Unrecoverable group's route is suspended: no sweep, re-check or
+/// comparison runs for it, nothing is charged, broken or parked, and its debt
+/// stays owed. Once the copy is repaired the route is served again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_suspends_an_unrecoverable_groups_route() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(every([1; 32], floor, t0, 60))
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![RunnerRoute {
+            unrecoverable: true,
+            ..required(&route, &[RELAY])
+        }],
+        &[&relay],
+    );
+    // No re-check has run, so one would be due at once.
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+    let owed = account.debt(&route, RELAY, t0 - 1);
+    assert!(!owed.is_empty());
+
+    assert_eq!(
+        idle(runner.step().await),
+        None,
+        "a suspended route waits for its repair, not for time"
+    );
+    clock.advance(DAY);
+    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(
+        runner.run_pass(Duration::from_secs(30)).await,
+        PassReport::default()
+    );
+    // A unit picked before its group froze does not begin.
+    let key = unit_key(&route, RELAY);
+    let policy = test_policy();
+    assert!(
+        host.debt_turn(move |turn| {
+            select::begin(turn, &key, false, Some(caps(500, true)), true, &policy).unwrap()
+        })
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(relay.requests(), 0);
+    assert!(relay.comparisons().is_empty());
+    assert!(
+        account.app.recovery_unit(&route, RELAY).unwrap().is_none(),
+        "never charged, broken or parked"
+    );
+    assert_eq!(account.debt(&route, RELAY, t0 - 1), owed);
+
+    host.routes.lock().unwrap()[0].unrecoverable = false;
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
+}
+
+/// A retained prior route owes history only through its goal's end: the sweep
+/// stops there, and once that is covered the route owes nothing more, though
+/// no live tail stands after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_owes_a_retained_route_nothing_past_its_goal() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let ceiling = t0 - HOUR / 2;
+    let relay = ModelRelay::new(RELAY, caps(500, false))
+        .with_events(every([1; 32], floor, t0, 60))
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![RunnerRoute {
+            goal_until: Some(ceiling),
+            ..required(&route, &[RELAY])
+        }],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    account.rechecked(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    let outcomes = run_until_idle(&mut runner, 10).await;
+    assert!(!outcomes.is_empty());
+    assert!(outcomes.iter().all(|outcome| *outcome == Outcome::Advanced));
+    assert_eq!(account.covered_through(&route, RELAY), ceiling);
+    assert!(relay.queries().iter().all(|query| query.until <= ceiling));
+    assert_eq!(account.debt(&route, RELAY, ceiling), []);
+
+    let requests = relay.requests();
+    clock.advance(60);
+    assert!(matches!(runner.step().await, Step::Idle { .. }));
+    assert_eq!(relay.requests(), requests);
 }

@@ -165,7 +165,8 @@ async fn a_malformed_or_missing_document_reads_as_unknown_caps() {
             format!(r#"{{"description":"{}"}}"#, "x".repeat(MAX_DOCUMENT_BYTES)),
             Err(Nip11Failure::Malformed),
         ),
-        // JSON without the fields, or with them mistyped, reads as unknown.
+        // JSON without the fields, or with them mistyped, is a document that
+        // advertises nothing: known, unlike a failed read.
         (200, "[500]".to_owned(), Ok(RelayCaps::default())),
         (
             200,
@@ -180,7 +181,8 @@ async fn a_malformed_or_missing_document_reads_as_unknown_caps() {
         assert_eq!(fetch(&no_dns(), &relay, true).await, expected, "{status}");
         assert_eq!(
             cache_with(no_dns()).caps(&relay, true).await,
-            RelayCaps::default()
+            expected.ok(),
+            "{status}"
         );
     }
 }
@@ -199,10 +201,7 @@ async fn a_relay_that_never_answers_times_out_to_unknown_caps() {
     assert_eq!(failure, Nip11Failure::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(server.connections(), 1);
-    assert_eq!(
-        cache_with(short).caps(&server.relay("/"), true).await,
-        RelayCaps::default()
-    );
+    assert_eq!(cache_with(short).caps(&server.relay("/"), true).await, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -286,7 +285,7 @@ async fn caps_are_fetched_once_per_freshness_window() {
     let first = cache.caps(&relay, true).await;
     // Another spelling of the same relay shares its entry.
     let second = cache.caps(&server.relay("").to_uppercase(), true).await;
-    assert_eq!(first.max_limit, Some(500));
+    assert_eq!(first.unwrap().max_limit, Some(500));
     assert_eq!(second, first);
     assert_eq!(server.connections(), 1);
 
@@ -310,8 +309,8 @@ async fn unknown_caps_are_retried_sooner_than_a_document_is_refreshed() {
     let cache = cache_with(no_dns());
     let relay = server.relay("/");
 
-    assert_eq!(cache.caps(&relay, true).await, RelayCaps::default());
-    assert_eq!(cache.caps(&relay, true).await, RelayCaps::default());
+    assert_eq!(cache.caps(&relay, true).await, None);
+    assert_eq!(cache.caps(&relay, true).await, None);
     assert_eq!(server.connections(), 1);
 
     let key = document_url(&relay, true).unwrap();
@@ -338,7 +337,7 @@ async fn concurrent_callers_share_one_fetch() {
 
     let (left, right) = tokio::join!(cache.caps(&relay, true), cache.caps(&relay, true));
 
-    assert_eq!(left.max_limit, Some(500));
+    assert_eq!(left.unwrap().max_limit, Some(500));
     assert_eq!(left, right);
     assert_eq!(server.connections(), 1);
 }
@@ -351,7 +350,7 @@ fn a_full_cache_drops_the_idle_entry_due_soonest() {
         slots.insert(
             key.to_owned(),
             Arc::new(tokio::sync::Mutex::new(Some(CachedCaps {
-                caps: RelayCaps::default(),
+                caps: Some(RelayCaps::default()),
                 fresh_until: now + Duration::from_secs(fresh_for),
             }))),
         );
@@ -400,8 +399,8 @@ async fn the_app_fetches_loopback_relays_only_under_the_dev_flag() {
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
 
-    assert_eq!(production.relay_caps(&relay).await, RelayCaps::default());
+    assert_eq!(production.relay_caps(&relay).await, None);
     assert_eq!(server.connections(), 0);
-    assert_eq!(dev.relay_caps(&relay).await.max_limit, Some(500));
+    assert_eq!(dev.relay_caps(&relay).await.unwrap().max_limit, Some(500));
     assert_eq!(server.connections(), 1);
 }

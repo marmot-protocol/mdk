@@ -695,6 +695,51 @@ fn rearm_tx(
     replace_spans_tx(conn, route, relay, PARKED_SPAN, &[])
 }
 
+/// Retire one gone unit: every span it retired, its parked spans and its
+/// debt through `now_seconds` become route gone, and it retires with a fresh
+/// budget and no fences. Returns whether it held any span or owed anything.
+fn retire_gone_unit_tx(
+    conn: &Connection,
+    unit: &RecoveryUnit,
+    now_seconds: u64,
+) -> StorageResult<bool> {
+    let (kind, id) = unit.route.storage_key();
+    conn.execute_cached(
+        "DELETE FROM account_recovery_unit_fences
+         WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3",
+        params![kind, id, unit.relay],
+    )
+    .storage()?;
+    let mut gone = unit_debt_tx(conn, &unit.route, &unit.relay, now_seconds)?;
+    for kind in [PARKED_SPAN, RETIRED_SPAN] {
+        gone.extend(
+            spans_tx(conn, &unit.route, &unit.relay, kind)?
+                .iter()
+                .map(|span| span.range),
+        );
+    }
+    let gone = union(gone)
+        .into_iter()
+        .map(|range| RecoveryUnitSpan {
+            range,
+            retired: Some(RecoverySpanRetirement::RouteGone),
+        })
+        .collect::<Vec<_>>();
+    if gone.is_empty() {
+        return Ok(false);
+    }
+    replace_spans_tx(conn, &unit.route, &unit.relay, PARKED_SPAN, &[])?;
+    replace_spans_tx(conn, &unit.route, &unit.relay, RETIRED_SPAN, &gone)?;
+    conn.execute_cached(
+        "UPDATE account_recovery_units SET state = ?4, broken_reason = NULL, probe = 0,
+         no_progress = 0, backoff_step = 0, next_attempt_at_seconds = 0, parked_at_seconds = NULL
+         WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3",
+        params![kind, id, unit.relay, RETIRED],
+    )
+    .storage()?;
+    Ok(true)
+}
+
 /// [`SqliteAppStorage::rearm_all_recovery_units`] inside the caller's
 /// transaction.
 pub(crate) fn rearm_all_units_tx(conn: &Connection) -> StorageResult<usize> {
@@ -925,6 +970,12 @@ pub(crate) fn probe_on_uncover_tx(
         let mut kept = Vec::new();
         let mut reopened = Vec::new();
         for span in &retired {
+            // A gone relay's spans reopen only when it carries the route again
+            // (`reopen_returned_recovery_units`).
+            if span.retired == Some(RecoverySpanRetirement::RouteGone) {
+                kept.push(*span);
+                continue;
+            }
             let rest = subtract(span.range, &uncovered);
             reopened.extend(subtract(span.range, &rest));
             kept.extend(rest.into_iter().map(|range| RecoveryUnitSpan {
@@ -1632,6 +1683,81 @@ impl SqliteAppStorage {
                 .storage()?;
             }
             Ok(true)
+        })
+    }
+
+    /// Retire what `relays` owe `route` now that it no longer carries them:
+    /// they left it, or, with `relays` `None`, the route ended and every unit
+    /// of it goes (mdk#2660 section 3). Each unit's retired and parked spans
+    /// and its debt through `now_seconds` are retired as route gone, never
+    /// covered; it retires with a fresh budget and drops its fences. An ended
+    /// route's remainder goes too. So none of it raises a notice, and loss
+    /// reopens none of it, while the relay stays gone. Returns the units
+    /// retired.
+    pub fn retire_gone_recovery_units(
+        &self,
+        route: &TransportReconciliationRoute,
+        relays: Option<&[String]>,
+        now_seconds: u64,
+    ) -> StorageResult<u64> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let (kind, id) = route.storage_key();
+            let mut retired = 0;
+            for unit in units_tx(
+                &conn,
+                "WHERE route_kind = ?1 AND route_id = ?2",
+                params![kind, id],
+            )?
+            .iter()
+            .filter(|unit| relays.is_none_or(|relays| relays.contains(&unit.relay)))
+            {
+                retired += u64::from(retire_gone_unit_tx(&conn, unit, now_seconds)?);
+            }
+            if relays.is_none() {
+                conn.execute_cached(
+                    "DELETE FROM account_recovery_coverage_remainders
+                     WHERE route_kind = ?1 AND route_id = ?2",
+                    params![kind, id],
+                )
+                .storage()?;
+            }
+            Ok(retired)
+        })
+    }
+
+    /// Reopen what each unit `carries` again had retired as route gone: a
+    /// relay added to a route owes its whole goal. The unit is active again
+    /// with a fresh budget. Returns the units reopened.
+    pub fn reopen_returned_recovery_units(
+        &self,
+        carries: impl Fn(&TransportReconciliationRoute, &str) -> bool,
+    ) -> StorageResult<u64> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let gone = units_tx(
+                &conn,
+                "WHERE EXISTS (SELECT 1 FROM account_recovery_unit_spans s
+                    WHERE s.route_kind = account_recovery_units.route_kind
+                      AND s.route_id = account_recovery_units.route_id
+                      AND s.relay = account_recovery_units.relay
+                      AND s.kind = ?1 AND s.reason = ?2)",
+                params![
+                    RETIRED_SPAN,
+                    retirement_code(RecoverySpanRetirement::RouteGone)
+                ],
+            )?;
+            let mut reopened = 0;
+            for unit in gone.iter().filter(|unit| carries(&unit.route, &unit.relay)) {
+                let kept = spans_tx(&conn, &unit.route, &unit.relay, RETIRED_SPAN)?
+                    .into_iter()
+                    .filter(|span| span.retired != Some(RecoverySpanRetirement::RouteGone))
+                    .collect::<Vec<_>>();
+                replace_spans_tx(&conn, &unit.route, &unit.relay, RETIRED_SPAN, &kept)?;
+                rearm_tx(&conn, &unit.route, &unit.relay)?;
+                reopened += 1;
+            }
+            Ok(reopened)
         })
     }
 

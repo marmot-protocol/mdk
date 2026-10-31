@@ -431,6 +431,8 @@ struct CurrentRoute {
     group_id: Option<Vec<u8>>,
     required: Vec<String>,
     best_effort: Vec<String>,
+    /// A retained prior route's goal end ([`crate::retained_route_goal_until`]).
+    goal_until: Option<u64>,
 }
 
 /// The ledger keys relays by one spelling: the adapter and the scope plans
@@ -531,26 +533,29 @@ impl AppClient {
     fn current_coverage_routes(&self) -> Vec<CurrentRoute> {
         let routing = self.routing.snapshot();
         let operated = &self.app.config.deployment.recovery_operated_relays;
-        let current = |route, group_id, endpoints: &[cgka_traits::TransportEndpoint]| {
-            let admitted = self.adapter.recovery_admitted_endpoints(endpoints);
-            let required = relays(&transport_nostr::recovery_required_endpoints(
-                &admitted, operated,
-            ));
-            let best_effort = relays(&admitted)
-                .into_iter()
-                .filter(|relay| !required.contains(relay))
-                .collect();
-            CurrentRoute {
-                route,
-                group_id,
-                required,
-                best_effort,
-            }
-        };
+        let current =
+            |route, group_id, endpoints: &[cgka_traits::TransportEndpoint], goal_until| {
+                let admitted = self.adapter.recovery_admitted_endpoints(endpoints);
+                let required = relays(&transport_nostr::recovery_required_endpoints(
+                    &admitted, operated,
+                ));
+                let best_effort = relays(&admitted)
+                    .into_iter()
+                    .filter(|relay| !required.contains(relay))
+                    .collect();
+                CurrentRoute {
+                    route,
+                    group_id,
+                    required,
+                    best_effort,
+                    goal_until,
+                }
+            };
         let mut routes = vec![current(
             TransportReconciliationRoute::Inbox,
             None,
             &routing.local_inbox_endpoints,
+            None,
         )];
         let mut seen = HashSet::new();
         for entry in &routing.group_routes {
@@ -562,6 +567,7 @@ impl AppClient {
                     TransportReconciliationRoute::Group(id),
                     Some(entry.group_id.as_slice().to_vec()),
                     &entry.endpoints,
+                    entry.retained_since.map(crate::retained_route_goal_until),
                 ));
             }
         }
@@ -571,15 +577,90 @@ impl AppClient {
     /// The account's current routes as its recovery runner reads them, once
     /// per debt turn (mdk#2660 phase 4).
     pub(crate) fn recovery_runner_routes(&self) -> Vec<super::recovery_runner::RunnerRoute> {
+        let windows = self.open_conversation_groups();
         self.current_coverage_routes()
             .into_iter()
             .map(|current| super::recovery_runner::RunnerRoute {
+                unrecoverable: current
+                    .group_id
+                    .as_deref()
+                    .is_some_and(|group_id| self.group_unrecoverable(group_id)),
+                window: current
+                    .group_id
+                    .as_ref()
+                    .is_some_and(|group_id| windows.contains(group_id)),
                 route: current.route,
                 group_id: current.group_id,
                 required: current.required,
                 best_effort: current.best_effort,
+                goal_until: current.goal_until,
             })
             .collect()
+    }
+
+    /// Settle what routing replacements changed since the recovery runner's
+    /// last debt turn (mdk#2660 section 3). A (route, relay) a replacement
+    /// dropped is retired as gone once this turn confirms it: the routes still
+    /// do not carry it, and its group is terminal or still has a route
+    /// installed (the inbox: still has a relay). A group left with none may
+    /// only be waiting to hydrate, so its drop is forgotten. A relay the
+    /// routes carry again owes its whole goal. It runs at the start of a debt
+    /// turn, between the owner's commands, so a command that drops a route and
+    /// restores it settles nothing. A failed write keeps the changes for the
+    /// next turn.
+    pub(crate) fn settle_recovery_route_changes(&self, app: &SqliteAppStorage, now: u64) {
+        let Some(changes) = self.routing.take_route_changes() else {
+            return;
+        };
+        if changes.dropped.is_empty() && !changes.changed {
+            return;
+        }
+        let routing = self.routing.snapshot();
+        let carried =
+            crate::ledger_route_pairs(&routing.group_routes, &routing.local_inbox_endpoints);
+        let mut gone: BTreeMap<&TransportReconciliationRoute, Vec<String>> = BTreeMap::new();
+        for (group, route, relay) in &changes.dropped {
+            if carried.contains(&(route.clone(), relay.clone())) {
+                continue;
+            }
+            let confirmed = match group {
+                Some(group) => {
+                    let group = cgka_traits::GroupId::new(group.clone());
+                    super::group_is_terminal(&self.runtime, &group)
+                        || routing
+                            .group_routes
+                            .iter()
+                            .any(|route| route.group_id == group)
+                }
+                None => !routing.local_inbox_endpoints.is_empty(),
+            };
+            if confirmed {
+                gone.entry(route).or_default().push(relay.clone());
+            }
+        }
+        let settled = (|| {
+            for (route, relays) in &gone {
+                let ended = !carried.iter().any(|(carried, _)| carried == *route);
+                app.retire_gone_recovery_units(route, (!ended).then_some(relays), now)?;
+            }
+            app.reopen_returned_recovery_units(|route, relay| {
+                carried.contains(&(route.clone(), relay.to_owned()))
+            })?;
+            Ok::<_, cgka_traits::storage::StorageError>(())
+        })();
+        if let Err(error) = settled {
+            log_failure("settle_recovery_route_changes", &AppError::from(error));
+            self.routing.restore_route_changes(changes);
+        }
+    }
+
+    /// Whether the group's local copy is Unrecoverable, which suspends its
+    /// recovery (mdk#2660 section 6). A group whose record cannot be read is
+    /// not suspended.
+    pub(crate) fn group_unrecoverable(&self, group_id: &[u8]) -> bool {
+        self.runtime
+            .group_record(&cgka_traits::GroupId::new(group_id.to_vec()))
+            .is_ok_and(|group| group.unrecoverable)
     }
 
     fn coverage_storage(&self) -> Result<storage_sqlite::SqliteAccountStorage, AppError> {
