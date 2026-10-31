@@ -64,7 +64,9 @@ impl AppClient {
     /// window above it is covered, that is once the runner has surveyed and
     /// catches up none of the route's units. A broken unit on a relay the
     /// route carries only as best effort, or no longer, owes nothing, so it
-    /// raises none; a remainder is the route's. A group route's notice names
+    /// raises none; a remainder is the route's, and its notice carries the
+    /// route's whole park revision, so dismissing it also dismisses such a
+    /// unit. A group route's notice names
     /// its group; one that is no current route's, a suspended group's, or one
     /// the host may not see, is left out.
     pub(crate) fn ledger_notices(
@@ -81,16 +83,19 @@ impl AppClient {
             .map(|route| (route.route, (route.group_id, route.required)))
             .collect::<BTreeMap<_, _>>();
         let catching_up = self.routing.recovery_runner_catching_up_now();
-        let mut parked = app
-            .parked_recovery_routes()?
-            .into_iter()
-            .filter(|parked| {
-                routes.get(&parked.route).is_some_and(|(_, required)| {
-                    parked.relays.iter().any(|relay| required.contains(relay))
-                })
-            })
-            .map(|parked| (parked.route, (parked.revision, parked.parked_at_seconds)))
-            .collect::<BTreeMap<_, _>>();
+        // Every notice carries its route's whole park revision, a park it
+        // does not show included, as dismissal checks that.
+        let mut revisions = BTreeMap::new();
+        let mut parked = BTreeMap::new();
+        for park in app.parked_recovery_routes()? {
+            let shown = routes.get(&park.route).is_some_and(|(_, required)| {
+                park.relays.iter().any(|relay| required.contains(relay))
+            });
+            if shown {
+                parked.insert(park.route.clone(), (park.revision, park.parked_at_seconds));
+            }
+            revisions.insert(park.route, park.revision);
+        }
         for remainder in app.recovery_coverage_remainders()? {
             if let Some((_, parked_at)) = parked.get_mut(&remainder.route) {
                 // Its revision already counts the remainder's.
@@ -99,10 +104,11 @@ impl AppClient {
                 .as_ref()
                 .is_some_and(|units| !units.iter().any(|unit| unit.route == remainder.route))
             {
-                parked.insert(
-                    remainder.route,
-                    (remainder.revision, remainder.parked_at_seconds),
-                );
+                let revision = revisions
+                    .get(&remainder.route)
+                    .copied()
+                    .unwrap_or(remainder.revision);
+                parked.insert(remainder.route, (revision, remainder.parked_at_seconds));
             }
         }
         let mut notices = parked

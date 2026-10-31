@@ -660,11 +660,11 @@ async fn a_worker_repair_re_arms_after_the_quantum_in_flight_settles() {
 fn a_cancel_wins_over_a_covered_window_and_a_covered_window_over_the_deadline() {
     use super::super::{PassBound, RepairEnd};
     use super::verdict_end;
-    let _runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
-        .unwrap()
-        .enter();
+        .unwrap();
+    let _entered = runtime.enter();
     let cancelled = PassBound::within(Duration::from_secs(60));
     cancelled.stop.cancel();
     assert!(matches!(

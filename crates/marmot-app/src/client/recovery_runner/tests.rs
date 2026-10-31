@@ -4330,14 +4330,14 @@ async fn recovery_runner_repair_never_covers_a_route_with_no_required_relay() {
 /// A retained route whose goal ended below the retention floor has nothing
 /// a re-check could search, so the survey schedules none, and a repair's
 /// verdict waits for none on its relay that compares: the repair ends with
-/// the window covered.
+/// the window covered, having compared nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_repair_waits_for_no_recheck_the_survey_never_schedules() {
     let account = account();
     let clock = Clock::new();
     let t0 = clock.now();
     let route = group(1);
-    let floor = t0 - HOUR;
+    let floor = t0 - storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS;
     account
         .app
         .record_recovery_relay_caps(
@@ -4354,18 +4354,20 @@ async fn recovery_runner_repair_waits_for_no_recheck_the_survey_never_schedules(
         &account,
         &clock,
         vec![RunnerRoute {
-            goal_until: Some(floor - HOUR / 2),
+            goal_until: Some(floor - HOUR),
             ..required(&route, &[RELAY])
         }],
         &[&relay],
     );
-    account.goal(&route, floor);
+    account.goal(&route, floor - 2 * HOUR);
     let (mut runner, _handle) = runner(&host, test_policy());
 
     let end = runner
         .repair(&super::PassBound::within(Duration::from_secs(60)))
         .await;
     assert!(matches!(end, super::RepairEnd::Covered));
+    // Its debt below the floor was swept; nothing above it was compared.
+    assert!(relay.comparisons().is_empty(), "no re-check");
 }
 
 /// An explicit repair judges a retained route's window only through its

@@ -439,6 +439,66 @@ async fn a_park_on_a_relay_the_route_carries_only_as_best_effort_is_no_notice() 
     assert_eq!(notices[0].group_id_hex, Some(hex::encode(group.as_slice())));
 }
 
+/// A remainder's notice carries its route's whole park revision, a newer park
+/// on a best-effort relay that shows no notice of its own included, so
+/// dismissing it works and clears both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remainder_notice_behind_a_best_effort_park_is_dismissable() {
+    const OPERATED: &str = "wss://operated.example";
+    const BEST_EFFORT: &str = "wss://best-effort.example";
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relays_and_config(
+        dir.path(),
+        vec![RELAY.into()],
+        crate::MarmotAppConfig::white_noise()
+            .with_open_ranking_provider(None, Vec::new())
+            .with_recovery_operated_relays(vec![OPERATED.into()]),
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()))
+    .with_recovery_runner_owning_debt();
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client
+        .create_group_with_options(
+            "best effort",
+            &[],
+            crate::AppCreateGroupOptions {
+                relays: Some(vec![OPERATED.into(), BEST_EFFORT.into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let route = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
+        .unwrap()
+        .route;
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    let now = crate::unix_now_seconds();
+    storage
+        .widen_recovery_coverage_goals(std::slice::from_ref(&route), now - 2 * DAY)
+        .unwrap();
+    storage
+        .prune_recovery_coverage(now - DAY, &[(route.clone(), vec![OPERATED.to_owned()])])
+        .unwrap();
+    park_on(&storage, &route, BEST_EFFORT);
+    catching_up(&client, &[]);
+
+    let notices = client.history_notices().unwrap();
+    assert_eq!(notices.len(), 1, "the remainder's notice");
+    assert!(
+        client
+            .dismiss_history_notice(&notices[0].notice_id)
+            .unwrap()
+    );
+    assert!(client.history_notices().unwrap().is_empty());
+    assert!(storage.parked_recovery_routes().unwrap().is_empty());
+}
+
 /// The status reports the groups and inbox the runner's last survey found
 /// catching up. A survey change the worker saw, or a notice change, owes
 /// hosts one announcement.
