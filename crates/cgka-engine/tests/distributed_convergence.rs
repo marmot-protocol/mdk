@@ -11593,7 +11593,6 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
                     content_id: cgka_traits::MessageId::new(vec![0xd0 + n; 32]),
                     welcomer: inviter.self_id(),
                     local_state_token: vec![0; 32],
-                    sibling: None,
                 }),
             })
             .unwrap();

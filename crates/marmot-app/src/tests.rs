@@ -118,7 +118,6 @@ async fn rejoin_eviction_invalidates_both_group_projections_without_mls_reads() 
             content_id: cgka_traits::MessageId::new(vec![0xe2; 32]),
             welcomer: client.runtime.session().self_id(),
             local_state_token: vec![],
-            sibling: None,
         }),
     };
     storage.put_welcome(&old).unwrap();
@@ -181,7 +180,6 @@ async fn rejoin_decline_does_not_require_live_mls_state() {
                 content_id: content_id.clone(),
                 welcomer: client.runtime.session().self_id(),
                 local_state_token: vec![],
-                sibling: None,
             }),
         })
         .unwrap();
