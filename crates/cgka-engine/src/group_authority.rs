@@ -25,6 +25,10 @@ pub struct GroupAuthorityFacts {
     pub epoch: EpochId,
     pub member_count: usize,
     pub is_member: bool,
+    /// Whether the record's members list this account, terminal or not. A
+    /// removed copy that still lists it lost only this device's leaf while
+    /// the account stays in the group (mdk#2628 D62).
+    pub account_listed: bool,
     /// Canonical admin policy membership gated by `is_member`. A staged
     /// membership change can suppress this before the admin policy changes.
     pub is_admin: bool,
@@ -116,14 +120,15 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
     ) -> Result<GroupAuthorityFacts, EngineError> {
         let group = self.storage.get_group(group_id)?;
+        let account_listed = group
+            .members
+            .iter()
+            .any(|m| &m.id == self.identity.self_id());
         let mut facts = GroupAuthorityFacts {
             epoch: group.epoch,
             member_count: group.members.len(),
-            is_member: !group.is_terminal()
-                && group
-                    .members
-                    .iter()
-                    .any(|m| &m.id == self.identity.self_id()),
+            is_member: !group.is_terminal() && account_listed,
+            account_listed,
             is_admin: false,
             admin_count: 0,
             removed: group.removed,

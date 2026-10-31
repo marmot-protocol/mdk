@@ -66,17 +66,21 @@ pub(crate) fn chat_mute_is_effective(
 /// The local account's own membership in a projected group.
 ///
 /// `Member` is the default and the fallback for unknown/forward-incompatible
-/// state: uncertainty must never hide a conversation. `Left` and `Removed` are
-/// both terminal "no longer a member" states that suppress the account's unread
-/// aggregate; they differ only in *why* membership ended — `Left` is a
-/// voluntary self-removal (including declining an invite), `Removed` is an
-/// eviction by another member.
+/// state: uncertainty must never hide a conversation. `Left`, `Removed` and
+/// `DeviceRemoved` are terminal "no longer a member on this device" states
+/// that suppress the account's unread aggregate; they differ only in *why*
+/// membership ended — `Left` is a voluntary self-removal (including declining
+/// an invite), `Removed` is an eviction of the account by another member, and
+/// `DeviceRemoved` is the removal of this device's leaf while the account
+/// keeps another device in the group (mdk#2628 D62), which hosts do not show
+/// as a removal from the group.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelfMembership {
     #[default]
     Member,
     Left,
     Removed,
+    DeviceRemoved,
 }
 
 impl SelfMembership {
@@ -86,6 +90,7 @@ impl SelfMembership {
             SelfMembership::Member => "member",
             SelfMembership::Left => "left",
             SelfMembership::Removed => "removed",
+            SelfMembership::DeviceRemoved => "device_removed",
         }
     }
 
@@ -95,8 +100,14 @@ impl SelfMembership {
         match value {
             "left" => SelfMembership::Left,
             "removed" => SelfMembership::Removed,
+            "device_removed" => SelfMembership::DeviceRemoved,
             _ => SelfMembership::Member,
         }
+    }
+
+    /// Whether this device is no longer a member, for whatever reason.
+    pub fn departed(self) -> bool {
+        self != SelfMembership::Member
     }
 }
 
@@ -1748,10 +1759,9 @@ impl SqliteAppStorage {
     /// Returns whether this transitioned an existing departed projection back to Member.
     pub fn restore_group_self_membership(&self, group_id_hex: &str) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
-            let departed = matches!(
-                self.group_self_membership(group_id_hex)?,
-                Some(SelfMembership::Left | SelfMembership::Removed)
-            );
+            let departed = self
+                .group_self_membership(group_id_hex)?
+                .is_some_and(SelfMembership::departed);
             if departed {
                 self.lock()?
                     .execute_cached(
@@ -1768,8 +1778,8 @@ impl SqliteAppStorage {
 
     /// Record the local account's own membership in `group_id_hex` so the
     /// chat list and removed-group-suppressed unread aggregate reflect whether
-    /// the account is still in the group and, if not, how it left. `Left` and
-    /// `Removed` both suppress the group's unread; `Member` re-affirms it
+    /// the account is still in the group and, if not, how it left. Every
+    /// departed state suppresses the group's unread; `Member` re-affirms it
     /// (preserve / un-suppress on re-add). No-op when the group has no
     /// `account_groups` row yet, so this never resurrects pruned projection
     /// state.
@@ -1820,7 +1830,7 @@ impl SqliteAppStorage {
                         .storage()?;
                     }
                 }
-                SelfMembership::Left | SelfMembership::Removed => {
+                SelfMembership::Left | SelfMembership::Removed | SelfMembership::DeviceRemoved => {
                     conn.execute_cached(
                         "DELETE FROM pending_push_registration_shares
                          WHERE group_id_hex = ?1",

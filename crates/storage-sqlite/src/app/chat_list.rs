@@ -1458,6 +1458,7 @@ fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
                    OR row.self_membership IS NOT CASE ag.self_membership
                         WHEN 'left' THEN 'left'
                         WHEN 'removed' THEN 'removed'
+                        WHEN 'device_removed' THEN 'device_removed'
                         ELSE 'member'
                       END
                    OR row.conversation_created_at IS NOT ag.conversation_created_at

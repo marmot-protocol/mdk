@@ -505,12 +505,15 @@ typedef enum MarmotEncryptedMediaVersion {
 
 /**
  * Whether the local account is still a member of this group, and if
- * not, whether it left voluntarily or was removed.
+ * not, whether it left voluntarily or was removed. `DeviceRemoved`: this
+ * device's leaf was removed while the account keeps another device in
+ * the group, which is not a removal from the group.
  */
 typedef enum MarmotSelfMembership {
   MARMOT_SELF_MEMBERSHIP_MEMBER,
   MARMOT_SELF_MEMBERSHIP_LEFT,
   MARMOT_SELF_MEMBERSHIP_REMOVED,
+  MARMOT_SELF_MEMBERSHIP_DEVICE_REMOVED,
 } MarmotSelfMembership;
 
 /**
@@ -1197,6 +1200,7 @@ typedef enum MarmotConversationParticipation {
   MARMOT_CONVERSATION_PARTICIPATION_REMOVED,
   MARMOT_CONVERSATION_PARTICIPATION_DISBANDED,
   MARMOT_CONVERSATION_PARTICIPATION_UNAVAILABLE,
+  MARMOT_CONVERSATION_PARTICIPATION_DEVICE_REMOVED,
 } MarmotConversationParticipation;
 
 typedef enum MarmotConversationAnchorKind {

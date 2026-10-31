@@ -304,6 +304,8 @@ mod migration_0143_device_activity;
 mod migration_0144_announced_key_packages;
 #[path = "migrations/0146_device_removals.rs"]
 mod migration_0146_device_removals;
+#[path = "migrations/0147_device_removed_membership.rs"]
+mod migration_0147_device_removed_membership;
 #[path = "migrations/0148_compromise_warning.rs"]
 mod migration_0148_compromise_warning;
 #[path = "migrations/0161_small_state.rs"]
@@ -1198,6 +1200,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0146_device_removals",
         suspend_foreign_keys: &[],
         apply: migration_0146_device_removals::apply,
+    },
+    Migration {
+        version: 147,
+        name: "0147_device_removed_membership",
+        suspend_foreign_keys: &[],
+        apply: migration_0147_device_removed_membership::apply,
     },
     Migration {
         version: 148,

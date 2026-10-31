@@ -574,6 +574,7 @@ pub(crate) fn group_management_state_ffi(
             SelfMembershipFfi::Member => marmot_app::SelfMembership::Member,
             SelfMembershipFfi::Left => marmot_app::SelfMembership::Left,
             SelfMembershipFfi::Removed => marmot_app::SelfMembership::Removed,
+            SelfMembershipFfi::DeviceRemoved => marmot_app::SelfMembership::DeviceRemoved,
         },
         is_admin: self_member.is_some_and(|member| member.is_admin),
         admin_count,

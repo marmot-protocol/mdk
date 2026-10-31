@@ -27,8 +27,15 @@
   `started_fresh`, and `trust_device_group`, which makes a device group
   trusted and takes its roster as this device's first in one transaction.
   `insert_device_group` and `set_device_group_trust` now refuse a trusted
-  state. The numbers below 148 that are not yet used (145 and 147) belong
-  to other work, which lands later; the runner applies them in order.
+  state. The number below 148 that is not yet used (145) belongs to other
+  work, which lands later; the runner applies it in order.
+- Migration 0147 advances account storage to schema 147 (mdk#2628 item
+  3.6b). `SelfMembership` adds `DeviceRemoved`, stored as `device_removed`:
+  this device's leaf was removed from a chat the account stays in. The
+  migration recreates the chat-list triggers so such a chat lists with the
+  departed chats, and setting it suppresses the chat's unread like the other
+  departed states.
+
 - Migration 0161 advances account storage to schema 161 (mdk#2628 item 4.3).
   It adds `small_state_items`, one row per chat and item (`read`, `pin`,
   `mute`, `archive`) holding the value the account's devices agree on, what

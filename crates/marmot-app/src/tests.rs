@@ -17038,10 +17038,13 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("drained replay", &[]).await.unwrap();
-    // The replay fixture represents an already terminal canonical copy.
+    // The replay fixture represents an already terminal canonical copy the
+    // account was removed from, so the account is off its roster.
     let storage = app.account_storage("alice").unwrap();
     let mut terminal = storage.get_group(&group_id).unwrap();
     terminal.removed = true;
+    let self_id = client.runtime.self_id();
+    terminal.members.retain(|member| member.id != self_id);
     storage.put_group(&terminal).unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
 

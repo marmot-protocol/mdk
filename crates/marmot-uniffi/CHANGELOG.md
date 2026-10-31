@@ -4,6 +4,12 @@
 
 ### Breaking changes
 
+- `SelfMembershipFfi` and `ConversationParticipationFfi` add `DeviceRemoved`
+  (mdk#2628 item 3.6b): this device's leaf was removed from a chat the account
+  stays in through another of its devices. Show no "removed from group"
+  notice for it. Update exhaustive Swift/Kotlin handling and regenerate
+  bindings with the matching native library.
+
 - `GroupEventKindFfi` adds `QueuedIntentRefused { intent_id_hex, intent_kind,
   reason }` (mdk#2694): a send that waited for the group to settle was dropped
   because the settled state refused it; tell the user, who may try again.

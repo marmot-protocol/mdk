@@ -2286,6 +2286,132 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
     send_app(&mut carol, &group_id, b"post-reorg send".to_vec()).await;
 }
 
+/// A host's advance never converges a removed copy again. Once the advance
+/// that realized this device's removal has returned, a same-epoch rival that
+/// would win stays unresolved and the copy stays removed: every host advance
+/// stops at the terminal gate, and ingest refuses new input for the copy. Only
+/// the stored-convergence call above
+/// (`superseded_self_removal_clears_removed_marker_and_restores_send`) reaches
+/// a pass that clears the marker. A device removed from its device group
+/// treats its removal as final from here on (mdk#2628 3.6b-1b).
+#[tokio::test]
+async fn a_host_advance_never_converges_a_removed_copy_again() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-removed-copy-stays-removed".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    // The rename goes to the committer the tie-break favours, so the removal
+    // loses whenever a pass holds both.
+    let (mut renamer, mut remover) =
+        if commit_tiebreak_winner_index(&alice.self_id(), &bob.self_id()) == 0 {
+            (alice, bob)
+        } else {
+            (bob, alice)
+        };
+    let remove_res = remover
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![carol.self_id()],
+        })
+        .await
+        .unwrap();
+    let (remove_commit, remove_pending) = evolution(remove_res);
+    remover.confirm_published(remove_pending).await.unwrap();
+    let rename_res = renamer
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("name after reorg".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (rename_commit, rename_pending) = evolution(rename_res);
+    renamer.confirm_published(rename_pending).await.unwrap();
+    let remove_commit = route(remove_commit, &group_id);
+    let rename_commit = route(rename_commit, &group_id);
+
+    carol.ingest(remove_commit).await.unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("removal branch applies");
+    assert!(carol_storage.get_group(&group_id).unwrap().removed);
+    carol.drain_events();
+
+    // The winning rival is held in stored convergence, as in the test above.
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, rename_commit.clone(), 1_001_000)
+        .expect("sibling rename commit buffered");
+    assert!(carol.has_pending_convergence_inputs(&group_id).unwrap());
+
+    // Both host entry points run on the engine's clock, now well past the
+    // rival's settlement window, and leave the copy as it is.
+    clock.advance_ms(10_000_000);
+    assert!(
+        carol
+            .advance_convergence(&group_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a removed copy drains nothing"
+    );
+    assert!(!carol.advance_convergence_inputs(&group_id).await.unwrap());
+
+    let group = carol_storage.get_group(&group_id).unwrap();
+    assert!(group.removed, "the removal stays realized");
+    assert_eq!(group.epoch, EpochId(2));
+    assert_ne!(group.name, "name after reorg");
+    assert!(
+        carol.has_pending_convergence_inputs(&group_id).unwrap(),
+        "the rival stays unresolved"
+    );
+    let events = carol.drain_events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::LocalGroupCopyRestored { .. })),
+        "a removed copy is not restored by a host advance: {events:?}"
+    );
+
+    // The rival does win: the stored-convergence call settles on it and clears
+    // the marker, so the host advances above held back a winner.
+    let result = carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("reorg over the superseded removal");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(result.accepted_commits, vec![content_hex(&rename_commit)]);
+    assert!(!carol_storage.get_group(&group_id).unwrap().removed);
+}
+
 /// State-derived inverse of `realize_self_eviction`: a `removed` marker that
 /// survives WITHOUT canonical evidence — the selected canonical branch
 /// records our membership — is reconciled by the next convergence apply. The
