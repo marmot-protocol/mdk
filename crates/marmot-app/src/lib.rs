@@ -1961,8 +1961,11 @@ impl MarmotApp {
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
         }
-        self.finish_client_open_network_maintenance(&mut client)
-            .await;
+        // An unlinked client does no maintenance (mdk#2628 D67).
+        if !client.device_unlinked() {
+            self.finish_client_open_network_maintenance(&mut client)
+                .await;
+        }
         // Seated here, where the client is already held: in `client()` the
         // extra await would copy the client through its stack, gate off or
         // not.
@@ -2271,6 +2274,7 @@ impl MarmotApp {
         // Hosts read the notice list after open; later changes raise an event.
         client.take_history_notice_changes();
         client.sync_key_package_announcement_group()?;
+        client.note_stored_device_group_removal();
         Ok(client)
     }
 
@@ -7875,6 +7879,21 @@ impl MarmotApp {
             .entry(account_id_hex.to_owned())
             .or_default()
             .clone()
+    }
+
+    /// Whether this device may no longer publish for the account: its device
+    /// group unlinked this device (mdk#2628 D67). For publishers that do not
+    /// come from [`Self::relay_client_for_account_id`].
+    pub(crate) fn account_publishing_stopped(&self, account_id_hex: &str) -> bool {
+        self.unlinked_publish_stops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(account_id_hex)
+            .is_some_and(|stop| stop.load(Ordering::Acquire))
+            || self
+                .account_home()
+                .account(account_id_hex)
+                .is_ok_and(|account| account.unlinked)
     }
 
     /// Forget a removed account's publish stop. Publishers already handed

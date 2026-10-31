@@ -670,6 +670,62 @@ async fn a_client_kept_after_its_unlink_publishes_nothing() {
 
 /// The laptop's engine applies its removal but the app never notes it, as
 /// after a crash between the two (here, device groups are off when it is
+/// applied). A caller then opens its client directly, without the runtime or
+/// a pairing drive. The open notes the removal, so the client is stopped
+/// before the caller can send in the chat it is still in (D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_opened_after_an_unnoted_removal_is_stopped() {
+    let (mut devices, group) = tagging_devices().await;
+    let chat = chat_with_both(&mut devices).await;
+    let mut laptop_cursor = published_count(&devices.relay);
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        laptop_app,
+        mut laptop,
+        ..
+    } = devices;
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    commit_removal_decided_elsewhere(&mut phone, &group, slot_of(&laptop)).await;
+    drop((laptop, laptop_app, phone));
+    let off = MarmotApp::with_relay_and_config(
+        _dirs[1].path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0),
+    )
+    .with_test_relay_client(relay.clone());
+    let mut laptop = off.client("alice").await.unwrap();
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    assert!(laptop.runtime.group_record(&group).unwrap().removed);
+    assert!(!laptop.device_unlinked());
+    drop((laptop, off));
+
+    let laptop_app = device_group_app_at(&_dirs[1], relay.clone());
+    let attempted = relay.attempted_events().len();
+    let mut laptop = laptop_app.client("alice").await.unwrap();
+    assert!(laptop.device_unlinked(), "the open notes the removal");
+    let account = laptop_app.account_home().account("alice").unwrap();
+    assert!(account.unlinked && account.signed_out);
+    assert!(
+        !laptop.runtime.group_record(&chat).unwrap().removed,
+        "the laptop is still in the chat"
+    );
+    let sent = laptop.send(&chat, b"still here").await.unwrap();
+    assert_eq!(sent.published, 0, "the message is not published");
+    assert_eq!(
+        relay.attempted_events().len(),
+        attempted,
+        "nothing goes out"
+    );
+}
+
+/// The laptop's engine applies its removal but the app never notes it, as
+/// after a crash between the two (here, device groups are off when it is
 /// applied). Started again under the runtime, its worker follows the removal
 /// before its catch-up: the account is unlinked and deactivated, and nothing
 /// goes out from it (D67).

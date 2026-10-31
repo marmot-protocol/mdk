@@ -713,6 +713,85 @@ async fn an_unlinked_device_stops_its_account_for_good() {
     runtime.shutdown().await;
 }
 
+/// The wipe of an unlinked account commits its removal, then fails to remove
+/// its secret. The account is gone all the same, so its publish stop goes
+/// with it: the same account linked again here publishes (mdk#2628 D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() {
+    use marmot_account::{
+        AccountHomeResult, AccountSecretStore, AccountSummary, LocalFileSecretStore,
+    };
+
+    struct FailSecretRemoval(LocalFileSecretStore);
+    impl AccountSecretStore for FailSecretRemoval {
+        fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
+            self.0.has_secret_for_label(label)
+        }
+        fn write_secret(
+            &self,
+            account: &AccountSummary,
+            keys: &nostr::prelude::Keys,
+        ) -> AccountHomeResult<()> {
+            self.0.write_secret(account, keys)
+        }
+        fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::prelude::Keys> {
+            self.0.load_secret(account)
+        }
+        fn remove_secret(&self, _account: &AccountSummary) -> AccountHomeResult<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let home = AccountHome::open_with_secret_store(
+        root.path(),
+        Arc::new(FailSecretRemoval(LocalFileSecretStore::new(root.path()))),
+    );
+    home.create_account("alice").unwrap();
+    let keys = home.load_signing_keys("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays_and_account_home_and_config(
+        root.path(),
+        vec!["wss://unlink.example".to_owned()],
+        home,
+        crate::MarmotAppConfig::white_noise().with_dev_settlement_quiescence_ms(0),
+    )
+    .with_test_relay_client(relay.clone());
+    let runtime = app.runtime();
+    runtime.reconcile_accounts().await.unwrap();
+    let managed = || runtime.accounts().managed_accounts().unwrap();
+    runtime
+        .accounts()
+        .unlink_device_for_test("alice")
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while managed()[0].running {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the runtime deactivates the account");
+
+    let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
+    assert!(!outcome.local_cleanup.completed, "the secret is kept");
+    assert!(app.account_home().accounts().unwrap().is_empty());
+
+    let attempted = relay.attempted_events().len();
+    app.account_home()
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while relay.attempted_events().len() == attempted {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the account linked again publishes");
+    runtime.shutdown().await;
+}
+
 #[test]
 fn generated_setup_context_round_trips_inbox_relays_and_reads_legacy_contexts() {
     let request = AccountSetupRequest {

@@ -539,7 +539,7 @@ impl MarmotApp {
         drop(work);
 
         let outcome = tokio::select! {
-            outcome = self.publish_moderation_wrap(&config, &event) => outcome,
+            outcome = self.publish_moderation_wrap(&account.account_id_hex, &config, &event) => outcome,
             _ = generation_changed(&mut generation) => {
                 // The purge that bumped the generation deletes the staged row.
                 return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
@@ -641,7 +641,7 @@ impl MarmotApp {
                 continue;
             }
             let outcome = tokio::select! {
-                outcome = self.publish_moderation_wrap(&config, &event) => outcome,
+                outcome = self.publish_moderation_wrap(&account.account_id_hex, &config, &event) => outcome,
                 _ = generation_changed(&mut generation) => break,
                 _ = runtime_stopping(&mut stopping) => break,
             };
@@ -733,9 +733,16 @@ impl MarmotApp {
 
     async fn publish_moderation_wrap(
         &self,
+        account_id_hex: &str,
         config: &ValidatedModerationReportConfig,
         event: &NostrTransportEvent,
     ) -> ModerationReportOutboxOutcome {
+        // The wrap goes out through an anonymous publisher, which the
+        // account's publish stop does not cover. An unlinked account's report
+        // stays queued until its sign-out purges it (mdk#2628 D67).
+        if self.account_publishing_stopped(account_id_hex) {
+            return ModerationReportOutboxOutcome::AcceptedPending;
+        }
         // Re-check at the dial chokepoint even though the configuration was validated.
         let endpoints = match self
             .relay_plane

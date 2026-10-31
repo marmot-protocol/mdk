@@ -260,6 +260,23 @@ impl AppClient {
         let _ = effects;
     }
 
+    /// Note, as a client opens, a removal from the device group that an
+    /// earlier run applied but ended before noting, so the client is stopped
+    /// before it sends anything (D67). Never while device groups are off.
+    pub(crate) fn note_stored_device_group_removal(&mut self) {
+        #[cfg(feature = "unreleased-device-pairing")]
+        if self.app.device_groups_enabled()
+            && let Err(error) = self.note_device_group_removal_live()
+        {
+            tracing::warn!(
+                target: "marmot_app::client::device_pairing",
+                method = "note_stored_device_group_removal",
+                error_kind = error.privacy_safe_kind(),
+                "could not note this device's removal from its device group; retrying"
+            );
+        }
+    }
+
     /// Notice that this device's device group removed it, without moving
     /// linking on: forget the copy and, when its link was made, mark the
     /// account unlinked (D67). The worker calls it before and after its
