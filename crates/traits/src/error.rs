@@ -274,6 +274,13 @@ pub enum EngineError {
     #[error("welcome already processed")]
     WelcomeAlreadyProcessed,
 
+    /// A sibling Welcome into a chat this device still holds an active copy
+    /// of, as one sent after a removal that has not reached it yet. Not a
+    /// failed join: nothing was written, and the same Welcome joins once that
+    /// copy reads removed or unrecoverable (mdk#2628 3.5b).
+    #[error("sibling welcome held while the chat's local copy is active")]
+    SiblingWelcomeHeld { group_id: GroupId },
+
     /// Last-resort bucket. Prefer adding a typed variant.
     #[error("backend failure: {0}")]
     Backend(String),
@@ -345,6 +352,7 @@ impl EngineError {
             EngineError::MissingWelcomeKeyPackage => "missing_welcome_key_package",
             EngineError::WelcomeNotAddressedToThisDevice => "welcome_not_addressed_to_this_device",
             EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
+            EngineError::SiblingWelcomeHeld { .. } => "sibling_welcome_held",
             EngineError::Backend(_) => "backend",
             EngineError::Other(_) => "other",
         }

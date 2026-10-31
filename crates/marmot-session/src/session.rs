@@ -49,6 +49,7 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, MaintenanceStorage, StorageError};
 use cgka_traits::transport::{Timestamp, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::welcome::SiblingWelcomeJoin;
 use cgka_traits::{
     OutboundFanout, SecretBytes, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
 };
@@ -1353,7 +1354,7 @@ impl AccountDeviceSession {
         message_id: &MessageId,
         welcome: &SiblingWelcome,
         created_at: Option<Timestamp>,
-    ) -> SessionResult<IngestOutcome> {
+    ) -> SessionResult<SiblingWelcomeJoin> {
         let outcome = self
             .engine
             .join_sibling_welcome(message_id, welcome, created_at)
@@ -1361,7 +1362,10 @@ impl AccountDeviceSession {
         tracing::debug!(
             target: TRACE_TARGET,
             method = "join_sibling_welcome",
-            outcome_kind = ingest_outcome_kind(&outcome),
+            outcome_kind = match &outcome {
+                SiblingWelcomeJoin::Settled(outcome) => ingest_outcome_kind(outcome),
+                SiblingWelcomeJoin::Held { .. } => "held",
+            },
             "sibling Welcome ingested"
         );
         Ok(outcome)

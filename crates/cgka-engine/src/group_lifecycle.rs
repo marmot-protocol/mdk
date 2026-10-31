@@ -1711,12 +1711,13 @@ impl<S: StorageProvider> Engine<S> {
             }
 
             if let Some(local_state_token) = confirmation_token {
-                // A sibling Welcome adds a device missing from the chat, and
-                // this one holds an active copy. An offer would also be
-                // confirmed by the delivery route, which refuses a private
-                // KeyPackage.
+                // A sibling Welcome into a chat this device still holds, as
+                // one sent after a removal that has not reached it yet, is
+                // no offer: the app keeps it and joins it once the copy reads
+                // removed or unrecoverable. Held, it rolls back like an offer
+                // and marks nothing (mdk#2628 3.5b).
                 if sibling_record.is_some() {
-                    return Err(EngineError::InvalidWelcome);
+                    return Err(EngineError::SiblingWelcomeHeld { group_id });
                 }
                 pending_rejoin = Some(PendingWelcome {
                     message_id: welcome_id.clone(),

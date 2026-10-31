@@ -25,14 +25,12 @@ use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
-use cgka_traits::message::MessageState;
-use cgka_traits::storage::StorageError;
+use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::storage::{
     IssuedPrivateKeyPackage, PrivateKeyPackageStorage, StorageProvider, private_key_package_halfway,
 };
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
-use cgka_traits::welcome::SiblingWelcomeRoute;
+use cgka_traits::welcome::SiblingWelcomeJoin;
 use cgka_traits::{MemberId, MessageId};
 use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
@@ -509,14 +507,17 @@ impl<S: StorageProvider> Engine<S> {
     /// The join consumes only the private KeyPackage the Welcome names, and
     /// only one this device issued to `from` and still holds; it then deletes
     /// that KeyPackage's issued record. Every other check is a Welcome join's.
-    /// Outcomes are an ingested Welcome's: a refusal names its reason, and
-    /// only storage and internal failures are errors.
+    /// Settled outcomes are an ingested Welcome's: a refusal names its
+    /// reason, and only storage and internal failures are errors. Into a
+    /// chat this device still holds an active copy of, it is held: nothing is
+    /// written, and the Welcome joins once that copy reads removed or
+    /// unrecoverable.
     pub async fn join_sibling_welcome(
         &mut self,
         message_id: &MessageId,
         welcome: &SiblingWelcome,
         created_at: Option<Timestamp>,
-    ) -> Result<IngestOutcome, EngineError> {
+    ) -> Result<SiblingWelcomeJoin, EngineError> {
         let msg = TransportMessage {
             id: sibling_welcome_id(message_id),
             payload: welcome.welcome.clone(),
@@ -527,58 +528,35 @@ impl<S: StorageProvider> Engine<S> {
                 recipient: self.identity.self_id().clone(),
             },
         };
-        let (peeled, content_id) = self.peeled_sibling_welcome(&msg, created_at)?;
-        let joined = self
-            .do_join_welcome(
-                msg.clone(),
-                Some((peeled, content_id.clone())),
-                crate::group_lifecycle::WelcomeRoute::Sibling(SiblingWelcomeRoute {
-                    carrier: message_id.clone(),
-                    from: welcome.from,
-                    key_package_ref: welcome.key_package_ref.clone(),
-                }),
-            )
-            .await;
-        // A private KeyPackage has no publication to name.
-        self.welcome_join_outcome(&msg, Some(content_id), None, joined)
-    }
-
-    /// A sibling Welcome's transport message as a join reads it, already
-    /// peeled, and its content id.
-    pub(crate) fn peeled_sibling_welcome(
-        &self,
-        msg: &TransportMessage,
-        created_at: Option<Timestamp>,
-    ) -> Result<(PeeledMessage, MessageId), EngineError> {
         let peeled = PeeledMessage {
             id: msg.id.clone(),
             group_id: None,
             // Every device of the account is a sibling's sender.
             sender: Some(self.identity.self_id().clone()),
             content: PeeledContent::Welcome {
-                bytes: msg.payload.clone(),
+                bytes: welcome.welcome.clone(),
                 created_at,
                 key_package_event_id: None,
             },
             origin: msg.clone(),
         };
         let content_id = crate::group_lifecycle::welcome_content_dedup_id(&peeled)?;
-        Ok((peeled, content_id))
-    }
-
-    /// Whether the device-group message that carried a sibling Welcome is
-    /// still delivered. A branch switch that withdrew it, or a rollback that
-    /// dropped it, withdraws the Welcome too, so a rejoin offer it left joins
-    /// only while it is.
-    pub(crate) fn sibling_carrier_delivered(
-        &self,
-        carrier: &MessageId,
-    ) -> Result<bool, EngineError> {
-        match self.storage.get_message(carrier) {
-            Ok(record) => Ok(record.state == MessageState::Processed),
-            Err(StorageError::NotFound) => Ok(false),
-            Err(error) => Err(error.into()),
+        let joined = self
+            .do_join_welcome(
+                msg.clone(),
+                Some((peeled, content_id.clone())),
+                crate::group_lifecycle::WelcomeRoute::Sibling {
+                    from: welcome.from,
+                    key_package_ref: welcome.key_package_ref.clone(),
+                },
+            )
+            .await;
+        if let Err(EngineError::SiblingWelcomeHeld { group_id }) = joined {
+            return Ok(SiblingWelcomeJoin::Held { group_id });
         }
+        // A private KeyPackage has no publication to name.
+        self.welcome_join_outcome(&msg, Some(content_id), None, joined)
+            .map(SiblingWelcomeJoin::Settled)
     }
 
     /// Every private KeyPackage this device issued, oldest first.

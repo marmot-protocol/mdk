@@ -7,9 +7,9 @@
 use cgka_traits::MessageId;
 use cgka_traits::TransportAdapter;
 use cgka_traits::app_components::DeviceSlotId;
-use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::storage::IssuedPrivateKeyPackage;
 use cgka_traits::transport::Timestamp;
+use cgka_traits::welcome::SiblingWelcomeJoin;
 
 use super::AccountDeviceRuntime;
 use crate::error::AccountResult;
@@ -48,7 +48,7 @@ where
         message_id: &MessageId,
         welcome: &SiblingWelcome,
         created_at: Option<Timestamp>,
-    ) -> AccountResult<IngestOutcome> {
+    ) -> AccountResult<SiblingWelcomeJoin> {
         Ok(self
             .session
             .join_sibling_welcome(message_id, welcome, created_at)

@@ -2555,6 +2555,7 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::MissingWelcomeKeyPackage
         | EngineError::WelcomeNotAddressedToThisDevice
         | EngineError::WelcomeAlreadyProcessed
+        | EngineError::SiblingWelcomeHeld { .. }
         | EngineError::UnknownGroup(_)
         | EngineError::GroupNotHydrated(_)
         | EngineError::UnknownMember { .. }
@@ -2630,6 +2631,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::MissingWelcomeKeyPackage => "missing_welcome_key_package",
         EngineError::WelcomeNotAddressedToThisDevice => "welcome_not_addressed_to_this_device",
         EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
+        EngineError::SiblingWelcomeHeld { .. } => "sibling_welcome_held",
         EngineError::InvalidTransition(_) => "invalid_transition",
         EngineError::GroupUnrecoverableRepairRequired { .. } => {
             "group_unrecoverable_repair_required"
