@@ -125,6 +125,15 @@ versioning through the workspace version in the root `Cargo.toml`.
   retired with `QueuedIntentRefused`. A lost edit is re-issued when the winner left that entry alone, even if it
   changed others. The device roster's write path uses it, so an entry read before a sibling's change never
   overwrites it.
+- New `SendIntent::ReplaceAccountEntry` replaces the account entry of a device group's roster (its backup writer and
+  recovery key) while the roster still holds the entry it was computed from (mdk#2628 item 4.4a), compared as
+  `ReplaceDeviceEntry` compares a device entry; otherwise the new `EngineError::AccountEntryChanged` refuses it. It is
+  never queued: while the device group settles, the new `EngineError::AccountEntryUnsettled` refuses it.
+  `Engine::recovery_public_key`, `seal_to_recovery_key` and `open_with_recovery_key` derive the X25519 recovery key
+  pair from the 128 bits of entropy 12 recovery words carry and seal to it under the label "Marmot Backup". Like the
+  roster, reachable only behind `dev_device_groups` until the backup spec is adopted.
+  `Engine::owes_superseded_own_commit_reissue` says whether an own commit a fork dropped is still owed a re-issue that
+  maintenance has not re-derived, as after a lost announcement; the device group's commit gate waits for it.
 - `SendIntent::UnlinkDevice` removes a device whose link failed, with its roster entry, in one admin Commit
   (mdk#2628 item 3.3b): the new device made no commit in the device group by the link's deadline. It takes the
   device's leaf signature key and a roster update that removes exactly one listed slot, adds no member and makes no

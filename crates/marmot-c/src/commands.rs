@@ -59,7 +59,7 @@ use crate::types::group::{
     MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
     MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
-use crate::types::history_notice::MarmotHistoryNoticeList;
+use crate::types::history_notice::{MarmotAccountRecoveryStatus, MarmotHistoryNoticeList};
 use crate::types::linked_device::MarmotLinkedDeviceList;
 use crate::types::local_submissions::{
     MarmotLocalSendAcceptance, MarmotLocalSendStatus, MarmotMediaUploadSubmission,
@@ -770,6 +770,12 @@ c_cmd! {
     /// first. Re-read on the `HistoryNoticesChanged` event. Free with
     /// `marmot_history_notice_list_free`.
     async fn marmot_history_notices(account_ref: str) -> rec(MarmotHistoryNoticeList) = history_notices;
+
+    /// Read the account's recovery status: the groups whose history is still
+    /// being fetched, whether the inbox's is, and every notice. Re-read on the
+    /// `RecoveryStatusChanged` event. Free with
+    /// `marmot_account_recovery_status_free`.
+    async fn marmot_account_recovery_status(account_ref: str) -> rec(MarmotAccountRecoveryStatus) = account_recovery_status;
 
     /// Dismiss one notice once the user accepts the history may be incomplete.
     /// Durable; recorded as its own outcome, never as recovered history.

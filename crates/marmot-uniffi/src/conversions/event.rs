@@ -162,6 +162,13 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's recovery status may have changed: re-read
+    /// `account_recovery_status`. Carries no group identities. Not raised
+    /// until the recovery runner owns history (mdk#2660).
+    RecoveryStatusChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
     /// The account's device group removed this device after its link was
     /// made, so the account stopped here and is signed out for good: re-read
     /// `list_accounts` and show the device-level notice. Fires once;
@@ -558,6 +565,13 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_id_hex,
                 account_label,
             } => Self::DeviceLinkChanged {
+                account_id_hex,
+                account_label,
+            },
+            MarmotAppEvent::RecoveryStatusChanged {
+                account_id_hex,
+                account_label,
+            } => Self::RecoveryStatusChanged {
                 account_id_hex,
                 account_label,
             },

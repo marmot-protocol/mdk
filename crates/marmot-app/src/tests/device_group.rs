@@ -19,6 +19,7 @@ use cgka_traits::engine::SendIntent;
 use marmot_session::DeviceRosterEdit;
 use storage_sqlite::DeviceGroupTrust;
 
+mod backups;
 mod chat_kinds;
 mod devices;
 mod heartbeats;

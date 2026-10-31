@@ -2,11 +2,11 @@
 //! what the account holds there, oldest first, each difference fetched by id
 //! (`run_comparison`).
 //!
-//! A debt unit compares instead of sweeping when its relay's caps show
-//! NIP-77 and the account already holds events in the owed ranges, from the
-//! inventory's floor on ([`plan_debt`]). Otherwise a sweep is cheaper: with
-//! nothing held, every id the relay names is fetched anyway. A re-check
-//! ([`super::recheck`]) always compares.
+//! A group's debt unit compares instead of sweeping when its relay's caps
+//! show NIP-77 and the account already holds events in the owed ranges, from
+//! the inventory's floor on ([`plan_debt`]). Otherwise a sweep is cheaper:
+//! with nothing held, every id the relay names is fetched anyway. The inbox's
+//! debt ([`plan_inbox`]) and a re-check ([`super::recheck`]) always compare.
 //!
 //! Each window the comparison certifies is staged with its events and covered
 //! through the quantum's mark, as a sweep slice is. What a cut window fetched
@@ -32,7 +32,7 @@ use transport_nostr_adapter::compare::{
     CompareEnd, ComparePolicy, CompareRequest, CompareSink, LocalItem, run_comparison,
 };
 use transport_nostr_adapter::sweep::{
-    RelayCaps, SweepEnd, SweepRange, SweepRoute, SweepSinkError, UnreachableKind,
+    ClosedReason, RelayCaps, SweepEnd, SweepRange, SweepRoute, SweepSinkError, UnreachableKind,
 };
 
 use super::quantum::{QuantumReport, SinkStop, route_events, uncovered_seconds};
@@ -49,9 +49,11 @@ pub(super) struct PlannedRange {
 /// What one comparison quantum compares. Not `Debug`: it carries its unit.
 pub(super) struct ComparePlan {
     pub(super) key: UnitKey,
-    pub(super) nostr_group_id: [u8; 32],
+    /// What the comparison asks the relay for.
+    pub(super) route: SweepRoute,
     pub(super) best_effort: bool,
-    /// The relay's caps as last known: the comparison read NIP-77 there.
+    /// The relay's caps as last known: the comparison read NIP-77 there, or,
+    /// for the inbox, whatever is known of them.
     pub(super) caps: RelayCaps,
     /// Oldest first.
     pub(super) ranges: Vec<PlannedRange>,
@@ -105,6 +107,36 @@ pub(super) fn plan_debt(
     Ok(held.then_some((caps, local)))
 }
 
+/// The inbox's comparison plan: its caps (as recorded, else `read`), and what
+/// the account holds in the owed ranges. The inbox is never swept, so it
+/// compares whatever its relay's caps say; a relay that will not compare
+/// refuses the unit ([`ComparePlan::sweeps_otherwise`]). Below the
+/// inventory's floor the held set is incomplete, so a comparison there may
+/// fetch wraps the account holds: they stage and admit as already held.
+pub(super) fn plan_inbox(
+    app: &SqliteAppStorage,
+    key: &UnitKey,
+    ranges: &[SweepRange],
+    read: Option<RelayCaps>,
+    now: u64,
+) -> StorageResult<(RelayCaps, Vec<LocalItem>)> {
+    let caps = app
+        .recovery_relay_health(&key.relay)?
+        .and_then(|health| health.caps)
+        .map(|caps| RelayCaps {
+            max_limit: caps.max_limit,
+            negentropy: caps.negentropy,
+        })
+        .or(read)
+        .unwrap_or_default();
+    let (Some(first), Some(last)) = (ranges.first(), ranges.last()) else {
+        return Ok((caps, Vec::new()));
+    };
+    let inventory = app.transport_reconciliation_inventory(&key.route, now)?;
+    let local = local_items(app, &key.route, &inventory.items, first.since, last.until)?;
+    Ok((caps, local))
+}
+
 /// The relay's recorded caps, if they show NIP-77.
 pub(super) fn recorded_caps(
     app: &SqliteAppStorage,
@@ -148,11 +180,24 @@ pub(super) fn local_items(
     Ok(local)
 }
 
-/// The sweep end a comparison end settles as.
-fn verdict(end: CompareEnd, first_unproven: u64) -> SweepEnd {
+impl ComparePlan {
+    /// Whether the unit has another way to be proved when its relay will not
+    /// compare: a group's debt is swept instead (`would_not_compare`), and a
+    /// re-check simply stops. The inbox's debt has none, so such a relay
+    /// refuses it.
+    fn sweeps_otherwise(&self) -> bool {
+        self.recheck || matches!(self.route, SweepRoute::Group { .. })
+    }
+}
+
+/// The sweep end a comparison end settles as. `sweeps_otherwise` is the
+/// plan's ([`ComparePlan::sweeps_otherwise`]).
+fn verdict(end: CompareEnd, first_unproven: u64, sweeps_otherwise: bool) -> SweepEnd {
     match end {
         CompareEnd::Finished => SweepEnd::Finished,
         CompareEnd::DeadlineReached => SweepEnd::DeadlineReached,
+        CompareEnd::Unsupported if !sweeps_otherwise => SweepEnd::Refused(ClosedReason(None)),
+        CompareEnd::Refused(reason) if !sweeps_otherwise => SweepEnd::Refused(reason),
         // A relay that would not compare taught nothing about the unit: the
         // runner sweeps it from now on (`would_not_compare`).
         CompareEnd::Cancelled | CompareEnd::Unsupported | CompareEnd::Refused(_) => {
@@ -334,9 +379,8 @@ pub(super) async fn run<H: RunnerHost>(
         report.end = SweepEnd::Unreachable(UnreachableKind::Disconnected);
         return (report, facts);
     };
-    let route = SweepRoute::Group {
-        nostr_group_id: plan.nostr_group_id,
-    };
+    let route = plan.route;
+    let sweeps_otherwise = plan.sweeps_otherwise();
     let limits = policy.compare();
     let mut events_left = limits.max_events;
     let mut bytes_left = limits.max_bytes;
@@ -353,7 +397,7 @@ pub(super) async fn run<H: RunnerHost>(
     for planned in &plan.ranges {
         if events_left == 0 || bytes_left == 0 {
             facts.end = CompareEnd::BudgetSpent;
-            report.end = verdict(facts.end, planned.range.since);
+            report.end = verdict(facts.end, planned.range.since, sweeps_otherwise);
             break;
         }
         sink.covered = planned.covered;
@@ -402,7 +446,7 @@ pub(super) async fn run<H: RunnerHost>(
             .last()
             .map_or(planned.range.since, |window| window.until.saturating_add(1));
         facts.end = compared.end;
-        report.end = verdict(compared.end, first_unproven);
+        report.end = verdict(compared.end, first_unproven, sweeps_otherwise);
         if compared.end != CompareEnd::Finished {
             break;
         }
@@ -417,9 +461,15 @@ pub(super) async fn run<H: RunnerHost>(
 }
 
 /// Whether the relay would not compare: it does not speak NIP-77, or it
-/// refused a comparison or a fetch by id for good. A comparison is only the
-/// cheaper way to cover a range, so the runner sweeps that relay instead until
-/// it reconnects, and the sweep's own replies settle the unit.
-pub(super) fn would_not_compare(end: CompareEnd) -> bool {
-    matches!(end, CompareEnd::Unsupported | CompareEnd::Refused(_))
+/// refused a group's comparison or fetch by id for good. A comparison is only
+/// the cheaper way to cover a group's range, so the runner sweeps that relay
+/// instead until it reconnects, and the sweep's own replies settle the unit.
+/// A refusal of the inbox's gift wraps says nothing of group events: many
+/// inbox relays restrict who may read kind 1059.
+pub(super) fn would_not_compare(plan: &ComparePlan, end: CompareEnd) -> bool {
+    match end {
+        CompareEnd::Unsupported => true,
+        CompareEnd::Refused(_) => matches!(plan.route, SweepRoute::Group { .. }),
+        _ => false,
+    }
 }

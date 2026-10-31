@@ -17,7 +17,9 @@
 //! `Box<dyn CgkaEngine + Send + Sync>` today and can be dropped later without
 //! breaking the contract.
 
-use crate::app_components::{AppComponentData, AppComponentId, DeviceEntryV1, DeviceSlotId};
+use crate::app_components::{
+    AccountEntryV1, AppComponentData, AppComponentId, DeviceEntryV1, DeviceSlotId,
+};
 use crate::app_event::AppMessageRetentionDecision;
 use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
@@ -260,6 +262,22 @@ pub enum SendIntent {
         slot: DeviceSlotId,
         expected: Box<DeviceEntryV1>,
         entry: Box<DeviceEntryV1>,
+    },
+    /// Replace the account entry in the roster of a device group with
+    /// `entry`, in one `marmot.account.device-roster.v1` `SetAccount`, while
+    /// the roster still holds `expected` there (mdk#2628 4.4a): the backup
+    /// writer and the recovery key's public half.
+    ///
+    /// `SetAccount` replaces the entry whole, so it is compared like
+    /// [`Self::ReplaceDeviceEntry`]: each time the engine prepares the Commit,
+    /// on a direct send or a re-issue after a lost fork. Any other entry
+    /// refuses it with [`EngineError::AccountEntryChanged`] and nothing is
+    /// staged. A send is never queued: while the group would queue it,
+    /// [`EngineError::AccountEntryUnsettled`] refuses it and nothing is kept.
+    ReplaceAccountEntry {
+        group_id: GroupId,
+        expected: Box<AccountEntryV1>,
+        entry: Box<AccountEntryV1>,
     },
     /// Update the group's `marmot.group.profile.v1` app component fields.
     UpdateGroupData {

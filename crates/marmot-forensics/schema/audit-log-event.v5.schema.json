@@ -3165,7 +3165,8 @@
         "explicit_history",
         "known_event",
         "incremental_history",
-        "subscription_replay"
+        "subscription_replay",
+        "unproven_history"
       ]
     },
     "Operational_recoveryNeedChange": {

@@ -51,6 +51,10 @@
 - `MarmotEventFfi` adds `CompromiseWarningChanged { account_id_hex,
   account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
   regenerate bindings with the matching native library.
+- `HistoryNoticeCauseFfi` adds `UnprovenHistory`, and `MarmotEventFfi` adds
+  `RecoveryStatusChanged { account_id_hex, account_label }` (mdk#2660). Update
+  exhaustive Swift/Kotlin handling and regenerate bindings with the matching
+  native library. Neither is produced until the recovery runner owns history.
 
 - `MarmotKitError` adds `AccountDevicesActivationRefused { group_id_hex, reason }`
   for an `enable_account_devices` call the group cannot take now (mdk#2628).
@@ -87,6 +91,13 @@
   `StickerFfi.plaintext_sha256` is the exact hash a `StickerRefFfi` carries.
 
 ### Added
+
+- `account_recovery_status(account_ref)` returns an `AccountRecoveryStatusFfi`:
+  the groups whose history is still being fetched (`catching_up_group_ids_hex`),
+  whether the inbox's is (`inbox_catching_up`), and every notice as
+  `history_notices` lists them (mdk#2660). Re-read it on
+  `RecoveryStatusChanged`. Until the recovery runner owns history nothing is
+  ever catching up.
 
 - `MarmotOptions.devicePlatform` names the platform this device runs on, such
   as `iOS`. With `clientName`, each device writes it into its own roster

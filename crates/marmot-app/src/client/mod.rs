@@ -74,6 +74,7 @@ pub(crate) mod audit_v5_probe;
 mod chat_history;
 #[cfg(feature = "test-policy-overrides")]
 pub use chat_history::DevSealedHistoryBundle;
+pub(crate) mod backups;
 pub(crate) mod compromise_warning;
 pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
@@ -833,6 +834,10 @@ pub struct AppClient {
     /// incomplete"): one small entry per parked occurrence, compared at each
     /// publication seam so a change raises `HistoryNoticesChanged`.
     pub(crate) history_notice_baseline: Option<history_notices::HistoryNoticeBaseline>,
+    /// The recovery runner's survey changed what is catching up since hosts
+    /// last heard; the worker's account-level seam drains it into one
+    /// `RecoveryStatusChanged` (mdk#2660 phase 4). Only a runner sets it.
+    pub(crate) recovery_status_owed: bool,
     /// The linked devices may have changed since hosts last heard: a hidden
     /// device-group event, a change of trust, or an open, which cannot know
     /// what hosts last read. The worker's account-level and applied-summary
@@ -842,6 +847,9 @@ pub struct AppClient {
     /// pass that judges differently owes hosts a `LinkedDevicesChanged`.
     /// `None` until a pass has judged.
     pub(crate) inactive_siblings: Option<std::collections::BTreeSet<String>>,
+    /// Recovery words shown and not yet confirmed (mdk#2628 4.4a): in memory
+    /// only, until they are confirmed or cancelled, or the client closes.
+    pub(crate) pending_recovery_words: Option<backups::PendingRecoveryWords>,
     /// The last overdue-refresh answer a maintenance pass computed, and
     /// whether hosts owe a `KeyPackageRefreshOverdueChanged`. The flag starts
     /// set, since a fresh client cannot know what hosts last read.

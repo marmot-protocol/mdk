@@ -49,6 +49,10 @@
   account_label }` (mdk#2628). Exhaustive matches add an arm for it.
 - `MarmotAppEvent` adds `CompromiseWarningChanged { account_id_hex,
   account_label }` (mdk#2628). Exhaustive matches add an arm for it.
+- `HistoryNoticeCause` adds `UnprovenHistory`, and `MarmotAppEvent` adds
+  `RecoveryStatusChanged { account_id_hex, account_label }` (mdk#2660).
+  Exhaustive matches add arms for them. Neither is produced until the recovery
+  runner owns history.
 
 - `MarmotDeployment::key_package_client_preference` and
   `KeyPackageClientPreference` are removed (mdk#2628). The KeyPackage `client`
@@ -57,6 +61,22 @@
 
 ### Added
 
+- `MarmotAppRuntime::begin_recovery_words`, `confirm_recovery_words`,
+  `cancel_recovery_words`, `turn_off_backups` and `backup_settings` set up
+  the recovery words an account's backups will be sealed to, and turn backups
+  off (mdk#2628 item 4.4a, D75). MDK makes 12 BIP-39 English words and holds
+  them in memory only; the user types back the two at the positions MDK
+  picks, and only the key's public half is kept: in the device group's
+  roster, committed as a compare-and-set over the entry this device read, or
+  by a device with no device group until the roster it founds carries it.
+  Turning backups on makes the confirming device the backup writer; new words
+  keep the writer; turning them off clears the writer and the key the same
+  way. MDK never sends a backup change again itself: the engine re-issues one
+  a fork dropped while the entry it was made over still stands, and the
+  runtime retries one the relays refused. A change whose re-issue is refused
+  stays lost; `BackupSettings` shows the roster's account entry as it is now,
+  so the user sees that and can make the change again. Only behind
+  `dev_device_groups`. Nothing writes backups yet.
 - Each device keeps an HPKE history key, generated on first use and stored in
   its encrypted account storage, and writes its public half into its own
   device-group roster entry (`history_key`) so siblings can seal chat history
@@ -82,6 +102,15 @@
   Downloading an imported attachment uses its key when the epoch's secret is
   not here, so a device that was never in the attachment's epoch can still
   open it. A message the device received itself never uses an imported key.
+- `MarmotAppRuntime::account_recovery_status(account_ref)` returns an
+  `AccountRecoveryStatus`: the groups whose history is still being fetched,
+  whether the inbox's is, and every notice as `history_notices` lists them
+  (mdk#2660). Re-read it on `RecoveryStatusChanged`. Until the recovery runner
+  owns history nothing is ever catching up, so it holds only the notices.
+- Audit v5 `recovery_need_changed` rows gain cause `unproven_history`: a
+  coverage-ledger route's notice, shown and dismissed, with the route's
+  one-way tag as `obligation_ref` (mdk#2660). Unproduced until the recovery
+  runner owns history; strict v5 receivers must accept it before then.
 - `MarmotAppConfig::device_platform` (`with_device_platform`) names the
   platform this device runs on. Each device writes it and
   `key_package_client_name` into its own roster entry with its next KeyPackage

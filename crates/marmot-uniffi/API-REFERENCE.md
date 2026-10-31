@@ -2370,7 +2370,19 @@ pub async fn history_notices( &self, account_ref: String, ) -> Result<Vec<Histor
 
 List the account's "history may be incomplete" notices, oldest first. Each is one parked recovery occurrence: automatic recovery stopped retrying because it could not prove some history complete. `cause` picks the host's wording; `group_id_hex` names the affected group for a group-scoped occurrence (an epoch gap) and is `None` when the account's history as a whole may be incomplete (delivery or notification loss, incremental or explicit history). The list is local and durable, needs no network, and is cheap to re-read: refresh it on `MarmotEventFfi::HistoryNoticesChanged`. A group's own occurrences also appear in `group_recovery_status` as `history_may_be_incomplete` and `history_notice_ids`. Treat `notice_id` as opaque; it changes when new evidence re-arms recovery, so never store it as an identity of a group or account.
 
-[Source](src/commands/history_notice.rs#L13)
+[Source](src/commands/history_notice.rs#L14)
+
+### `Marmot::account_recovery_status`
+
+**Current.**
+
+```rust
+pub async fn account_recovery_status( &self, account_ref: String, ) -> Result<AccountRecoveryStatusFfi, MarmotKitError>
+```
+
+Read the account's recovery in one call: `catching_up_group_ids_hex` lists the groups whose history is still being fetched (lowercase hex, sorted), `inbox_catching_up` says whether the inbox's is, and `notices` holds every notice exactly as `history_notices` lists them. Show the first two as "catching up" and the notices as "history may be incomplete". It reads local state on the account worker, needs no network, and is cheap to re-read: refresh it on `MarmotEventFfi::RecoveryStatusChanged`. Until the recovery runner owns history (mdk#2660) nothing is ever catching up and that event never fires, so the record holds only the notices.
+
+[Source](src/commands/history_notice.rs#L31)
 
 ### `Marmot::dismiss_history_notice`
 
@@ -2382,7 +2394,7 @@ pub async fn dismiss_history_notice( &self, account_ref: String, notice_id: Stri
 
 Dismiss one notice after the user accepts that this history may be incomplete. The dismissal is durable and is recorded as its own outcome, never as recovered history. It retires exactly that occurrence; for delivery or notification loss the transport cursor may advance again once no loss recovery remains pending. Returns `false`, changing nothing, for a stale id (new evidence re-armed recovery, or it was already dismissed); re-read the list and show the current notices. A malformed id is `InvalidHex`. New loss, a higher missing epoch, a later startup comparison or a new explicit repair can raise a new notice with a new id. Runs on the account worker in order with other mutations; it performs no network I/O.
 
-[Source](src/commands/history_notice.rs#L30)
+[Source](src/commands/history_notice.rs#L46)
 
 </details>
 

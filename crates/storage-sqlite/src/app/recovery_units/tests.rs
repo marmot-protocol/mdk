@@ -557,13 +557,14 @@ fn caps_changes_rearm_and_unknown_reads_do_not() {
     assert_eq!(unit(&app, &planned, RELAY).state, RecoveryUnitState::Active);
 }
 
-/// Explicit repair re-arms every broken and retired unit, owes every parked
-/// and retired span again and makes every re-check due.
+/// Explicit repair re-arms every broken and retired unit, ends an active
+/// unit's backoff, owes every parked and retired span again and makes every
+/// re-check due.
 #[test]
 fn explicit_repair_rearms_everything() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let app = storage.app_storage();
-    let (parked, retired) = (group(1), group(2));
+    let (parked, retired, backing_off) = (group(1), group(2), group(3));
     for route in [&parked, &retired] {
         owing(&app, route, NOW - 1_000, (NOW - 1_000, NOW - 501));
         break_unit(&app, route, NOW);
@@ -572,7 +573,27 @@ fn explicit_repair_rearms_everything() {
     }
     let revision = unit(&app, &retired, RELAY).park.unwrap().revision;
     assert!(app.dismiss_recovery_route_park(&retired, revision).unwrap());
+    owing(&app, &backing_off, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    let before = settle(
+        &app,
+        &backing_off,
+        RELAY,
+        RecoveryUnitOutcome::NoProgress,
+        NOW,
+    );
+    assert!(before.next_attempt_at_seconds > NOW);
     assert_eq!(app.rearm_all_recovery_units().unwrap(), 2);
+    let due = unit(&app, &backing_off, RELAY);
+    assert_eq!(
+        (
+            due.state,
+            due.no_progress,
+            due.backoff_step,
+            due.next_attempt_at_seconds
+        ),
+        (RecoveryUnitState::Active, 0, 0, 0),
+        "an active unit backing off is due again"
+    );
     for route in [&parked, &retired] {
         let repaired = unit(&app, route, RELAY);
         assert_eq!(
@@ -592,6 +613,39 @@ fn explicit_repair_rearms_everything() {
             vec![range(NOW - 500, NOW)]
         );
     }
+}
+
+/// A dismissal scoped to some relays checks its revision against their parks
+/// and the remainder only, and leaves a broken unit on any other relay as it
+/// is.
+#[test]
+fn a_dismissal_on_some_relays_leaves_the_others_broken() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    let first = break_unit(&app, &route, NOW).park.unwrap().revision;
+    let second = settle(&app, &route, OTHER, RecoveryUnitOutcome::Refused, NOW + 5)
+        .park
+        .unwrap()
+        .revision;
+    let relay = [RELAY.to_owned()];
+    assert!(
+        !app.dismiss_recovery_route_park_on(&route, &relay, second)
+            .unwrap()
+    );
+    assert!(
+        app.dismiss_recovery_route_park_on(&route, &relay, first)
+            .unwrap()
+    );
+    assert_eq!(unit(&app, &route, RELAY).state, RecoveryUnitState::Retired);
+    assert!(matches!(
+        unit(&app, &route, OTHER).state,
+        RecoveryUnitState::Broken(_)
+    ));
+    let notices = app.parked_recovery_routes().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].relays, vec![OTHER.to_owned()]);
 }
 
 /// Dismissal checks the route's newest park: a stale revision does nothing.

@@ -104,7 +104,7 @@ mod external_signer;
 mod groups;
 mod history_bundle;
 mod history_notices;
-pub use history_notices::{HistoryNotice, HistoryNoticeCause};
+pub use history_notices::{AccountRecoveryStatus, HistoryNotice, HistoryNoticeCause};
 mod ids;
 mod key_package_records;
 #[cfg(test)]
@@ -222,6 +222,7 @@ pub use client::AppClient;
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::DevSealedHistoryBundle;
+pub use client::backups::{BackupSettings, RecoveryWords};
 pub use client::compromise_warning::{CompromiseWarningItem, CompromiseWarningReason};
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
@@ -2154,9 +2155,11 @@ impl MarmotApp {
             announced_convergence_parks: std::collections::HashSet::new(),
             pending_convergence_park_notices: std::collections::HashSet::new(),
             history_notice_baseline: None,
+            recovery_status_owed: false,
             // A fresh client cannot know what hosts last read.
             linked_devices_changed: true,
             inactive_siblings: None,
+            pending_recovery_words: None,
             key_package_refresh_overdue: None,
             key_package_refresh_overdue_changed: true,
             sign_in_schedule: Default::default(),
@@ -8140,6 +8143,11 @@ struct SharedAppRouting {
     /// settled yet. `None` until a runner tracks them, so nothing is kept
     /// while none runs.
     route_changes: Mutex<Option<RouteChanges>>,
+    /// What the account's recovery runner last found catching up; `None`
+    /// until one has surveyed.
+    recovery_runner_catching_up: tokio::sync::watch::Sender<
+        Option<std::collections::BTreeSet<client::recovery_runner::UnitKey>>,
+    >,
 }
 
 /// What routing replacements changed since the account's recovery runner
@@ -8223,6 +8231,7 @@ impl AppTransportRouting {
                 state: RwLock::new(state),
                 recovery_runner_wake: tokio::sync::watch::channel(0).0,
                 route_changes: Mutex::default(),
+                recovery_runner_catching_up: tokio::sync::watch::channel(None).0,
             }),
         }
     }
@@ -8264,6 +8273,33 @@ impl AppTransportRouting {
     /// The sender a recovery runner wakes on.
     fn recovery_runner_wake(&self) -> tokio::sync::watch::Sender<u64> {
         self.inner.recovery_runner_wake.clone()
+    }
+
+    /// Where a recovery runner leaves what its last survey found catching up.
+    fn recovery_runner_catching_up(
+        &self,
+    ) -> tokio::sync::watch::Sender<
+        Option<std::collections::BTreeSet<client::recovery_runner::UnitKey>>,
+    > {
+        self.inner.recovery_runner_catching_up.clone()
+    }
+
+    /// What the account's recovery runner last found catching up; `None`
+    /// until one has surveyed.
+    fn recovery_runner_catching_up_now(
+        &self,
+    ) -> Option<std::collections::BTreeSet<client::recovery_runner::UnitKey>> {
+        self.inner.recovery_runner_catching_up.borrow().clone()
+    }
+
+    /// A receiver that changes whenever what the runner finds catching up
+    /// does: a unit starts or stops owing, breaks or is re-armed.
+    fn subscribe_recovery_runner_catching_up(
+        &self,
+    ) -> tokio::sync::watch::Receiver<
+        Option<std::collections::BTreeSet<client::recovery_runner::UnitKey>>,
+    > {
+        self.inner.recovery_runner_catching_up.subscribe()
     }
 
     /// Wake the account's recovery runner, if one runs. Coalesces.

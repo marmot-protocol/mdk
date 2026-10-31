@@ -107,6 +107,28 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   founding Add's and every later link's), so a kept id shows up again only when a fork brings back an earlier state.
   Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots` instead, never as
   device entries.
+- Recovery words for backups (`src/client/backups.rs`, mdk#2628 4.4a) live only in `AppClient::pending_recovery_words`
+  as zeroized entropy, until confirmed or cancelled: never write or log the words, their entropy or the private half.
+  A device that trusts no device group keeps only the key's public half (`backup_recovery_key`), and
+  `create_device_group` founds the roster with it and this device writing; trusting any device group, founded or
+  joined, forgets it in the trust write (`trust_device_group`), so a device that joins one leaves the group's backups
+  as they are. Confirm and turn-off settle an unsettled creation first (`reconcile_device_groups`), so a creation whose
+  trust write failed takes the change in its roster rather than in the kept key. In a device group, write the roster's account entry only through the runtime's
+  `edit_roster_account_entry` (`ReplaceAccountEntry`, a compare-and-set over the entry this device read), and only
+  while the device group takes a commit from this device. That gate stays closed while a re-issue is owed, so neither
+  action answers "nothing to send" while a change of this device's may still land. Never send a backup change again
+  from here, and never store what became of one (D75): the engine's re-issue and the runtime's retry are the only
+  paths that commit one again, and a change whose re-issue is refused stays lost. `backup_settings` reads the roster's
+  account entry as it is now, so the user sees a lost change and can make it again. The backup spec leaves the rest
+  of a device's own handling local; MDK's is this. A confirm refused as `device_group_busy` (the group can't take
+  the commit, its entry changed, or the engine would only queue the send: `AccountEntryUnsettled`), or failing with
+  any other error, keeps the words in memory for another try with the same words from a fresh read, which finds their
+  key in place if the commit went out after all; a cancel or a restart drops them, and the user starts again with new
+  words. A turn-off refused as `device_group_busy` changes nothing. An
+  update this device committed ends when its publication fails and the engine discards it, when branch selection
+  drops it onto another account entry (its re-issue is a conflict, so it is refused at the drop), or once branch
+  selection can no longer drop it. Until its publication has an outcome, and from a drop until its re-issue is
+  committed or refused, the gate answers another change with `device_group_busy`.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
   `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this
@@ -383,7 +405,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
   account owner's native input goal uses cause `subscription_replay` in those existing rows, without loss
-  charges or history certificates. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
+  charges or history certificates. Ledger notices (behind `runner_owns_debt`) record `notice_shown` and
+  `notice_dismissed` with cause `unproven_history`, the route tag as the obligation id. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
@@ -430,7 +453,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
-  `recheck`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
+  `recheck`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
   `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, off; proofs turn it on with the hidden
   `MarmotApp::with_recovery_runner_owning_debt`), never a host setting or cargo feature, until the switch-over flips it.
   With the gate off nothing constructs it and the comparison owner keeps every behavior. `host` is its only seat:
@@ -467,7 +490,22 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own
   `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
   with the adapter's fence ticket and held routes; `fence_live_frames` answers with that ticket. Nothing calls
-  them or `enable_live_fences` before the switch-over. Logs carry aggregates only.
+  them or `enable_live_fences` before the switch-over. The inbox is a route like a group's, compared only and never
+  swept (`compare::plan_inbox`); a relay that will not compare it refuses its unit, never that relay's group
+  comparisons, and admission never fences it. Explicit repair behind the gate (`repair`) is one request the runner
+  takes at a step boundary (`RecoveryRunner::repair` under a `PassBound`): a re-arm turn, then passes whose turns the
+  waiting caller serves, until a verdict turn or the bound's stop or deadline, which settles the quantum in flight. The
+  worker spawns its runner before the startup drain and hands its `SpawnedRunner` through the command context.
+  Only the caller's cancel trips the bound's stop, which only preempts: the caller decides `Cancelled` first, as
+  today (`serve_repair`). Verdicts are today's, never `Ok`, leave a suspended group's routes out, and need something
+  judged: no covered window without a non-suspended route, each with a required relay. A verdict waits for a re-check
+  only where `recheck::owed`, the survey's own predicate, owes one. Each survey publishes the required units still catching up
+  (`RunnerHost::surveyed`) into `AppTransportRouting`'s catching-up watch: the only source of the account recovery
+  status, the worker's `RecoveryStatusChanged` cue, and the condition for a remainder's notice. Ledger notices
+  (`HistoryNoticeCause::UnprovenHistory`, ids from `ledger_route_tag` and the park revision) skip a suspended group's
+  routes (`RunnerRoute::suspended`) and a broken unit on a relay its route no longer requires. A notice's revision and
+  its dismissal (`dismiss_recovery_route_park_on`) cover exactly what it shows. They, the status and its event show
+  nothing with the gate off.
   An Unrecoverable group's routes are suspended (`RunnerRoute.unrecoverable`, read from the engine's group record
   each debt turn): never scheduled, charged, broken or noticed, left out of admission so what they staged is given
   back as an unlisted route's is, and with the gate on the comparison owner drops their
@@ -481,7 +519,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   read (`None`) is never evidence. Window hints come from the live conversation captures
   (`open_conversation_groups`). The breaker's pauses and late findings are process counters
   (`recovery_runner_counts`) carried only by the v5 `recovery_runner_paused` row, written through the turn's audit
-  sink (`WorkerTurn::audit`).
+  sink (`WorkerTurn::audit`). Logs carry aggregates only.
 - The configured audit OTLP/HTTP sender is `marmot-observability`'s `src/audit_otlp_sender.rs`, which hosts name as
   `marmot_app::audit_otlp_sender`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,

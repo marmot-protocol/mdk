@@ -487,6 +487,9 @@ pub(crate) enum AccountWorkerCommand {
     HistoryNotices {
         respond: oneshot::Sender<Result<Vec<crate::HistoryNotice>, AppError>>,
     },
+    AccountRecoveryStatus {
+        respond: oneshot::Sender<Result<crate::AccountRecoveryStatus, AppError>>,
+    },
     LinkedDevices {
         respond: oneshot::Sender<Result<Vec<crate::LinkedDevice>, AppError>>,
     },
@@ -527,6 +530,22 @@ pub(crate) enum AccountWorkerCommand {
     },
     RemovedDeviceLeftoverChats {
         respond: oneshot::Sender<Result<u32, AppError>>,
+    },
+    BeginRecoveryWords {
+        respond: oneshot::Sender<Result<crate::RecoveryWords, AppError>>,
+    },
+    ConfirmRecoveryWords {
+        answers: Vec<String>,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    CancelRecoveryWords {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    TurnOffBackups {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    BackupSettings {
+        respond: oneshot::Sender<Result<crate::BackupSettings, AppError>>,
     },
     DismissHistoryNotice {
         notice_id: String,
@@ -850,6 +869,7 @@ impl AccountWorkerCommand {
                 | Self::QuarantinedGroups { .. }
                 | Self::GroupRecoveryStatus { .. }
                 | Self::HistoryNotices { .. }
+                | Self::AccountRecoveryStatus { .. }
                 | Self::GroupCommitDelivery { .. }
                 | Self::GroupPushDebugInfo { .. }
                 | Self::AccountDevicesActivation { .. }
@@ -1653,6 +1673,10 @@ async fn run_app_runtime_account_worker(
                                         if deferred.is_empty() => {
                                         let _ = respond.send(client.history_notices());
                                     }
+                                    AccountWorkerCommand::AccountRecoveryStatus { respond }
+                                        if deferred.is_empty() => {
+                                        let _ = respond.send(client.account_recovery_status());
+                                    }
                                     AccountWorkerCommand::SendMessage {
                                         enqueued_at, queued, group_id, payload, respond,
                                     } if deferred.is_empty() && !client.device_unlinked() => {
@@ -1921,6 +1945,14 @@ async fn run_app_runtime_account_worker(
         prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
         worker_lifetime: media_http_worker_lifetime,
     };
+    // Only with the internal `runner_owns_debt` gate on (mdk#2660 phase 4).
+    // Spawned before the deferred commands replay, so a repair among them
+    // goes through it; its turns wait until a repair or the loop below
+    // serves them.
+    let mut recovery_runner = client.spawn_recovery_runner().await;
+    // What the runner's survey finds catching up; only a runner changes it.
+    // Each client has its own, so a reconnect subscribes again.
+    let mut recovery_catching_up = client.routing.subscribe_recovery_runner_catching_up();
     let mut pending = deferred
         .into_iter()
         .map(|deferred_command| match deferred_command {
@@ -1981,6 +2013,7 @@ async fn run_app_runtime_account_worker(
                         shared: &shared,
                         media_http: &media_http,
                         scheduled_convergence: &mut scheduled_convergence,
+                        recovery_runner: recovery_runner.as_mut(),
                     },
                 )
                 .await;
@@ -2041,8 +2074,6 @@ async fn run_app_runtime_account_worker(
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
     let mut replay_changes = client.adapter.replay_changes().await;
     let mut admission_retry = ReplayAdmissionRetry::default();
-    // Only with the internal `runner_owns_debt` gate on (mdk#2660 phase 4).
-    let mut recovery_runner = client.spawn_recovery_runner().await;
     'worker: loop {
         // An unlinked device stops: no sends, commits, publications or
         // pairing answers once its device group removed it. The account is
@@ -2527,6 +2558,7 @@ async fn run_app_runtime_account_worker(
                                         shared: &shared,
                                         media_http: &media_http,
                                         scheduled_convergence: &mut scheduled_convergence,
+                                        recovery_runner: recovery_runner.as_mut(),
                                     },
                                 )
                                 .await;
@@ -3143,6 +3175,8 @@ async fn run_app_runtime_account_worker(
                         };
                         replay_changes = client.adapter.replay_changes().await;
                         recovery_runner = client.spawn_recovery_runner().await;
+                        recovery_catching_up =
+                            client.routing.subscribe_recovery_runner_catching_up();
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -3155,6 +3189,10 @@ async fn run_app_runtime_account_worker(
             // loop's top serves one per pass while other work is ready.
             turn = next_runner_turn(&mut recovery_runner), if !client.has_pending_effect_projections() => {
                 turn.serve(&mut client).await;
+            }
+            Ok(()) = recovery_catching_up.changed() => {
+                client.recovery_status_owed = true;
+                publish_account_level_changes(&mut client, &events, &account_id_hex, &account_label);
             }
             _ = tokio::task::yield_now(), if avatar_due && !lifecycle.is_stopping() => {
                 avatar_due = false;
@@ -5032,6 +5070,9 @@ struct AccountWorkerCommandContext<'a> {
     shared: &'a RuntimeSharedServices,
     media_http: &'a MediaHttpContext,
     scheduled_convergence: &'a mut ScheduledConvergence,
+    /// The account's recovery runner, behind the internal `runner_owns_debt`
+    /// gate: explicit repair serves its turns while it waits on it.
+    recovery_runner: Option<&'a mut SpawnedRunner>,
 }
 
 // Keep response ownership and error classification outside the large async dispatch
@@ -5096,6 +5137,7 @@ fn account_worker_command_future<'a>(
         shared,
         media_http,
         scheduled_convergence,
+        recovery_runner,
     } = context;
     let storage_permit = shared.observer.product().permit();
     match command {
@@ -5278,7 +5320,7 @@ fn account_worker_command_future<'a>(
             let cancelled = || respond.is_closed() || shared.lifecycle().is_stopping();
             let repaired = Box::pin(serve_snapshot_reads_until(
                 read_snapshot,
-                client.repair_full_history_cancellable(&cancelled),
+                client.repair_full_history_cancellable(&cancelled, recovery_runner),
                 commands,
                 pending,
                 app,
@@ -5998,6 +6040,15 @@ fn account_worker_command_future<'a>(
             );
             true
         }),
+        AccountWorkerCommand::AccountRecoveryStatus { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.account_recovery_status(),
+            );
+            true
+        }),
         AccountWorkerCommand::LinkedDevices { respond } => Box::pin(async move {
             let _ = respond_diagnosed(
                 shared,
@@ -6093,6 +6144,39 @@ fn account_worker_command_future<'a>(
                 storage_permit.as_ref(),
                 respond,
                 client.removed_device_leftover_chats(),
+            );
+            true
+        }),
+        AccountWorkerCommand::BeginRecoveryWords { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.begin_recovery_words(),
+            );
+            true
+        }),
+        AccountWorkerCommand::ConfirmRecoveryWords { answers, respond } => Box::pin(async move {
+            let result = client.confirm_recovery_words(&answers).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::CancelRecoveryWords { respond } => Box::pin(async move {
+            client.cancel_recovery_words();
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Ok(()));
+            true
+        }),
+        AccountWorkerCommand::TurnOffBackups { respond } => Box::pin(async move {
+            let result = client.turn_off_backups().await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::BackupSettings { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.backup_settings(),
             );
             true
         }),
@@ -8254,7 +8338,9 @@ fn publish_client_pending_applied_summary(
 /// `GroupStateUpdated` for each group whose own notices appeared or
 /// disappeared, so hosts re-read that group's `GroupRecoveryStatus`. Parking,
 /// un-parking by new evidence and dismissal all surface at the next seam that
-/// calls this; each call is one indexed read of the parked set. It also
+/// calls this; each call is one indexed read of the parked set. Behind the
+/// internal `runner_owns_debt` gate a change in what the recovery runner
+/// catches up, or in the notices, is one `RecoveryStatusChanged`. It also
 /// announces device-group and sign-in changes
 /// ([`publish_device_group_changes`], [`publish_sign_in_changes`]).
 fn publish_account_level_changes(
@@ -8267,7 +8353,14 @@ fn publish_account_level_changes(
     client.record_subscription_refusals();
     publish_device_group_changes(client, events, account_id_hex, account_label);
     publish_sign_in_changes(client, events, account_id_hex, account_label);
-    let Some(groups) = client.take_history_notice_changes() else {
+    let notice_changes = client.take_history_notice_changes();
+    if client.take_recovery_status_changed(notice_changes.is_some()) {
+        let _ = events.send(MarmotAppEvent::RecoveryStatusChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+    let Some(groups) = notice_changes else {
         return;
     };
     let _ = events.send(MarmotAppEvent::HistoryNoticesChanged {
@@ -10505,6 +10598,7 @@ mod tests {
                     shared: &shared,
                     media_http: &media_http,
                     scheduled_convergence: &mut scheduled_convergence,
+                    recovery_runner: None,
                 },
             )
             .await;
@@ -11552,6 +11646,7 @@ mod tests {
                     shared: &shared,
                     media_http: &media_http,
                     scheduled_convergence: &mut scheduled_convergence,
+                    recovery_runner: None,
                 },
             );
             let observer = async {
