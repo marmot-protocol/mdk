@@ -138,12 +138,17 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   hands foreign ones to `replace_foreign_slot_publications`, which publishes a newer KeyPackage or, for one dated past
   the skew window, asks the relays to delete it by id (D63). An incomplete own-slot read is retried within the hour.
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
-  `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in
-  `observe_device_group_event` (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending
-  leaf's device tag (mdk#2628 D33). That read sees only the current tree, so a message from an earlier epoch has no
-  readable sender. List every kind sent only in a device group in `is_device_group_kind` (457, 459, 460, 462), the
-  one list: `observe_event` drops one received in any other group before the host summary and the stored
-  projection, the notification preview refuses it, and the custom path rejects it as reserved.
+  `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in `observe_device_group_event`
+  (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
+  D33). That read sees only the current tree, so a message from an earlier epoch has no readable sender. List every kind
+  sent only in a device group in `is_device_group_kind` (457, 459, 460, 462, 475, 476), the one list: `observe_event`
+  drops one received in any other group before the host summary and the stored projection, the notification preview
+  refuses it, and the custom path rejects it as reserved. The engine withdraws a message by message id alone (an own
+  send's transport id, a received message's content id), so a kind whose withdrawal a feature acts on is listed in
+  `withdrawal_handled` and dispatched in `device_group_message_withdrawn`. Each such message is recorded with its kind
+  in `device_group_messages` when sent (before the send; its message id is filled in from whichever drain's effects
+  publish it, in `retain_effect_projection`) and when read. Records go after a week or past 4,096, so a feature also
+  acts on a withdrawn message with no record, which may be of any kind.
 - Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
   Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
   roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
@@ -200,6 +205,21 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`key_package_not_published`). Each drive ends by comparing linking as hosts read it with
   `DevicePairing::last_view` and sets `device_link_changed` when it differs; the client opens with that flag set, and
   the same two seams as `linked_devices_changed` drain it into `DeviceLinkChanged`.
+- Small state (`src/small_state.rs` and `src/client/small_state.rs`, mdk#2628 4.3) keeps each chat's read position,
+  pin, mute and archive the same on the account's devices, from the first maintenance pass after this device trusts a
+  device group. A pass is one storage transaction (`sync_small_state`): a local state that differs from what this
+  device last observed is its user's change, so no setter needs a hook and leaving a chat is never a change. Archives
+  go through the worker's in-memory account state (`apply_sibling_archives`, one save, mdk#178) and, like pins and
+  mutes from siblings, record no product outcome. Each chat a pass changes gets one chat-list update through `pending_projection_updates`. The merge rule's tie-break
+  (`tie_break`), its placement of a new pin (`new_pin_index`) and the broadcast schedule (`broadcast_due`) are each one
+  function; change them nowhere else. Recovery is a broadcast of every held item, with no stopping condition and
+  nothing tracked per sibling: at start, daily, when the device-group tip passes the app-payload window since the last
+  one, and an hour after the last when a sibling asked. Each maintenance pass then sends what is owed: updates split
+  to fit 32,768 bytes, each page's items marked sent only after it went out (a duplicate is harmless, a loss is not),
+  and a broadcast request when owed. Updates and requests are read from any member of the trusted device group, never
+  through `ensure_sent_by`. A withdrawn update owes every held item again, whoever sent it, and a withdrawn broadcast
+  request owes a new one; a withdrawn message with no record in the trusted device group owes both. A winning pin for
+  an archived chat waits, unobserved, until the chat is unarchived.
 - Keep outbound Welcomes on the engine's Welcome rows (mdk#2628 3.5a). The invite slot of
   `drive_unpublished_welcome_delivery` holds only Welcome ids, published through the runtime's
   `deliver_owed_welcomes_with_audit_context`; the founding slot keeps the create's `SessionEffects`, because a legacy

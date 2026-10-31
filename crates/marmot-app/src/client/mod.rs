@@ -88,6 +88,7 @@ mod recovery_coverage;
 pub(crate) mod recovery_runner;
 mod retention;
 pub(crate) mod sign_ins;
+mod small_state;
 mod sync;
 #[cfg(test)]
 mod upload_cleanup_tests;
@@ -1484,6 +1485,7 @@ impl AppClient {
             crate::ProductUnit::Attempt,
         );
         self.drive_sign_ins().await;
+        self.drive_small_state().await;
         self.drive_device_removals().await;
         self.device_rename_upkeep().await;
         let held = self.epoch_gap_held_groups()?;

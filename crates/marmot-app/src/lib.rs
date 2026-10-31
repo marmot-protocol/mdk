@@ -133,6 +133,7 @@ mod relay_caps;
 mod root_closers;
 mod root_runtime_lease;
 mod runtime;
+mod small_state;
 mod sqlcipher;
 mod startup_diagnostics;
 pub use startup_diagnostics::{
@@ -6506,7 +6507,7 @@ impl MarmotApp {
     /// URIs) used for push notifications, scoped to the local account. The
     /// unread window is already kind-9 filtered, but the real chat kind is
     /// passed for correctness.
-    fn chat_list_mention_classifier(
+    pub(crate) fn chat_list_mention_classifier(
         account_id_hex: &str,
     ) -> impl Fn(&str, &[Vec<String>]) -> bool + use<> {
         let account_id_hex = account_id_hex.to_owned();

@@ -7,6 +7,7 @@ pub(crate) mod attachment_history;
 pub(crate) mod avatar_cache;
 pub(crate) mod chat_list;
 pub(crate) mod chat_presentation;
+pub(crate) mod device_group_messages;
 pub(crate) mod device_groups;
 pub(crate) mod device_links;
 pub(crate) mod device_removals;
