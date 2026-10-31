@@ -5,8 +5,8 @@
 //! removed device's leaves from the chats that take a same-account removal.
 //! The decision is recorded first and kept while this device trusts the
 //! device group, so a busy device group only delays it, and a removal that
-//! branch selection drops is committed again. A removed device never refills
-//! its emptied slot (3.4).
+//! branch selection drops is committed again. A device refills its emptied
+//! slot (3.4) only while its roster lists it, so a removed one never does.
 
 use super::*;
 use crate::tests::sign_ins::{
@@ -857,6 +857,29 @@ async fn a_removal_is_refused_with_nothing_recorded() {
         "no_device_group"
     );
     assert_eq!(pending_removals(&phone_app), 0);
+}
+
+/// A device its trusted roster lists refills its emptied slot like any
+/// other (mdk#2628 3.4), announcing the new KeyPackage first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_its_roster_lists_refills_its_slot() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut laptop,
+            ..
+        },
+        _group,
+    ) = tagging_devices().await;
+    let laptop_slot = own_slot(&laptop);
+    let published = publish_two_days_ago(&laptop);
+    relay_empties_slot(&relay, &laptop_slot);
+
+    assert!(laptop.check_sign_ins().await.unwrap().refilling);
+    laptop.run_due_maintenance().await.unwrap();
+    assert!(published_at(&laptop) > published);
+    assert!(relay_serves_slot(&relay, &laptop_slot));
 }
 
 /// A device its siblings removed refills nothing in its emptied slot

@@ -54,10 +54,11 @@
 //!   id when it is dated too far ahead to outrank (D63). A relay that
 //!   accepted this device's current publication and, read to its end,
 //!   serves nothing in the slot was emptied by a deletion; the runtime
-//!   publishes a new KeyPackage there too, at most once a day, unless this
-//!   device's siblings removed it (3.6b). Only a relay's finished read shows
-//!   it empty, even when no relay returned anything else. An incomplete read
-//!   still acts on what it found, and the check runs again within the hour.
+//!   publishes a new KeyPackage there too, at most once a day and, with a
+//!   device group, only while its roster lists this device. Only a relay's
+//!   finished read shows it empty, even when no relay returned anything
+//!   else. An incomplete read still acts on what it found, and the check
+//!   runs again within the hour.
 //!
 //! Everything here runs only while device groups are on.
 
@@ -386,7 +387,7 @@ impl AppClient {
 
     /// Publish a new KeyPackage into this device's slot when a relay that
     /// accepted its current publication, read to its end, serves nothing
-    /// there, unless its siblings removed it. See the module docs.
+    /// there, while its device group lists it. See the module docs.
     fn refill_own_slot(
         &mut self,
         own: &OwnKeyPackages,
@@ -396,7 +397,7 @@ impl AppClient {
         let (Some(slot_hex), Some(own_read)) = (own.slot.as_deref(), own_read) else {
             return Ok(false);
         };
-        if self.removed_by_siblings(slot_hex, roster)? {
+        if !self.listed_as_device(slot_hex, roster)? {
             return Ok(false);
         }
         Ok(self
@@ -404,36 +405,21 @@ impl AppClient {
             .refill_emptied_slot(&emptied_targets(&own.targets, &own_read.empty))?)
     }
 
-    /// Whether this device's siblings removed it (3.6b): the trusted roster
-    /// records its slot as `removed`, or its copy of the trusted device group
-    /// ended in the Commit that removed its leaf. A removed device refills
-    /// nothing: its siblings deleted its slot, and a KeyPackage dated after
-    /// that reads to them as the removed device trying to come back. This
-    /// holds only while the device keeps that copy; once it forgets it,
-    /// nothing here remembers the removal, and what a removed device does
-    /// with its slot is 3.6b's (its own side).
-    fn removed_by_siblings(
+    /// Whether this device's device group lets it refill its slot: always
+    /// with no trusted device group, and with one only while its trusted
+    /// roster lists this device's slot as a device. A copy that ended, as
+    /// one does when this device's siblings remove it (3.6b), lists nothing.
+    /// Once the device forgets such a copy, nothing here remembers it: what
+    /// a removed device does with its slot is 3.6b's (its own side).
+    fn listed_as_device(
         &self,
         slot_hex: &str,
         roster: Option<&DeviceRosterV1>,
     ) -> Result<bool, AppError> {
-        let removed_in_roster = roster
-            .zip(roster_slot(slot_hex))
-            .is_some_and(|(roster, slot)| {
-                roster
-                    .rejected_slots
-                    .get(&slot)
-                    .is_some_and(|record| record.reason == RejectedSlotReasonV1::Removed)
-            });
-        if removed_in_roster {
-            return Ok(true);
+        if let Some(roster) = roster {
+            return Ok(roster_slot(slot_hex).is_some_and(|slot| roster.devices.contains_key(&slot)));
         }
-        let Some(group_id) = self.trusted_device_group()? else {
-            return Ok(false);
-        };
-        Ok(self
-            .stored_group(&group_id)?
-            .is_some_and(|group| group.removed))
+        Ok(self.trusted_device_group()?.is_none())
     }
 
     /// Check now, for the host, and restart the schedule from this check as

@@ -140,8 +140,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   hands foreign ones to `replace_foreign_slot_publications`, which publishes a newer KeyPackage or, for one dated past
   the skew window, asks the relays to delete it by id (D63). It also hands over each relay whose own read finished and
   returned nothing in the slot (`OwnSlotRead::empty`), named as the lifecycle's publication targets name it, to
-  `refill_emptied_slot`, which publishes a new KeyPackage when one accepted the current publication, unless this
-  device's siblings removed it (`removed_by_siblings`). A failed or unfinished read never shows a relay empty. An incomplete own-slot read is retried within the hour.
+  `refill_emptied_slot`, which publishes a new KeyPackage when one accepted the current publication, while this
+  device's trusted roster, if it has one, lists it as a device (`listed_as_device`). A failed or unfinished read never
+  shows a relay empty. An incomplete own-slot read is retried within the hour.
 - The compromise warning (`src/client/compromise_warning.rs`, mdk#2628 3.7a, D53) is storage's
   (`account_compromise_warning_items`): every `not_me` slot and rejected KeyPackage in the trusted roster, plus this
   device's own rejected sign-ins, gathered with insert-or-ignore so a seen mark survives branch selection dropping and
