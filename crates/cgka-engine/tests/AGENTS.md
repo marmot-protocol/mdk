@@ -253,8 +253,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only). A sibling
     Welcome (3.5b) consumes only the private KeyPackage it names, issued to its sender, and one back into a chat still
     held active is held, writing nothing, until that copy reads removed or unrecoverable. One carried no later than a
-    local forget is refused for that carrier alone, so the same Welcome in a later carrier joins. An invite with a
-    private KeyPackage, whose Welcome the Nostr binding cannot wrap, writes nothing.
+    local forget is refused for that carrier alone, so the same Welcome in a later carrier joins. An invite or a
+    same-account Add with a private KeyPackage, whose Welcome the Nostr binding cannot wrap, writes nothing.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and

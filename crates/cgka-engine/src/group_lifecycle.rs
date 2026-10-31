@@ -809,6 +809,18 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         if self.new_protocol_profile == ProtocolProfile::Legacy {
+            // Every check that can refuse the creation runs before its first
+            // write. A current-profile create runs them inside its creation
+            // transaction instead.
+            crate::capability_manager::check_key_packages_carry_profile(
+                group_record.protocol_profile,
+                &parsed_kps,
+            )?;
+            crate::capability_manager::check_own_leaf(
+                &mls_group,
+                self.identity.self_id(),
+                self.ciphersuite,
+            )?;
             // SQLite enforces message/group foreign keys, so the group row
             // must exist before `record_sent_message` writes welcome records.
             self.storage.put_group(&group_record)?;
@@ -994,17 +1006,6 @@ impl<S: StorageProvider> Engine<S> {
             }
             return Ok((group_id, SendResult::FoundingGroupCreated { welcomes }));
         }
-
-        crate::capability_manager::check_key_package_profiles(
-            &self.storage,
-            &group_id,
-            &parsed_kps,
-        )?;
-        crate::capability_manager::check_own_leaf(
-            &mls_group,
-            self.identity.self_id(),
-            self.ciphersuite,
-        )?;
 
         // 7. Enter PendingPublish — the caller must confirm_published once
         //    the transport hands off every welcome. The visible epoch
