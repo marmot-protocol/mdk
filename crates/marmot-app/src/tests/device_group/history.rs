@@ -306,7 +306,7 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         ..reference.clone()
     };
     assert!(
-        bob.cache_attachment_source_epoch_secret(&chat, &source)
+        bob.cache_attachment_source_epoch_secret(&chat, &photo, &source)
             .is_err()
     );
 
@@ -354,8 +354,55 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
     assert_eq!(slots[0].message_id_hex, photo);
     assert_eq!(slots[0].source_message_id_hex, photo);
     assert_eq!(slots[0].source_epoch, Some(epoch));
-    bob.cache_attachment_source_epoch_secret(&chat, &source)
+    bob.cache_attachment_source_epoch_secret(&chat, &photo, &source)
         .expect("the imported key opens the photo");
+    let prepared = bob
+        .prepare_background_attachment_download_for_message(
+            &chat,
+            Some(&photo),
+            source.clone(),
+            1024,
+        )
+        .unwrap()
+        .expect("the imported key opens the photo");
+    assert!(prepared.opens_with_imported_key());
+
+    // The key belongs to the imported photo. A message Bob received himself
+    // that names the same file waits for its epoch's secret instead.
+    let received = "ee".repeat(32);
+    assert!(
+        bob.prepare_background_attachment_download_for_message(
+            &chat,
+            Some(&received),
+            source.clone(),
+            1024,
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        bob.cache_attachment_source_epoch_secret(&chat, &received, &source)
+            .is_err()
+    );
+    // Once the epoch's secret is here, it opens even the imported photo.
+    storage
+        .remember_encrypted_media_epoch_secret(
+            &chat_hex,
+            crate::media::EncryptedMediaVersion::V2.component_id(),
+            epoch,
+            &secret,
+        )
+        .unwrap();
+    let prepared = bob
+        .prepare_background_attachment_download_for_message(
+            &chat,
+            Some(&photo),
+            source.clone(),
+            1024,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(!prepared.opens_with_imported_key());
 
     let passed_on = bob.export_chat_history(&chat, None).unwrap().unwrap();
     let event = passed_on

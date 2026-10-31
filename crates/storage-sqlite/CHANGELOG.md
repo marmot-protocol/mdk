@@ -130,12 +130,17 @@
   Each key is named by its media reference's `ciphertext_sha256`, is zeroed
   before its app event is deleted, and goes with it.
   `ImportedAppEvent::file_keys` carries the keys, and `import_app_events`
-  stores them only for rows it adds. `imported_media_file_key` reads the key
-  for one media reference, and `imported_media_file_keys` reads a message's
-  keys so they can be passed on. Imported chat messages now get attachment
-  slots. `attachment_history_source` takes a row without a transport id when
-  `app_event_imports` marks it, and the attachment tables use its app event id
-  as its `source_message_id_hex`.
+  stores them only for rows it adds, refusing a second, different key for a
+  ciphertext the chat already holds one for. `imported_media_file_key` reads
+  an imported message's key for one media reference,
+  `imported_media_file_key_for_ciphertext` reads the chat's key for a
+  ciphertext when the caller cannot name the message, and
+  `imported_media_file_keys` reads a message's keys so they can be passed on.
+  `AttachmentAcquisitionSource` gains `message_id_hex`. Imported chat messages
+  now get attachment slots, which a timeline rebuild keeps.
+  `attachment_history_source` and its insert trigger take a row without a
+  transport id when `app_event_imports` marks it, and the attachment tables
+  use its app event id as its `source_message_id_hex`.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`

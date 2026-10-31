@@ -349,9 +349,33 @@ impl SqliteAppStorage {
         .transpose()
     }
 
-    /// The imported key that opens the chat's media reference with
-    /// `ciphertext_sha256`, if a sibling sent one.
+    /// The key a sibling sent with the imported chat message `message_id_hex`
+    /// for its media reference with `ciphertext_sha256`. A message this device
+    /// received itself has none.
     pub fn imported_media_file_key(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        ciphertext_sha256: &str,
+    ) -> StorageResult<Option<Zeroizing<[u8; 32]>>> {
+        let key = self
+            .lock()?
+            .query_row_cached(
+                "SELECT file_key FROM imported_media_file_keys
+                 WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND ciphertext_sha256 = ?3",
+                params![group_id_hex, message_id_hex, ciphertext_sha256],
+                |row| row.get::<_, Vec<u8>>(0).map(Zeroizing::new),
+            )
+            .optional()
+            .storage()?;
+        key.map(|key| file_key_bytes(&key)).transpose()
+    }
+
+    /// The imported key for the chat's media reference with
+    /// `ciphertext_sha256`, for a caller that cannot name the message. Import
+    /// refuses a second, different key for a held ciphertext, so the chat has
+    /// at most one.
+    pub fn imported_media_file_key_for_ciphertext(
         &self,
         group_id_hex: &str,
         ciphertext_sha256: &str,
@@ -711,13 +735,26 @@ mod tests {
             vec![file_key(0xbb, 2)]
         );
         assert_eq!(
-            s.imported_media_file_key(GROUP, &hex::encode([0xbb; 32]))
+            s.imported_media_file_key(GROUP, &new.message_id_hex, &hex::encode([0xbb; 32]))
+                .unwrap()
+                .map(|key| *key),
+            Some([2; 32])
+        );
+        // A key belongs to its message: another message naming the same
+        // ciphertext does not get it.
+        assert!(
+            s.imported_media_file_key(GROUP, &held.message_id_hex, &hex::encode([0xbb; 32]))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.imported_media_file_key_for_ciphertext(GROUP, &hex::encode([0xbb; 32]))
                 .unwrap()
                 .map(|key| *key),
             Some([2; 32])
         );
         assert!(
-            s.imported_media_file_key(GROUP, &hex::encode([0xaa; 32]))
+            s.imported_media_file_key_for_ciphertext(GROUP, &hex::encode([0xaa; 32]))
                 .unwrap()
                 .is_none()
         );

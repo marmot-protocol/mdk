@@ -46,8 +46,9 @@
   secret, or is the one the sender imported itself, and the epoch secret never
   goes in a bundle. The receiving device keeps a key only for a message it
   adds and only when the key names one of that message's attachments.
-  Downloading an imported attachment uses its key, so a device that was never
-  in the attachment's epoch can still open it.
+  Downloading an imported attachment uses its key when the epoch's secret is
+  not here, so a device that was never in the attachment's epoch can still
+  open it. A message the device received itself never uses an imported key.
 - `MarmotAppConfig::device_platform` (`with_device_platform`) names the
   platform this device runs on. Each device writes it and
   `key_package_client_name` into its own roster entry with its next KeyPackage
