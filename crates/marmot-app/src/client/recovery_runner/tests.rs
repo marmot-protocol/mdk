@@ -910,6 +910,8 @@ struct TestHost {
     debt_turns: AtomicUsize,
     /// How long a NIP-11 read takes.
     caps_latency: Mutex<Duration>,
+    /// Every NIP-11 read is unknown, as a relay that serves no document.
+    caps_unknown: AtomicBool,
     /// Worker turns still to fail, against `closed`.
     failing_turns: AtomicUsize,
     closed: OnceLock<Account>,
@@ -983,6 +985,7 @@ impl TestHost {
                 .collect(),
             debt_turns: AtomicUsize::new(0),
             caps_latency: Mutex::new(Duration::ZERO),
+            caps_unknown: AtomicBool::new(false),
             failing_turns: AtomicUsize::new(0),
             closed: OnceLock::new(),
             connections: watch::channel(BTreeMap::new()).0,
@@ -1093,6 +1096,9 @@ impl RunnerHost for TestHost {
         let latency = *self.caps_latency.lock().unwrap();
         if !latency.is_zero() {
             tokio::time::sleep(latency).await;
+        }
+        if self.caps_unknown.load(Ordering::SeqCst) {
+            return None;
         }
         self.relays.get(relay).and_then(|relay| relay.published)
     }
@@ -1839,6 +1845,50 @@ async fn recovery_runner_breaks_a_unit_after_six_answers_without_progress() {
         "a broken unit waits for evidence, not for time"
     );
     assert_eq!(relay.requests(), requests);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_rearms_nothing_on_an_unknown_caps_read() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let relay = stalling_relay([1; 32], floor).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, handle) = runner(&host, test_policy());
+    let broken = RecoveryUnitState::Broken(RecoveryUnitBreak::NoProgress);
+    let state = || {
+        let unit = account.app.recovery_unit(&route, RELAY).unwrap();
+        unit.map(|unit| unit.state)
+    };
+    while state() != Some(broken) {
+        match runner.step().await {
+            Step::Ran(summary) => assert_eq!(summary.outcome, Outcome::NoProgress),
+            Step::Idle { next_due } => clock.advance_to(next_due.unwrap()),
+            Step::Raced | Step::Stopped => panic!("the unit runs until it breaks"),
+        }
+    }
+    let requests = relay.requests();
+
+    // The relay reconnects without a document: no evidence its caps changed.
+    host.caps_unknown.store(true, Ordering::SeqCst);
+    handle.relay_reconnected(RELAY);
+    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(account.unit(&route, RELAY).state, broken);
+    // Nor is reading the caps it was planned with.
+    host.caps_unknown.store(false, Ordering::SeqCst);
+    handle.relay_reconnected(RELAY);
+    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(account.unit(&route, RELAY).state, broken);
+    assert_eq!(relay.requests(), requests, "a broken unit fetches nothing");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
