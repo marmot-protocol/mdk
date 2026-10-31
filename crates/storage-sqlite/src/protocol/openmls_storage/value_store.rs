@@ -649,6 +649,7 @@ fn delete_group_labels_on_connection(
 mod tests {
     use super::*;
     use crate::SqliteAccountStorage;
+    use crate::protocol::storage::write_contention::SharedDatabase;
     use openmls_traits::storage::Entity;
     use serde::{Deserialize, Serialize};
 
@@ -689,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn list_push_derives_buffer_ownership_from_the_existing_list() {
+    fn list_push_appends_elements_in_the_current_encoding() {
         let mut public = SerializedList::Public(Vec::new());
         public
             .push(OpenMlsValueLabel::test_public(b"P"), &TestEntity(7))
@@ -809,37 +810,17 @@ mod tests {
         let key = b"row".to_vec();
         let legacy_key = build_key_legacy(label.as_bytes(), key.clone());
 
-        mls.lock()
-            .unwrap()
-            .execute(
-                "INSERT OR REPLACE INTO openmls_values
-                    (provider_version, label, storage_key, group_key, value)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    CURRENT_VERSION,
-                    label.as_bytes(),
-                    legacy_key.clone(),
-                    Option::<&[u8]>::None,
-                    serde_json::to_vec(&7u8).unwrap()
-                ],
-            )
-            .unwrap();
+        insert_raw_row(mls, label, &legacy_key, serde_json::to_vec(&7u8).unwrap());
 
         assert_eq!(mls.read_json::<u8>(label, key.clone()).unwrap(), Some(7));
 
         mls.write_value(label, key.clone(), None, serde_json::to_vec(&8u8).unwrap())
             .unwrap();
-        let legacy_count: i64 = mls
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM openmls_values
-                 WHERE provider_version = ?1 AND storage_key = ?2",
-                params![CURRENT_VERSION, legacy_key],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(legacy_count, 0, "new write should migrate legacy row away");
+        assert_eq!(
+            row_count(mls, &legacy_key),
+            0,
+            "new write should migrate legacy row away"
+        );
         assert_eq!(
             mls.read_json::<u8>(label, key.clone()).unwrap(),
             Some(8),
@@ -859,21 +840,12 @@ mod tests {
         let legacy_key = build_key_legacy(label.as_bytes(), key.clone());
         let legacy_list = vec![serde_json::to_vec(&TestEntity(1)).unwrap()];
 
-        mls.lock()
-            .unwrap()
-            .execute(
-                "INSERT OR REPLACE INTO openmls_values
-                    (provider_version, label, storage_key, group_key, value)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    CURRENT_VERSION,
-                    label.as_bytes(),
-                    legacy_key.clone(),
-                    Option::<&[u8]>::None,
-                    serde_json::to_vec(&legacy_list).unwrap()
-                ],
-            )
-            .unwrap();
+        insert_raw_row(
+            mls,
+            label,
+            &legacy_key,
+            serde_json::to_vec(&legacy_list).unwrap(),
+        );
 
         mls.append_entity(label, key.clone(), None, &TestEntity(2))
             .unwrap();
@@ -881,17 +853,11 @@ mod tests {
             mls.read_list::<TestEntity>(label, key.clone()).unwrap(),
             vec![TestEntity(1), TestEntity(2)]
         );
-        let legacy_count: i64 = mls
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM openmls_values
-                 WHERE provider_version = ?1 AND storage_key = ?2",
-                params![CURRENT_VERSION, legacy_key],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(legacy_count, 0, "legacy row should be migrated away");
+        assert_eq!(
+            row_count(mls, &legacy_key),
+            0,
+            "legacy row should be migrated away"
+        );
 
         mls.remove_entity(label, key.clone(), None, &TestEntity(1))
             .unwrap();
@@ -901,64 +867,130 @@ mod tests {
         );
     }
 
+    /// A list mutation writes the list under the current key and deletes the
+    /// legacy-key row in one transaction: when the cleanup fails, the
+    /// rewritten list rolls back with it instead of committing on its own.
     #[test]
-    fn list_mutations_keep_read_modify_write_under_one_transaction() {
-        let source = include_str!("value_store.rs");
-        for function in ["append_entity", "remove_entity"] {
-            let body = source
-                .split(&format!("fn {function}"))
-                .nth(1)
-                .expect("function body");
-            let body = body
-                .split("pub(in crate::protocol::openmls_storage) fn")
-                .next()
-                .unwrap_or(body);
-            let body = body.split("\n    fn ").next().unwrap_or(body);
+    fn list_mutations_roll_back_when_the_legacy_cleanup_fails() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let label = OpenMlsValueLabel::test_public(b"LegacyList");
+        let key = b"list".to_vec();
+        let legacy_key = build_key_legacy(label.as_bytes(), key.clone());
+        let legacy_list = vec![serde_json::to_vec(&TestEntity(1)).unwrap()];
+        insert_raw_row(
+            mls,
+            label,
+            &legacy_key,
+            serde_json::to_vec(&legacy_list).unwrap(),
+        );
+        mls.lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_legacy_cleanup
+                 BEFORE DELETE ON openmls_values
+                 WHEN hex(OLD.storage_key) = '{}'
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected legacy cleanup failure');
+                 END;",
+                hex::encode_upper(&legacy_key)
+            ))
+            .unwrap();
 
-            assert!(
-                body.contains("transaction_with_behavior(TransactionBehavior::Immediate)"),
-                "{function}"
-            );
-            assert!(!body.contains("read_raw_list"), "{function}");
-            assert!(!body.contains("self.write_value"), "{function}");
-        }
+        let append = mls.append_entity(label, key.clone(), None, &TestEntity(2));
+        assert_injected_cleanup_failure(append);
+        let remove = mls.remove_entity(label, key.clone(), None, &TestEntity(1));
+        assert_injected_cleanup_failure(remove);
+
+        assert_eq!(
+            row_count(mls, &build_key(label.as_bytes(), key.clone())),
+            0,
+            "the rewritten list must roll back with its failed cleanup"
+        );
+        assert_eq!(
+            mls.read_list::<TestEntity>(label, key).unwrap(),
+            vec![TestEntity(1)]
+        );
     }
 
-    #[test]
-    fn delete_group_labels_deletes_all_labels_under_one_transaction() {
-        // clear_proposal_queue deletes multiple labels (QueuedProposal entities
-        // and ProposalQueueRefs) in one call. Those deletes must be atomic: a
-        // crash between separate autocommit deletes could leave refs whose
-        // entities are gone, which bricks MlsGroup::load for that group with no
-        // self-healing path (issue #148). Enforce the single-transaction wrap
-        // by source inspection, mirroring the list-mutation guard above.
-        let source = include_str!("value_store.rs");
-        let body = source
-            .split("fn delete_group_labels")
-            .nth(1)
-            .expect("delete_group_labels body");
-        let body = body
-            .split("\n    fn ")
-            .next()
-            .unwrap_or(body)
-            .split("\nfn ")
-            .next()
-            .unwrap_or(body)
-            .split("\n#[cfg(test)]")
-            .next()
-            .unwrap_or(body);
+    fn assert_injected_cleanup_failure(result: Result<(), SqliteOpenMlsStorageError>) {
+        let error = result.expect_err("the injected cleanup failure must surface");
+        assert!(
+            error
+                .to_string()
+                .contains("injected legacy cleanup failure"),
+            "{error}"
+        );
+    }
 
-        assert!(
-            body.contains("transaction_with_behavior(TransactionBehavior::Immediate)"),
-            "delete_group_labels must wrap its deletes in a single transaction"
+    /// A list mutation reads the list inside its write transaction (#39): an
+    /// element another connection appends while this one waits for the write
+    /// lock survives, rather than being overwritten by a list read before it.
+    #[test]
+    fn list_mutations_keep_an_append_committed_while_they_wait() {
+        let db = SharedDatabase::new(5_000);
+        let store = db.open();
+        let label = OpenMlsValueLabel::test_public(b"List");
+        let key = b"list".to_vec();
+        store
+            .openmls
+            .append_entity(label, key.clone(), None, &TestEntity(1))
+            .unwrap();
+        let append_elsewhere = |entity: u8| {
+            let key = key.clone();
+            move |other: &SqliteAccountStorage| {
+                other
+                    .openmls
+                    .append_entity(label, key, None, &TestEntity(entity))
+                    .unwrap();
+            }
+        };
+
+        let blocker = db.hold_write_lock(append_elsewhere(2));
+        store
+            .openmls
+            .append_entity(label, key.clone(), None, &TestEntity(3))
+            .unwrap();
+        blocker.join().unwrap();
+        let blocker = db.hold_write_lock(append_elsewhere(4));
+        store
+            .openmls
+            .remove_entity(label, key.clone(), None, &TestEntity(1))
+            .unwrap();
+        blocker.join().unwrap();
+
+        assert_eq!(
+            store.openmls.read_list::<TestEntity>(label, key).unwrap(),
+            vec![TestEntity(2), TestEntity(3), TestEntity(4)]
         );
-        assert!(
-            body.contains("tx.commit()"),
-            "delete_group_labels must commit its transaction"
-        );
-        assert!(
-            !body.contains("conn.execute"),
-            "delete_group_labels must execute through the transaction, not the bare connection"
-        );
+    }
+
+    fn insert_raw_row(
+        mls: &SqliteOpenMlsStorage,
+        label: OpenMlsValueLabel,
+        storage_key: &[u8],
+        value: Vec<u8>,
+    ) {
+        mls.lock()
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO openmls_values
+                    (provider_version, label, storage_key, group_key, value)
+                 VALUES (?1, ?2, ?3, NULL, ?4)",
+                params![CURRENT_VERSION, label.as_bytes(), storage_key, value],
+            )
+            .unwrap();
+    }
+
+    fn row_count(mls: &SqliteOpenMlsStorage, storage_key: &[u8]) -> i64 {
+        mls.lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM openmls_values
+                 WHERE provider_version = ?1 AND storage_key = ?2",
+                params![CURRENT_VERSION, storage_key],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 }

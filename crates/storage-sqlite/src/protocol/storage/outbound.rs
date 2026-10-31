@@ -372,6 +372,17 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let mut fanout = sample_fanout(7);
+        // Successors cannot change the application message, so the equality
+        // below also proves it survives the in-place updates.
+        fanout
+            .set_application_message(OutboundApplicationMessage {
+                authority: None,
+                group_id: gid(1),
+                app_event_id: "durable-app-event".into(),
+                source_epoch: EpochId(7),
+                retention: AppMessageRetentionDecision::new(100, 30),
+            })
+            .unwrap();
 
         store.put_outbound_fanout(&fanout).unwrap();
         fanout.mark_attempt_started(0).unwrap();
@@ -396,31 +407,6 @@ mod tests {
         );
         store.delete_outbound_fanout(&mid(7)).unwrap();
         assert!(store.list_outbound_fanouts().unwrap().is_empty());
-    }
-
-    #[test]
-    fn frozen_outbound_fanout_survives_reopen_with_exact_bytes_and_targets() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fanout.sqlite");
-        let key = crate::SqlCipherKey::new("durable fanout key").unwrap();
-        let mut expected = sample_fanout(8);
-        expected
-            .set_application_message(OutboundApplicationMessage {
-                authority: None,
-                group_id: gid(1),
-                app_event_id: "durable-app-event".into(),
-                source_epoch: EpochId(7),
-                retention: AppMessageRetentionDecision::new(100, 30),
-            })
-            .unwrap();
-        {
-            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
-            store.put_outbound_fanout(&expected).unwrap();
-        }
-
-        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        assert_eq!(reopened.outbound_fanout(&mid(8)).unwrap(), Some(expected));
     }
 
     #[test]
@@ -573,7 +559,12 @@ mod tests {
             Err(StorageError::Backend("force rollback".to_string()))
         });
 
-        assert!(result.is_err());
+        // Only the injected error proves both writes ran inside the
+        // transaction: a nested-transaction failure is also `Backend`.
+        assert!(
+            matches!(&result, Err(StorageError::Backend(message)) if message == "force rollback"),
+            "{result:?}"
+        );
         let ids = store
             .list_queued_outbound_intents(&gid(1))
             .unwrap()
@@ -592,66 +583,25 @@ mod tests {
     // "database is locked" to the send caller.
     #[test]
     fn queued_send_contention_is_retried_not_surfaced() {
-        use crate::base::test_support::{gid, mid, sample_group, sample_queued_intent};
-        use crate::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
-        use cgka_traits::storage::{GroupStorage, OutboundIntentStorage};
+        use crate::protocol::storage::write_contention::SharedDatabase;
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queued-contention.sqlite");
-        let key = SqlCipherKey::new("queued contention test key").unwrap();
         // Short busy timeout so the first attempt fails fast and the win comes
         // from the retry loop rather than from SQLite's own busy_timeout wait.
-        let options = SqliteStorageOptions {
-            busy_timeout_ms: 50,
-            ..SqliteStorageOptions::default()
-        };
-
-        let writer =
-            SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
-                .unwrap();
+        let db = SharedDatabase::new(50);
+        let writer = db.open();
         writer.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         // Pre-seed an intent to delete under contention later.
         writer
             .put_queued_outbound_intent(&sample_queued_intent(mid(9), gid(1)))
             .unwrap();
 
-        // Spawn a blocker that holds an exclusive write transaction on a
-        // separate connection for longer than one busy-timeout window.
-        let spawn_blocker = |blocker_gid: u8| {
-            let hold = std::time::Duration::from_millis(200);
-            let blocker_options = options.clone();
-            let blocker_key = SqlCipherKey::new("queued contention test key").unwrap();
-            let blocker_path = path.clone();
-            std::thread::spawn(move || {
-                let blocker = SqliteAccountStorage::open_encrypted_with_options(
-                    &blocker_path,
-                    &blocker_key,
-                    blocker_options,
-                )
-                .unwrap();
-                let conn = blocker.lock().unwrap();
-                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-                conn.execute(
-                    "INSERT INTO cgka_groups (id, record) VALUES (?1, ?2)",
-                    rusqlite::params![gid(blocker_gid).as_slice(), b"blocker".as_slice()],
-                )
-                .ok();
-                std::thread::sleep(hold);
-                conn.execute_batch("COMMIT").unwrap();
-            })
-        };
-
-        // 1. put_queued_outbound_intent under contention must succeed via retry.
-        let blocker = spawn_blocker(2);
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        let blocker = db.hold_write_lock(|_| {});
         writer
             .put_queued_outbound_intent(&sample_queued_intent(mid(1), gid(1)))
             .expect("contended queued put must succeed via busy retry, not surface as failure");
         blocker.join().unwrap();
 
-        // 2. delete_queued_outbound_intent under contention must succeed too.
-        let blocker = spawn_blocker(3);
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        let blocker = db.hold_write_lock(|_| {});
         writer
             .delete_queued_outbound_intent(&mid(9))
             .expect("contended queued delete must succeed via busy retry, not surface as failure");

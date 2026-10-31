@@ -890,23 +890,73 @@ mod tests {
             ))
             .unwrap();
 
+        let error = mls
+            .queue_proposal(&group_id, &proposal_ref, &proposal)
+            .expect_err("the injected ref failure must surface");
         assert!(
-            mls.queue_proposal(&group_id, &proposal_ref, &proposal)
-                .is_err()
+            error.to_string().contains("injected proposal-ref failure"),
+            "{error}"
         );
-        let queued_entity_count: i64 = mls
-            .lock()
+        assert_eq!(
+            label_row_count(mls, QUEUED_PROPOSAL_LABEL),
+            0,
+            "the proposal entity must roll back with the failed ref append"
+        );
+    }
+
+    /// `clear_proposal_queue` deletes the queued proposals and their refs in
+    /// one transaction (#148): when the refs delete fails, the proposals stay
+    /// too, so a crash between the deletes cannot leave refs to missing
+    /// entities.
+    #[test]
+    fn clear_proposal_queue_keeps_the_proposals_when_the_refs_delete_fails() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let group_id = TestGroupId(vec![1, 2, 3, 4]);
+        mls.queue_proposal(
+            &group_id,
+            &TestProposalRef(vec![0xAA]),
+            &TestQueuedProposal(vec![0xCC]),
+        )
+        .unwrap();
+        let refs_label_hex = hex::encode_upper(PROPOSAL_QUEUE_REFS_LABEL.as_bytes());
+        mls.lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_proposal_refs_delete
+                 BEFORE DELETE ON openmls_values
+                 WHEN hex(OLD.label) = '{refs_label_hex}'
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected proposal-refs delete failure');
+                 END;"
+            ))
+            .unwrap();
+
+        let error = mls
+            .clear_proposal_queue::<TestGroupId, TestProposalRef>(&group_id)
+            .expect_err("the injected refs delete failure must surface");
+        assert!(
+            error
+                .to_string()
+                .contains("injected proposal-refs delete failure"),
+            "{error}"
+        );
+        assert_eq!(
+            label_row_count(mls, QUEUED_PROPOSAL_LABEL),
+            1,
+            "the proposal delete must roll back with the failed refs delete"
+        );
+    }
+
+    fn label_row_count(mls: &SqliteOpenMlsStorage, label: OpenMlsValueLabel) -> i64 {
+        mls.lock()
             .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM openmls_values WHERE label = ?1",
-                rusqlite::params![QUEUED_PROPOSAL_LABEL.as_bytes()],
+                rusqlite::params![label.as_bytes()],
                 |row| row.get(0),
             )
-            .unwrap();
-        assert_eq!(
-            queued_entity_count, 0,
-            "the proposal entity must roll back with the failed ref append"
-        );
+            .unwrap()
     }
 
     #[test]

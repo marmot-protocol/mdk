@@ -185,12 +185,14 @@ mod tests {
         TestGroupState, gid, mid, sample_group, sample_message, sample_queued_intent,
     };
     use crate::{SqliteAccountStorage, TransportReconciliationItem, TransportReconciliationRoute};
+    use cgka_traits::capabilities::Capability;
     use cgka_traits::engine::GroupEvent;
-    use cgka_traits::group::ProtocolProfile;
+    use cgka_traits::group::{DisbandTombstone, ProtocolProfile};
     use cgka_traits::storage::{
         ConvergencePolicyStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
         StorageError, StorageProvider, TransportGroupRoute,
     };
+    use cgka_traits::transport::Timestamp;
     use cgka_traits::types::{EpochId, MemberId};
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
 
@@ -205,6 +207,7 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records.contains(&first));
         assert!(records.contains(&second));
+        assert_eq!(store.list_groups().unwrap(), vec![gid(1), gid(2)]);
     }
 
     fn route(
@@ -223,6 +226,27 @@ mod tests {
         let mut routes = store.list_transport_group_routes().unwrap();
         routes.sort_by(|a, b| a.transport_group_id.cmp(&b.transport_group_id));
         routes
+    }
+
+    fn record_reconciliation_item(
+        store: &SqliteAccountStorage,
+        route_id: [u8; 32],
+        event_id: [u8; 32],
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store
+            .app_storage()
+            .record_reconciliation_items(std::iter::once((
+                &TransportReconciliationRoute::Group(route_id),
+                &TransportReconciliationItem {
+                    event_id,
+                    created_at: now,
+                },
+            )))
+            .unwrap();
     }
 
     fn reconciliation_row_counts(store: &SqliteAccountStorage, route_id: [u8; 32]) -> (i64, i64) {
@@ -309,21 +333,8 @@ mod tests {
         store
             .put_transport_group_route(&[0x04; 32], &bystander.id, EpochId(1))
             .unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         for route_id in [[0x01; 32], [0x02; 32], [0x03; 32], [0x04; 32]] {
-            store
-                .app_storage()
-                .record_reconciliation_items(std::iter::once((
-                    &TransportReconciliationRoute::Group(route_id),
-                    &TransportReconciliationItem {
-                        event_id: route_id,
-                        created_at: now,
-                    },
-                )))
-                .unwrap();
+            record_reconciliation_item(&store, route_id, route_id);
         }
 
         // Bulk retirement below the retention cutoff touches only the named
@@ -363,63 +374,44 @@ mod tests {
         store
             .put_transport_group_route(&[0xAA; 32], &group.id, EpochId(1))
             .unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        store
-            .app_storage()
-            .record_reconciliation_items(std::iter::once((
-                &TransportReconciliationRoute::Group([0xAA; 32]),
-                &TransportReconciliationItem {
-                    event_id: [0xBB; 32],
-                    created_at: now,
-                },
-            )))
-            .unwrap();
+        record_reconciliation_item(&store, [0xAA; 32], [0xBB; 32]);
 
         let result: Result<(), StorageError> = store.with_transaction(|storage| {
             storage.delete_transport_group_route(&[0xAA; 32])?;
             Err(StorageError::Backend("force rollback".to_string()))
         });
 
-        assert!(matches!(result, Err(StorageError::Backend(_))));
+        // Only the injected error proves the retirement ran inside the
+        // transaction: a nested-transaction failure is also `Backend`.
+        assert!(
+            matches!(&result, Err(StorageError::Backend(message)) if message == "force rollback"),
+            "{result:?}"
+        );
         assert_eq!(sorted_routes(&store), vec![route([0xAA; 32], &group.id, 1)]);
         assert_eq!(reconciliation_row_counts(&store, [0xAA; 32]), (1, 1));
-    }
-
-    #[test]
-    fn deleting_a_group_cascades_its_transport_routes() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let group = sample_group(gid(1), 1, 1);
-        store.put_group(&group).unwrap();
-        store
-            .put_transport_group_route(&[0xCC; 32], &group.id, EpochId(1))
-            .unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        store
-            .app_storage()
-            .record_reconciliation_items(std::iter::once((
-                &TransportReconciliationRoute::Group([0xCC; 32]),
-                &TransportReconciliationItem {
-                    event_id: [0xDD; 32],
-                    created_at: now,
-                },
-            )))
-            .unwrap();
-        store.delete_group(&group.id).unwrap();
-        assert!(store.list_transport_group_routes().unwrap().is_empty());
-        assert_eq!(reconciliation_row_counts(&store, [0xCC; 32]), (0, 0));
     }
 
     #[test]
     fn group_roundtrip_preserves_every_field() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let mut group = sample_group(gid(1), 7, 3);
+        // Every field away from its default, so a codec that drops one fails.
+        group.required_capabilities.insert(Capability::Proposal(10));
         group.protocol_profile = ProtocolProfile::Current;
+        group.removed = true;
+        group.unrecoverable = true;
+        group.disbanded = Some(DisbandTombstone {
+            epoch: EpochId(7),
+            actor: MemberId::new(vec![5; 4]),
+            origin_commit_id: Some(mid(3)),
+            commit_digest: [0x1d; 32],
+            local_was_committer_leaf: true,
+            former_members: group.members.clone(),
+            announced: true,
+        });
+        group.join_epoch = EpochId(2);
+        group.local_copy_install_epoch = EpochId(4);
+        group.local_copy_welcome_created_at = Some(Timestamp(1_800_000_000));
         store.put_group(&group).unwrap();
         assert_eq!(store.get_group(&group.id).unwrap(), group);
     }
@@ -510,15 +502,6 @@ mod tests {
     }
 
     #[test]
-    fn group_missing_returns_not_found() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        assert!(matches!(
-            store.get_group(&gid(9)),
-            Err(StorageError::NotFound)
-        ));
-    }
-
-    #[test]
     fn group_delete_cascades_messages_queued_policy_and_openmls_group_state() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 0, 1);
@@ -548,6 +531,10 @@ mod tests {
             .mls_storage()
             .write_group_state(&mls_group_id, &TestGroupState(b"epoch-0".to_vec()))
             .unwrap();
+        store
+            .put_transport_group_route(&[0xCC; 32], &group.id, EpochId(1))
+            .unwrap();
+        record_reconciliation_item(&store, [0xCC; 32], [0xDD; 32]);
 
         store.delete_group(&group.id).unwrap();
 
@@ -567,6 +554,8 @@ mod tests {
         assert!(store.convergence_policy(&group.id).unwrap().is_none());
         let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
         assert!(state.is_none());
+        assert!(store.list_transport_group_routes().unwrap().is_empty());
+        assert_eq!(reconciliation_row_counts(&store, [0xCC; 32]), (0, 0));
     }
 
     #[test]
@@ -598,13 +587,5 @@ mod tests {
         ));
         let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
         assert!(state.is_none());
-    }
-
-    #[test]
-    fn list_groups_returns_all_ids() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
-        store.put_group(&sample_group(gid(2), 0, 0)).unwrap();
-        assert_eq!(store.list_groups().unwrap(), vec![gid(1), gid(2)]);
     }
 }

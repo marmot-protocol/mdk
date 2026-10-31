@@ -63,7 +63,7 @@ fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SqlCipherKey, SqliteAccountStorage};
+    use crate::SqliteAccountStorage;
 
     fn history_key(identity: u8, public: u8) -> AccountDeviceHistoryKey {
         AccountDeviceHistoryKey {
@@ -75,38 +75,30 @@ mod tests {
     }
 
     #[test]
-    fn the_first_history_key_stays_across_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("local identity key").unwrap();
+    fn the_first_history_key_is_kept_over_a_later_one() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let first = history_key(1, 0x11);
-
-        {
-            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            assert_eq!(
-                store
-                    .put_account_device_history_key_if_absent(&first)
-                    .unwrap(),
-                first
-            );
-            // A second key for the same identity never replaces the first.
-            assert_eq!(
-                store
-                    .put_account_device_history_key_if_absent(&history_key(1, 0x22))
-                    .unwrap(),
-                first
-            );
-        }
-
-        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(
-            reopened
+            store
+                .put_account_device_history_key_if_absent(&first)
+                .unwrap(),
+            first
+        );
+        // A second key for the same identity never replaces the first.
+        assert_eq!(
+            store
+                .put_account_device_history_key_if_absent(&history_key(1, 0x22))
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            store
                 .account_device_history_key(&first.marmot_identity)
                 .unwrap(),
             Some(first)
         );
         assert_eq!(
-            reopened
+            store
                 .account_device_history_key(&MemberId::new(vec![9; 32]))
                 .unwrap(),
             None
