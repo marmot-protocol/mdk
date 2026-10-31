@@ -306,7 +306,8 @@ impl AppClient {
     }
 
     /// Join a chat from every stashed sibling Welcome, oldest first, and
-    /// project the joins. A Welcome leaves the stash once its join settles,
+    /// project the joins and the rejoin offers they leave. A Welcome leaves
+    /// the stash once its join settles,
     /// whether it joined, was refused or left a rejoin offer, and unjoined
     /// once its carrier is no longer delivered; one whose join failed stays
     /// for the next pass. A failure waits for the next pass.
@@ -325,9 +326,11 @@ impl AppClient {
     }
 
     async fn try_join_stashed_sibling_welcomes(&mut self) -> Result<(), AppError> {
-        let account = self.app.account_storage(&self.state.label)?;
-        let storage = account.app_storage();
-        let stashed = storage.stashed_sibling_welcomes()?;
+        let stashed = self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .stashed_sibling_welcomes()?;
         if stashed.is_empty() {
             return Ok(());
         }
@@ -335,6 +338,28 @@ impl AppClient {
         // their projection have settled.
         let policy_lock = self.app.block_update_lock(&self.state.label).await;
         let _policy_guard = policy_lock.lock().await;
+        let offers = self.rejoin_offer_snapshot()?;
+        let joined = self.join_each_stashed_sibling_welcome(stashed).await;
+        // A Welcome into a chat this device still holds leaves a rejoin offer
+        // the host shows, as a delivered one does.
+        self.reconcile_rejoin_offer_changes(offers)?;
+        if joined? > 0 {
+            // GroupJoined is journaled durably, so a failed projection is
+            // repaired by the ordinary reopen and drain path.
+            let summary = self.drain_pending_session_events().await?;
+            self.pending_applied_sync_summary.merge(summary);
+        }
+        Ok(())
+    }
+
+    /// Join from each of `stashed`, as [`Self::join_stashed_sibling_welcomes`]
+    /// says, and return how many joined.
+    async fn join_each_stashed_sibling_welcome(
+        &mut self,
+        stashed: Vec<StashedSiblingWelcome>,
+    ) -> Result<usize, AppError> {
+        let account = self.app.account_storage(&self.state.label)?;
+        let storage = account.app_storage();
         let (mut joined, mut offered, mut refused, mut withdrawn, mut failed) =
             (0usize, 0usize, 0usize, 0usize, 0usize);
         for record in stashed {
@@ -394,13 +419,7 @@ impl AppClient {
             failed,
             "joined from stashed sibling Welcomes"
         );
-        if joined > 0 {
-            // GroupJoined is journaled durably, so a failed projection is
-            // repaired by the ordinary reopen and drain path.
-            let summary = self.drain_pending_session_events().await?;
-            self.pending_applied_sync_summary.merge(summary);
-        }
-        Ok(())
+        Ok(joined)
     }
 
     /// Delete expired private KeyPackages on both sides, issued ones with

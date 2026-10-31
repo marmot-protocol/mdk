@@ -10,7 +10,7 @@ use cgka_traits::app_components::DeviceSlotId;
 use cgka_traits::app_components::{
     AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NOSTR_ROUTING_MAX_RELAYS, encode_nostr_routing_v1,
 };
-use cgka_traits::engine::CreateGroupRequest;
+use cgka_traits::engine::{CreateGroupRequest, SendIntent};
 use cgka_traits::storage::IssuedPrivateKeyPackage;
 use marmot_session::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
@@ -516,31 +516,88 @@ async fn chat_adding_the_phone(devices: &mut Devices) -> (GroupId, SiblingWelcom
             _ => None,
         })
         .unwrap();
-    let keys = devices
-        .laptop_app
-        .account_home()
-        .load_signing_keys("alice")
-        .unwrap();
-    let wrap = transport_nostr_peeler::NostrTransportEvent::from_transport_message(&wrap)
-        .unwrap()
-        .to_verified_nostr_event()
-        .unwrap();
-    let rumor = nostr::nips::nip59::extract_rumor(&keys, &wrap)
-        .unwrap()
-        .rumor;
-    let welcome = base64::engine::general_purpose::STANDARD
-        .decode(&rumor.content)
-        .unwrap();
     (
         created.group_id,
         SiblingWelcome {
             from: laptop_slot,
             to: phone_slot,
             key_package_ref,
-            welcome,
+            welcome: unwrapped_welcome(devices, &wrap),
             relays: vec!["wss://relay.example".into()],
         },
     )
+}
+
+/// The Welcome in a gift wrap the laptop made.
+fn unwrapped_welcome(devices: &Devices, wrap: &TransportMessage) -> Vec<u8> {
+    let keys = devices
+        .laptop_app
+        .account_home()
+        .load_signing_keys("alice")
+        .unwrap();
+    let wrap = transport_nostr_peeler::NostrTransportEvent::from_transport_message(wrap)
+        .unwrap()
+        .to_verified_nostr_event()
+        .unwrap();
+    let rumor = nostr::nips::nip59::extract_rumor(&keys, &wrap)
+        .unwrap()
+        .rumor;
+    base64::engine::general_purpose::STANDARD
+        .decode(&rumor.content)
+        .unwrap()
+}
+
+/// The laptop removes the phone from `chat` and adds it back with another
+/// private KeyPackage, publishing neither commit, so the phone still holds
+/// its copy active: the sibling Welcome that adds it back.
+async fn re_adding_the_phone(devices: &mut Devices, chat: &GroupId) -> SiblingWelcome {
+    let (phone_slot, laptop_slot) = (slot(&devices.phone), slot(&devices.laptop));
+    let private = devices
+        .laptop
+        .take_private_key_package(&phone_slot)
+        .unwrap()
+        .unwrap();
+    let key_package_ref = issued(&devices.phone)
+        .into_iter()
+        .find(|record| record.key_package == private.bytes())
+        .unwrap()
+        .key_package_ref;
+    let private = KeyPackage {
+        source: Some(cgka_traits::engine::KeyPackageSource {
+            event_id: MessageId::new(vec![0x43; 32]),
+        }),
+        ..private
+    };
+    let phone_key = devices.phone.runtime.own_signature_key();
+    let session = devices.laptop.runtime.session_mut();
+    let mut welcome = None;
+    for intent in [
+        SendIntent::RemoveOwnAccountDevices {
+            group_id: chat.clone(),
+            leaf_signature_keys: vec![phone_key],
+        },
+        SendIntent::AddOwnAccountDevices {
+            group_id: chat.clone(),
+            key_packages: vec![private.clone()],
+        },
+    ] {
+        let effects = session.send(intent).await.unwrap();
+        let Some(PublishWork::GroupEvolution {
+            welcomes, pending, ..
+        }) = effects.publish.into_iter().next()
+        else {
+            panic!("expected a group evolution")
+        };
+        session.confirm_published(pending).await.unwrap();
+        welcome = welcomes.into_iter().next().or(welcome);
+    }
+    SiblingWelcome {
+        from: laptop_slot,
+        to: phone_slot,
+        key_package_ref,
+        welcome: unwrapped_welcome(devices, &welcome.unwrap()),
+        relays: vec!["wss://relay.example".into()],
+    }
 }
 
 async fn send_sibling_welcome(client: &mut AppClient, group: &GroupId, welcome: &SiblingWelcome) {
@@ -589,6 +646,40 @@ async fn a_sibling_welcome_adds_this_device_to_a_chat() {
     send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
     deliver_all(&mut phone, &devices.relay).await;
     assert_eq!(stashed(&phone), 0);
+}
+
+/// A sibling Welcome that reaches the phone before the removal it follows is
+/// a rejoin offer, and the host is told the chat's recovery status changed,
+/// as for a delivered one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_into_a_chat_still_held_shows_as_an_offer() {
+    let (mut devices, group) = tagging_devices().await;
+    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
+    send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert!(devices.phone.state_group_record(&chat).is_some());
+
+    let again = re_adding_the_phone(&mut devices, &chat).await;
+    send_sibling_welcome(&mut devices.laptop, &group, &again).await;
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 1);
+    devices.phone.pending_recovery_status_updates.clear();
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert_eq!(stashed(&devices.phone), 0);
+    assert!(
+        devices
+            .phone
+            .pending_recovery_status_updates
+            .contains(&chat)
+    );
+    let status = devices.phone.group_recovery_status(&chat).unwrap();
+    assert_eq!(status.rejoin_invitations.len(), 1);
+    assert!(
+        issued(&devices.phone)
+            .iter()
+            .any(|record| record.key_package_ref == again.key_package_ref)
+    );
 }
 
 /// The phone stashes only a sibling Welcome addressed to it, from a sibling
