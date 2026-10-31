@@ -60,7 +60,9 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 | `src/app/recovery_health.rs` | Durable reports of unsuccessful automatic synchronization recovery. |
 | `src/app/transport/transport_reconciliation.rs` | Account-private NIP-77 set-reconciliation inventory. |
 | `src/app/pending_welcome_delivery.rs` | Durable pointer to a confirmed create/invite whose Welcome publish failed, for re-delivery (mdk#352). |
+| `src/app/device_group_messages.rs` | The kind of each device-group message this device sent or read whose withdrawal a feature acts on (mdk#2628, migration 0161), so the app can hand a withdrawal named only by message id (an own send's transport id, a received message's content id) to its feature. An own send is recorded by app event id before it goes out, and its message id filled in from the drain that publishes it. Rows go after a week, beyond 4,096, and with a local forget of their group. |
 | `src/app/device_groups.rs` | The account's device groups this device knows of and how it came to know each (mdk#2628 item 3.1); at most one row claims the account's. |
+| `src/app/device_renames.rs` | Renames this device made in its device group's roster (mdk#2628 item 3.6, D37), one row per device renamed: the label, the rename ids the rename wrote, and the ids the entry held where this device's renames of it were built. |
 | `src/app/sign_ins.rs` | The account's sign-ins this device does not recognize (mdk#2628 item 3.2): one transaction per check, the first taking the baseline of every slot its read returned; this device's answers and rejections the roster does not record yet. |
 | `src/app/device_links.rs` | The devices this device added to the account's device group and how each link ended, and the device groups it joined through a link whose first commit has not landed yet (mdk#2628 item 3.3b). |
 | `src/app/private_key_packages.rs` | Private KeyPackages siblings handed to this device, keyed by issuer slot, and what this device still wants from each (mdk#2628 item 3.4b). A used one keeps its ref until it expires and is never kept again (D42). |
@@ -69,6 +71,7 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 | `src/app/transport/agent_stream_sequences.rs` | Durable, fail-closed publisher sequence reservations for QUIC previews. |
 | `src/app/account_projection.rs` | Account-level event projection. |
 | `src/app/chat_list.rs` | Chat-list projection, including avatar URLs; `chat_list/` holds attention, pages, and windows. |
+| `src/app/chat_list/small_state.rs` | Small state shared with the account's other devices (mdk#2628 item 4.3, migration 0161): each chat's read position, pin, mute and archive as items. One transaction records local changes (a local state that differs from what this device last observed), merges received items under the app's `SmallStateRule`, and applies winners; archives go back to the caller, which owns the in-memory account state. An item held at the highest version is put back, never changed. Invalid items, and chats whose MLS group id is over 256 bytes, are skipped, never stored. A read marker on a row no position names gives the furthest delivered message before it. Also this device's broadcast schedule: its last broadcast's time and tip, and whether it owes a broadcast request or an answer. |
 | `src/app/chat_presentation.rs` | Durable selected-presentation foundation (runtime orchestration owns hydration). |
 | `src/app/group_system.rs` | Local presentation of kind-1210 content (not a wire-format change). |
 | `src/app/transport/user_blocks.rs` | Account-private NIP-51 block state; never stored in the shared database. |
@@ -100,7 +103,11 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 ## Invariants
 
 - Accept raw SQLCipher keys only. Key derivation and recovery live above this crate.
-- Apply privacy/durability defaults unless callers opt out with `SqliteStorageOptions`.
+- Apply privacy/durability defaults unless callers opt out with `SqliteStorageOptions`. The only exceptions are the
+  test helpers `in_memory_for_test()` (which this crate's own unit tests get from `in_memory()`) and
+  `relax_storage_for_test_process()` (see README). Keep `test-support` inert: nothing changes until a test calls a
+  helper. Never call them from non-test code, and keep the tests that pin the production settings
+  (`encrypted_connection_applies_operational_defaults`, the `pins_cipher_pragmas_before_keying` tests) away from them.
 - Keep invalidated message records. Applications decide whether to show them.
 - Prepare every database file with `fs_private::ensure_private_db_files` before `Connection::open`, and never open,
   read or copy a database or `-wal`/`-shm`/`-journal` sidecar through `std::fs` while this process may hold a

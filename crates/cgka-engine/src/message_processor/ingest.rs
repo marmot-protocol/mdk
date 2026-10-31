@@ -284,6 +284,30 @@ impl<S: StorageProvider> Engine<S> {
         Ok(IngestOutcome::Rejected { category })
     }
 
+    /// Whether a delivery that hit the Welcome content dedup marker names a
+    /// KeyPackage publication this device never held
+    /// (`group_lifecycle::joined_welcome_names_another_key_package`).
+    fn joined_welcome_names_another_key_package(
+        &self,
+        content_id: Option<&MessageId>,
+        claimed: Option<&MessageId>,
+    ) -> Result<bool, EngineError> {
+        let Some(content_id) = content_id else {
+            return Ok(false);
+        };
+        if claimed.is_none() || !self.storage.has_ingress_dedup_marker(content_id)? {
+            return Ok(false);
+        }
+        let lifecycle = match self.storage.maintenance_storage() {
+            Some(maintenance) => maintenance.key_package_lifecycle()?,
+            None => None,
+        };
+        Ok(group_lifecycle::joined_welcome_names_another_key_package(
+            lifecycle.as_ref(),
+            claimed,
+        ))
+    }
+
     pub(crate) async fn ingest_welcome(
         &mut self,
         msg: &TransportMessage,
@@ -313,6 +337,17 @@ impl<S: StorageProvider> Engine<S> {
             .as_ref()
             .ok()
             .map(|(_, content_id)| content_id.clone());
+        let key_package_claim =
+            prepared
+                .as_ref()
+                .ok()
+                .and_then(|(peeled, _)| match &peeled.content {
+                    cgka_traits::ingest::PeeledContent::Welcome {
+                        key_package_event_id,
+                        ..
+                    } => key_package_event_id.clone(),
+                    _ => None,
+                });
         // Reuse the existing join_welcome machinery. Any classifiable failure
         // for this individual welcome is terminal input, not a failure of the
         // transport drain: persist an account-scoped marker even when no group
@@ -329,16 +364,18 @@ impl<S: StorageProvider> Engine<S> {
             }
             Err(error) => Err(error),
         };
-        self.welcome_join_outcome(msg, content_id, joined)
+        self.welcome_join_outcome(msg, content_id, key_package_claim, joined)
     }
 
     /// The ingest outcome of a Welcome join, shared by both Welcome routes.
-    /// Any classifiable failure is terminal input, not a failure of the
-    /// drain; storage and internal transition failures still propagate.
+    /// `key_package_claim` is the KeyPackage publication the delivery names,
+    /// if any. Any classifiable failure is terminal input, not a failure of
+    /// the drain; storage and internal transition failures still propagate.
     pub(crate) fn welcome_join_outcome(
         &mut self,
         msg: &TransportMessage,
         content_id: Option<MessageId>,
+        key_package_claim: Option<MessageId>,
         joined: Result<GroupId, EngineError>,
     ) -> Result<IngestOutcome, EngineError> {
         match joined {
@@ -348,9 +385,18 @@ impl<S: StorageProvider> Engine<S> {
             }
             Err(EngineError::WelcomeAlreadyProcessed) => {
                 self.storage.put_ingress_dedup_marker(&msg.id)?;
-                Ok(IngestOutcome::Ignored {
-                    category: InputRejectionCategory::Duplicate,
-                })
+                // Another device's delivery of a Welcome this device already
+                // joined is not addressed to it either. Only this wrapper is
+                // remembered, as for the same delivery before the join.
+                let category = if self.joined_welcome_names_another_key_package(
+                    content_id.as_ref(),
+                    key_package_claim.as_ref(),
+                )? {
+                    InputRejectionCategory::NotAddressedToThisDevice
+                } else {
+                    InputRejectionCategory::Duplicate
+                };
+                Ok(IngestOutcome::Ignored { category })
             }
             Err(EngineError::InvalidTransition(error)) => {
                 // The offer may have arrived under another transport wrapper.

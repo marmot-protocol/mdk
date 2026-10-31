@@ -98,29 +98,39 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Write a device entry of the roster only through the runtime's `edit_device_roster_entry` (renaming, announcements).
   It refuses while the device group has anything of this device's in flight; surface that as `device_group_busy`.
   The engine stages a `ReplaceDeviceEntry` only while the entry is still the one the edit read, so a whole-entry
-  replacement never undoes a change that lands in between. A rename (`client/device_renames.rs`) whose commit loses a
-  fork to one that also changes that device's entry is not made again; the engine re-issues it only when the winner
-  left that entry alone. Rejected slots (3.2's sign-in rejections, below) are written by `commit_device_roster_update`
+  replacement never undoes a change that lands in between. A rename (`client/device_renames.rs`) writes a fresh rename
+  id next to the label and is kept on disk before its commit is sent. Maintenance reads only the rename id the winning
+  roster holds (D37): one the rename wrote means applied, one its renames replaced means lost with nothing renamed
+  since (made again with a fresh id), any other means another rename stands. Never infer a rename's fate from labels
+  or commit ids. Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots`
   instead, never as device entries.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
-  inviter's rules; a live KeyPackage from the directory subscription only brings a check forward (`SignInNudges`). The
-  first check's baseline, every slot id its read returned whether or not it counted, never a publication time,
-  separates devices that were here first from new sign-ins. Only a complete read changes whether a listed sign-in is
-  still signed in, and a slot holding a valid publication that is merely stale (`current_slots`) stays signed in. A
-  read of the configured directory relays, when the account lists none, is never complete. Rejections are recorded
-  locally first, then committed to the trusted roster only while the device group is quiet
-  (`device_group_quiet`); a device with no device group keeps them until `create_device_group` founds the roster with
-  them or it trusts a group it joined. A rejection is committed only while the roster has no entry for the slot, and
-  never replaces one; a slot the roster holds as a device ends it, since the user confirmed that link. A rejection stays
-  pending until the roster shows it. A sign-in this device dismissed is listed again once the roster has no entry for
-  its slot. Every device-group event and every superseded roster update rechecks every rejection
-  (`recheck_sign_in_rejections`): it ends at once a rejection of a slot the roster now holds as a device, so a link
-  that branch selection drops before the next pass asks again rather than restoring `not_me`, and re-arms the rest. A
-  rejection settled from another device's commit is lost when that commit loses convergence, and only a device that
-  made the rejection restores it. A slot is its `d` as published, compared as bytes;
-  one the roster cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a
-  rejected KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's
-  included, into a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7).
+  inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
+  `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this
+  device already joined), only brings a check forward (`SignInNudges`):
+  a KeyPackage is addressable, so the one a Welcome names is served only as its slot's newest publication. The
+  first check's baseline, every slot id its read returned whether or not it counted, never a publication time, separates
+  devices that were here first from new sign-ins. Only a complete read changes whether a listed sign-in is still signed
+  in, and a slot holding a valid publication that is merely stale (`current_slots`) stays signed in. A read of the
+  configured directory relays, when the account lists none, is never complete. Rejections are recorded locally first,
+  then committed to the trusted roster through the runtime's rejected-slot write (`reject_device_slots`), behind the
+  gate the runtime's own roster updates wait behind; a device with no device group keeps them until
+  `create_device_group` founds the roster with them or it trusts a group it joined. A rejection is committed only while
+  the roster has no entry for the slot, and never replaces one; a slot the roster holds as a device ends it, since the
+  user confirmed that link. A rejection stays pending until the roster shows it. A sign-in this device dismissed is
+  listed again once the roster has no entry for its slot. Every device-group event and every superseded roster update
+  rechecks every rejection (`recheck_sign_in_rejections`): it ends at once a rejection of a slot the roster now holds as
+  a device, so a link that branch selection drops before the next pass asks again rather than restoring `not_me`, and
+  re-arms the rest. A rejection settled from another device's commit is lost when that commit loses convergence, and
+  only a device that made the rejection restores it. A slot is its `d` as published, compared as bytes; one the roster
+  cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a rejected
+  KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's included, into
+  a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7). A roster device's KeyPackage matches its slot when
+  the trusted roster announces it now or the engine recorded it from a roster state applied in the last 30 days
+  (`announced_key_packages`, D31 item 7); only this classification reads that record. Hosts read the list as
+  `unrecognized_sign_ins`. A check or answer that changes it, and every roster change (`note_device_roster_changed`),
+  sets `unrecognized_sign_ins_changed`, drained at the device-group seams into one payload-free
+  `UnrecognizedSignInsChanged`; every client opens with it set.
 - The own-slot check (mdk#2628 3.4, `src/client/sign_ins.rs`) rides 3.2's read: `read_account_key_package_slots` also
   reads this device's slot by `d` from every relay (`OwnSlotRead`), keeping each relay's current publication there by
   NIP-01's rule, valid or not. One whose event id is none of this device's current, pending or retained events is
@@ -128,13 +138,18 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   hands foreign ones to `replace_foreign_slot_publications`, which publishes a newer KeyPackage or, for one dated past
   the skew window, asks the relays to delete it by id (D63). An incomplete own-slot read is retried within the hour.
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
-  `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in
-  `observe_device_group_event` (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending
-  leaf's device tag (mdk#2628 D33). A message from an earlier epoch is read from that epoch's retained anchor, so one
-  older than the retained anchors has no readable sender. List every kind sent only in a device group in
-  `is_device_group_kind` (457, 459, 460, 461, 462), the one list: `observe_event` drops one received in any other
-  group before the host summary and the stored projection, the notification preview refuses it, and the custom path
-  rejects it as reserved.
+  `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in `observe_device_group_event`
+  (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
+  D33). A message from an earlier epoch is read from that epoch's retained anchor, so one older than the retained
+  anchors has no readable sender. List every kind sent only in a device group in `is_device_group_kind` (457, 459, 460,
+  461, 462, 475, 476), the one list: `observe_event` drops one received in any other group before the host summary and
+  the stored projection, the notification preview refuses it, and the custom path rejects it as reserved. The engine
+  withdraws a message by message id alone (an own send's transport id, a received message's content id), so a kind
+  whose withdrawal a feature acts on is listed in `withdrawal_handled` and dispatched in
+  `device_group_message_withdrawn`. Each such message is recorded with its kind in `device_group_messages` when sent
+  (before the send; its message id is filled in from whichever drain's effects publish it, in
+  `retain_effect_projection`) and when read. Records go after a week or past 4,096, so a feature also acts on a
+  withdrawn message with no record, which may be of any kind.
 - Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
   Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
   roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
@@ -190,9 +205,28 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   crash cannot lose it. The new device records a `device_group_joins` row before it trusts the group it joined, nudges
   its first commit there (`set_device_tag_key`) on each drive rather than waiting for maintenance, and drops the row
   once that commit landed. Removed from the device group, it forgets its copy (`forget_group_local`); removed before
-  its first commit landed, it shows `Ended { LinkFailed }`. Each drive ends by comparing linking as hosts read it with
+  its first commit landed, it shows `Ended { LinkFailed }`. A later link's Welcome into that group is a first join,
+  held by the engine to the link rather than to the forget's date. A new device never starts a link by a KeyPackage it
+  already joined by (`last_consumed_key_package_ref`): the link binds its Welcome by KeyPackage alone, so a used one
+  would also admit the Welcome that installed the forgotten copy. The start waits for the replacement's publication
+  (`key_package_not_published`). Each drive ends by comparing linking as hosts read it with
   `DevicePairing::last_view` and sets `device_link_changed` when it differs; the client opens with that flag set, and
   the same two seams as `linked_devices_changed` drain it into `DeviceLinkChanged`.
+- Small state (`src/small_state.rs` and `src/client/small_state.rs`, mdk#2628 4.3) keeps each chat's read position,
+  pin, mute and archive the same on the account's devices, from the first maintenance pass after this device trusts a
+  device group. A pass is one storage transaction (`sync_small_state`): a local state that differs from what this
+  device last observed is its user's change, so no setter needs a hook and leaving a chat is never a change. Archives
+  go through the worker's in-memory account state (`apply_sibling_archives`, one save, mdk#178) and, like pins and
+  mutes from siblings, record no product outcome. Each chat a pass changes gets one chat-list update through `pending_projection_updates`. The merge rule's tie-break
+  (`tie_break`), its placement of a new pin (`new_pin_index`) and the broadcast schedule (`broadcast_due`) are each one
+  function; change them nowhere else. Recovery is a broadcast of every held item, with no stopping condition and
+  nothing tracked per sibling: at start, daily, when the device-group tip passes the app-payload window since the last
+  one, and an hour after the last when a sibling asked. Each maintenance pass then sends what is owed: updates split
+  to fit 32,768 bytes, each page's items marked sent only after it went out (a duplicate is harmless, a loss is not),
+  and a broadcast request when owed. Updates and requests are read from any member of the trusted device group, never
+  through `ensure_sent_by`. A withdrawn update owes every held item again, whoever sent it, and a withdrawn broadcast
+  request owes a new one; a withdrawn message with no record in the trusted device group owes both. A winning pin for
+  an archived chat waits, unobserved, until the chat is unarchived.
 - Keep outbound Welcomes on the engine's Welcome rows (mdk#2628 3.5a). The invite slot of
   `drive_unpublished_welcome_delivery` holds only Welcome ids, published through the runtime's
   `deliver_owed_welcomes_with_audit_context`; the founding slot keeps the create's `SessionEffects`, because a legacy
@@ -285,8 +319,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the per-account upload checkpoint file (`audit-upload-checkpoint.json`), and the `MarmotApp` methods for audit
   settings, recorder open/build, file enumeration, path validation/resolution/removal, and upload. Audit-log unit tests
   live in its own `#[cfg(test)] mod tests`.
-- Keep the v4 upload's HTTP half in `src/audit_upload.rs`: snapshot capture, the checkpoint record, endpoint validation
-  with its retired-host check, the per-attempt pinned request and the response handling. It opens no files:
+- The v4 upload's HTTP half is `marmot-observability`'s `src/audit_upload.rs`: snapshot capture, the checkpoint record,
+  endpoint validation with its retired-host check, the per-attempt pinned request and the response handling. It opens
+  no files:
   `audit_log.rs` validates and opens each audit file and reads and writes the checkpoint file, then hands it the open
   file or the record. It returns `AuditUploadError`; `From<AuditUploadError> for AppError` in `src/error.rs` restores
   the variant, message and `privacy_safe_kind` the upload reported before it had its own type, and
@@ -351,9 +386,24 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
-  `recheck`, `policy` and `tails` modules (mdk#2660 phase 4). It is built but not started: nothing outside its tests
-  constructs, wakes or reads it until the switch-over replaces the comparison owner, so do not wire it from
-  `account_worker.rs` or a host surface in passing. Every ledger and retry-state write happens in a worker turn; the
+  `recheck`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
+  `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, off; proofs turn it on with the hidden
+  `MarmotApp::with_recovery_runner_owning_debt`), never a host setting or cargo feature, until the switch-over flips it.
+  With the gate off nothing constructs it and the comparison owner keeps every behavior. `host` is its only seat:
+  the account worker spawns it with the worker, serves one of its turns each pass of its loop (as comparison
+  admission gets one) and waits for the next in one select arm, and stops it on the client at every exit that still
+  holds one (`SpawnedRunner::stop`), so a preempted quantum settles there but nothing is ingested on the way out.
+  Whoever lets go of a runner, by a stop, an abort or a dropped in-place pass, refunds the attempts it began and never
+  settled as `Unanswered` (`OpenAttempts`), through storage that is still open, and a settle whose write failed stays
+  open for that refund. `shutdown_and_close` refunds only if storage is still open as the runner stops; otherwise,
+  and after a crash, the charge stays until it ages out of the hour. A
+  directly owned client from `MarmotApp::client()` runs one pass in place from `sync()` and from `next_event()`'s
+  loss branch. The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
+  adapter's installed subscriptions, which trail the routes a debt turn reads: a valid event that routes nowhere yet
+  stops its slice uncovered as a local failure (`SinkStop::Unrouted`), and only an invalid one is dropped. Wake it
+  through `AppTransportRouting`'s sender at the chokepoint that changes debt or routes (loss import, goal widening,
+  route replacement, a released receipt, a dismissal, a group lifecycle effect), never per call site; it re-reads
+  the ledger on every wake. Every ledger and retry-state write happens in a worker turn; the
   credit wait, caps read and sweep run off the worker, and nothing read before the credit wait is planned on. Live
   tails are a query read fresh in each turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
   covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
@@ -374,7 +424,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
   with the adapter's fence ticket and held routes; `fence_live_frames` answers with that ticket. Nothing calls
   them or `enable_live_fences` before the switch-over. Logs carry aggregates only.
-- Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
+- The configured audit OTLP/HTTP sender is `marmot-observability`'s `src/audit_otlp_sender.rs`, which hosts name as
+  `marmot_app::audit_otlp_sender`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown
   outcomes retain the prepared range. Runtime tracker/manual triggers and additive native bindings configure it;
@@ -599,15 +650,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.
 - Keep the relay-telemetry export path in the relay plane (`transport-nostr`, rollup in its `src/telemetry.rs`) and
-  `relay_telemetry_export.rs` (exporter, including the `RelayTelemetryExporter::new` constructor). It is
+  `marmot-observability`'s `relay_telemetry_export.rs` (exporter, including the `RelayTelemetryExporter::new`
+  constructor). It is
   opt-in and off by default: `RelayTelemetryExporter::new` is the single construction gate, relay-identity
   resolution requires it (through the plane's `RelayExportGate`, which the export config implements), and export
   points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
   the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default
-  build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
+  build. Keep per-attempt collector DNS validation and pinning in `marmot-observability`'s `collector_host_safety.rs`: validate
   every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. It builds every collector
   client through the `http_builder` that both `MarmotApp` constructors hand in (`hand_in_http_builder`); before that
-  it builds none, so nothing dials, tests included: a test that dials hands in a builder itself. Endpoint parsers and the exporters' resolved config live in `export_config.rs`;
+  it builds none, so nothing dials, tests included: a test that dials hands in a builder itself. Endpoint parsers and the exporters' resolved config live in `marmot-observability`'s `export_config.rs`;
   `config.rs` keeps the settings that resolve against `MarmotServiceEndpoints`. Explicit SOCKS5 routing
   must send the validated IP rather than delegate HTTP DNS to the proxy. Build every relay client with
   `network_proxy::nostr_builder()` (in `transport-nostr`, its own `nostr_builder()`, which calls the same adapter
@@ -618,17 +670,20 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   helper so forensic audit uploads share it; do not feature-gate the module or introduce a second uploader. Relay
   NIP-11 fetches (`relay_caps.rs`) pin through its `pin_with` too, after the relay gate (`RelaySafetyPolicy`). See
   `docs/marmot-architecture/relay-observability.md`, `audit-logging.md`, and `overview/dial-safety.md`.
-- The diagnostics code is moving to its own crate (mdk#2627). The rest of this crate records through `Observer`'s
-  views (`observer.rs`: `ProductRecorder`, `PerformanceRecorder`, `ProductOperation`) and runs the collectors through
-  `wiring.rs`. Hosts can name `ProductAnalytics`, `AppPerformanceTelemetry`, `ProductObservation`, `DiagnosticsPermit`
-  and `AuditOtlpSender`, so do not make their crate-private methods `pub` and do not call them from outside the
-  moving set; add the method to a view or to `wiring.rs`. Items the rest of the crate names from a private module
-  in the set are `pub` there.
-- Tests in the moving set need nothing else from this crate. Tests that need a `MarmotApp`, its runtime or the
-  network-proxy policy live in `src/observability_tests/`, one module per set file, and reach the set as the rest of
-  the crate does, plus the fixtures in `observability_test_support.rs` and the `_for_test` hooks. Those are gated
-  `cfg(any(test, feature = "test-support"))` and reach state through methods, never fields.
-  `observability_crossings_tests` keeps the crossing list in `src/observability_crossings.txt` at zero.
+- The diagnostics exporters live in [`marmot-observability`](../marmot-observability/AGENTS.md) (mdk#2627). Its
+  surface is its crate root; its other modules are private. This crate records through `Observer`'s views
+  (`ProductRecorder`, `PerformanceRecorder`, `ProductOperation`), runs the collectors through
+  `marmot_observability::wiring`, names everything else at the crate root, and re-exports what hosts name at their
+  `marmot_app::` paths: the `product_analytics` and `audit_otlp_sender` modules, and the other types by name from the
+  crate root. Hosts can name `ProductAnalytics`, `AppPerformanceTelemetry`, `ProductObservation`, `DiagnosticsPermit`
+  and `AuditOtlpSender`, so do not give them new `pub` methods; add the method to a view or to `wiring`. An operation
+  recorded as one product outcome runs its body through `ProductRecorder::observed` and an outcome rule
+  (`success_or_failure`, `confirmed_or_failure`, `send_outcome` or its own); do not write an `_unobserved` twin beside
+  it.
+- Diagnostics tests that need a `MarmotApp`, its runtime or the network-proxy policy live in `src/observability_tests/`,
+  one module per crate file. They reach the crate as the rest of this crate does, plus the fixtures its root
+  re-exports and its `_for_test` hooks, which `marmot-observability`'s `test-support` feature (enabled here as a
+  dev-dependency only) builds.
 
 ## Code map (modules not covered above)
 
@@ -649,13 +704,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `nostr_verification.rs` (stateless public-event verification), `relay_caps.rs` (each relay's NIP-11
   `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `profile_pseudonyms.rs` (cosmetic display names; not a
   security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
-  stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `app_telemetry.rs` +
-  `app_telemetry/` (aggregate app-performance telemetry; same privacy model as relay telemetry), `product_analytics/`
-  (opt-in bounded product observations; export behind `product-analytics-export`), `observer.rs` (`Observer`, the
-  runtime's recording handle, and its recorder views), `wiring.rs` (consent receipts, silencing, the telemetry
-  origin, collector configuration and the delivery worker), `usage_diagnostics.rs`
+  stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `usage_diagnostics.rs`
   (`MarmotApp`'s usage-diagnostics consent persistence and the headless-host analytics configuration; it reaches the
-  product collector only through `wiring.rs`, consent lock before state lock), `projection.rs` (legacy account
+  product collector only through `marmot_observability::wiring`, consent lock before state lock), `projection.rs` (legacy account
   projection import), `messages/` (`AppMessageIntent` and custom-event intents), `local_open_test_gate.rs` and
   `test_support.rs` (test-only gates/helpers).
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
@@ -667,7 +718,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (runtime-only network approval; never restore it from disk).
 - `src/client/`: `recovery.rs` (recovery grant authorization), `recovery_coverage.rs` (the shadow coverage-ledger
   recorder and its comparison with pending obligations, mdk#2660), `recovery_runner.rs` (the per-account recovery
-  runner, not started yet, mdk#2660), `invite_recovery.rs` (durable invitation recovery),
+  runner behind the internal `runner_owns_debt` gate, mdk#2660; `recovery_runner/host.rs` seats it on the worker or
+  a direct client), `invite_recovery.rs` (durable invitation recovery),
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
   job).
@@ -681,11 +733,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 
 - `test-policy-overrides`: test-only convergence timing/rewind overrides. Never enable in app artifacts.
 - `otlp-export`: OTLP protobuf encoding and HTTP push for relay telemetry (the privacy mapping stays in the default
-  build).
-- `product-analytics-export`: product analytics export path.
+  build); forwards to `marmot-observability/otlp-export`.
+- `product-analytics-export`: product analytics export path; forwards to `marmot-observability/product-analytics-export`.
 - `media-benchmarks`: internal surface for the media transport benchmarks.
-- `test-support`: exposes `error_kind_table` to the host crates' tests and compiles the diagnostics test fixtures
-  and hooks. Enable it only as a dev-dependency.
+- `test-support`: exposes `error_kind_table` to the host crates' tests and turns on `marmot-observability/test-support`
+  (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency.
 
 ## Verification
 

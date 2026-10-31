@@ -26,6 +26,11 @@ use super::codec::{decode_var_bytes, encode_var_bytes};
 /// of the KeyPackage event's `d` value.
 pub type DeviceSlotId = [u8; 32];
 
+/// A rename id: 16 random bytes that every rename of a device writes next to
+/// its label, so a device can tell its own rename from another one after a
+/// fork. No other update changes it.
+pub type DeviceRenameId = [u8; 16];
+
 /// Largest label, client name or platform string, in UTF-8 bytes.
 pub const DEVICE_ROSTER_TEXT_MAX_LEN: usize = 64;
 /// Largest `KeyPackageRef`, in bytes. Marmot's ciphersuite makes it 32.
@@ -53,6 +58,9 @@ pub struct DeviceRosterV1 {
 pub struct DeviceEntryV1 {
     /// The name the user gave the device. UTF-8.
     pub label: String,
+    /// The id the device's latest rename wrote, absent until it is first
+    /// renamed.
+    pub rename_id: Option<DeviceRenameId>,
     /// The device's client name. UTF-8.
     pub client: String,
     /// The device's platform, shared once it is linked. UTF-8.
@@ -434,6 +442,13 @@ pub fn encode_device_roster_update_v1(update: &DeviceRosterUpdateV1) -> Result<V
 
 fn encode_device(device: &DeviceEntryV1, out: &mut Vec<u8>) {
     encode_var_bytes(device.label.as_bytes(), out);
+    match &device.rename_id {
+        None => out.push(0),
+        Some(rename_id) => {
+            out.push(1);
+            out.extend_from_slice(rename_id);
+        }
+    }
     encode_var_bytes(device.client.as_bytes(), out);
     encode_var_bytes(device.platform.as_bytes(), out);
     out.extend_from_slice(&device.linked_at.to_be_bytes());
@@ -605,6 +620,13 @@ fn decode_vector(cursor: &mut &[u8], label: &str) -> Result<Vec<u8>, String> {
 
 fn decode_device(cursor: &mut &[u8]) -> Result<DeviceEntryV1, String> {
     let label = decode_text(cursor, "label")?;
+    let rename_id = decode_optional(cursor, "rename id", |cursor| {
+        let (bytes, rest) = cursor
+            .split_first_chunk::<16>()
+            .ok_or_else(|| "device roster rename id is truncated".to_owned())?;
+        *cursor = rest;
+        Ok(*bytes)
+    })?;
     let client = decode_text(cursor, "client")?;
     let platform = decode_text(cursor, "platform")?;
     let linked_at = take_u64(cursor, "linked_at")?;
@@ -639,6 +661,7 @@ fn decode_device(cursor: &mut &[u8]) -> Result<DeviceEntryV1, String> {
     })?;
     Ok(DeviceEntryV1 {
         label,
+        rename_id,
         client,
         platform,
         linked_at,
@@ -785,6 +808,7 @@ mod tests {
     fn full_roster() -> DeviceRosterV1 {
         let phone = DeviceEntryV1 {
             label: "Phone".into(),
+            rename_id: Some([0x06; 16]),
             client: "wn".into(),
             platform: "ios".into(),
             linked_at: 1_700_000_000,
@@ -860,6 +884,7 @@ mod tests {
                 slot(0x11),
                 DeviceEntryV1 {
                     label: "Phone".into(),
+                    rename_id: Some([0x55; 16]),
                     client: "wn".into(),
                     platform: String::new(),
                     linked_at: 0x6553_f100,
@@ -881,9 +906,10 @@ mod tests {
         };
         let expected = concat!(
             "3333333333333333333333333333333333333333333333333333333333333333", // leaf_tag_key
-            "4059", // devices<V>: 89 bytes
+            "406a", // devices<V>: 106 bytes
             "1111111111111111111111111111111111111111111111111111111111111111", // slot
             "0550686f6e65", // label "Phone"
+            "0155555555555555555555555555555555", // rename id
             "02776e", // client "wn"
             "00",   // platform ""
             "000000006553f100", // linked_at
@@ -949,7 +975,7 @@ mod tests {
         };
         let bytes = encode_device_roster_v1(&two).unwrap();
         // Swap the two device entries, which have the same length. The leaf
-        // tag key comes first; the devices' 100-byte vector takes a two-byte
+        // tag key comes first; the devices' 102-byte vector takes a two-byte
         // length prefix; the two empty rejection vectors and the empty
         // account entry, four bytes, follow.
         let devices_at = 32 + 2;
@@ -969,10 +995,14 @@ mod tests {
             ..DeviceRosterV1::default()
         })
         .unwrap();
-        // Layout: leaf tag key, devices len, slot, label (2), client,
-        // platform, linked_at, linked_by, settings, status, KeyPackageRef,
-        // tag signature key, history key, ...
-        let settings_at = 32 + 1 + 32 + 2 + 1 + 1 + 8 + 1;
+        // Layout: leaf tag key, devices len, slot, label (2), rename id,
+        // client, platform, linked_at, linked_by, settings, status,
+        // KeyPackageRef, tag signature key, history key, ...
+        let rename_id_at = 32 + 1 + 32 + 2;
+        let mut bad_rename_presence = one.clone();
+        bad_rename_presence[rename_id_at] = 2;
+        assert!(decode_device_roster_v1(&bad_rename_presence).is_err());
+        let settings_at = rename_id_at + 1 + 1 + 1 + 8 + 1;
         let mut reserved_bit = one.clone();
         reserved_bit[settings_at] = 0b1000;
         assert!(decode_device_roster_v1(&reserved_bit).is_err());

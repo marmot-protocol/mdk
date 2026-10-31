@@ -36,14 +36,17 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     device's own still stands there; every step that stages, publishes, resends or republishes asks it. One dated past
     the skew window is deleted by id (D63) and never outranked, so it never holds back a refresh.
   - `runtime/device_roster.rs` — this device's reads and writes of its device group's roster: its slot, the merged
-    roster, the gate its roster commits wait behind (not stable, held, quarantined, settling, or a change of this
-    device's still queued or unconfirmed), and the sends. The runtime's roster-writing steps use these rather than
+    roster, the gate its roster commits wait behind (`device_group_takes_commit`: not stable, held, quarantined,
+    settling, or a change of this device's still queued or unconfirmed; public, so the host judges a lost rename only
+    once its commits there have an outcome), and the sends. The runtime's roster-writing steps use these rather than
     their own copies. Device entries have one write path (`edit_device_roster_entry`, mdk#2628 3.4, 3.6): one
     `SetDevice` commit replacing one device entry with an edit applied to the roster as read now, sent as
     `SendIntent::ReplaceDeviceEntry` naming the entry it read. The engine stages it only while the slot still holds
     that entry, so an entry is never replaced from a stale read (`DeviceEntryChanged` maps to `Busy`). Announcements,
     the tag signature key and the host's device edits all go through it; don't add another device-entry commit. Each
-    announcement also writes the host's `DeviceSelfReport` (this device's client and platform) into its own entry.
+    announcement also writes the host's `DeviceSelfReport` (this device's client and platform) and this device's
+    history key (4.1) into its own entry; the tag-key commit carries the history key too. Only this device's own
+    entry ever gets its history key.
     `send_device_roster_update` carries rejected-slot operations only.
   - `runtime/device_tag_key.rs` — this device's tag signature key (mdk#2628 3.1d): the host names the device group to
     tag from (`set_device_tag_group`). Maintenance, and the host before each KeyPackage publication
@@ -54,6 +57,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     counts toward `key_package_refresh_overdue` like one held back by its announcement.
   - `runtime/removed_slot_expiry.rs` — maintenance drops `removed` slot records 30 days after their `rejected_at`, by
     this device's clock (device-roster-v1.md), in one roster update after the KeyPackage steps. `not_me` records stay.
+  - `runtime/sign_in_rejection.rs` — the host's rejected sign-ins (mdk#2628 3.2) as `not_me` rejected slots, in one
+    roster update behind the same gate (`reject_device_slots`). A slot the merged roster already holds, as a device or
+    a rejected slot, is left out: a rejection never replaces an entry.
   - `runtime/welcome_delivery.rs` — outbound Welcome delivery (mdk#2628 3.5a). The engine's Welcome row is the
     obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again, a staged
     one waits for its commit, and a device link's Welcome never goes out from its `deliver_until` on, by this

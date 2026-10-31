@@ -4,6 +4,27 @@
 
 ### Breaking changes
 
+- Migration 0161 advances account storage to schema 161 (mdk#2628 item 4.3).
+  It adds `small_state_items`, one row per chat and item (`read`, `pin`,
+  `mute`, `archive`) holding the value the account's devices agree on, what
+  this device last observed of it and whether its siblings are still owed it,
+  and `small_state_sync`, which records that this device started, when and at
+  which device-group tip it last broadcast every item, and whether it owes a
+  broadcast request or an answer to one. Only chats whose MLS group id is at
+  most 256 bytes hold items. It also adds `device_group_messages`: the kind of
+  each device-group message this device sent or read whose withdrawal a
+  feature acts on, by app event id and, once known, the message id the engine
+  names it by (an own send's transport id, a received message's content id),
+  kept a week and capped at 4,096 rows; a local forget of the group removes
+  them. `SqliteAppStorage` gains `record_device_group_message`,
+  `note_device_group_message_ids`, `device_group_message_kind`,
+  `start_small_state`, `small_state_started`, `small_state_schedule`,
+  `begin_small_state_broadcast`, `owe_small_state_broadcast_request`,
+  `small_state_broadcast_request_sent`, `owe_small_state_broadcast_answer`,
+  `sync_small_state`, `small_state_items`, `unsent_small_state_items`,
+  `mark_small_state_sent` and `owe_all_small_state_items`, with
+  `SmallStateItem`, `SmallStateRule`, `SmallStateSchedule`,
+  `SmallStateBroadcast` and their value types.
 - Migration 0160 advances account storage to schema 160 (mdk#2628 item 3.5b).
   It adds `sibling_welcomes_received`, the sibling Welcomes this device
   admitted from its device group and has not joined from yet, keyed by the
@@ -11,6 +32,13 @@
   `SqliteAppStorage` gains `stash_sibling_welcome`, `stashed_sibling_welcomes`
   and `delete_stashed_sibling_welcome`, over `StashedSiblingWelcome`. Nothing
   writes them unless device groups are on.
+- Migration 0137 advances account storage to schema 137 (mdk#2628 item 3.6).
+  It adds `device_renames`, one row per device this device renamed in its
+  device group's roster: the label its latest rename sets, the rename ids
+  that rename wrote, and the rename ids the device's entry held where this
+  device's renames of it were built. `SqliteAppStorage` gains
+  `device_renames`, `device_rename`, `put_device_rename` and
+  `drop_device_rename`, with `DeviceRenameRecord`.
 - Migration 0136 advances account storage to schema 136 (mdk#2660 phase 4).
   It adds `account_recovery_conversion`, the marker of the one-time upgrade
   conversion (its next step, whether the changed "history may be incomplete"
@@ -50,12 +78,36 @@
   (what this device still wants from each issuer). `SqliteAccountStorage` implements the new
   `PrivateKeyPackageStorage`; `SqliteAppStorage` gains the received-KeyPackage
   and need reads and writes. Nothing writes them unless device groups are on.
+- Migration 0144 advances account storage to schema 144 (mdk#2628 item 3.2).
+  It adds `cgka_announced_key_packages`: one row per KeyPackage a
+  device-group roster this device applied announced for a slot, with when it
+  last applied one that did. `SqliteAccountStorage` implements the new
+  `AnnouncedKeyPackageStorage`. Rows survive a branch-selection rewind, go
+  with their group, and are pruned after 30 days or past 16 per slot. Nothing
+  writes them unless device groups are on.
+- Migration 0146 advances account storage to schema 146 (mdk#2628 item 3.6b).
+  It adds `device_removals`, one row per device this device's user removed
+  from the account's device group, written before anything is committed, with
+  when the user decided and when the removed device's slot deletion was
+  accepted. A row lasts as long as this device trusts the device group:
+  forgetting the group removes its rows, with its trust row, and nothing else
+  does. `SqliteAppStorage` gains `record_device_removal`, which keeps a
+  decision already recorded, `device_removals` and
+  `set_device_removal_slot_withdrawn`. No rows are seeded.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`
   would, so the generation stays routed, and lowers the generation's floor to
   the lowest bound they list; `None` makes it account-wide, as every such
   observation did before.
+- Migration 0138 (mdk#2628 item 4.1) runs on every account database that
+  lacks it, including one already at schema 140. It adds
+  `cgka_account_device_history_keys`: this device's HPKE history key
+  pair, one per account-device identity, next to its MLS signer's binding.
+  `SqliteAccountStorage` implements the new
+  `cgka_traits::storage::AccountDeviceHistoryKeyStorage`, which
+  `StorageProvider` now requires; `put_account_device_history_key_if_absent`
+  never replaces a stored key.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it

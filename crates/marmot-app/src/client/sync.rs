@@ -1,5 +1,5 @@
 use crate::RuntimePerformanceOperation as RuntimeOp;
-use crate::app_telemetry::runtime::Outcome as TelemetryOutcome;
+use marmot_observability::Outcome as TelemetryOutcome;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,6 @@ use storage_sqlite::{
 use tokio::time::timeout;
 use transport_nostr_adapter::NostrReconciliationItem as AdapterReconciliationItem;
 
-use crate::app_telemetry::{AppPerformanceOperation, SyncFailureStage};
 use crate::groups::{
     EventGroupProjection, decode_received_event, event_group_id, fail_if_publish_failed,
     observe_event,
@@ -24,12 +23,14 @@ use crate::notifications;
 use crate::{
     AccountState, AppError, AppMessageProjection, ClassifiedSyncFailure, SDK_DRAIN_WAIT,
     SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
-    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, observer::PerformanceRecorder, unix_now_seconds,
+    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
 };
 use marmot_forensics::{
     AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillExecutionSeam,
     EpochStallBackfillTrigger, ForensicRecorder as _,
 };
+use marmot_observability::PerformanceRecorder;
+use marmot_observability::{AppPerformanceOperation, SyncFailureStage};
 
 #[cfg(test)]
 use marmot_forensics::EpochBackfillCompletionKind;
@@ -1047,6 +1048,23 @@ impl AppClient {
         &mut self,
         effects: &marmot_session::AccountDeviceEffects,
     ) {
+        // Every engine effect passes here. A group's lifecycle decides what the
+        // recovery runner may serve, so it reads its debt again.
+        if effects.events.iter().any(|event| {
+            use cgka_traits::engine::GroupEvent;
+            matches!(
+                event,
+                GroupEvent::GroupCreated { .. }
+                    | GroupEvent::GroupJoined { .. }
+                    | GroupEvent::LocalGroupCopyTerminated { .. }
+                    | GroupEvent::LocalGroupCopyRestored { .. }
+                    | GroupEvent::GroupUnrecoverable { .. }
+                    | GroupEvent::GroupStateInvalidated { .. }
+                    | GroupEvent::GroupStateRevalidated { .. }
+            )
+        }) {
+            self.wake_recovery_runner();
+        }
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return;
         }
@@ -1960,7 +1978,31 @@ impl AppClient {
                 summary = self.refresh_live_group_subscriptions(summary).await?;
             }
         }
+        // Behind the internal `runner_owns_debt` gate, a directly owned client
+        // also runs its recovery runner in place for one pass (mdk#2660).
+        if explicit && self.has_in_place_recovery_runner() {
+            summary = self.run_in_place_recovery_pass(summary).await?;
+        }
         self.finish_prepared_sync_summary(summary).await
+    }
+
+    /// The in-place runner's pass after an explicit sync, behind `summary`.
+    /// Boxed like the pass itself, so its awaits add nothing to every sync's
+    /// stack.
+    fn run_in_place_recovery_pass(
+        &mut self,
+        mut summary: SyncSummary,
+    ) -> futures::future::BoxFuture<'_, Result<SyncSummary, ClassifiedSyncFailure>> {
+        Box::pin(async move {
+            self.pending_applied_sync_summary
+                .merge(std::mem::take(&mut summary));
+            self.run_recovery_runner_pass().await;
+            self.prepend_pending_applied_summary(&mut summary);
+            if self.pending_runtime_group_subscription_refresh {
+                summary = self.refresh_live_group_subscriptions(summary).await?;
+            }
+            Ok(summary)
+        })
     }
 
     /// Bring the live group subscriptions up to the current routes. Nothing
@@ -2466,6 +2508,7 @@ impl AppClient {
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
         self.remember_published_reports(effects);
+        self.note_device_group_sent_ids(effects);
         self.note_superseded_intent_reports(effects);
         self.settle_accepted_push_announces(effects);
         self.enqueue_effect_projection(effects, source_message_id_hex, received_at, drained);
@@ -2979,7 +3022,7 @@ impl AppClient {
                 // The loss is durable and fences the cursor. A directly owned
                 // client has no worker, so its recovery job runs here.
                 transport_nostr::AccountDeliveryReceive::Overflow(_) => {
-                    match self
+                    let recovered = match self
                         .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Receive)
                         .await?
                     {
@@ -2988,6 +3031,15 @@ impl AppClient {
                         EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending => {
                             SyncSummary::default()
                         }
+                    };
+                    // Behind the internal `runner_owns_debt` gate, its
+                    // recovery runner runs one pass here too (mdk#2660).
+                    if self.has_in_place_recovery_runner() {
+                        self.pending_applied_sync_summary.merge(recovered);
+                        self.run_recovery_runner_pass().await;
+                        self.take_pending_applied_sync_summary()
+                    } else {
+                        recovered
                     }
                 }
             };
@@ -4055,6 +4107,20 @@ impl AppClient {
             });
         }
         let effects = ingest?;
+        // A Welcome delivery naming another KeyPackage of this account is a
+        // reason to look for a new sign-in (mdk#2628 3.2): bring the check
+        // forward, as a live KeyPackage of the account does.
+        if matches!(
+            effects.outcome,
+            IngestOutcome::Ignored {
+                category: cgka_traits::InputRejectionCategory::NotAddressedToThisDevice,
+            }
+        ) {
+            client
+                .app
+                .sign_in_nudges
+                .nudge(&hex::encode(client.runtime.self_id().as_slice()));
+        }
         let queued = client.pending_applied_effects.len();
         client.retain_effect_projection(
             &effects.effects,
@@ -7762,9 +7828,10 @@ mod runtime_group_subscription_refresh_tests {
     use std::sync::Arc;
 
     use super::{SyncCheckpointError, SyncSummary};
+    use crate::MarmotApp;
     use crate::tests::ScriptedPushRelayClient;
-    use crate::{MarmotApp, observer::PerformanceRecorder};
     use marmot_account::AccountHome;
+    use marmot_observability::PerformanceRecorder;
 
     /// A send can release a peer's route update without changing membership.
     /// Its retained observer must install that route and retry a failed rebuild.

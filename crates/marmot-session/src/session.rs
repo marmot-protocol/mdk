@@ -1035,6 +1035,15 @@ impl AccountDeviceSession {
             .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
     }
 
+    /// See [`cgka_engine::engine::Engine::own_account_leaf_claims`].
+    pub fn own_account_leaf_claims(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> SessionResult<Vec<(Vec<u8>, DeviceTagClaim)>> {
+        Ok(self.engine.own_account_leaf_claims(group_id, roster)?)
+    }
+
     pub fn app_component(
         &self,
         group_id: &GroupId,
@@ -1759,6 +1768,27 @@ impl AccountDeviceSession {
         expectation: &DeviceGroupWelcomeExpectation,
     ) -> Result<(), EngineError> {
         self.engine.expect_device_group_welcome(expectation)
+    }
+
+    /// See [`cgka_engine::engine::Engine::history_public_key`].
+    pub fn history_public_key(&self) -> SessionResult<Vec<u8>> {
+        Ok(self.engine.history_public_key()?)
+    }
+
+    /// See [`cgka_engine::engine::Engine::seal_history`].
+    pub fn seal_history(
+        &self,
+        recipient_public_key: &[u8],
+        context: &[u8],
+        plaintext: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.engine
+            .seal_history(recipient_public_key, context, plaintext)
+    }
+
+    /// See [`cgka_engine::engine::Engine::open_history`].
+    pub fn open_history(&self, context: &[u8], sealed: &[u8]) -> SessionResult<Option<Vec<u8>>> {
+        Ok(self.engine.open_history(context, sealed)?)
     }
 
     /// See `CgkaEngine::withdraw_device_group_welcome`.

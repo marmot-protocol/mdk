@@ -4,11 +4,11 @@
 //! A fetch first clears the relay dial gate (`RelaySafetyPolicy`): retired,
 //! invalid and unsafe relays, and loopback ones without the dev flag, are
 //! refused before any DNS. It then resolves once, validates and pins every
-//! address through `collector_host_safety`, and sends one GET with
-//! `Accept: application/nostr+json` to the relay's own URL over HTTPS (HTTP only
-//! for a loopback `ws://` relay the dev flag admits). TLS verifies against the
-//! bundled roots for the configured host name, never a resolved address.
-//! Redirects are refused.
+//! address through the collector helper (`marmot_observability::pin_with`),
+//! and sends one GET with `Accept: application/nostr+json` to the relay's own
+//! URL over HTTPS (HTTP only for a loopback `ws://` relay the dev flag admits).
+//! TLS verifies against the bundled roots for the configured host name, never
+//! a resolved address. Redirects are refused.
 //!
 //! A missing, malformed, oversized or unreachable document reads as unknown
 //! caps ([`RelayCaps::default`]), so the sweep infers the cap from full replies
@@ -29,7 +29,7 @@ use transport_nostr::{RelayEndpointPolicy, RelaySafetyPolicy};
 use transport_nostr_adapter::sweep::RelayCaps;
 use url::Url;
 
-use crate::collector_host_safety;
+use marmot_observability::{pin_with, system_resolve};
 
 /// Relay connects use 5 s (`dial-safety.md`); the document fetch matches.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -86,9 +86,7 @@ struct Nip11Fetch {
 impl Default for Nip11Fetch {
     fn default() -> Self {
         Self {
-            resolver: Arc::new(|host, port| {
-                Box::pin(collector_host_safety::system_resolve(host, port))
-            }),
+            resolver: Arc::new(|host, port| Box::pin(system_resolve(host, port))),
             connect_timeout: CONNECT_TIMEOUT,
             request_timeout: REQUEST_TIMEOUT,
         }
@@ -100,12 +98,11 @@ impl Nip11Fetch {
     async fn caps(&self, url: Url, allow_loopback: bool) -> Result<RelayCaps, Nip11Failure> {
         let loopback = allow_loopback && url.host().is_some_and(is_loopback_host);
         let resolver = self.resolver.clone();
-        let pin =
-            collector_host_safety::pin_with(url, loopback, self.connect_timeout, |host, port| {
-                resolver(host, port)
-            })
-            .await
-            .map_err(|_| Nip11Failure::Refused)?;
+        let pin = pin_with(url, loopback, self.connect_timeout, |host, port| {
+            resolver(host, port)
+        })
+        .await
+        .map_err(|_| Nip11Failure::Refused)?;
         let client = pin
             .build_client_with_timeouts(self.connect_timeout, self.request_timeout)
             .map_err(|_| Nip11Failure::Refused)?;

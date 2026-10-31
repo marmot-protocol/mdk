@@ -23,6 +23,7 @@ members = [
     "crates/marmot-markdown",
     "crates/marmot-account",
     "crates/marmot-pairing",
+    "crates/marmot-observability",
     "crates/marmot-app",
     "crates/marmot-uniffi",
     "crates/marmot-uniffi-macros",
@@ -167,6 +168,7 @@ marmot-forensics = { path = "crates/marmot-forensics" }
 marmot-markdown = { path = "crates/marmot-markdown" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-pairing = { path = "crates/marmot-pairing" }
+marmot-observability = { path = "crates/marmot-observability" }
 marmot-app = { path = "crates/marmot-app" }
 marmot-uniffi = { path = "crates/marmot-uniffi" }
 marmot-uniffi-macros = { path = "crates/marmot-uniffi-macros" }
@@ -188,6 +190,13 @@ libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite.git", rev = "5ae7
 # unchanged. `test` inherits these overrides from `dev`.
 [profile.dev.package."*"]
 debug = false
+
+# Build the bundled SQLCipher C code optimized in dev and test builds too. Every
+# test that opens a database replays the migrations, and at -O0 SQLite's own SQL
+# parsing was a fifth of the workspace test lane's CPU (mdk#2738). Release
+# builds already optimize it.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
 
 # Standard release profile for MarmotKit and other workspace release consumers.
 # Thin LTO with one codegen unit is the measured candidate; do not add a custom

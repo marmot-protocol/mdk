@@ -5,14 +5,16 @@
 
 use std::collections::BTreeSet;
 
-use super::canonical_membership::{deliver_new, published_key_package};
+use super::canonical_membership::{deliver_events, deliver_new, published_key_package};
 use super::*;
 use crate::client::sign_ins::{Announcement, SlotOutcome};
 use crate::{ConfirmedDeviceLink, SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
 use cgka_traits::app_components::{
-    DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterV1,
-    RejectedSlotReasonV1, decode_device_roster_v1,
+    AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
+    DeviceRosterUpdateV1, DeviceRosterV1, RejectedSlotReasonV1, RejectedSlotV1,
+    decode_device_roster_v1, encode_device_roster_update_v1,
 };
+use cgka_traits::engine::SendIntent;
 use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
 use storage_sqlite::SignInAnswer;
 
@@ -118,6 +120,32 @@ fn roster(client: &AppClient, group: &GroupId) -> DeviceRosterV1 {
             .unwrap(),
     )
     .unwrap()
+}
+
+/// One roster commit by `client` in `group`, standing in for another
+/// device's change of the roster or a link.
+async fn commit_roster(
+    client: &mut AppClient,
+    group: &GroupId,
+    operations: Vec<DeviceRosterOperationV1>,
+) {
+    let update =
+        encode_device_roster_update_v1(&DeviceRosterUpdateV1::new(operations).unwrap()).unwrap();
+    let effects = client
+        .runtime
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group.clone(),
+            updates: vec![AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: update,
+            }],
+        })
+        .await
+        .unwrap();
+    client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
 }
 
 fn listed(client: &mut AppClient) -> Vec<(String, bool, UnrecognizedSignInState)> {
@@ -672,8 +700,11 @@ async fn a_rejection_in_the_device_group_reaches_every_sibling() {
             .roster_pending
     );
 
+    // The phone's roster commit is what tells the laptop's host to re-read.
+    laptop.take_unrecognized_sign_ins_changed();
     deliver_new(&mut laptop, relay, &mut cursor).await;
     laptop.sync().await.unwrap();
+    assert!(laptop.take_unrecognized_sign_ins_changed());
     assert_eq!(
         listed(&mut laptop),
         [(
@@ -702,14 +733,12 @@ async fn a_rejection_in_the_device_group_reaches_every_sibling() {
 
     // The roster loses the rejection: the laptop has none of its own, so it
     // asks again, until the phone, which keeps its rejection, restores it.
-    laptop
-        .commit_device_roster_update(
-            group.clone(),
-            vec![DeviceRosterOperationV1::RemoveRejectedSlot(tablet_slot_id)],
-            "remove_rejected_slot",
-        )
-        .await
-        .unwrap();
+    commit_roster(
+        &mut laptop,
+        &group,
+        vec![DeviceRosterOperationV1::RemoveRejectedSlot(tablet_slot_id)],
+    )
+    .await;
     assert_eq!(
         listed(&mut laptop),
         [(tablet_slot.clone(), false, UnrecognizedSignInState::Prompt)]
@@ -786,14 +815,12 @@ async fn a_rejection_the_roster_loses_is_committed_again() {
     };
     assert!(holds_it(&laptop));
 
-    laptop
-        .commit_device_roster_update(
-            group.clone(),
-            vec![DeviceRosterOperationV1::RemoveRejectedSlot(tablet_slot_id)],
-            "remove_rejected_slot",
-        )
-        .await
-        .unwrap();
+    commit_roster(
+        &mut laptop,
+        &group,
+        vec![DeviceRosterOperationV1::RemoveRejectedSlot(tablet_slot_id)],
+    )
+    .await;
     deliver_new(&mut phone, relay, &mut phone_cursor).await;
     phone.sync().await.unwrap();
     assert!(!holds_it(&phone));
@@ -843,25 +870,21 @@ async fn a_link_dropped_before_the_next_pass_asks_again() {
     laptop.sync().await.unwrap();
 
     // The laptop links the tablet, and the link is gone again.
-    laptop
-        .commit_device_roster_update(
-            group.clone(),
-            vec![
-                DeviceRosterOperationV1::SetDevice(tablet_slot_id, DeviceEntryV1::default()),
-                DeviceRosterOperationV1::RemoveRejectedSlot(tablet_slot_id),
-            ],
-            "link_device",
-        )
-        .await
-        .unwrap();
-    laptop
-        .commit_device_roster_update(
-            group.clone(),
-            vec![DeviceRosterOperationV1::RemoveDevice(tablet_slot_id)],
-            "drop_link",
-        )
-        .await
-        .unwrap();
+    commit_roster(
+        &mut laptop,
+        &group,
+        vec![
+            DeviceRosterOperationV1::SetDevice(tablet_slot_id, DeviceEntryV1::default()),
+            DeviceRosterOperationV1::RemoveRejectedSlot(tablet_slot_id),
+        ],
+    )
+    .await;
+    commit_roster(
+        &mut laptop,
+        &group,
+        vec![DeviceRosterOperationV1::RemoveDevice(tablet_slot_id)],
+    )
+    .await;
     deliver_new(&mut phone, relay, &mut phone_cursor).await;
     phone.sync().await.unwrap();
     let record = account.apps[0]
@@ -953,6 +976,139 @@ async fn rejections_made_at_once_both_reach_the_roster() {
     );
 }
 
+/// The runtime's rejected-slot write records only slots the merged roster has
+/// no entry for: a device's slot and a `removed` record stay as they are. A
+/// held device group takes nothing, and a write with nothing left to record
+/// sends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_slot_write_never_replaces_a_roster_entry() {
+    let account = Account::new(2, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+    let mut laptop = account.open(1).await;
+    let laptop_key_package = published_key_package(&mut laptop, relay).await;
+    let link = link_for(&laptop_key_package, 0x5a, &phone);
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    let mut laptop_cursor = 0;
+    deliver_new(&mut laptop, relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+
+    let now = unix_now_seconds();
+    let laptop_slot: [u8; 32] = hex::decode(own_slot(&laptop)).unwrap().try_into().unwrap();
+    let (removed, fresh) = ([7; 32], [9; 32]);
+    let removed_record = RejectedSlotV1 {
+        reason: RejectedSlotReasonV1::Removed,
+        rejected_at: now,
+        tag_signature_key: Some(vec![7; 32]),
+    };
+    let mut phone_cursor = relay.published_events.lock().unwrap().len();
+    commit_roster(
+        &mut laptop,
+        &group,
+        vec![DeviceRosterOperationV1::SetRejectedSlot(
+            removed,
+            removed_record.clone(),
+        )],
+    )
+    .await;
+    deliver_new(&mut phone, relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+
+    let not_me = RejectedSlotV1 {
+        reason: RejectedSlotReasonV1::NotMe,
+        rejected_at: now,
+        tag_signature_key: None,
+    };
+    let context = || AppClient::local_human_action_context("reject_sign_in", vec![], vec![], None);
+    let before = relay.published_events.lock().unwrap().len();
+    phone
+        .runtime
+        .reject_device_slots(
+            &group,
+            std::slice::from_ref(&group),
+            vec![(fresh, not_me.clone())],
+            context(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(relay.published_events.lock().unwrap().len(), before);
+
+    let effects = phone
+        .runtime
+        .reject_device_slots(
+            &group,
+            &[],
+            vec![
+                (laptop_slot, not_me.clone()),
+                (removed, not_me.clone()),
+                (fresh, not_me.clone()),
+            ],
+            context(),
+        )
+        .await
+        .unwrap();
+    phone
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    let held = roster(&phone, &group);
+    assert!(held.devices.contains_key(&laptop_slot));
+    assert!(!held.rejected_slots.contains_key(&laptop_slot));
+    assert_eq!(held.rejected_slots[&removed], removed_record);
+    assert_eq!(held.rejected_slots[&fresh], not_me);
+
+    let before = relay.published_events.lock().unwrap().len();
+    phone
+        .runtime
+        .reject_device_slots(&group, &[], vec![(fresh, not_me)], context())
+        .await
+        .unwrap();
+    assert_eq!(relay.published_events.lock().unwrap().len(), before);
+}
+
+/// A roster update of this device's that loses to another branch tells the
+/// host to re-read its devices and sign-ins, which now read the winner's
+/// roster. One in a chat does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_superseded_roster_update_tells_the_host_sign_ins_changed() {
+    let account = Account::new(2, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+    let mut laptop = account.open(1).await;
+    let laptop_key_package = published_key_package(&mut laptop, relay).await;
+    let link = link_for(&laptop_key_package, 0x5a, &phone);
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    let chat = phone.create_group("chat", &[]).await.unwrap();
+
+    let superseded = |group_id: &GroupId| {
+        let mut effects = marmot_session::AccountDeviceEffects::default();
+        effects
+            .superseded_intents
+            .push(cgka_traits::engine::SupersededIntentReport {
+                group_id: group_id.clone(),
+                commit_id: cgka_traits::MessageId::new(group_id.as_slice().to_vec()),
+                kind: cgka_traits::engine::SupersededIntentKind::AppComponents,
+                outcome: cgka_traits::engine::SupersededIntentOutcome::Conflict,
+                reason: "test",
+            });
+        effects
+    };
+    phone.take_unrecognized_sign_ins_changed();
+    phone.take_linked_devices_changed();
+    phone.note_superseded_intent_reports(&superseded(&chat));
+    assert!(!phone.take_unrecognized_sign_ins_changed());
+    assert!(!phone.take_linked_devices_changed());
+
+    phone.note_superseded_intent_reports(&superseded(&group));
+    assert!(phone.take_unrecognized_sign_ins_changed());
+    assert!(phone.take_linked_devices_changed());
+}
+
 /// A live KeyPackage of the account brings the next check forward to a
 /// minute after the last one, instead of six hours.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -980,6 +1136,112 @@ async fn a_live_key_package_brings_the_check_forward() {
     );
     phone.drive_sign_ins().await;
     assert_eq!(phone.unrecognized_sign_ins().unwrap().len(), 1);
+}
+
+/// The deliveries published after `cursor`, with the Welcome rumors that name
+/// `own` first or last and the order otherwise kept. Advances `cursor`.
+async fn welcomes_ordered(
+    account: &Account,
+    cursor: &mut usize,
+    own: &MessageId,
+    own_first: bool,
+) -> Vec<NostrTransportEvent> {
+    let events = account.relay.published_events.lock().unwrap()[*cursor..].to_vec();
+    *cursor += events.len();
+    let peeler =
+        transport_nostr_peeler::NostrMlsPeeler::new().with_welcome_signer(account.keys.clone());
+    let (mut named, mut own_rumors, mut other_rumors) = (Vec::new(), 0, 0);
+    for event in events {
+        let names_own = match peeler
+            .peel_welcome_with_provenance(&event.to_transport_message().unwrap())
+            .await
+        {
+            Ok((_, provenance)) => {
+                let names_own = provenance.key_package_event_id.as_slice() == own.as_slice();
+                if names_own {
+                    own_rumors += 1;
+                } else {
+                    other_rumors += 1;
+                }
+                names_own
+            }
+            Err(_) => false,
+        };
+        named.push((names_own != own_first, event));
+    }
+    assert!(own_rumors > 0 && other_rumors > 0, "both devices' rumors");
+    named.sort_by_key(|(later, _)| *later);
+    named.into_iter().map(|(_, event)| event).collect()
+}
+
+/// A Welcome that names another KeyPackage of the account brings the check
+/// forward too (mdk#2628 3.2). Bob invites Alice, so the phone also receives
+/// the delivery made for the laptop's KeyPackage, which is not addressed to
+/// it, and checks within the minute, whichever delivery comes first. Anyone
+/// can send such a Welcome: a burst right after a check waits its minute,
+/// then makes one check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_welcome_naming_another_key_package_brings_the_check_forward() {
+    let account = Account::new(2, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    let phones = published_key_package(&mut phone, relay)
+        .await
+        .source
+        .unwrap()
+        .event_id;
+    phone.drive_sign_ins().await;
+    let mut laptop = account.open(1).await;
+    published_key_package(&mut laptop, relay).await;
+    let a_minute = std::time::Duration::from_secs(61);
+    // Whether a pass a minute on from the last check runs one.
+    let checks_a_minute_on = async |phone: &mut AppClient| {
+        phone.sign_in_schedule.rewind(a_minute);
+        let before = phone.sign_in_schedule.last;
+        phone.drive_sign_ins().await;
+        phone.sign_in_schedule.last != before
+    };
+    assert!(!checks_a_minute_on(&mut phone).await, "nothing nudged it");
+
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = sign_in_app_at(&bob_dir, relay.clone(), false);
+    remember_test_member_inbox(&bob_app, &account.alice_id, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let mut cursor = relay.published_events.lock().unwrap().len();
+    // The phone's own deliveries first: it joins each group before the
+    // laptop's delivery of the same Welcome arrives.
+    for name in ["one", "two", "three"] {
+        bob.create_group(name, &[&account.alice_id]).await.unwrap();
+    }
+    let burst = welcomes_ordered(&account, &mut cursor, &phones, true).await;
+    let delivered = deliver_events(&mut phone, &burst).await;
+    assert_eq!(delivered.joined_groups.len(), 3);
+    assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
+    assert!(checks_a_minute_on(&mut phone).await);
+    assert_eq!(
+        listed(&mut phone),
+        [(own_slot(&laptop), false, UnrecognizedSignInState::Prompt)]
+    );
+
+    // A burst right after a check, the laptop's deliveries first, waits its
+    // minute, then makes one check and leaves none pending.
+    for name in ["four", "five", "six"] {
+        bob.create_group(name, &[&account.alice_id]).await.unwrap();
+    }
+    let burst = welcomes_ordered(&account, &mut cursor, &phones, false).await;
+    let delivered = deliver_events(&mut phone, &burst).await;
+    assert_eq!(delivered.joined_groups.len(), 3);
+    let checked = phone.sign_in_schedule.last;
+    phone.drive_sign_ins().await;
+    assert_eq!(
+        phone.sign_in_schedule.last, checked,
+        "not within the minute"
+    );
+    assert!(checks_a_minute_on(&mut phone).await);
+    assert!(!checks_a_minute_on(&mut phone).await, "one check per burst");
 }
 
 /// Sign a publication into `slot` with the account's key at `created_at`,
@@ -1036,6 +1298,25 @@ async fn a_foreign_publication_in_its_own_slot_is_replaced() {
     assert!(!report.foreign.replacing);
     phone.run_due_maintenance().await.unwrap();
     assert_eq!(account.relay.published_events.lock().unwrap().len(), before);
+}
+
+/// A host's check while maintenance is paused cannot replace a foreign
+/// publication in this device's slot, so it leaves the schedule alone: the
+/// first pass after resume checks again and replaces it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_now_while_paused_leaves_the_own_slot_repair_due() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let forged_at = published_at(&phone) + 2;
+    publish_into_slot(&account, &slot, "not a key package", forged_at);
+
+    phone.pause_maintenance();
+    phone.check_sign_ins_now().await.unwrap();
+    phone.resume_maintenance();
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > forged_at);
 }
 
 /// A foreign publication dated further ahead than this device would sign
@@ -1150,4 +1431,156 @@ async fn sign_ins_stay_off_without_device_groups() {
             .unwrap(),
         None
     );
+}
+
+/// Hosts reach sign-ins through the runtime: the list, a check on request,
+/// answers and their refusals, and an `UnrecognizedSignInsChanged` at open
+/// and after each change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_host_lists_checks_and_answers_sign_ins() {
+    let account = Account::new(2, true);
+    drop(account.open(0).await);
+    let phone_app = &account.apps[0];
+    let _eose = scripted_eose_pump(
+        phone_app.relay_plane.clone(),
+        account.relay.clone(),
+        every_subscription,
+    );
+    let runtime = MarmotAppRuntime::new(phone_app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    next_sign_ins_changed(&mut events, &account.alice_id).await;
+    // This first check takes the phone's baseline: only its own slot.
+    assert!(runtime.check_sign_ins("alice").await.unwrap().is_empty());
+
+    let mut tablet = account.open(1).await;
+    published_key_package(&mut tablet, &account.relay).await;
+    let tablet_slot = own_slot(&tablet);
+    drop(tablet);
+    let state = |sign_ins: Vec<UnrecognizedSignIn>| {
+        sign_ins
+            .into_iter()
+            .map(|sign_in| {
+                (
+                    sign_in.slot_id_hex,
+                    sign_in.before_this_device,
+                    sign_in.state,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        state(runtime.check_sign_ins("alice").await.unwrap()),
+        [(tablet_slot.clone(), false, UnrecognizedSignInState::Prompt)]
+    );
+    next_sign_ins_changed(&mut events, &account.alice_id).await;
+
+    let refused = |result: Result<(), AppError>, code: &str| {
+        assert!(
+            matches!(result, Err(AppError::DeviceGroupRefused(refused)) if refused == code),
+            "{code}"
+        );
+    };
+    refused(
+        runtime
+            .answer_sign_in("alice", &tablet_slot, SignInResponse::Dismiss)
+            .await,
+        "sign_in_unanswered",
+    );
+    refused(
+        runtime
+            .answer_sign_in("alice", &"ef".repeat(32), SignInResponse::NotNow)
+            .await,
+        "sign_in_unknown",
+    );
+
+    runtime
+        .answer_sign_in("alice", &tablet_slot, SignInResponse::NotNow)
+        .await
+        .unwrap();
+    next_sign_ins_changed(&mut events, &account.alice_id).await;
+    assert_eq!(
+        state(runtime.unrecognized_sign_ins("alice").await.unwrap()),
+        [(tablet_slot.clone(), false, UnrecognizedSignInState::NotNow)]
+    );
+    refused(
+        runtime
+            .answer_sign_in("alice", &tablet_slot, SignInResponse::NotNow)
+            .await,
+        "sign_in_answered",
+    );
+
+    runtime
+        .answer_sign_in("alice", &tablet_slot, SignInResponse::Reject)
+        .await
+        .unwrap();
+    next_sign_ins_changed(&mut events, &account.alice_id).await;
+    assert!(
+        runtime
+            .unrecognized_sign_ins("alice")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    runtime.shutdown().await;
+}
+
+/// With device groups off, the runtime lists nothing, checks nothing, and
+/// never announces a change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_host_sees_no_sign_ins_without_device_groups() {
+    let account = Account::new(2, false);
+    drop(account.open(0).await);
+    drop(account.open(1).await);
+    let phone_app = &account.apps[0];
+    let _eose = scripted_eose_pump(
+        phone_app.relay_plane.clone(),
+        account.relay.clone(),
+        every_subscription,
+    );
+    let runtime = MarmotAppRuntime::new(phone_app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    assert!(runtime.check_sign_ins("alice").await.unwrap().is_empty());
+    assert!(
+        runtime
+            .unrecognized_sign_ins("alice")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        runtime
+            .answer_sign_in("alice", &"ef".repeat(32), SignInResponse::NotNow)
+            .await,
+        Err(AppError::DeviceGroupRefused("roster_unsupported"))
+    ));
+    runtime.shutdown().await;
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, MarmotAppEvent::UnrecognizedSignInsChanged { .. }),
+            "{event:?}"
+        );
+    }
+}
+
+/// Waits for the account's next `UnrecognizedSignInsChanged`.
+async fn next_sign_ins_changed(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    account_id_hex: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::UnrecognizedSignInsChanged {
+                    account_id_hex: changed,
+                    account_label,
+                }) if changed == account_id_hex && account_label == "alice" => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("events closed"),
+            }
+        }
+    })
+    .await
+    .expect("UnrecognizedSignInsChanged");
 }

@@ -15,7 +15,7 @@ workspace HTTP client has been audited.
 
 ## Shared helper
 
-`crates/marmot-app/src/collector_host_safety.rs` is the default-build chokepoint for
+`crates/marmot-observability/src/collector_host_safety.rs` is the default-build chokepoint for
 OTLP export, product analytics, and forensic audit-log POST uploads.
 
 - Parse the configured URL with `export_config::parse_relay_telemetry_endpoint` before DNS.
@@ -46,7 +46,7 @@ OTLP export, product analytics, and forensic audit-log POST uploads.
 
 ## Forensic audit upload
 
-`crates/marmot-app/src/audit_upload.rs` uses the same helper after snapshot capture and
+`crates/marmot-observability/src/audit_upload.rs` uses the same helper after snapshot capture and
 v4 eligibility. It adds:
 
 - retired-host rejection at the configured-URL gate, including case and trailing-root-dot

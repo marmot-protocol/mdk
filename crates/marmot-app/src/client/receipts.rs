@@ -84,6 +84,9 @@ impl AppClient {
                 released_count = released.len(),
                 "retired released transport receipt claims and restored replay eligibility"
             );
+            // A released receipt un-covered its second: the runner reads its
+            // debt again.
+            self.wake_recovery_runner();
         }
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_released_backfill_reload) {

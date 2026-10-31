@@ -203,7 +203,7 @@ impl AppClient {
             && (!matches!(event, cgka_traits::engine::GroupEvent::GroupJoined { .. })
                 || self.settle_held_device_group(group_id)?)
         {
-            self.linked_devices_changed = true;
+            self.note_device_roster_changed();
             // Its roster may now hold a slot this device rejected, or have
             // lost a rejection it made (mdk#2628 3.2).
             self.recheck_sign_in_rejections();

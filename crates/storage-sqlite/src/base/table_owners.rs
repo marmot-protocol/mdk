@@ -17,7 +17,9 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     // The migration ledger.
     ("cgka_schema_migrations", Side::Base),
     // The engine: `cgka_*`, OpenMLS values, the engine-to-app outbox and local forgets.
+    ("cgka_account_device_history_keys", Side::Protocol),
     ("cgka_account_device_signers", Side::Protocol),
+    ("cgka_announced_key_packages", Side::Protocol),
     ("cgka_convergence_passes", Side::Protocol),
     ("cgka_convergence_policies", Side::Protocol),
     ("cgka_deferred_peel_generations", Side::Protocol),
@@ -138,8 +140,11 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("content_reports", Side::App),
     ("conversation_read_state", Side::App),
     ("device_group_joins", Side::App),
+    ("device_group_messages", Side::App),
     ("device_groups", Side::App),
     ("device_links", Side::App),
+    ("device_removals", Side::App),
+    ("device_renames", Side::App),
     ("direct_conversation_members", Side::App),
     ("encrypted_media_epoch_secret_references", Side::App),
     (
@@ -179,6 +184,8 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("secure_delete_checkpoint_intents", Side::App),
     ("seen_events", Side::App),
     ("sibling_welcomes_received", Side::App),
+    ("small_state_items", Side::App),
+    ("small_state_sync", Side::App),
     ("transport_reconciliation_items", Side::App),
     ("transport_reconciliation_route_state", Side::App),
     ("transport_reconciliation_scheduler", Side::App),

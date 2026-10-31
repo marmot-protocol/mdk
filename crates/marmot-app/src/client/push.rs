@@ -88,43 +88,28 @@ impl AppClient {
         server_pubkey_hex: &str,
         relay_hint: Option<String>,
     ) -> Result<notifications::PushRegistrationSyncResult, AppError> {
-        let observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Notification,
             "register",
             crate::ProductUnit::Action,
         );
-        let result = Box::pin(self.upsert_and_share_push_registration_unobserved(
-            platform,
-            raw_token,
-            server_pubkey_hex,
-            relay_hint,
-        ))
-        .await;
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    async fn upsert_and_share_push_registration_unobserved(
-        &mut self,
-        platform: notifications::PushPlatform,
-        raw_token: &str,
-        server_pubkey_hex: &str,
-        relay_hint: Option<String>,
-    ) -> Result<notifications::PushRegistrationSyncResult, AppError> {
-        let registration = self.app.upsert_push_registration(
-            &self.state.label,
-            platform,
-            raw_token,
-            server_pubkey_hex,
-            relay_hint,
-        )?;
-        let share = self.share_push_registration().await?;
-        Ok(notifications::PushRegistrationSyncResult {
-            registration,
-            share,
-        })
+        let work = async move {
+            let registration = self.app.upsert_push_registration(
+                &self.state.label,
+                platform,
+                raw_token,
+                server_pubkey_hex,
+                relay_hint,
+            )?;
+            let share = self.share_push_registration().await?;
+            Ok(notifications::PushRegistrationSyncResult {
+                registration,
+                share,
+            })
+        };
+        observed
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
+            .await
     }
 
     pub(crate) async fn share_push_registration(

@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 use url::Url;
 
-use crate::collector_host_safety::{
+use marmot_observability::{
     CONNECT_TIMEOUT, CollectorRequestError, PinnedCollector, REQUEST_TIMEOUT, hand_in_http_builder,
     resolve_with_for_test,
 };

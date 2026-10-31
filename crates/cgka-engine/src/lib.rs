@@ -34,6 +34,7 @@
 
 mod account_devices_activation;
 pub mod account_identity_proof;
+mod announced_key_packages;
 pub mod app_components;
 
 pub(crate) mod app_payload;
@@ -61,6 +62,7 @@ pub mod group_authority;
 pub mod group_context_view;
 pub mod group_lifecycle;
 pub mod group_state_changes;
+pub mod history_key;
 pub mod identity;
 pub mod key_package;
 pub mod leaf_advertisement;

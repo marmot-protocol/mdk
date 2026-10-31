@@ -539,7 +539,8 @@ impl<S: StorageProvider> Engine<S> {
                 }),
             )
             .await;
-        self.welcome_join_outcome(&msg, Some(content_id), joined)
+        // A private KeyPackage has no publication to name.
+        self.welcome_join_outcome(&msg, Some(content_id), None, joined)
     }
 
     /// A sibling Welcome's transport message as a join reads it, already

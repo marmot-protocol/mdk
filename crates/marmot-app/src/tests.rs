@@ -18,6 +18,8 @@ mod key_package_selection;
 mod message_journeys;
 #[cfg(feature = "test-policy-overrides")]
 mod multi_device_members;
+#[cfg(feature = "product-analytics-export")]
+mod observed_operations;
 mod publication_progress;
 #[cfg(feature = "test-policy-overrides")]
 mod push_announce;
@@ -33,6 +35,8 @@ mod replaceable_delivery;
 mod report_backfill;
 #[cfg(feature = "test-policy-overrides")]
 mod sign_ins;
+#[cfg(feature = "test-policy-overrides")]
+mod small_state;
 mod suspension_close;
 mod unreachable_group_relays;
 mod user_blocks;
@@ -367,7 +371,7 @@ fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
             crate::client::PreparedGroupImageUploadStart::Complete(_)
         ));
 
-        let telemetry = crate::observer::PerformanceRecorder::default();
+        let telemetry = marmot_observability::PerformanceRecorder::default();
         let group_id = client
             .create_group_with_prepared_initial_image_and_telemetry(
                 "prepared image",
@@ -431,7 +435,7 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
             .unwrap()
             .unwrap()
             .component_data;
-        let telemetry = crate::observer::PerformanceRecorder::default();
+        let telemetry = marmot_observability::PerformanceRecorder::default();
 
         // Simulate the narrow crash window: MLS creation is canonical, but
         // consumption fails and the best-effort app projection is absent.
@@ -7425,7 +7429,7 @@ async fn local_ready_result_does_not_report_an_unrequested_key_package_publicati
     #[cfg(feature = "product-analytics-export")]
     let app = {
         let mut app = app;
-        app.product_analytics = crate::observability_test_support::test_product_collector();
+        app.product_analytics = marmot_observability::test_product_collector();
         app.set_usage_diagnostics_consent(true).unwrap();
         app
     };
@@ -14653,7 +14657,7 @@ fn app_transport_routing_recovers_from_poisoned_lock() {
         required_acks: 1,
     });
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = routing.inner.write().unwrap();
+        let _guard = routing.inner.state.write().unwrap();
         panic!("poison app routing lock");
     }));
 
@@ -15276,11 +15280,13 @@ fn custom_intent_rejects_every_reserved_kind() {
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
         // Device-group kinds: heartbeat, private KeyPackage request and
-        // hand-off, anomaly alert.
+        // hand-off, anomaly alert, small-state update and broadcast request.
         457,
         459,
         460,
         462,
+        475,
+        476,
     ] {
         assert!(crate::is_reserved_app_event_kind(kind));
         let result = build_inner_event(
@@ -15566,6 +15572,50 @@ fn app_error_display_does_not_expose_group_or_account_ids() {
         assert!(!error.contains(&group_id), "{error}");
         assert!(!error.contains(&account_id), "{error}");
     }
+}
+
+/// The app constructors relax storage for this unit-test process, so a
+/// database opened afterwards skips SQLCipher's memory security even when its
+/// options ask for it.
+#[test]
+fn app_unit_tests_open_databases_without_sqlcipher_memory_security() {
+    static CIPHER_PRAGMAS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn record_cipher_pragma(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+            let sql = sql.to_ascii_lowercase();
+            if sql.starts_with("pragma cipher") {
+                CIPHER_PRAGMAS.lock().unwrap().push(sql);
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let connection = rusqlite::Connection::open(dir.path().join("probe.sqlite")).unwrap();
+    connection.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(record_cipher_pragma),
+    );
+
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &storage_sqlite::SqlCipherKey::raw([0x42; 32]),
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+
+    let pragmas = CIPHER_PRAGMAS.lock().unwrap().clone();
+    assert!(
+        pragmas
+            .iter()
+            .any(|sql| sql.contains("cipher_compatibility")),
+        "{pragmas:?}"
+    );
+    assert!(
+        !pragmas
+            .iter()
+            .any(|sql| sql.contains("cipher_memory_security")),
+        "{pragmas:?}"
+    );
 }
 
 #[test]
@@ -19560,7 +19610,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     #[cfg(feature = "product-analytics-export")]
     let app = {
         let mut app = app;
-        app.product_analytics = crate::observability_test_support::test_product_collector();
+        app.product_analytics = marmot_observability::test_product_collector();
         app
     };
     #[cfg(feature = "product-analytics-export")]
@@ -22700,7 +22750,7 @@ async fn invite_with_unresolved_commit_holds_its_welcome() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_with_unresolved_commit_leaves_no_welcome_slot() {
     let mut invite = unresolved_invite().await;
-    let telemetry = crate::observer::PerformanceRecorder::default();
+    let telemetry = marmot_observability::PerformanceRecorder::default();
     let summary = invite
         .alice
         .invite_members_with_telemetry(
@@ -22753,7 +22803,7 @@ async fn retained_invite_leaves_no_welcome_for_a_later_create_to_send() {
                 &[],
                 AppCreateGroupOptions::default(),
                 &staged.upload_id,
-                &crate::observer::PerformanceRecorder::default(),
+                &marmot_observability::PerformanceRecorder::default(),
             )
             .await
             .unwrap();

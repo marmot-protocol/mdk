@@ -14,13 +14,13 @@ use marmot_account::AccountSummary;
 use cgka_traits::TransportEndpoint;
 use storage_sqlite::SqliteSharedStorage;
 
-use crate::observer::ProductOperation;
 use crate::{
     APP_CACHE_DB_FILE, AccountRelayListStatus, AppError,
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, MarmotApp, SqlcipherDatabaseKind,
     remove_sqlite_file_set,
 };
 use crate::{ProductFamily, ProductUnit};
+use marmot_observability::ProductOperation;
 use nostr_directory::error::DirectoryError;
 use nostr_directory::hydrate_directory_record;
 use nostr_directory::public_directory_user_record;
@@ -461,7 +461,7 @@ mod observer_tests {
     fn directory_observations_keep_their_events_and_drop_rule() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = MarmotApp::with_relays(dir.path(), vec![]);
-        app.product_analytics = crate::observability_test_support::test_product_collector();
+        app.product_analytics = marmot_observability::test_product_collector();
         app.set_usage_diagnostics_consent(true).unwrap();
 
         let counts = DirectoryObserver::begin(

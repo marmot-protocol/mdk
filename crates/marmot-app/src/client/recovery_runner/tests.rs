@@ -112,13 +112,18 @@ struct Account {
     admitted: AdmittedLog,
 }
 
-fn account() -> Account {
-    let dir = tempfile::tempdir().unwrap();
+const ACCOUNT_DB: &str = "account.db";
+
+fn account_key() -> SqlCipherKey {
     // A raw key skips SQLCipher's passphrase derivation, which dominates a
     // test's run time in debug builds.
-    let key = SqlCipherKey::raw([7; 32]);
+    SqlCipherKey::raw([7; 32])
+}
+
+fn account() -> Account {
+    let dir = tempfile::tempdir().unwrap();
     let storage =
-        SqliteAccountStorage::open_encrypted(dir.path().join("account.db"), &key).unwrap();
+        SqliteAccountStorage::open_encrypted(dir.path().join(ACCOUNT_DB), &account_key()).unwrap();
     let app = storage.app_storage();
     Account {
         _dir: dir,
@@ -129,6 +134,18 @@ fn account() -> Account {
 }
 
 impl Account {
+    /// A second connection to the database, only to inject write faults.
+    fn fault_connection(&self) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open(self._dir.path().join(ACCOUNT_DB)).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &account_key(),
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection
+    }
+
     fn goal(&self, route: &Route, since: u64) {
         self.app
             .widen_recovery_coverage_goals(std::slice::from_ref(route), since)
@@ -872,6 +889,8 @@ struct TestHost {
     admitted: AdmittedLog,
     /// Events the engine keeps no trace of.
     no_trace: Mutex<BTreeSet<Vec<u8>>>,
+    /// Events no installed subscription routes yet.
+    unrouted: Mutex<BTreeSet<Vec<u8>>>,
     /// Events whose ingest fails locally.
     failing_ingests: Mutex<BTreeSet<Vec<u8>>>,
     /// How many seconds of the host's clock each ingest and each debt turn
@@ -944,6 +963,7 @@ impl TestHost {
             counts: Mutex::default(),
             admitted: admitted.clone(),
             no_trace: Mutex::default(),
+            unrouted: Mutex::default(),
             failing_ingests: Mutex::default(),
             ingest_seconds: AtomicU64::new(0),
             debt_turn_seconds: AtomicU64::new(0),
@@ -1087,8 +1107,13 @@ impl RunnerHost for TestHost {
         }))
     }
 
-    async fn deliveries(&self, _relay: &str, event: Event) -> Vec<TransportDelivery> {
-        vec![delivery(&event)]
+    async fn deliveries(&self, _relay: &str, event: Event) -> Option<Vec<TransportDelivery>> {
+        let unrouted = self
+            .unrouted
+            .lock()
+            .unwrap()
+            .contains(event.id.as_bytes().as_slice());
+        (!unrouted).then(|| vec![delivery(&event)])
     }
 
     async fn admit_staged(
@@ -1477,6 +1502,76 @@ async fn recovery_runner_cancelled_or_crashed_mid_sweep_requests_no_slice_twice(
     assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
     assert_eq!(account.admitted_events(), total, "every event was admitted");
     assert_eq!(available_credits(&credits), 2);
+}
+
+/// A runner aborted mid-quantum leaves its attempt open, and its owner's
+/// refund settles it as unanswered: the charge goes back, the unit keeps its
+/// retry state and the relay gets no verdict. A runner whose quantum settles
+/// leaves nothing open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_refunds_the_attempt_an_aborted_quantum_left_open() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let relay = ModelRelay::new(RELAY, caps(20, true))
+        .with_events(every([1; 32], floor, t0, HOUR))
+        .checking(&account)
+        .build();
+    account.goal(&route, floor);
+    account.rechecked(&route, RELAY, t0);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    host.tails.stand(&route, RELAY, t0);
+    let attempts = || {
+        account
+            .app
+            .recovery_account_usage(clock.now())
+            .unwrap()
+            .attempts
+    };
+
+    relay.gate.hold_from(0);
+    let (aborted, _handle) = runner(&host, test_policy());
+    let open = aborted.open_attempts();
+    let task = aborted.spawn();
+    wait_until("a held request", WAIT, || relay.gate.waiting() == 1).await;
+    assert_eq!(attempts(), 1, "the quantum began");
+    assert!(!open.is_empty());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    open.refund(&account.app, &test_policy().unit, clock.now());
+    assert!(open.is_empty());
+    assert_eq!(attempts(), 0, "the refund gave the charge back");
+    let unit = account.app.recovery_unit(&route, RELAY).unwrap().unwrap();
+    assert_eq!(
+        (
+            unit.no_progress,
+            unit.backoff_step,
+            unit.next_attempt_at_seconds
+        ),
+        (0, 0, 0),
+        "the unit keeps its retry state"
+    );
+    let health = account.app.recovery_relay_health(RELAY).unwrap().unwrap();
+    assert_eq!(
+        (health.unreachable_streak, health.cooldown),
+        (0, None),
+        "the relay gets no verdict"
+    );
+
+    relay.gate.open();
+    let (mut settled, _handle) = runner(&host, test_policy());
+    let open = settled.open_attempts();
+    let outcomes = run_until_idle(&mut settled, 20).await;
+    assert!(!outcomes.is_empty());
+    assert!(open.is_empty(), "every quantum settled");
 }
 
 // A paused clock (Tokio allows one only on the current-thread runtime) makes
@@ -2384,6 +2479,56 @@ async fn recovery_runner_charges_returned_bytes_to_required_units_alone() {
     assert_eq!(usage().attempts, 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_leaves_a_slice_owed_while_its_events_route_nowhere() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let events = every([1; 32], floor, t0, 10 * 60);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(events.clone())
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    // The account was just given the relay: its installed subscriptions do
+    // not route the group there yet.
+    host.unrouted
+        .lock()
+        .unwrap()
+        .extend(events.iter().map(|event| event.id.to_bytes().to_vec()));
+    let (mut runner, _handle) = runner(&host, test_policy());
+    let usage = || account.app.recovery_account_usage(clock.now()).unwrap();
+
+    // A local failure: the relay is not blamed, and the unit waits out a
+    // local hold rather than fetching the same slice again at once.
+    assert_eq!(ran(runner.step().await).outcome, Outcome::LocalFailure);
+    assert_eq!(account.app.staged_recovery_total().unwrap().events, 0);
+    assert!(
+        !account.debt(&route, RELAY, t0 - 1).is_empty(),
+        "nothing it fetched covers the hour"
+    );
+    assert!(usage().event_bytes > 0, "its bytes are charged");
+    let due = idle(runner.step().await).expect("the unit is retried");
+
+    // Once the subscriptions catch up, the retry stages and covers it.
+    host.unrouted.lock().unwrap().clear();
+    clock.advance_to(due);
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
+    assert_eq!(
+        account.app.staged_recovery_total().unwrap().events,
+        events.len() as u64
+    );
+    assert!(account.debt(&route, RELAY, t0 - 1).is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn recovery_runner_charges_what_a_dropped_request_already_read() {
     const READ: u64 = 4096;
@@ -2549,6 +2694,55 @@ async fn recovery_runner_task_wakes_on_a_bump_and_at_its_retry_time() {
     task.await.unwrap();
 }
 
+// The account's own wake sender (the routing's) wakes a runner built on it,
+// and the spawned task answers a pass until it stops. Paused as above.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_task_wakes_on_its_accounts_sender_and_answers_passes() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let relay = stalling_relay([1; 32], floor).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, floor);
+    let wake = tokio::sync::watch::channel(0).0;
+    let (runner, handle) = RecoveryRunner::waking_on(
+        host.clone(),
+        test_policy(),
+        recovery_credits::private_recovery_credit_pool_for_test(),
+        wake.clone(),
+    );
+    let task = runner.spawn();
+
+    tokio::time::sleep(Duration::from_secs(HOUR)).await;
+    assert_eq!(relay.requests(), 0, "nothing is owed, so the task sleeps");
+    host.tails.lapse(&route, RELAY);
+    wake.send_modify(|bumps| *bumps += 1);
+    wait_until("the woken quantum", WAIT, || {
+        account
+            .app
+            .recovery_unit(&route, RELAY)
+            .unwrap()
+            .is_some_and(|unit| unit.last_served_at_seconds.is_some())
+    })
+    .await;
+
+    assert!(handle.run_pass(WAIT).await.is_some());
+    handle.shutdown();
+    task.await.unwrap();
+    assert!(
+        handle.run_pass(WAIT).await.is_none(),
+        "a stopped runner runs no pass"
+    );
+}
+
 #[test]
 fn recovery_runner_classifies_every_sweep_end() {
     use SweepEnd as End;
@@ -2558,6 +2752,7 @@ fn recovery_runner_classifies_every_sweep_end() {
     let local = Some(SinkStop::Local);
     let stale = Some(SinkStop::StaleMark);
     let gone = Some(SinkStop::WorkerGone);
+    let unrouted = Some(SinkStop::Unrouted);
     // (end, answered, last reply rate limited, newly covered, sink stop, still
     // owed)
     let cases = [
@@ -2663,6 +2858,15 @@ fn recovery_runner_classifies_every_sweep_end() {
         (
             (End::SinkFailed, true, false, 0, gone, true),
             Outcome::Unanswered,
+        ),
+        // An event no installed subscription routes yet is local too.
+        (
+            (End::SinkFailed, true, false, 0, unrouted, true),
+            Outcome::LocalFailure,
+        ),
+        (
+            (End::SinkFailed, true, false, 9, unrouted, true),
+            Outcome::LocalFailure,
         ),
         (
             (End::StoreFailed, true, false, 0, None, true),

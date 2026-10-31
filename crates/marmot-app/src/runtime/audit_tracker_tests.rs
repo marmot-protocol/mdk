@@ -428,7 +428,7 @@ async fn redirected_tracker_upload_is_not_checkpointed_until_direct_success() {
     assert!(observed.try_recv().is_ok());
     assert_eq!(
         app.audit_upload_checkpoint("alice").acknowledged(&first),
-        Some(crate::audit_upload::AuditUploadOutcome::Uploaded)
+        Some(marmot_observability::AuditUploadOutcome::Uploaded)
     );
     server.abort();
 }

@@ -50,10 +50,10 @@ pub use codec::{
 pub use device_roster::{
     AccountEntryV1, DEVICE_ROSTER_KEY_PACKAGE_REF_MAX_LEN, DEVICE_ROSTER_RESERVED_KEY_MAX_LEN,
     DEVICE_ROSTER_TAG_SIGNATURE_KEY_MAX_LEN, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
-    DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1, DeviceSettingsV1, DeviceSlotId,
-    DeviceStatusV1, RejectedKeyPackageV1, RejectedSlotReasonV1, RejectedSlotV1,
-    apply_device_roster_update_v1, decode_device_roster_update_v1, decode_device_roster_v1,
-    encode_device_roster_update_v1, encode_device_roster_v1,
+    DeviceRenameId, DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1,
+    DeviceSettingsV1, DeviceSlotId, DeviceStatusV1, RejectedKeyPackageV1, RejectedSlotReasonV1,
+    RejectedSlotV1, apply_device_roster_update_v1, decode_device_roster_update_v1,
+    decode_device_roster_v1, encode_device_roster_update_v1, encode_device_roster_v1,
 };
 pub use device_tag::{
     DEVICE_TAG_NONCE_LEN, DEVICE_TAG_VECTOR_MAX_LEN, DeviceTagClaim, DeviceTagContentV1,

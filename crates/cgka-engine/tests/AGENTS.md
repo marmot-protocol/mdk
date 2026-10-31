@@ -24,8 +24,8 @@ cargo insta review
 ## Tier 2 — Engine integration tests (this directory)
 
 **What they prove:** real OpenMLS-backed engine behavior across one or more engine instances using a pass-through
-`MockPeeler`. Most files use in-memory `Engine<SqliteAccountStorage>`; `sqlite_storage.rs` keeps the encrypted
-file-backed backend on the same rail.
+`MockPeeler`. Most files use in-memory `Engine<SqliteAccountStorage>` opened with `in_memory_for_test()`, which skips
+SQLCipher's per-allocation memory locking; `sqlite_storage.rs` keeps the encrypted file-backed backend on the same rail.
 
 **Transport visibility.** The pass-through `MockPeeler` gives every test client perfect cross-branch visibility, which
 production does not have: a real transport seals a group message under the sender's current-epoch exporter secret and
@@ -215,7 +215,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     instead of a queued link while convergence is unsettled or an own Commit is in flight. Its undo, `UnlinkDevice`
     (D40): one privileged Commit removing the linked leaf and its entry, which the removed device sees as its removal;
     refused for another leaf than one other leaf of the account, an update that doesn't remove exactly one listed
-    entry, or while an own Commit is in flight.
+    entry, or while an own Commit is in flight. A device it removed that forgot its copy joins again through the next
+    link's Welcome, which no forget cutoff dates.
 
 - **File:** `account_devices/device_group_welcome.rs` (test-policy builds only)
   - **Owns:** Which Welcome a new device joins its device group through (mdk#2628 D28, D30): only the one a stored

@@ -1762,7 +1762,7 @@ async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
     let peeler = ProbePeeler {
         inner: NostrMlsPeeler::new().with_welcome_signer(wrong_key),
         slot: slot.clone(),
-        storage: storage_sqlite::SqliteAccountStorage::in_memory()
+        storage: storage_sqlite::SqliteAccountStorage::in_memory_for_test()
             .unwrap()
             .app_storage(),
         #[cfg(feature = "unreleased-device-pairing")]

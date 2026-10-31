@@ -286,14 +286,24 @@ mod migration_0134_recovery_recheck_revision;
 mod migration_0135_recovery_unit_fences;
 #[path = "migrations/0136_recovery_conversion.rs"]
 mod migration_0136_recovery_conversion;
+#[path = "migrations/0137_device_renames.rs"]
+mod migration_0137_device_renames;
+#[path = "migrations/0138_account_device_history_keys.rs"]
+mod migration_0138_account_device_history_keys;
 #[path = "migrations/0140_private_key_packages.rs"]
 mod migration_0140_private_key_packages;
 #[path = "migrations/0141_sonar_stickers.rs"]
 mod migration_0141_sonar_stickers;
 #[path = "migrations/0142_sticker_asset_history.rs"]
 mod migration_0142_sticker_asset_history;
+#[path = "migrations/0144_announced_key_packages.rs"]
+mod migration_0144_announced_key_packages;
+#[path = "migrations/0146_device_removals.rs"]
+mod migration_0146_device_removals;
 #[path = "migrations/0160_sibling_welcomes.rs"]
 mod migration_0160_sibling_welcomes;
+#[path = "migrations/0161_small_state.rs"]
+mod migration_0161_small_state;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1132,6 +1142,18 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0136_recovery_conversion::apply,
     },
     Migration {
+        version: 137,
+        name: "0137_device_renames",
+        suspend_foreign_keys: &[],
+        apply: migration_0137_device_renames::apply,
+    },
+    Migration {
+        version: 138,
+        name: "0138_account_device_history_keys",
+        suspend_foreign_keys: &[],
+        apply: migration_0138_account_device_history_keys::apply,
+    },
+    Migration {
         version: 140,
         name: "0140_private_key_packages",
         suspend_foreign_keys: &[],
@@ -1150,10 +1172,28 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0142_sticker_asset_history::apply,
     },
     Migration {
+        version: 144,
+        name: "0144_announced_key_packages",
+        suspend_foreign_keys: &[],
+        apply: migration_0144_announced_key_packages::apply,
+    },
+    Migration {
+        version: 146,
+        name: "0146_device_removals",
+        suspend_foreign_keys: &[],
+        apply: migration_0146_device_removals::apply,
+    },
+    Migration {
         version: 160,
         name: "0160_sibling_welcomes",
         suspend_foreign_keys: &[],
         apply: migration_0160_sibling_welcomes::apply,
+    },
+    Migration {
+        version: 161,
+        name: "0161_small_state",
+        suspend_foreign_keys: &[],
+        apply: migration_0161_small_state::apply,
     },
 ];
 

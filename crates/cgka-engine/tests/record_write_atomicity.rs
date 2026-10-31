@@ -26,14 +26,14 @@ use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, PeeledContent, 
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePassStorage, ConvergencePolicyStorage, DeviceGroupWelcomeExpectation,
-    DeviceGroupWelcomeStorage, DisbandCandidate, DisbandCandidateStorage, DisbandRequest,
-    DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage,
-    KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MemberValidationCacheStorage,
-    MessageStorage, OpenMlsContentFilter, OutboundFanoutStorage, OutboundIntentStorage,
-    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
-    WelcomeStorage,
+    AccountDeviceHistoryKey, AccountDeviceHistoryKeyStorage, AccountDeviceSignerBinding,
+    AccountDeviceSignerStorage, CapabilityStorage, ConvergencePassStorage,
+    ConvergencePolicyStorage, DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage,
+    DisbandCandidate, DisbandCandidateStorage, DisbandRequest, DisbandRequestStorage,
+    DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage,
+    LeaveRequest, LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage,
+    OpenMlsContentFilter, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -766,6 +766,21 @@ impl AccountDeviceSignerStorage for FaultStorage {
     }
 }
 
+impl AccountDeviceHistoryKeyStorage for FaultStorage {
+    fn put_account_device_history_key_if_absent(
+        &self,
+        key: &AccountDeviceHistoryKey,
+    ) -> StorageResult<AccountDeviceHistoryKey> {
+        self.inner.put_account_device_history_key_if_absent(key)
+    }
+    fn account_device_history_key(
+        &self,
+        marmot_identity: &MemberId,
+    ) -> StorageResult<Option<AccountDeviceHistoryKey>> {
+        self.inner.account_device_history_key(marmot_identity)
+    }
+}
+
 impl DeviceGroupWelcomeStorage for FaultStorage {
     fn put_device_group_welcome_expectation(
         &self,
@@ -900,7 +915,7 @@ fn build_counted_fault_selfremove_client(
     fault: PutGroupFault,
     apply_snapshots: ApplySnapshotCounter,
 ) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let engine = EngineBuilder::new(FaultStorage {
         inner,
@@ -992,7 +1007,7 @@ async fn next_routed_commit(
 #[tokio::test]
 async fn a_failed_ring_insert_rolls_back_the_room_it_made() {
     let insert_fault = LeaveWriteFault::default();
-    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(b"ring-insert-alice"))
         .account_identity_proof_signer(proof_signer(b"ring-insert-alice"))
@@ -1126,7 +1141,7 @@ async fn a_failed_ring_insert_rolls_back_the_room_it_made() {
 #[tokio::test]
 async fn a_failed_ring_eviction_drops_the_new_message_and_keeps_the_bound() {
     let release_fault = LeaveWriteFault::default();
-    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(b"ring-evict-alice"))
         .account_identity_proof_signer(proof_signer(b"ring-evict-alice"))
@@ -1371,7 +1386,7 @@ fn build_release_fault_client(
     release_fault: LeaveWriteFault,
     insert_fault: LeaveWriteFault,
 ) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let engine = EngineBuilder::new(FaultStorage {
         inner,
@@ -1401,7 +1416,7 @@ fn build_leave_write_fault_client(
     leave_write_fault: LeaveWriteFault,
     peeler: Box<dyn TransportPeeler>,
 ) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let engine = EngineBuilder::new(FaultStorage {
         inner,
@@ -1441,7 +1456,10 @@ fn build_selfremove_client_on_storage(
 }
 
 fn build_selfremove_client(identity: &[u8]) -> cgka_engine::Engine<SqliteAccountStorage> {
-    build_selfremove_client_on_storage(identity, SqliteAccountStorage::in_memory().unwrap())
+    build_selfremove_client_on_storage(
+        identity,
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    )
 }
 
 async fn setup_leave_fault_case(
@@ -2071,7 +2089,7 @@ fn sqlite_reorg_side(
     cgka_engine::Engine<SqliteAccountStorage>,
     SqliteAccountStorage,
 ) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     (
         build_selfremove_client_on_storage(id, storage.clone()),
         storage,
@@ -2509,7 +2527,7 @@ async fn slow_preparation_case(
     PreparationDelay,
 ) {
     let delay = PreparationDelay::default();
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut bob = EngineBuilder::new(FaultStorage {
         inner: storage.clone(),
         fault: PutGroupFault::default(),
@@ -2582,7 +2600,7 @@ async fn past_peel_backlog_case(
     RetainedAnchorRewindCounter,
 ) {
     let rewinds = RetainedAnchorRewindCounter::default();
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = storage.clone();
     let mut bob = EngineBuilder::new(FaultStorage {
         inner: storage,
@@ -2944,7 +2962,7 @@ async fn setup_own_intent_fault_case(
     SqliteAccountStorage,
     GroupId,
 ) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut engine = EngineBuilder::new(FaultStorage {
         inner: storage.clone(),
         fault: PutGroupFault::default(),
@@ -3217,7 +3235,7 @@ fn opaque_row(label: &[u8], group_id: &GroupId) -> TransportMessage {
 #[cfg(feature = "test-policy-overrides")]
 async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pass() {
     let failed_state_fault = FailedStateWriteFault::default();
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let mut carol = EngineBuilder::new(FaultStorage {
         inner,
@@ -3399,7 +3417,7 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
 async fn eviction_realization_retries_all_cleanup_before_announcing_termination() {
     for (queued_count, fault_write) in [(1, 1), (1, 2), (0, 1)] {
         let termination_fault = LeaveWriteFault::default();
-        let inner = SqliteAccountStorage::in_memory().unwrap();
+        let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
         let handle = inner.clone();
         let mut bob = EngineBuilder::new(FaultStorage {
             inner,
@@ -3572,7 +3590,7 @@ async fn assert_convergence_membership_fault(
 ) {
     let termination_fault = LeaveWriteFault::default();
     let post_commit_disband_read_fault = LeaveWriteFault::default();
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let mut bob = EngineBuilder::new(FaultStorage {
         inner,
@@ -3753,7 +3771,7 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
     use cgka_traits::group::ProtocolProfile;
 
     let clock = ManualConvergenceClock::new(0, 10_000);
-    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(pad32(b"alice-disband-cleanup"))
         .account_identity_proof_signer(proof_signer(b"alice-disband-cleanup"))
         .protocol_profile(ProtocolProfile::Current)
@@ -3762,7 +3780,7 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
         .build()
         .unwrap();
     let termination_fault = LeaveWriteFault::default();
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let mut bob = EngineBuilder::new(FaultStorage {
         inner,

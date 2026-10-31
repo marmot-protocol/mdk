@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use marmot_forensics::local_delivery::{DeliveryStep, LocalAuditDelivery, Preparation};
 
-use crate::audit_otlp_sender::{AuditOtlpSendResult, AuditOtlpSender};
 use crate::{AppError, MarmotApp};
+use marmot_observability::{AuditOtlpSendResult, AuditOtlpSender};
 
 use super::{MarmotAppRuntime, RuntimeLifecycle, blocking_app_task};
 
@@ -76,13 +76,13 @@ pub(crate) async fn send_audit_otlp_once_for_app(
         }
         app.audit_export_lifecycle.reserve(
             &account.account_id_hex,
-            crate::wiring::audit_destination(sender),
+            marmot_observability::wiring::audit_destination(sender),
             &directory,
         )
     } else {
         app.audit_export_lifecycle.reserve(
             &account.account_id_hex,
-            crate::wiring::audit_destination(sender),
+            marmot_observability::wiring::audit_destination(sender),
             &directory,
         )
     };

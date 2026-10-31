@@ -7,11 +7,11 @@
 //! state lock inside each step.
 
 use crate::conversions::usage_diagnostics_settings_from_storage;
-use crate::wiring::{self, ReceiptRevisions};
 use crate::{
     AppError, DiagnosticsPermit, MarmotApp, ProductAnalyticsError, ProductAnalyticsMetadata,
     ProductAnalyticsRuntimeConfig, UsageDiagnosticsDecision, UsageDiagnosticsSettings,
 };
+use marmot_observability::wiring::{self, ReceiptRevisions};
 
 impl MarmotApp {
     /// Opaque, revocable grant for direct diagnostic exporter integrations.
@@ -173,7 +173,7 @@ mod tests {
                 "MARMOT_PRODUCT_ANALYTICS_ENVIRONMENT" => Some(environment.into()),
                 _ => None,
             });
-            assert!(crate::observer::permit_valid(&permit));
+            assert!(marmot_observability::permit_valid(&permit));
             assert_eq!(runtime.stored_usage_diagnostics_settings().unwrap(), before);
             assert!(!app.product_analytics.config_ready());
         }

@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn every_guard_snapshot_is_classified_by_the_recovery_set() {
-        let storage = SqliteAccountStorage::in_memory().expect("storage");
+        let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
         let group_id = GroupId::new(vec![9; 16]);
         storage
             .put_group(&group(&group_id, 4, "live"))
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn group_state_guard_does_not_rewrite_live_message_or_queue_rows() {
-        let storage = SqliteAccountStorage::in_memory().expect("storage");
+        let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
         let group_id = GroupId::new(vec![7; 16]);
         let live_group = group(&group_id, 3, "live");
         let original_message = message(&group_id, 1, 2);

@@ -17,7 +17,6 @@ use super::{
     local_account_worker_response, long_account_worker_catch_up_response,
     long_account_worker_response, publish_app_runtime_group_state_updated,
 };
-use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
 use crate::{
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
@@ -29,6 +28,7 @@ use crate::{
     PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
     PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
 };
+use marmot_observability::AppPerformanceOperation;
 
 impl AccountManager {
     #[cfg(test)]
@@ -1068,6 +1068,51 @@ impl AccountManager {
         local_account_worker_response(response).await
     }
 
+    pub async fn unrecognized_sign_ins(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::UnrecognizedSignIns { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn answer_sign_in(
+        &self,
+        account_ref: &str,
+        slot_id_hex: &str,
+        response: crate::SignInResponse,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, receiver) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AnswerSignIn {
+                slot_id_hex: slot_id_hex.to_owned(),
+                response,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(receiver).await
+    }
+
+    pub async fn check_sign_ins(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CheckSignIns { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn rename_linked_device(
         &self,
         account_ref: &str,
@@ -1085,6 +1130,33 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await
+    }
+
+    pub async fn remove_linked_device(
+        &self,
+        account_ref: &str,
+        slot_id_hex: String,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RemoveLinkedDevice {
+                slot_id_hex,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn removed_device_leftover_chats(&self, account_ref: &str) -> Result<u32, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RemovedDeviceLeftoverChats { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
     }
 
     pub async fn acknowledge_group_catching_up(

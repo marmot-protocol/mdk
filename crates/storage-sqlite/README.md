@@ -67,6 +67,16 @@ Default connection settings are privacy/durability oriented:
 Override with `open_encrypted_with_options` or `in_memory_with_options`. There is no first-class key rotation: create a
 new encrypted database, migrate data, and replace the old file.
 
+Tests can opt out of two defaults, because memory security turns every SQLite allocation into system calls and a full
+fsync per commit adds disk waits. Together they made up most of the workspace test lane's run time. Both helpers exist
+only in this crate's own tests or with the `test-support` feature, and do nothing until a test calls them:
+
+- `in_memory_for_test()` opens an in-memory store without `cipher_memory_security`. This crate's own unit tests get it
+  from `in_memory()`; dependents call it explicitly.
+- After a test process calls `relax_storage_for_test_process()`, every database it opens skips
+  `cipher_memory_security` and uses `synchronous=NORMAL`. `marmot-app`'s constructors call it in its unit tests. The
+  tests that pin the production settings never call it.
+
 Long-lived connections are closeable so a host can release file locks before suspending; closing is terminal and
 surviving clones return `StorageError::Closed`.
 
@@ -177,6 +187,11 @@ targets always read the tail). `conversation_account_snapshot` captures that win
 inputs, draft descriptors, and persisted controls in one deferred read. `StorageProvider::with_read_snapshot` composes
 public storage calls under one deferred transaction, enforcing and restoring SQLite query-only mode even when nested.
 See the [opening contract](../../docs/marmot-architecture/further-context/conversation-opening.md).
+
+A sibling's read position (small state, mdk#2628 item 4.3) advances the read marker as a local read does, but keeps a
+manual-unread reminder. It may name a message this device does not hold yet: unread counts compare canonical order
+keys, not ids. The position this device sends is the furthest delivered message, other than an edit, at or before its
+read marker, so a marker on a synthesized group system row or an undelivered send still has one.
 
 Selected composer reads and revision-checked mutations share the encrypted draft tables; migration 0073 tracks legacy
 writes too, and queued/fanout acceptance clears only its submitted revision atomically. See the

@@ -15,7 +15,7 @@ use marmot_forensics::v5::{
 
 use super::AppClient;
 use crate::AppError;
-use crate::app_telemetry::SyncErrorClass;
+use marmot_observability::SyncErrorClass;
 
 fn elapsed_ms(elapsed: Duration) -> marmot_forensics::v5::U64String {
     u64::try_from(elapsed.as_millis())

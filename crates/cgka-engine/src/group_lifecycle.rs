@@ -175,6 +175,24 @@ pub(crate) enum WelcomeRoute {
     Sibling(SiblingWelcomeRoute),
 }
 
+/// Whether a delivery of a Welcome this device already joined names a
+/// KeyPackage publication this device never held. One Welcome reaches every
+/// device it adds, each in its own delivery of the same content, so once this
+/// device joined through its own, a sibling's lands on the content dedup
+/// marker. It is still not addressed to this device (mdk#2628 3.2). Without
+/// a claim or a lifecycle record, it stays a duplicate.
+pub(crate) fn joined_welcome_names_another_key_package(
+    lifecycle: Option<&KeyPackageLifecycleState>,
+    claimed: Option<&MessageId>,
+) -> bool {
+    match (lifecycle, claimed) {
+        (Some(lifecycle), Some(claimed)) => !lifecycle
+            .held_publications()
+            .any(|(held, _)| held == claimed),
+        _ => false,
+    }
+}
+
 pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
     matches!(
         error,
@@ -865,6 +883,12 @@ impl<S: StorageProvider> Engine<S> {
                         canonical_record.members = marmot_members(&mls_group);
                         storage.put_group(&canonical_record)?;
                         persist_new_group_maintenance(storage, &group_id, enrolled_at, None, None)?;
+                        crate::announced_key_packages::record_roster_announcements(
+                            storage,
+                            &group_id,
+                            &mls_group,
+                            enrolled_at,
+                        )?;
 
                         for (welcome, parsed_kp) in welcomes.iter().zip(&parsed_kps) {
                             let payload = StoredMessagePayload::outbound_welcome(
@@ -1487,8 +1511,18 @@ impl<S: StorageProvider> Engine<S> {
                 return Err(EngineError::InvalidWelcome);
             }
 
+            // A forgotten group takes only a Welcome its author dated after
+            // the forget. A device link's Welcome is held to its link
+            // instead (5f): the existing device's leaf key and the
+            // KeyPackage the link confirmed, which is never one the device
+            // joined by, so the Welcome that installed the discarded copy
+            // stays out and the two devices' clocks never decide a link.
             let reset_cutoff = storage.group_local_reset_cutoff(&group_id)?;
-            if let Some(cutoff) = reset_cutoff
+            let awaited_by_a_link = storage
+                .device_group_welcome_expectation(&group_id)?
+                .is_some_and(|expected| expected.key_package_ref == consumed_key_package_ref);
+            let dated_reset = reset_cutoff.filter(|_| !awaited_by_a_link);
+            if let Some(cutoff) = dated_reset
                 && welcome_created_at.is_none_or(|created_at| created_at <= cutoff)
             {
                 return Err(EngineError::InvalidWelcome);
@@ -1584,7 +1618,7 @@ impl<S: StorageProvider> Engine<S> {
             // Bind the timestamp's authenticated author to the MLS inviter;
             // an unrelated sender rewrapping old Welcome bytes cannot make
             // those bytes a fresh invitation across a reset boundary.
-            if reset_cutoff.is_some() && peeled.sender.as_ref() != Some(&welcome_sender_id) {
+            if dated_reset.is_some() && peeled.sender.as_ref() != Some(&welcome_sender_id) {
                 return Err(EngineError::InvalidWelcome);
             }
             let mls_group = staged
@@ -1768,6 +1802,9 @@ impl<S: StorageProvider> Engine<S> {
                 storage.complete_group_local_reset(&group_id)?;
             }
             storage.put_group(&group_record)?;
+            crate::announced_key_packages::record_roster_announcements(
+                storage, &group_id, &mls_group, joined_at,
+            )?;
             if local_state_is_stale {
                 if consent.is_some() {
                     // Explicitly discarding a fork also discards its rewind
@@ -2560,6 +2597,34 @@ mod tests {
         assert!(matches!(
             decide(None, None),
             Err(EngineError::MissingWelcomeKeyPackage)
+        ));
+    }
+
+    #[test]
+    fn a_joined_welcome_delivered_for_another_key_package_is_not_a_duplicate() {
+        let id = |byte| MessageId::new(vec![byte; 32]);
+        let mut lifecycle = KeyPackageLifecycleState::slot_only("slot".into());
+        lifecycle.current_key_package_ref = Some(vec![1]);
+        lifecycle.authored_event_id = Some(id(1));
+
+        // A sibling's or unknown delivery names a publication never held.
+        assert!(joined_welcome_names_another_key_package(
+            Some(&lifecycle),
+            Some(&id(2))
+        ));
+        // This device's own delivery again is a duplicate.
+        assert!(!joined_welcome_names_another_key_package(
+            Some(&lifecycle),
+            Some(&id(1))
+        ));
+        // So is any delivery it cannot tell apart.
+        assert!(!joined_welcome_names_another_key_package(
+            Some(&lifecycle),
+            None
+        ));
+        assert!(!joined_welcome_names_another_key_package(
+            None,
+            Some(&id(2))
         ));
     }
 }

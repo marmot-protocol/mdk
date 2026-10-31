@@ -74,7 +74,9 @@ mod device_tag_key;
 mod own_slot;
 pub use own_slot::{ForeignSlotOutcome, ForeignSlotPublication};
 mod private_key_packages;
+mod removed_device_slot;
 mod removed_slot_expiry;
+mod sign_in_rejection;
 mod slot_announcement;
 mod welcome_delivery;
 
@@ -801,6 +803,18 @@ where
             .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
     }
 
+    /// This account's other leaves in `group_id`, by signature key, with the
+    /// roster slot each one's device tag reads as against the device group's
+    /// current `roster`. See
+    /// [`cgka_engine::engine::Engine::own_account_leaf_claims`].
+    pub fn own_account_leaf_claims(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> AccountResult<Vec<(Vec<u8>, DeviceTagClaim)>> {
+        Ok(self.session.own_account_leaf_claims(group_id, roster)?)
+    }
+
     pub fn app_component(
         &self,
         group_id: &GroupId,
@@ -899,6 +913,32 @@ where
         expectation: &DeviceGroupWelcomeExpectation,
     ) -> SessionResult<()> {
         Ok(self.session.expect_device_group_welcome(expectation)?)
+    }
+
+    /// The public half of this device's history key (mdk#2628 4.1),
+    /// generated and stored on first use. This device's own roster entry
+    /// carries it; see [`cgka_engine::engine::Engine::history_public_key`].
+    pub fn history_public_key(&self) -> SessionResult<Vec<u8>> {
+        self.session.history_public_key()
+    }
+
+    /// `plaintext` sealed to a sibling's history key, as its roster entry
+    /// holds it, for `context`; `None` when that key is not one this device
+    /// can seal to. See [`cgka_engine::history_key`].
+    pub fn seal_history(
+        &self,
+        recipient_public_key: &[u8],
+        context: &[u8],
+        plaintext: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.session
+            .seal_history(recipient_public_key, context, plaintext)
+    }
+
+    /// `sealed` opened with this device's history key for `context`;
+    /// `None` when it does not open or this device has no history key yet.
+    pub fn open_history(&self, context: &[u8], sealed: &[u8]) -> SessionResult<Option<Vec<u8>>> {
+        self.session.open_history(context, sealed)
     }
 
     /// See `CgkaEngine::withdraw_device_group_welcome`.

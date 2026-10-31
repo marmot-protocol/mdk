@@ -1,6 +1,6 @@
 //! Collector fixtures for the product collector's own tests and for `marmot-app`'s (#2627).
-//! Gated `cfg(any(test, feature = "test-support"))`; `marmot-app`'s tests reach them through
-//! [`crate::observability_test_support`].
+//! Gated `cfg(any(test, feature = "test-support"))`; `marmot-app`'s tests reach them through the
+//! crate root's gated re-exports.
 
 use super::*;
 

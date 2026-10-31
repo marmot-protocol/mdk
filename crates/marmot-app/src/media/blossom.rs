@@ -19,9 +19,9 @@ use super::host_safety::{
     is_loopback_host, parse_profile_image_fetch_url, parse_profile_image_redirect_url,
     reject_non_public_ip, validate_blossom_fetch_url,
 };
-use crate::app_telemetry::AppPerformanceOperation;
-use crate::observer::PerformanceRecorder;
 use crate::{AppError, unix_now_seconds};
+use marmot_observability::AppPerformanceOperation;
+use marmot_observability::PerformanceRecorder;
 
 #[cfg(test)]
 use cgka_traits::app_components::ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN;

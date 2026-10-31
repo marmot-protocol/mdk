@@ -5,9 +5,9 @@
 //! Device entries have one write path (3.4, 3.6, 3.1d):
 //! [`AccountDeviceRuntime::edit_device_roster_entry`], a commit that replaces
 //! one entry. Slot announcements, the tag signature key and the host's device
-//! edits all use it. Rejected-slot records (3.1d's expiry) go through
-//! [`AccountDeviceRuntime::send_device_roster_update`] and never touch a
-//! device entry.
+//! edits all use it. Rejected-slot records (3.1d's expiry and 3.2's sign-in
+//! rejections) go through [`AccountDeviceRuntime::send_device_roster_update`]
+//! and never touch a device entry.
 //!
 //! `SetDevice` replaces an entry whole, so a commit computed from an older
 //! read would put back whatever a sibling or an earlier commit of this device
@@ -21,7 +21,8 @@
 //! caller retries or reports it.
 //!
 //! A device keeps its own entry's `client` and `platform` current itself
-//! ([`DeviceSelfReport`]); each announcement of its KeyPackage writes them.
+//! ([`DeviceSelfReport`]), and its `history_key` (4.1, generated on first
+//! use); each announcement of its KeyPackage writes them.
 
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
@@ -31,7 +32,9 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::SendIntent;
 use cgka_traits::{EngineError, EpochState, FanoutMlsState, GroupId, TransportAdapter};
 
-use super::{AccountDeviceEffects, AccountDeviceRuntime};
+use marmot_forensics::AuditEventContext;
+
+use super::{AccountDeviceEffects, AccountDeviceRuntime, TRACE_TARGET};
 use crate::error::{AccountError, AccountResult};
 use crate::key_package::KeyPackagePublisher;
 use crate::routing::TransportRoutingPolicy;
@@ -147,10 +150,29 @@ where
         )))
     }
 
+    /// The public half of this device's history key, for its own roster
+    /// entry, or `None` when it cannot be read or stored now. A history key
+    /// never holds back the roster edit it rides on; a later edit of this
+    /// device's own entry writes it.
+    pub(super) fn own_history_key(&self, method: &'static str) -> Option<Vec<u8>> {
+        self.session
+            .history_public_key()
+            .inspect_err(|_| {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = method,
+                    error_kind = "history_key",
+                    "could not read this device's history key; a later roster edit writes it"
+                );
+            })
+            .ok()
+    }
+
     /// Whether this device may commit in the device group `group_id` now:
     /// it is stable and not held, quarantined or settling, and nothing of
-    /// this device's is queued or unconfirmed there.
-    pub(super) fn device_group_takes_commit(
+    /// this device's is queued or unconfirmed there. Every commit this device
+    /// made there has then reached its outcome.
+    pub fn device_group_takes_commit(
         &mut self,
         group_id: &GroupId,
         held: &[GroupId],
@@ -199,13 +221,15 @@ where
     }
 
     /// Commit rejected-slot `operations` to `group_id`'s roster as one
-    /// update. The returned effects carry the commit. A device entry is
-    /// never written here: [`Self::edit_device_roster_entry`] replaces one
-    /// only while it is still the entry it read.
+    /// update, audited with `context` when the host gives one. The returned
+    /// effects carry the commit. A device entry is never written here:
+    /// [`Self::edit_device_roster_entry`] replaces one only while it is still
+    /// the entry it read.
     pub(super) async fn send_device_roster_update(
         &mut self,
         group_id: GroupId,
         operations: Vec<DeviceRosterOperationV1>,
+        context: Option<AuditEventContext>,
     ) -> AccountResult<AccountDeviceEffects> {
         debug_assert!(operations.iter().all(|operation| matches!(
             operation,
@@ -215,13 +239,16 @@ where
         let update = DeviceRosterUpdateV1::new(operations)
             .and_then(|update| encode_device_roster_update_v1(&update))
             .map_err(|error| AccountError::Engine(cgka_traits::EngineError::Serialize(error)))?;
-        self.send(SendIntent::UpdateAppComponents {
+        let intent = SendIntent::UpdateAppComponents {
             group_id,
             updates: vec![AppComponentData {
                 component_id: DEVICE_ROSTER_COMPONENT_ID,
                 data: update,
             }],
-        })
-        .await
+        };
+        match context {
+            Some(context) => self.send_with_audit_context(intent, context).await,
+            None => self.send(intent).await,
+        }
     }
 }

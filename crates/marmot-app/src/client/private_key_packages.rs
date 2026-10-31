@@ -642,9 +642,8 @@ impl AppClient {
     }
 
     /// Discard everything exchanged with `sibling` (3.6): the KeyPackages
-    /// issued to it, keys included, and those it handed over.
-    // 3.5 and 3.6 call this; until then only tests do.
-    #[cfg_attr(not(all(test, feature = "test-policy-overrides")), allow(dead_code))]
+    /// issued to it, keys included, and those it handed over. Removing a
+    /// device (`device_removal`) calls this for each `removed` slot.
     pub(crate) fn discard_private_key_packages_of(
         &mut self,
         sibling: &DeviceSlotId,

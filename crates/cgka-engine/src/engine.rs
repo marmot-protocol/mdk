@@ -3826,6 +3826,42 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    /// Every other leaf of this device's account in `group_id`'s current
+    /// tree, as its signature key (the [`Member::credential`] bytes) and the
+    /// roster slot its device tag reads as against `roster`, the device
+    /// group's current roster (device-tag-v1.md, "Reading tags"). This
+    /// device's own leaf is left out. A removed device's leaves read as
+    /// [`DeviceTagClaim::RejectedSlot`] while the roster keeps its `removed`
+    /// record (mdk#2628 3.6b).
+    ///
+    /// [`Member::credential`]: cgka_traits::group::Member
+    pub fn own_account_leaf_claims(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> Result<Vec<(Vec<u8>, DeviceTagClaim)>, EngineError> {
+        self.with_live_mls_group(group_id, |mls_group| {
+            let own_leaf = mls_group.own_leaf_index();
+            Ok(mls_group
+                .members()
+                .filter(|member| {
+                    member.index != own_leaf
+                        && openmls::prelude::BasicCredential::try_from(member.credential.clone())
+                            .is_ok_and(|credential| {
+                                credential.identity() == self.identity.self_id().as_slice()
+                            })
+                })
+                .filter_map(|member| {
+                    let leaf = mls_group.public_group().leaf(member.index)?;
+                    Some((
+                        member.signature_key,
+                        crate::device_tag::device_tag_claim(leaf, roster),
+                    ))
+                })
+                .collect())
+        })
+    }
+
     /// Return the current Marmot admin policy keys mirrored from signed MLS
     /// group state.
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> Result<Vec<[u8; 32]>, EngineError> {

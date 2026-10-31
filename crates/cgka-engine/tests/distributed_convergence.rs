@@ -276,7 +276,7 @@ fn selfremove_registry() -> FeatureRegistry {
 }
 
 fn build_client(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = build_client_with_storage(id, storage.clone());
     (engine, storage)
 }
@@ -285,7 +285,7 @@ fn build_epoch_gate_client(
     id: &[u8],
     clock: Option<ManualConvergenceClock>,
 ) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut builder = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -905,8 +905,8 @@ async fn advance_scheduled_group(
 #[tokio::test]
 async fn live_own_chain_recovers() {
     let clock = ManualConvergenceClock::new(1_000, 10_000);
-    let alice_storage = SqliteAccountStorage::in_memory().unwrap();
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_client_with_storage_and_clock(b"alice", alice_storage, clock.clone());
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -5438,7 +5438,7 @@ async fn a_settled_convergence_pass_leaves_no_unscheduled_retained_intent() {
     // had not settled yet — must not leave the projection claiming the group is
     // idle while a user's message is still durable and unsent.
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -5609,15 +5609,15 @@ async fn a_completed_pass_rearms_the_drain_for_intents_queued_inside_the_window(
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut alice = build_client_with_storage_and_clock(
         b"alice",
-        SqliteAccountStorage::in_memory().unwrap(),
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
         clock.clone(),
     );
     let mut bob = build_client_with_storage_and_clock(
         b"bob",
-        SqliteAccountStorage::in_memory().unwrap(),
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
         clock.clone(),
     );
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
 
@@ -7385,7 +7385,7 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
 #[tokio::test]
 async fn collecting_pass_restart_preserves_remaining_window_and_backward_clock_fails_closed() {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -7467,7 +7467,7 @@ async fn collecting_pass_restart_preserves_remaining_window_and_backward_clock_f
 #[tokio::test]
 async fn conformance_progress_uses_the_schedulers_effective_policy_deadline() {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -7570,7 +7570,7 @@ async fn conformance_progress_uses_the_schedulers_effective_policy_deadline() {
 async fn rebuilt_engine_parks_losing_branch_app_for_revival_after_convergence() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -7927,7 +7927,7 @@ async fn stale_unconsumed_proposal_does_not_poison_later_candidate_paths() {
 async fn engine_duplicate_convergence_input_does_not_reset_quiescence() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -8220,7 +8220,7 @@ async fn far_future_app_is_not_admitted_to_an_active_pass() {
 #[tokio::test]
 async fn convergence_pass_freezes_at_absolute_cap_under_continuous_selection_input() {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -8463,7 +8463,7 @@ async fn buffered_convergence_pass_fixture(group_name: &str) -> BufferedPassFixt
     let audit_path = audit_dir.path().join("audit.jsonl");
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut david, _david_storage) = build_client(b"david");
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut carol = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(b"carol"))
@@ -9620,7 +9620,7 @@ async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue()
 #[tokio::test]
 async fn send_preflight_terminally_retires_deferred_app_message_outside_past_epoch_window() {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut bob = build_client_with_max_past_epochs(b"bob", bob_storage.clone(), 1);
 
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -10159,7 +10159,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
 async fn queued_outbound_intent_survives_engine_rebuild() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -10510,7 +10510,7 @@ async fn convergence_emits_run_state_and_decision_with_run_id_context() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("audit.jsonl");
     let recorder = JsonlRecorder::open(&path, "test-engine-conv".to_string()).unwrap();
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = EngineBuilder::new(storage)
         .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
@@ -10582,7 +10582,7 @@ async fn convergence_emits_run_state_and_decision_with_run_id_context() {
 
 async fn ingest_app_and_read_audit(path: &std::path::Path) -> Vec<marmot_forensics::AuditEvent> {
     // Receiver (bob) records; sender (alice) does not need a recorder.
-    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let bob_recorder = marmot_forensics::JsonlRecorder::open(path, "bob-engine".into()).unwrap();
     let mut bob = EngineBuilder::new(bob_storage)
         .legacy_compatibility_profile()

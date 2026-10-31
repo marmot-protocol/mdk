@@ -12,6 +12,7 @@ mod cross;
 pub mod media_store_bench;
 mod protocol;
 
+pub use app::device_renames::DeviceRenameRecord;
 pub use app::group_system::{
     GroupSystemEventProjection, GroupSystemEventProvenance, group_system_event_from_message,
 };
@@ -86,7 +87,9 @@ pub use app::chat_list::{
     ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListQuery,
     ChatListRow, ChatListSelectionError, ChatListSelectionSnapshot, ChatListView,
     ChatListWindowQuery, ChatListWindowRead, ChatPinError, ChatPinState,
-    ExistingDirectConversation, RetentionExpiryScan, conversation_kind,
+    ExistingDirectConversation, MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition,
+    RetentionExpiryScan, SmallStateBroadcast, SmallStateItem, SmallStateItemName, SmallStateRule,
+    SmallStateSchedule, SmallStateSync, SmallStateValue, SmallStateVersion, conversation_kind,
     select_reusable_direct_conversation,
 };
 pub use app::chat_presentation::{
@@ -99,6 +102,7 @@ pub use app::chat_presentation::{
 };
 pub use app::device_groups::{DeviceGroupRecord, DeviceGroupTrust};
 pub use app::device_links::{DeviceLinkOutcome, DeviceLinkRecord};
+pub use app::device_removals::DeviceRemovalRecord;
 pub use app::message_drafts::{
     ChatListDraftVersion, MessageDraftRevision, MessageDraftRevisionError, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent, StoredMessageDraft,
@@ -148,6 +152,8 @@ pub use app::transport::transport_reconciliation::{
     TRANSPORT_RECONCILIATION_MAX_ITEMS_PER_ROUTE, TRANSPORT_RECONCILIATION_RETENTION_SECS,
     TransportReconciliationInventory, TransportReconciliationItem, TransportReconciliationRoute,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use base::connection::relax_storage_for_test_process;
 pub use base::connection::{
     CloseableConnection, ConnectionGuard, DatabaseCloser, SqlCipherHardening, SqlCipherKey,
     SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, SqliteTimingObserver,

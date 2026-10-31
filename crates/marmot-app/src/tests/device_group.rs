@@ -16,11 +16,13 @@ use cgka_traits::app_components::{
     RejectedSlotV1, decode_device_roster_v1, encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
+use marmot_session::DeviceRosterEdit;
 use storage_sqlite::DeviceGroupTrust;
 
 mod chat_kinds;
 mod devices;
 mod private_key_packages;
+mod removal;
 
 fn device_group_app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
     MarmotApp::with_relay_and_config(
@@ -36,17 +38,17 @@ fn device_group_app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClie
 
 /// Alice's phone and laptop, each with a published KeyPackage, and the link
 /// confirming the laptop's under `device_group_id`.
-struct Devices {
-    _dirs: [tempfile::TempDir; 2],
-    relay: Arc<ScriptedPushRelayClient>,
-    phone_app: MarmotApp,
-    laptop_app: MarmotApp,
-    phone: AppClient,
-    laptop: AppClient,
-    link: ConfirmedDeviceLink,
+pub(super) struct Devices {
+    pub(super) _dirs: [tempfile::TempDir; 2],
+    pub(super) relay: Arc<ScriptedPushRelayClient>,
+    pub(super) phone_app: MarmotApp,
+    pub(super) laptop_app: MarmotApp,
+    pub(super) phone: AppClient,
+    pub(super) laptop: AppClient,
+    pub(super) link: ConfirmedDeviceLink,
 }
 
-async fn phone_and_laptop() -> Devices {
+pub(super) async fn phone_and_laptop() -> Devices {
     let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
     let home = AccountHome::open(dirs[0].path());
     let alice_id = home.create_account("alice").unwrap().account_id_hex;
@@ -999,7 +1001,7 @@ async fn the_host_never_learns_of_the_device_group() {
     assert_eq!(quarantined, vec![chat_hex]);
 }
 
-fn stable_slot(app: &MarmotApp) -> String {
+pub(super) fn stable_slot(app: &MarmotApp) -> String {
     app.account_storage("alice")
         .unwrap()
         .key_package_lifecycle()
@@ -1056,6 +1058,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         add_to_all_chats: true,
         bring_history: true,
         keep_while_inactive: false,
+        removal_pending: false,
     };
     // The dev hook links the new device with both settings off.
     let new_device = |this| LinkedDevice {
@@ -1076,6 +1079,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
     let phone_slot_bytes: [u8; 32] = hex::decode(&phone_slot).unwrap().try_into().unwrap();
     let entry = |label: &str, linked_at, status, settings| DeviceEntryV1 {
         label: label.into(),
+        rename_id: Some([6; 16]),
         client: format!("{label} client"),
         platform: format!("{label} platform"),
         linked_at,
@@ -1149,6 +1153,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         add_to_all_chats: true,
         bring_history: true,
         keep_while_inactive: false,
+        removal_pending: false,
     };
     let desk = LinkedDevice {
         slot_id_hex: "08".repeat(32),
@@ -1160,6 +1165,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         add_to_all_chats: false,
         bring_history: true,
         keep_while_inactive: true,
+        removal_pending: false,
         ..tablet.clone()
     };
     assert_eq!(
@@ -1485,7 +1491,7 @@ async fn settled_linked_devices() -> (Devices, GroupId) {
     (devices, group)
 }
 
-async fn deliver_all(client: &mut AppClient, relay: &ScriptedPushRelayClient) {
+pub(super) async fn deliver_all(client: &mut AppClient, relay: &ScriptedPushRelayClient) {
     let mut cursor = 0;
     deliver_new(client, relay, &mut cursor).await;
     client.sync().await.unwrap();
@@ -1512,6 +1518,12 @@ async fn linked_devices() -> (Devices, GroupId) {
         trust(&devices.laptop_app, &group),
         Some(DeviceGroupTrust::Linked)
     );
+    // Each device starts small state (mdk#2628 4.3a), sending the broadcast
+    // request it owes at start, so a test's first maintenance pass publishes
+    // only what that test is about.
+    for client in [&mut devices.phone, &mut devices.laptop] {
+        client.drive_small_state().await;
+    }
     (devices, group)
 }
 
@@ -1956,6 +1968,104 @@ async fn each_device_tags_from_the_device_group_it_trusts() {
         key_package_claim(&phone, &roster(&phone, &group)),
         DeviceTagClaim::Device(phone_slot)
     );
+}
+
+/// Each device's own roster entry carries its history key (mdk#2628 4.1),
+/// with no commit of its own: the founder's founding entry, and the new
+/// device's first commit, which sets its tag signature key. A sibling seals
+/// to the key the roster holds, and only that device opens it. A device whose
+/// entry lost the key writes it again with its next announcement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_device_keeps_its_history_key_in_its_own_entry() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let (phone_slot, laptop_slot) = (slot_of(&phone), slot_of(&laptop));
+    let phone_key = phone.runtime.history_public_key().unwrap();
+    let laptop_key = laptop.runtime.history_public_key().unwrap();
+    assert_ne!(phone_key, laptop_key);
+    let founding = roster(&laptop, &group);
+    assert_eq!(
+        founding.devices[&phone_slot].history_key,
+        Some(phone_key.clone())
+    );
+    assert_eq!(founding.devices[&laptop_slot].history_key, None);
+
+    let mut phone_cursor = relay.published_events.lock().unwrap().len();
+    let since = phone_cursor;
+    laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        published_kinds(&relay, since),
+        vec![
+            transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE,
+            transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE,
+            30443
+        ],
+        "the history key rides on the tag-key commit"
+    );
+    deliver_new(&mut phone, &relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    for reader in [&phone, &laptop] {
+        let entry = &roster(reader, &group).devices[&laptop_slot];
+        assert_eq!(
+            entry.tag_signature_key,
+            Some(laptop.runtime.own_signature_key())
+        );
+        assert_eq!(entry.history_key, Some(laptop_key.clone()));
+    }
+
+    let context = b"history for the laptop";
+    let sealed = phone
+        .runtime
+        .seal_history(
+            roster(&phone, &group).devices[&laptop_slot]
+                .history_key
+                .as_deref()
+                .unwrap(),
+            context,
+            b"bundle",
+        )
+        .unwrap();
+    assert_eq!(
+        laptop.runtime.open_history(context, &sealed).unwrap(),
+        Some(b"bundle".to_vec())
+    );
+    assert_eq!(phone.runtime.open_history(context, &sealed).unwrap(), None);
+
+    // The phone clears the laptop's key; the laptop's next announcement
+    // writes it back.
+    let mut laptop_cursor = relay.published_events.lock().unwrap().len();
+    let cleared = phone
+        .runtime
+        .edit_device_roster_entry(&group, &laptop_slot, &[], |entry| {
+            entry.history_key = None;
+        })
+        .await
+        .unwrap();
+    assert!(matches!(cleared, DeviceRosterEdit::Committed(_)));
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    assert_eq!(
+        roster(&laptop, &group).devices[&laptop_slot].history_key,
+        None
+    );
+    let mut phone_cursor = relay.published_events.lock().unwrap().len();
+    laptop.run_due_maintenance().await.unwrap();
+    deliver_new(&mut phone, &relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    for reader in [&phone, &laptop] {
+        assert_eq!(
+            roster(reader, &group).devices[&laptop_slot].history_key,
+            Some(laptop_key.clone())
+        );
+    }
 }
 
 /// A KeyPackage staged while this device's tag signature key is due would go
