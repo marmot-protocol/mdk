@@ -1204,7 +1204,9 @@ history debt.
 the recovery-runner proofs. In the first, one relay endpoint never answers history while live traffic flows; the
 account must recover from the other endpoint, and attempts on the stalled one must thin out. In the second, 20,000
 owed events and a quiet group must finish exactly after a restart, with the runner asking no sweep window twice, and
-again after a reconnect.
+again after a reconnect. Two more wait for the switch-over and are ignored until it lands: a fence control (a counted
+group's live frames wait for its unproven range, a quiet group's do not) and the upgrade from the earlier owner's
+rows.
 Commands, limits, and remaining coverage gaps are in
 [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).
 

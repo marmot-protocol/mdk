@@ -724,3 +724,15 @@ async fn public_app_runner_stalled_relay_does_not_loop() {
 async fn public_app_runner_finishes_tens_of_thousands_of_owed_events() {
     recovery_runner_proofs::owed_history().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "fails until mdk#2660 PR 5g wires live fences (live_counts, enable_live_fences, fence_live_frames)"]
+async fn public_app_runner_fences_a_counted_group_and_not_a_quiet_one() {
+    recovery_runner_proofs::fence_control().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "fails until mdk#2660 PR 5g calls the upgrade conversion before the runner's first start"]
+async fn public_app_runner_owns_debt_after_the_upgrade_conversion() {
+    recovery_runner_proofs::upgrade().await;
+}

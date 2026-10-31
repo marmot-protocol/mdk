@@ -5,8 +5,10 @@
 //! one store and publish the production NIP-11 document.
 //!
 //! Until the gate flips (5g), the earlier recovery owner still runs beside
-//! the runner. Every bound here holds for both owners together, so it only
-//! tightens once the runner works alone.
+//! the runner. Wire bounds count both owners' requests; the runner's own
+//! bounds read its debug trace and the sweep requests only it sends. Two
+//! journeys can only hold once 5g wires live fences and the upgrade
+//! conversion, and are ignored until then: the fence control and the upgrade.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -49,11 +51,22 @@ const BURST_GAP_MS: u64 = 2_000;
 /// are only counted, never attributed.
 const RUNNER_SWEEP_LIMIT: u64 = 500;
 /// Runner attempts on the stalled relay in the loop's second half. 0.14.0
-/// made one about every 20 seconds, about 24 there.
+/// made one about every 30 seconds (a 10-second attempt, then the next about
+/// 20 seconds later), about 16 there.
 const LOOP_SECOND_HALF_ATTEMPTS: usize = 4;
 /// Runner attempts that asked a relay and ended without progress while the
 /// owed group drains from two healthy endpoints.
 const OWED_WASTED_ATTEMPTS: usize = 4;
+/// Messages inside the rebuild lookback (120 s) when bob restarts, so the
+/// counted group's live count is non-empty and under the 500-event clamp.
+const COUNTED_MESSAGES: usize = 30;
+/// History stays unanswered on both endpoints this long after the restart:
+/// well inside the 30-second replay deadline a fence holds for at most.
+const FENCE_STALL: Duration = Duration::from_secs(12);
+/// Owed before the upgrade, and how long the earlier owner works on it
+/// against stalled history.
+const UPGRADE_MESSAGES: usize = 2_000;
+const BEFORE_UPGRADE: Duration = Duration::from_secs(60);
 
 fn clients() -> Vec<String> {
     let named = ["alice", "bob"].into_iter().chain(SENDERS);
@@ -404,6 +417,13 @@ fn wasted(events: &[Value]) -> usize {
         .count()
 }
 
+/// Runner attempts that newly covered part of a unit's debt.
+fn advanced(events: &[Value]) -> usize {
+    let covered = |event: &&Value| event["newly_covered_seconds"].as_u64() > Some(0);
+    let advanced = events.iter().filter(|event| event["outcome"] == "advanced");
+    advanced.filter(covered).count()
+}
+
 /// The runner's attempts captured in `[from, to)` on the trace clock.
 fn trace_between(from: u64, to: u64) -> Vec<Value> {
     let events = runner_trace::since(from).into_iter();
@@ -551,16 +571,21 @@ async fn caught_up(bob: &AppRuntimeProbe) -> TestResult<bool> {
 
 /// Run a proof journey under the watchdog, save its report, close every
 /// runtime, and return the report or the journey's error.
-async fn run_proof<J>(label: &str, journey: J) -> Value
+/// Run `journey` with bob in this process, his recovery runner owning debt
+/// from the start or, without `owning_debt`, only once the journey turns it on.
+async fn run_proof<J>(label: &str, owning_debt: bool, journey: J) -> Value
 where
     J: AsyncFnOnce(&mut AppRuntimeHarness, &Path) -> TestResult<Value>,
 {
     let artifacts = journey_artifacts(label);
     let clients = clients();
     runner_trace::start().expect("capture the runner's trace");
-    let mut subject = AppRuntimeHarness::new_with_relay_pair_owning_debt(&clients, &clients[1..2])
-        .await
-        .expect("runner proof harness setup");
+    let subject = if owning_debt {
+        AppRuntimeHarness::new_with_relay_pair_owning_debt(&clients, &clients[1..2]).await
+    } else {
+        AppRuntimeHarness::new_with_relay_pair(&clients, &clients[1..2]).await
+    };
+    let mut subject = subject.expect("runner proof harness setup");
     let outcome = tokio::time::timeout(WATCHDOG, journey(&mut subject, artifacts.path()))
         .await
         .unwrap_or_else(|_| {
@@ -603,7 +628,7 @@ where
 /// from the healthy endpoint, live messages must keep arriving, and the
 /// stalled endpoint's attempts must thin out instead of repeating.
 pub(super) async fn stalled_relay_loop() {
-    let report = run_proof("runner-loop", async |subject, out| {
+    let report = run_proof("runner-loop", true, async |subject, out| {
         let started = Instant::now();
         let clients = clients();
         let group = create(subject, "loop", &clients).await?;
@@ -677,9 +702,14 @@ pub(super) async fn stalled_relay_loop() {
         if live_visibility["not_visible"] != 0 {
             return Err("live messages stopped arriving behind the stalled relay".into());
         }
-        // 0.14.0 attempted about three times a minute for as long as it ran.
+        // 0.14.0 attempted about twice a minute for as long as it ran.
         if per_minute(half, clocks[1] + window_ms) > 0.5 {
             return Err(format!("the stalled relay is still attempted every two minutes or more often: {proof}").into());
+        }
+        // The control: the runner did try the stalled relay, so the bound
+        // below is not met by a runner that never looked at it.
+        if wasted(&runner[0]) == 0 {
+            return Err(format!("the runner never attempted the stalled relay: {proof}").into());
         }
         if wasted(&runner[1]) > LOOP_SECOND_HALF_ATTEMPTS {
             return Err(format!("the runner keeps attempting the stalled relay: {proof}").into());
@@ -700,7 +730,7 @@ pub(super) async fn stalled_relay_loop() {
 ///   quiet group's, whose live range is empty. Live messages to the quiet
 ///   group are never held behind it.
 pub(super) async fn owed_history() {
-    let report = run_proof("runner-owed-history", async |subject, out| {
+    let report = run_proof("runner-owed-history", true, async |subject, out| {
         let started = Instant::now();
         let clients = clients();
         let pair = clients[..2].to_vec();
@@ -860,6 +890,11 @@ pub(super) async fn owed_history() {
         if wasted(&restart_trace) > OWED_WASTED_ATTEMPTS {
             return failure("the runner's attempts kept ending without progress");
         }
+        // The control: the runner itself worked the owed group over
+        // successive attempts, so an idle runner does not meet the bounds.
+        if advanced(&restart_trace) < 2 {
+            return failure("the runner did not work the debt over successive attempts");
+        }
         if !swept(&after_restart, &quiet_route).iter().all(|swept| *swept) {
             return failure("the quiet group's gap was not swept after the restart");
         }
@@ -873,4 +908,235 @@ pub(super) async fn owed_history() {
     })
     .await;
     assert_eq!(report["proof"]["restart"]["busy_timeline_exact"], true);
+}
+
+/// When each payload first showed in bob's timeline, polled until `until`.
+async fn watch_until(
+    bob: &AppRuntimeProbe,
+    watched: &[(&GroupId, &str)],
+    from: Instant,
+    until: Duration,
+) -> TestResult<BTreeMap<String, f64>> {
+    let mut seen = BTreeMap::new();
+    while from.elapsed() < until {
+        for (group, payload) in watched {
+            if seen.contains_key(*payload) {
+                continue;
+            }
+            let (_, chat) = bob.chat_view(group, Some(256)).await?;
+            if chat.iter().any(|text| text == payload) {
+                seen.insert((*payload).to_owned(), from.elapsed().as_secs_f64());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(seen)
+}
+
+/// Proof 5's positive control: a non-empty admitted live count fences its
+/// group's live frames past the range it leaves unproven, while a quiet
+/// group's empty count fences nothing. Without it, "never fenced" passes as
+/// well with fences that never engage.
+///
+/// Bob restarts with 30 messages inside the rebuild lookback in one group and
+/// none in the other, and history goes unanswered on both endpoints for 12
+/// seconds, so nothing can prove the counted range. A live message to each
+/// group during the stall: the quiet one must arrive during it, the counted
+/// one only after it, and both timelines must end exact.
+pub(super) async fn fence_control() {
+    let report = run_proof("runner-fence-control", true, async |subject, out| {
+        let started = Instant::now();
+        let pair = clients()[..2].to_vec();
+        let counted = create(subject, "counted", &pair).await?;
+        let quiet = create(subject, "quiet", &pair).await?;
+        settle_maintenance(subject, &pair, &[counted.clone(), quiet.clone()]).await?;
+        let (alice, bob) = (subject.probe("alice")?, subject.probe("bob")?);
+        let mut quiet_expected = vec!["quiet-early".to_owned()];
+        send(&alice, &quiet, "quiet-early").await?;
+        wait_for("quiet history at bob", SETTLEMENT, async || {
+            holds_exactly(&bob, &quiet, &quiet_expected).await
+        })
+        .await?;
+        tokio::time::sleep(QUIET_AGE).await;
+        note(started, "groups created, quiet group aged");
+
+        subject.set_online("bob", false).await?;
+        let mut counted_expected = Vec::new();
+        for index in 0..COUNTED_MESSAGES {
+            let payload = format!("counted-{index:03}");
+            send(&alice, &counted, &payload).await?;
+            counted_expected.push(payload);
+        }
+        for endpoint in 0..2 {
+            subject.stall_relay_history(endpoint, true).await?;
+        }
+        let clocks = relay_clocks(subject).await?;
+        let trace_from = runner_trace::now_ms();
+        subject.set_online("bob", true).await?;
+        let restarted = Instant::now();
+        let bob = subject.probe("bob")?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let sent_at = restarted.elapsed().as_secs_f64();
+        send(&alice, &counted, "counted-live").await?;
+        send(&alice, &quiet, "quiet-live").await?;
+        counted_expected.push("counted-live".into());
+        quiet_expected.push("quiet-live".into());
+        let watched = [(&counted, "counted-live"), (&quiet, "quiet-live")];
+        let during = watch_until(&bob, &watched, restarted, FENCE_STALL).await?;
+        let (_, chat) = bob.chat_view(&counted, None).await?;
+        let backlog_during = chat.iter().filter(|text| text.starts_with("counted-0")).count();
+        for endpoint in 0..2 {
+            subject.stall_relay_history(endpoint, false).await?;
+        }
+        note(started, "history answered again");
+        let settled = wait_for("both timelines exact", Duration::from_secs(120), async || {
+            Ok(holds_exactly(&bob, &counted, &counted_expected).await?
+                && holds_exactly(&bob, &quiet, &quiet_expected).await?)
+        })
+        .await;
+        let after = watch_until(&bob, &watched, restarted, restarted.elapsed()).await?;
+        let history = history_since(subject, &clocks).await?;
+        let trace = runner_trace::since(trace_from);
+        let proof = json!({
+            "counted_messages": COUNTED_MESSAGES,
+            "stall_seconds": FENCE_STALL.as_secs(),
+            "live_sent_at_seconds": sent_at,
+            "seen_during_stall_at_seconds": during,
+            "seen_by_end_at_seconds": after,
+            "counted_backlog_visible_during_stall": backlog_during,
+            "timelines_exact": settled.is_ok(),
+            "runner": runner_summary(&trace),
+            "history": history.iter().map(|requests| history_summary(requests, &BTreeMap::new())).collect::<Vec<_>>(),
+            "status_at_end": bob.account_recovery_status().await?,
+        });
+        save(out, "history.json", &history)?;
+        save(out, "runner-trace.json", &trace)?;
+        let failure = |what: &str| Err::<Value, _>(format!("{what}: {proof}").into());
+        if settled.is_err() {
+            return failure("the timelines did not end exact");
+        }
+        if !during.contains_key("quiet-live") {
+            return failure("the quiet group's live message was held behind the stall");
+        }
+        // The control itself, last: it holds only once 5g wires live fences.
+        if during.contains_key("counted-live") {
+            return failure("the counted group's live message went ahead of its unproven range");
+        }
+        Ok(json!({"proof": proof}))
+    })
+    .await;
+    assert_eq!(report["proof"]["timelines_exact"], true);
+}
+
+/// Proof 4, the upgrade end to end: the earlier owner plans the debt and
+/// leaves its rows, then bob opens with the runner owning debt, 5g converts
+/// those rows before the runner's first start, and the runner alone finishes
+/// the debt.
+///
+/// 5d's fixtures are storage-only (synthetic routes and relays, no account or
+/// MLS state), so a runtime cannot open them; 5d's storage tests convert
+/// every row kind of both. Here the earlier owner writes its rows the way a
+/// nightly build does: bob restarts owing 2,000 events with the gate off
+/// while history goes unanswered, so the earlier owner plans the debt and
+/// cannot finish it.
+pub(super) async fn upgrade() {
+    let report = run_proof("runner-upgrade", false, async |subject, out| {
+        let started = Instant::now();
+        let clients = clients();
+        let busy = create(subject, "busy", &clients).await?;
+        settle_maintenance(subject, &clients, std::slice::from_ref(&busy)).await?;
+        note(started, "group created and settled");
+
+        // Before the upgrade: the earlier owner plans the debt, against
+        // history no endpoint answers.
+        subject.set_online("bob", false).await?;
+        let mut expected = publish(subject, &busy, "owed-", UPGRADE_MESSAGES).await?;
+        for endpoint in 0..2 {
+            subject.stall_relay_history(endpoint, true).await?;
+        }
+        subject.set_online("bob", true).await?;
+        tokio::time::sleep(BEFORE_UPGRADE).await;
+        let bob = subject.probe("bob")?;
+        let (_, chat) = bob.chat_view(&busy, None).await?;
+        let owed_at_upgrade = UPGRADE_MESSAGES - chat.iter().filter(|text| text.starts_with("owed-")).count();
+        subject.set_online("bob", false).await?;
+        for endpoint in 0..2 {
+            subject.stall_relay_history(endpoint, false).await?;
+        }
+        note(started, "the earlier owner left its rows");
+
+        // The upgrade: the runner owns the debt from this open on.
+        subject.set_runner_owns_debt(true);
+        let clocks = relay_clocks(subject).await?;
+        let (t0, trace_from) = (Instant::now(), runner_trace::now_ms());
+        subject.set_online("bob", true).await?;
+        let (alice, bob) = (subject.probe("alice")?, subject.probe("bob")?);
+        let live = Live::start(alice, bob.clone(), busy.clone(), Duration::from_secs(3), "live-");
+        let (mut drained, mut reported_caught_up) = (None, None);
+        while (drained.is_none() || reported_caught_up.is_none()) && t0.elapsed() < RECOVERY_DEADLINE {
+            if drained.is_none() {
+                let (_, chat) = bob.chat_view(&busy, None).await?;
+                if chat.iter().filter(|text| text.starts_with("owed-")).count() == UPGRADE_MESSAGES {
+                    drained = Some(t0.elapsed().as_secs_f64());
+                }
+            }
+            if drained.is_some() && reported_caught_up.is_none() && caught_up(&bob).await? {
+                reported_caught_up = Some(t0.elapsed().as_secs_f64());
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        let (live_sent, live_visibility) = live.finish().await?;
+        expected.extend(live_sent);
+        let exact = holds_exactly(&bob, &busy, &expected).await?;
+        let history = history_since(subject, &clocks).await?;
+        let trace = runner_trace::since(trace_from);
+        // The earlier owner's capture pages are the only history `REQ`s
+        // without a limit; 5g turns capture off.
+        let capture_pages = history.iter().map(|requests| {
+            let pages = requests.iter().filter(|r| r.verb == "REQ" && r.ids == 0 && r.limit.is_none());
+            pages.count()
+        });
+        let capture_pages = capture_pages.collect::<Vec<_>>();
+        let status = bob.account_recovery_status().await?;
+        let proof = json!({
+            "owed_messages": UPGRADE_MESSAGES,
+            "owed_at_upgrade": owed_at_upgrade,
+            "owed_visible_seconds": drained,
+            "runner_caught_up_seconds": reported_caught_up,
+            "timeline_exact": exact,
+            "live_visibility_ms": live_visibility,
+            "capture_pages_per_endpoint": capture_pages,
+            "runner": runner_summary(&trace),
+            "history": history.iter().map(|requests| history_summary(requests, &BTreeMap::new())).collect::<Vec<_>>(),
+            "status_at_end": status,
+        });
+        save(out, "history.json", &history)?;
+        save(out, "runner-trace.json", &trace)?;
+        let failure = |what: &str| Err::<Value, _>(format!("{what}: {proof}").into());
+        if owed_at_upgrade == 0 {
+            return failure("nothing was owed at the upgrade, so it proves nothing");
+        }
+        if drained.is_none() || !exact {
+            return failure("the owed group did not finish exactly after the upgrade");
+        }
+        if live_visibility["not_visible"] != 0 {
+            return failure("live messages were lost after the upgrade");
+        }
+        if reported_caught_up.is_none() {
+            return failure("the runner never reported the account caught up");
+        }
+        if advanced(&trace) == 0 {
+            return failure("the runner did not work the converted debt");
+        }
+        // The rest holds only once 5g converts the rows and turns capture off.
+        if capture_pages.iter().any(|pages| *pages > 0) {
+            return failure("the earlier owner still captured history after the upgrade");
+        }
+        if !status.notices.is_empty() {
+            return failure("a converted notice outlived the debt it named");
+        }
+        Ok(json!({"proof": proof}))
+    })
+    .await;
+    assert_eq!(report["proof"]["timeline_exact"], true);
 }
