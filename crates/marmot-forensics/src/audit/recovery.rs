@@ -18,7 +18,8 @@ pub const RECOVERY_AUDIT_MAX_OBLIGATIONS: usize = 16;
 /// endpoint list bound; a longer list sets `endpoints_truncated`.
 pub const RECOVERY_AUDIT_MAX_ENDPOINTS: usize = 16;
 
-/// Why an obligation exists: `storage_sqlite::RecoveryCause`, one to one.
+/// Why an obligation exists: `storage_sqlite::RecoveryCause`, one to one,
+/// plus [`Self::UnprovenHistory`] for a coverage-ledger route's notice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryObligationCause {
@@ -39,6 +40,10 @@ pub enum RecoveryObligationCause {
     /// Complete-range admission of an issued native subscription window.
     /// This is not exhaustive history or acknowledgment of delivery loss.
     SubscriptionReplay,
+    /// A coverage-ledger route the recovery runner parked or could not
+    /// prove. It has no obligation: its rows carry the route's one-way tag
+    /// as `obligation_id` and the route's park revision, and charge nothing.
+    UnprovenHistory,
 }
 
 /// A meaningful change to recovery need. Unchanged scheduler evaluations
@@ -678,7 +683,8 @@ mod tests {
                 C::ExplicitHistory,
                 C::KnownEvent,
                 C::IncrementalHistory,
-                C::SubscriptionReplay
+                C::SubscriptionReplay,
+                C::UnprovenHistory
             ]),
             defined("Operational_recoveryObligationCause")
         );

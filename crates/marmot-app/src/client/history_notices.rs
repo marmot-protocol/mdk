@@ -2,28 +2,168 @@
 //! user-authorized retirement. Retirement is recorded as its own outcome,
 //! never as coverage, and releases a retired loss's cursor fence without
 //! recording recovery success.
+//!
+//! Behind the internal `runner_owns_debt` gate (mdk#2660 phase 4), routes the
+//! coverage ledger parks raise notices too ([`LedgerNotice`]), and the
+//! account's recovery status reads what the recovery runner is catching up.
+use std::collections::{BTreeMap, BTreeSet};
+
 use cgka_traits::GroupId;
+use storage_sqlite::{RecoveryDemandTicket, SqliteAppStorage, TransportReconciliationRoute};
 
 use super::AppClient;
-use crate::history_notices::{decode_notice_id, encode_notice_id, history_notice};
-use crate::{AppError, HistoryNotice, HistoryNoticeCause};
+use crate::history_notices::{
+    decode_notice_id, encode_notice_id, history_notice, ledger_route_tag,
+};
+use crate::{AccountRecoveryStatus, AppError, HistoryNotice, HistoryNoticeCause};
+
+/// One route the coverage ledger parks: one `UnprovenHistory` notice, whose
+/// ticket is the route's tag and its park revision (the newest among its
+/// broken units' parks and its remainder). Not `Debug`: it carries its route.
+pub(crate) struct LedgerNotice {
+    route: TransportReconciliationRoute,
+    ticket: RecoveryDemandTicket,
+    /// The route's MLS group; `None` for the inbox.
+    group_id: Option<Vec<u8>>,
+    parked_at_seconds: u64,
+}
+
+impl LedgerNotice {
+    fn notice(&self) -> HistoryNotice {
+        HistoryNotice {
+            notice_id: encode_notice_id(self.ticket),
+            cause: HistoryNoticeCause::UnprovenHistory,
+            group_id_hex: self.group_id.as_ref().map(hex::encode),
+            parked_at_ms: Some(self.parked_at_seconds.saturating_mul(1000)),
+        }
+    }
+}
 
 /// The parked set as last announced: each occurrence's obligation id and
 /// revision, with its group for group-scoped demand.
 pub(crate) type HistoryNoticeBaseline = Vec<([u8; 16], u64, Option<Vec<u8>>)>;
 
 impl AppClient {
-    /// Every current occurrence, oldest first.
+    /// Every current occurrence: parked obligations oldest first, then the
+    /// ledger's parked routes oldest first.
     pub(crate) fn history_notices(&self) -> Result<Vec<HistoryNotice>, AppError> {
-        Ok(self
-            .app
-            .account_storage(&self.state.label)?
-            .app_storage()
+        let app = self.app.account_storage(&self.state.label)?.app_storage();
+        let mut notices = app
             .parked_recovery_obligations()?
             .iter()
             .filter(|parked| self.host_may_see_parked(parked.group_id.as_deref()))
             .map(history_notice)
-            .collect())
+            .collect::<Vec<_>>();
+        notices.extend(self.ledger_notices(&app)?.iter().map(LedgerNotice::notice));
+        Ok(notices)
+    }
+
+    /// The routes the coverage ledger parks, one notice each, oldest first,
+    /// behind the internal `runner_owns_debt` gate: a route with a broken
+    /// unit, or with a parked remainder once the window above it is covered,
+    /// that is once the runner has surveyed and catches up none of the
+    /// route's units. A group route's notice names its group; one that is no
+    /// current route's, a suspended group's, or one the host may not see, is
+    /// left out.
+    pub(crate) fn ledger_notices(
+        &self,
+        app: &SqliteAppStorage,
+    ) -> Result<Vec<LedgerNotice>, AppError> {
+        if !self.app.recovery_runner_owns_debt() {
+            return Ok(Vec::new());
+        }
+        let groups = self
+            .recovery_runner_routes()
+            .into_iter()
+            .filter(|route| !route.suspended())
+            .map(|route| (route.route, route.group_id))
+            .collect::<BTreeMap<_, _>>();
+        let catching_up = self.routing.recovery_runner_catching_up_now();
+        let mut parked = app
+            .parked_recovery_routes()?
+            .into_iter()
+            .map(|parked| (parked.route, (parked.revision, parked.parked_at_seconds)))
+            .collect::<BTreeMap<_, _>>();
+        for remainder in app.recovery_coverage_remainders()? {
+            if let Some((_, parked_at)) = parked.get_mut(&remainder.route) {
+                // Its revision already counts the remainder's.
+                *parked_at = (*parked_at).min(remainder.parked_at_seconds);
+            } else if catching_up
+                .as_ref()
+                .is_some_and(|units| !units.iter().any(|unit| unit.route == remainder.route))
+            {
+                parked.insert(
+                    remainder.route,
+                    (remainder.revision, remainder.parked_at_seconds),
+                );
+            }
+        }
+        let mut notices = parked
+            .into_iter()
+            .filter_map(|(route, (revision, parked_at_seconds))| {
+                let group_id = match route {
+                    TransportReconciliationRoute::Inbox => None,
+                    TransportReconciliationRoute::Group(_) => Some(groups.get(&route)?.clone()?),
+                };
+                if !self.host_may_see_parked(group_id.as_deref()) {
+                    return None;
+                }
+                Some(LedgerNotice {
+                    ticket: RecoveryDemandTicket {
+                        id: ledger_route_tag(&route),
+                        revision,
+                    },
+                    route,
+                    group_id,
+                    parked_at_seconds,
+                })
+            })
+            .collect::<Vec<_>>();
+        notices.sort_by_key(|notice| notice.parked_at_seconds);
+        Ok(notices)
+    }
+
+    /// The account's recovery status. Behind the internal `runner_owns_debt`
+    /// gate, it reports the groups and inbox the runner's last survey found
+    /// catching up; otherwise, and until a runner has surveyed, nothing is.
+    pub(crate) fn account_recovery_status(&self) -> Result<AccountRecoveryStatus, AppError> {
+        let mut status = AccountRecoveryStatus {
+            notices: self.history_notices()?,
+            ..AccountRecoveryStatus::default()
+        };
+        if !self.app.recovery_runner_owns_debt() {
+            return Ok(status);
+        }
+        let Some(units) = self.routing.recovery_runner_catching_up_now() else {
+            return Ok(status);
+        };
+        let groups = self
+            .recovery_runner_routes()
+            .into_iter()
+            .map(|route| (route.route, route.group_id))
+            .collect::<BTreeMap<_, _>>();
+        let mut catching_up = BTreeSet::new();
+        for unit in units {
+            if unit.route == TransportReconciliationRoute::Inbox {
+                status.inbox_catching_up = true;
+            } else if let Some(Some(group_id)) = groups.get(&unit.route)
+                && self.host_may_see_group(&GroupId::new(group_id.clone()))
+            {
+                catching_up.insert(hex::encode(group_id));
+            }
+        }
+        status.catching_up_group_ids_hex = catching_up.into_iter().collect();
+        Ok(status)
+    }
+
+    /// Whether hosts are owed a `RecoveryStatusChanged`, behind the internal
+    /// `runner_owns_debt` gate: the runner's survey changed what is catching
+    /// up ([`AppClient::recovery_status_owed`]), or `notices_changed`. Every
+    /// survey change counts, even one a later survey undid, so a host never
+    /// keeps a state it read in between.
+    pub(crate) fn take_recovery_status_changed(&mut self, notices_changed: bool) -> bool {
+        let owed = std::mem::take(&mut self.recovery_status_owed);
+        self.app.recovery_runner_owns_debt() && (owed || notices_changed)
     }
 
     /// A group-scoped occurrence reaches the host only for a group it may see.
@@ -31,19 +171,25 @@ impl AppClient {
         group_id.is_none_or(|group_id| self.host_may_see_group(&GroupId::new(group_id.to_vec())))
     }
 
-    /// Notice ids of this group's own parked occurrences, oldest first.
+    /// Notice ids of this group's own parked occurrences, oldest first, then
+    /// its routes' ledger notices.
     pub(crate) fn group_history_notice_ids(
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<String>, AppError> {
-        Ok(self
-            .app
-            .account_storage(&self.state.label)?
-            .app_storage()
+        let app = self.app.account_storage(&self.state.label)?.app_storage();
+        let mut ids = app
             .parked_group_recovery_obligations(group_id.as_slice())?
             .into_iter()
             .map(|parked| encode_notice_id(parked.ticket))
-            .collect())
+            .collect::<Vec<_>>();
+        ids.extend(
+            self.ledger_notices(&app)?
+                .into_iter()
+                .filter(|notice| notice.group_id.as_deref() == Some(group_id.as_slice()))
+                .map(|notice| encode_notice_id(notice.ticket)),
+        );
+        Ok(ids)
     }
 
     /// Retire exactly the dismissed occurrence as "history may be incomplete".
@@ -65,12 +211,7 @@ impl AppClient {
             .find(|parked| parked.ticket == ticket)
             .map(|parked| (parked.cause, parked.group_id))
         else {
-            tracing::debug!(
-                target: "marmot_app::recovery",
-                method = "dismiss_history_notice",
-                "history notice was stale; nothing retired",
-            );
-            return Ok(false);
+            return self.dismiss_ledger_notice(&app, ticket);
         };
         // The plane's pending generation before retirement. Releasing the
         // fence requires it to be unchanged afterwards.
@@ -151,22 +292,92 @@ impl AppClient {
         Ok(true)
     }
 
+    /// Dismiss a ledger-parked route's notice: storage retires the parked
+    /// spans of the route's broken units and its remainder, never as
+    /// coverage. Returns false, changing nothing, when the notice is stale:
+    /// the route re-armed, parked again under a newer revision, or was
+    /// dismissed already.
+    fn dismiss_ledger_notice(
+        &mut self,
+        app: &SqliteAppStorage,
+        ticket: RecoveryDemandTicket,
+    ) -> Result<bool, AppError> {
+        let notice = self
+            .ledger_notices(app)?
+            .into_iter()
+            .find(|notice| notice.ticket == ticket);
+        let dismissed = match &notice {
+            Some(notice) => app.dismiss_recovery_route_park(&notice.route, ticket.revision)?,
+            None => false,
+        };
+        if !dismissed {
+            tracing::debug!(
+                target: "marmot_app::recovery",
+                method = "dismiss_history_notice",
+                "history notice was stale; nothing retired",
+            );
+            return Ok(false);
+        }
+        self.wake_recovery_runner();
+        self.record_need_changed(
+            notice
+                .and_then(|notice| notice.group_id)
+                .map(GroupId::new)
+                .as_ref(),
+            marmot_forensics::RecoveryObligationCause::UnprovenHistory,
+            marmot_forensics::RecoveryNeedChange::NoticeDismissed,
+            ticket,
+            None,
+            None,
+            None,
+        );
+        tracing::info!(
+            target: "marmot_app::recovery",
+            method = "dismiss_history_notice",
+            cause = HistoryNoticeCause::UnprovenHistory.as_str(),
+            "retired a parked recovery route; its history may be incomplete",
+        );
+        Ok(true)
+    }
+
     /// Re-read the parked set and return the groups whose own occurrences
     /// changed since the last call, or `None` when nothing changed. The first
     /// call only records the baseline. A failed read keeps the old baseline,
-    /// so the next publication seam retries.
+    /// so the next publication seam retries. Behind the internal
+    /// `runner_owns_debt` gate the ledger's parked routes count too, and an
+    /// upgrade conversion that changed the notices is announced once, even
+    /// when the set reads the same.
     pub(crate) fn take_history_notice_changes(&mut self) -> Option<Vec<GroupId>> {
         let mut causes = Vec::new();
+        let mut converted = None;
         let current: HistoryNoticeBaseline = match self
             .app
             .account_storage(&self.state.label)
-            .and_then(|storage| Ok(storage.app_storage().parked_recovery_obligations()?))
-        {
-            Ok(parked) => parked
+            .and_then(|storage| {
+                let app = storage.app_storage();
+                let parked = app.parked_recovery_obligations()?;
+                let ledger = self.ledger_notices(&app)?;
+                if self.app.recovery_runner_owns_debt()
+                    && !app.recovery_conversion_pending()?
+                    && app.recovery_conversion_notices_changed()?
+                {
+                    converted = Some(app);
+                }
+                Ok((parked, ledger))
+            }) {
+            Ok((parked, ledger)) => parked
                 .into_iter()
                 .map(|parked| {
-                    causes.push((parked.ticket.id, parked.cause));
-                    (parked.ticket.id, parked.ticket.revision, parked.group_id)
+                    let cause = super::audit_recovery::obligation_cause(parked.cause);
+                    (parked.ticket, parked.group_id, cause)
+                })
+                .chain(ledger.into_iter().map(|notice| {
+                    let cause = marmot_forensics::RecoveryObligationCause::UnprovenHistory;
+                    (notice.ticket, notice.group_id, cause)
+                }))
+                .map(|(ticket, group, cause)| {
+                    causes.push((ticket.id, cause));
+                    (ticket.id, ticket.revision, group)
                 })
                 .collect(),
             Err(_) => {
@@ -178,17 +389,34 @@ impl AppClient {
                 return None;
             }
         };
+        // The announcement is the caller's, right after this; once the
+        // baseline is set a lost one is only a missed event, and hosts read
+        // the notices after every open.
+        if let Some(app) = &converted
+            && app.acknowledge_recovery_conversion_notices().is_err()
+        {
+            tracing::debug!(
+                target: "marmot_app::recovery",
+                method = "take_history_notice_changes",
+                "conversion notice acknowledgement failed; announcing again at the next seam",
+            );
+        }
+        let announce_all = converted.is_some();
         let previous = self.history_notice_baseline.replace(current)?;
         let current = self.history_notice_baseline.as_ref()?;
-        if previous == *current {
+        if previous == *current && !announce_all {
             return None;
         }
         self.record_history_notice_changes(&previous, &causes);
         let current = self.history_notice_baseline.as_ref()?;
         let mut groups = previous
             .iter()
-            .filter(|entry| !current.contains(entry))
-            .chain(current.iter().filter(|entry| !previous.contains(entry)))
+            .filter(|entry| announce_all || !current.contains(entry))
+            .chain(
+                current
+                    .iter()
+                    .filter(|entry| announce_all || !previous.contains(entry)),
+            )
             .filter_map(|(_, _, group)| group.clone())
             .collect::<Vec<_>>();
         groups.sort();
@@ -204,14 +432,15 @@ impl AppClient {
 }
 
 impl AppClient {
-    /// Audit the notice set's transitions: each newly parked occurrence is a
-    /// shown notice, and a withdrawn one whose obligation is now satisfied
-    /// was closed with qualified coverage. Other withdrawals are recorded
-    /// where they happen: a dismissal, or new evidence resuming the demand.
+    /// Audit the notice set's transitions: each newly parked occurrence, an
+    /// obligation's or a ledger route's, is a shown notice, and a withdrawn
+    /// one whose obligation is now satisfied was closed with qualified
+    /// coverage. Other withdrawals are recorded where they happen: a
+    /// dismissal, or new evidence resuming the demand.
     fn record_history_notice_changes(
         &self,
         previous: &HistoryNoticeBaseline,
-        causes: &[([u8; 16], storage_sqlite::RecoveryCause)],
+        causes: &[([u8; 16], marmot_forensics::RecoveryObligationCause)],
     ) {
         if !self.audit_v5_enabled() {
             return;
@@ -225,7 +454,7 @@ impl AppClient {
             };
             self.record_need_changed(
                 group.clone().map(GroupId::new).as_ref(),
-                super::audit_recovery::obligation_cause(*cause),
+                *cause,
                 marmot_forensics::RecoveryNeedChange::NoticeShown,
                 storage_sqlite::RecoveryDemandTicket {
                     id: *id,
@@ -346,6 +575,9 @@ pub(crate) fn settle_recovery_for_test(
         )
         .unwrap()
 }
+
+#[cfg(test)]
+mod ledger_tests;
 
 #[cfg(test)]
 mod tests {

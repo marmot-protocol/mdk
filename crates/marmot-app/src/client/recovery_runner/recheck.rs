@@ -1,7 +1,7 @@
 //! Re-check units (decision 5 of mdk#2660's phase 4 plan): one resumable
-//! pass per (group route, required relay) over the unit's covered and retired
-//! ranges inside the route's complete inventory window, by NIP-77 comparison
-//! with what the account holds there.
+//! pass per (route, required relay), the inbox's included, over the unit's
+//! covered and retired ranges inside the route's complete inventory window,
+//! by NIP-77 comparison with what the account holds there.
 //!
 //! - The window is `transport_reconciliation_inventory`'s: the retention
 //!   window, raised past whatever the inventory compacted away. Automatic
@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use cgka_traits::storage::StorageResult;
 use storage_sqlite::{
     RecoveryCoverageProof, RecoveryRecheckPass, RecoveryStagedSlice, RecoveryUnitOutcome,
-    SqliteAppStorage, TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationRoute,
+    SqliteAppStorage, TRANSPORT_RECONCILIATION_RETENTION_SECS,
 };
 use transport_nostr_adapter::compare::CompareEnd;
 use transport_nostr_adapter::sweep::{RelayCaps, SweepRange};
@@ -45,8 +45,8 @@ use transport_nostr_adapter::sweep::{RelayCaps, SweepRange};
 use super::admission::{Admission, Stalled};
 use super::compare::{CompareFacts, ComparePlan, PlannedRange, local_items, recorded_caps};
 use super::quantum::{QuantumReport, classify};
-use super::select::{Candidate, cooldown_until, suspended, sweepable};
-use super::{DebtTurn, RecoveryRunnerPolicy, UnitKey, WorkerTurn, recovery_caps};
+use super::select::{Candidate, cooldown_until, suspended};
+use super::{DebtTurn, RecoveryRunnerPolicy, UnitKey, WorkerTurn, fetch_route, recovery_caps};
 
 /// One re-check quantum's plan. Not `Debug`: it carries its unit.
 pub(super) struct RecheckPlan {
@@ -103,7 +103,7 @@ pub(super) fn survey(
     let mut caps = BTreeMap::new();
     let mut cooldowns = BTreeMap::new();
     let mut candidates = Vec::new();
-    for route in sweepable(turn.routes) {
+    for route in turn.routes {
         for (relay, best_effort) in route.relays() {
             if best_effort {
                 continue;
@@ -242,10 +242,7 @@ pub(super) fn begin(
 ) -> StorageResult<Option<RecheckPlan>> {
     let app = turn.app;
     let now = turn.now;
-    let TransportReconciliationRoute::Group(nostr_group_id) = key.route else {
-        return Ok(None);
-    };
-    let Some(route) = sweepable(turn.routes).find(|route| {
+    let Some(route) = turn.routes.iter().find(|route| {
         route.route == key.route
             && !suspended(route)
             && route
@@ -304,7 +301,7 @@ pub(super) fn begin(
     Ok(Some(RecheckPlan {
         compare: ComparePlan {
             key: key.clone(),
-            nostr_group_id,
+            route: fetch_route(&key.route, turn.inbox),
             best_effort: false,
             caps,
             ranges,

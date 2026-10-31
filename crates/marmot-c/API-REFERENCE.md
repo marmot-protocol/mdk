@@ -2596,6 +2596,30 @@ Free a list returned by this library. NULL is a no-op.
 
 [Header contract](include/marmot.h#L13462)
 
+### `marmot_account_recovery_status`
+
+**Current.**
+
+```c
+MarmotStatus marmot_account_recovery_status(const struct MarmotClient *client, const char *account_ref, struct MarmotAccountRecoveryStatus **out);
+```
+
+Read the account's recovery from local state; blocks on the account worker without network I/O. The owned `MarmotAccountRecoveryStatus` lists the groups still catching up (`catching_up_group_ids_hex`/`catching_up_group_ids_hex_len`, lowercase hex, sorted), `inbox_catching_up`, and every notice (`notices`/`notices_len`) as `marmot_history_notices` lists them. Re-read on `MARMOT_EVENT_RECOVERY_STATUS_CHANGED`, which is not raised until the recovery runner owns history (mdk#2660); until then nothing is catching up. Free it with `marmot_account_recovery_status_free`.
+
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotaccount_recovery_status) · [Header contract](include/marmot.h#L7930)
+
+### `marmot_account_recovery_status_free`
+
+**Current.**
+
+```c
+void marmot_account_recovery_status_free(struct MarmotAccountRecoveryStatus *ptr);
+```
+
+Free a status returned by `marmot_account_recovery_status`, its group ids and notices included. NULL is a no-op.
+
+[Header contract](include/marmot.h#L13380)
+
 </details>
 
 <details>

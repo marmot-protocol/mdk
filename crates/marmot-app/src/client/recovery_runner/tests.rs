@@ -46,12 +46,17 @@ use crate::runtime::account_worker::recovery_credits::{
 };
 
 mod comparison;
+mod inbox;
 
 const RELAY: &str = "wss://a.example";
 const OTHER_RELAY: &str = "wss://b.example";
 const HOUR: u64 = 60 * 60;
 const DAY: u64 = 24 * HOUR;
 const GROUP_MESSAGE_KIND: u16 = 445;
+const GIFT_WRAP_KIND: u16 = 1059;
+/// The account's public key: its inbox's `#p`, and the recipient of the
+/// deliveries the host routes.
+const INBOX_KEY: [u8; 32] = [0xAA; 32];
 
 type Route = TransportReconciliationRoute;
 type Outcome = RecoveryUnitOutcome;
@@ -300,6 +305,15 @@ impl Clock {
 static PUBKEY: LazyLock<PublicKey> = LazyLock::new(|| Keys::generate().public_key());
 
 fn event(group: [u8; 32], created_at: u64) -> Event {
+    tagged(GROUP_MESSAGE_KIND, "h", group, created_at)
+}
+
+/// A gift wrap to `recipient`.
+fn wrap(recipient: [u8; 32], created_at: u64) -> Event {
+    tagged(GIFT_WRAP_KIND, "p", recipient, created_at)
+}
+
+fn tagged(kind: u16, tag: &str, value: [u8; 32], created_at: u64) -> Event {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let next = NEXT.fetch_add(1, Ordering::Relaxed);
     let mut id = [0u8; 32];
@@ -308,11 +322,38 @@ fn event(group: [u8; 32], created_at: u64) -> Event {
         EventId::from_byte_array(id),
         *PUBKEY,
         Timestamp::from_secs(created_at),
-        Kind::from(GROUP_MESSAGE_KIND),
-        [Tag::parse(["h", hex::encode(group).as_str()]).unwrap()],
+        Kind::from(kind),
+        [Tag::parse([tag, hex::encode(value).as_str()]).unwrap()],
         "",
         Signature::from_byte_array([1; 64]),
     )
+}
+
+/// The value of the event's first `tag` tag.
+fn tag_value(event: &Event, tag: &str) -> Option<Vec<u8>> {
+    event.tags.iter().find_map(|candidate| {
+        let parts = candidate.as_slice();
+        (parts.len() >= 2 && parts[0] == tag)
+            .then(|| hex::decode(&parts[1]).ok())
+            .flatten()
+    })
+}
+
+/// Whether the event belongs to `route`, as a relay filters it.
+fn on_route(route: SweepRoute, event: &Event) -> bool {
+    let (kind, tag, value) = match route {
+        SweepRoute::Group { nostr_group_id } => (GROUP_MESSAGE_KIND, "h", nostr_group_id),
+        SweepRoute::Inbox { pubkey } => (GIFT_WRAP_KIND, "p", pubkey),
+    };
+    event.kind == Kind::from(kind) && tag_value(event, tag).as_deref() == Some(value.as_slice())
+}
+
+/// The ledger route a wire route names.
+fn ledger_route(route: SweepRoute) -> Route {
+    match route {
+        SweepRoute::Group { nostr_group_id } => Route::Group(nostr_group_id),
+        SweepRoute::Inbox { .. } => Route::Inbox,
+    }
 }
 
 /// One event every `step` seconds in `[since, until)`.
@@ -324,18 +365,26 @@ fn every(group: [u8; 32], since: u64, until: u64, step: u64) -> Vec<Event> {
 }
 
 fn group_tag(event: &Event) -> Option<Vec<u8>> {
-    event.tags.iter().find_map(|tag| {
-        let parts = tag.as_slice();
-        (parts.len() >= 2 && parts[0] == "h")
-            .then(|| hex::decode(&parts[1]).ok())
-            .flatten()
-    })
+    tag_value(event, "h")
 }
 
 fn delivery(event: &Event) -> TransportDelivery {
     let at = TransportTime(event.created_at.as_secs());
+    let account_id = MemberId::new(INBOX_KEY.to_vec());
+    let (envelope, plane) = match group_tag(event) {
+        Some(transport_group_id) => (
+            TransportEnvelope::GroupMessage { transport_group_id },
+            TransportDeliveryPlane::Group,
+        ),
+        None => (
+            TransportEnvelope::Welcome {
+                recipient: account_id.clone(),
+            },
+            TransportDeliveryPlane::AccountInbox,
+        ),
+    };
     TransportDelivery {
-        account_id: MemberId::new(vec![0xAA; 32]),
+        account_id,
         group_id_hint: None,
         message: TransportMessage {
             id: MessageId::new(event.id.to_bytes().to_vec()),
@@ -343,14 +392,12 @@ fn delivery(event: &Event) -> TransportDelivery {
             timestamp: at,
             causal_deps: Vec::new(),
             source: TransportSource("nostr".to_owned()),
-            envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: group_tag(event).expect("a group event"),
-            },
+            envelope,
         },
         received_at: at,
         source: TransportDeliverySource {
             transport: TransportSource("nostr".to_owned()),
-            plane: TransportDeliveryPlane::Group,
+            plane,
             endpoint: None,
             subscription_id: Some("recovery".to_owned()),
             wire: None,
@@ -524,6 +571,9 @@ struct ModelRelay {
     comparisons: Mutex<Vec<SweepRange>>,
     /// Every id fetched by id, in order.
     fetched_ids: Mutex<Vec<EventId>>,
+    /// It refuses every read of an inbox's gift wraps, as a relay that
+    /// restricts kind 1059 to authenticated recipients does.
+    refusing_inbox: bool,
 }
 
 impl ModelRelay {
@@ -550,7 +600,13 @@ impl ModelRelay {
             refetches: Mutex::new(Vec::new()),
             comparisons: Mutex::new(Vec::new()),
             fetched_ids: Mutex::new(Vec::new()),
+            refusing_inbox: false,
         }
+    }
+
+    fn refusing_inbox(mut self) -> Self {
+        self.refusing_inbox = true;
+        self
     }
 
     fn with_events(mut self, events: Vec<Event>) -> Self {
@@ -631,15 +687,12 @@ impl ModelRelay {
     }
 
     fn matching(&self, route: SweepRoute, since: u64, until: u64) -> Vec<Event> {
-        let SweepRoute::Group { nostr_group_id } = route;
         let mut matching = self
             .events
             .iter()
             .filter(|event| {
                 let at = event.created_at.as_secs();
-                at >= since
-                    && at <= until
-                    && group_tag(event).as_deref() == Some(nostr_group_id.as_slice())
+                at >= since && at <= until && on_route(route, event)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -651,9 +704,8 @@ impl ModelRelay {
         let Some(app) = &self.ledger else {
             return;
         };
-        let SweepRoute::Group { nostr_group_id } = route;
         let proved = app
-            .recovery_coverage_ranges(&Route::Group(nostr_group_id), self.url)
+            .recovery_coverage_ranges(&ledger_route(route), self.url)
             .unwrap();
         if proved.iter().any(|proved| {
             proved.range.since_seconds <= since && since <= proved.range.until_seconds
@@ -759,6 +811,9 @@ impl ModelRelay {
         if !self.negentropy {
             return CompareReply::Unsupported;
         }
+        if self.refusing_inbox && matches!(route, SweepRoute::Inbox { .. }) {
+            return CompareReply::Closed(restricted());
+        }
         let held = local.iter().map(|item| item.id).collect::<BTreeSet<_>>();
         let set = self
             .matching(route, window.since, window.until)
@@ -808,6 +863,10 @@ enum ClosedOrUnreachable {
 
 fn rate_limited() -> ClosedReason {
     ClosedReason::from_message("rate-limited: slow down")
+}
+
+fn restricted() -> ClosedReason {
+    ClosedReason::from_message("restricted: gift wraps are for their recipient")
 }
 
 /// The sweep's view of a model relay, with the caps the runner planned.
@@ -919,6 +978,8 @@ struct TestHost {
     connections: watch::Sender<BTreeMap<String, u64>>,
     /// Audit rows the runner's worker turns recorded.
     audited: Mutex<Vec<AuditEventKind>>,
+    /// What the last survey found catching up.
+    catching_up: Mutex<Option<BTreeSet<UnitKey>>>,
 }
 
 impl TestHost {
@@ -990,6 +1051,7 @@ impl TestHost {
             closed: OnceLock::new(),
             connections: watch::channel(BTreeMap::new()).0,
             audited: Mutex::default(),
+            catching_up: Mutex::default(),
         })
     }
 
@@ -1085,6 +1147,7 @@ impl RunnerHost for TestHost {
             now,
             tails: &*tails,
             live_counts: &counts,
+            inbox: INBOX_KEY,
         });
         self.debt_turns.fetch_add(1, Ordering::SeqCst);
         self.clock
@@ -1191,6 +1254,10 @@ impl RunnerHost for TestHost {
 
     fn relay_connections(&self) -> Option<watch::Receiver<BTreeMap<String, u64>>> {
         Some(self.connections.subscribe())
+    }
+
+    fn surveyed(&self, catching_up: BTreeSet<UnitKey>) {
+        *self.catching_up.lock().unwrap() = Some(catching_up);
     }
 }
 
@@ -2546,6 +2613,7 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
         paused_until: None,
         fenced: BTreeSet::new(),
         window: BTreeSet::new(),
+        catching_up: BTreeSet::new(),
     };
     let select::Pick::Unit(first) =
         select::pick(survey, &mut memory, &PriorityHints::default(), 0, true)
@@ -2770,6 +2838,52 @@ async fn recovery_runner_charges_the_reply_a_cut_request_was_reading() {
         "the interrupted request ended within the grace"
     );
     assert_eq!(relay.gate.waiting(), 0);
+    assert_eq!(
+        account
+            .app
+            .recovery_account_usage(clock.now())
+            .unwrap()
+            .event_bytes,
+        READ
+    );
+}
+
+// The paused clock (Tokio allows one only on the current-thread runtime)
+// keeps the quantum's deadline away while the stop waits for the request.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_charges_the_reply_a_stopped_request_was_reading() {
+    const READ: u64 = 4096;
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    // The first request is still reading when the runner is stopped, as an
+    // explicit caller's cancel stops it; its relay ends it when interrupted
+    // and reports what it read.
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .interruptible(READ)
+        .build();
+    relay.gate.hold_from(0);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, t0 - HOUR);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, handle) = runner(&host, test_policy());
+
+    let stop = async {
+        // Busy, so the paused clock never runs the quantum out first.
+        while relay.gate.waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        handle.shutdown();
+    };
+    let (step, ()) = tokio::join!(runner.step(), stop);
+    assert_eq!(ran(step).outcome, Outcome::Unanswered);
+    assert_eq!(relay.gate.waiting(), 0, "the stop ended the request");
     assert_eq!(
         account
             .app

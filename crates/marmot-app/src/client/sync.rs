@@ -477,7 +477,7 @@ pub(crate) struct RecoveryExecutionState {
 
 /// The public outcome of an explicit full-history repair that did not
 /// qualify. Everything the repair admitted stays in the partial summary.
-fn incomplete_full_history_repair(
+pub(crate) fn incomplete_full_history_repair(
     summary: SyncSummary,
     reason: crate::FullHistoryRepairIncompleteReason,
     delivery_loss_pending: bool,
@@ -5897,13 +5897,22 @@ impl AppClient {
     pub(crate) async fn repair_full_history(
         &mut self,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        self.repair_full_history_cancellable(&|| false).await
+        self.repair_full_history_cancellable(&|| false, None).await
     }
 
+    /// Explicit repair. Behind the internal `runner_owns_debt` gate it runs
+    /// through the account's runner, `spawned` for a worker account
+    /// (mdk#2660 phase 4).
     pub(crate) async fn repair_full_history_cancellable(
         &mut self,
         cancelled: &(dyn Fn() -> bool + Sync),
+        spawned: Option<&mut super::recovery_runner::host::SpawnedRunner>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        if self.repairs_through_runner(spawned.as_deref()) {
+            return self
+                .repair_full_history_through_runner(cancelled, FULL_HISTORY_REPAIR_TIMEOUT, spawned)
+                .await;
+        }
         self.repair_full_history_with_control(&FullHistoryRepairControl {
             started: Instant::now(),
             timeout: FULL_HISTORY_REPAIR_TIMEOUT,

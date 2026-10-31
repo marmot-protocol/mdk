@@ -9,8 +9,8 @@ use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 use std::sync::Arc;
 use std::time::Duration;
 use storage_sqlite::{
-    RecoveryCause, RecoveryUnitOutcome, SqliteAppStorage, StoredEpochBackfillIntent,
-    TransportReconciliationRoute,
+    RecoveryCause, RecoveryCoverageProof, RecoveryCoverageSlice, RecoveryUnitOutcome,
+    SqliteAppStorage, StoredEpochBackfillIntent, TransportReconciliationRoute,
 };
 use tokio::sync::watch;
 
@@ -92,6 +92,31 @@ fn group_routes(client: &AppClient) -> Vec<TransportReconciliationRoute> {
         .map(|route| route.route)
         .filter(|route| matches!(route, TransportReconciliationRoute::Group(_)))
         .collect()
+}
+
+/// The inbox owes nothing on its relays, so only the groups' debt runs.
+fn cover_inbox(client: &AppClient, storage: &SqliteAppStorage) {
+    let now = unix_now_seconds();
+    for route in client
+        .recovery_runner_routes()
+        .into_iter()
+        .filter(|route| route.route == TransportReconciliationRoute::Inbox)
+    {
+        for relay in route.required.iter().chain(&route.best_effort) {
+            storage
+                .record_recovery_coverage(
+                    &[RecoveryCoverageSlice {
+                        route: &route.route,
+                        relay,
+                        since_seconds: 0,
+                        until_seconds: now + DAY,
+                        proof: RecoveryCoverageProof::Comparison,
+                    }],
+                    now + DAY,
+                )
+                .unwrap();
+        }
+    }
 }
 
 fn passes(client: &AppClient) -> u32 {
@@ -200,6 +225,7 @@ async fn held_client(
     storage
         .widen_recovery_coverage_goals(&group_routes(&client), unix_now_seconds() - HOUR)
         .unwrap();
+    cover_inbox(&client, &storage);
     (dir, relay, client, storage)
 }
 

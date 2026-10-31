@@ -366,7 +366,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
   account owner's native input goal uses cause `subscription_replay` in those existing rows, without loss
-  charges or history certificates. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
+  charges or history certificates. Ledger notices (behind `runner_owns_debt`) record `notice_shown` and
+  `notice_dismissed` with cause `unproven_history`, the route tag as the obligation id. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
@@ -413,7 +414,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
-  `recheck`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
+  `recheck`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
   `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, off; proofs turn it on with the hidden
   `MarmotApp::with_recovery_runner_owning_debt`), never a host setting or cargo feature, until the switch-over flips it.
   With the gate off nothing constructs it and the comparison owner keeps every behavior. `host` is its only seat:
@@ -450,7 +451,17 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own
   `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
   with the adapter's fence ticket and held routes; `fence_live_frames` answers with that ticket. Nothing calls
-  them or `enable_live_fences` before the switch-over. Logs carry aggregates only.
+  them or `enable_live_fences` before the switch-over. The inbox is a route like a group's, compared only and never
+  swept (`compare::plan_inbox`); a relay that will not compare it refuses its unit, never that relay's group
+  comparisons, and admission never fences it. Explicit repair behind the gate (`repair`) is one request the runner
+  takes at a step boundary (`RecoveryRunner::repair` under a `PassBound`): a re-arm turn, then passes whose turns the
+  waiting caller serves, until a verdict turn or the bound's stop or deadline, which settles the quantum in flight. The
+  worker spawns its runner before the startup drain and hands its `SpawnedRunner` through the command context.
+  Verdicts are today's, never `Ok`. Each survey publishes the required units still catching up
+  (`RunnerHost::surveyed`) into `AppTransportRouting`'s catching-up watch: the only source of the account recovery
+  status, the worker's `RecoveryStatusChanged` cue, and the condition for a remainder's notice. Ledger notices
+  (`HistoryNoticeCause::UnprovenHistory`, ids from `ledger_route_tag` and the park revision) skip a suspended group's
+  routes (`RunnerRoute::suspended`); they, the status and its event show nothing with the gate off.
   An Unrecoverable group's routes are suspended (`RunnerRoute.unrecoverable`, read from the engine's group record
   each debt turn): never scheduled, charged, broken or noticed, left out of admission so what they staged is given
   back as an unlisted route's is, and with the gate on the comparison owner drops their
@@ -464,7 +475,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   read (`None`) is never evidence. Window hints come from the live conversation captures
   (`open_conversation_groups`). The breaker's pauses and late findings are process counters
   (`recovery_runner_counts`) carried only by the v5 `recovery_runner_paused` row, written through the turn's audit
-  sink (`WorkerTurn::audit`).
+  sink (`WorkerTurn::audit`). Logs carry aggregates only.
 - The configured audit OTLP/HTTP sender is `marmot-observability`'s `src/audit_otlp_sender.rs`, which hosts name as
   `marmot_app::audit_otlp_sender`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,

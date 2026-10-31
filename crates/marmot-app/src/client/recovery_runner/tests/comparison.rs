@@ -6,7 +6,7 @@ use storage_sqlite::TransportReconciliationItem;
 
 impl Account {
     /// The account holds `events` on `route`: its reconciliation inventory.
-    fn hold(&self, route: &Route, events: &[Event]) {
+    pub(super) fn hold(&self, route: &Route, events: &[Event]) {
         let items = events
             .iter()
             .map(|event| TransportReconciliationItem {
@@ -32,7 +32,7 @@ impl Account {
             .unwrap();
     }
 
-    fn staged_events(&self, route: &Route) -> u64 {
+    pub(super) fn staged_events(&self, route: &Route) -> u64 {
         self.app
             .staged_recovery_usage(std::slice::from_ref(route), None)
             .unwrap()
@@ -41,13 +41,13 @@ impl Account {
 }
 
 /// `count` events spread evenly over `[since, until)`.
-fn spread(group: [u8; 32], since: u64, until: u64, count: u64) -> Vec<Event> {
+pub(super) fn spread(group: [u8; 32], since: u64, until: u64, count: u64) -> Vec<Event> {
     (0..count)
         .map(|index| event(group, since + index * (until - since) / count))
         .collect()
 }
 
-fn ids(events: &[Event]) -> BTreeSet<EventId> {
+pub(super) fn ids(events: &[Event]) -> BTreeSet<EventId> {
     events.iter().map(|event| event.id).collect()
 }
 

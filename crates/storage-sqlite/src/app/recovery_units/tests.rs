@@ -557,13 +557,14 @@ fn caps_changes_rearm_and_unknown_reads_do_not() {
     assert_eq!(unit(&app, &planned, RELAY).state, RecoveryUnitState::Active);
 }
 
-/// Explicit repair re-arms every broken and retired unit, owes every parked
-/// and retired span again and makes every re-check due.
+/// Explicit repair re-arms every broken and retired unit, ends an active
+/// unit's backoff, owes every parked and retired span again and makes every
+/// re-check due.
 #[test]
 fn explicit_repair_rearms_everything() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let app = storage.app_storage();
-    let (parked, retired) = (group(1), group(2));
+    let (parked, retired, backing_off) = (group(1), group(2), group(3));
     for route in [&parked, &retired] {
         owing(&app, route, NOW - 1_000, (NOW - 1_000, NOW - 501));
         break_unit(&app, route, NOW);
@@ -572,7 +573,27 @@ fn explicit_repair_rearms_everything() {
     }
     let revision = unit(&app, &retired, RELAY).park.unwrap().revision;
     assert!(app.dismiss_recovery_route_park(&retired, revision).unwrap());
+    owing(&app, &backing_off, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    let before = settle(
+        &app,
+        &backing_off,
+        RELAY,
+        RecoveryUnitOutcome::NoProgress,
+        NOW,
+    );
+    assert!(before.next_attempt_at_seconds > NOW);
     assert_eq!(app.rearm_all_recovery_units().unwrap(), 2);
+    let due = unit(&app, &backing_off, RELAY);
+    assert_eq!(
+        (
+            due.state,
+            due.no_progress,
+            due.backoff_step,
+            due.next_attempt_at_seconds
+        ),
+        (RecoveryUnitState::Active, 0, 0, 0),
+        "an active unit backing off is due again"
+    );
     for route in [&parked, &retired] {
         let repaired = unit(&app, route, RELAY);
         assert_eq!(

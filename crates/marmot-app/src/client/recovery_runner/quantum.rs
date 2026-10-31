@@ -354,9 +354,7 @@ pub(super) async fn run<H: RunnerHost>(
         relay: &*relay,
         meter: &meter,
     };
-    let route = SweepRoute::Group {
-        nostr_group_id: plan.nostr_group_id,
-    };
+    let route = plan.route;
     let mut sink = StageSink {
         host,
         plan,

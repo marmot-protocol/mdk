@@ -751,6 +751,13 @@ pub(crate) fn rearm_all_units_tx(conn: &Connection) -> StorageResult<usize> {
             [],
         )
         .storage()?;
+    // An active unit backing off is due again too, with no streak.
+    conn.execute_cached(
+        "UPDATE account_recovery_units SET no_progress = 0, backoff_step = 0,
+         next_attempt_at_seconds = 0 WHERE state = 0",
+        [],
+    )
+    .storage()?;
     conn.execute_cached("DELETE FROM account_recovery_unit_spans", [])
         .storage()?;
     conn.execute_cached(
@@ -1561,9 +1568,11 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Explicit repair: every broken and retired unit is active again with a
-    /// fresh budget, every parked and retired span is owed again, and every
-    /// unit's re-check falls due now. Returns the units re-armed.
+    /// Explicit repair: every broken and retired unit is active again, every
+    /// unit starts a fresh budget (no backoff, no no-progress streak), every
+    /// parked and retired span is owed again, and every unit's re-check falls
+    /// due now. Relay cooldowns and the account's budget stay. Returns the
+    /// broken and retired units re-armed.
     pub fn rearm_all_recovery_units(&self) -> StorageResult<usize> {
         self.connection
             .with_transaction(|| rearm_all_units_tx(&*self.lock()?))

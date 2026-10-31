@@ -59,11 +59,19 @@ pub use sdk::SdkSweepRelay;
 /// Marmot group message kind.
 const GROUP_MESSAGE_KIND: u16 = 445;
 
-/// What one sweep walks.
+/// NIP-59 gift wrap kind: an account inbox's events.
+const GIFT_WRAP_KIND: u16 = 1059;
+
+/// What one sweep or comparison walks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SweepRoute {
     /// A group's kind-445 events, by their 32-byte Nostr routing id (`#h`).
     Group { nostr_group_id: [u8; 32] },
+    /// An account inbox's gift wraps, by the recipient's 32-byte public key
+    /// (`#p`). Compared only, never swept: many inbox relays restrict who may
+    /// read kind 1059, so a short page proves nothing there (see the module's
+    /// known limit).
+    Inbox { pubkey: [u8; 32] },
 }
 
 impl SweepRoute {
@@ -77,31 +85,33 @@ impl SweepRoute {
     }
 
     fn second_filter(&self, since: u64, until: u64) -> Filter {
-        match self {
-            Self::Group { nostr_group_id } => Filter::new()
-                .kind(Kind::from(GROUP_MESSAGE_KIND))
-                .custom_tag(
-                    SingleLetterTag::from_char('h').expect("h is a valid single-letter tag"),
-                    hex::encode(nostr_group_id),
-                )
-                .since(Timestamp::from_secs(since))
-                .until(Timestamp::from_secs(until)),
-        }
+        let (kind, tag, value) = match self {
+            Self::Group { nostr_group_id } => (GROUP_MESSAGE_KIND, 'h', nostr_group_id),
+            Self::Inbox { pubkey } => (GIFT_WRAP_KIND, 'p', pubkey),
+        };
+        Filter::new()
+            .kind(Kind::from(kind))
+            .custom_tag(
+                SingleLetterTag::from_char(tag).expect("a valid single-letter tag"),
+                hex::encode(value),
+            )
+            .since(Timestamp::from_secs(since))
+            .until(Timestamp::from_secs(until))
     }
 
     /// Whether an event a relay returned belongs to this route.
     pub(crate) fn matches(&self, event: &Event) -> bool {
-        match self {
-            Self::Group { nostr_group_id } => {
-                event.kind == Kind::from(GROUP_MESSAGE_KIND)
-                    && event.tags.iter().any(|tag| {
-                        let parts = tag.as_slice();
-                        parts.len() >= 2
-                            && parts[0] == "h"
-                            && hex::decode(&parts[1]).ok().as_deref() == Some(nostr_group_id)
-                    })
-            }
-        }
+        let (kind, tag, value) = match self {
+            Self::Group { nostr_group_id } => (GROUP_MESSAGE_KIND, "h", nostr_group_id),
+            Self::Inbox { pubkey } => (GIFT_WRAP_KIND, "p", pubkey),
+        };
+        event.kind == Kind::from(kind)
+            && event.tags.iter().any(|candidate| {
+                let parts = candidate.as_slice();
+                parts.len() >= 2
+                    && parts[0] == tag
+                    && hex::decode(&parts[1]).ok().as_deref() == Some(value.as_slice())
+            })
     }
 }
 

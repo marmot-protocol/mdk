@@ -27,12 +27,25 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   intent_kind, reason }` (mdk#2694), freed with its event. Handle the new tag
   and use matching regenerated headers and libraries.
 
+- `MarmotHistoryNoticeCause` appends `UnprovenHistory`, and `MarmotEvent`
+  appends `RecoveryStatusChanged { account_id_hex, account_label }`, freed with
+  its event (mdk#2660). Existing values keep their numbers. Handle the new
+  values in exhaustive switches and use matching regenerated headers and
+  libraries. Neither is produced until the recovery runner owns history.
+
 - `marmot_deployment_set_key_package_client_preference` is removed
   (mdk#2628): the KeyPackage `client` tag no longer ranks invite candidates.
   Drop the call and use matching regenerated headers and libraries.
 
 ### Added
 
+- `marmot_account_recovery_status` writes an owned
+  `MarmotAccountRecoveryStatus`: the groups whose history is still being
+  fetched (`catching_up_group_ids_hex`), whether the inbox's is
+  (`inbox_catching_up`), and every notice (`notices`) (mdk#2660). Free it with
+  `marmot_account_recovery_status_free`, and re-read it on
+  `MARMOT_EVENT_RECOVERY_STATUS_CHANGED`. Until the recovery runner owns
+  history nothing is ever catching up.
 - `MarmotClientOptions` gains a trailing `device_platform`: the platform this
   device runs on, such as "iOS", which each device writes with its client
   label into its own roster entry (mdk#2628 item 3.6). NULL leaves it out.
