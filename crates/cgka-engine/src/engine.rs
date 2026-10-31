@@ -3764,24 +3764,94 @@ impl<S: StorageProvider> Engine<S> {
         roster: &DeviceRosterV1,
     ) -> Result<Option<DeviceTagClaim>, EngineError> {
         self.with_live_mls_group(group_id, |mls_group| {
-            if mls_group.epoch().as_u64() != epoch.0 {
-                return Ok(None);
-            }
-            let Some(leaf) = mls_group
-                .public_group()
-                .leaf(openmls::prelude::LeafNodeIndex::new(leaf_index))
-            else {
-                return Ok(None);
-            };
-            let own_account = openmls::prelude::BasicCredential::try_from(
-                leaf.credential().clone(),
-            )
-            .is_ok_and(|credential| credential.identity() == self.identity.self_id().as_slice());
-            Ok(Some(if own_account {
-                crate::device_tag::device_tag_claim(leaf, roster)
+            Ok(if mls_group.epoch().as_u64() == epoch.0 {
+                self.leaf_device_tag_claim(mls_group, leaf_index, roster)
             } else {
-                DeviceTagClaim::Unclaimed
-            }))
+                None
+            })
+        })
+    }
+
+    /// Which roster slot the leaf at `leaf_index` belonged to at `epoch`, as
+    /// [`Self::member_device_tag_claim`] reads it, but a past epoch is read
+    /// from its own retained anchor, never from another epoch's tree, so a
+    /// message read after later commits still names the leaf that sent it, as
+    /// that leaf was then (mdk#2628 3.5). That read writes nothing: it
+    /// rewinds inside a savepoint it always rolls back. `None` when `epoch` is
+    /// neither current nor retained, or no leaf sat at that index.
+    pub fn member_device_tag_claim_at(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> Result<Option<DeviceTagClaim>, EngineError> {
+        let claim = |mls_group: &openmls::group::MlsGroup| {
+            self.leaf_device_tag_claim(mls_group, leaf_index, roster)
+        };
+        if let Some(current) = self.with_live_mls_group(group_id, |mls_group| {
+            Ok((mls_group.epoch().as_u64() == epoch.0).then(|| claim(mls_group)))
+        })? {
+            return Ok(current);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-device-tag-restore/v1");
+        hasher.update(group_id.as_slice());
+        hasher.update(epoch.0.to_be_bytes());
+        let suffix = hex::encode(&hasher.finalize()[..8]);
+        let site = crate::snapshot_guard::RewindSite::DeviceTagSource;
+        // The read leaves through the savepoint's error path, so every write
+        // the rewind made, its guard included, is rolled back.
+        enum Undone {
+            Read(Result<Option<DeviceTagClaim>, EngineError>),
+            Storage(StorageError),
+        }
+        impl From<StorageError> for Undone {
+            fn from(error: StorageError) -> Self {
+                Self::Storage(error)
+            }
+        }
+        let undone = self.storage.with_group_savepoint(
+            group_id,
+            &site.snapshot_name(&format!("{suffix}-undo")),
+            |storage| {
+                Err::<std::convert::Infallible, _>(Undone::Read(
+                    crate::openmls_projection::with_retained_anchor_group(
+                        storage,
+                        &self.crypto,
+                        group_id,
+                        epoch,
+                        site,
+                        &suffix,
+                        |historical_group, _| Ok(claim(historical_group)),
+                    ),
+                ))
+            },
+        );
+        match undone {
+            Ok(never) => match never {},
+            Err(Undone::Read(read)) => read,
+            Err(Undone::Storage(error)) => Err(error.into()),
+        }
+    }
+
+    /// The slot the leaf at `leaf_index` of `mls_group` reads as, or `None`
+    /// when no leaf sits there.
+    fn leaf_device_tag_claim(
+        &self,
+        mls_group: &openmls::group::MlsGroup,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> Option<DeviceTagClaim> {
+        let leaf = mls_group
+            .public_group()
+            .leaf(openmls::prelude::LeafNodeIndex::new(leaf_index))?;
+        let own_account = openmls::prelude::BasicCredential::try_from(leaf.credential().clone())
+            .is_ok_and(|credential| credential.identity() == self.identity.self_id().as_slice());
+        Some(if own_account {
+            crate::device_tag::device_tag_claim(leaf, roster)
+        } else {
+            DeviceTagClaim::Unclaimed
         })
     }
 
@@ -4003,7 +4073,12 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &mut self,
         welcome_msg: TransportMessage,
     ) -> Result<GroupId, EngineError> {
-        self.do_join_welcome(welcome_msg, None).await
+        self.do_join_welcome(
+            welcome_msg,
+            None,
+            crate::group_lifecycle::WelcomeRoute::Delivery,
+        )
+        .await
     }
 
     fn feature_status(

@@ -79,7 +79,7 @@ pub use profile::{
 };
 pub use routing::{
     NOSTR_RELAY_URL_MAX_LEN, NOSTR_ROUTING_MAX_RELAYS, NostrRoutingV1, decode_nostr_routing_v1,
-    encode_nostr_routing_v1,
+    encode_nostr_routing_v1, validate_nostr_relay_url,
 };
 
 /// MLS ComponentID.

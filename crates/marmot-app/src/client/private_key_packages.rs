@@ -31,19 +31,42 @@
 //!   receipts. An issuer at its cap answers with the newest KeyPackages it
 //!   already issued, handed over again, and this device never keeps one it
 //!   has used (mdk#2628 D42).
+//! - A sibling Welcome (461) adds this device to a chat with one of the
+//!   KeyPackages it issued (3.5b). It is read like a hand-off, and also only
+//!   when its relays are valid and its KeyPackage is one this device issued
+//!   to its sender. The dispatch that reads it cannot wait for a join, so an
+//!   admitted one is stashed (migration 0160) and each maintenance pass joins
+//!   from the stash, before upkeep tops the sender's stock up again, while
+//!   its carrier is still delivered. A refused one is dropped like a refused
+//!   hand-off, and so is one whose carrier a branch switch withdrew. One whose
+//!   checks could not be read, or admitted but not stashed, fails the event's
+//!   projection, which is retried, so a failed read or write never loses it.
+//! - A sibling Welcome into a chat this device still holds an active copy of,
+//!   such as one ahead of the removal it follows, is held: the engine writes
+//!   nothing, and the row keeps the chat's id. Each pass leaves it until that
+//!   copy reads removed or unrecoverable, then joins it, with no consent
+//!   asked. It goes once it can never join: its carrier withdrawn, its
+//!   KeyPackage used or expired, or the chat forgotten or disbanded. A full
+//!   stash makes room for a new Welcome by dropping its oldest held one.
 
 use base64::Engine as _;
-use cgka_traits::app_components::DeviceSlotId;
-use cgka_traits::storage::IssuedPrivateKeyPackage;
-use cgka_traits::{EpochId, GroupId, KeyPackage, MemberId, MessageId};
+use cgka_traits::app_components::{
+    DeviceSlotId, NOSTR_ROUTING_MAX_RELAYS, validate_nostr_relay_url,
+};
+use cgka_traits::storage::{IssuedPrivateKeyPackage, MessageStorage as _};
+use cgka_traits::welcome::SiblingWelcomeJoin;
+use cgka_traits::{
+    EpochId, GroupId, IngestOutcome, KeyPackage, MemberId, MessageId, MessageState, StorageError,
+    Timestamp,
+};
 use marmot_session::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,
     MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW, PRIVATE_KEY_PACKAGE_STOCK_TARGET,
-    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, private_key_package_stock,
+    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, SiblingWelcome, private_key_package_stock,
     validate_received_private_key_package,
 };
-use std::collections::BTreeMap;
-use storage_sqlite::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage};
+use std::collections::{BTreeMap, BTreeSet};
+use storage_sqlite::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage, StashedSiblingWelcome};
 
 use super::AppClient;
 use super::device_group::Exchange;
@@ -54,6 +77,26 @@ const TRACE_TARGET: &str = "marmot_app::client::private_key_packages";
 /// While a need lasts, a device asks the same sibling again at most this
 /// often.
 const REQUEST_INTERVAL_SECS: u64 = 60 * 60;
+
+/// Where the chat a held sibling Welcome is into stands.
+enum HeldChat {
+    /// This device still holds an active copy of it.
+    Active,
+    /// Its copy reads removed or unrecoverable: the Welcome joins now.
+    LetGo,
+    /// Forgotten or disbanded: the Welcome never joins.
+    Gone,
+}
+
+/// What admission makes of a sibling Welcome. A read admission could not
+/// make is an error, never a refusal.
+pub(super) enum SiblingWelcomeAdmission {
+    /// Not addressed to this device.
+    NotAddressed,
+    /// Refused for what it says or who sent it.
+    Refused(AppError),
+    Admitted(StashedSiblingWelcome),
+}
 
 impl AppClient {
     /// Answer a sibling's request by issuing what it wants. Upkeep sends the
@@ -153,6 +196,253 @@ impl AppClient {
             "kept handed-over private KeyPackages"
         );
         Ok(())
+    }
+
+    /// Admit a sibling Welcome that adds this device to a chat, for
+    /// [`Self::stash_sibling_welcome`] to keep. Beyond a hand-off's checks,
+    /// its relays must be one to [`NOSTR_ROUTING_MAX_RELAYS`] distinct relay
+    /// URLs, and its KeyPackage one this device issued to the sender and
+    /// still holds; the join checks that KeyPackage again. An error is a
+    /// read that failed, which the caller retries rather than drop the
+    /// Welcome.
+    pub(super) fn admit_sibling_welcome(
+        &mut self,
+        group_id: &GroupId,
+        message_id: &MessageId,
+        sender: (EpochId, Option<u32>),
+        created_at: u64,
+        content: &str,
+    ) -> Result<SiblingWelcomeAdmission, AppError> {
+        use SiblingWelcomeAdmission::{Admitted, NotAddressed, Refused};
+        let Some(exchange) = self.device_group_exchange()? else {
+            return Ok(NotAddressed);
+        };
+        let invalid = || Refused(AppError::InvalidAppMessagePayload("sibling Welcome".into()));
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(content) else {
+            return Ok(invalid());
+        };
+        let Ok(welcome) = SiblingWelcome::decode(&bytes) else {
+            return Ok(invalid());
+        };
+        if &exchange.group_id != group_id || welcome.to != exchange.own_slot {
+            return Ok(NotAddressed);
+        }
+        if !exchange.is_sibling(&welcome.from) {
+            return Ok(Refused(AppError::DeviceGroupRefused("unknown_sibling")));
+        }
+        match self.ensure_sent_by(&exchange.group_id, &exchange.roster, sender, &welcome.from) {
+            Ok(()) => {}
+            Err(refused @ AppError::DeviceGroupRefused(_)) => return Ok(Refused(refused)),
+            Err(error) => return Err(error),
+        }
+        if !valid_sibling_welcome_relays(&welcome.relays) {
+            return Ok(invalid());
+        }
+        if !self
+            .runtime
+            .issued_private_key_packages()?
+            .iter()
+            .any(|record| {
+                record.key_package_ref == welcome.key_package_ref
+                    && record.recipient_slot == welcome.from
+            })
+        {
+            return Ok(Refused(AppError::DeviceGroupRefused(
+                "key_package_not_issued_to_sender",
+            )));
+        }
+        Ok(Admitted(StashedSiblingWelcome {
+            message_id_hex: hex::encode(message_id.as_slice()),
+            content: bytes,
+            created_at,
+            received_at: unix_now_seconds(),
+            held_group_id_hex: None,
+        }))
+    }
+
+    /// Keep an admitted sibling Welcome for the next maintenance pass to
+    /// join. A full stash makes room by evicting its oldest held Welcome;
+    /// with none held, the new one is dropped, and its sender's resend (3.5e)
+    /// is the repair.
+    pub(super) fn stash_sibling_welcome(
+        &mut self,
+        admitted: &StashedSiblingWelcome,
+    ) -> Result<(), AppError> {
+        let stashed = self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .stash_sibling_welcome(admitted)?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "stash_sibling_welcome",
+            stashed,
+            "stashed a sibling Welcome"
+        );
+        Ok(())
+    }
+
+    /// Join a chat from every stashed sibling Welcome, oldest first, and
+    /// project the joins. A Welcome leaves the stash once its join settles,
+    /// whether it joined or was refused, and unjoined once its carrier is no
+    /// longer delivered. One into a chat this device still holds stays, held,
+    /// until that chat lets go of it or it can never join. One whose join
+    /// failed stays for the next pass.
+    pub(crate) async fn join_stashed_sibling_welcomes(&mut self) {
+        if !self.app.device_groups_enabled() || self.runtime.maintenance_is_paused() {
+            return;
+        }
+        if let Err(error) = self.try_join_stashed_sibling_welcomes().await {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "join_stashed_sibling_welcomes",
+                error_kind = error.privacy_safe_kind(),
+                "could not join from stashed sibling Welcomes"
+            );
+        }
+    }
+
+    async fn try_join_stashed_sibling_welcomes(&mut self) -> Result<(), AppError> {
+        let stashed = self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .stashed_sibling_welcomes()?;
+        if stashed.is_empty() {
+            return Ok(());
+        }
+        // As for any other join, keep block updates out until the joins and
+        // their projection have settled.
+        let policy_lock = self.app.block_update_lock(&self.state.label).await;
+        let _policy_guard = policy_lock.lock().await;
+        // A join retires its chat's rejoin offers, which the host shows until
+        // it is told, even when a later row's failure ends the pass.
+        let offers = self.rejoin_offer_snapshot()?;
+        let joined = self.join_each_stashed_sibling_welcome(stashed).await;
+        self.reconcile_rejoin_offer_changes(offers)?;
+        if joined? > 0 {
+            // GroupJoined is journaled durably, so a failed projection is
+            // repaired by the ordinary reopen and drain path.
+            let summary = self.drain_pending_session_events().await?;
+            self.pending_applied_sync_summary.merge(summary);
+        }
+        Ok(())
+    }
+
+    /// Settle each stashed row in turn; the number that joined a chat.
+    async fn join_each_stashed_sibling_welcome(
+        &mut self,
+        stashed: Vec<StashedSiblingWelcome>,
+    ) -> Result<usize, AppError> {
+        let account = self.app.account_storage(&self.state.label)?;
+        let storage = account.app_storage();
+        let issued = self.runtime.issued_private_key_packages()?;
+        let now = unix_now_seconds();
+        let (mut joined, mut held, mut refused, mut withdrawn, mut expired, mut failed) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        for record in stashed {
+            let (Ok(welcome), Ok(message_id)) = (
+                SiblingWelcome::decode(&record.content),
+                hex::decode(&record.message_id_hex).map(MessageId::new),
+            ) else {
+                storage.delete_stashed_sibling_welcome(&record.message_id_hex)?;
+                refused += 1;
+                continue;
+            };
+            // Join only while the carrier is still delivered: a branch
+            // switch that withdraws it (or rolls it back) withdraws the
+            // Welcome too. Should the carrier be selected again, its replay
+            // stashes the Welcome again.
+            match account.get_message(&message_id) {
+                Ok(carrier) if carrier.state == MessageState::Processed => {}
+                Ok(_) | Err(StorageError::NotFound) => {
+                    storage.delete_stashed_sibling_welcome(&record.message_id_hex)?;
+                    withdrawn += 1;
+                    continue;
+                }
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            }
+            // A held Welcome waits for its chat's copy to let go, and goes
+            // once it can never join.
+            if let Some(chat) = &record.held_group_id_hex {
+                let key_package_held = issued.iter().any(|issued| {
+                    issued.key_package_ref == welcome.key_package_ref
+                        && issued.recipient_slot == welcome.from
+                        && now < issued.not_after
+                });
+                let chat = match hex::decode(chat) {
+                    Ok(chat) if key_package_held => self.held_chat(&GroupId::new(chat)),
+                    _ => Ok(HeldChat::Gone),
+                };
+                match chat {
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                    Ok(HeldChat::Active) => {
+                        held += 1;
+                        continue;
+                    }
+                    Ok(HeldChat::Gone) => {
+                        storage.delete_stashed_sibling_welcome(&record.message_id_hex)?;
+                        expired += 1;
+                        continue;
+                    }
+                    Ok(HeldChat::LetGo) => {}
+                }
+            }
+            match self
+                .runtime
+                .join_sibling_welcome(&message_id, &welcome, Some(Timestamp(record.created_at)))
+                .await
+            {
+                Ok(SiblingWelcomeJoin::Held { group_id }) => {
+                    storage.hold_stashed_sibling_welcome(
+                        &record.message_id_hex,
+                        &hex::encode(group_id.as_slice()),
+                    )?;
+                    held += 1;
+                }
+                Ok(SiblingWelcomeJoin::Settled(outcome)) => {
+                    storage.delete_stashed_sibling_welcome(&record.message_id_hex)?;
+                    if matches!(outcome, IngestOutcome::Processed) {
+                        joined += 1;
+                    } else {
+                        refused += 1;
+                    }
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "join_stashed_sibling_welcomes",
+            joined,
+            held,
+            refused,
+            withdrawn,
+            expired,
+            failed,
+            "joined from stashed sibling Welcomes"
+        );
+        Ok(joined)
+    }
+
+    /// Where the chat a held sibling Welcome is into stands. A chat whose
+    /// record cannot be read now, such as one awaiting hydration, is still
+    /// active.
+    fn held_chat(&self, chat: &GroupId) -> Result<HeldChat, AppError> {
+        if self.is_group_forgotten(chat)? {
+            return Ok(HeldChat::Gone);
+        }
+        Ok(match self.runtime.group_record(chat) {
+            Ok(group) if group.disbanded.is_some() => HeldChat::Gone,
+            Ok(group) if group.removed || group.unrecoverable => HeldChat::LetGo,
+            Ok(_) | Err(_) => HeldChat::Active,
+        })
     }
 
     /// Delete expired private KeyPackages on both sides, issued ones with
@@ -408,4 +698,17 @@ impl AppClient {
             .delete_received_private_key_packages_from(&hex::encode(sibling))?;
         Ok(())
     }
+}
+
+/// Whether `relays` is a sibling Welcome's valid relay list: one to
+/// [`NOSTR_ROUTING_MAX_RELAYS`] Nostr relay URLs, none repeated once parsed.
+/// Parsing folds host case, a default port and an empty path, so two
+/// spellings of one relay count as a repeat.
+fn valid_sibling_welcome_relays(relays: &[String]) -> bool {
+    let mut parsed = BTreeSet::new();
+    (1..=NOSTR_ROUTING_MAX_RELAYS).contains(&relays.len())
+        && relays.iter().all(|relay| {
+            validate_nostr_relay_url(relay).is_ok()
+                && url::Url::parse(relay).is_ok_and(|url| parsed.insert(url))
+        })
 }

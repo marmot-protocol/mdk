@@ -320,7 +320,8 @@ async fn a_history_stays_owed_until_it_reaches_a_relay_and_again_once_withdrawn_
             epoch: cgka_traits::EpochId(0),
             reason: cgka_traits::engine::AppMessageInvalidationReason::LosingBranch,
             decrypted_payload_ref: None,
-        });
+        })
+        .unwrap();
     assert_eq!(phone_storage.unsent_history_deliveries().unwrap().len(), 1);
     devices.phone.drive_history_deliveries().await;
     assert!(

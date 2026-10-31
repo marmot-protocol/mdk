@@ -522,10 +522,10 @@
 ### Fixed
 
 - Kinds sent only in a device group (heartbeat 457, private KeyPackage
-  request 459 and hand-off 460, small-state update 475 and broadcast
-  request 476) are ignored in any other group (mdk#2628). One
-  received in a chat makes no timeline row, host message or notification,
-  and `send_custom_event` refuses each as reserved
+  request 459 and hand-off 460, sibling Welcome 461, history delivery 473,
+  small-state update 475 and broadcast request 476) are ignored in any other
+  group (mdk#2628). One received in a chat makes no timeline row, host
+  message or notification, and `send_custom_event` refuses each as reserved
   (`is_reserved_app_event_kind`). The device group itself still reads them.
 - External-signer sticker installs and uninstalls prepare event IDs and
   finish signing before changing local intent. Refused signatures leave

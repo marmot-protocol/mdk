@@ -354,9 +354,30 @@ impl<S: StorageProvider> Engine<S> {
         // id could be recovered, then return a typed stale outcome. Storage and
         // truly internal transition failures still propagate.
         let joined = match prepared {
-            Ok(prepared) => self.do_join_welcome(msg.clone(), Some(prepared)).await,
+            Ok(prepared) => {
+                self.do_join_welcome(
+                    msg.clone(),
+                    Some(prepared),
+                    group_lifecycle::WelcomeRoute::Delivery,
+                )
+                .await
+            }
             Err(error) => Err(error),
         };
+        self.welcome_join_outcome(msg, content_id, key_package_claim, joined)
+    }
+
+    /// The ingest outcome of a Welcome join, shared by both Welcome routes.
+    /// `key_package_claim` is the KeyPackage publication the delivery names,
+    /// if any. Any classifiable failure is terminal input, not a failure of
+    /// the drain; storage and internal transition failures still propagate.
+    pub(crate) fn welcome_join_outcome(
+        &mut self,
+        msg: &TransportMessage,
+        content_id: Option<MessageId>,
+        key_package_claim: Option<MessageId>,
+        joined: Result<GroupId, EngineError>,
+    ) -> Result<IngestOutcome, EngineError> {
         match joined {
             Ok(gid) => {
                 self.persist_transport_message(msg, &gid, EpochId(0), MessageState::Processed)?;

@@ -17,9 +17,9 @@
 //!   other group, so no chat projects one and no host sends one as a custom
 //!   event.
 //! - [`AppClient::ensure_sent_by`] reads which slot sent a message from the
-//!   sending leaf's device tag (D33), through 3.1d's one tag reader. It reads
-//!   only the current tree, so a message from an earlier epoch has no
-//!   readable sender.
+//!   sending leaf's device tag (D33), through 3.1d's one tag reader. A
+//!   message from an earlier epoch is read from that epoch's retained anchor,
+//!   so one older than the retained anchors has no readable sender.
 //! - [`AppClient::device_group_exchange`] names the device group, its roster,
 //!   this device's slot and whether this device's own leaf is tagged, which
 //!   decides whether siblings will read what it sends.
@@ -37,10 +37,13 @@ use cgka_traits::app_event::MarmotAppEvent;
 use cgka_traits::engine::{GroupEvent, SendIntent};
 use cgka_traits::storage::MaintenanceStorage as _;
 use cgka_traits::{EpochId, GroupId, MessageId};
-use marmot_session::{KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST};
+use marmot_session::{
+    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
+};
 
 use super::device_slot;
 use crate::client::AppClient;
+use crate::client::private_key_packages::SiblingWelcomeAdmission;
 use crate::history_delivery::KIND_HISTORY_DELIVERY;
 use crate::small_state::{KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE};
 use crate::{AppError, unix_now_seconds};
@@ -51,16 +54,17 @@ const TRACE_TARGET: &str = "marmot_app::client::device_group::messages";
 pub(crate) const KIND_DEVICE_HEARTBEAT: u64 = 457;
 
 /// True for a kind sent only in a device group: a heartbeat, a private
-/// KeyPackage request or hand-off, a history delivery, or a small-state update
-/// or broadcast request. A device reads these only in the device group it
-/// trusts and ignores them in any other group. Whatever kind a device-group
-/// feature adds goes here too.
+/// KeyPackage request or hand-off, a sibling Welcome, a history delivery, or a
+/// small-state update or broadcast request. A device reads these only in the
+/// device group it trusts and ignores them in any other group. Whatever kind a
+/// device-group feature adds goes here too.
 pub(crate) fn is_device_group_kind(kind: u64) -> bool {
     matches!(
         kind,
         KIND_DEVICE_HEARTBEAT
             | KIND_PRIVATE_KEY_PACKAGE_REQUEST
             | KIND_PRIVATE_KEY_PACKAGE_HAND_OFF
+            | KIND_SIBLING_WELCOME
             | KIND_HISTORY_DELIVERY
             | KIND_SMALL_STATE_UPDATE
             | KIND_SMALL_STATE_BROADCAST_REQUEST
@@ -128,8 +132,14 @@ impl AppClient {
 
     /// Take a message from a device-group event and hand it to the feature
     /// that owns its kind. Anything else is ignored, and so is anything that
-    /// feature finds not addressed to this device.
-    pub(crate) fn observe_device_group_event(&mut self, event: &GroupEvent) {
+    /// feature finds not addressed to this device. A refused message is
+    /// logged and dropped. An error means a sibling Welcome could not be
+    /// checked or kept: the event's projection fails and is retried, as any
+    /// failed projection write is.
+    pub(crate) fn observe_device_group_event(
+        &mut self,
+        event: &GroupEvent,
+    ) -> Result<(), AppError> {
         if let GroupEvent::AppMessageInvalidated {
             group_id,
             message_id,
@@ -137,7 +147,7 @@ impl AppClient {
         } = event
         {
             self.device_group_message_withdrawn(group_id, message_id);
-            return;
+            return Ok(());
         }
         let GroupEvent::MessageReceived {
             group_id,
@@ -148,10 +158,10 @@ impl AppClient {
             ..
         } = event
         else {
-            return;
+            return Ok(());
         };
         let Ok(message) = MarmotAppEvent::decode(payload) else {
-            return;
+            return Ok(());
         };
         let sender = (*epoch, *sender_leaf_index);
         let result = match message.kind {
@@ -164,6 +174,19 @@ impl AppClient {
             KIND_PRIVATE_KEY_PACKAGE_HAND_OFF => {
                 self.receive_key_package_hand_off(group_id, sender, &message.content)
             }
+            KIND_SIBLING_WELCOME => match self.admit_sibling_welcome(
+                group_id,
+                message_id,
+                sender,
+                message.created_at,
+                &message.content,
+            )? {
+                SiblingWelcomeAdmission::Admitted(admitted) => {
+                    return self.stash_sibling_welcome(&admitted);
+                }
+                SiblingWelcomeAdmission::NotAddressed => Ok(()),
+                SiblingWelcomeAdmission::Refused(refused) => Err(refused),
+            },
             KIND_HISTORY_DELIVERY => {
                 self.receive_history_delivery(group_id, &message.id, sender, &message.content)
             }
@@ -171,7 +194,7 @@ impl AppClient {
             KIND_SMALL_STATE_BROADCAST_REQUEST => {
                 self.receive_small_state_broadcast_request(group_id, &message.content)
             }
-            _ => return,
+            _ => return Ok(()),
         };
         let result = result.and_then(|()| {
             if withdrawal_handled(message.kind) {
@@ -194,14 +217,15 @@ impl AppClient {
                 "a device-group message was refused"
             );
         }
+        Ok(())
     }
 
     /// Refuse a message unless the leaf that sent it, at the message's epoch,
     /// carries a device tag that reads as `from`'s in `roster` (mdk#2628 D33).
     /// A sibling whose leaf is not tagged yet is refused and not counted; it
     /// sends again once it has tagged its leaf. So is a removed device, whose
-    /// tag reads as its rejected slot, and a message from an epoch that is no
-    /// longer current.
+    /// tag reads as its rejected slot, and a message from an epoch that is
+    /// neither current nor retained.
     pub(crate) fn ensure_sent_by(
         &mut self,
         group_id: &GroupId,
@@ -212,7 +236,7 @@ impl AppClient {
         let claim = match sender_leaf_index {
             Some(leaf) => self
                 .runtime
-                .member_device_tag_claim(group_id, epoch, leaf, roster)?,
+                .member_device_tag_claim_at(group_id, epoch, leaf, roster)?,
             None => None,
         };
         if claim == Some(DeviceTagClaim::Device(*from)) {

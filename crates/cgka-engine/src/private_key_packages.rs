@@ -13,6 +13,9 @@
 //! - A request (kind 459) and a hand-off (kind 460) carry the sender's and the
 //!   addressee's slots in their content. This module owns their wire codecs;
 //!   the app sends and receives them.
+//! - A sibling Welcome (kind 461) carries the Welcome for an add that consumed
+//!   the addressee's private KeyPackage, with that KeyPackage's ref and the
+//!   chat's relays (marmot#471). This module owns its codec too.
 
 use crate::engine::Engine;
 use crate::key_package::{
@@ -22,12 +25,16 @@ use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
+use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::storage::{
     IssuedPrivateKeyPackage, PrivateKeyPackageStorage, StorageProvider, private_key_package_halfway,
 };
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
+use cgka_traits::welcome::SiblingWelcomeJoin;
 use cgka_traits::{MemberId, MessageId};
 use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use tls_codec::{Deserialize as _, Serialize as _, VLBytes};
 
@@ -35,6 +42,8 @@ use tls_codec::{Deserialize as _, Serialize as _, VLBytes};
 pub const KIND_PRIVATE_KEY_PACKAGE_REQUEST: u64 = 459;
 /// Kind of a hand-off of private KeyPackages, sent inside the device group.
 pub const KIND_PRIVATE_KEY_PACKAGE_HAND_OFF: u64 = 460;
+/// Kind of a sibling Welcome, sent inside the device group.
+pub const KIND_SIBLING_WELCOME: u64 = 461;
 /// How many usable private KeyPackages an issuer keeps with each sibling.
 pub const PRIVATE_KEY_PACKAGE_STOCK_TARGET: usize = 10;
 /// Below this many usable ones, the issuer tops a sibling up to the target.
@@ -51,6 +60,11 @@ pub const MAX_HAND_OFF_KEY_PACKAGES: usize = 20;
 pub const MAX_RETAINED_PRIVATE_KEY_PACKAGES: usize = 3 * MAX_PRIVATE_KEY_PACKAGE_WANT as usize;
 const HAND_OFF_VERSION: u8 = 1;
 const REQUEST_VERSION: u64 = 1;
+const SIBLING_WELCOME_VERSION: u8 = 1;
+/// The longest `KeyPackageRefV1` the roster's encoding allows.
+const MAX_KEY_PACKAGE_REF_LEN: usize = 64;
+/// The longest relay URL a sibling Welcome carries.
+const MAX_SIBLING_WELCOME_RELAY_LEN: usize = 512;
 
 /// A sibling asks the addressee for `want` new private KeyPackages.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -183,6 +197,116 @@ impl PrivateKeyPackageHandOff {
     }
 }
 
+/// A Welcome that consumes the addressee's private KeyPackage, sent by the
+/// sibling whose Commit added it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiblingWelcome {
+    pub from: DeviceSlotId,
+    pub to: DeviceSlotId,
+    /// The consumed private KeyPackage's `KeyPackageRef`, 1 to 64 bytes.
+    pub key_package_ref: Vec<u8>,
+    /// One `mls_welcome` MLSMessage, as MLS encodes it.
+    pub welcome: Vec<u8>,
+    /// Where the new member fetches the chat's group messages.
+    pub relays: Vec<String>,
+}
+
+impl SiblingWelcome {
+    /// The binary `SiblingWelcomeV1 { uint8 version; SlotId from; SlotId to;
+    /// KeyPackageRefV1 key_package_ref; MLSMessage welcome;
+    /// SiblingWelcomeRelayV1 relays<V> }`, each relay an `opaque url<1..512>`.
+    /// The message content is its standard base64.
+    pub fn encode(&self) -> Result<Vec<u8>, EngineError> {
+        let invalid = |reason: &str| EngineError::Serialize(format!("sibling Welcome: {reason}"));
+        if !(1..=MAX_KEY_PACKAGE_REF_LEN).contains(&self.key_package_ref.len()) {
+            return Err(invalid("a KeyPackageRef is 1 to 64 bytes"));
+        }
+        if !is_one_welcome(&self.welcome) {
+            return Err(invalid("not one mls_welcome MLSMessage"));
+        }
+        let mut relays = Vec::new();
+        for relay in &self.relays {
+            if !(1..=MAX_SIBLING_WELCOME_RELAY_LEN).contains(&relay.len()) {
+                return Err(invalid("a relay URL is 1 to 512 bytes"));
+            }
+            VLBytes::new(relay.as_bytes().to_vec())
+                .tls_serialize(&mut relays)
+                .map_err(|error| invalid(&format!("{error:?}")))?;
+        }
+        let mut bytes = vec![SIBLING_WELCOME_VERSION];
+        bytes.extend_from_slice(&self.from);
+        bytes.extend_from_slice(&self.to);
+        VLBytes::new(self.key_package_ref.clone())
+            .tls_serialize(&mut bytes)
+            .map_err(|error| invalid(&format!("{error:?}")))?;
+        bytes.extend_from_slice(&self.welcome);
+        VLBytes::new(relays)
+            .tls_serialize(&mut bytes)
+            .map_err(|error| invalid(&format!("{error:?}")))?;
+        Ok(bytes)
+    }
+
+    /// Decode a sibling Welcome, accepting only the exact encoding: version
+    /// 1, a ref of 1 to 64 bytes, one `mls_welcome` MLSMessage, relay URLs of
+    /// 1 to 512 bytes of UTF-8, and nothing left over. The Welcome itself is
+    /// not processed here.
+    pub fn decode(bytes: &[u8]) -> Result<Self, EngineError> {
+        let invalid = || EngineError::Serialize("invalid sibling Welcome".into());
+        let (&version, rest) = bytes.split_first().ok_or_else(invalid)?;
+        if version != SIBLING_WELCOME_VERSION || rest.len() < 64 {
+            return Err(invalid());
+        }
+        let (from, rest) = rest.split_at(32);
+        let (to, mut rest) = rest.split_at(32);
+        let key_package_ref = VLBytes::tls_deserialize(&mut rest).map_err(|_| invalid())?;
+        if !(1..=MAX_KEY_PACKAGE_REF_LEN).contains(&key_package_ref.as_slice().len()) {
+            return Err(invalid());
+        }
+        let before = rest;
+        let message = MlsMessageIn::tls_deserialize(&mut rest).map_err(|_| invalid())?;
+        if !matches!(message.extract(), MlsMessageBodyIn::Welcome(_)) {
+            return Err(invalid());
+        }
+        let welcome = before[..before.len() - rest.len()].to_vec();
+        let list = VLBytes::tls_deserialize(&mut rest).map_err(|_| invalid())?;
+        if !rest.is_empty() {
+            return Err(invalid());
+        }
+        let mut remaining = list.as_slice();
+        let mut relays = Vec::new();
+        while !remaining.is_empty() {
+            let relay = VLBytes::tls_deserialize(&mut remaining).map_err(|_| invalid())?;
+            if !(1..=MAX_SIBLING_WELCOME_RELAY_LEN).contains(&relay.as_slice().len()) {
+                return Err(invalid());
+            }
+            relays.push(String::from_utf8(relay.as_slice().to_vec()).map_err(|_| invalid())?);
+        }
+        Ok(Self {
+            from: from.try_into().map_err(|_| invalid())?,
+            to: to.try_into().map_err(|_| invalid())?,
+            key_package_ref: key_package_ref.as_slice().to_vec(),
+            welcome,
+            relays,
+        })
+    }
+}
+
+/// The id a sibling Welcome's join is recorded under, derived from the id of
+/// the device-group message that carried it, which keeps its own record.
+pub(crate) fn sibling_welcome_id(message_id: &MessageId) -> MessageId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot sibling welcome v1");
+    hasher.update(message_id.as_slice());
+    MessageId::new(hasher.finalize().to_vec())
+}
+
+/// Whether `bytes` are exactly one `mls_welcome` MLSMessage.
+fn is_one_welcome(mut bytes: &[u8]) -> bool {
+    MlsMessageIn::tls_deserialize(&mut bytes)
+        .is_ok_and(|message| matches!(message.extract(), MlsMessageBodyIn::Welcome(_)))
+        && bytes.is_empty()
+}
+
 /// Validate a KeyPackage a sibling handed over, as decoded: a current-profile
 /// KeyPackage of `account`, single-use, unexpired at `now`, whose leaf
 /// carries a device tag that reads as `from`'s in `roster`, the device
@@ -229,16 +353,15 @@ pub(crate) fn issued_references<S: StorageProvider>(
     })
 }
 
-/// Whether `key_package_ref` names a private KeyPackage this device issued.
-pub(crate) fn is_issued<S: StorageProvider>(
+/// The record of the private KeyPackage `key_package_ref` names, if this
+/// device issued it.
+pub(crate) fn issued_record<S: StorageProvider>(
     storage: &S,
     key_package_ref: &[u8],
-) -> Result<bool, EngineError> {
+) -> Result<Option<IssuedPrivateKeyPackage>, EngineError> {
     Ok(match storage.private_key_package_storage() {
-        Some(private) => private
-            .issued_private_key_package(key_package_ref)?
-            .is_some(),
-        None => false,
+        Some(private) => private.issued_private_key_package(key_package_ref)?,
+        None => None,
     })
 }
 
@@ -251,7 +374,7 @@ fn private_storage<S: StorageProvider>(
 }
 
 /// Delete a record and its private bundle.
-fn delete_issued<S: StorageProvider>(
+pub(crate) fn delete_issued<S: StorageProvider>(
     storage: &S,
     record: &IssuedPrivateKeyPackage,
 ) -> Result<(), EngineError> {
@@ -373,6 +496,67 @@ impl<S: StorageProvider> Engine<S> {
             }
             Ok(answered)
         })
+    }
+
+    /// Join a chat from a sibling Welcome (mdk#2628 3.5), carried by the
+    /// device-group message `message_id`, which `created_at` dates as its
+    /// sender wrote it. The caller admits it first: it arrived in the trusted
+    /// device group, `to` is this device's slot, `from` is another device of
+    /// the roster, and the sending leaf's tag reads as `from`'s.
+    ///
+    /// The join consumes only the private KeyPackage the Welcome names, and
+    /// only one this device issued to `from` and still holds; it then deletes
+    /// that KeyPackage's issued record. Every other check is a Welcome join's.
+    /// Settled outcomes are an ingested Welcome's: a refusal names its
+    /// reason, and only storage and internal failures are errors. Into a
+    /// chat this device still holds an active copy of, it is held: nothing is
+    /// written, and the Welcome joins once that copy reads removed or
+    /// unrecoverable.
+    pub async fn join_sibling_welcome(
+        &mut self,
+        message_id: &MessageId,
+        welcome: &SiblingWelcome,
+        created_at: Option<Timestamp>,
+    ) -> Result<SiblingWelcomeJoin, EngineError> {
+        let msg = TransportMessage {
+            id: sibling_welcome_id(message_id),
+            payload: welcome.welcome.clone(),
+            timestamp: created_at.unwrap_or_default(),
+            causal_deps: Vec::new(),
+            source: TransportSource("device-group".into()),
+            envelope: TransportEnvelope::Welcome {
+                recipient: self.identity.self_id().clone(),
+            },
+        };
+        let peeled = PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            // Every device of the account is a sibling's sender.
+            sender: Some(self.identity.self_id().clone()),
+            content: PeeledContent::Welcome {
+                bytes: welcome.welcome.clone(),
+                created_at,
+                key_package_event_id: None,
+            },
+            origin: msg.clone(),
+        };
+        let content_id = crate::group_lifecycle::welcome_content_dedup_id(&peeled)?;
+        let joined = self
+            .do_join_welcome(
+                msg.clone(),
+                Some((peeled, content_id.clone())),
+                crate::group_lifecycle::WelcomeRoute::Sibling {
+                    from: welcome.from,
+                    key_package_ref: welcome.key_package_ref.clone(),
+                },
+            )
+            .await;
+        if let Err(EngineError::SiblingWelcomeHeld { group_id }) = joined {
+            return Ok(SiblingWelcomeJoin::Held { group_id });
+        }
+        // A private KeyPackage has no publication to name.
+        self.welcome_join_outcome(&msg, Some(content_id), None, joined)
+            .map(SiblingWelcomeJoin::Settled)
     }
 
     /// Every private KeyPackage this device issued, oldest first.

@@ -23,10 +23,10 @@ pub use cgka_engine::key_package::{
     KeyPackageRequirements, durably_owned_key_packages, key_package_metadata,
 };
 pub use cgka_engine::private_key_packages::{
-    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,
-    MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW, PRIVATE_KEY_PACKAGE_STOCK_TARGET,
-    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, private_key_package_stock,
-    validate_received_private_key_package,
+    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
+    MAX_HAND_OFF_KEY_PACKAGES, MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW,
+    PRIVATE_KEY_PACKAGE_STOCK_TARGET, PrivateKeyPackageHandOff, PrivateKeyPackageRequest,
+    SiblingWelcome, private_key_package_stock, validate_received_private_key_package,
 };
 pub use cgka_engine::recovery_key::RECOVERY_ENTROPY_LEN;
 use cgka_engine::{Engine, EngineBuilder};
@@ -50,6 +50,7 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, MaintenanceStorage, StorageError};
 use cgka_traits::transport::{Timestamp, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::welcome::SiblingWelcomeJoin;
 use cgka_traits::{
     OutboundFanout, SecretBytes, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
 };
@@ -1036,6 +1037,19 @@ impl AccountDeviceSession {
             .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
     }
 
+    /// See [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
+    pub fn member_device_tag_claim_at(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> SessionResult<Option<DeviceTagClaim>> {
+        Ok(self
+            .engine
+            .member_device_tag_claim_at(group_id, epoch, leaf_index, roster)?)
+    }
+
     /// See [`cgka_engine::engine::Engine::own_account_leaf_claims`].
     pub fn own_account_leaf_claims(
         &self,
@@ -1344,6 +1358,31 @@ impl AccountDeviceSession {
             effects,
             valid_proposal_groups,
         })
+    }
+
+    /// Join a chat from a sibling Welcome the caller admitted from the
+    /// trusted device group. Its events wait for the next drain, as a
+    /// confirmed rejoin's do. See [`cgka_engine::Engine::join_sibling_welcome`].
+    pub async fn join_sibling_welcome(
+        &mut self,
+        message_id: &MessageId,
+        welcome: &SiblingWelcome,
+        created_at: Option<Timestamp>,
+    ) -> SessionResult<SiblingWelcomeJoin> {
+        let outcome = self
+            .engine
+            .join_sibling_welcome(message_id, welcome, created_at)
+            .await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "join_sibling_welcome",
+            outcome_kind = match &outcome {
+                SiblingWelcomeJoin::Settled(outcome) => ingest_outcome_kind(outcome),
+                SiblingWelcomeJoin::Held { .. } => "held",
+            },
+            "sibling Welcome ingested"
+        );
+        Ok(outcome)
     }
 
     pub async fn advance_convergence(

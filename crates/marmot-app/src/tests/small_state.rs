@@ -530,10 +530,12 @@ async fn siblings_exchange_small_state_through_the_device_group() {
     );
     devices
         .phone
-        .observe_device_group_event(&withdrawn(&group, &sent[&update].0));
+        .observe_device_group_event(&withdrawn(&group, &sent[&update].0))
+        .unwrap();
     devices
         .laptop
-        .observe_device_group_event(&withdrawn(&group, &read[&update].0));
+        .observe_device_group_event(&withdrawn(&group, &read[&update].0))
+        .unwrap();
     assert_eq!(
         phone_storage().unsent_small_state_items().unwrap().len(),
         401
@@ -546,10 +548,12 @@ async fn siblings_exchange_small_state_through_the_device_group() {
     // A withdrawn request owes a new one, on both.
     devices
         .phone
-        .observe_device_group_event(&withdrawn(&group, &sent[&request].0));
+        .observe_device_group_event(&withdrawn(&group, &sent[&request].0))
+        .unwrap();
     devices
         .laptop
-        .observe_device_group_event(&withdrawn(&group, &read[&request].0));
+        .observe_device_group_event(&withdrawn(&group, &read[&request].0))
+        .unwrap();
     for storage in [phone_storage(), laptop_storage()] {
         assert!(
             storage
@@ -582,13 +586,15 @@ async fn siblings_exchange_small_state_through_the_device_group() {
     assert!(!recorded(&devices.phone, &group).contains_key(&request));
     devices
         .phone
-        .observe_device_group_event(&withdrawn(&group, &sent[&request].0));
+        .observe_device_group_event(&withdrawn(&group, &sent[&request].0))
+        .unwrap();
     assert_eq!(phone.unsent_small_state_items().unwrap().len(), 401);
     assert!(phone.small_state_schedule().unwrap().unwrap().request_owed);
     settle();
     devices
         .phone
-        .observe_device_group_event(&withdrawn(&group, &MessageId::new(vec![0x77; 32])));
+        .observe_device_group_event(&withdrawn(&group, &MessageId::new(vec![0x77; 32])))
+        .unwrap();
     assert_eq!(phone.unsent_small_state_items().unwrap().len(), 401);
     assert!(phone.small_state_schedule().unwrap().unwrap().request_owed);
 }
