@@ -5309,3 +5309,327 @@ fn canonical_push_leaf_reconciliation_is_atomic_and_account_scoped() {
         0
     );
 }
+
+fn hex_id(byte: u8, len: usize) -> String {
+    hex::encode(vec![byte; len])
+}
+
+fn direct_group(group_id_hex: &str, local: &str, peer: &str) -> StoredAccountGroup {
+    StoredAccountGroup {
+        member_count: Some(2),
+        direct_member_ids_hex: Some(vec![local.to_owned(), peer.to_owned()]),
+        ..group(group_id_hex, "")
+    }
+}
+
+#[test]
+fn fill_unindexed_direct_conversation_members_does_not_clobber_newer_rows() {
+    let local = hex_id(0xaa, 32);
+    let old_peer = hex_id(0xbb, 32);
+    let new_peer = hex_id(0xcc, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct_group(&group_id, &local, &old_peer)],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .replace_direct_conversation_members(&group_id, &[local.clone(), new_peer.clone()])
+        .unwrap();
+    assert!(
+        !store
+            .fill_unindexed_direct_conversation_members(
+                &group_id,
+                &[local.clone(), old_peer.clone()]
+            )
+            .unwrap(),
+        "a later projection save must win over a stale backfill write"
+    );
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    assert_eq!(
+        store
+            .direct_conversation_candidate_rows(&new_peer)
+            .unwrap()
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec![group_id.as_str()]
+    );
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&old_peer)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn fill_unindexed_direct_conversation_members_writes_when_empty() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let group_id = hex_id(0x11, 16);
+    let mut unindexed = direct_group(&group_id, &local, &peer);
+    unindexed.direct_member_ids_hex = None;
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![unindexed],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    assert_eq!(
+        store.unindexed_direct_conversation_group_ids().unwrap(),
+        vec![group_id.clone()]
+    );
+    assert!(
+        store
+            .fill_unindexed_direct_conversation_members(&group_id, &[local.clone(), peer.clone()])
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec![group_id.as_str()]
+    );
+}
+
+#[test]
+fn reset_direct_conversation_members_backfill_clears_index_and_marker() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct_group(&group_id, &local, &peer)],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    store
+        .mark_account_import_complete("direct-conversation-members-backfill-v1")
+        .unwrap();
+    assert!(
+        !store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .account_import_marker("direct-conversation-members-backfill-v1")
+            .unwrap()
+    );
+
+    store
+        .reset_direct_conversation_members_backfill("direct-conversation-members-backfill-v1")
+        .unwrap();
+
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !store
+            .account_import_marker("direct-conversation-members-backfill-v1")
+            .unwrap()
+    );
+    assert_eq!(
+        store.unindexed_direct_conversation_group_ids().unwrap(),
+        vec![group_id]
+    );
+}
+
+#[test]
+fn persist_direct_index_follows_two_member_ids_not_stale_count() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let extra = hex_id(0xcc, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+
+    let mut stale_count = direct_group(&group_id, &local, &peer);
+    stale_count.member_count = Some(3);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![stale_count],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    let loaded = store
+        .load_account_projection_state("alice", 16)
+        .unwrap()
+        .groups
+        .into_iter()
+        .find(|group| group.group_id_hex == group_id)
+        .expect("stale-count group");
+    let mut loaded_members = loaded.direct_member_ids_hex.expect("persisted members");
+    loaded_members.sort();
+    let mut expected_members = vec![local.clone(), peer.clone()];
+    expected_members.sort();
+    assert_eq!(
+        loaded_members, expected_members,
+        "empty-name projections with exactly two member ids must persist the index"
+    );
+
+    let mut stale_ids = direct_group(&group_id, &local, &peer);
+    stale_ids.direct_member_ids_hex = Some(vec![local.clone(), peer.clone(), extra]);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![stale_ids],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty(),
+        "a three-member id slice must not persist the peer index"
+    );
+}
+
+#[test]
+fn replace_direct_conversation_members_rejects_non_two_member_slices() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let extra = hex_id(0xcc, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct_group(&group_id, &local, &peer)],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+
+    store
+        .replace_direct_conversation_members(&group_id, std::slice::from_ref(&local))
+        .unwrap();
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+
+    store
+        .replace_direct_conversation_members(&group_id, &[local.clone(), peer.clone(), extra])
+        .unwrap();
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+
+    store
+        .replace_direct_conversation_members(&group_id, &[local.clone(), peer.clone()])
+        .unwrap();
+    assert_eq!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec![group_id.as_str()]
+    );
+}
+
+#[test]
+fn account_group_ids_defaulting_to_member_lists_only_default_rows() {
+    // Backfill candidate set: rows still carrying the migration default
+    // 'member' are returned; rows explicitly flipped to 'removed' are not, so
+    // re-running the one-time backfill stays idempotent.
+    let other_group = group("22", "Marmot Lab");
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![group("11", "Marmot Lab"), other_group],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+
+    // Both rows start at the default 'member', so both are candidates.
+    assert_eq!(
+        store.account_group_ids_defaulting_to_member().unwrap(),
+        vec!["11".to_owned(), "22".to_owned()]
+    );
+
+    // Once a row is flipped to 'removed' it drops out of the candidate set.
+    store
+        .set_group_self_membership("11", SelfMembership::Removed)
+        .unwrap();
+    assert_eq!(
+        store.account_group_ids_defaulting_to_member().unwrap(),
+        vec!["22".to_owned()]
+    );
+
+    // Re-affirming 'member' keeps a row in the candidate set (still default).
+    store
+        .set_group_self_membership("22", SelfMembership::Member)
+        .unwrap();
+    assert_eq!(
+        store.account_group_ids_defaulting_to_member().unwrap(),
+        vec!["22".to_owned()]
+    );
+
+    // No defaulted rows left once every row is explicitly resolved.
+    store
+        .set_group_self_membership("22", SelfMembership::Removed)
+        .unwrap();
+    assert!(
+        store
+            .account_group_ids_defaulting_to_member()
+            .unwrap()
+            .is_empty()
+    );
+}

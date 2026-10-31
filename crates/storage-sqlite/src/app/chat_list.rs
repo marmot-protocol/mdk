@@ -540,28 +540,6 @@ impl SqliteAppStorage {
         direct_conversation_candidate_rows_tx(&conn, peer_account_id_hex)
     }
 
-    /// `EXPLAIN QUERY PLAN` for the peer-keyed candidate read.
-    ///
-    /// Used by the regression that requires
-    /// `idx_direct_conversation_members_member` as the driving index.
-    pub fn direct_conversation_candidate_query_plan(
-        &self,
-        peer_account_id_hex: &str,
-    ) -> StorageResult<Vec<String>> {
-        let peer_account_id_hex = peer_account_id_hex.trim().to_ascii_lowercase();
-        if peer_account_id_hex.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.lock()?;
-        let sql = format!("EXPLAIN QUERY PLAN {}", direct_conversation_candidate_sql());
-        let mut statement = conn.prepare_cached(&sql).storage()?;
-        statement
-            .query_map(params![peer_account_id_hex], |row| row.get::<_, String>(3))
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()
-    }
-
     /// Direct groups that still have no peer-index rows.
     ///
     /// Used only by the once-per-open upgrade backfill. Steady-state lookup

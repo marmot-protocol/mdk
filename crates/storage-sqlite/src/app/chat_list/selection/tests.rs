@@ -97,6 +97,24 @@ fn native_view_predicates_exclude_ineligible_ids() {
             .chat_list_selection_snapshot(view)
             .unwrap();
         assert_eq!(ids(&store.app_storage(), &selection), expected);
+        // A display page reads the same view.
+        let page = store
+            .app_storage()
+            .chat_list_page(crate::ChatListPageQuery {
+                view,
+                limit: 100,
+                direction: crate::ChatListPageDirection::Forward,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(
+            page.rows
+                .iter()
+                .map(|row| row.group_id_hex.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{view:?}"
+        );
     }
 }
 

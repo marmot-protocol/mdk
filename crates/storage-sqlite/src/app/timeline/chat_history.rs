@@ -491,9 +491,9 @@ mod tests {
     use super::*;
     use crate::SqliteAccountStorage;
     use cgka_traits::app_event::{
-        AppMessageAuthority, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE,
-        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
-        MARMOT_APP_EVENT_KIND_REMOVE,
+        AppMessageAuthority, AppMessageRetentionDecision, MARMOT_APP_EVENT_KIND_CHAT,
+        MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        MARMOT_APP_EVENT_KIND_REACTION, MARMOT_APP_EVENT_KIND_REMOVE,
     };
 
     const GROUP: &str = "6767676767676767";
@@ -873,6 +873,92 @@ mod tests {
             s.imported_media_file_keys(GROUP, &other.message_id_hex)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    // mdk#2628 4.2a: an import skips a row this device holds, a repeat within
+    // the batch, and a row whose retention expired; it marks what it adds with
+    // its source and keeps that row's retention decision.
+    #[test]
+    fn an_import_adds_only_the_rows_this_device_lacks() {
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let source = DeviceSlotId::from([7; 32]);
+        let held = chat(1, 3, 30, "live");
+        let old = chat(2, 1, 10, "imported");
+        let expired = chat(2, 2, 20, "expired");
+        s.record_app_event(&held).unwrap();
+        let retained = |event: &StoredAppEvent, seconds| ImportedAppEvent {
+            retention: Some(AppMessageRetentionDecision::new(event.recorded_at, seconds)),
+            ..imported(event, Vec::new())
+        };
+
+        let outcome = s
+            .import_app_events(
+                GROUP,
+                &source,
+                &[
+                    ImportedAppEvent {
+                        plaintext: "imported".to_owned(),
+                        ..imported(&held, Vec::new())
+                    },
+                    retained(&old, 500),
+                    imported(&old, Vec::new()),
+                    retained(&expired, 5),
+                ],
+                NOW,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.imported, 1);
+        let changed = outcome
+            .update
+            .changes
+            .iter()
+            .map(|change| match change {
+                TimelineMessageChange::Upsert { trigger, message } => {
+                    (message.message_id_hex.clone(), trigger.clone())
+                }
+                TimelineMessageChange::Remove { .. } => panic!("an import removes nothing"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            changed,
+            [(
+                old.message_id_hex.clone(),
+                TimelineUpdateTrigger::SnapshotRefresh
+            )]
+        );
+
+        let kept = s
+            .timeline_message(GROUP, &held.message_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.plaintext, "live");
+        assert_eq!(kept.source_message_id_hex, held.source_message_id_hex);
+        assert_eq!(
+            s.app_event_import_source(GROUP, &held.message_id_hex)
+                .unwrap(),
+            None
+        );
+
+        let added = s
+            .timeline_message(GROUP, &old.message_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(added.plaintext, "imported");
+        assert_eq!(added.direction, "received");
+        assert_eq!(added.source_message_id_hex, None);
+        assert_eq!(added.source_epoch, Some(1));
+        assert_eq!(added.retention_expires_at, Some(510));
+        assert_eq!(
+            s.app_event_import_source(GROUP, &old.message_id_hex)
+                .unwrap(),
+            Some(source)
+        );
+        assert!(
+            s.timeline_message(GROUP, &expired.message_id_hex)
+                .unwrap()
+                .is_none()
         );
     }
 }

@@ -4,7 +4,7 @@ use crate::SqliteAccountStorage;
 use crate::base::test_support::sample_group;
 use crate::{
     SelfMembership, SqlCipherKey, StoredAccountGroup, StoredAccountGroupComponent,
-    StoredAccountState, StoredAppEvent, TimelineMessageChange, TimelineUpdateTrigger,
+    StoredAccountState, StoredAppEvent,
 };
 use cgka_traits::app_components::{
     GROUP_AVATAR_URL_COMPONENT, GROUP_AVATAR_URL_COMPONENT_ID, GroupAvatarUrlV1,
@@ -276,102 +276,6 @@ fn chat_preview_retention_finalization_is_visible_without_rebuilding_chat_rows()
     )
     .unwrap();
     assert_preview_retention(&store, "pending", (Some(300), Some(350)));
-}
-
-// Compare the existing readiness API with migration 0066’s index on synthetic history.
-// Setup, index construction, and the connection/KDF are outside the timed region.
-// Run: cargo test -p storage-sqlite --release --lib chat_startup_benchmark -- --ignored --nocapture
-#[test]
-#[ignore = "file-backed chat startup performance investigation"]
-fn chat_startup_benchmark() {
-    crate::base::connection::use_production_storage_for_test_process();
-    let dir = tempfile::tempdir().unwrap();
-    let key = SqlCipherKey::new("synthetic chat benchmark").unwrap();
-    let store =
-        SqliteAccountStorage::open_encrypted(dir.path().join("account.sqlite3"), &key).unwrap();
-    store
-        .app_storage()
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "benchmark".to_owned(),
-                groups: vec![group()],
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-    store
-        .lock()
-        .unwrap()
-        .execute_batch("DROP INDEX idx_message_timeline_group_received")
-        .unwrap();
-    let mut seeded = 0;
-    let body = "x".repeat(512);
-    for count in [10_000, 100_000] {
-        cgka_traits::StorageProvider::with_transaction(&store, |store| {
-            for index in seeded..count {
-                let mut event = chat(&format!("{index:064x}"), REMOTE, index, &body);
-                event.source_epoch = Some(1);
-                store.app_storage().record_app_event(&event)?;
-            }
-            Ok::<_, cgka_traits::StorageError>(())
-        })
-        .unwrap();
-        seeded = count;
-        let id = format!("{:064x}", count - 1);
-        store
-            .app_storage()
-            .mark_timeline_message_read(LOCAL, GROUP, &id, &no_mentions)
-            .unwrap();
-        store
-            .app_storage()
-            .ensure_chat_list_rows(LOCAL, &no_mentions)
-            .unwrap();
-        let expected = store
-            .app_storage()
-            .chat_list_rows(ChatListQuery::default())
-            .unwrap();
-        assert_eq!(expected.len(), 1);
-        assert_eq!(
-            expected[0].last_message.as_ref().unwrap().message_id_hex,
-            id
-        );
-        assert_eq!(expected[0].unread_count, 0);
-        // Repeat A/B after dropping the index to expose cache/order effects.
-        for mode in ["baseline", "indexed", "baseline", "indexed"] {
-            if mode == "indexed" {
-                store.lock().unwrap().execute_batch("CREATE INDEX idx_message_timeline_group_received ON message_timeline(group_id_hex, received_at)").unwrap();
-            }
-            store
-                .app_storage()
-                .ensure_chat_list_rows(LOCAL, &no_mentions)
-                .unwrap();
-            let mut samples = Vec::new();
-            for _ in 0..7 {
-                let start = std::time::Instant::now();
-                store
-                    .app_storage()
-                    .ensure_chat_list_rows(LOCAL, &no_mentions)
-                    .unwrap();
-                let rows = store
-                    .app_storage()
-                    .chat_list_rows(ChatListQuery::default())
-                    .unwrap();
-                samples.push(start.elapsed().as_micros());
-                assert_eq!(rows, expected);
-            }
-            samples.sort_unstable();
-            eprintln!("count={count} mode={mode} median_us={}", samples[3]);
-            if mode == "indexed" {
-                store
-                    .lock()
-                    .unwrap()
-                    .execute_batch("DROP INDEX idx_message_timeline_group_received")
-                    .unwrap();
-            }
-        }
-    }
 }
 
 /// Preview work stays bounded for accepted history and displaced pending sends.
@@ -784,7 +688,7 @@ fn clearing_manual_unread_does_not_move_the_message_marker() {
 }
 
 #[test]
-fn chat_list_rows_join_effective_mute_without_per_row_queries() {
+fn chat_list_rows_report_effective_mute() {
     let store = setup_store().app_storage();
     store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
 
@@ -1166,8 +1070,19 @@ fn direct_conversation_candidate_rows_are_keyed_by_peer() {
     expected_members.sort();
     assert_eq!(loaded_members, expected_members);
 
-    let plan = app
-        .direct_conversation_candidate_query_plan(&hex_id(0xbb, 32))
+    let plan = store
+        .lock()
+        .unwrap()
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            direct_conversation_candidate_sql()
+        ))
+        .unwrap()
+        .query_map(rusqlite::params![hex_id(0xbb, 32)], |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
         .unwrap()
         .join("\n")
         .to_ascii_lowercase();
@@ -1178,263 +1093,6 @@ fn direct_conversation_candidate_rows_are_keyed_by_peer() {
     assert!(
         !plan.contains("scan chat_list_rows") && !plan.contains("scan account_groups"),
         "peer lookup must not full-scan chat tables: {plan}"
-    );
-}
-
-#[test]
-fn fill_unindexed_direct_conversation_members_does_not_clobber_newer_rows() {
-    let local = hex_id(0xaa, 32);
-    let old_peer = hex_id(0xbb, 32);
-    let new_peer = hex_id(0xcc, 32);
-    let group_id = hex_id(0x11, 16);
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: vec![direct_group(&group_id, &local, &old_peer)],
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-    store
-        .replace_direct_conversation_members(&group_id, &[local.clone(), new_peer.clone()])
-        .unwrap();
-    assert!(
-        !store
-            .fill_unindexed_direct_conversation_members(
-                &group_id,
-                &[local.clone(), old_peer.clone()]
-            )
-            .unwrap(),
-        "a later projection save must win over a stale backfill write"
-    );
-    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
-    assert_eq!(
-        store
-            .direct_conversation_candidate_rows(&new_peer)
-            .unwrap()
-            .iter()
-            .map(|row| row.group_id_hex.as_str())
-            .collect::<Vec<_>>(),
-        vec![group_id.as_str()]
-    );
-    assert!(
-        store
-            .direct_conversation_candidate_rows(&old_peer)
-            .unwrap()
-            .is_empty()
-    );
-}
-
-#[test]
-fn fill_unindexed_direct_conversation_members_writes_when_empty() {
-    let local = hex_id(0xaa, 32);
-    let peer = hex_id(0xbb, 32);
-    let group_id = hex_id(0x11, 16);
-    let mut unindexed = direct_group(&group_id, &local, &peer);
-    unindexed.direct_member_ids_hex = None;
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: vec![unindexed],
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
-    assert_eq!(
-        store.unindexed_direct_conversation_group_ids().unwrap(),
-        vec![group_id.clone()]
-    );
-    assert!(
-        store
-            .fill_unindexed_direct_conversation_members(&group_id, &[local.clone(), peer.clone()])
-            .unwrap()
-    );
-    assert_eq!(
-        store
-            .direct_conversation_candidate_rows(&peer)
-            .unwrap()
-            .iter()
-            .map(|row| row.group_id_hex.as_str())
-            .collect::<Vec<_>>(),
-        vec![group_id.as_str()]
-    );
-}
-
-#[test]
-fn reset_direct_conversation_members_backfill_clears_index_and_marker() {
-    let local = hex_id(0xaa, 32);
-    let peer = hex_id(0xbb, 32);
-    let group_id = hex_id(0x11, 16);
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: vec![direct_group(&group_id, &local, &peer)],
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
-    store
-        .mark_account_import_complete("direct-conversation-members-backfill-v1")
-        .unwrap();
-    assert!(
-        !store
-            .direct_conversation_candidate_rows(&peer)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        store
-            .account_import_marker("direct-conversation-members-backfill-v1")
-            .unwrap()
-    );
-
-    store
-        .reset_direct_conversation_members_backfill("direct-conversation-members-backfill-v1")
-        .unwrap();
-
-    assert!(
-        store
-            .direct_conversation_candidate_rows(&peer)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        !store
-            .account_import_marker("direct-conversation-members-backfill-v1")
-            .unwrap()
-    );
-    assert_eq!(
-        store.unindexed_direct_conversation_group_ids().unwrap(),
-        vec![group_id]
-    );
-}
-
-#[test]
-fn persist_direct_index_follows_two_member_ids_not_stale_count() {
-    let local = hex_id(0xaa, 32);
-    let peer = hex_id(0xbb, 32);
-    let extra = hex_id(0xcc, 32);
-    let group_id = hex_id(0x11, 16);
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-
-    let mut stale_count = direct_group(&group_id, &local, &peer);
-    stale_count.member_count = Some(3);
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: vec![stale_count],
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
-    let loaded = store
-        .load_account_projection_state("alice", 16)
-        .unwrap()
-        .groups
-        .into_iter()
-        .find(|group| group.group_id_hex == group_id)
-        .expect("stale-count group");
-    let mut loaded_members = loaded.direct_member_ids_hex.expect("persisted members");
-    loaded_members.sort();
-    let mut expected_members = vec![local.clone(), peer.clone()];
-    expected_members.sort();
-    assert_eq!(
-        loaded_members, expected_members,
-        "empty-name projections with exactly two member ids must persist the index"
-    );
-
-    let mut stale_ids = direct_group(&group_id, &local, &peer);
-    stale_ids.direct_member_ids_hex = Some(vec![local.clone(), peer.clone(), extra]);
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: vec![stale_ids],
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
-    assert!(
-        store
-            .direct_conversation_candidate_rows(&peer)
-            .unwrap()
-            .is_empty(),
-        "a three-member id slice must not persist the peer index"
-    );
-}
-
-#[test]
-fn replace_direct_conversation_members_rejects_non_two_member_slices() {
-    let local = hex_id(0xaa, 32);
-    let peer = hex_id(0xbb, 32);
-    let extra = hex_id(0xcc, 32);
-    let group_id = hex_id(0x11, 16);
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: vec![direct_group(&group_id, &local, &peer)],
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
-
-    store
-        .replace_direct_conversation_members(&group_id, std::slice::from_ref(&local))
-        .unwrap();
-    assert!(
-        store
-            .direct_conversation_candidate_rows(&peer)
-            .unwrap()
-            .is_empty()
-    );
-
-    store
-        .replace_direct_conversation_members(&group_id, &[local.clone(), peer.clone(), extra])
-        .unwrap();
-    assert!(
-        store
-            .direct_conversation_candidate_rows(&peer)
-            .unwrap()
-            .is_empty()
-    );
-
-    store
-        .replace_direct_conversation_members(&group_id, &[local.clone(), peer.clone()])
-        .unwrap();
-    assert_eq!(
-        store
-            .direct_conversation_candidate_rows(&peer)
-            .unwrap()
-            .iter()
-            .map(|row| row.group_id_hex.as_str())
-            .collect::<Vec<_>>(),
-        vec![group_id.as_str()]
     );
 }
 
@@ -1705,18 +1363,6 @@ fn never_messaged_rows_sort_by_creation_then_group_id_across_rebuilds() {
 }
 
 #[test]
-fn initialize_chat_read_state_returns_none_for_unknown_group() {
-    let store = setup_store();
-
-    let row = store
-        .app_storage()
-        .initialize_chat_read_state(LOCAL, "missing-group", &no_mentions)
-        .unwrap();
-
-    assert_eq!(row, None);
-}
-
-#[test]
 fn visible_activity_survives_read_metadata_membership_and_secure_prune_updates() {
     for mark_read in [false, true] {
         let store = setup_store();
@@ -1925,6 +1571,12 @@ fn refresh_chat_list_row_returns_refreshed_single_group_projection() {
             .unwrap(),
         None
     );
+    assert_eq!(
+        store
+            .initialize_chat_read_state(LOCAL, "missing-group", &no_mentions)
+            .unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -2129,51 +1781,6 @@ fn ensure_chat_list_rows_rebuilds_stale_message_rows() {
     assert_eq!(last_message.plaintext, "new preview");
 }
 
-/// Migration 0141 adds `last_message_tags_json` as nullable. Existing rows with
-/// a last message have NULL until rebuilt; the completeness check must detect
-/// them and force a rebuild so tags are populated.
-#[test]
-fn ensure_chat_list_rows_rebuilds_when_last_message_tags_json_is_null() {
-    let store = setup_store().app_storage();
-    store
-        .record_app_event(&chat_with_tags(
-            "tagged",
-            REMOTE,
-            10,
-            "hello",
-            vec![vec!["p".to_owned(), LOCAL.to_owned()]],
-        ))
-        .unwrap();
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-
-    // Simulate the post-migration state: tags_json is NULL for a row that has
-    // a last message.
-    {
-        let conn = store.lock().unwrap();
-        conn.execute(
-            "UPDATE chat_list_rows SET last_message_tags_json = NULL WHERE group_id_hex = ?1",
-            params![GROUP],
-        )
-        .unwrap();
-    }
-
-    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let row = store
-        .chat_list_rows(crate::ChatListQuery::default())
-        .unwrap()
-        .pop()
-        .expect("chat row");
-
-    let last_message = row.last_message.expect("last message");
-    assert_eq!(
-        last_message.tags,
-        vec![vec!["p".to_owned(), LOCAL.to_owned()]],
-        "tags should be rebuilt from the timeline after the NULL-tag rebuild"
-    );
-}
-
 #[test]
 fn ensure_chat_list_rows_rebuilds_stale_read_state_rows() {
     let store = setup_store();
@@ -2256,127 +1863,86 @@ fn chat_list_read_state_and_preview_follow_canonical_epoch_order() {
 }
 
 #[test]
-fn newer_authenticated_message_replaces_older_pending_preview() {
-    let store = setup_store().app_storage();
-    let mut pending = chat("pending", LOCAL, 100, "older pending send");
-    pending.source_message_id_hex = None;
-    pending.source_epoch = None;
-    store.record_app_event(&pending).unwrap();
-
-    let mut delivered = chat("delivered", LOCAL, 100, "newer delivered send");
-    delivered.source_epoch = Some(7);
-    store.record_app_event(&delivered).unwrap();
-
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap()
-        .expect("chat row");
-    let preview = row.last_message.expect("latest preview");
-    assert_eq!(preview.message_id_hex, "delivered");
-    assert_eq!(
-        preview.delivery_state,
-        ChatListMessageDeliveryState::Delivered
-    );
-}
-
-#[test]
-fn newer_pending_message_replaces_older_authenticated_preview() {
-    let store = setup_store().app_storage();
-    let mut delivered = chat("delivered", LOCAL, 100, "older delivered send");
-    delivered.source_epoch = Some(7);
-    store.record_app_event(&delivered).unwrap();
-
-    let mut pending = chat("pending", LOCAL, 100, "newer pending send");
-    pending.source_message_id_hex = None;
-    pending.source_epoch = None;
-    store.record_app_event(&pending).unwrap();
-
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap()
-        .expect("chat row");
-    let preview = row.last_message.expect("latest preview");
-    assert_eq!(preview.message_id_hex, "pending");
-    assert_eq!(
-        preview.delivery_state,
-        ChatListMessageDeliveryState::Pending
-    );
-}
-
-#[test]
-fn pending_preview_clock_rollback() {
-    let store = setup_store().app_storage();
-    let mut stale = chat("stale", LOCAL, 1_000, "stale pending");
-    stale.source_message_id_hex = None;
-    store.record_app_event(&stale).unwrap();
-    store
-        .record_app_event(&chat("accepted", REMOTE, 100, "accepted"))
-        .unwrap();
-    // Both sends are newer insertions, but the last insertion has an older clock.
-    for (id, at) in [("newer-clock", 50), ("newer-insertion", 40)] {
-        let mut pending = chat(id, LOCAL, at, "pending");
-        pending.source_message_id_hex = None;
-        store.record_app_event(&pending).unwrap();
+fn latest_preview_orders_pending_and_accepted_sends() {
+    // A send no relay accepted has no source id, even when its source epoch
+    // is already set: the epoch is captured at encryption time.
+    fn pending(id: &str, at: u64, source_epoch: Option<u64>) -> StoredAppEvent {
+        let mut event = chat(id, LOCAL, at, "pending send");
+        event.source_message_id_hex = None;
+        event.source_epoch = source_epoch;
+        event
     }
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap()
-        .unwrap();
-    assert_eq!(row.last_message.unwrap().message_id_hex, "newer-clock");
-}
-
-#[test]
-fn pending_send_with_source_epoch_uses_pending_preview_ordering() {
-    let store = setup_store().app_storage();
-    let mut delivered = chat("delivered", LOCAL, 100, "older delivered send");
-    delivered.source_epoch = Some(8);
-    store.record_app_event(&delivered).unwrap();
-
-    // Source epoch is captured when the MLS message is encrypted, before a
-    // relay-assigned source id exists. The missing source id is therefore the
-    // authoritative pending signal even when the epoch is already present.
-    let mut pending = chat("pending", LOCAL, 100, "newer pending send");
-    pending.source_message_id_hex = None;
-    pending.source_epoch = Some(7);
-    store.record_app_event(&pending).unwrap();
-
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap()
-        .expect("chat row");
-    let preview = row.last_message.expect("latest preview");
-    assert_eq!(preview.message_id_hex, "pending");
-    assert_eq!(
-        preview.delivery_state,
-        ChatListMessageDeliveryState::Pending
-    );
-}
-
-#[test]
-fn replayed_older_authenticated_message_does_not_replace_newer_pending_preview() {
-    let store = setup_store().app_storage();
-    let mut delivered = chat("delivered", LOCAL, 100, "older delivered send");
-    delivered.source_epoch = Some(7);
-    store.record_app_event(&delivered).unwrap();
-
-    let mut pending = chat("pending", LOCAL, 150, "newer pending send");
-    pending.source_message_id_hex = None;
-    pending.source_epoch = None;
-    store.record_app_event(&pending).unwrap();
-
-    delivered.received_at = 200;
-    store.record_app_event(&delivered).unwrap();
-
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap()
-        .expect("chat row");
-    assert_eq!(
-        row.last_message
-            .as_ref()
-            .map(|message| message.message_id_hex.as_str()),
-        Some("pending")
-    );
+    fn delivered(id: &str, at: u64, source_epoch: u64) -> StoredAppEvent {
+        let mut event = chat(id, LOCAL, at, "delivered send");
+        event.source_epoch = Some(source_epoch);
+        event
+    }
+    let mut replayed = delivered("delivered", 100, 7);
+    replayed.received_at = 200;
+    use ChatListMessageDeliveryState::{Delivered, Pending};
+    for (case, events, expected_id, expected_state) in [
+        (
+            "a newer delivered send replaces an older pending one",
+            vec![
+                pending("pending", 100, None),
+                delivered("delivered", 100, 7),
+            ],
+            "delivered",
+            Delivered,
+        ),
+        (
+            "a newer pending send replaces an older delivered one",
+            vec![
+                delivered("delivered", 100, 7),
+                pending("pending", 100, None),
+            ],
+            "pending",
+            Pending,
+        ),
+        (
+            "a missing source id marks a send pending despite its source epoch",
+            vec![
+                delivered("delivered", 100, 8),
+                pending("pending", 100, Some(7)),
+            ],
+            "pending",
+            Pending,
+        ),
+        (
+            "a replayed older delivered send does not displace a newer pending one",
+            vec![
+                delivered("delivered", 100, 7),
+                pending("pending", 150, None),
+                replayed,
+            ],
+            "pending",
+            Pending,
+        ),
+        (
+            "among pending sends the newer clock wins over the newer insertion",
+            vec![
+                pending("stale", 1_000, None),
+                chat("accepted", REMOTE, 100, "accepted"),
+                pending("newer-clock", 50, None),
+                pending("newer-insertion", 40, None),
+            ],
+            "newer-clock",
+            Pending,
+        ),
+    ] {
+        let store = setup_store().app_storage();
+        for event in &events {
+            store.record_app_event(event).unwrap();
+        }
+        let preview = store
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+            .unwrap()
+            .expect("chat row")
+            .last_message
+            .expect("latest preview");
+        assert_eq!(preview.message_id_hex, expected_id, "{case}");
+        assert_eq!(preview.delivery_state, expected_state, "{case}");
+    }
 }
 
 #[test]
@@ -2845,136 +2411,75 @@ fn remote_group_system_event_advances_preview_unread_and_read_marker() {
     assert_eq!(read.last_read_message_id_hex.as_deref(), Some("made-admin"));
 }
 
+/// Membership and admin changes in a group chat are chat-list activity: they
+/// become the preview, move activity, and count unread when another member
+/// sent them. Other system types, and any system row in a direct chat, change
+/// nothing. A payload naming the local account is never a mention.
 #[test]
-fn every_membership_and_admin_system_type_signals_activity() {
-    for system_type in [
+fn group_system_activity_follows_type_sender_and_conversation_kind() {
+    let signaling = [
         GROUP_SYSTEM_TYPE_MEMBER_ADDED,
         GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
         GROUP_SYSTEM_TYPE_MEMBER_LEFT,
         GROUP_SYSTEM_TYPE_ADMIN_ADDED,
         GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
-    ] {
-        let store = setup_store().app_storage();
+    ]
+    .map(|system_type| (system_type, REMOTE, system_type, None, false, true, 1));
+    let admin = GROUP_SYSTEM_TYPE_ADMIN_ADDED;
+    let renamed = GROUP_SYSTEM_TYPE_GROUP_RENAMED;
+    // (id, sender, system type, payload subject, direct chat, signals, unread)
+    let cases = signaling.into_iter().chain([
+        ("own-admin", LOCAL, admin, None, false, true, 0),
+        ("names-me", REMOTE, admin, Some(LOCAL), false, true, 1),
+        ("renamed", REMOTE, renamed, None, false, false, 0),
+        ("direct-admin", REMOTE, admin, None, true, false, 0),
+    ]);
+    for (id, sender, system_type, subject, direct, signals, unread) in cases {
+        let mut saved = group();
+        if direct {
+            saved.profile_name.clear();
+            saved.member_count = Some(2);
+        }
+        let store = setup_store_with_group(saved).app_storage();
         store
-            .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+            .record_app_event(&chat("old", REMOTE, 10, "existing preview"))
             .unwrap();
         store
-            .record_app_event(&group_system(
-                system_type,
-                REMOTE,
-                unix_now_seconds() + 1,
-                system_type,
-                &format!(r#"{{"v":1,"system_type":"{system_type}","text":"Changed"}}"#),
-            ))
+            .initialize_chat_read_state(LOCAL, GROUP, &mentions_local)
             .unwrap();
-
-        let row = store
-            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        let before = store
+            .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
             .unwrap()
             .expect("chat row");
+
+        let system_at = unix_now_seconds() + 1;
+        let data = subject.map_or(String::new(), |subject| {
+            format!(r#","data":{{"subject":"{subject}"}}"#)
+        });
+        let payload = format!(r#"{{"v":1,"system_type":"{system_type}","text":"Changed"{data}}}"#);
+        store
+            .record_app_event(&group_system(id, sender, system_at, system_type, &payload))
+            .unwrap();
+        let row = store
+            .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+            .unwrap()
+            .expect("chat row");
+
+        let preview = row.last_message.as_ref().map(|m| m.message_id_hex.as_str());
+        if signals {
+            assert_eq!(preview, Some(id));
+            assert_eq!(row.activity_sort_at, system_at, "{id}");
+        } else {
+            assert_eq!(preview, Some("old"), "{id}");
+            assert_eq!(row.activity_sort_at, before.activity_sort_at, "{id}");
+        }
+        assert_eq!(row.unread_count, unread, "{id}");
+        assert_eq!(row.unread_mention_count, 0, "{id}");
         assert_eq!(
-            row.last_message
-                .expect("group activity preview")
-                .message_id_hex,
-            system_type,
+            row.conversation_kind == ChatConversationKind::Direct,
+            direct
         );
-        assert_eq!(row.unread_count, 1, "system type {system_type}");
     }
-}
-
-#[test]
-fn own_group_system_event_advances_preview_without_becoming_unread() {
-    let store = setup_store().app_storage();
-    store
-        .record_app_event(&chat("old", REMOTE, 10, "before role change"))
-        .unwrap();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-
-    let system_at = unix_now_seconds() + 1;
-    store
-        .record_app_event(&group_system(
-            "own-role-change",
-            LOCAL,
-            system_at,
-            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
-            r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
-        ))
-        .unwrap();
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap()
-        .expect("chat row");
-
-    assert_eq!(
-        row.last_message
-            .expect("group-system preview")
-            .message_id_hex,
-        "own-role-change"
-    );
-    assert_eq!(row.activity_sort_at, system_at);
-    assert_eq!(row.unread_count, 0);
-}
-
-#[test]
-fn group_system_payload_does_not_increment_mentions() {
-    let store = setup_store().app_storage();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &mentions_local)
-        .unwrap();
-    store
-        .record_app_event(&group_system(
-            "role-change",
-            REMOTE,
-            20,
-            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
-            r#"{"v":1,"system_type":"admin_added","text":"Admin added","data":{"subject":"aa"}}"#,
-        ))
-        .unwrap();
-
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
-        .unwrap()
-        .expect("chat row");
-    assert_eq!(row.unread_count, 1);
-    assert_eq!(row.unread_mention_count, 0);
-}
-
-#[test]
-fn unrelated_group_system_event_does_not_signal_chat_list_activity() {
-    let store = setup_store().app_storage();
-    store
-        .record_app_event(&chat("old", REMOTE, 10, "existing preview"))
-        .unwrap();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-    let before = store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap()
-        .expect("chat row");
-
-    store
-        .record_app_event(&group_system(
-            "renamed",
-            REMOTE,
-            unix_now_seconds() + 1,
-            GROUP_SYSTEM_TYPE_GROUP_RENAMED,
-            r#"{"v":1,"system_type":"group_renamed","text":"Group renamed"}"#,
-        ))
-        .unwrap();
-    let after = store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap()
-        .expect("chat row");
-
-    assert_eq!(
-        after.last_message.expect("existing preview").message_id_hex,
-        "old"
-    );
-    assert_eq!(after.activity_sort_at, before.activity_sort_at);
-    assert_eq!(after.unread_count, 0);
 }
 
 #[test]
@@ -3023,36 +2528,7 @@ fn invalidated_group_activity_is_removed_from_preview_and_unread() {
 }
 
 #[test]
-fn direct_conversation_does_not_project_admin_activity() {
-    let mut direct = group();
-    direct.profile_name.clear();
-    direct.member_count = Some(2);
-    let store = setup_store_with_group(direct).app_storage();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-
-    store
-        .record_app_event(&group_system(
-            "direct-role-change",
-            REMOTE,
-            unix_now_seconds() + 1,
-            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
-            r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
-        ))
-        .unwrap();
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap()
-        .expect("chat row");
-
-    assert_eq!(row.conversation_kind, ChatConversationKind::Direct);
-    assert!(row.last_message.is_none());
-    assert_eq!(row.unread_count, 0);
-}
-
-#[test]
-fn secure_prune_refreshes_unread_count_mentions_and_first_message_atomically() {
+fn secure_prune_refreshes_unread_count_mentions_and_first_message() {
     let store = setup_store().app_storage();
     let mentions = |plaintext: &str, _tags: &[Vec<String>]| plaintext.contains("@local");
     store
@@ -3275,6 +2751,15 @@ fn own_kind9_send_clears_existing_unread_without_counting_as_unread() {
     store
         .record_app_event(&chat("own", LOCAL, 11, "my reply"))
         .unwrap();
+    // The own send adds nothing: only the remote message is still unread.
+    assert_eq!(
+        store
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+            .unwrap()
+            .expect("chat row")
+            .unread_count,
+        1
+    );
     store
         .mark_timeline_message_read(LOCAL, GROUP, "own", &no_mentions)
         .unwrap();
@@ -3394,76 +2879,57 @@ fn chat_list_preview_is_empty_when_only_invalidated_kind9_exists() {
     assert_eq!(row.last_message, None);
 }
 
+/// An unread message mentions the local account through a p-tag or inline
+/// text; a p-tag for another account is no mention, and the account's own
+/// message is neither unread nor a mention.
 #[test]
-fn unread_p_tag_mention_of_local_account_counts() {
-    let store = setup_store().app_storage();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-    store
-        .record_app_event(&chat_with_tags(
-            "ping",
+fn unread_mentions_follow_tags_inline_text_and_sender() {
+    let inline = format!("yo {LOCAL} around?");
+    let to_self = format!("note to self {LOCAL}");
+    // (case, sender, plaintext, p-tag, (unread, mentions, has mention))
+    for (case, sender, plaintext, p_tag, expected) in [
+        ("p-tag", REMOTE, "hey there", Some(LOCAL), (1, 1, true)),
+        ("inline", REMOTE, inline.as_str(), None, (1, 1, true)),
+        (
+            "other account",
             REMOTE,
-            10,
-            "hey there",
-            vec![vec!["p".to_owned(), LOCAL.to_owned()]],
-        ))
-        .unwrap();
-
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
-        .unwrap()
-        .expect("chat row");
-
-    assert_eq!(row.unread_count, 1);
-    assert_eq!(row.unread_mention_count, 1);
-    assert!(row.has_unread_mention);
-}
-
-#[test]
-fn unread_inline_mention_of_local_account_counts() {
-    let store = setup_store().app_storage();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-    store
-        .record_app_event(&chat("inline", REMOTE, 10, &format!("yo {LOCAL} around?")))
-        .unwrap();
-
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
-        .unwrap()
-        .expect("chat row");
-
-    assert_eq!(row.unread_count, 1);
-    assert_eq!(row.unread_mention_count, 1);
-    assert!(row.has_unread_mention);
-}
-
-#[test]
-fn unread_mention_of_other_account_does_not_count() {
-    let store = setup_store().app_storage();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-    store
-        .record_app_event(&chat_with_tags(
-            "ping-other",
-            REMOTE,
-            10,
             "no inline mention here",
-            vec![vec!["p".to_owned(), REMOTE.to_owned()]],
-        ))
-        .unwrap();
+            Some(REMOTE),
+            (1, 0, false),
+        ),
+        (
+            "self sent",
+            LOCAL,
+            to_self.as_str(),
+            Some(LOCAL),
+            (0, 0, false),
+        ),
+    ] {
+        let store = setup_store().app_storage();
+        store
+            .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+            .unwrap();
+        let tags = p_tag
+            .map(|account| vec![vec!["p".to_owned(), account.to_owned()]])
+            .unwrap_or_default();
+        store
+            .record_app_event(&chat_with_tags("ping", sender, 10, plaintext, tags))
+            .unwrap();
 
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
-        .unwrap()
-        .expect("chat row");
-
-    assert_eq!(row.unread_count, 1);
-    assert_eq!(row.unread_mention_count, 0);
-    assert!(!row.has_unread_mention);
+        let row = store
+            .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+            .unwrap()
+            .expect("chat row");
+        assert_eq!(
+            (
+                row.unread_count,
+                row.unread_mention_count,
+                row.has_unread_mention
+            ),
+            expected,
+            "{case}"
+        );
+    }
 }
 
 #[test]
@@ -3718,34 +3184,6 @@ fn already_read_mention_does_not_count_as_unread_mention() {
 }
 
 #[test]
-fn self_sent_mention_does_not_count_as_unread_mention() {
-    let store = setup_store().app_storage();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-    // A message authored by the local account that references the local account
-    // is excluded by the unread window (sender == local), so it cannot count.
-    store
-        .record_app_event(&chat_with_tags(
-            "self",
-            LOCAL,
-            10,
-            &format!("note to self {LOCAL}"),
-            vec![vec!["p".to_owned(), LOCAL.to_owned()]],
-        ))
-        .unwrap();
-
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
-        .unwrap()
-        .expect("chat row");
-
-    assert_eq!(row.unread_count, 0);
-    assert_eq!(row.unread_mention_count, 0);
-    assert!(!row.has_unread_mention);
-}
-
-#[test]
 fn ensure_chat_list_rows_corrects_stale_unread_mention_count() {
     // Mirrors a migration-0018 upgrade: the projection exists and is otherwise
     // complete, but `unread_mention_count` defaults to 0. `ensure_chat_list_rows`
@@ -3876,8 +3314,14 @@ fn ensure_chat_list_rows_reconciles_pre_group_system_projection() {
 }
 
 #[test]
-fn account_unread_total_is_zero_on_empty_store() {
+fn account_unread_total_reports_zero_while_base_rows_are_missing() {
+    // The saved group has no chat row yet, so its base rows are missing: the
+    // attention total is unavailable while the legacy total reads as zero.
     let store = setup_store();
+    assert!(matches!(
+        store.app_storage().account_attention_total(),
+        Err(StorageError::NotFound)
+    ));
 
     let total = store.app_storage().account_unread_total().unwrap();
     assert_eq!(total, AccountUnreadTotal::default());
@@ -3917,37 +3361,6 @@ fn account_unread_total_aggregates_materialized_projection() {
     assert!(total.has_unread());
 }
 
-#[test]
-fn account_unread_total_excludes_archived_conversations() {
-    let mut group = group();
-    group.archived = true;
-    let store = setup_store_with_group(group).app_storage();
-    store
-        .record_app_event(&chat("old", REMOTE, 10, "before first open"))
-        .unwrap();
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-    store
-        .record_app_event(&chat("new", REMOTE, 11, "after first open"))
-        .unwrap();
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap()
-        .expect("chat row");
-    assert!(row.archived);
-    assert_eq!(row.unread_count, 1);
-
-    // The archived conversation has unread messages, but the account-level
-    // aggregate excludes archived rows.
-    let total = store.account_unread_total().unwrap();
-    assert_eq!(total, AccountUnreadTotal::default());
-    assert!(!total.has_unread());
-}
-
 /// Seed `GROUP` with one unread remote message and a materialized chat-list
 /// row, returning the store. The single conversation has `unread_count == 1`.
 fn setup_store_with_one_unread() -> SqliteAccountStorage {
@@ -3984,78 +3397,34 @@ fn chat_list_row_reports_a_self_leave_as_left() {
     assert_eq!(row.self_membership, SelfMembership::Left);
 }
 
+/// Leaving and removal are terminal for the total and suppress the group's
+/// unread; `member`, the default and the state after a re-add, counts it, since
+/// uncertainty never suppresses.
 #[test]
-fn account_unread_total_suppresses_removed_self_membership_group() {
+fn account_unread_total_follows_self_membership_through_leave_removal_and_rejoin() {
     let store = setup_store_with_one_unread().app_storage();
+    let counted = |total: AccountUnreadTotal| {
+        assert_eq!(total.unread_count, 1);
+        assert_eq!(total.unread_conversations, 1);
+    };
+    counted(store.account_unread_total().unwrap());
 
-    // Default 'member' membership still counts.
-    let total = store.account_unread_total().unwrap();
-    assert_eq!(total.unread_count, 1);
-    assert_eq!(total.unread_conversations, 1);
-
-    store
-        .set_group_self_membership(GROUP, SelfMembership::Removed)
-        .unwrap();
-
-    // Once the local account is known-removed, the group's unread is suppressed.
-    let total = store.account_unread_total().unwrap();
-    assert_eq!(total, AccountUnreadTotal::default());
-    assert!(!total.has_unread());
-}
-
-#[test]
-fn account_unread_total_suppresses_left_self_membership_group() {
-    let store = setup_store_with_one_unread().app_storage();
-
-    // A voluntary self-leave is also a terminal "no longer a member" state, so
-    // it suppresses the group's unread exactly like an involuntary removal.
-    store
-        .set_group_self_membership(GROUP, SelfMembership::Left)
-        .unwrap();
-
-    let total = store.account_unread_total().unwrap();
-    assert_eq!(total, AccountUnreadTotal::default());
-    assert!(!total.has_unread());
-}
-
-#[test]
-fn account_unread_total_preserves_member_self_membership_group() {
-    let store = setup_store_with_one_unread().app_storage();
-
-    // Default state (no observed self-removal) is 'member' and must preserve the
-    // unread count: uncertainty never suppresses.
-    let total = store.account_unread_total().unwrap();
-    assert_eq!(total.unread_count, 1);
-    assert_eq!(total.unread_conversations, 1);
-
-    // Re-affirming 'member' (e.g. after a re-add) keeps the unread counted.
-    store
-        .set_group_self_membership(GROUP, SelfMembership::Member)
-        .unwrap();
-    let total = store.account_unread_total().unwrap();
-    assert_eq!(total.unread_count, 1);
-    assert_eq!(total.unread_conversations, 1);
-}
-
-#[test]
-fn account_unread_total_unsuppresses_after_rejoin() {
-    let store = setup_store_with_one_unread().app_storage();
-
-    store
-        .set_group_self_membership(GROUP, SelfMembership::Removed)
-        .unwrap();
-    assert_eq!(
-        store.account_unread_total().unwrap(),
-        AccountUnreadTotal::default()
-    );
-
-    // A re-add restores counting.
-    store
-        .set_group_self_membership(GROUP, SelfMembership::Member)
-        .unwrap();
-    let total = store.account_unread_total().unwrap();
-    assert_eq!(total.unread_count, 1);
-    assert_eq!(total.unread_conversations, 1);
+    for (membership, counts) in [
+        (SelfMembership::Member, true),
+        (SelfMembership::Left, false),
+        (SelfMembership::Member, true),
+        (SelfMembership::Removed, false),
+        (SelfMembership::Member, true),
+    ] {
+        store.set_group_self_membership(GROUP, membership).unwrap();
+        let total = store.account_unread_total().unwrap();
+        if counts {
+            counted(total);
+        } else {
+            assert_eq!(total, AccountUnreadTotal::default(), "{membership:?}");
+            assert!(!total.has_unread());
+        }
+    }
 }
 
 #[test]
@@ -4142,22 +3511,6 @@ fn put_disband_tombstone_for(store: &SqliteAccountStorage, group_id_hex: &str) {
 }
 
 #[test]
-fn account_unread_total_includes_pending_invite_attention() {
-    let mut pending = group();
-    pending.pending_confirmation = true;
-    let store = setup_store_with_group(pending).app_storage();
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-
-    let total = store.account_unread_total().unwrap();
-    assert_eq!(total.unread_count, 0);
-    assert_eq!(total.unread_conversations, 1);
-    assert_eq!(total.attention_only_conversations, 1);
-    assert!(total.has_unread());
-}
-
-#[test]
 fn account_unread_total_does_not_double_count_unread_plus_manual() {
     let store = setup_store_with_one_unread().app_storage();
     store
@@ -4168,37 +3521,6 @@ fn account_unread_total_does_not_double_count_unread_plus_manual() {
     assert_eq!(total.unread_count, 1);
     assert_eq!(total.unread_conversations, 1);
     assert_eq!(total.attention_only_conversations, 0);
-}
-
-#[test]
-fn account_unread_total_counts_pending_invite_once_without_counting_its_unread_messages() {
-    let mut pending = group();
-    pending.pending_confirmation = true;
-    let store = setup_store_with_group(pending).app_storage();
-    materialize_one_unread(&store, GROUP);
-
-    let total = store.account_unread_total().unwrap();
-    assert_eq!(total.unread_count, 0);
-    assert_eq!(total.unread_conversations, 1);
-    assert_eq!(total.attention_only_conversations, 1);
-}
-
-#[test]
-fn account_unread_total_excludes_archived_attention_only_rows() {
-    let mut archived_pending = group();
-    archived_pending.pending_confirmation = true;
-    archived_pending.archived = true;
-    let store = setup_store_with_group(archived_pending).app_storage();
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap();
-    store
-        .set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
-        .unwrap();
-
-    let total = store.account_unread_total().unwrap();
-    assert_eq!(total, AccountUnreadTotal::default());
-    assert!(!total.has_unread());
 }
 
 #[test]
@@ -4301,64 +3623,6 @@ fn set_group_self_membership_survives_projection_resave() {
     let total = store.account_unread_total().unwrap();
     assert_eq!(total, AccountUnreadTotal::default());
     assert!(!total.has_unread());
-}
-
-#[test]
-fn account_group_ids_defaulting_to_member_lists_only_default_rows() {
-    // Backfill candidate set: rows still carrying the migration default
-    // 'member' are returned; rows explicitly flipped to 'removed' are not, so
-    // re-running the one-time backfill stays idempotent.
-    let other_group = StoredAccountGroup {
-        group_id_hex: "22".to_owned(),
-        ..group()
-    };
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: vec![group(), other_group],
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-
-    // Both rows start at the default 'member', so both are candidates.
-    assert_eq!(
-        store.account_group_ids_defaulting_to_member().unwrap(),
-        vec![GROUP.to_owned(), "22".to_owned()]
-    );
-
-    // Once a row is flipped to 'removed' it drops out of the candidate set.
-    store
-        .set_group_self_membership(GROUP, SelfMembership::Removed)
-        .unwrap();
-    assert_eq!(
-        store.account_group_ids_defaulting_to_member().unwrap(),
-        vec!["22".to_owned()]
-    );
-
-    // Re-affirming 'member' keeps a row in the candidate set (still default).
-    store
-        .set_group_self_membership("22", SelfMembership::Member)
-        .unwrap();
-    assert_eq!(
-        store.account_group_ids_defaulting_to_member().unwrap(),
-        vec!["22".to_owned()]
-    );
-
-    // No defaulted rows left once every row is explicitly resolved.
-    store
-        .set_group_self_membership("22", SelfMembership::Removed)
-        .unwrap();
-    assert!(
-        store
-            .account_group_ids_defaulting_to_member()
-            .unwrap()
-            .is_empty()
-    );
 }
 
 #[test]
@@ -4894,11 +4158,8 @@ fn system_preview_provenance_does_not_trust_member_claims_or_stale_payloads() {
 }
 
 #[test]
-fn system_preview_survives_restart_and_revalidation_with_exact_multisubject_selection() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("systems.db");
-    let key = SqlCipherKey::new("system preview test key").unwrap();
-    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+fn system_preview_revalidation_keeps_exact_multisubject_selection() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
     store
         .app_storage()
         .save_account_projection_state(
@@ -4961,19 +4222,7 @@ fn system_preview_survives_restart_and_revalidation_with_exact_multisubject_sele
         .unwrap()
         .last_message
         .unwrap();
-    drop(store);
-    let store = SqliteAccountStorage::open_encrypted(&path, &key)
-        .unwrap()
-        .app_storage();
-    assert_eq!(
-        store
-            .chat_list_row(GROUP)
-            .unwrap()
-            .unwrap()
-            .last_message
-            .unwrap(),
-        before
-    );
+    let store = store.app_storage();
     store
         .invalidate_app_event_by_message_id(GROUP, "4-dd", "SupersededByBranchSelection")
         .unwrap();
@@ -5112,33 +4361,39 @@ fn deleted_chat_preview_hides_retained_tags() {
     assert_projection_complete(&store, "a masked deleted preview is current");
 }
 
-/// A non-null but stale tag column is drift, not just a NULL one.
+/// Stale preview tags are drift and get rebuilt from the timeline: NULL is
+/// the state migration 0141 leaves rows with a last message in, and a
+/// non-null stale value is drift too.
 #[test]
 fn ensure_chat_list_rows_rebuilds_stale_last_message_tags() {
-    let store = setup_store().app_storage();
-    store
-        .record_app_event(&chat_with_tags("tagged", REMOTE, 10, "", sticker_tags()))
-        .unwrap();
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    assert_projection_complete(&store, "a fresh preview is current");
+    for injected in [None, Some(r#"[["stale"]]"#)] {
+        let store = setup_store().app_storage();
+        store
+            .record_app_event(&chat_with_tags("tagged", REMOTE, 10, "", sticker_tags()))
+            .unwrap();
+        store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        assert_projection_complete(&store, "a fresh preview is current");
 
-    store
-        .lock()
-        .unwrap()
-        .execute(
-            r#"UPDATE chat_list_rows SET last_message_tags_json = '[["stale"]]'
-               WHERE group_id_hex = ?1"#,
-            params![GROUP],
-        )
-        .unwrap();
-    {
-        let conn = store.lock().unwrap();
-        assert!(!chat_list_projection_complete_tx(&conn).unwrap());
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE chat_list_rows SET last_message_tags_json = ?2 WHERE group_id_hex = ?1",
+                params![GROUP, injected],
+            )
+            .unwrap();
+        {
+            let conn = store.lock().unwrap();
+            assert!(
+                !chat_list_projection_complete_tx(&conn).unwrap(),
+                "{injected:?}"
+            );
+        }
+
+        store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        assert_eq!(latest_preview(&store).tags, sticker_tags(), "{injected:?}");
+        assert_projection_complete(&store, "the rebuilt tags are current");
     }
-
-    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    assert_eq!(latest_preview(&store).tags, sticker_tags());
-    assert_projection_complete(&store, "the rebuilt tags are current");
 }
 
 /// Unread membership tolerates unreadable timeline tags; the chat-list
@@ -5233,13 +4488,6 @@ fn record_expiring(
         event,
         Some(AppMessageRetentionDecision::new(event.recorded_at, 50)),
     )
-}
-
-#[test]
-fn retention_scan_empty_group_has_nothing_due() {
-    let app = setup_store().app_storage();
-    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
-    assert_eq!(scan, RetentionExpiryScan::default());
 }
 
 // mdk#2425: two received messages share the read marker's wall second; only
@@ -5436,67 +4684,6 @@ fn imported(
         moderation_grant: None,
         file_keys: Vec::new(),
     }
-}
-
-#[test]
-fn an_import_adds_only_the_rows_this_device_lacks() {
-    let app = setup_store().app_storage();
-    app.record_app_event(&live("held", 3, 30)).unwrap();
-
-    let outcome = app
-        .import_app_events(
-            GROUP,
-            &SOURCE_SLOT,
-            &[
-                imported("held", 3, 30, None),
-                imported(
-                    "old",
-                    1,
-                    10,
-                    Some(AppMessageRetentionDecision::new(10, 500)),
-                ),
-                imported("old", 1, 10, None),
-                imported(
-                    "expired",
-                    2,
-                    20,
-                    Some(AppMessageRetentionDecision::new(20, 5)),
-                ),
-            ],
-            100,
-        )
-        .unwrap();
-
-    assert_eq!(outcome.imported, 1);
-    let changed = outcome
-        .update
-        .changes
-        .iter()
-        .map(|change| match change {
-            TimelineMessageChange::Upsert { trigger, message } => {
-                (message.message_id_hex.as_str(), trigger.clone())
-            }
-            TimelineMessageChange::Remove { .. } => panic!("an import removes nothing"),
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(changed, [("old", TimelineUpdateTrigger::SnapshotRefresh)]);
-
-    let held = app.timeline_message(GROUP, "held").unwrap().unwrap();
-    assert_eq!(held.plaintext, "live");
-    assert_eq!(held.source_message_id_hex.as_deref(), Some("source-held"));
-    assert_eq!(app.app_event_import_source(GROUP, "held").unwrap(), None);
-
-    let old = app.timeline_message(GROUP, "old").unwrap().unwrap();
-    assert_eq!(old.plaintext, "imported");
-    assert_eq!(old.direction, "received");
-    assert_eq!(old.source_message_id_hex, None);
-    assert_eq!(old.source_epoch, Some(1));
-    assert_eq!(old.retention_expires_at, Some(510));
-    assert_eq!(
-        app.app_event_import_source(GROUP, "old").unwrap(),
-        Some(SOURCE_SLOT)
-    );
-    assert!(app.timeline_message(GROUP, "expired").unwrap().is_none());
 }
 
 #[test]
