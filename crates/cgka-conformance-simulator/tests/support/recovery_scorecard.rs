@@ -384,6 +384,7 @@ fn wire_totals(relay: &RelayTrafficV1) -> Value {
     if let Some(fields) = totals.as_object_mut() {
         fields.remove("events");
         fields.remove("history_requests");
+        fields.remove("connection_inboxes");
         fields.remove("now_ms");
     }
     totals

@@ -130,12 +130,11 @@ succeeded, at least half the sends the interval allows must have been made, and 
 seconds after the last send to arrive.
 
 Until the switch-over (mdk#2660 PR 5g) the earlier owner still runs beside the runner, and in these runs it does the
-startup recovery itself. So the loop and the owed-history journeys run in two modes. Beside the earlier owner, the
-bounds count both owners' requests on the wire and the runner's numbers are recorded only. The `runner_alone`
-variants also assert the runner's own bounds, each with a control that an idle runner fails. A runner attempt ends
-without progress when it asked a relay and neither advanced nor found nothing owed; a re-check that finishes is an
-answer. Beside the earlier owner these bounds need not hold, so the variants are ignored with a reason naming 5g,
-which un-ignores them and drops the both-owners variants.
+startup recovery itself. So the wire bounds count both of bob's owners, and the runner's own numbers are recorded:
+its attempts, those that asked a relay and ended without progress (a re-check that finishes is an answer), and when
+it reported the account caught up. The runner is held only to what it does beside the earlier owner. 5g adds the
+runner-alone bounds, a positive control for live fences and the upgrade journey, where they can run against the
+switch-over.
 
 - `public_app_runner_stalled_relay_does_not_loop` reproduces the 0.14.0 loop's shape. Bob owes 3,000 events. Endpoint
   1 stays connected but never answers history (`stall_relay_history`), while alice sends a live message every two
@@ -143,8 +142,7 @@ which un-ignores them and drops the both-owners variants.
   arrives, and that the stalled endpoint, attempted in the first half of the window, sees at most one burst of
   history requests every two minutes in the second, and requests in at most four of its eight minutes (requests
   that never pause make one long burst). On 0.14.0 an attempt came about every 30 seconds for as long as
-  the app ran. Alone, the runner must also have attempted the stalled relay in the first half and make at most four
-  attempts there that ask a relay and end without progress in the second.
+  the app ran.
 - `public_app_runner_finishes_tens_of_thousands_of_owed_events` owes 20,000 events in one group, published while bob
   is stopped. A second group stays quiet: its messages are older than the restart's rebuild lookback. After the
   restart alice sends a live message to the busy group every three seconds. It asserts:
@@ -160,29 +158,16 @@ which un-ignores them and drops the both-owners variants.
   endpoint 0, that a runner quantum newly covers part of a route after the reconnect, that the account reports
   caught up within five minutes (read after a runner attempt since the reconnect: until a runner surveys, the status
   lists nothing, and across a reconnect it keeps its last answer), and that a quiet-group message sent after the
-  reconnect arrives. Alone, the runner must also advance at least twice after the restart with at most four
-  attempts that end without progress, report the account caught up after the restart, ask no window twice after
-  the reconnect either, and hold no live message longer than 60 seconds (a fence holds for one 30-second replay
-  deadline; beside the earlier owner, its capture holds live frames until the backlog lands).
-- `public_app_runner_fences_a_counted_group_and_not_a_quiet_one` is the positive control for "never fenced", ignored
-  until 5g wires live fences. Bob restarts with 30 messages inside the rebuild lookback in one group and none in the
-  other, while both endpoints leave history unanswered for 12 seconds. A live message to the quiet group must arrive
-  during the stall, and one to the counted group only after it. Both timelines must end exact.
-- `public_app_runner_owns_debt_after_the_upgrade_conversion` is the upgrade end to end, ignored until 5g calls the
-  conversion. Bob restarts owing 2,000 events with the gate off while history goes unanswered, so the earlier owner
-  plans the debt and leaves its rows. Then he opens with the runner owning debt. The group must finish exactly with
-  live traffic, the runner must report caught up and must have advanced, no capture page (a history `REQ` without a
-  limit) may follow the upgrade, and no notice may remain. 5d's own fixtures are storage-only, so its storage tests
-  cover their every row kind.
+  reconnect arrives. Beside the earlier owner its capture holds live frames until the backlog lands, so the restart
+  bounds no live message's wait.
 
 Each run writes `report.json`, `history.json` and the runner's `runner-trace.json` under
-`MDK_APP_JOURNEY_ARTIFACTS`. The proofs that hold before 5g:
+`MDK_APP_JOURNEY_ARTIFACTS`:
 
 ```sh
 MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
 cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_journeys \
-  public_app_runner -- --ignored --skip runner_alone --skip counted_group --skip upgrade_conversion \
-  --test-threads=1 --nocapture
+  public_app_runner -- --ignored --test-threads=1 --nocapture
 ```
 
 ## First basic public journeys

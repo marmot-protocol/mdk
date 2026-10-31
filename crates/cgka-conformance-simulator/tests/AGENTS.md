@@ -36,9 +36,8 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     It runs with either history owner, and records bob's per-endpoint history requests too.
     `support/recovery_runner_proofs.rs` holds the explicit slow recovery-runner proofs (mdk#2660): a stalled relay
     that never answers history, and tens of thousands of owed events through a restart, an idle window and a
-    reconnect. Bob runs in process with the runner owning debt. While the earlier owner still runs beside it, the
-    both-owners variants bound the wire. The `runner_alone` variants need not hold and the fence control and the
-    upgrade journey fail until PR 5g; all stay ignored with reasons naming it. Count bob's own history requests
+    reconnect. Bob runs in process with the runner owning debt. While the earlier owner still runs beside it (until
+    PR 5g), the wire bounds count both of bob's owners. Count bob's own history requests
     (`client_history_requests`), and give any bound that an idle runner would meet a control that it fails.
 
 - **File:** `app_runtime_interaction_journeys.rs`

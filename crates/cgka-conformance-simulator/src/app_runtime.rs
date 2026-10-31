@@ -421,13 +421,6 @@ impl AppRuntimeHarness {
         Self::new_with_execution(clients, None, None, true, topology).await
     }
 
-    /// Whether the in-process participants' recovery runner owns history debt
-    /// from their next open on, as an upgrade first opens an account that the
-    /// earlier recovery owner left rows in.
-    pub fn set_runner_owns_debt(&mut self, owns: bool) {
-        self.runner_owns_debt = owns;
-    }
-
     /// [`Self::new_with_relay_pair`] with the in-process participants' history
     /// recovery owned by their account's recovery runner (mdk#2660 phase 4):
     /// marmot-app's internal gate, turned on per app until the switch-over

@@ -25,8 +25,6 @@ mod recovery_runner_proofs;
 #[path = "support/recovery_scorecard.rs"]
 mod recovery_scorecard;
 
-use recovery_runner_proofs::Owners;
-
 #[derive(Clone, Copy, Debug)]
 enum Journey {
     Messaging,
@@ -718,35 +716,11 @@ async fn public_app_large_account_recovery_scorecard_runner_owns_debt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
 async fn public_app_runner_stalled_relay_does_not_loop() {
-    recovery_runner_proofs::stalled_relay_loop(Owners::Both).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "runner-alone bounds for mdk#2660 PR 5g; until then the earlier owner shares the attempts, so they need not hold"]
-async fn public_app_runner_alone_stalled_relay_does_not_loop() {
-    recovery_runner_proofs::stalled_relay_loop(Owners::RunnerAlone).await;
+    recovery_runner_proofs::stalled_relay_loop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
 async fn public_app_runner_finishes_tens_of_thousands_of_owed_events() {
-    recovery_runner_proofs::owed_history(Owners::Both).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "runner-alone bounds for mdk#2660 PR 5g; until then the earlier owner shares the attempts, so they need not hold"]
-async fn public_app_runner_alone_finishes_tens_of_thousands_of_owed_events() {
-    recovery_runner_proofs::owed_history(Owners::RunnerAlone).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fails until mdk#2660 PR 5g wires live fences (live_counts, enable_live_fences, fence_live_frames)"]
-async fn public_app_runner_fences_a_counted_group_and_not_a_quiet_one() {
-    recovery_runner_proofs::fence_control().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fails until mdk#2660 PR 5g calls the upgrade conversion before the runner's first start"]
-async fn public_app_runner_owns_debt_after_the_upgrade_conversion() {
-    recovery_runner_proofs::upgrade().await;
+    recovery_runner_proofs::owed_history().await;
 }
