@@ -10,7 +10,10 @@
 //! receiver's history key, and sends one delivery per bundle. Whether the
 //! sibling asks for history is read then. A send that reached no relay leaves
 //! the history owed; a delivery that branch selection withdraws, or whose
-//! queued publish later fails for good, makes it owed again. A history longer
+//! queued publish later fails for good, makes it owed again. There are no
+//! receipts: a withdrawal is acted on only when this device hears of it, so
+//! one whose device-group record was evicted, or that a crash interrupted,
+//! loses that history. A history longer
 //! than [`MAX_INLINE_BUNDLES`] is not sent, and an event too large for one
 //! delivery is left out.
 //!
