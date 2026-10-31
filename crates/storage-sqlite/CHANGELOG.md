@@ -407,6 +407,9 @@
 - `delete_group` joins a caller's `with_transaction` instead of beginning its
   own, which failed inside one, so the engine's cleanup of a failed group
   creation now removes the group's MLS state.
+- A queued proposal or proposal-queue ref list that fails to decode in the
+  MessagePack value encoding clears the group's proposal queue, as a
+  corrupt JSON row already did, instead of failing group load.
 
 ## 0.14.0 - 2026-10-23
 
