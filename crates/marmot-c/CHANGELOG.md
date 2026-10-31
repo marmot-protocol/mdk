@@ -48,6 +48,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   (mdk#2628 item 3.1). The new `MARMOT_EVENT_LINKED_DEVICES_CHANGED` event says
   to re-read it. The list is empty in release builds until the roster's spec
   lands. Use matching regenerated headers and libraries.
+- `MarmotLinkedDevice` adds `has_last_active_at`/`last_active_at`, when a
+  heartbeat last showed a sibling running, and `inactive`, this device's own
+  judgement 30 days after the later of that and when it first found the
+  sibling in the roster (mdk#2628 item 3.6). Use matching regenerated headers
+  and libraries.
 - `marmot_key_package_refresh_overdue` writes whether this device's device
   group has held its KeyPackage refresh back for a week (mdk#2628 item 3.4),
   so the app can tell the user before inviters stop treating the device as

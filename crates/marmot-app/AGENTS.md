@@ -103,8 +103,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   id next to the label and is kept on disk before its commit is sent. Maintenance reads only the rename id the winning
   roster holds (D37): one the rename wrote means applied, one its renames replaced means lost with nothing renamed
   since (made again with a fresh id), any other means another rename stands. Never infer a rename's fate from labels
-  or commit ids. Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots`
-  instead, never as device entries.
+  or commit ids. Every entry is created with a fresh rename id (`fresh_rename_id`: the creator's founding entry, the
+  founding Add's and every later link's), so a kept id shows up again only when a fork brings back an earlier state.
+  Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots` instead, never as
+  device entries.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
   `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this
@@ -175,6 +177,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.
+- Heartbeats (mdk#2628 item 3.6, D35) live in `src/client/device_heartbeats.rs`. Send one only from the trusted
+  device group, once this device's own leaf reads as its slot, at most once an hour. Record the sent time only once the
+  send returns that it went out (published, unresolved or queued), and leave the record alone when it reached no one
+  or failed, so a crash mid-send costs at most one extra heartbeat, never an hour's silence. Count one only when the sending leaf's tag reads as a
+  sibling in the tree this device holds when it reads it (one from an earlier epoch counts for no device), never read
+  its content, and date it `min(created_at, now)`. Judge `inactive` locally for the Devices screen; never write the
+  roster's `inactive` status from it.
 - Keep device pairing (mdk#2628 item 3.3b) in `src/client/device_pairing.rs` (host DTOs) and
   `src/client/device_pairing/live.rs` (behind `unreleased-device-pairing`, and inert unless
   `MarmotAppConfig::dev_device_groups` is set). The Welcome peeler opens each gift wrap to the account once and hands

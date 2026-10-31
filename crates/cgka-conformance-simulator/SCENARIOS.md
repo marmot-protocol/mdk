@@ -1232,7 +1232,8 @@ It records unsupported cases explicitly; it does not rewrite scenarios, remove a
 ## Byte Fixtures
 
 The `vectors/byte-fixtures/` files are conformance artifacts, but they are not simulator scenarios. They check byte
-encoding and validation for app-component data such as Nostr routing component state and updates.
+encoding and validation for app-component data such as Nostr routing component state and updates, and transport wire
+formats such as a gift-wrapped Welcome whose NIP-44 layers need the extended length prefix.
 
 Keep those in the vector manifest. Add them here only if they become runnable `ScenarioSpec` fixtures.
 

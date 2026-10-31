@@ -16,6 +16,9 @@ Map for portable JSON vector fixtures.
   Commit only the synthesized vector, never the source export.
 - Keep `../SCENARIOS.md` updated when adding or changing a runnable scenario vector.
 - Byte-level fixtures live under `byte-fixtures/` and follow `byte-fixtures/schema.v1.json`.
+- A `wire_format` byte fixture carries a relay-delivered Nostr event in `nostr_event`. The Welcome one is recorded from
+  MDK's own wrap: regenerate it with the ignored `write_nostr_welcome_wire_fixture` test in
+  `../tests/vector_artifacts.rs`, never by hand.
 - Keep fixture names stable and versioned, usually `name.v1.json`.
 - Do not store OpenMLS protocol bytes in fixtures.
 - Never commit a sensitive replay capsule, participant database, incident export, or real identifier/payload as a

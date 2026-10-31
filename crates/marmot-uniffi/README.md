@@ -995,6 +995,12 @@ the device group this device trusts, for a Devices screen:
 - Each device writes its own `client` and `platform`: its `clientName` and `devicePlatform` options (a short name
   such as `iOS`), trimmed, and empty when blank or over 64 bytes. It writes them with its next KeyPackage
   announcement in the device group, so they appear after its next maintenance pass.
+- `last_active_at` is when a heartbeat last showed a sibling running, in Unix seconds. Each running device sends one
+  in the device group at most once an hour; each is dated when it was created or, if earlier, when this device read
+  it. It is `None` for this device and for a sibling none of whose heartbeats has counted yet.
+- `inactive` is this device's own judgement, for showing the user: 30 days have passed since a sibling's last activity
+  or since this device first found it in the roster, whichever is later. It is never set for this device. `status`
+  `Inactive` is the roster's own mark.
 - The list is empty until this device trusts a device group (a single-device account has none), and in every release
   build until the roster's spec lands.
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no

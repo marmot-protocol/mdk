@@ -17,6 +17,7 @@ pub use app::compromise_warning::{
     CompromiseWarningGather, CompromiseWarningReason, CompromiseWarningRecord, FirstTrustedRoster,
     ObservedWarningItem,
 };
+pub use app::device_activity::{DeviceActivityRecord, DeviceHeartbeatSent};
 pub use app::device_renames::DeviceRenameRecord;
 pub use app::group_system::{
     GroupSystemEventProjection, GroupSystemEventProvenance, group_system_event_from_message,

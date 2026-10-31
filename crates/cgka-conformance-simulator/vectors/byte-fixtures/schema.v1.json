@@ -6,10 +6,44 @@
     "fixture_name",
     "fixture_version",
     "vector_type",
-    "component",
     "encoding",
-    "bytes",
     "expected"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "vector_type": {
+            "enum": [
+              "app_component_state",
+              "app_component_update"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "component",
+          "bytes"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "vector_type": {
+            "const": "wire_format"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "wire",
+          "recipient_secret_key_hex",
+          "nostr_event"
+        ]
+      }
+    }
   ],
   "properties": {
     "fixture_name": {
@@ -37,6 +71,21 @@
           "type": "string",
           "pattern": "^0x[0-9a-fA-F]{4}$"
         },
+        "name": {
+          "type": "string"
+        },
+        "document": {
+          "type": "string"
+        }
+      }
+    },
+    "wire": {
+      "type": "object",
+      "required": [
+        "name",
+        "document"
+      ],
+      "properties": {
         "name": {
           "type": "string"
         },
@@ -78,6 +127,14 @@
           "pattern": "^([0-9a-fA-F]{2})*$"
         }
       }
+    },
+    "recipient_secret_key_hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nostr_event": {
+      "type": "object",
+      "description": "A signed Nostr event exactly as a relay delivers it."
     },
     "expected": {
       "type": "object",

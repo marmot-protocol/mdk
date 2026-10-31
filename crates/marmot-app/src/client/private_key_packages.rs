@@ -33,8 +33,8 @@
 //!   has used (mdk#2628 D42).
 
 use base64::Engine as _;
-use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
-use cgka_traits::storage::{IssuedPrivateKeyPackage, MaintenanceStorage as _};
+use cgka_traits::app_components::DeviceSlotId;
+use cgka_traits::storage::IssuedPrivateKeyPackage;
 use cgka_traits::{EpochId, GroupId, KeyPackage, MemberId, MessageId};
 use marmot_session::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,
@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 use storage_sqlite::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage};
 
 use super::AppClient;
-use super::device_group::device_slot;
+use super::device_group::Exchange;
 use crate::{AppError, unix_now_seconds};
 
 const TRACE_TARGET: &str = "marmot_app::client::private_key_packages";
@@ -55,64 +55,7 @@ const TRACE_TARGET: &str = "marmot_app::client::private_key_packages";
 /// often.
 const REQUEST_INTERVAL_SECS: u64 = 60 * 60;
 
-/// The device group private KeyPackages travel in, its roster, this
-/// device's slot there, and whether this device's own leaf carries a device
-/// tag that reads as that slot.
-struct Exchange {
-    group_id: GroupId,
-    roster: DeviceRosterV1,
-    own_slot: DeviceSlotId,
-    tagged: bool,
-}
-
-impl Exchange {
-    /// Every other device the roster lists.
-    fn siblings(&self) -> Vec<DeviceSlotId> {
-        self.roster
-            .devices
-            .keys()
-            .filter(|slot| **slot != self.own_slot)
-            .copied()
-            .collect()
-    }
-
-    fn is_sibling(&self, slot: &DeviceSlotId) -> bool {
-        *slot != self.own_slot && self.roster.devices.contains_key(slot)
-    }
-}
-
 impl AppClient {
-    /// The exchange this device takes part in: the trusted device group's,
-    /// while the roster lists this device.
-    fn private_key_package_exchange(&mut self) -> Result<Option<Exchange>, AppError> {
-        let Some((group_id, roster)) = self.trusted_device_roster()? else {
-            return Ok(None);
-        };
-        let Some(own_slot) = self
-            .app
-            .account_storage(&self.state.label)?
-            .key_package_lifecycle()?
-            .and_then(|lifecycle| device_slot(&lifecycle.stable_slot_id).ok())
-        else {
-            return Ok(None);
-        };
-        if !roster.devices.contains_key(&own_slot) {
-            return Ok(None);
-        }
-        let epoch = self.runtime.group_record(&group_id)?.epoch;
-        let own_leaf = self.runtime.own_leaf_index(&group_id)?;
-        let tagged = self
-            .runtime
-            .member_device_tag_claim(&group_id, epoch, own_leaf, &roster)?
-            == Some(DeviceTagClaim::Device(own_slot));
-        Ok(Some(Exchange {
-            group_id,
-            roster,
-            own_slot,
-            tagged,
-        }))
-    }
-
     /// Answer a sibling's request by issuing what it wants. Upkeep sends the
     /// hand-offs. A request answered before issues nothing, and so does one
     /// that reaches this device before its own leaf is tagged.
@@ -123,7 +66,7 @@ impl AppClient {
         sender: (EpochId, Option<u32>),
         content: &str,
     ) -> Result<(), AppError> {
-        let Some(exchange) = self.private_key_package_exchange()? else {
+        let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
         let request = PrivateKeyPackageRequest::decode(content)
@@ -160,7 +103,7 @@ impl AppClient {
         sender: (EpochId, Option<u32>),
         content: &str,
     ) -> Result<(), AppError> {
-        let Some(exchange) = self.private_key_package_exchange()? else {
+        let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
         let invalid = || AppError::InvalidAppMessagePayload("private KeyPackage hand-off".into());
@@ -257,7 +200,7 @@ impl AppClient {
 
     async fn try_sibling_key_package_upkeep(&mut self, held: &[GroupId]) -> Result<(), AppError> {
         let now = unix_now_seconds();
-        let Some(exchange) = self.private_key_package_exchange()? else {
+        let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
         if held.contains(&exchange.group_id) || !exchange.tagged {

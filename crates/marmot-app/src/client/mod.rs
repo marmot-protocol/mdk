@@ -77,6 +77,7 @@ pub use chat_history::DevSealedHistoryBundle;
 pub(crate) mod compromise_warning;
 pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
+pub(crate) mod device_heartbeats;
 pub(crate) mod device_pairing;
 mod device_removal;
 mod device_renames;
@@ -805,6 +806,10 @@ pub struct AppClient {
     /// what hosts last read. The worker's account-level and applied-summary
     /// seams drain it into one `LinkedDevicesChanged`.
     pub(crate) linked_devices_changed: bool,
+    /// The siblings the last maintenance pass judged inactive, by slot, so a
+    /// pass that judges differently owes hosts a `LinkedDevicesChanged`.
+    /// `None` until a pass has judged.
+    pub(crate) inactive_siblings: Option<std::collections::BTreeSet<String>>,
     /// The last overdue-refresh answer a maintenance pass computed, and
     /// whether hosts owe a `KeyPackageRefreshOverdueChanged`. The flag starts
     /// set, since a fresh client cannot know what hosts last read.
@@ -1505,6 +1510,7 @@ impl AppClient {
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;
         self.sibling_key_package_upkeep(&held).await;
+        self.device_heartbeat_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
         self.note_key_package_refresh_overdue();
         let mut activity = self.runtime.take_maintenance_activity();

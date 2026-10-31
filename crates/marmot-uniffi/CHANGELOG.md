@@ -94,6 +94,11 @@
   trusts, this device first (mdk#2628 item 3.1). Re-read it on
   `LinkedDevicesChanged`. It is empty in release builds until the roster's
   spec lands.
+- `LinkedDeviceFfi` adds `last_active_at`, when a heartbeat last showed a
+  sibling running, and `inactive`, this device's own judgement 30 days after
+  the later of that and when it first found the sibling in the roster
+  (mdk#2628 item 3.6). Each device sends a heartbeat in the device group at
+  most once an hour while it runs. Release builds show neither.
 
 - `key_package_refresh_overdue(account_ref)` says when this device's device
   group has held its KeyPackage refresh back for a week (mdk#2628 item 3.4),
