@@ -51,8 +51,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn populated_upgrade_preserves_bytes_and_usage() {
+    fn upgraded() -> rusqlite::Connection {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;
             CREATE TABLE attachment_acquisition(token BLOB PRIMARY KEY);
@@ -67,6 +66,12 @@ mod tests {
         let tx = conn.transaction().unwrap();
         apply(&tx).unwrap();
         tx.commit().unwrap();
+        conn
+    }
+
+    #[test]
+    fn populated_upgrade_preserves_bytes_and_usage() {
+        let conn = upgraded();
         assert_eq!(
             conn.query_row("SELECT bytes FROM retained_attachment_bytes", [], |row| row
                 .get::<_, Vec<u8>>(0))
@@ -120,5 +125,24 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    /// Accounting trusts `byte_len`, so a declared length that disagrees with
+    /// the body is refused on insert and on update.
+    #[test]
+    fn a_declared_length_must_match_the_body() {
+        let conn = upgraded();
+        conn.execute("INSERT INTO attachment_acquisition VALUES(x'02')", [])
+            .unwrap();
+        for sql in [
+            "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(x'02',3,x'0102')",
+            "UPDATE retained_attachment_bytes SET byte_len=2 WHERE token=x'01'",
+        ] {
+            let error = conn.execute(sql, []).unwrap_err().to_string();
+            assert!(
+                error.contains("invalid retained body length"),
+                "{sql}: {error}"
+            );
+        }
     }
 }
