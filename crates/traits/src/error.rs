@@ -281,6 +281,13 @@ pub enum EngineError {
     #[error("sibling welcome held while the chat's local copy is active")]
     SiblingWelcomeHeld { group_id: GroupId },
 
+    /// A sibling Welcome whose carrier is dated at or before this device
+    /// forgot the chat. A sibling Welcome is dated by the message that
+    /// carried it, so this refuses that carrier only: the same Welcome in a
+    /// carrier dated after the forget still joins (mdk#2628 3.5b).
+    #[error("sibling welcome carried before the chat was forgotten")]
+    SiblingWelcomePredatesForget,
+
     /// Last-resort bucket. Prefer adding a typed variant.
     #[error("backend failure: {0}")]
     Backend(String),
@@ -353,6 +360,7 @@ impl EngineError {
             EngineError::WelcomeNotAddressedToThisDevice => "welcome_not_addressed_to_this_device",
             EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
             EngineError::SiblingWelcomeHeld { .. } => "sibling_welcome_held",
+            EngineError::SiblingWelcomePredatesForget => "sibling_welcome_predates_forget",
             EngineError::Backend(_) => "backend",
             EngineError::Other(_) => "other",
         }

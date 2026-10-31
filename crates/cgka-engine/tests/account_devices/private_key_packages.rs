@@ -639,6 +639,66 @@ async fn a_held_sibling_welcome_joins_a_chat_whose_copy_is_unrecoverable() {
     );
 }
 
+/// A sibling Welcome is dated by the message that carried it. One carried
+/// no later than the laptop forgot the chat is refused for that carrier
+/// alone, its KeyPackage still issued, so the same Welcome sent again in a
+/// carrier dated after the forget joins.
+#[tokio::test]
+async fn a_sibling_welcome_carried_before_a_forget_joins_from_a_later_carrier() {
+    let mut phone = device(b"alice", true);
+    let mut laptop = device(b"alice", true);
+    laptop
+        .engine
+        .issue_private_key_packages(&SLOT, 2, None, NOW)
+        .unwrap();
+    let issued = laptop.engine.issued_private_key_packages().unwrap();
+    let private = |index: usize| current(issued[index].key_package.clone());
+    let (gid, welcomes) = create(&mut phone, vec![private(0)], vec![]).await.unwrap();
+    join_sibling(
+        &mut laptop,
+        b"first",
+        &sibling_welcome(&welcomes[0], SLOT, &issued[0].key_package_ref),
+    )
+    .await;
+    let (_, welcome) = remove_and_add_back(&mut phone, &laptop, &gid, private(1)).await;
+    let sibling = sibling_welcome(&welcome, SLOT, &issued[1].key_package_ref);
+    assert!(laptop.engine.forget_group_local(&gid).unwrap());
+    let cutoff = laptop
+        .storage
+        .group_local_reset_cutoff(&gid)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        laptop
+            .engine
+            .join_sibling_welcome(&hash_id(b"before"), &sibling, Some(cutoff))
+            .await
+            .unwrap(),
+        Settled(refused(InputRejectionCategory::InvalidEncoding))
+    );
+    assert!(
+        laptop
+            .engine
+            .issued_private_key_packages()
+            .unwrap()
+            .iter()
+            .any(|issued| issued.key_package_ref == sibling.key_package_ref)
+    );
+    assert_eq!(
+        laptop
+            .engine
+            .join_sibling_welcome(&hash_id(b"after"), &sibling, Some(Timestamp(cutoff.0 + 1)))
+            .await
+            .unwrap(),
+        Settled(IngestOutcome::Processed)
+    );
+    assert_eq!(
+        laptop.engine.epoch(&gid).unwrap(),
+        phone.engine.epoch(&gid).unwrap()
+    );
+}
+
 /// A sibling Welcome decodes only from its exact encoding.
 #[tokio::test]
 async fn a_sibling_welcome_decodes_only_its_exact_encoding() {

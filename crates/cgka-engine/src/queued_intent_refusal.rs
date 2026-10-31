@@ -105,6 +105,7 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::WelcomeNotAddressedToThisDevice
         | EngineError::WelcomeAlreadyProcessed
         | EngineError::SiblingWelcomeHeld { .. }
+        | EngineError::SiblingWelcomePredatesForget
         | EngineError::UnexpectedDeviceGroupWelcome
         | EngineError::Other(_) => false,
     }

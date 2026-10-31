@@ -906,17 +906,38 @@ async fn a_held_sibling_welcome_goes_only_once_it_can_never_join() {
 /// This is the user's way out of a chat whose removal never arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_forgotten_chat_joins_from_a_sibling_welcome_sent_again() {
+    forget_then_send_again(true).await;
+}
+
+/// The same way out when the forget comes before any pass tried the
+/// Welcome: the pass refuses that carrier, dated before the forget, and
+/// keeps its KeyPackage, so the same Welcome in a later carrier joins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chat_forgotten_before_any_pass_joins_from_a_sibling_welcome_sent_again() {
+    forget_then_send_again(false).await;
+}
+
+/// The phone stashes a sibling Welcome back into a chat it still holds
+/// active, holding it first if `held_first`, forgets the chat, and joins
+/// from the same Welcome sent again after the forget.
+async fn forget_then_send_again(held_first: bool) {
     use cgka_traits::storage::GroupStorage as _;
     let (mut devices, group) = tagging_devices().await;
     let (chat, again, _) = chat_re_adding_the_phone(&mut devices, &group).await;
     send_sibling_welcome(&mut devices.laptop, &group, &again).await;
     deliver_all(&mut devices.phone, &devices.relay).await;
-    devices.phone.run_due_maintenance().await.unwrap();
-    assert_eq!(held_for(&devices.phone), vec![Some(chat.clone())]);
+    if held_first {
+        devices.phone.run_due_maintenance().await.unwrap();
+        assert_eq!(held_for(&devices.phone), vec![Some(chat.clone())]);
+    } else {
+        assert_eq!(held_for(&devices.phone), vec![None]);
+    }
 
     assert!(devices.phone.forget_group_local(&chat).await.unwrap());
     devices.phone.run_due_maintenance().await.unwrap();
     assert_eq!(stashed(&devices.phone), 0);
+    assert!(devices.phone.state_group_record(&chat).is_none());
+    assert!(key_package_issued(&devices.phone, &again));
     let cutoff = group_storage(&devices.phone)
         .group_local_reset_cutoff(&chat)
         .unwrap()

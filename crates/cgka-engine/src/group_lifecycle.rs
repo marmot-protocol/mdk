@@ -212,6 +212,7 @@ pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
             | EngineError::MissingRequiredCapabilities { .. }
             | EngineError::NotGroupAdmin { .. }
             | EngineError::WelcomeAlreadyProcessed
+            | EngineError::SiblingWelcomePredatesForget
     )
 }
 
@@ -1286,9 +1287,14 @@ impl<S: StorageProvider> Engine<S> {
         match &result {
             Ok(_) => {}
             Err(error) if terminal_welcome_error(error) => {
+                // A sibling Welcome refused for its carrier's date refuses
+                // that carrier only; every other refusal is the Welcome's.
+                let content_refused = !matches!(error, EngineError::SiblingWelcomePredatesForget);
                 self.storage.with_transaction(|storage| {
                     storage.put_ingress_dedup_marker(&welcome_id)?;
-                    storage.put_ingress_dedup_marker(&content_id)?;
+                    if content_refused {
+                        storage.put_ingress_dedup_marker(&content_id)?;
+                    }
                     Ok::<_, EngineError>(())
                 })?;
             }
@@ -1499,7 +1505,13 @@ impl<S: StorageProvider> Engine<S> {
             if let Some(cutoff) = dated_reset
                 && welcome_created_at.is_none_or(|created_at| created_at <= cutoff)
             {
-                return Err(EngineError::InvalidWelcome);
+                // A sibling Welcome's date is its carrier's, so the same
+                // Welcome in a later carrier is a fresh one.
+                return Err(if sibling_record.is_some() {
+                    EngineError::SiblingWelcomePredatesForget
+                } else {
+                    EngineError::InvalidWelcome
+                });
             }
 
             let mut superseded: Vec<(MessageId, EpochId)> = Vec::new();
