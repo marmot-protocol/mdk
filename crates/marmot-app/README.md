@@ -422,6 +422,12 @@ with nothing sent, since a commit then could build on a roster that is about to 
 commit loses a fork is made again on a later maintenance pass, unless another rename of that device won; that one
 stands. Show the label the next list returns after `LinkedDevicesChanged`, not the one the user typed.
 
+When another of the account's devices removes this one, the account stops on this device once it reads the removal,
+and nothing more is sent from it. `MarmotAppEvent::DeviceUnlinked` fires once; afterwards `ManagedAccount::unlinked`
+and `signed_out` stay set, `sign_in_account` fails with `AccountHomeError::AccountUnlinked`, and local history is not
+shown. `sign_out_and_wipe` wipes the account without leaving its chats or deleting its slot, which the other devices
+did; signing in again is then a new link.
+
 ### Overdue KeyPackage refresh
 
 While this device trusts a device group, each KeyPackage it publishes is first announced in its own roster entry there,

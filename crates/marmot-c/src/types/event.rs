@@ -383,6 +383,14 @@ pub enum MarmotEvent {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
+    /// The account's device group removed this device after its link was
+    /// made, so the account stopped here and is signed out for good: re-read
+    /// the accounts and show the device-level notice. Fires once; afterwards
+    /// `MarmotAccountSummary.unlinked` says so.
+    DeviceUnlinked {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
 }
 
 impl From<MarmotEventFfi> for MarmotEvent {
@@ -525,6 +533,13 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 account_id_hex: owned_c_string(account_id_hex),
                 account_label: owned_c_string(account_label),
             },
+            F::DeviceUnlinked {
+                account_id_hex,
+                account_label,
+            } => Self::DeviceUnlinked {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
         }
     }
 }
@@ -594,6 +609,10 @@ impl CFree for MarmotEvent {
                     account_label,
                 }
                 | Self::DeviceLinkChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::DeviceUnlinked {
                     account_id_hex,
                     account_label,
                 } => {

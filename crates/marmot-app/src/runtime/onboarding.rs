@@ -1600,6 +1600,7 @@ impl AccountManager {
                     local_signing: false,
                     external_signing: true,
                     signed_out: false,
+                    unlinked: false,
                 };
                 self.app.account_home().begin_account_setup_with(
                     &pending,

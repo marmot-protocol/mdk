@@ -11,6 +11,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Errors for an account whose device group unlinked this device carry `code=account_unlinked` and its `account_ref`
+  (mdk#2628 item 3.6b). Such an account stays signed out; wiping it skips leaving its chats and deleting its slot.
+
 - `self_membership` in `groups show`, `chats list` and their feeds can read `device_removed` (mdk#2628 item 3.6b):
   this device's leaf was removed while the account stays in the group through another of its devices. It is not a
   removal of the account from the group.

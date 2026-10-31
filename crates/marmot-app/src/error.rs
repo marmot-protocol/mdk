@@ -826,6 +826,7 @@ fn account_home_error_kind(error: &AccountHomeError) -> &'static str {
         AccountHomeError::AccountExists(_) => "account_home_account_exists",
         AccountHomeError::AccountIdInUse(_) => "account_home_account_id_in_use",
         AccountHomeError::UnknownAccount(_) => "account_home_unknown_account",
+        AccountHomeError::AccountUnlinked(_) => "account_home_account_unlinked",
         AccountHomeError::InvalidSecretKey => "account_home_invalid_secret_key",
         AccountHomeError::InvalidPublicKey => "account_home_invalid_public_key",
         AccountHomeError::InvalidAccountLabel(_) => "account_home_invalid_account_label",

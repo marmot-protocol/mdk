@@ -268,6 +268,11 @@ enum MarmotStatus
    * Signal sticker import is not available for external-signing accounts.
    */
   MARMOT_STATUS_STICKER_IMPORT_UNSUPPORTED = 115,
+  /**
+   * This device was unlinked from the account by its other devices. The
+   * account stays signed out here: wipe it, then link the device again.
+   */
+  MARMOT_STATUS_ACCOUNT_UNLINKED = 116,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -2093,6 +2098,7 @@ typedef struct MarmotAccountSummary {
   bool external_signing;
   bool signed_out;
   bool running;
+  bool unlinked;
 } MarmotAccountSummary;
 
 /**
@@ -5860,6 +5866,13 @@ typedef enum MarmotEvent_Tag {
    * fire with no visible change.
    */
   MARMOT_EVENT_DEVICE_LINK_CHANGED,
+  /**
+   * The account's device group removed this device after its link was
+   * made, so the account stopped here and is signed out for good: re-read
+   * the accounts and show the device-level notice. Fires once; afterwards
+   * `MarmotAccountSummary.unlinked` says so.
+   */
+  MARMOT_EVENT_DEVICE_UNLINKED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -5956,6 +5969,11 @@ typedef struct MarmotEvent_DeviceLinkChanged_Body {
   char *account_label;
 } MarmotEvent_DeviceLinkChanged_Body;
 
+typedef struct MarmotEvent_DeviceUnlinked_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_DeviceUnlinked_Body;
+
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
   union {
@@ -5975,6 +5993,7 @@ typedef struct MarmotEvent {
     MarmotEvent_UnrecognizedSignInsChanged_Body UNRECOGNIZED_SIGN_INS_CHANGED;
     MarmotEvent_CompromiseWarningChanged_Body COMPROMISE_WARNING_CHANGED;
     MarmotEvent_DeviceLinkChanged_Body DEVICE_LINK_CHANGED;
+    MarmotEvent_DeviceUnlinked_Body DEVICE_UNLINKED;
   };
 } MarmotEvent;
 

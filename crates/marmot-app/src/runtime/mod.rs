@@ -1049,6 +1049,11 @@ pub struct ManagedAccount {
     pub external_signing: bool,
     pub signed_out: bool,
     pub running: bool,
+    /// The account's device group removed this device after its link was
+    /// made. The account is signed out here for good: show that this device
+    /// was unlinked from the account, and offer `sign_out_and_wipe`, after
+    /// which signing in again is a new link (mdk#2628 D67).
+    pub unlinked: bool,
 }
 
 /// Structured outcome of [`MarmotAppRuntime::sign_out_and_wipe`].
@@ -1581,6 +1586,15 @@ pub enum MarmotAppEvent {
     /// progress. Carries no device, session or group identities, and may
     /// fire with no visible change.
     DeviceLinkChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// The account's device group removed this device after its link was
+    /// made, so the account stopped here and is signed out for good: re-read
+    /// `accounts` and show the device-level notice. Fires once, when the
+    /// device finds its removal; afterwards `ManagedAccount::unlinked` says
+    /// so (mdk#2628 D62, D67).
+    DeviceUnlinked {
         account_id_hex: String,
         account_label: String,
     },
@@ -4537,6 +4551,8 @@ impl MarmotAppRuntime {
     /// - Stages 1 and 2 are network-bound; their per-target failures are
     ///   surfaced for the app's partial-failure sheet and never block local
     ///   cleanup.
+    /// - An unlinked account (`ManagedAccount::unlinked`) skips stages 1 and
+    ///   2: its device group already removed this device.
     /// - Every account that can sign — local or external-signer — can be
     ///   wiped. Only tracked-only (npub) accounts are rejected. An external
     ///   signer that is unavailable at wipe time degrades stages 1 and 2 to
@@ -4559,59 +4575,66 @@ impl MarmotAppRuntime {
 
         let mut outcome = WipeOutcome::default();
 
-        // Stage 1: best-effort leave for every active MLS group. We read the
-        // group set directly from the in-memory account state (no relay round
-        // trip). We attempt the leave for *every* group with local MLS
-        // membership, including ones still marked `pending_confirmation`: in
-        // mdk an incoming Welcome auto-joins MLS state while the app
-        // keeps the invite pending until the user accepts, so a
-        // pending-confirmation group is already a committed MLS member this
-        // device can — and must — leave before its state is wiped (mirroring
-        // `decline_group_invite`, which leaves the group before archiving). If
-        // we skipped them, signing out before accepting an invite would wipe
-        // the local MLS state without ever publishing a leave, and the engine
-        // could never sign one afterwards. A failure to enumerate groups is a
-        // recorded failure, not a silent "no groups" — it must not let the wipe
-        // skip remote leaves without surfacing why.
-        let groups = match self.accounts.app.groups(&account.label) {
-            Ok(groups) => groups,
-            Err(err) => {
-                outcome.group_leave_failures.push(GroupLeaveFailure {
-                    group_id_hex: String::new(),
-                    reason: format!("group discovery failed: {}", wipe_failure_reason(&err)),
-                });
-                Vec::new()
-            }
-        };
-        for group in groups {
-            let group_id_hex = group.group_id_hex.clone();
-            let group_id = match hex::decode(&group_id_hex) {
-                Ok(bytes) => GroupId::new(bytes),
-                Err(_) => {
+        // An unlinked device skips stages 1 and 2. Its device group removed
+        // it: its siblings took its leaves out of the chats that allow it and
+        // deleted its slot, and the account stays in every chat through them,
+        // so a leave here would speak for an account that is not leaving
+        // (mdk#2628 D67).
+        if !account.unlinked {
+            // Stage 1: best-effort leave for every active MLS group. We read the
+            // group set directly from the in-memory account state (no relay round
+            // trip). We attempt the leave for *every* group with local MLS
+            // membership, including ones still marked `pending_confirmation`: in
+            // mdk an incoming Welcome auto-joins MLS state while the app
+            // keeps the invite pending until the user accepts, so a
+            // pending-confirmation group is already a committed MLS member this
+            // device can — and must — leave before its state is wiped (mirroring
+            // `decline_group_invite`, which leaves the group before archiving). If
+            // we skipped them, signing out before accepting an invite would wipe
+            // the local MLS state without ever publishing a leave, and the engine
+            // could never sign one afterwards. A failure to enumerate groups is a
+            // recorded failure, not a silent "no groups" — it must not let the wipe
+            // skip remote leaves without surfacing why.
+            let groups = match self.accounts.app.groups(&account.label) {
+                Ok(groups) => groups,
+                Err(err) => {
                     outcome.group_leave_failures.push(GroupLeaveFailure {
-                        group_id_hex,
-                        reason: "invalid group id".to_owned(),
+                        group_id_hex: String::new(),
+                        reason: format!("group discovery failed: {}", wipe_failure_reason(&err)),
                     });
-                    continue;
+                    Vec::new()
                 }
             };
-            match self.leave_group(account_ref, &group_id).await {
-                Ok(_) => outcome.groups_left += 1,
-                Err(err) => outcome.group_leave_failures.push(GroupLeaveFailure {
-                    group_id_hex,
-                    reason: wipe_failure_reason(&err),
-                }),
+            for group in groups {
+                let group_id_hex = group.group_id_hex.clone();
+                let group_id = match hex::decode(&group_id_hex) {
+                    Ok(bytes) => GroupId::new(bytes),
+                    Err(_) => {
+                        outcome.group_leave_failures.push(GroupLeaveFailure {
+                            group_id_hex,
+                            reason: "invalid group id".to_owned(),
+                        });
+                        continue;
+                    }
+                };
+                match self.leave_group(account_ref, &group_id).await {
+                    Ok(_) => outcome.groups_left += 1,
+                    Err(err) => outcome.group_leave_failures.push(GroupLeaveFailure {
+                        group_id_hex,
+                        reason: wipe_failure_reason(&err),
+                    }),
+                }
             }
-        }
 
-        // Stage 2: delete this device's KeyPackage slot while its private
-        // material still exists. A failure must not abort the wipe.
-        self.withdraw_own_key_package_slot(
-            account_ref,
-            &mut outcome.key_packages_deleted,
-            &mut outcome.key_package_failures,
-        )
-        .await;
+            // Stage 2: delete this device's KeyPackage slot while its private
+            // material still exists. A failure must not abort the wipe.
+            self.withdraw_own_key_package_slot(
+                account_ref,
+                &mut outcome.key_packages_deleted,
+                &mut outcome.key_package_failures,
+            )
+            .await;
+        }
 
         // Stages 3-5: local cleanup. `remove_account` shuts the worker down,
         // drops in-memory caches, and removes the account directory (MLS DB,
@@ -6738,6 +6761,7 @@ impl AccountManager {
                 local_signing: account.local_signing,
                 external_signing: account.external_signing,
                 signed_out: account.signed_out,
+                unlinked: account.unlinked,
             })
             .collect())
     }
@@ -7009,6 +7033,28 @@ impl AccountManager {
         report_purge
     }
 
+    /// Deactivate `account_label` once its worker reports that the device
+    /// group unlinked this device. The worker marked the account unlinked and
+    /// stopped; deactivation reaps it and drops what the account holds in
+    /// memory. A worker that ends any other way drops the sender, and this
+    /// task ends with it.
+    fn deactivate_when_unlinked(&self, account_label: String, unlinked: oneshot::Receiver<()>) {
+        let accounts = self.clone();
+        tokio::spawn(async move {
+            if unlinked.await.is_err() {
+                return;
+            }
+            if let Err(error) = accounts.deactivate_account(&account_label).await {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "deactivate_when_unlinked",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not deactivate an unlinked account; it stays signed out"
+                );
+            }
+        });
+    }
+
     async fn restore_signed_out_after_key_package_failure(&self, account_ref: &str) {
         if let Err(error) = self.deactivate_account(account_ref).await {
             tracing::warn!(
@@ -7056,6 +7102,7 @@ impl AccountManager {
                 external_signing: account.external_signing,
                 signed_out: account.signed_out,
                 running,
+                unlinked: account.unlinked,
             })
         };
         observed
@@ -7275,6 +7322,8 @@ impl AccountManager {
                         AccountStartupProgress::new(self.shared.observer.performance().clone());
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
+                    let (unlinked_tx, unlinked_rx) = oneshot::channel();
+                    self.deactivate_when_unlinked(account.label.clone(), unlinked_rx);
                     let handle = spawn_app_runtime_account_worker(
                         AccountWorkerRuntime {
                             app: self.app.clone(),
@@ -7284,6 +7333,7 @@ impl AccountManager {
                             events: self.events.clone(),
                             lifecycle: self.shared.lifecycle(),
                             shared: self.shared.clone(),
+                            unlinked: unlinked_tx,
                         },
                         command_tx.clone(),
                         command_rx,

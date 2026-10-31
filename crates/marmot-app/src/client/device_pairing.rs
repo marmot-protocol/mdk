@@ -229,6 +229,57 @@ impl AppClient {
         self.drive_device_pairing_live().await;
     }
 
+    /// Note at once that a batch the engine applied removed this device
+    /// from its device group, whichever ingest applied it, so that an
+    /// unlinked device stops before the ingest's caller sends anything more
+    /// (D67). Its copy is forgotten at the next follow. Never while device
+    /// groups are off.
+    pub(crate) fn note_device_group_removal(
+        &mut self,
+        effects: &marmot_session::AccountDeviceEffects,
+    ) {
+        #[cfg(feature = "unreleased-device-pairing")]
+        if self.app.device_groups_enabled()
+            && !self.device_unlinked
+            && effects.events.iter().any(|event| {
+                matches!(
+                    event,
+                    cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated { .. }
+                )
+            })
+            && let Err(error) = self.note_device_group_removal_live()
+        {
+            tracing::warn!(
+                target: "marmot_app::client::device_pairing",
+                method = "note_device_group_removal",
+                error_kind = error.privacy_safe_kind(),
+                "could not note this device's removal from its device group; retrying"
+            );
+        }
+        #[cfg(not(feature = "unreleased-device-pairing"))]
+        let _ = effects;
+    }
+
+    /// Notice that this device's device group removed it, without moving
+    /// linking on: forget the copy and, when its link was made, mark the
+    /// account unlinked (D67). The worker calls it before and after its
+    /// startup catch-up, so a removal found then stops the account before
+    /// anything goes out, and as it stops an unlinked account. Never while
+    /// device groups are off.
+    pub(crate) async fn follow_device_group_removal(&mut self) {
+        #[cfg(feature = "unreleased-device-pairing")]
+        if self.app.device_groups_enabled()
+            && let Err(error) = self.follow_device_group_removal_live().await
+        {
+            tracing::warn!(
+                target: "marmot_app::client::device_pairing",
+                method = "follow_device_group_removal",
+                error_kind = error.privacy_safe_kind(),
+                "could not follow this device's removal from its device group; retrying"
+            );
+        }
+    }
+
     /// Whether to announce `DeviceLinkChanged`, clearing the flag. Never
     /// without pairing, or while device groups are off.
     pub(crate) fn take_device_link_changed(&mut self) -> bool {

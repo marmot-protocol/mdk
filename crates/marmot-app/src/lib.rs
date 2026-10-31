@@ -1984,7 +1984,15 @@ impl MarmotApp {
         let app = self.clone();
         // Resolve every supported account ref before touching label-keyed
         // caches or the session-owner registry.
-        let label = self.account_home().account(label)?.label;
+        let account = self.account_home().account(label)?;
+        // An account its device group unlinked never runs on this device
+        // again: it can only be wiped (mdk#2628 D67).
+        if account.unlinked {
+            return Err(AppError::AccountHome(
+                marmot_account::AccountHomeError::AccountUnlinked(account.label),
+            ));
+        }
+        let label = account.label;
         let relay_plane_for_open = relay_plane.clone();
         let permit = lifecycle
             .as_ref()
@@ -2091,6 +2099,8 @@ impl MarmotApp {
             #[cfg(test)]
             test_comparison_delay: None,
             #[cfg(test)]
+            test_fail_unlink_mark: false,
+            #[cfg(test)]
             test_comparison_saved_cursor: None,
             recovery_owner,
             epoch_gap_windows: Default::default(),
@@ -2136,6 +2146,7 @@ impl MarmotApp {
             compromise_warning_changed: true,
             compromise_warning_gather_due: true,
             device_link_changed: true,
+            device_unlinked: false,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),

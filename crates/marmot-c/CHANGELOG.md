@@ -17,6 +17,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   development device groups must be recreated. Use matching regenerated
   headers and libraries.
 
+- A device that its device group removes after its link was made is
+  unlinked (mdk#2628 item 3.6b): the account stops on that device and stays
+  signed out. The new `MARMOT_EVENT_DEVICE_UNLINKED` event, sent once, says
+  so; `MarmotAccountSummary` gains a trailing `unlinked`; and signing in to
+  such an account returns the new `MARMOT_STATUS_ACCOUNT_UNLINKED` (116).
+  `marmot_sign_out_and_wipe` skips leaving its chats and deleting its slot;
+  signing in again is then a new link. The struct layout changed: use
+  matching regenerated headers and libraries.
+
 - `MarmotSelfMembership` and `MarmotConversationParticipation` add
   `DeviceRemoved` (mdk#2628 item 3.6b): this device's leaf was removed from a
   chat the account stays in through another of its devices. Show no "removed

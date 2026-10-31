@@ -10,6 +10,16 @@
   of. Kind 462 is no longer reserved. The device roster changed its encoding,
   so existing development device groups must be recreated.
 
+- A device that its device group removes after its link was made is
+  unlinked (mdk#2628 item 3.6b): the account stops on that device and stays
+  signed out. `MarmotEventFfi` adds `DeviceUnlinked { account_id_hex,
+  account_label }`, sent once; `AccountSummaryFfi` adds `unlinked`; and
+  `MarmotKitError` adds `AccountUnlinked { account_ref }`, which signing in to
+  such an account returns. Show that this device was unlinked and offer
+  `sign_out_and_wipe`, which skips leaving chats and deleting the slot;
+  signing in again is then a new link. Update exhaustive Swift/Kotlin
+  handling and regenerate bindings with the matching native library.
+
 - `SelfMembershipFfi` and `ConversationParticipationFfi` add `DeviceRemoved`
   (mdk#2628 item 3.6b): this device's leaf was removed from a chat the account
   stays in through another of its devices. Show no "removed from group"

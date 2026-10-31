@@ -335,6 +335,9 @@ pub(crate) struct AccountWorkerRuntime {
     pub(crate) events: broadcast::Sender<MarmotAppEvent>,
     pub(crate) lifecycle: RuntimeLifecycle,
     pub(crate) shared: RuntimeSharedServices,
+    /// Fired once when the device group unlinks this device and the worker
+    /// stops, so the runtime deactivates the account (mdk#2628 D67).
+    pub(crate) unlinked: oneshot::Sender<()>,
 }
 
 pub(crate) enum AccountWorkerCommand {
@@ -812,6 +815,11 @@ pub(crate) enum AccountWorkerCommand {
     UnhydratedGroupCount {
         respond: oneshot::Sender<usize>,
     },
+    /// Unlink this device as the device group's removal would.
+    #[cfg(test)]
+    UnlinkDeviceForTest {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     /// Whether the worker runs a recovery runner, and if so one explicit pass
     /// of it, awaited off the worker. `None` without a runner.
     #[cfg(test)]
@@ -1083,6 +1091,7 @@ async fn run_app_runtime_account_worker(
         events,
         lifecycle,
         shared,
+        unlinked,
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
     let mut open_client = std::pin::pin!(app.runtime_local_client(
@@ -1275,6 +1284,21 @@ async fn run_app_runtime_account_worker(
             return;
         }
     }
+    // A removal from the device group applied on an earlier run, which then
+    // ended before it was followed, stops the account before catch-up sends
+    // anything (mdk#2628 D67).
+    client.follow_device_group_removal().await;
+    if client.device_unlinked() {
+        stop_unlinked_worker(
+            &mut client,
+            &events,
+            &account_id_hex,
+            &account_label,
+            unlinked,
+        )
+        .await;
+        return;
+    }
 
     // The snapshot answers read commands while the initial sync holds
     // `&mut client`; its only failure is the shared profile load. Readiness
@@ -1424,8 +1448,10 @@ async fn run_app_runtime_account_worker(
             let summary = client
                 .finish_deferred_comparison_sync(Some(&publish_startup_progress))
                 .await?;
-            app.finish_client_open_network_maintenance(&mut client)
-                .await;
+            if !client.device_unlinked() {
+                app.finish_client_open_network_maintenance(&mut client)
+                    .await;
+            }
             Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Complete(summary))
         });
         loop {
@@ -1549,6 +1575,13 @@ async fn run_app_runtime_account_worker(
                                                 publish_client_pending_projection_updates(
                                                     &mut client, &events, &account_id_hex, &account_label,
                                                 );
+                                                if client.device_unlinked() {
+                                                    // Nothing more goes out: the
+                                                    // comparison ends and the worker
+                                                    // stops (D67).
+                                                    network.abort_and_wait().await;
+                                                    return None;
+                                                }
                                                 start_post_join_history_after_visibility(
                                                     &mut client, &summary, &events,
                                                     &account_id_hex, &account_label,
@@ -1622,7 +1655,7 @@ async fn run_app_runtime_account_worker(
                                     }
                                     AccountWorkerCommand::SendMessage {
                                         enqueued_at, queued, group_id, payload, respond,
-                                    } if deferred.is_empty() => {
+                                    } if deferred.is_empty() && !client.device_unlinked() => {
                                         send_message_on_worker(
                                             &mut client, enqueued_at, queued, group_id, payload, respond,
                                             &events, &account_id_hex, &account_label, &shared,
@@ -1652,7 +1685,8 @@ async fn run_app_runtime_account_worker(
                             }
                             () = tokio::task::yield_now(), if native_progress => {}
                             _ = tokio::time::sleep_until(local_submission_retry_at),
-                                if local_submission_due && deferred.is_empty() && !lifecycle.is_stopping() => {
+                                if local_submission_due && deferred.is_empty() && !lifecycle.is_stopping()
+                                    && !client.device_unlinked() => {
                                 let retry = publish_next_local_submission(
                                     &mut client, &app, &shared, &events,
                                     &account_id_hex, &account_label,
@@ -1691,6 +1725,9 @@ async fn run_app_runtime_account_worker(
                             Err(failure)
                         }
                     };
+                    if client.device_unlinked() {
+                        return None;
+                    }
                     // Startup is a sync: whatever the comparison admitted, it
                     // still drains the live replay its activation started.
                     let result = match result {
@@ -1713,6 +1750,9 @@ async fn run_app_runtime_account_worker(
                         }
                         Err(failure) => Err(failure),
                     };
+                    if client.device_unlinked() {
+                        return None;
+                    }
                     app.finish_client_open_network_maintenance(&mut client)
                         .await;
                     result
@@ -1721,13 +1761,35 @@ async fn run_app_runtime_account_worker(
             })
         });
         let Some(result) = continuation.await else {
-            if startup_explicit_shutdown {
+            if client.device_unlinked() {
+                stop_unlinked_worker(
+                    &mut client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    unlinked,
+                )
+                .await;
+            } else if startup_explicit_shutdown {
                 client.finish_audit_recording();
             }
             return;
         };
         result
     };
+    // A removal the catch-up applied stops the account before anything
+    // else goes out (mdk#2628 D67).
+    if client.device_unlinked() {
+        stop_unlinked_worker(
+            &mut client,
+            &events,
+            &account_id_hex,
+            &account_label,
+            unlinked,
+        )
+        .await;
+        return;
+    }
     if let Err(failure) = &mut startup_sync_result {
         client.drain_epoch_stall_escalations(&mut failure.partial_summary);
     }
@@ -1831,6 +1893,20 @@ async fn run_app_runtime_account_worker(
             ))
         }
     };
+    // A removal from the device group that the catch-up applied stops the
+    // account before the deferred commands replay (mdk#2628 D67).
+    client.follow_device_group_removal().await;
+    if client.device_unlinked() {
+        stop_unlinked_worker(
+            &mut client,
+            &events,
+            &account_id_hex,
+            &account_label,
+            unlinked,
+        )
+        .await;
+        return;
+    }
     // Replay commands deferred during the initial catch-up in arrival order, now
     // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
     // with the initial catch-up's result. Replay uses the live command queue so
@@ -1968,6 +2044,22 @@ async fn run_app_runtime_account_worker(
     // Only with the internal `runner_owns_debt` gate on (mdk#2660 phase 4).
     let mut recovery_runner = client.spawn_recovery_runner().await;
     'worker: loop {
+        // An unlinked device stops: no sends, commits, publications or
+        // pairing answers once its device group removed it. The account is
+        // already marked unlinked; the runtime deactivates it once this
+        // worker has exited (mdk#2628 D67).
+        if client.device_unlinked() {
+            stop_recovery_runner(&mut recovery_runner, &mut client).await;
+            stop_unlinked_worker(
+                &mut client,
+                &events,
+                &account_id_hex,
+                &account_label,
+                unlinked,
+            )
+            .await;
+            break 'worker;
+        }
         // Activation may replace the source watch. Reacquire only a live
         // receiver; a closed activation must not turn this into a busy loop.
         if replay_changes.is_none() {
@@ -2756,6 +2848,10 @@ async fn run_app_runtime_account_worker(
                                 true,
                             );
                         }
+                        if client.device_unlinked() {
+                            // Nothing more goes out; the next turn stops the worker.
+                            continue 'worker;
+                        }
                         start_post_join_history_after_visibility(
                             &mut client,
                             &summary,
@@ -3143,6 +3239,11 @@ async fn run_app_runtime_account_worker(
                 );
                 // Pairing timers, KeyPackage retries and link settlement.
                 client.drive_device_pairing().await;
+                if client.device_unlinked() {
+                    // Nothing more goes out; the next turn stops the worker.
+                    phase.finish(TelemetryOutcome::Success);
+                    continue 'worker;
+                }
                 attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
                 attachments::spawn_legacy_migration(
                     &client,
@@ -3163,6 +3264,12 @@ async fn run_app_runtime_account_worker(
                     };
                     if let Some(observation) = observation {
                         observation.finish(outcome.as_str());
+                    }
+                    if client.device_unlinked() {
+                        // The catch-up applied this device's removal:
+                        // nothing more goes out (D67).
+                        phase.finish(TelemetryOutcome::Success);
+                        continue 'worker;
                     }
                     match catch_up {
                         Ok(Ok(summary)) => {
@@ -4253,6 +4360,10 @@ async fn handle_startup_hydration_command(
             let count = client.runtime.session().unhydrated_group_ids().len();
             let _ = respond.send(count);
         }
+        #[cfg(test)]
+        AccountWorkerCommand::UnlinkDeviceForTest { respond } => {
+            let _ = respond.send(client.mark_device_unlinked());
+        }
         AccountWorkerCommand::CatchUp { respond } => {
             deferred.push(DeferredStartupCommand::CatchUp(respond));
         }
@@ -5066,6 +5177,11 @@ fn account_worker_command_future<'a>(
         AccountWorkerCommand::UnhydratedGroupCount { respond } => Box::pin(async move {
             let count = client.runtime.session().unhydrated_group_ids().len();
             let _ = respond.send(count);
+            true
+        }),
+        #[cfg(test)]
+        AccountWorkerCommand::UnlinkDeviceForTest { respond } => Box::pin(async move {
+            let _ = respond.send(client.mark_device_unlinked());
             true
         }),
         // The worker loop answers it from its runner before dispatch.
@@ -7609,6 +7725,27 @@ struct ReceiveTailContext<'a> {
     command_tx: &'a mpsc::Sender<AccountWorkerCommand>,
 }
 
+/// Forget the device-group copy, announce that the device group unlinked
+/// this device and ask the runtime to deactivate the account; the caller
+/// then ends the worker. Once the account is marked unlinked, a crash from
+/// here on still leaves it signed out; a mark that failed keeps the copy,
+/// so the next start finds the removal and marks it (mdk#2628 D67).
+async fn stop_unlinked_worker(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    unlinked: oneshot::Sender<()>,
+) {
+    client.follow_device_group_removal().await;
+    let _ = events.send(MarmotAppEvent::DeviceUnlinked {
+        account_id_hex: account_id_hex.to_owned(),
+        account_label: account_label.to_owned(),
+    });
+    client.finish_audit_recording();
+    let _ = unlinked.send(());
+}
+
 async fn finish_receive_after_recovery(
     client: &mut AppClient,
     context: ReceiveTailContext<'_>,
@@ -9364,6 +9501,7 @@ mod tests {
                 events,
                 lifecycle: shared.lifecycle(),
                 shared: shared.clone(),
+                unlinked: oneshot::channel().0,
             },
             commands.clone(),
             receiver,

@@ -1030,6 +1030,34 @@ impl AppClient {
         std::mem::take(&mut self.linked_devices_changed) && self.app.device_groups_enabled()
     }
 
+    /// Whether the device group removed this device after its link was made,
+    /// so the account must stop here (mdk#2628 D67).
+    pub(crate) fn device_unlinked(&self) -> bool {
+        self.device_unlinked
+    }
+
+    /// Stop the account on this device for good: the device group removed
+    /// it after its link was made (mdk#2628 D67). The client stops first, so
+    /// nothing more goes out even when the durable mark fails; the caller
+    /// then keeps the device-group copy, and the next open finds the removal
+    /// again and retries the mark before it sends anything. Once the mark
+    /// lands, a crash before the worker stops still leaves the account
+    /// signed out.
+    #[cfg(any(test, feature = "unreleased-device-pairing"))]
+    pub(crate) fn mark_device_unlinked(&mut self) -> Result<(), AppError> {
+        self.device_unlinked = true;
+        #[cfg(test)]
+        if self.test_fail_unlink_mark {
+            return Err(AppError::AccountHome(marmot_account::AccountHomeError::Io(
+                std::io::Error::other("injected unlink mark failure"),
+            )));
+        }
+        self.app
+            .account_home()
+            .mark_account_unlinked(&self.state.label)?;
+        Ok(())
+    }
+
     /// Whether this device's KeyPackage refresh is overdue because its device
     /// group can't take the announcement, so the host warns the user (D31
     /// choice 6). Always false while device groups are off. It names the

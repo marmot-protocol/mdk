@@ -162,6 +162,14 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's device group removed this device after its link was
+    /// made, so the account stopped here and is signed out for good: re-read
+    /// `list_accounts` and show the device-level notice. Fires once;
+    /// afterwards `AccountSummaryFfi.unlinked` says so.
+    DeviceUnlinked {
+        account_id_hex: String,
+        account_label: String,
+    },
 }
 
 /// FFI projection of [`cgka_traits::engine::GroupEvent`]. The previous FFI
@@ -550,6 +558,13 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_id_hex,
                 account_label,
             } => Self::DeviceLinkChanged {
+                account_id_hex,
+                account_label,
+            },
+            MarmotAppEvent::DeviceUnlinked {
+                account_id_hex,
+                account_label,
+            } => Self::DeviceUnlinked {
                 account_id_hex,
                 account_label,
             },

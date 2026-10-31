@@ -382,6 +382,378 @@ async fn a_device_removed_from_a_chat_its_account_stays_in_is_not_removed_from_i
     );
 }
 
+/// The phone removes the laptop from the device group long after its link
+/// was made. The laptop is unlinked as it applies the removal: the account
+/// is marked unlinked, and so signed out for good, and its next pairing
+/// drive forgets its device-group copy. Nothing more goes out from it, and
+/// signing in again is refused (D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_its_device_group_removes_is_unlinked_from_the_account() {
+    let (devices, group) = tagging_devices().await;
+    let mut laptop_cursor = published_count(&devices.relay);
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        laptop_app,
+        mut laptop,
+        ..
+    } = devices;
+    let laptop_storage = laptop_app.account_storage("alice").unwrap().app_storage();
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    assert!(
+        laptop_storage.device_group_joins().unwrap().is_empty(),
+        "the laptop's link is settled, so its removal is not a failed link"
+    );
+
+    phone
+        .remove_linked_device(&own_slot(&laptop))
+        .await
+        .unwrap();
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    assert!(laptop.runtime.group_record(&group).unwrap().removed);
+    assert!(
+        laptop.device_unlinked(),
+        "it stops as it applies the removal"
+    );
+    let account = laptop_app.account_home().account("alice").unwrap();
+    assert!(account.unlinked && account.signed_out);
+    assert!(trust(&laptop_app, &group).is_some());
+
+    let published = published_count(&relay);
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    assert!(
+        trust(&laptop_app, &group).is_none(),
+        "its copy is forgotten"
+    );
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    assert_eq!(published_count(&relay), published, "nothing goes out");
+    assert!(matches!(
+        laptop_app
+            .account_home()
+            .set_account_signed_out("alice", false),
+        Err(marmot_account::AccountHomeError::AccountUnlinked(_))
+    ));
+    drop(laptop);
+    assert!(
+        matches!(
+            laptop_app.client("alice").await.err(),
+            Some(AppError::AccountHome(
+                marmot_account::AccountHomeError::AccountUnlinked(_)
+            ))
+        ),
+        "an unlinked account never opens again"
+    );
+    assert_eq!(published_count(&relay), published);
+}
+
+/// The laptop sends its first commit in the device group and is closed
+/// before a later pairing drive settles its link, so it still holds its
+/// join. The phone sees that commit and removes the laptop, and the laptop
+/// applies the removal with its join still held. The removal left a
+/// `removed` record for its slot, so it was unlinked, not a failed link
+/// (D40, D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_found_with_the_join_still_held_unlinks() {
+    let (devices, group) = tagging_devices().await;
+    let mut laptop_cursor = published_count(&devices.relay);
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        laptop_app,
+        mut laptop,
+        ..
+    } = devices;
+    let laptop_storage = laptop_app.account_storage("alice").unwrap().app_storage();
+    assert!(
+        !laptop_storage.device_group_joins().unwrap().is_empty(),
+        "no drive has settled the laptop's link yet"
+    );
+
+    phone
+        .remove_linked_device(&own_slot(&laptop))
+        .await
+        .unwrap();
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    assert!(laptop.runtime.group_record(&group).unwrap().removed);
+    assert!(
+        !laptop_storage.device_group_joins().unwrap().is_empty(),
+        "the join is still held when the removal is applied"
+    );
+    assert!(laptop.device_unlinked());
+    let account = laptop_app.account_home().account("alice").unwrap();
+    assert!(account.unlinked && account.signed_out);
+
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    assert!(trust(&laptop_app, &group).is_none());
+    assert!(
+        !matches!(
+            laptop
+                .device_link(DeviceLinkOp::Read)
+                .await
+                .unwrap()
+                .new_device,
+            Some(NewDeviceLinkState::Ended {
+                reason: DeviceLinkEndReason::LinkFailed
+            })
+        ),
+        "it is not shown as a failed link"
+    );
+}
+
+/// The laptop can't write its account record when it applies its removal.
+/// It stops all the same, and keeps its device-group copy, so its next
+/// client finds the removal again and makes the mark then (D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_unlink_mark_still_stops_and_is_made_again() {
+    let (devices, group) = tagging_devices().await;
+    let mut laptop_cursor = published_count(&devices.relay);
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        laptop_app,
+        mut laptop,
+        ..
+    } = devices;
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    phone
+        .remove_linked_device(&own_slot(&laptop))
+        .await
+        .unwrap();
+    laptop.test_fail_unlink_mark = true;
+    let published = published_count(&relay);
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    assert!(laptop.runtime.group_record(&group).unwrap().removed);
+
+    assert!(
+        laptop.device_unlinked(),
+        "it stops although the mark failed"
+    );
+    assert!(!laptop_app.account_home().account("alice").unwrap().unlinked);
+    assert!(
+        trust(&laptop_app, &group).is_some(),
+        "it keeps its copy until the mark lands"
+    );
+    assert_eq!(published_count(&relay), published, "nothing goes out");
+
+    drop(laptop);
+    let mut laptop = laptop_app.client("alice").await.unwrap();
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    assert!(laptop.device_unlinked());
+    let account = laptop_app.account_home().account("alice").unwrap();
+    assert!(account.unlinked && account.signed_out);
+    assert!(
+        trust(&laptop_app, &group).is_none(),
+        "its copy is forgotten"
+    );
+}
+
+/// The laptop's engine applies its removal but the app never notes it, as
+/// after a crash between the two (here, device groups are off when it is
+/// applied). Started again under the runtime, its worker follows the removal
+/// before its catch-up: the account is unlinked and deactivated, and nothing
+/// goes out from it (D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_applied_before_a_restart_unlinks_before_catch_up() {
+    let (devices, group) = tagging_devices().await;
+    let mut laptop_cursor = published_count(&devices.relay);
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        laptop_app,
+        mut laptop,
+        ..
+    } = devices;
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    phone
+        .remove_linked_device(&own_slot(&laptop))
+        .await
+        .unwrap();
+    drop((laptop, laptop_app, phone));
+    let off = MarmotApp::with_relay_and_config(
+        _dirs[1].path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0),
+    )
+    .with_test_relay_client(relay.clone());
+    let mut laptop = off.client("alice").await.unwrap();
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    assert!(laptop.runtime.group_record(&group).unwrap().removed);
+    assert!(!laptop.device_unlinked());
+    drop((laptop, off));
+    let laptop_app = device_group_app_at(&_dirs[1], relay.clone());
+    let account_id_hex = laptop_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+
+    let attempted = relay.attempted_events().len();
+    let subscriptions = relay.subscription_count();
+    let _eose = scripted_eose_pump(
+        laptop_app.relay_plane.clone(),
+        relay.clone(),
+        every_subscription,
+    );
+    let runtime = MarmotAppRuntime::new(laptop_app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    next_device_group_change(&mut events, "DeviceUnlinked", |event| {
+        matches!(event, MarmotAppEvent::DeviceUnlinked {
+            account_id_hex: unlinked,
+            account_label,
+        } if *unlinked == account_id_hex && account_label == "alice")
+    })
+    .await;
+    let managed = || runtime.accounts().managed_accounts().unwrap().remove(0);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while managed().running {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the runtime deactivates the account");
+    let account = managed();
+    assert!(account.unlinked && account.signed_out);
+    assert!(
+        trust(&laptop_app, &group).is_none(),
+        "its copy is forgotten"
+    );
+    assert_eq!(
+        relay.attempted_events().len(),
+        attempted,
+        "nothing goes out before the stop"
+    );
+    assert_eq!(
+        relay.subscription_count(),
+        subscriptions,
+        "it stops before its catch-up subscribes"
+    );
+    runtime.shutdown().await;
+}
+
+/// The laptop runs under the runtime when its removal arrives live. The
+/// ingest that applies it stops the account: the runtime deactivates it,
+/// and nothing more goes out from it (D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_arriving_live_stops_the_running_account() {
+    let (devices, group) = tagging_devices().await;
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        laptop_app,
+        mut laptop,
+        ..
+    } = devices;
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    let slot = own_slot(&laptop);
+    drop(laptop);
+    let account_id_hex = laptop_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+
+    let _eose = scripted_eose_pump(
+        laptop_app.relay_plane.clone(),
+        relay.clone(),
+        every_subscription,
+    );
+    let runtime = MarmotAppRuntime::new(laptop_app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+
+    // The laptop's own startup work may still be publishing; the removal
+    // arrives once that is done.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut seen = relay.attempted_events().len();
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let now = relay.attempted_events().len();
+            if now == seen {
+                break;
+            }
+            seen = now;
+        }
+    })
+    .await
+    .expect("the laptop's startup work settles");
+    let removal_start = published_count(&relay);
+    phone.remove_linked_device(&slot).await.unwrap();
+    drop(phone);
+    let removal: Vec<_> = relay.published_events.lock().unwrap()[removal_start..].to_vec();
+    let attempted = relay.attempted_events().len();
+    // Separate apps share no live relay: route the removal in.
+    for event in removal {
+        laptop_app
+            .relay_plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+                subscription_id: Some("live-removal-test".to_owned()),
+                event,
+            })
+            .await
+            .unwrap();
+    }
+    next_device_group_change(&mut events, "DeviceUnlinked", |event| {
+        matches!(event, MarmotAppEvent::DeviceUnlinked {
+            account_id_hex: unlinked,
+            ..
+        } if *unlinked == account_id_hex)
+    })
+    .await;
+    let managed = || runtime.accounts().managed_accounts().unwrap().remove(0);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while managed().running {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the runtime deactivates the account");
+    let account = managed();
+    assert!(account.unlinked && account.signed_out);
+    assert!(
+        trust(&laptop_app, &group).is_none(),
+        "its copy is forgotten"
+    );
+    assert_eq!(
+        relay.attempted_events().len(),
+        attempted,
+        "nothing more goes out"
+    );
+    runtime.shutdown().await;
+}
+
 /// The phone removes the laptop, and deletes its slot, while the laptop
 /// renames itself twice from the same epoch. The laptop's longer branch wins
 /// and drops the removal, so the laptop is listed again. The phone's next

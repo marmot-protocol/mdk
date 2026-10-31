@@ -1018,6 +1018,18 @@ one roster commit in the device group:
 - A rename whose commit loses a fork is made again on a later maintenance pass, unless another rename of that device
   won; that one stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`, not the one the user typed.
 
+### This device unlinked
+
+When another of the account's devices removes this one with `remove_linked_device`, the account stops on this device
+once it reads the removal, and nothing more is sent from it (mdk#2628):
+
+- `MarmotEventFfi::DeviceUnlinked { account_id_hex, account_label }` fires once. Afterwards the account's
+  `AccountSummaryFfi` has `unlinked` and `signed_out` set, and both stay set.
+- Show that this device was unlinked from the account. Its local history is not shown.
+- Signing in to it fails with `MarmotKitError::AccountUnlinked`. Offer `sign_out_and_wipe`, which skips leaving the
+  account's chats and deleting its KeyPackage slot, since the other devices did both. Signing in again is then a new
+  sign-in that links this device anew.
+
 ### Overdue KeyPackage refresh
 
 While this device trusts a device group, it announces each KeyPackage in its own roster entry before publishing it, so

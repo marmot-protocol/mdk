@@ -629,6 +629,75 @@ async fn account_owned_profile_publish_rejects_signed_out_and_stopped_accounts()
     assert!(matches!(stopped, AppError::RuntimeStopping));
 }
 
+/// Once the device group unlinks this device, its worker stops and the
+/// runtime deactivates the account: hosts hear `DeviceUnlinked`, the account
+/// lists as unlinked and signed out, neither signing in nor reconciling starts
+/// it again, and wiping it skips the leave and slot stages (mdk#2628 D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unlinked_device_stops_its_account_for_good() {
+    let root = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(root.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(root.path(), "wss://unlink.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = app.runtime();
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    let managed = || runtime.accounts().managed_accounts().unwrap().remove(0);
+    assert!(managed().running && !managed().unlinked);
+
+    runtime
+        .accounts()
+        .unlink_device_for_test("alice")
+        .await
+        .unwrap();
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(MarmotAppEvent::DeviceUnlinked { account_id_hex, .. }) = events.recv().await
+                && account_id_hex == account.account_id_hex
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("hosts hear the unlink");
+    timeout(Duration::from_secs(10), async {
+        while managed().running {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the runtime deactivates the account");
+    let unlinked = managed();
+    assert!(unlinked.unlinked && unlinked.signed_out);
+
+    assert!(matches!(
+        runtime.sign_in_account("alice").await,
+        Err(AppError::AccountHome(AccountHomeError::AccountUnlinked(_)))
+    ));
+    runtime.reconcile_accounts().await.unwrap();
+    assert!(!managed().running);
+
+    let attempted = relay.attempted_events().len();
+    let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
+    assert_eq!(outcome.groups_left, 0);
+    assert!(outcome.group_leave_failures.is_empty());
+    assert_eq!(outcome.key_packages_deleted, 0);
+    assert!(outcome.key_package_failures.is_empty());
+    assert!(outcome.local_cleanup.completed);
+    assert_eq!(
+        relay.attempted_events().len(),
+        attempted,
+        "an unlinked wipe sends nothing"
+    );
+    assert!(app.account_home().accounts().unwrap().is_empty());
+    runtime.shutdown().await;
+}
+
 #[test]
 fn generated_setup_context_round_trips_inbox_relays_and_reads_legacy_contexts() {
     let request = AccountSetupRequest {

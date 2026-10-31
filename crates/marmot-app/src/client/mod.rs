@@ -765,6 +765,9 @@ pub struct AppClient {
     pub(crate) test_comparison_results: Option<sync::ScriptedComparisons>,
     #[cfg(test)]
     pub(crate) test_comparison_delay: Option<std::time::Duration>,
+    /// Fail the durable unlink mark, as a full or read-only disk would.
+    #[cfg(test)]
+    pub(crate) test_fail_unlink_mark: bool,
     /// A cursor a scripted comparison saves before its delay, as the adapter
     /// does before each exact-ID fetch.
     #[cfg(test)]
@@ -865,6 +868,10 @@ pub struct AppClient {
     /// client just opened, ending any link in progress. The same seams drain
     /// it into one `DeviceLinkChanged`.
     pub(crate) device_link_changed: bool,
+    /// The device group removed this device after its link was made, and the
+    /// account is marked unlinked (mdk#2628 D67). The account worker stops at
+    /// its next turn and asks the runtime to deactivate the account.
+    pub(crate) device_unlinked: bool,
     /// Account-queue placement counts at this client's previous
     /// `transport_cursor_advanced` row (or its open), so each row reports
     /// what changed since.
