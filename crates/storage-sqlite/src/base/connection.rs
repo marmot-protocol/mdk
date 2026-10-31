@@ -1447,8 +1447,10 @@ fn apply_sqlcipher_key(connection: &rusqlite::Connection, key: &SqlCipherKey) ->
     Ok(())
 }
 
+/// This crate's own unit tests start relaxed. Dependents built with
+/// `test-support` start on the defaults until a test relaxes them.
 #[cfg(any(test, feature = "test-support"))]
-static TEST_PROCESS_STORAGE_RELAXED: AtomicBool = AtomicBool::new(false);
+static TEST_PROCESS_STORAGE_RELAXED: AtomicBool = AtomicBool::new(cfg!(test));
 
 /// Skip SQLCipher's memory security and full fsync for every database this
 /// process opens from now on, whatever options the open passes. Test support
@@ -1463,6 +1465,16 @@ static TEST_PROCESS_STORAGE_RELAXED: AtomicBool = AtomicBool::new(false);
 #[cfg(any(test, feature = "test-support"))]
 pub fn relax_storage_for_test_process() {
     TEST_PROCESS_STORAGE_RELAXED.store(true, Ordering::Release);
+}
+
+/// Return this test process to SQLCipher's memory security and full fsync.
+/// This crate's unit tests start relaxed, so the tests that pin the production
+/// settings call this before opening anything. Under `cargo test`, whose tests
+/// share one process, it also returns the tests still running to the
+/// defaults, which only slows them.
+#[cfg(test)]
+pub(crate) fn use_production_storage_for_test_process() {
+    TEST_PROCESS_STORAGE_RELAXED.store(false, Ordering::Release);
 }
 
 fn test_process_storage_relaxed() -> bool {
@@ -2577,6 +2589,7 @@ mod tests {
 
     #[test]
     fn encrypted_connection_applies_operational_defaults() {
+        use_production_storage_for_test_process();
         for key in [
             SqlCipherKey::new("operational defaults key").unwrap(),
             SqlCipherKey::raw([0x42; 32]),
@@ -3092,6 +3105,7 @@ mod tests {
 
     #[test]
     fn encrypted_connection_pins_cipher_pragmas_before_keying() {
+        use_production_storage_for_test_process();
         let _guard = TRACE_TEST_LOCK.lock().unwrap();
         for key in [
             SqlCipherKey::new("trace setup key").unwrap(),
@@ -3155,6 +3169,7 @@ mod tests {
 
     #[test]
     fn public_hardened_open_pins_cipher_pragmas_before_keying() {
+        use_production_storage_for_test_process();
         let _guard = TRACE_TEST_LOCK.lock().unwrap();
         for key in [
             SqlCipherKey::new("public hardened key").unwrap(),
@@ -3408,8 +3423,8 @@ mod tests {
     /// `relaxed_test_process_skips_memory_security_and_full_fsync`.
     const RELAXED_STORAGE_CHILD: &str = "STORAGE_SQLITE_RELAXED_STORAGE_CHILD";
 
-    /// The relaxation is process-wide, so the checks run in a child process
-    /// of this test binary and leave the tests beside it on the defaults.
+    /// Memory security is process-wide, so the checks run in a child process
+    /// of this test binary, where no other test can have turned it on.
     #[test]
     fn relaxed_test_process_skips_memory_security_and_full_fsync() {
         if std::env::var_os(RELAXED_STORAGE_CHILD).is_none() {
@@ -3432,6 +3447,8 @@ mod tests {
             return;
         }
 
+        // Start from the defaults, so the relaxation below is what is checked.
+        use_production_storage_for_test_process();
         relax_storage_for_test_process();
         let key = SqlCipherKey::raw([0x42; 32]);
         let dir = tempfile::tempdir().unwrap();

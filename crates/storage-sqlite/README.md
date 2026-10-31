@@ -74,8 +74,9 @@ only in this crate's own tests or with the `test-support` feature, and do nothin
 - `in_memory_for_test()` opens an in-memory store without `cipher_memory_security`. This crate's own unit tests get it
   from `in_memory()`; dependents call it explicitly.
 - After a test process calls `relax_storage_for_test_process()`, every database it opens skips
-  `cipher_memory_security` and uses `synchronous=NORMAL`. `marmot-app`'s constructors call it in its unit tests. The
-  tests that pin the production settings never call it.
+  `cipher_memory_security` and uses `synchronous=NORMAL`. `marmot-app`'s constructors call it in its unit tests, and
+  this crate's own unit tests start that way. The tests that pin the production settings never call it, and here they
+  call `use_production_storage_for_test_process()` first.
 
 Long-lived connections are closeable so a host can release file locks before suspending; closing is terminal and
 surviving clones return `StorageError::Closed`.
