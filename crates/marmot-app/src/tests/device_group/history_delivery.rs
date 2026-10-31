@@ -98,9 +98,9 @@ async fn history_devices() -> (Devices, GroupId, GroupId, String) {
 
 /// The phone's confirmed Commit that adds the laptop to a chat owes the
 /// laptop that chat's history, once its entry asks for history. One delivery
-/// carries it; the laptop imports it, marked with the phone's slot, and keeps
-/// no record of the delivery. An add while the entry asks for none sends
-/// nothing.
+/// carries it; the laptop imports it, marked with the phone's slot, even
+/// though it holds a later device-group epoch than the delivery's. An add
+/// while the entry asks for none sends nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_device_that_adds_a_sibling_to_a_chat_sends_it_the_history() {
     let (mut devices, group) = tagging_devices().await;
@@ -145,9 +145,13 @@ async fn the_device_that_adds_a_sibling_to_a_chat_sends_it_the_history() {
             .unwrap()
             .is_none()
     );
-    // The laptop's second KeyPackage moved the device group on; the phone
-    // takes that commit first, so the laptop can read who sent the delivery.
-    deliver_all(&mut devices.phone, &devices.relay).await;
+    // The laptop's second KeyPackage moved the device group on, and the phone
+    // sends before it takes that commit: the laptop reads who sent the
+    // delivery at the delivery's epoch, not its own later one.
+    assert!(
+        devices.laptop.runtime.group_record(&group).unwrap().epoch
+            > devices.phone.runtime.group_record(&group).unwrap().epoch
+    );
     let before = published_count(&devices.relay);
     devices.phone.drive_history_deliveries().await;
     assert_eq!(published_count(&devices.relay), before + 1, "one delivery");
