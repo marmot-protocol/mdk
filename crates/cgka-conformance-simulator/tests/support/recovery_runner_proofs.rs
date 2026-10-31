@@ -626,6 +626,35 @@ async fn holds_exactly(
     Ok(observed == expected)
 }
 
+/// How bob's timeline holds `expected`, for the report: messages shown,
+/// distinct ones, and the first few missing or shown more than once.
+async fn timeline_view(
+    bob: &AppRuntimeProbe,
+    group: &GroupId,
+    expected: &[String],
+) -> TestResult<Value> {
+    let (_, observed) = bob.chat_view(group, None).await?;
+    let mut shown = BTreeMap::<&str, usize>::new();
+    for text in &observed {
+        *shown.entry(text).or_default() += 1;
+    }
+    let missing = expected
+        .iter()
+        .filter(|text| !shown.contains_key(text.as_str()));
+    let repeated = shown
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(text, _)| *text);
+    Ok(json!({
+        "shown": observed.len(),
+        "distinct": shown.len(),
+        "missing": missing.clone().count(),
+        "first_missing": missing.take(10).collect::<Vec<_>>(),
+        "repeated": repeated.clone().count(),
+        "first_repeated": repeated.take(10).collect::<Vec<_>>(),
+    }))
+}
+
 /// Whether the runner reports nothing left to fetch and nothing parked, read
 /// after one of its attempts since `trace_from` (trace clock). The status
 /// lists nothing until a runner has surveyed, and keeps its last survey's
@@ -730,6 +759,7 @@ pub(super) async fn stalled_relay_loop() {
         let mut expected = backlog.clone();
         expected.extend(ticks);
         let complete = holds_exactly(&bob, &group, &expected).await?;
+        let timeline = timeline_view(&bob, &group, &expected).await?;
         let history = history_since(subject, &clocks).await?;
         let route = bob.nostr_route(&group).await?.ok_or("bob holds no route")?;
         let labels = BTreeMap::from([(route.clone(), "loop".to_owned())]);
@@ -750,6 +780,7 @@ pub(super) async fn stalled_relay_loop() {
             "backlog": backlog.len(),
             "recovered_seconds": recovered,
             "timeline_exact": complete,
+            "timeline": timeline,
             "live_visibility_ms": live_visibility,
             "stalled_endpoint_bursts": starts.len(),
             "stalled_bursts_per_minute": {
@@ -769,7 +800,7 @@ pub(super) async fn stalled_relay_loop() {
         save(out, "history.json", &labeled(&history, &labels))?;
         save(out, "runner-trace.json", &runner_trace::since(trace_t0))?;
         if !complete || recovered.is_none() {
-            return Err("the backlog did not recover exactly from the healthy endpoint".into());
+            return Err(format!("the backlog did not recover exactly from the healthy endpoint: {proof}").into());
         }
         if !live_complete(&live_visibility) {
             return Err(format!("live messages failed or stopped arriving behind the stalled relay: {proof}").into());
@@ -870,6 +901,7 @@ pub(super) async fn owed_history() {
         let (live_sent, live_visibility) = live.finish().await?;
         expected.extend(live_sent);
         let busy_exact = holds_exactly(&bob, &busy, &expected).await?;
+        let busy_timeline = timeline_view(&bob, &busy, &expected).await?;
         let after_restart = history_since(subject, &restart_clocks).await?;
         let trace_idle = runner_trace::now_ms();
         let restart_trace = trace_between(trace_restart, trace_idle);
@@ -935,6 +967,7 @@ pub(super) async fn owed_history() {
                 "runner_caught_up_seconds": reported_caught_up,
                 "deadline_seconds": RECOVERY_DEADLINE.as_secs(),
                 "busy_timeline_exact": busy_exact,
+                "busy_timeline": busy_timeline,
                 "live_visibility_ms": live_visibility,
                 "quiet_message_visible_ms": quiet_after_restart,
                 "busy_visible_when_quiet_seen": busy_visible_when_quiet_seen,
