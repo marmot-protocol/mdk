@@ -22,14 +22,24 @@ pub(super) async fn deliver_new(
     relay: &ScriptedPushRelayClient,
     cursor: &mut usize,
 ) -> SyncSummary {
-    let mut summary = SyncSummary::default();
     let events = relay.published_events.lock().unwrap().clone();
+    let summary = deliver_events(client, &events[*cursor..]).await;
+    *cursor = events.len();
+    summary
+}
+
+/// Deliver `events`, in this order, as `deliver_new` does.
+pub(super) async fn deliver_events(
+    client: &mut AppClient,
+    events: &[NostrTransportEvent],
+) -> SyncSummary {
+    let mut summary = SyncSummary::default();
     let account = client
         .app
         .account_home()
         .account(&client.state.label)
         .unwrap();
-    for event in &events[*cursor..] {
+    for event in events {
         let plane = match event.kind {
             1059 if event.tags.iter().any(|tag| {
                 tag.first().is_some_and(|v| v == "p") && tag.get(1) == Some(&account.account_id_hex)
@@ -61,7 +71,6 @@ pub(super) async fn deliver_new(
                 .unwrap(),
         );
     }
-    *cursor = events.len();
     summary
 }
 
@@ -1166,8 +1175,7 @@ async fn maintenance_counts_one_recovery_transition() {
         .create_account("alice")
         .unwrap();
     let mut app = app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
-    app.product_analytics =
-        marmot_observability::observability_test_support::test_product_collector();
+    app.product_analytics = marmot_observability::test_product_collector();
     let runtime = app.runtime();
     runtime.set_usage_diagnostics_consent(true).unwrap();
     let mut client = app.client("alice").await.unwrap();

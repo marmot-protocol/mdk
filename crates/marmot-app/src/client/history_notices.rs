@@ -89,6 +89,7 @@ impl AppClient {
         }
         // The retirement is durable from here on; the dismissal succeeded
         // even if the in-memory fence cannot be released right now.
+        self.wake_recovery_runner();
         self.record_need_changed(
             group.map(GroupId::new).as_ref(),
             super::audit_recovery::obligation_cause(cause),

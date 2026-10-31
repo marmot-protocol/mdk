@@ -58,6 +58,19 @@
   device then replaces its untagged KeyPackage with a tagged one. Maintenance
   drops a removed device's roster record 30 days after it was recorded.
   Release builds hold no device group and tag nothing.
+- While this device trusts a device group, it keeps each chat's read
+  position, pin, mute and archive the same on the account's devices (mdk#2628
+  item 4.3a, `features/account-sync.md`). Each maintenance pass records what
+  the user changed on this device, sends it to the siblings in small-state
+  updates (kind 475, split to fit 32,768 bytes), and applies the values they
+  sent, with the usual chat-list updates. Every device broadcasts every item
+  it holds when it starts, at least daily, whenever the device group's tip
+  passes the app-payload window since its last broadcast, and at most hourly
+  when a sibling asks with a broadcast request (kind 476). An update or
+  request that branch selection withdraws is sent again. Pin order stays per
+  device; an archived chat is never pinned, so a sibling's pin waits until the
+  chat is unarchived here. Drafts are not synced. Release builds hold no device group and
+  sync nothing.
 - `MarmotAppRuntime::linked_devices` lists this account's own devices as
   `LinkedDevice`s, from the roster of the device group this device trusts,
   this device first (mdk#2628 item 3.1). `LinkedDevicesChanged` says to
@@ -79,7 +92,10 @@
   3.2): a fresh, valid KeyPackage in a slot neither this device nor its device
   group's roster knows. `answer_sign_in` takes a `SignInResponse` (Not now,
   Reject or Dismiss), and `check_sign_ins` checks now instead of at the next
-  scheduled check. A KeyPackage the roster announced for a device's slot in
+  scheduled check. A Welcome delivery naming another KeyPackage of the
+  account brings the next check forward, as a live one of its KeyPackages
+  does, whether it arrives before or after this device's own delivery of
+  that Welcome. A KeyPackage the roster announced for a device's slot in
   the last 30 days counts as that device's, even after a newer announcement
   or a rewind. `UnrecognizedSignInsChanged` says to re-read the list. All
   are empty and silent in release builds until the roster's spec lands.
@@ -350,7 +366,9 @@
   it records no failed join, never becomes a rejoin offer, and leaves the
   device's KeyPackages as they were, and analytics count it as a duplicate.
   Before, a device already in a group recorded the Welcome for a sibling device
-  added later as a failed join. A rejoin offer stored by an earlier release
+  added later as a failed join. A sibling's delivery of a Welcome this device
+  already joined through its own delivery is ignored the same way; only this
+  device's own Welcome, delivered again, is a duplicate. A rejoin offer stored by an earlier release
   is still decided by its MLS Welcome alone, so one stored under a sibling's
   delivery stays confirmable. KeyPackage lifecycle records now keep the
   publication id of each replaced KeyPackage. Packages replaced before this
@@ -391,9 +409,10 @@
 ### Fixed
 
 - Kinds sent only in a device group (heartbeat 457, private KeyPackage
-  request 459 and hand-off 460, anomaly alert 462) are ignored in any other
-  group (mdk#2628). One received in a chat makes no timeline row, host
-  message or notification, and `send_custom_event` refuses each as reserved
+  request 459 and hand-off 460, anomaly alert 462, small-state update 475
+  and broadcast request 476) are ignored in any other group (mdk#2628). One
+  received in a chat makes no timeline row, host message or notification,
+  and `send_custom_event` refuses each as reserved
   (`is_reserved_app_event_kind`). The device group itself still reads them.
 - External-signer sticker installs and uninstalls prepare event IDs and
   finish signing before changing local intent. Refused signatures leave

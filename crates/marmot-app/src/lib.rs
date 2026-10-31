@@ -133,6 +133,7 @@ mod relay_caps;
 mod root_closers;
 mod root_runtime_lease;
 mod runtime;
+mod small_state;
 mod sqlcipher;
 mod startup_diagnostics;
 pub use startup_diagnostics::{
@@ -468,6 +469,11 @@ const APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(16 *
 pub(crate) const ACCOUNT_SETUP_ADVISORY_WAIT: Duration = Duration::from_secs(10);
 const APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
+/// The internal `runner_owns_debt` gate's default (mdk#2660 phase 4): off
+/// until the switch-over's flip turns it on. While off, no recovery runner
+/// runs and the comparison owner keeps every behavior; proofs turn it on per
+/// app ([`MarmotApp::with_recovery_runner_owning_debt`]).
+const RECOVERY_RUNNER_OWNS_DEBT: bool = false;
 /// Maximum amount the persisted transport cursor may run ahead of local
 /// wall-clock. The cursor is advanced from the inbound message timestamp, which
 /// is the sender-controlled Nostr `created_at` of the outer kind-445 event and
@@ -561,6 +567,9 @@ pub struct MarmotApp {
     relay_plane: MarmotRelayPlane,
     /// Each relay's NIP-11 caps for the history sweep; see [`Self::relay_caps`].
     relay_caps: relay_caps::RelayCapsCache,
+    /// The internal `runner_owns_debt` gate; see
+    /// [`Self::recovery_runner_owns_debt`].
+    recovery_runner_owns_debt: bool,
     config: MarmotAppConfig,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
     /// One encrypted media store per account (mdk#2314), over that account's
@@ -606,7 +615,7 @@ pub struct MarmotApp {
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     audit_recorders: Arc<Mutex<HashMap<String, audit_log::AuditRecorderSlot>>>,
-    product_analytics: marmot_observability::observer::ProductRecorder,
+    product_analytics: marmot_observability::ProductRecorder,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
@@ -941,29 +950,27 @@ impl From<AppError> for SyncFailure {
 pub(crate) struct ClassifiedSyncFailure {
     pub(crate) partial_summary: SyncSummary,
     pub(crate) source: AppError,
-    classification: marmot_observability::app_telemetry::SyncFailureClassification,
+    classification: marmot_observability::SyncFailureClassification,
 }
 
 impl ClassifiedSyncFailure {
     pub(crate) fn at_stage(
         partial_summary: SyncSummary,
         source: AppError,
-        failure_stage: marmot_observability::app_telemetry::SyncFailureStage,
+        failure_stage: marmot_observability::SyncFailureStage,
     ) -> Self {
         let error_class = source.sync_error_class();
         Self {
             partial_summary,
             source,
-            classification: marmot_observability::app_telemetry::SyncFailureClassification::new(
+            classification: marmot_observability::SyncFailureClassification::new(
                 failure_stage,
                 error_class,
             ),
         }
     }
 
-    pub(crate) const fn classification(
-        &self,
-    ) -> marmot_observability::app_telemetry::SyncFailureClassification {
+    pub(crate) const fn classification(&self) -> marmot_observability::SyncFailureClassification {
         self.classification
     }
 }
@@ -1525,7 +1532,7 @@ impl MarmotApp {
         Ok(self
             .relay_telemetry_settings()?
             .export_config_with_runtime_and_endpoints(
-                marmot_observability::export_config::RelayTelemetryRuntimeConfig::default(),
+                marmot_observability::RelayTelemetryRuntimeConfig::default(),
                 self.service_endpoints(),
             ))
     }
@@ -1572,6 +1579,24 @@ impl MarmotApp {
     /// opened from this app applies (see [`CursorPersistence`]).
     pub(crate) fn cursor_persistence(&self) -> CursorPersistence {
         self.config.cursor_persistence
+    }
+
+    /// Run each account's history recovery runner (mdk#2660 phase 4): the
+    /// account worker spawns one per account and a directly owned client runs
+    /// one pass in place from `sync()` and `next_event()`. Internal and
+    /// unsupported: the switch-over's proofs turn it on before the default
+    /// flips. Not a host setting. Call it before cloning the app or building
+    /// a runtime from it.
+    #[doc(hidden)]
+    pub fn with_recovery_runner_owning_debt(mut self) -> Self {
+        self.recovery_runner_owns_debt = true;
+        self
+    }
+
+    /// The internal `runner_owns_debt` gate: whether the recovery runner runs
+    /// for this app's accounts.
+    pub(crate) fn recovery_runner_owns_debt(&self) -> bool {
+        self.recovery_runner_owns_debt
     }
 
     pub fn telemetry_install_id(&self) -> Result<String, AppError> {
@@ -1639,10 +1664,8 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
-        marmot_observability::collector_host_safety::hand_in_http_builder(
-            network_proxy::http_builder,
-        );
-        let product_analytics = marmot_observability::observer::ProductRecorder::default();
+        marmot_observability::hand_in_http_builder(network_proxy::http_builder);
+        let product_analytics = marmot_observability::ProductRecorder::default();
         marmot_observability::wiring::silence(
             &product_analytics,
             config.usage_diagnostics_silent
@@ -1660,6 +1683,7 @@ impl MarmotApp {
             relay_urls,
             relay_plane,
             relay_caps: relay_caps::RelayCapsCache::default(),
+            recovery_runner_owns_debt: RECOVERY_RUNNER_OWNS_DEBT,
             config,
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
@@ -1747,10 +1771,8 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
-        marmot_observability::collector_host_safety::hand_in_http_builder(
-            network_proxy::http_builder,
-        );
-        let product_analytics = marmot_observability::observer::ProductRecorder::default();
+        marmot_observability::hand_in_http_builder(network_proxy::http_builder);
+        let product_analytics = marmot_observability::ProductRecorder::default();
         marmot_observability::wiring::silence(
             &product_analytics,
             config.usage_diagnostics_silent
@@ -1768,6 +1790,7 @@ impl MarmotApp {
             account_home,
             relay_plane,
             relay_caps: relay_caps::RelayCapsCache::default(),
+            recovery_runner_owns_debt: RECOVERY_RUNNER_OWNS_DEBT,
             config,
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
@@ -1925,6 +1948,10 @@ impl MarmotApp {
         }
         self.finish_client_open_network_maintenance(&mut client)
             .await;
+        // Seated here, where the client is already held: in `client()` the
+        // extra await would copy the client through its stack, gate off or
+        // not.
+        client.seat_recovery_runner_in_place().await;
         Ok(client)
     }
 
@@ -2066,6 +2093,7 @@ impl MarmotApp {
                 crate::runtime::account_worker::recovery_credits::shared_recovery_credit_pool(),
             #[cfg(test)]
             recovery_credits: crate::runtime::account_worker::recovery_credits::private_recovery_credit_pool_for_test(),
+            recovery_runner: Default::default(),
             comparison_startup_requested: false,
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
@@ -6480,7 +6508,7 @@ impl MarmotApp {
     /// URIs) used for push notifications, scoped to the local account. The
     /// unread window is already kind-9 filtered, but the real chat kind is
     /// passed for correctness.
-    fn chat_list_mention_classifier(
+    pub(crate) fn chat_list_mention_classifier(
         account_id_hex: &str,
     ) -> impl Fn(&str, &[Vec<String>]) -> bool + use<> {
         let account_id_hex = account_id_hex.to_owned();
@@ -6919,6 +6947,18 @@ impl MarmotApp {
         Ok(store)
     }
 
+    /// The account's storage if it is already open, and only while app
+    /// storage is: it never opens a database, so a drop path cannot reopen one
+    /// that `shutdown_and_close` or a removal let go of.
+    pub(crate) fn open_account_storage(&self, label: &str) -> Option<SqliteAccountStorage> {
+        self.ensure_storage_open("account storage").ok()?;
+        self.account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .cloned()
+    }
+
     /// Observe account-open admission before analytics or cache locks; preserve the original storage result.
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
         let probe = self
@@ -7157,7 +7197,7 @@ impl MarmotApp {
                 "publication",
                 ProductUnit::Transition,
             )
-            .map(marmot_observability::observer::ProductOperation::counts_only);
+            .map(marmot_observability::ProductOperation::counts_only);
         let storage = self.account_storage(label)?;
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let authority_update = storage.app_storage().finalize_app_event_authority(
@@ -8006,7 +8046,16 @@ fn app_feature_registry() -> FeatureRegistry {
 
 #[derive(Clone)]
 struct AppTransportRouting {
-    inner: Arc<RwLock<AppRoutingState>>,
+    inner: Arc<SharedAppRouting>,
+}
+
+/// One pointer per clone: every client and session carries the routing.
+struct SharedAppRouting {
+    state: RwLock<AppRoutingState>,
+    /// Bumped when the account's routes change, and from the client's other
+    /// recovery chokepoints. The account's recovery runner, if one runs,
+    /// reads its debt again (mdk#2660 phase 4).
+    recovery_runner_wake: tokio::sync::watch::Sender<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -8021,8 +8070,23 @@ struct AppRoutingState {
 impl AppTransportRouting {
     fn new(state: AppRoutingState) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(state)),
+            inner: Arc::new(SharedAppRouting {
+                state: RwLock::new(state),
+                recovery_runner_wake: tokio::sync::watch::channel(0).0,
+            }),
         }
+    }
+
+    /// The sender a recovery runner wakes on.
+    fn recovery_runner_wake(&self) -> tokio::sync::watch::Sender<u64> {
+        self.inner.recovery_runner_wake.clone()
+    }
+
+    /// Wake the account's recovery runner, if one runs. Coalesces.
+    fn wake_recovery_runner(&self) {
+        self.inner
+            .recovery_runner_wake
+            .send_modify(|count| *count = count.wrapping_add(1));
     }
 
     /// Atomically replace every current/prior subscription for one group.
@@ -8059,6 +8123,8 @@ impl AppTransportRouting {
             .group_routes
             .retain(|route| route.group_id != *group_id);
         state.group_routes.extend(routes);
+        drop(state);
+        self.wake_recovery_runner();
         true
     }
 
@@ -8080,17 +8146,26 @@ impl AppTransportRouting {
     }
 
     fn replace(&self, state: AppRoutingState) {
-        *self.write() = state;
+        let mut installed = self.write();
+        let routes_changed = installed.local_inbox_endpoints != state.local_inbox_endpoints
+            || installed.group_routes != state.group_routes;
+        *installed = state;
+        drop(installed);
+        if routes_changed {
+            self.wake_recovery_runner();
+        }
     }
 
     fn read(&self) -> RwLockReadGuard<'_, AppRoutingState> {
         self.inner
+            .state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn write(&self) -> RwLockWriteGuard<'_, AppRoutingState> {
         self.inner
+            .state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }

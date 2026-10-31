@@ -1,6 +1,7 @@
 mod attention;
 mod pages;
 mod selection;
+mod small_state;
 mod window;
 use crate::app::account_projection::chat_mute_is_effective;
 use crate::base::connection::CachedSql;
@@ -28,6 +29,11 @@ pub use pages::{
 use rusqlite::{Connection, OptionalExtension, Params, params};
 pub use selection::{ChatListSelectionError, ChatListSelectionSnapshot};
 use serde::{Deserialize, Serialize};
+pub use small_state::{
+    MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition, SmallStateBroadcast, SmallStateItem,
+    SmallStateItemName, SmallStateRule, SmallStateSchedule, SmallStateSync, SmallStateValue,
+    SmallStateVersion,
+};
 use std::collections::{HashMap, HashSet};
 pub use window::{ChatListWindowQuery, ChatListWindowRead};
 

@@ -27,7 +27,6 @@ pub(crate) mod consent;
 #[cfg(feature = "product-analytics-export")]
 mod delivery;
 #[cfg(any(test, feature = "test-support"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod fixtures;
 pub(crate) mod observed;
 pub(crate) mod recording;

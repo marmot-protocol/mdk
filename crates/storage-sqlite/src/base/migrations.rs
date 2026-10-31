@@ -302,6 +302,8 @@ mod migration_0143_device_activity;
 mod migration_0144_announced_key_packages;
 #[path = "migrations/0146_device_removals.rs"]
 mod migration_0146_device_removals;
+#[path = "migrations/0161_small_state.rs"]
+mod migration_0161_small_state;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1186,6 +1188,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0146_device_removals",
         suspend_foreign_keys: &[],
         apply: migration_0146_device_removals::apply,
+    },
+    Migration {
+        version: 161,
+        name: "0161_small_state",
+        suspend_foreign_keys: &[],
+        apply: migration_0161_small_state::apply,
     },
 ];
 

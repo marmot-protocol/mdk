@@ -3,8 +3,8 @@ use marmot_account::AccountHomeError;
 use marmot_session::AccountError;
 
 use crate::MissingRelayListKind;
-use marmot_observability::app_telemetry::{SyncErrorClass, SyncFailureClassification};
-use marmot_observability::audit_upload::AuditUploadError;
+use marmot_observability::AuditUploadError;
+use marmot_observability::{SyncErrorClass, SyncFailureClassification};
 pub use nostr_directory::error::MissingKeyPackageReason;
 use nostr_directory::error::{
     DirectoryError, ResourceError, sqlite_error_kind, storage_error_kind,
@@ -961,7 +961,7 @@ mod tests {
                         reason,
                         delivery_loss_pending: loss,
                     },
-                    marmot_observability::app_telemetry::SyncFailureStage::Unknown,
+                    marmot_observability::SyncFailureStage::Unknown,
                 );
                 let wrapped = AppError::AccountCatchUp(AccountCatchUpFailure::from_sync_failure(
                     "display only".into(),
@@ -976,7 +976,7 @@ mod tests {
         }
         let text_only = AppError::AccountCatchUp(AccountCatchUpFailure::new(
             "full_history_coverage_unproven".into(),
-            marmot_observability::app_telemetry::SyncFailureClassification::UNKNOWN,
+            marmot_observability::SyncFailureClassification::UNKNOWN,
         ));
         assert_eq!(text_only.full_history_repair_incomplete(), None);
     }
@@ -1295,7 +1295,7 @@ mod audit_upload_error_tests {
     //! built before it had its own type.
 
     use super::AppError;
-    use marmot_observability::audit_upload::{
+    use marmot_observability::{
         AUDIT_LOG_UPLOAD_MAX_BYTES, AuditUploadError, AuditUploadSnapshot, invalid_audit_upload,
         validate_audit_upload_endpoint,
     };

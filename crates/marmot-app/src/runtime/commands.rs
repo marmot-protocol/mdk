@@ -28,7 +28,7 @@ use crate::{
     PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
     PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
 };
-use marmot_observability::app_telemetry::AppPerformanceOperation;
+use marmot_observability::AppPerformanceOperation;
 
 impl AccountManager {
     #[cfg(test)]

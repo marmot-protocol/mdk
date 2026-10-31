@@ -35,7 +35,7 @@ use transport_nostr_adapter::sweep::{
     RelayCaps, SweepEnd, SweepRange, SweepRoute, SweepSinkError, UnreachableKind,
 };
 
-use super::quantum::{QuantumReport, SinkStop, uncovered_seconds};
+use super::quantum::{QuantumReport, SinkStop, route_events, uncovered_seconds};
 use super::{RecoveryRunnerPolicy, RunnerHost, UnitKey, WorkerTurn};
 
 /// One range a comparison quantum compares.
@@ -200,10 +200,12 @@ impl<H: RunnerHost> CompareSink for CompareStage<'_, H> {
             fetched_bytes
         };
         let found = !events.is_empty();
-        let mut deliveries = Vec::with_capacity(events.len());
-        for event in events {
-            deliveries.extend(self.host.deliveries(&self.plan.key.relay, event).await);
-        }
+        let Some(deliveries) = route_events(self.host, &self.plan.key.relay, events).await else {
+            // Nothing was written: settlement charges these bytes instead.
+            self.unstaged_bytes = self.unstaged_bytes.saturating_add(fetched_bytes);
+            self.stop = Some(SinkStop::Unrouted);
+            return Err(SweepSinkError);
+        };
         let key = self.plan.key.clone();
         let mark = self.plan.mark;
         let proof = if self.plan.recheck && !found {

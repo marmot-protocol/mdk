@@ -717,6 +717,11 @@ its next attempt time. Each quantum's outcome is one transaction:
 | Unanswered, local failure | — | — | Refunded |
 
 An attempt is charged when it begins, so a process that dies mid-quantum still counts it.
+A runner stopped mid-quantum while storage is open, by a reconnect or a dropped pass, refunds
+the attempt as unanswered instead, unless the quantum's own settle came in time. A full
+shutdown (`shutdown_and_close`) refunds the same way if storage is still open as the runner
+stops, and otherwise keeps the charge until it leaves the hour. A crash keeps the charge too,
+which caps a reply that crashes the process.
 Newer loss over a parked span earns one probe under the same park. Newer loss inside a
 retired span reopens that part whatever the unit's state: an active unit owes it as ordinary
 debt, a broken one adds it to its park with one probe, and a retired one parks it under a new
@@ -738,11 +743,18 @@ refetches nothing: the events are durable and the ledger-derived cursor is past 
 Staging is not admission; a row leaves once its event is in the seen index, or, if it no
 longer decodes, by un-covering its second so it is fetched again.
 
-### 9. The recovery runner (built, not started)
+### 9. The recovery runner (behind its gate)
 
 `client/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
-fetches over the ledger and the retry state above. No production path starts it before the
-switch-over, so the comparison job keeps every behavior until then. A unit is one (route,
+fetches over the ledger and the retry state above. It runs only behind the internal
+`runner_owns_debt` gate, off until the switch-over turns it on, so the comparison job keeps
+every behavior until then. With the gate on (`recovery_runner/host.rs`), the account worker
+spawns the runner with itself, serves its turns between its other work and stops it on every
+exit, a quantum in flight included. A directly owned client runs one pass in place from
+`sync()` and from `next_event()` when it meets delivery loss. Sweeps go over the account's own
+relay pool and dial nothing. The places that change debt or routes wake it: loss import, goal
+widening, route replacement, a released receipt, a dismissal and a group lifecycle change. A
+wake only makes it read the ledger again. A unit is one (route,
 required relay) of a group route; a best-effort relay gets one uncharged attempt per new debt.
 One step picks a unit in a worker turn and waits off the worker for one of the process's two
 recovery credits. It then begins: it reads the relay's NIP-11 caps, records known ones, reads
@@ -766,7 +778,7 @@ Units are served by class: held groups, then open conversation windows and the i
 rest, then best-effort relays. Within a class each eligible unit runs once per round, smallest
 route debt first, so a large group is served every round. The runner sleeps until a bump, a
 hint change, a relay reconnect or its earliest retry time. An explicit pass runs each due unit
-once in place within a budget, as a directly owned client's `sync()` will after the switch-over.
+once in place within a budget, as a directly owned client's `sync()` does behind the gate.
 Its starting values are convergence-ledger decision A19.
 
 A unit compares instead of sweeping when its relay's recorded caps show NIP-77 and the device

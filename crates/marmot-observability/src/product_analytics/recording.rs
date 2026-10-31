@@ -1,6 +1,6 @@
 //! What `marmot-app` records into the collector besides observations (#2627): the storage-failure
 //! kind its errors convert into, and the backlog source an account worker samples. Hosts never see
-//! them; `marmot-app` reaches them through [`crate::observer`].
+//! them; `marmot-app` reaches them through the crate root.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,12 +24,20 @@ impl StorageFailureKind {
         }
     }
     /// The storage operation it is counted under.
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Busy => "busy",
             Self::Corruption => "corruption",
             Self::Capacity => "capacity",
         }
+    }
+}
+
+/// Test hook for `marmot-app`'s outcome table (#2627): [`StorageFailureKind::as_str`].
+#[cfg(any(test, feature = "test-support"))]
+impl StorageFailureKind {
+    pub const fn as_str_for_test(self) -> &'static str {
+        self.as_str()
     }
 }
 
