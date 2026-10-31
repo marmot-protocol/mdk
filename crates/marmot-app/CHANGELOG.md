@@ -9,7 +9,8 @@
   chat the account stays in through another of its devices. It is not a
   removal of the account from the chat, so hosts show no "removed from group"
   notice; the chat lists with the departed chats and takes no sends.
-  Exhaustive matches add an arm for each.
+  Exhaustive matches add an arm for each. `AppGroupRoster::roster_revision`
+  now steps by four per epoch, so each membership changes it.
 
 - `GroupEvent` adds `QueuedIntentRefused { group_id, intent_id, intent_kind,
   reason }` (mdk#2694), forwarded to hosts as `MarmotAppEvent::GroupEvent`.

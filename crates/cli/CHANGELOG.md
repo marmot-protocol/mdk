@@ -11,6 +11,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- `self_membership` in `groups show`, `chats list` and their feeds can read `device_removed` (mdk#2628 item 3.6b):
+  this device's leaf was removed while the account stays in the group through another of its devices. It is not a
+  removal of the account from the group.
 - A new `marmot-pairing` crate implements device pairing's code exchange (mdk#2628): Matrix's `m.sas.v1`
   verification in Marmot encodings, with seven emoji to compare, a commitment to the new device's key, and
   confirmations that cover the new device's exact `KeyPackageRef`, the device group's id, and the MLS signature key of

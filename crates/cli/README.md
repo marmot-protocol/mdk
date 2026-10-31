@@ -343,7 +343,9 @@ or `post_join_rotation_pending_retryable`); a pending post-join rotation does no
   `disband_request.failed.reason`, then clear it with `groups acknowledge-disband-failure`), the terminal `disbanded`,
   or `unknown` (no positive signal and the MLS state could not be read, as for a quarantined, terminal, or removed copy;
   `not_enabled` is only asserted from a successful MLS read). It also reports `lifecycle_state`, `disbanding` (ordinary
-  outbound work is gated), `disbanded`, `unrecoverable`, and `self_membership` (`member`, `left`, or `removed`).
+  outbound work is gated), `disbanded`, `unrecoverable`, and `self_membership` (`member`, `left`, `removed`, or
+  `device_removed`: this device's leaf was removed while the account stays in the group through another of its
+  devices).
 - Ordinary sends into a disbanding group fail with `group_disbanding`. A removed member's copy records its own removal
   (`self_membership: removed`) when the terminal commit lands; read both fields rather than inferring the end from one.
 

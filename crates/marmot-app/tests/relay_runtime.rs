@@ -4222,7 +4222,7 @@ async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
             .await
             .expect("roster reads must not wait for scheduled recovery")
             .unwrap();
-            assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
+            assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(4));
             assert_eq!(roster.self_membership, SelfMembership::Member);
             assert_eq!(roster.members.len(), 2);
         }
@@ -4324,7 +4324,7 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     .await
     .expect("roster read must not block on the initial catch-up")
     .unwrap();
-    assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
+    assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(4));
     assert_eq!(roster.self_membership, SelfMembership::Member);
     let roster_member_ids = roster
         .members
