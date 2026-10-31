@@ -46,6 +46,7 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 | `src/base/codec.rs` | JSON serialization helpers and SQLite error mapping. |
 | `src/base/migrations.rs` | Rust migration runner and migration tests. |
 | `src/base/test_support.rs` | Shared storage test fixtures for both sides' tests. |
+| `src/cross/migrated_template.rs` | Test support: `in_memory_for_test()` copies a migrated template that a test binary's processes share instead of replaying every migration; a copy draws its own per-database values. |
 | `src/base/table_owners.rs`, `src/base/boundary_tests.rs`, `src/cross/allow-list.txt` | The owning side of every table; the boundary tests and the crossings that stay. |
 | `src/base/migrations/` | Numbered Rust migration bodies plus upgrade/query-work tests; see its local `AGENTS.md`. |
 | `src/protocol/storage/` | Marmot engine storage tables by concern; see its local `AGENTS.md`. |

@@ -1214,42 +1214,6 @@ pub(crate) fn open_account_in_memory(
     finish_account_open(connection, options, None)
 }
 
-/// Test-only in-memory database copied from one migrated template per
-/// process. Harnesses that open thousands of short-lived databases would
-/// otherwise replay every migration for each. Opening the copy still runs
-/// the migration ledger check, which finds nothing to apply.
-#[cfg(feature = "test-migrated-template")]
-pub(crate) fn open_account_in_memory_from_migrated_template(
-    options: SqliteStorageOptions,
-) -> StorageResult<OpenedAccount> {
-    static TEMPLATE: std::sync::OnceLock<Mutex<rusqlite::Connection>> = std::sync::OnceLock::new();
-    if TEMPLATE.get().is_none() {
-        let template_options = SqliteStorageOptions {
-            cipher_memory_security: false,
-            ..options.clone()
-        };
-        let mut template = rusqlite::Connection::open_in_memory().storage()?;
-        apply_cipher_pragmas(&template, &template_options)?;
-        apply_operational_pragmas(&template, &template_options)?;
-        migrations::run_all_observed(&mut template, None)?;
-        // A concurrent first caller may win; either template is complete.
-        let _ = TEMPLATE.set(Mutex::new(template));
-    }
-    let template = TEMPLATE
-        .get()
-        .expect("template was just initialized")
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut connection = rusqlite::Connection::open_in_memory().storage()?;
-    apply_cipher_pragmas(&connection, &options)?;
-    rusqlite::backup::Backup::new(&template, &mut connection)
-        .storage()?
-        .run_to_completion(std::ffi::c_int::MAX, Duration::ZERO, None)
-        .storage()?;
-    drop(template);
-    finish_account_open(connection, options, None)
-}
-
 /// Create private database files before opening and observing the unpublished connection.
 pub(crate) fn open_account_encrypted(
     path: &Path,
@@ -1488,7 +1452,7 @@ fn test_process_storage_relaxed() -> bool {
     }
 }
 
-fn apply_cipher_pragmas(
+pub(crate) fn apply_cipher_pragmas(
     connection: &rusqlite::Connection,
     options: &SqliteStorageOptions,
 ) -> StorageResult<()> {
@@ -1647,66 +1611,6 @@ mod tests {
     };
     use tracing::{Event, Subscriber, field::Visit};
     use tracing_subscriber::{Layer, layer::Context, prelude::*};
-
-    #[cfg(feature = "test-migrated-template")]
-    #[test]
-    fn migrated_template_copies_match_a_migrated_database_and_stay_independent() {
-        fn schema(store: &SqliteAccountStorage) -> Vec<(String, String, Option<String>)> {
-            let conn = store.lock().unwrap();
-            let mut statement = conn
-                .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
-                .unwrap();
-            statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
-        }
-        fn ledger(store: &SqliteAccountStorage) -> Vec<i64> {
-            let conn = store.lock().unwrap();
-            let mut statement = conn
-                .prepare("SELECT version FROM cgka_schema_migrations ORDER BY version")
-                .unwrap();
-            statement
-                .query_map([], |row| row.get(0))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
-        }
-        let migrated = SqliteAccountStorage::in_memory().unwrap();
-        assert!(migrated.migration_summary().0 > 0);
-        let first =
-            SqliteAccountStorage::in_memory_from_migrated_template(Default::default()).unwrap();
-        let second =
-            SqliteAccountStorage::in_memory_from_migrated_template(Default::default()).unwrap();
-        assert_eq!(
-            first.migration_summary().0,
-            0,
-            "the copy needs no migration"
-        );
-        assert_eq!(schema(&first), schema(&migrated));
-        assert_eq!(ledger(&first), ledger(&migrated));
-        assert!(!ledger(&first).is_empty());
-
-        first
-            .lock()
-            .unwrap()
-            .execute_batch("CREATE TABLE template_copy_probe(value INTEGER)")
-            .unwrap();
-        let probe = "SELECT count(*) FROM sqlite_master WHERE name = 'template_copy_probe'";
-        let count = |store: &SqliteAccountStorage| -> i64 {
-            store
-                .lock()
-                .unwrap()
-                .query_row(probe, [], |row| row.get(0))
-                .unwrap()
-        };
-        assert_eq!(count(&first), 1);
-        assert_eq!(count(&second), 0, "copies must not share pages");
-        let third =
-            SqliteAccountStorage::in_memory_from_migrated_template(Default::default()).unwrap();
-        assert_eq!(count(&third), 0, "writes must not reach the template");
-    }
 
     #[test]
     fn disabled_timing_skips_observer_lock_and_can_be_reenabled() {

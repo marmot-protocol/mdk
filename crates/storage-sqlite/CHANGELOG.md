@@ -329,6 +329,13 @@
   An expectation's record gains `key_package_ref`, the confirmed KeyPackage's
   `KeyPackageRef`; a record stored before it reads with an empty ref. No
   migration: the field lives in the stored record.
+- The test-only `test-migrated-template` feature and
+  `SqliteAccountStorage::in_memory_from_migrated_template` are gone.
+  `in_memory_for_test()` (`test-support`) now copies a migrated template that
+  a test binary's processes share, so each test no longer replays every
+  migration, and each copy draws its own store epoch. Before, a template lived
+  in one process, so nextest's process per test built it again for every test,
+  and every copy shared one store epoch and skipped incremental auto-vacuum.
 
 ### Added
 
