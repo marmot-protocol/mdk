@@ -164,7 +164,12 @@ pub struct DirectorySubscriptionSyncSummary {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DirectoryFetchOutcome {
     pub records: Vec<DirectoryRelayEventRecord>,
+    /// Every requested relay reached its end of stored events for every
+    /// query, and no page came back full.
     pub complete: bool,
+    /// The relays whose own read finished that way, whether or not the
+    /// others did: what one of them did not return, it does not serve.
+    pub complete_endpoints: Vec<TransportEndpoint>,
 }
 
 type DirectoryFetchResult = Result<Vec<DirectoryRelayEventRecord>, String>;
@@ -185,7 +190,7 @@ pub trait DirectoryRelayFetcher: Send + Sync {
             .await
             .map(|records| DirectoryFetchOutcome {
                 records,
-                complete: false,
+                ..DirectoryFetchOutcome::default()
             })
     }
 
@@ -1053,14 +1058,17 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         }
 
         let mut outcome = DirectoryFetchOutcome {
-            records: Vec::new(),
             complete: true,
+            ..DirectoryFetchOutcome::default()
         };
         while let Some(result) = tasks.join_next().await {
             match result {
                 Ok(endpoint) => {
                     outcome.complete &= endpoint.complete;
                     outcome.records.extend(endpoint.records);
+                    outcome
+                        .complete_endpoints
+                        .extend(endpoint.complete_endpoints);
                 }
                 Err(_) => outcome.complete = false,
             }
@@ -1283,7 +1291,11 @@ async fn strict_fetch_endpoint(
         // chunk cannot establish absence.
         complete &= chunk_complete;
     }
-    DirectoryFetchOutcome { records, complete }
+    DirectoryFetchOutcome {
+        records,
+        complete,
+        complete_endpoints: if complete { vec![endpoint] } else { Vec::new() },
+    }
 }
 
 fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<RelayUrl>, String> {
@@ -1654,6 +1666,49 @@ mod tests {
             assert_eq!(outcome.records.len(), stored);
             assert_eq!(outcome.complete, expect_complete, "{stored} stored events");
         }
+    }
+
+    /// Each relay's read is judged on its own: one that reached its end of
+    /// stored events is named even when another was cut short, so a caller
+    /// can tell what the finished relay does not serve (mdk#2628 3.4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_directory_fetch_names_each_relay_that_finished() {
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
+
+        let keys = Keys::generate();
+        let events = (0..RELAY_REPLAY_PAGE_LIMIT)
+            .map(|index| {
+                let event = EventBuilder::new(Kind::TextNote, format!("note {index}"))
+                    .finalize(&keys)
+                    .unwrap();
+                serde_json::to_value(&event).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (cut_short, _, cut_short_server) = spawn_filter_limited_relay(3, events.clone()).await;
+        let (finished, _, finished_server) =
+            spawn_filter_limited_relay(3, events[..1].to_vec()).await;
+        let query = DirectoryEventQuery::new(
+            1,
+            vec![keys.public_key().to_hex()],
+            RELAY_REPLAY_PAGE_LIMIT + 100,
+        );
+        let request =
+            DirectoryFetchRequest::new(vec![cut_short, finished.clone()], vec![query]).unwrap();
+        let outcome = timeout(
+            Duration::from_secs(20),
+            NostrSdkDirectoryRelayFetcher::standalone()
+                .fetch_directory_events_with_completion(request),
+        )
+        .await
+        .expect("strict fetch completes")
+        .unwrap();
+        cut_short_server.abort();
+        finished_server.abort();
+        assert!(!outcome.complete);
+        let [named] = outcome.complete_endpoints.as_slice() else {
+            panic!("{:?}", outcome.complete_endpoints);
+        };
+        assert!(crate::same_relay(named.as_str(), finished.as_str()));
     }
 
     #[test]

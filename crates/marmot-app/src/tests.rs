@@ -577,6 +577,9 @@ pub(crate) struct ScriptedPushRelayClient {
     fail_publish_kind: std::sync::Mutex<Option<u64>>,
     accept_first_endpoint_only: std::sync::atomic::AtomicBool,
     accepted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
+    /// Every completion read stops before its end of stored events, as a
+    /// relay that timed out or closed the subscription.
+    pub(crate) unfinished_directory_reads: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
     publish_release: tokio::sync::Notify,
@@ -866,6 +869,7 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         Ok(transport_nostr::DirectoryFetchOutcome {
             records: retained,
             complete,
+            complete_endpoints: if complete { endpoints } else { Vec::new() },
         })
     }
 }
@@ -1146,21 +1150,29 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
     }
 
     // The scripted relay holds every event published through it, so a read
-    // finishes unless a query's limit cut it short.
+    // finishes unless a query's limit cut it short or a test cut it off.
     async fn fetch_directory_events_with_completion(
         &self,
         request: transport_nostr::DirectoryFetchRequest,
     ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
         let queries = request.queries.clone();
+        let endpoints = request.endpoints.clone();
         let records = self.fetch_directory_events(request).await?;
-        let complete = queries.iter().all(|query| {
-            records
-                .iter()
-                .filter(|record| query.matches(&record.event))
-                .count()
-                < query.limit
-        });
-        Ok(transport_nostr::DirectoryFetchOutcome { records, complete })
+        let complete = !self
+            .unfinished_directory_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && queries.iter().all(|query| {
+                records
+                    .iter()
+                    .filter(|record| query.matches(&record.event))
+                    .count()
+                    < query.limit
+            });
+        Ok(transport_nostr::DirectoryFetchOutcome {
+            records,
+            complete,
+            complete_endpoints: if complete { endpoints } else { Vec::new() },
+        })
     }
 }
 

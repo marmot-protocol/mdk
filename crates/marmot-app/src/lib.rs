@@ -5694,6 +5694,8 @@ impl MarmotApp {
             .read_account_key_package_slots(&account_id_hex, &source_relays, own_slot)
             .await?;
         slots.complete &= listed;
+        // A relay's own finished read still shows what that relay serves, so
+        // the relays it found empty stand.
         if let Some(own_slot) = slots.own_slot.as_mut() {
             own_slot.complete &= listed;
         }

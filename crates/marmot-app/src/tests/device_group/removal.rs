@@ -5,9 +5,13 @@
 //! removed device's leaves from the chats that take a same-account removal.
 //! The decision is recorded first and kept while this device trusts the
 //! device group, so a busy device group only delays it, and a removal that
-//! branch selection drops is committed again.
+//! branch selection drops is committed again. A removed device never refills
+//! its emptied slot (3.4).
 
 use super::*;
+use crate::tests::sign_ins::{
+    publish_two_days_ago, published_at, relay_empties_slot, relay_serves_slot,
+};
 
 fn published_count(relay: &ScriptedPushRelayClient) -> usize {
     relay.published_events.lock().unwrap().len()
@@ -853,4 +857,110 @@ async fn a_removal_is_refused_with_nothing_recorded() {
         "no_device_group"
     );
     assert_eq!(pending_removals(&phone_app), 0);
+}
+
+/// A device its siblings removed refills nothing in its emptied slot
+/// (mdk#2628 3.4): they deleted that slot, and a KeyPackage dated after the
+/// deletion reads to them as the removed device trying to come back. Here
+/// the removal took the laptop's leaf, so its copy of the device group
+/// ended there and it reads no roster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_device_never_refills_its_slot() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            laptop_app,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = tagging_devices().await;
+    let laptop_slot = own_slot(&laptop);
+    let mut laptop_cursor = published_count(&relay);
+    phone.remove_linked_device(&laptop_slot).await.unwrap();
+    phone.run_due_maintenance().await.unwrap();
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    let storage = laptop_app.account_storage("alice").unwrap();
+    assert!(
+        cgka_traits::storage::GroupStorage::get_group(&storage, &group)
+            .unwrap()
+            .removed
+    );
+    // The laptop no longer tags, so its next pass replaces its tagged
+    // KeyPackage. What a removed device does with its own slot is 3.6b's
+    // (its own side); this test is about the refill.
+    laptop.run_due_maintenance().await.unwrap();
+
+    let published = publish_two_days_ago(&laptop);
+    relay_empties_slot(&relay, &laptop_slot);
+    assert!(!laptop.check_sign_ins().await.unwrap().refilling);
+    laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(published_at(&laptop), published);
+    assert!(!relay_serves_slot(&relay, &laptop_slot));
+}
+
+/// [`a_removed_device_never_refills_its_slot`] for a removal that took no
+/// leaf, as one does when no leaf's tag reads as the slot: the laptop still
+/// reads the roster, which records its slot as `removed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_its_roster_records_as_removed_never_refills_its_slot() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = tagging_devices().await;
+    let laptop_slot = own_slot(&laptop);
+    let laptop_slot_bytes = slot_of(&laptop);
+    let removed = RejectedSlotV1 {
+        reason: RejectedSlotReasonV1::Removed,
+        rejected_at: crate::unix_now_seconds(),
+        tag_signature_key: roster(&phone, &group).devices[&laptop_slot_bytes]
+            .tag_signature_key
+            .clone(),
+    };
+    let update = encode_device_roster_update_v1(
+        &DeviceRosterUpdateV1::new(vec![
+            DeviceRosterOperationV1::RemoveDevice(laptop_slot_bytes),
+            DeviceRosterOperationV1::SetRejectedSlot(laptop_slot_bytes, removed),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let mut laptop_cursor = published_count(&relay);
+    let effects = phone
+        .runtime
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: update,
+            }],
+        })
+        .await
+        .unwrap();
+    phone
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    assert_eq!(
+        roster(&laptop, &group).rejected_slots[&laptop_slot_bytes].reason,
+        RejectedSlotReasonV1::Removed
+    );
+
+    let published = publish_two_days_ago(&laptop);
+    relay_empties_slot(&relay, &laptop_slot);
+    assert!(!laptop.check_sign_ins().await.unwrap().refilling);
+    laptop.run_due_maintenance().await.unwrap();
+    assert_eq!(published_at(&laptop), published);
+    assert!(!relay_serves_slot(&relay, &laptop_slot));
 }

@@ -12,10 +12,10 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cgka_engine::key_package::{KeyPackageMetadata, key_package_metadata};
-use cgka_traits::MessageId;
 use cgka_traits::app_components::PRIVATE_USE_APP_COMPONENT_ID_START;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::group::ProtocolProfile;
+use cgka_traits::{MessageId, TransportEndpoint};
 use serde::{Deserialize, Serialize};
 use transport_nostr_adapter::parse_nip65_relay_set;
 use transport_nostr_adapter::{
@@ -775,6 +775,10 @@ pub struct OwnSlotRead {
     /// Every relay reached its end of stored events and no page came back
     /// full, so no relay serves a current publication the read missed.
     pub complete: bool,
+    /// Each relay whose own read finished that way and returned no
+    /// publication in the slot: it serves nothing there. A relay whose read
+    /// failed or did not finish is never here.
+    pub empty: Vec<TransportEndpoint>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -792,20 +796,23 @@ pub struct SlotKeyPackage {
 }
 
 /// [`AccountKeyPackageSlots`] from one read of `account`'s KeyPackages and
-/// deletion requests, and of `own_slot` when given. It drops whatever an
-/// inviter would: a deleted, invalid, legacy or future-dated publication, and
-/// every slot whose newest publication is one of those. Only fresh
-/// KeyPackages count. The own slot is read as relays serve it, none dropped.
+/// deletion requests, and of `own_slot` when given. `complete_relays` are
+/// the relays whose own read finished. It drops whatever an inviter would: a
+/// deleted, invalid, legacy or future-dated publication, and every slot whose
+/// newest publication is one of those. Only fresh KeyPackages count. The own
+/// slot is read as relays serve it, none dropped.
 pub fn account_key_package_slots_from_records(
     account: &str,
     records: &[RelayEventRecord],
     complete: bool,
+    complete_relays: &[TransportEndpoint],
     freshness: DirectoryFreshness,
     own_slot: Option<&str>,
 ) -> AccountKeyPackageSlots {
     let own_slot = own_slot.map(|slot| OwnSlotRead {
         current: current_slot_publications(account, slot, records),
         complete,
+        empty: relays_serving_nothing(account, slot, records, complete_relays),
     });
     let complete = complete && !key_package_read_page_full(account, records);
     let reached = complete || records.iter().any(|record| record.event.pubkey == account);
@@ -878,6 +885,32 @@ fn current_slot_publications(
         }
     }
     current
+}
+
+/// Each of `complete_relays` that returned no publication in `slot`, each
+/// relay once.
+fn relays_serving_nothing(
+    account: &str,
+    slot: &str,
+    records: &[RelayEventRecord],
+    complete_relays: &[TransportEndpoint],
+) -> Vec<TransportEndpoint> {
+    let serving = records
+        .iter()
+        .filter(|record| {
+            record.event.kind == KIND_MARMOT_KEY_PACKAGE
+                && record.event.pubkey == account
+                && record.event.tag_value("d") == Some(slot)
+        })
+        .flat_map(|record| &record.endpoints)
+        .collect::<BTreeSet<_>>();
+    let mut empty = Vec::<TransportEndpoint>::new();
+    for relay in complete_relays {
+        if !serving.contains(relay) && !empty.contains(relay) {
+            empty.push(relay.clone());
+        }
+    }
+    empty
 }
 
 /// The author's MLS KeyPackage with a legacy-profile account proof. Current
