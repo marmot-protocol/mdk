@@ -212,29 +212,6 @@ pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
     )
 }
 
-/// Refuse a Welcome for good: mark the delivery `welcome_id` and the
-/// Welcome's content, and retire every rejoin offer of it, whatever carried
-/// it. A decline and a terminal join failure act on the Welcome, not on the
-/// one offer or delivery they came through (mdk#2628 3.5b).
-fn refuse_welcome<S: StorageProvider>(
-    storage: &S,
-    welcome_id: &MessageId,
-    content_id: &MessageId,
-) -> Result<(), EngineError> {
-    storage.put_ingress_dedup_marker(welcome_id)?;
-    storage.put_ingress_dedup_marker(content_id)?;
-    for offer in storage.list_welcomes()? {
-        if offer
-            .rejoin
-            .as_ref()
-            .is_some_and(|rejoin| &rejoin.content_id == content_id)
-        {
-            storage.take_welcome(&offer.message_id)?;
-        }
-    }
-    Ok(())
-}
-
 fn classify_openmls_welcome_error<StorageError: std::fmt::Debug>(
     error: WelcomeError<StorageError>,
 ) -> EngineError {
@@ -1147,38 +1124,30 @@ impl<S: StorageProvider> Engine<S> {
                     method = "retry_rejoins_after_trusted_removal", "skipping a group awaiting hydration repair");
                 continue;
             }
-            // A sibling Welcome's offer joins by its own route, through a
-            // carrier still delivered.
-            let (welcome, prepeeled, route) = match candidate
+            // A sibling Welcome's offer joins by its own route, and only
+            // while its carrier is still delivered.
+            let (prepeeled, route) = match candidate
                 .rejoin
                 .as_ref()
                 .and_then(|rejoin| rejoin.sibling.clone())
             {
                 Some(sibling) => {
-                    let Some(carrier) = self.delivered_sibling_carrier(&candidate, &sibling)?
-                    else {
+                    if !self.sibling_carrier_delivered(&sibling.carrier)? {
+                        self.storage.take_welcome(&candidate.message_id)?;
                         tracing::debug!(target: "cgka_engine::group_lifecycle",
                             method = "retry_rejoins_after_trusted_removal", "retired a withdrawn sibling offer");
                         continue;
-                    };
-                    let (welcome, route) = crate::private_key_packages::sibling_offer_welcome(
-                        &welcome, &sibling, &carrier,
-                    );
+                    }
                     let prepeeled =
                         self.peeled_sibling_welcome(&welcome, Some(welcome.timestamp))?;
-                    (welcome, Some(prepeeled), route)
+                    (Some(prepeeled), WelcomeRoute::Sibling(sibling))
                 }
-                None => (welcome, None, WelcomeRoute::Delivery),
+                None => (None, WelcomeRoute::Delivery),
             };
             match self.do_join_welcome(welcome, prepeeled, route).await {
                 Ok(_) => joined = true,
-                // A failure the join refused the Welcome for has already
-                // retired its offers.
                 Err(error) if terminal_welcome_error(&error) => {
-                    match self.storage.take_welcome(&candidate.message_id) {
-                        Ok(_) | Err(StorageError::NotFound) => {}
-                        Err(error) => return Err(error.into()),
-                    }
+                    self.storage.take_welcome(&candidate.message_id)?;
                 }
                 Err(_) => {
                     // Keep retryable material owned, but isolate this offer's
@@ -1204,18 +1173,12 @@ impl<S: StorageProvider> Engine<S> {
             .into_iter()
             .find(|candidate| &candidate.message_id == welcome_id)
             .ok_or(EngineError::InvalidWelcome)?;
-        let rejoin = candidate
+        let sibling = candidate
             .rejoin
             .as_ref()
-            .ok_or(EngineError::InvalidWelcome)?;
-        let sibling = rejoin.sibling.clone();
-        // A declined or refused Welcome never joins, as on the retry's path.
-        if self.storage.has_ingress_dedup_marker(&rejoin.content_id)? {
-            self.storage.with_transaction(|storage| {
-                refuse_welcome(storage, welcome_id, &rejoin.content_id)
-            })?;
-            return Err(EngineError::WelcomeAlreadyProcessed);
-        }
+            .ok_or(EngineError::InvalidWelcome)?
+            .sibling
+            .clone();
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let group = MlsGroup::load(
             provider.storage(),
@@ -1230,19 +1193,16 @@ impl<S: StorageProvider> Engine<S> {
         // Recheck the live token inside the replacement transaction below.
         let welcome: TransportMessage = serde_json::from_slice(&candidate.welcome_bytes)
             .map_err(|error| EngineError::Serialize(error.to_string()))?;
-        let (welcome, peeled, content_id, route) = match sibling {
+        let (peeled, content_id, route) = match sibling {
+            // A withdrawn sibling Welcome is gone, like a declined offer.
+            Some(sibling) if !self.sibling_carrier_delivered(&sibling.carrier)? => {
+                self.storage.take_welcome(welcome_id)?;
+                return Err(EngineError::InvalidWelcome);
+            }
             Some(sibling) => {
-                // With every carrier withdrawn, the Welcome is gone like a
-                // declined offer, but nothing marks it.
-                let Some(carrier) = self.delivered_sibling_carrier(&candidate, &sibling)? else {
-                    return Err(EngineError::InvalidWelcome);
-                };
-                let (welcome, route) = crate::private_key_packages::sibling_offer_welcome(
-                    &welcome, &sibling, &carrier,
-                );
                 let (peeled, content_id) =
                     self.peeled_sibling_welcome(&welcome, Some(welcome.timestamp))?;
-                (welcome, peeled, content_id, route)
+                (peeled, content_id, WelcomeRoute::Sibling(sibling))
             }
             None => {
                 let peeled = self
@@ -1251,36 +1211,28 @@ impl<S: StorageProvider> Engine<S> {
                     .await
                     .map_err(EngineError::Peeler)?;
                 let content_id = welcome_content_dedup_id(&peeled)?;
-                (welcome, peeled, content_id, WelcomeRoute::Delivery)
+                (peeled, content_id, WelcomeRoute::Delivery)
             }
         };
-        let joined_id = welcome.id.clone();
-        let result = self
-            .join_peeled_welcome_with_consent(
-                welcome,
-                peeled,
-                content_id.clone(),
-                Some((&candidate.group_id, local_state_token)),
-                route,
-            )
-            .await;
-        // A terminal failure refuses the Welcome, as on every other path.
-        if let Err(error) = &result
-            && terminal_welcome_error(error)
-        {
-            self.storage
-                .with_transaction(|storage| refuse_welcome(storage, &joined_id, &content_id))?;
-        }
-        result
+        self.join_peeled_welcome_with_consent(
+            welcome,
+            peeled,
+            content_id,
+            Some((&candidate.group_id, local_state_token)),
+            route,
+        )
+        .await
     }
 
-    /// Reject the selected offer's Welcome. Redelivery cannot re-open it.
+    /// Reject only the selected offer. Redelivery cannot re-open it.
     pub fn decline_group_rejoin(&mut self, welcome_id: &MessageId) -> Result<(), EngineError> {
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
                 let candidate = storage.take_welcome(welcome_id)?;
                 let rejoin = candidate.rejoin.ok_or(EngineError::InvalidWelcome)?;
-                refuse_welcome(storage, welcome_id, &rejoin.content_id)
+                storage.put_ingress_dedup_marker(welcome_id)?;
+                storage.put_ingress_dedup_marker(&rejoin.content_id)?;
+                Ok(())
             })
     }
 
@@ -1366,7 +1318,9 @@ impl<S: StorageProvider> Engine<S> {
             Ok(_) => {}
             Err(error) if terminal_welcome_error(error) => {
                 self.storage.with_transaction(|storage| {
-                    refuse_welcome(storage, &welcome_id, &content_id)
+                    storage.put_ingress_dedup_marker(&welcome_id)?;
+                    storage.put_ingress_dedup_marker(&content_id)?;
+                    Ok::<_, EngineError>(())
                 })?;
             }
             Err(_) => {}
@@ -1891,7 +1845,7 @@ impl<S: StorageProvider> Engine<S> {
 
             // A sibling offer of another Welcome stays (mdk#2628 3.5b): from
             // another re-add, it can be the way back after the next removal,
-            // and its own route and carriers decide it then.
+            // and its own route and carrier decide it then.
             for candidate in storage.list_welcomes()? {
                 if candidate.group_id == group_id
                     && let Some(rejoin) = candidate.rejoin
@@ -1977,116 +1931,98 @@ impl<S: StorageProvider> Engine<S> {
         });
         if let Some(candidate) = pending_rejoin {
             // Bound stored offers; retain the exact first copy/revision on duplicates.
-            // A sibling Welcome is one offer too (mdk#2628 3.5b): another
-            // carrier of it joins the offer's carriers, and the offer joins
-            // through any still delivered. Only a decline or a terminal join
-            // failure marks one.
-            let offers: Vec<_> = self
-                .storage
-                .list_welcomes()?
-                .into_iter()
-                .filter(|old| old.rejoin.is_some())
-                .collect();
-            let route = |offer: &PendingWelcome| {
-                offer.rejoin.as_ref().map(|rejoin| {
-                    (
-                        rejoin.content_id.clone(),
-                        rejoin
-                            .sibling
-                            .as_ref()
-                            .map(|sibling| (sibling.from, sibling.key_package_ref.clone())),
-                    )
-                })
-            };
-            // Keep the first offer without terminally deduplicating its
-            // content: trusted removal may still make it auto-joinable.
-            match offers.iter().find(|old| route(old) == route(&candidate)) {
-                Some(old) => {
-                    let carriers = |offer: &PendingWelcome| {
-                        offer
-                            .rejoin
-                            .as_ref()
-                            .and_then(|rejoin| rejoin.sibling.as_ref())
-                            .map(|sibling| sibling.carriers.clone())
-                            .unwrap_or_default()
-                    };
-                    let known = carriers(old);
-                    let added: Vec<_> = carriers(&candidate)
-                        .into_iter()
-                        .filter(|carrier| !known.contains(carrier))
-                        .collect();
-                    if !added.is_empty() {
-                        let mut offer = old.clone();
-                        if let Some(sibling) = offer
-                            .rejoin
-                            .as_mut()
-                            .and_then(|rejoin| rejoin.sibling.as_mut())
-                        {
-                            sibling.carriers.extend(added);
-                        }
-                        self.storage.put_welcome(&offer)?;
-                    }
-                }
-                None => {
-                    // A sibling offer none of whose carriers is still delivered.
-                    let mut withdrawn = std::collections::HashSet::new();
-                    for old in &offers {
-                        if let Some(sibling) = old
-                            .rejoin
-                            .as_ref()
-                            .and_then(|rejoin| rejoin.sibling.as_ref())
-                        {
-                            let mut delivered = false;
-                            for carrier in &sibling.carriers {
-                                delivered |= self.sibling_carrier_delivered(carrier)?;
-                            }
-                            if !delivered {
-                                withdrawn.insert(old.message_id.clone());
-                            }
-                        }
-                    }
-                    // Retire an offer when full: a withdrawn sibling offer, else
-                    // the oldest unconsented one. User decisions must not pin the
-                    // account transport cursor; a stale screen's confirmation
-                    // safely fails because the selected id is gone.
-                    self.storage
-                        .with_transaction(|storage| -> Result<(), EngineError> {
-                            let group_full = offers
-                                .iter()
-                                .filter(|old| old.group_id == candidate.group_id)
-                                .count()
-                                >= 4;
-                            let account_full = offers.len() >= 64;
-                            if group_full || account_full {
-                                let in_scope = |old: &&PendingWelcome| {
-                                    !group_full || old.group_id == candidate.group_id
-                                };
-                                let victim = offers
-                                    .iter()
-                                    .filter(in_scope)
-                                    .find(|old| withdrawn.contains(&old.message_id))
-                                    .or_else(|| offers.iter().find(in_scope))
-                                    .ok_or(EngineError::InvalidWelcome)?;
-                                storage.take_welcome(&victim.message_id)?;
-                                // Eviction is capacity management, not rejection of
-                                // the authenticated Welcome. Another wrapper may
-                                // offer this content again or enable trusted reentry.
-                                // A sibling offer's carriers already left the app's
-                                // stash, so a marker would only stop one of them,
-                                // delivered again, from joining.
-                                if victim
-                                    .rejoin
-                                    .as_ref()
-                                    .is_some_and(|rejoin| rejoin.sibling.is_none())
-                                {
-                                    storage.put_ingress_dedup_marker(&victim.message_id)?;
-                                }
-                            }
-                            storage.put_welcome(&candidate)?;
-                            Ok(())
-                        })?;
+            // A sibling offer is its carrier's (mdk#2628 3.5b): another carrier
+            // of the same Welcome keeps its own offer, the Welcome arriving
+            // again retires its offers whose carrier was withdrawn, and
+            // eviction takes a withdrawn one first. Only a decline marks one.
+            let existing = self.storage.list_welcomes()?;
+            let mut withdrawn = std::collections::HashSet::new();
+            for old in &existing {
+                if let Some(sibling) = old
+                    .rejoin
+                    .as_ref()
+                    .and_then(|rejoin| rejoin.sibling.as_ref())
+                    && !self.sibling_carrier_delivered(&sibling.carrier)?
+                {
+                    withdrawn.insert(old.message_id.clone());
                 }
             }
+            let retired: std::collections::HashSet<_> = existing
+                .iter()
+                .filter(|old| {
+                    withdrawn.contains(&old.message_id)
+                        && old
+                            .rejoin
+                            .as_ref()
+                            .zip(candidate.rejoin.as_ref())
+                            .is_some_and(|(a, b)| {
+                                b.sibling.is_some() && a.content_id == b.content_id
+                            })
+                })
+                .map(|old| old.message_id.clone())
+                .collect();
+            let offers: Vec<_> = existing
+                .iter()
+                .filter(|old| old.rejoin.is_some() && !retired.contains(&old.message_id))
+                .collect();
+            // Keep the first offer without terminally deduplicating its
+            // content: trusted removal may still make it auto-joinable.
+            let duplicate = offers.iter().any(|old| {
+                old.rejoin
+                    .as_ref()
+                    .zip(candidate.rejoin.as_ref())
+                    .is_some_and(|(a, b)| {
+                        a.content_id == b.content_id
+                            && a.sibling.as_ref().map(|route| &route.carrier)
+                                == b.sibling.as_ref().map(|route| &route.carrier)
+                    })
+            });
+            // Retire an offer when full: a withdrawn sibling offer, else the
+            // oldest unconsented one. User decisions must not pin the account
+            // transport cursor; a stale screen's confirmation safely fails
+            // because the selected id is gone.
+            self.storage
+                .with_transaction(|storage| -> Result<(), EngineError> {
+                    for message_id in &retired {
+                        storage.take_welcome(message_id)?;
+                    }
+                    if duplicate {
+                        return Ok(());
+                    }
+                    let group_full = offers
+                        .iter()
+                        .filter(|old| old.group_id == candidate.group_id)
+                        .count()
+                        >= 4;
+                    let account_full = offers.len() >= 64;
+                    if group_full || account_full {
+                        let in_scope = |old: &&&PendingWelcome| {
+                            !group_full || old.group_id == candidate.group_id
+                        };
+                        let victim = offers
+                            .iter()
+                            .filter(in_scope)
+                            .find(|old| withdrawn.contains(&old.message_id))
+                            .or_else(|| offers.iter().find(in_scope))
+                            .ok_or(EngineError::InvalidWelcome)?;
+                        storage.take_welcome(&victim.message_id)?;
+                        // Eviction is capacity management, not rejection of
+                        // the authenticated Welcome. Another wrapper may
+                        // offer this content again or enable trusted reentry.
+                        // A sibling offer's carrier already left the app's
+                        // stash, so a marker would only stop that carrier,
+                        // delivered again, from joining.
+                        if victim
+                            .rejoin
+                            .as_ref()
+                            .is_some_and(|rejoin| rejoin.sibling.is_none())
+                        {
+                            storage.put_ingress_dedup_marker(&victim.message_id)?;
+                        }
+                    }
+                    storage.put_welcome(&candidate)?;
+                    Ok(())
+                })?;
         }
         let (
             group_id,

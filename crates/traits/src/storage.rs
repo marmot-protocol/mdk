@@ -763,8 +763,6 @@ pub trait DisbandTombstoneStorage {
 // ── WelcomeStorage ──────────────────────────────────────────────────────────
 
 pub trait WelcomeStorage {
-    /// Store `welcome`, replacing the one with its id in place: the order
-    /// `list_welcomes` reads is the order ids were first stored.
     fn put_welcome(&self, welcome: &PendingWelcome) -> StorageResult<()>;
     fn take_welcome(&self, id: &MessageId) -> StorageResult<PendingWelcome>;
     fn list_welcomes(&self) -> StorageResult<Vec<PendingWelcome>>;

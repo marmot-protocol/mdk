@@ -11,10 +11,8 @@ impl WelcomeStorage for SqliteAccountStorage {
     fn put_welcome(&self, welcome: &PendingWelcome) -> StorageResult<()> {
         self.lock()?
             .execute_cached(
-                "INSERT INTO cgka_welcomes (message_id, group_id, record)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT (message_id) DO UPDATE
-                 SET group_id = excluded.group_id, record = excluded.record",
+                "INSERT OR REPLACE INTO cgka_welcomes (message_id, group_id, record)
+                 VALUES (?1, ?2, ?3)",
                 params![
                     welcome.message_id.as_slice(),
                     welcome.group_id.as_slice(),
@@ -111,24 +109,6 @@ mod tests {
             store.take_welcome(&mid(1)),
             Err(StorageError::NotFound)
         ));
-    }
-
-    #[test]
-    fn replacing_a_welcome_keeps_its_place() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let welcome = |n: u8, bytes: Vec<u8>| PendingWelcome {
-            message_id: mid(n),
-            group_id: gid(1),
-            welcome_bytes: bytes,
-            rejoin: None,
-        };
-        store.put_welcome(&welcome(1, vec![1])).unwrap();
-        store.put_welcome(&welcome(2, vec![2])).unwrap();
-        store.put_welcome(&welcome(1, vec![3])).unwrap();
-        assert_eq!(
-            store.list_welcomes().unwrap(),
-            vec![welcome(1, vec![3]), welcome(2, vec![2])]
-        );
     }
 
     #[test]

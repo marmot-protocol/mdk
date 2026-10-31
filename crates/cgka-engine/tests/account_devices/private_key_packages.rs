@@ -517,18 +517,17 @@ fn deliver_carrier(device: &Device, device_group: &GroupId, carrier: &[u8]) {
 /// A sibling Welcome back into a chat whose copy the laptop still holds
 /// active, such as one that reaches it before the removal it follows, leaves
 /// a rejoin offer that keeps its route and the KeyPackage issued. The removal
-/// landing joins it, and so does consent. The Welcome is one offer whatever
-/// carried it: another carrier joins its carriers, and it joins through one
-/// still delivered. One whose carriers were all withdrawn is retired, leaving
-/// the Welcome free to join when it arrives again, and consent never joins
-/// a Welcome already refused.
+/// landing joins it, and so does consent. Each carrier of the Welcome keeps
+/// its own offer, so a withdrawn one is retired and joins nothing while
+/// another still joins, and a retired one leaves the Welcome free to join
+/// when it arrives again.
 #[tokio::test]
 async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route() {
     let mut phone = device(b"alice", true);
     let mut laptop = device(b"alice", true);
     laptop
         .engine
-        .issue_private_key_packages(&SLOT, 6, None, NOW)
+        .issue_private_key_packages(&SLOT, 5, None, NOW)
         .unwrap();
     let issued = laptop.engine.issued_private_key_packages().unwrap();
     let private = |index: usize| current(issued[index].key_package.clone());
@@ -562,13 +561,13 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
         .await,
         offered
     );
-    assert_eq!(held(&laptop), 5);
+    assert_eq!(held(&laptop), 4);
     let offers = laptop.engine.pending_group_rejoins_for(Some(&gid)).unwrap();
     assert_eq!(offers.len(), 1);
     assert_eq!(
         offers[0].rejoin.as_ref().unwrap().sibling,
         Some(SiblingWelcomeRoute {
-            carriers: vec![hash_id(b"before removal")],
+            carrier: hash_id(b"before removal"),
             from: SLOT,
             key_package_ref: reference(1).to_vec(),
         })
@@ -586,7 +585,7 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
         laptop.engine.epoch(&gid).unwrap(),
         phone.engine.epoch(&gid).unwrap()
     );
-    assert_eq!(held(&laptop), 4);
+    assert_eq!(held(&laptop), 3);
     assert!(
         laptop
             .engine
@@ -622,10 +621,10 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
         laptop.engine.epoch(&gid).unwrap(),
         phone.engine.epoch(&gid).unwrap()
     );
-    assert_eq!(held(&laptop), 3);
+    assert_eq!(held(&laptop), 2);
 
-    // Another carrier of the Welcome joins its offer's carriers, and the
-    // offer joins through the one still delivered.
+    // Another carrier of the Welcome keeps its own offer, and retires the one
+    // whose carrier was withdrawn; the delivered one joins.
     let (remove, welcome) = remove_and_add_back(&mut phone, &laptop, &gid, private(3)).await;
     let sibling = sibling_welcome(&welcome, SLOT, reference(3));
     deliver_carrier(&laptop, &device_group, b"withdrawn");
@@ -639,13 +638,14 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
         join_sibling(&mut laptop, b"redelivered", &sibling).await,
         offered
     );
-    let [offer] =
-        <[_; 1]>::try_from(laptop.engine.pending_group_rejoins_for(Some(&gid)).unwrap()).unwrap();
-    assert_eq!(
-        offer.rejoin.unwrap().sibling.unwrap().carriers,
-        vec![hash_id(b"withdrawn"), hash_id(b"redelivered")]
-    );
-    laptop.engine.drain_events();
+    let carriers: Vec<_> = laptop
+        .engine
+        .pending_group_rejoins_for(Some(&gid))
+        .unwrap()
+        .into_iter()
+        .map(|offer| offer.rejoin.unwrap().sibling.unwrap().carrier)
+        .collect();
+    assert_eq!(carriers, vec![hash_id(b"redelivered")]);
     remove_laptop(&mut laptop, &gid, remove).await;
     assert!(
         laptop
@@ -655,23 +655,11 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
             .unwrap()
     );
     assert!(!laptop.engine.group_record(&gid).unwrap().removed);
-    // The join is recorded under the id its carrier gives it.
-    let via: Vec<_> = laptop
-        .engine
-        .drain_events()
-        .into_iter()
-        .filter_map(|event| match event {
-            GroupEvent::GroupJoined { via_welcome, .. } => Some(via_welcome),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(via.len(), 1);
-    assert_ne!(via[0], offer.message_id);
     assert_eq!(
         laptop.engine.epoch(&gid).unwrap(),
         phone.engine.epoch(&gid).unwrap()
     );
-    assert_eq!(held(&laptop), 2);
+    assert_eq!(held(&laptop), 1);
     assert!(
         laptop
             .engine
@@ -729,49 +717,13 @@ async fn a_sibling_welcome_before_its_removal_is_an_offer_that_keeps_its_route()
             .unwrap()
             .is_empty()
     );
-    assert_eq!(held(&laptop), 2);
+    assert_eq!(held(&laptop), 1);
     assert_eq!(
         join_sibling(&mut laptop, b"after removal", &sibling).await,
         IngestOutcome::Processed
     );
     assert!(!laptop.engine.group_record(&gid).unwrap().removed);
-    assert_eq!(held(&laptop), 1);
-
-    // An offer of a Welcome already refused, as one stored before a refusal
-    // retired every offer of its Welcome can be, never joins.
-    let (_, welcome) = remove_and_add_back(&mut phone, &laptop, &gid, private(5)).await;
-    deliver_carrier(&laptop, &device_group, b"refused");
-    assert_eq!(
-        join_sibling(
-            &mut laptop,
-            b"refused",
-            &sibling_welcome(&welcome, SLOT, reference(5))
-        )
-        .await,
-        offered
-    );
-    let [offer] =
-        <[_; 1]>::try_from(laptop.engine.pending_group_rejoins_for(Some(&gid)).unwrap()).unwrap();
-    let rejoin = offer.rejoin.unwrap();
-    laptop
-        .storage
-        .put_ingress_dedup_marker(&rejoin.content_id)
-        .unwrap();
-    assert!(matches!(
-        laptop
-            .engine
-            .confirm_group_rejoin(&offer.message_id, &rejoin.local_state_token)
-            .await,
-        Err(EngineError::WelcomeAlreadyProcessed)
-    ));
-    assert!(
-        laptop
-            .engine
-            .pending_group_rejoins_for(None)
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(held(&laptop), 1);
+    assert_eq!(held(&laptop), 0);
 }
 
 /// Withdraw the message that carried a sibling Welcome, as a branch switch
@@ -806,8 +758,6 @@ struct ReAdded {
     removals: Vec<TransportMessage>,
     /// Each round's Welcome, oldest first.
     welcomes: Vec<SiblingWelcome>,
-    /// The private KeyPackage each Welcome names.
-    key_packages: Vec<KeyPackage>,
 }
 
 /// A store that skips SQLCipher's memory security, copied from one migrated
@@ -844,14 +794,11 @@ async fn re_added(rounds: usize) -> ReAdded {
     );
     let mut removals = Vec::new();
     let mut welcomes = Vec::new();
-    let mut key_packages = Vec::new();
     for record in &issued[1..] {
         let key_package = current(record.key_package.clone());
-        let (remove, welcome) =
-            remove_and_add_back(&mut phone, &laptop, &gid, key_package.clone()).await;
+        let (remove, welcome) = remove_and_add_back(&mut phone, &laptop, &gid, key_package).await;
         removals.push(remove);
         welcomes.push(sibling_welcome(&welcome, SLOT, &record.key_package_ref));
-        key_packages.push(key_package);
     }
     ReAdded {
         laptop: Rc::new(laptop),
@@ -859,7 +806,6 @@ async fn re_added(rounds: usize) -> ReAdded {
         device_group,
         removals,
         welcomes,
-        key_packages,
     }
 }
 
@@ -879,33 +825,11 @@ impl ReAdded {
             .collect()
     }
 
-    /// The carriers of the chat's offers, oldest offer first.
     fn carriers(&self) -> Vec<MessageId> {
         self.offers()
             .into_iter()
-            .flat_map(|offer| offer.rejoin.unwrap().sibling.unwrap().carriers)
+            .map(|offer| offer.rejoin.unwrap().sibling.unwrap().carrier)
             .collect()
-    }
-
-    /// The content id of `welcome`, which its offer and its marker carry.
-    fn content(&self, welcome: usize) -> MessageId {
-        MessageId::new(Sha256::digest(&self.welcomes[welcome].welcome).to_vec())
-    }
-
-    /// Whether `welcome` is refused for good.
-    fn marked(&self, welcome: usize) -> bool {
-        self.laptop
-            .storage
-            .has_ingress_dedup_marker(&self.content(welcome))
-            .unwrap()
-    }
-
-    /// `welcome`'s offer, if the chat holds one.
-    fn offer_of(&self, welcome: usize) -> Option<PendingWelcome> {
-        let content = self.content(welcome);
-        self.offers()
-            .into_iter()
-            .find(|offer| offer.rejoin.as_ref().unwrap().content_id == content)
     }
 
     /// Whether the laptop joined through `welcome`, consuming its KeyPackage.
@@ -1000,7 +924,10 @@ async fn a_full_chat_evicts_a_withdrawn_sibling_offer_first() {
     }
     withdraw_carrier(&chat.laptop, b"B");
     assert_eq!(chat.arrive(4, b"E").await, offered());
-    let carriers: Vec<_> = b"ACDE".iter().map(|&carrier| hash_id(&[carrier])).collect();
+    let carriers: Vec<_> = [b'A', b'C', b'D', b'E']
+        .into_iter()
+        .map(|carrier| hash_id(&[carrier]))
+        .collect();
     assert_eq!(chat.carriers(), carriers);
     for carrier in b'C'..=b'E' {
         withdraw_carrier(&chat.laptop, &[carrier]);
@@ -1019,17 +946,14 @@ enum OfferStep {
     Insert(usize, usize),
     /// The carrier is withdrawn, as a branch switch does.
     Withdraw(usize, usize),
-    /// The Welcome's KeyPackage is gone, so its next join fails for good.
-    Break(usize),
-    /// Other Welcomes' offers fill the chat's limit, and one more arrives.
+    /// A third Welcome's offers fill the chat's limit, and one more arrives.
     Evict,
     /// The removal of the laptop's copy lands, and the retry runs.
     RemovalLands,
-    /// The user consents to the Welcome's offer, or to the one a stale screen
-    /// still shows after a decline.
-    Join(usize),
-    /// The user declines the Welcome's offer.
-    Decline(usize),
+    /// The user consents to the carrier's offer.
+    Join(usize, usize),
+    /// The user declines it.
+    Decline(usize, usize),
 }
 
 /// The longest sequence walked.
@@ -1037,12 +961,6 @@ const OFFER_STEPS: usize = 4;
 
 /// The chat's limit on offers.
 const CHAT_OFFERS: usize = 4;
-
-/// The Welcomes walked; the rest fill the chat's limit.
-const WALKED: usize = 2;
-
-/// Enough filler Welcomes for every eviction a walk makes.
-const FILLERS: usize = 6;
 
 fn offer_carrier(welcome: usize, carrier: usize) -> Vec<u8> {
     format!("welcome {welcome} carrier {carrier}").into_bytes()
@@ -1056,69 +974,74 @@ struct OfferWalk {
     /// Which copy the laptop holds: 0 is the founding one, `w + 1` Welcome
     /// `w`'s.
     copy: usize,
-    /// The copies whose removal landed.
-    landed: Vec<bool>,
+    landed: [bool; 3],
     inserted: HashSet<(usize, usize)>,
     withdrawn: HashSet<(usize, usize)>,
-    /// The carriers that arrived since the Welcome's offer was stored.
-    carriers: HashMap<usize, HashSet<usize>>,
-    broken: HashSet<usize>,
-    evicted: HashSet<usize>,
+    evicted: HashSet<(usize, usize)>,
     declined: HashSet<usize>,
-    /// Broken Welcomes a join failed for.
-    refused: HashSet<usize>,
-    /// The last offer id and token the host saw for each Welcome.
-    shown: HashMap<usize, (MessageId, Vec<u8>)>,
+    contents: HashMap<usize, MessageId>,
     fillers: usize,
 }
 
 impl OfferWalk {
     async fn new() -> Self {
-        let chat = re_added(WALKED + FILLERS).await;
-        for welcome in 0..WALKED {
+        let chat = re_added(3).await;
+        for welcome in 0..2 {
             for carrier in 0..2 {
                 let carrier = offer_carrier(welcome, carrier);
                 deliver_carrier(&chat.laptop, &chat.device_group, &carrier);
             }
         }
         Self {
-            landed: vec![false; chat.removals.len()],
             chat,
             sequence: Vec::new(),
             copy: 0,
+            landed: [false; 3],
             inserted: HashSet::new(),
             withdrawn: HashSet::new(),
-            carriers: HashMap::new(),
-            broken: HashSet::new(),
             evicted: HashSet::new(),
             declined: HashSet::new(),
-            refused: HashSet::new(),
-            shown: HashMap::new(),
-            fillers: WALKED,
+            contents: HashMap::new(),
+            fillers: 0,
         }
     }
 
     /// The walked Welcome and carrier an offer's carrier is.
     fn walked(carrier: &MessageId) -> Option<(usize, usize)> {
-        (0..WALKED)
+        (0..2)
             .flat_map(|welcome| (0..2).map(move |carrier| (welcome, carrier)))
             .find(|&(welcome, index)| &hash_id(&offer_carrier(welcome, index)) == carrier)
     }
 
-    /// The walked Welcomes with an offer in the table.
-    fn present(&self) -> HashSet<usize> {
-        (0..WALKED)
-            .filter(|&welcome| self.chat.offer_of(welcome).is_some())
+    /// The walked offers in the table.
+    fn present(&self) -> HashSet<(usize, usize)> {
+        self.chat
+            .carriers()
+            .iter()
+            .filter_map(Self::walked)
             .collect()
     }
 
-    /// Whether any carrier of `welcome`'s offer is still delivered.
-    fn delivered(&self, welcome: usize) -> bool {
-        self.carriers.get(&welcome).is_some_and(|carriers| {
-            carriers
-                .iter()
-                .any(|&carrier| !self.withdrawn.contains(&(welcome, carrier)))
-        })
+    fn offer(&self, welcome: usize, carrier: usize) -> PendingWelcome {
+        self.chat
+            .laptop
+            .engine
+            .pending_group_rejoins_for(Some(&self.chat.gid))
+            .unwrap()
+            .into_iter()
+            .find(|offer| {
+                Self::walked(
+                    &offer
+                        .rejoin
+                        .as_ref()
+                        .unwrap()
+                        .sibling
+                        .as_ref()
+                        .unwrap()
+                        .carrier,
+                ) == Some((welcome, carrier))
+            })
+            .unwrap()
     }
 
     /// Every step that does something from here. A Welcome's second carrier
@@ -1127,11 +1050,11 @@ impl OfferWalk {
         let present = self.present();
         let removed = self.chat.removed();
         let mut steps = Vec::new();
-        for welcome in 0..WALKED {
-            let joined = self.chat.joined(welcome);
+        for welcome in 0..2 {
+            let open = !self.declined.contains(&welcome) && !self.chat.joined(welcome);
             for carrier in 0..2 {
                 let offer = (welcome, carrier);
-                if !joined
+                if open
                     && !self.withdrawn.contains(&offer)
                     && (carrier == 0 || self.inserted.contains(&(welcome, 0)))
                 {
@@ -1140,21 +1063,16 @@ impl OfferWalk {
                 if self.inserted.contains(&offer) && !self.withdrawn.contains(&offer) {
                     steps.push(OfferStep::Withdraw(welcome, carrier));
                 }
-            }
-            if !joined && !self.broken.contains(&welcome) && !self.declined.contains(&welcome) {
-                steps.push(OfferStep::Break(welcome));
-            }
-            if present.contains(&welcome) || (self.declined.contains(&welcome) && !joined) {
-                steps.push(OfferStep::Join(welcome));
-            }
-            if present.contains(&welcome) {
-                steps.push(OfferStep::Decline(welcome));
+                if present.contains(&offer) {
+                    steps.push(OfferStep::Join(welcome, carrier));
+                    steps.push(OfferStep::Decline(welcome, carrier));
+                }
             }
         }
-        if !removed && !present.is_empty() {
+        if !removed && !self.chat.joined(2) {
             steps.push(OfferStep::Evict);
         }
-        if !removed && self.copy < self.landed.len() && !self.landed[self.copy] {
+        if !removed && self.copy < 3 && !self.landed[self.copy] {
             steps.push(OfferStep::RemovalLands);
         }
         steps
@@ -1162,10 +1080,8 @@ impl OfferWalk {
 
     async fn apply(&mut self, step: OfferStep) {
         self.sequence.push(step);
-        let sequence = self.sequence.clone();
-        let joined: Vec<_> = (0..self.chat.welcomes.len())
-            .map(|welcome| self.chat.joined(welcome))
-            .collect();
+        let sequence = &self.sequence;
+        let joined: Vec<_> = (0..3).map(|welcome| self.chat.joined(welcome)).collect();
         let before = self.present();
         let full = self.chat.offers().len() >= CHAT_OFFERS;
         match step {
@@ -1173,35 +1089,23 @@ impl OfferWalk {
                 let sibling = self.chat.welcomes[welcome].clone();
                 let carrier_id = offer_carrier(welcome, carrier);
                 let outcome = join_sibling(self.chat.laptop(), &carrier_id, &sibling).await;
-                if self.declined.contains(&welcome) || self.refused.contains(&welcome) {
-                    assert!(
-                        matches!(outcome, IngestOutcome::Ignored { .. }),
-                        "{sequence:?} opened refused Welcome {welcome}: {outcome:?}"
-                    );
-                } else if self.broken.contains(&welcome) {
-                    assert_eq!(
-                        outcome,
-                        refused(InputRejectionCategory::MissingWelcomeKeyPackage),
-                        "{sequence:?}"
-                    );
-                    self.refused.insert(welcome);
-                } else {
-                    // An open Welcome is never refused.
-                    assert!(
-                        outcome == offered() || outcome == IngestOutcome::Processed,
-                        "{sequence:?} refused an open Welcome: {outcome:?}"
-                    );
-                    if outcome == offered() {
-                        self.inserted.insert((welcome, carrier));
-                        self.evicted.remove(&welcome);
-                        if !before.contains(&welcome) {
-                            self.carriers.remove(&welcome);
-                        }
-                        self.carriers.entry(welcome).or_default().insert(carrier);
-                        // At the limit, a new offer evicts one.
-                        if full {
-                            self.evicted.extend(before.difference(&self.present()));
-                        }
+                // An open Welcome is never refused: nothing but a decline or
+                // a join marks it.
+                assert!(
+                    outcome == offered() || outcome == IngestOutcome::Processed,
+                    "{sequence:?} refused an open Welcome: {outcome:?}"
+                );
+                if outcome == offered() {
+                    self.inserted.insert((welcome, carrier));
+                    self.evicted.remove(&(welcome, carrier));
+                    // At the limit, the arrival evicts one offer.
+                    let gone: Vec<_> = before
+                        .difference(&self.present())
+                        .filter(|offer| !self.withdrawn.contains(offer))
+                        .copied()
+                        .collect();
+                    if full && gone.len() == 1 {
+                        self.evicted.extend(gone);
                     }
                 }
             }
@@ -1209,27 +1113,12 @@ impl OfferWalk {
                 withdraw_carrier(&self.chat.laptop, &offer_carrier(welcome, carrier));
                 self.withdrawn.insert((welcome, carrier));
             }
-            OfferStep::Break(welcome) => {
-                let key_package = self.chat.key_packages[welcome].clone();
-                self.chat
-                    .laptop()
-                    .engine
-                    .delete_key_package(&key_package)
-                    .await
-                    .unwrap();
-                self.broken.insert(welcome);
-            }
             OfferStep::Evict => {
                 loop {
                     let count = self.chat.offers().len();
-                    assert!(
-                        self.fillers < self.chat.welcomes.len(),
-                        "{sequence:?} ran out of fillers"
-                    );
-                    let filler = self.fillers;
+                    let carrier = format!("filler {}", self.fillers).into_bytes();
                     self.fillers += 1;
-                    let carrier = format!("filler {filler}").into_bytes();
-                    assert_eq!(self.chat.arrive(filler, &carrier).await, offered());
+                    assert_eq!(self.chat.arrive(2, &carrier).await, offered());
                     if self.chat.offers().len() == count {
                         break;
                     }
@@ -1241,152 +1130,68 @@ impl OfferWalk {
                 self.chat.remove(self.copy).await;
                 self.chat.retry().await;
             }
-            OfferStep::Join(welcome) => {
-                let (id, token) = match self.chat.offer_of(welcome) {
-                    Some(_) => {
-                        let offer = self
-                            .chat
-                            .laptop
-                            .engine
-                            .pending_group_rejoins_for(Some(&self.chat.gid))
-                            .unwrap()
-                            .into_iter()
-                            .find(|offer| {
-                                offer.rejoin.as_ref().unwrap().content_id
-                                    == self.chat.content(welcome)
-                            })
-                            .unwrap();
-                        (offer.message_id, offer.rejoin.unwrap().local_state_token)
-                    }
-                    None => self.shown[&welcome].clone(),
-                };
-                let result = self
+            OfferStep::Join(welcome, carrier) => {
+                let offer = self.offer(welcome, carrier);
+                let token = offer.rejoin.unwrap().local_state_token;
+                let _ = self
                     .chat
                     .laptop()
                     .engine
-                    .confirm_group_rejoin(&id, &token)
+                    .confirm_group_rejoin(&offer.message_id, &token)
                     .await;
-                // Consent joins a Welcome only through a delivered carrier,
-                // and never one declined or refused.
-                if self.declined.contains(&welcome) {
-                    assert!(
-                        result.is_err(),
-                        "{sequence:?} joined declined Welcome {welcome}"
-                    );
-                } else if !self.delivered(welcome) {
-                    assert!(
-                        matches!(result, Err(EngineError::InvalidWelcome)),
-                        "{sequence:?} joined Welcome {welcome} without a carrier: {result:?}"
-                    );
-                } else if self.broken.contains(&welcome) {
-                    assert!(
-                        matches!(result, Err(EngineError::MissingWelcomeKeyPackage)),
-                        "{sequence:?} joined broken Welcome {welcome}: {result:?}"
-                    );
-                    self.refused.insert(welcome);
-                } else {
-                    assert_eq!(
-                        result.as_ref().ok(),
-                        Some(&self.chat.gid),
-                        "{sequence:?} did not join Welcome {welcome}: {result:?}"
-                    );
-                }
             }
-            OfferStep::Decline(welcome) => {
-                let (id, _) = self.shown[&welcome].clone();
-                self.chat.laptop().engine.decline_group_rejoin(&id).unwrap();
+            OfferStep::Decline(welcome, carrier) => {
+                let offer = self.offer(welcome, carrier);
+                self.chat
+                    .laptop()
+                    .engine
+                    .decline_group_rejoin(&offer.message_id)
+                    .unwrap();
                 self.declined.insert(welcome);
             }
         }
-        if let Some(welcome) =
-            (0..joined.len()).find(|&welcome| !joined[welcome] && self.chat.joined(welcome))
+        if let Some(welcome) = (0..3).find(|&welcome| !joined[welcome] && self.chat.joined(welcome))
         {
             self.copy = welcome + 1;
         }
-        for welcome in 0..WALKED {
-            if self.broken.contains(&welcome) && self.chat.marked(welcome) {
-                self.refused.insert(welcome);
+        for offer in self.chat.offers() {
+            let rejoin = offer.rejoin.unwrap();
+            if let Some((welcome, _)) = Self::walked(&rejoin.sibling.unwrap().carrier) {
+                self.contents.insert(welcome, rejoin.content_id);
             }
-        }
-        // An offer goes only when its Welcome joins, is declined or refused,
-        // the limit evicts it or its carriers were all withdrawn.
-        let present = self.present();
-        for &welcome in before.difference(&present) {
-            assert!(
-                self.chat.joined(welcome)
-                    || self.declined.contains(&welcome)
-                    || self.refused.contains(&welcome)
-                    || self.evicted.contains(&welcome)
-                    || !self.delivered(welcome),
-                "{sequence:?} lost Welcome {welcome}'s offer"
-            );
-        }
-        for welcome in 0..WALKED {
-            if !present.contains(&welcome) {
-                self.carriers.remove(&welcome);
-            }
-        }
-        for welcome in &present {
-            let offer = self
-                .chat
-                .laptop
-                .engine
-                .pending_group_rejoins_for(Some(&self.chat.gid))
-                .unwrap()
-                .into_iter()
-                .find(|offer| {
-                    offer.rejoin.as_ref().unwrap().content_id == self.chat.content(*welcome)
-                })
-                .unwrap();
-            self.shown.insert(
-                *welcome,
-                (offer.message_id, offer.rejoin.unwrap().local_state_token),
-            );
         }
     }
 
-    /// Only a decline, a terminal join failure or a join marks a Welcome; a
-    /// declined or refused one has no offer and never joins; an offer holds
-    /// exactly the carriers that arrived for it, less withdrawn ones the
-    /// retry or a confirmation dropped; and a removal leaves no offer
+    /// A valid sibling Welcome is lost only to a decline or the size limit:
+    /// an offer whose carrier is still delivered stays until its Welcome
+    /// joins, only a decline marks a Welcome, and a removal leaves no offer
     /// unjoined.
-    fn assert_offers_hold(&self) {
+    fn assert_nothing_lost(&self) {
         let sequence = &self.sequence;
         let present = self.present();
-        for welcome in 0..WALKED {
-            let joined = self.chat.joined(welcome);
-            if self.chat.marked(welcome) {
+        for welcome in 0..2 {
+            if self.declined.contains(&welcome) || self.chat.joined(welcome) {
+                continue;
+            }
+            for carrier in 0..2 {
+                let offer = (welcome, carrier);
                 assert!(
-                    joined || self.declined.contains(&welcome) || self.broken.contains(&welcome),
+                    !self.inserted.contains(&offer)
+                        || self.withdrawn.contains(&offer)
+                        || self.evicted.contains(&offer)
+                        || present.contains(&offer),
+                    "{sequence:?} lost Welcome {welcome}'s offer through carrier {carrier}"
+                );
+            }
+            if let Some(content) = self.contents.get(&welcome) {
+                assert!(
+                    !self
+                        .chat
+                        .laptop
+                        .storage
+                        .has_ingress_dedup_marker(content)
+                        .unwrap(),
                     "{sequence:?} marked Welcome {welcome}"
-                );
-            }
-            if self.declined.contains(&welcome) || self.refused.contains(&welcome) {
-                assert!(
-                    !joined && !present.contains(&welcome) && self.chat.marked(welcome),
-                    "{sequence:?} kept refused Welcome {welcome} open"
-                );
-            }
-            if let Some(offer) = self.chat.offer_of(welcome) {
-                let carriers: HashSet<_> = offer
-                    .rejoin
-                    .unwrap()
-                    .sibling
-                    .unwrap()
-                    .carriers
-                    .iter()
-                    .map(|carrier| Self::walked(carrier).map(|walked| walked.1))
-                    .collect();
-                let arrived = &self.carriers[&welcome];
-                assert!(
-                    carriers
-                        .iter()
-                        .all(|carrier| carrier.is_some_and(|carrier| arrived.contains(&carrier)))
-                        && arrived.iter().all(|&carrier| {
-                            self.withdrawn.contains(&(welcome, carrier))
-                                || carriers.contains(&Some(carrier))
-                        }),
-                    "{sequence:?} gave Welcome {welcome}'s offer carriers {carriers:?}"
                 );
             }
         }
@@ -1405,16 +1210,15 @@ impl OfferWalk {
 }
 
 /// Every sequence of up to `OFFER_STEPS` steps over two sibling Welcomes back
-/// into one chat, each through two carriers, loses a Welcome with a delivered
-/// carrier only to a decline, a terminal join failure or the size limit, and
-/// never joins a declined or refused one. Where a sequence branches, the
-/// other branches start from a copy of the laptop's database, opened again.
+/// into one chat, each through two carriers, loses a valid sibling Welcome
+/// only to a decline or the size limit. Where a sequence branches, the other
+/// branches start from a copy of the laptop's database, opened again.
 #[tokio::test]
 async fn sibling_offers_are_lost_only_to_a_decline_or_the_size_limit() {
     let mut walk = OfferWalk::new().await;
     let mut pending = Vec::new();
     loop {
-        walk.assert_offers_hold();
+        walk.assert_nothing_lost();
         let mut steps = if walk.sequence.len() < OFFER_STEPS {
             walk.steps()
         } else {
