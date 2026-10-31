@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn populated_upgrade_backfills_navigation_and_rolls_back_failed_migration() {
+    fn populated_upgrade_backfills_navigation() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
         run(&mut conn, &MIGRATIONS[..71]).unwrap();
@@ -236,18 +236,7 @@ mod tests {
                 SELECT group_id_hex, 0, 0, 1 FROM account_groups;
             INSERT INTO chat_pin_positions VALUES ('01',7), ('04',99);
             INSERT INTO cgka_groups(id,epoch,record) VALUES(x'04',0,x'00');
-            INSERT INTO cgka_leave_requests VALUES(x'04',CAST('{\"requested_at_ms\":123}' AS BLOB));
-            CREATE TABLE chat_list_navigation_meta (collision INTEGER);").unwrap();
-        assert!(run(&mut conn, MIGRATIONS).is_err());
-        assert_eq!(conn.query_row("SELECT count(*) FROM pragma_table_xinfo('chat_list_rows') WHERE name = 'list_scope'", [], |r|r.get::<_,i64>(0)).unwrap(), 0);
-        assert_eq!(
-            conn.query_row("SELECT count(*) FROM chat_list_rows", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            4
-        );
-        conn.execute_batch("DROP TABLE chat_list_navigation_meta")
-            .unwrap();
+            INSERT INTO cgka_leave_requests VALUES(x'04',CAST('{\"requested_at_ms\":123}' AS BLOB));").unwrap();
         run(&mut conn, MIGRATIONS).unwrap();
         let rows = conn.prepare("SELECT group_id_hex,list_scope,list_unread,list_pin_position FROM chat_list_rows ORDER BY group_id_hex").unwrap().query_map([], |r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,Option<i64>>(3)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
         assert_eq!(

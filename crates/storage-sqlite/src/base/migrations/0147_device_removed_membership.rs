@@ -140,7 +140,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         run_through(&mut conn, 146).unwrap();
         let before = trigger_sql(&conn);
-        run(&mut conn, MIGRATIONS).unwrap();
+        run_through(&mut conn, 147).unwrap();
         let after = trigger_sql(&conn);
         assert_eq!(
             before.iter().map(|(name, _)| name).collect::<Vec<_>>(),

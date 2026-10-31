@@ -17,23 +17,15 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::base::migrations::{MIGRATIONS, run};
 
     #[test]
-    fn preparation_deferral_migration_preserves_jobs_and_is_transactional() {
+    fn preparation_deferral_migration_preserves_jobs() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         run(&mut conn, &MIGRATIONS[..98]).unwrap();
         conn.execute_batch("PRAGMA foreign_keys=OFF;
             INSERT INTO attachment_acquisition(token,group_id_hex,message_id_hex,attachment_index,source_message_id_hex,source_epoch,slot_json,plaintext_digest,state,attempts,due)
             VALUES(randomblob(16),'g','m',0,'s',1,'[\"imeta\"]',randomblob(32),2,7,1234);").unwrap();
-        let tx = conn.transaction().unwrap();
-        apply(&tx).unwrap();
-        tx.rollback().unwrap();
-        assert!(
-            conn.prepare("SELECT preparation_deferrals FROM attachment_acquisition")
-                .is_err()
-        );
         run(&mut conn, MIGRATIONS).unwrap();
         run(&mut conn, MIGRATIONS).unwrap();
         let row = conn

@@ -58,28 +58,70 @@ CREATE UNIQUE INDEX account_recovery_single_replay ON account_recovery_obligatio
 
 #[cfg(test)]
 mod tests {
-    use crate::base::migrations::{MIGRATIONS, run};
+    use crate::base::migrations::run_through;
+    use rusqlite::{Connection, types::Value};
 
+    fn columns(conn: &Connection, table: &str) -> String {
+        let statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+        statement.column_names().join(",")
+    }
+
+    fn rows(conn: &Connection, table: &str, columns: &str) -> Vec<Vec<Value>> {
+        let mut statement = conn
+            .prepare(&format!("SELECT {columns} FROM {table} ORDER BY 1"))
+            .unwrap();
+        let width = statement.column_count();
+        statement
+            .query_map([], |row| (0..width).map(|i| row.get(i)).collect())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Every debt shape at 114 keeps each column through the rebuild: queue
+    /// loss, an epoch gap, an explicit demand with its caller origin and
+    /// urgency, and incremental history with its scope window.
     #[test]
     fn native_replay_upgrade_preserves_existing_debt_scopes_and_retry_cost() {
-        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        run(&mut conn, &MIGRATIONS[..114]).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run_through(&mut conn, 114).unwrap();
         conn.execute_batch(
-            "INSERT INTO account_recovery_obligations
-                (id,demand_key,cause,created_at_ms,updated_at_ms,revision,eligibility,parked_at_ms,dismissed_scopes)
-             VALUES(zeroblob(16),'incremental',5,1,2,9,4,3,x'00');
+            "INSERT INTO account_state(label,updated_at) VALUES ('alice',100);
+             INSERT INTO cgka_groups(id,epoch,record) VALUES (x'aa',7,x'00');
+             INSERT INTO account_recovery_obligations
+                (id,demand_key,cause,group_id,account_label,stalled_epoch,marker_token,pending_since,
+                 dropped_count,revision,predicate,urgency,created_at_ms,updated_at_ms,state,
+                 eligibility,incomplete_reason,caller_origin,parked_at_ms,dismissed_scopes)
+             VALUES
+                (x'11111111111111111111111111111111','overflow:alice',0,x'aa','alice',3,42,124,9,
+                 2,1,2,10,11,1,2,3,1,12,x'0a'),
+                (x'22222222222222222222222222222222','epoch:aa',1,x'aa','alice',7,43,125,8,
+                 3,2,1,20,21,2,3,4,1,22,x'0b'),
+                (x'33333333333333333333333333333333','explicit',3,x'aa','alice',5,44,126,7,
+                 4,1,1,30,31,1,1,5,1,32,x'0c'),
+                (zeroblob(16),'incremental',5,NULL,NULL,NULL,NULL,NULL,NULL,
+                 9,0,0,1,2,0,4,NULL,0,3,x'00');
              INSERT INTO account_recovery_scopes
                 (obligation_id,scope_id,since_seconds,until_seconds,snapshot_state,scope_payload)
              VALUES(zeroblob(16),0,7,99,1,x'010203');
              UPDATE account_recovery_state SET next_attempt=8,retry_ordinal=5,retry_not_before_ms=12345;",
-        ).unwrap();
-        run(&mut conn, MIGRATIONS).unwrap();
-        let retained: (i64, i64, i64, Vec<u8>, i64, i64, Vec<u8>) = conn.query_row(
-            "SELECT revision,eligibility,parked_at_ms,dismissed_scopes,since_seconds,until_seconds,scope_payload
-             FROM account_recovery_obligations JOIN account_recovery_scopes ON id=obligation_id",
-            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
-        ).unwrap();
-        assert_eq!(retained, (9, 4, 3, vec![0], 7, 99, vec![1, 2, 3]));
+        )
+        .unwrap();
+        let tables = ["account_recovery_obligations", "account_recovery_scopes"];
+        let before: Vec<_> = tables
+            .iter()
+            .map(|table| {
+                let columns = columns(&conn, table);
+                let rows = rows(&conn, table, &columns);
+                (columns, rows)
+            })
+            .collect();
+        assert_eq!(before[0].1.len(), 4);
+        run_through(&mut conn, 115).unwrap();
+        for (table, (columns, expected)) in tables.iter().zip(&before) {
+            assert_eq!(&rows(&conn, table, columns), expected, "{table}");
+        }
         let retry: (i64, i64, i64) = conn
             .query_row(
                 "SELECT next_attempt,retry_ordinal,retry_not_before_ms FROM account_recovery_state",
@@ -96,6 +138,18 @@ mod tests {
             "INSERT INTO account_recovery_obligations(demand_key,cause,predicate,created_at_ms,updated_at_ms)
              VALUES('replay:second',7,3,1,1)", [],
         ).is_err());
+        // The rebuild keeps 0093's single explicit demand.
+        let duplicate = conn
+            .execute(
+                "INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms)
+                 VALUES('explicit:second',3,1,1)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            duplicate.to_string().contains("UNIQUE constraint failed"),
+            "{duplicate}"
+        );
         conn.execute("DELETE FROM account_recovery_obligations WHERE cause=5", [])
             .unwrap();
         let scopes: i64 = conn

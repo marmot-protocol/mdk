@@ -63,12 +63,18 @@ mod tests {
             .unwrap()
         };
         assert_eq!(used(&conn), 5);
-        assert!(
-            conn.execute(
-                "UPDATE outgoing_attachment_upload_bodies SET bytes=x'00'",
-                []
+        // Same length, so only the immutability trigger can refuse it.
+        let error = conn
+            .execute(
+                "UPDATE outgoing_attachment_upload_bodies SET bytes=x'0102030405'",
+                [],
             )
-            .is_err()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outgoing upload body is immutable"),
+            "{error}"
         );
         conn.execute("DELETE FROM outgoing_attachment_uploads", [])
             .unwrap();
