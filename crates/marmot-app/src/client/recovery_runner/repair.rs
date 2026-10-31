@@ -26,10 +26,10 @@
 //!   never succeeds outright, as today. Otherwise the caller or the budget
 //!   ends it (`Cancelled`, `Deadline`), or a pass that served nothing within
 //!   the bound means the runner can do no more now (`CoverageUnproven`). As
-//!   today, the caller's cancel wins even over a covered window, and a
-//!   covered window over the deadline ([`verdict_end`]). The
-//!   repair keeps no request of its own: the re-arm and the goals are what
-//!   the runner serves.
+//!   today, the caller decides `Cancelled` first, even over a covered window
+//!   (`serve_repair`), and a covered window wins over the deadline
+//!   ([`verdict_end`]). The repair keeps no request of its own: the re-arm
+//!   and the goals are what the runner serves.
 
 use std::time::Duration;
 
@@ -40,8 +40,9 @@ use tokio::time::Instant;
 
 use super::compare::recorded_caps;
 use super::host::SpawnedRunner;
+use super::recheck;
 use super::select::suspended;
-use super::{DebtTurn, PassBound, RecoveryRunner, RepairEnd, RunnerHost, TARGET};
+use super::{DebtTurn, PassBound, RecoveryRunner, RepairEnd, RunnerHost, TARGET, UnitKey};
 use crate::client::AppClient;
 use crate::client::sync::incomplete_full_history_repair;
 use crate::{
@@ -172,10 +173,11 @@ impl<H: RunnerHost> RecoveryRunner<H> {
     }
 }
 
-/// How a repair ends after a pass and its verdict, in today's order: the
-/// caller's cancel, even over a covered window; then a covered window, even
-/// past the deadline, as a pass that finished is judged on its routes; then
-/// the deadline; then a pass that served nothing. `None` runs another pass.
+/// How a repair ends after a pass and its verdict, in today's order: a
+/// tripped stop at once (its caller reports `Cancelled` however the runner
+/// ends); then a covered window, even past the deadline, as a pass that
+/// finished is judged on its routes; then the deadline; then a pass that
+/// served nothing. `None` runs another pass.
 fn verdict_end(bound: &PassBound, covered: bool, served: bool) -> Option<RepairEnd> {
     if bound.stop.is_cancelled() {
         Some(RepairEnd::Cancelled)
@@ -217,21 +219,28 @@ fn rearm(turn: &DebtTurn<'_>) -> StorageResult<u64> {
 
 /// Whether every current route's window is covered on each of its required
 /// relays, up to their live tails (and a retained route's goal end), and
-/// re-checked since `requested` on each whose recorded caps show NIP-77. A cap-only relay's count proofs cover,
-/// but it is never re-checked (decision 2). A unit that broke or was
-/// dismissed since the re-arm never is: its parked and retired spans are left
-/// out of its debt, not covered. Nor is a route with staged events: staging
-/// covers what it fetched, but the engine has not admitted them (each step
-/// admits first, so a finished pass left them staged only because the engine
-/// kept no trace of one). A suspended group's routes are left out, as their
-/// notices are: the runner serves none of their debt.
+/// re-checked since `requested` on each whose recorded caps show NIP-77,
+/// wherever the re-check survey owes a pass ([`recheck::owed`]). A cap-only
+/// relay's count proofs cover, but it is never re-checked (decision 2). A
+/// unit that broke or was dismissed since the re-arm never is: its parked
+/// and retired spans are left out of its debt, not covered. Nor is a route
+/// with staged events: staging covers what it fetched, but the engine has not
+/// admitted them (each step admits first, so a finished pass left them staged
+/// only because the engine kept no trace of one). A suspended group's routes
+/// are left out, as their notices are: the runner serves none of their debt.
+/// Something must have been judged, as today's path certifies only a
+/// non-empty set of scopes, each compared: a route with no required relay
+/// (none admitted) is not covered, and nor is a turn whose every route is
+/// suspended.
 pub(super) fn repaired(turn: &DebtTurn<'_>, requested: u64) -> StorageResult<bool> {
     let app = turn.app;
     let staged = app.staged_recovery_routes()?;
+    let mut judged = false;
     for route in turn.routes.iter().filter(|route| !suspended(route)) {
-        if staged.contains(&route.route) {
+        if staged.contains(&route.route) || route.required.is_empty() {
             return Ok(false);
         }
+        judged = true;
         for relay in &route.required {
             let unit = app.recovery_unit(&route.route, relay)?;
             if unit
@@ -247,16 +256,25 @@ pub(super) fn repaired(turn: &DebtTurn<'_>, requested: u64) -> StorageResult<boo
             {
                 return Ok(false);
             }
+            let pass = unit.map(|unit| unit.recheck).unwrap_or_default();
             if recorded_caps(app, relay)?.is_some()
-                && !unit
-                    .and_then(|unit| unit.recheck.completed_at_seconds)
-                    .is_some_and(|at| at >= requested)
+                && !pass.completed_at_seconds.is_some_and(|at| at >= requested)
+                && recheck::owed(
+                    turn,
+                    route,
+                    &UnitKey {
+                        route: route.route.clone(),
+                        relay: relay.clone(),
+                    },
+                    pass,
+                )?
+                .is_some()
             {
                 return Ok(false);
             }
         }
     }
-    Ok(true)
+    Ok(judged)
 }
 
 #[cfg(test)]

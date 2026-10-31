@@ -500,26 +500,29 @@ impl AppClient {
     /// current step ends, or else this client's in-place one. Its turns run
     /// on this client meanwhile. Once `cancelled` says so the bound's stop is
     /// tripped; on it, or at the deadline, the runner ends, its quantum in
-    /// flight interrupting and settling on a turn served here. `Stopped`
-    /// without a runner.
+    /// flight interrupting and settling on a turn served here. A repair whose
+    /// caller cancelled is `Cancelled` however it ended ([`serve_repair`]).
+    /// `Stopped` without a runner.
     pub(crate) async fn repair_through_recovery_runner(
         &mut self,
         spawned: Option<&mut SpawnedRunner>,
         bound: PassBound,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> RepairEnd {
-        let answered = match spawned {
+        match spawned {
             Some(spawned) => {
                 let handle = spawned.handle.clone();
                 let request = bound.clone();
                 let repair = async move { handle.repair(request).await };
-                serve_repair(self, repair, &mut spawned.turns, &bound, cancelled).await
+                serve_repair(self, repair, &mut spawned.turns, &bound, cancelled)
+                    .await
+                    .end
             }
             None => {
                 let Some(mut seat) = self.take_in_place_runner().await else {
                     return RepairEnd::Stopped;
                 };
-                let answered = {
+                let served = {
                     let InPlaceRunner { runner, turns, .. } = &mut seat;
                     // On the heap: a repair's future carries a pass's.
                     let repair = Box::pin(async { Some(runner.repair(&bound).await) });
@@ -528,19 +531,12 @@ impl AppClient {
                 // A runner that never answered is dropped with its seat, and
                 // refunds the attempt it left open; the next pass builds a
                 // fresh one.
-                if answered.is_some() {
+                if served.answered {
                     self.recovery_runner = RunnerSeat::InPlace(Box::new(Some(seat)));
                 }
-                answered
+                served.end
             }
-        };
-        answered.unwrap_or_else(|| {
-            if cancelled() {
-                RepairEnd::Cancelled
-            } else {
-                RepairEnd::Deadline
-            }
-        })
+        }
     }
 
     /// Whether this directly owned client runs a recovery runner in place.
@@ -672,51 +668,73 @@ impl Drop for SpawnedRunner {
     }
 }
 
-/// Serve `turns` on `client` until `repair` answers. Once `cancelled` says so,
-/// trip `bound`'s stop; then, or once its deadline passes, on which the
-/// runner ends by itself, give up after [`CANCEL_WAIT`] more. Only the
-/// caller's cancel trips the stop, so a repair the clock ended is never
-/// `Cancelled`. What the runner sent by then is still served, so a settle
-/// that came in time keeps its verdict and its bytes. `None` once it gives
-/// up; an answer of `None`, the runner gone, is `Stopped`.
+/// How a repair ended for its caller.
+struct ServedRepair {
+    end: RepairEnd,
+    /// The runner answered; one that did not is gone or overstayed.
+    answered: bool,
+}
+
+/// Serve `turns` on `client` until `repair` answers. Whenever `cancelled`
+/// says so, trip `bound`'s stop; once it is tripped or the deadline passes,
+/// on which the runner ends by itself, give up after [`CANCEL_WAIT`] more.
+/// What the runner sent by then is still served, so a settle that came in
+/// time keeps its verdict and its bytes. The caller decides `Cancelled`
+/// first, as today's path does: a repair whose caller cancelled is
+/// `Cancelled` however the runner ended, so the stop only preempts, and a
+/// late trip changes no end. A storage failure still outranks it, as today.
+/// Nothing but the caller's cancel trips the stop, so a repair the clock
+/// ended is never `Cancelled`. An answer of `None`, the runner gone, is
+/// `Stopped`; no answer by the backstop is `Deadline`.
 async fn serve_repair(
     client: &mut AppClient,
     repair: impl Future<Output = Option<RepairEnd>>,
     turns: &mut mpsc::Receiver<RunnerTurn>,
     bound: &PassBound,
     cancelled: &(dyn Fn() -> bool + Sync),
-) -> Option<RepairEnd> {
+) -> ServedRepair {
     tokio::pin!(repair);
     let mut poll = tokio::time::interval(CANCEL_POLL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut stopping_by = None;
-    loop {
+    let answer = loop {
         tokio::select! {
             biased;
-            end = &mut repair => return Some(end.unwrap_or(RepairEnd::Stopped)),
+            end = &mut repair => break Some(end.unwrap_or(RepairEnd::Stopped)),
             Some(turn) = turns.recv() => turn.serve(client).await,
             _ = poll.tick() => {}
         }
         // After every arm: a runner whose turns come back to back keeps the
-        // turn arm ready, so the tick alone could wait forever.
+        // turn arm ready, so the tick alone could wait forever. Also once the
+        // deadline armed the backstop: a cancel then still preempts.
+        if cancelled() {
+            bound.stop.cancel();
+        }
         let now = tokio::time::Instant::now();
-        match stopping_by {
-            None => {
-                if cancelled() {
-                    bound.stop.cancel();
-                } else if now < bound.deadline {
-                    continue;
-                }
-                stopping_by = Some(now + CANCEL_WAIT);
+        let by = match stopping_by {
+            Some(by) => by,
+            None if bound.stop.is_cancelled() || now >= bound.deadline => {
+                *stopping_by.insert(now + CANCEL_WAIT)
             }
-            Some(by) if now >= by => break,
-            Some(_) => {}
+            None => continue,
+        };
+        if now >= by {
+            break None;
+        }
+    };
+    let answered = answer.is_some();
+    if !answered {
+        while let Ok(turn) = turns.try_recv() {
+            turn.serve(client).await;
         }
     }
-    while let Ok(turn) = turns.try_recv() {
-        turn.serve(client).await;
-    }
-    None
+    let end = match answer {
+        Some(RepairEnd::Failed(error)) => RepairEnd::Failed(error),
+        _ if cancelled() => RepairEnd::Cancelled,
+        Some(end) => end,
+        None => RepairEnd::Deadline,
+    };
+    ServedRepair { end, answered }
 }
 
 /// The worker's runner, if it has one: the next turn its runner sends.

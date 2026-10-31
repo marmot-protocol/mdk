@@ -775,9 +775,60 @@ async fn a_repair_past_its_deadline_is_never_cancelled_by_its_caller() {
             RepairEnd::Deadline
         })
     };
-    let end = serve_repair(&mut client, repair, &mut turns, &bound, &|| false).await;
-    assert!(matches!(end, Some(RepairEnd::Deadline)));
+    let served = serve_repair(&mut client, repair, &mut turns, &bound, &|| false).await;
+    assert!(served.answered);
+    assert!(matches!(served.end, RepairEnd::Deadline));
     assert!(!bound.stop.is_cancelled());
+}
+
+/// A cancel that comes as the runner reads its verdict, before the caller
+/// trips the stop, as a spawned runner's may on another thread, still ends
+/// the repair `Cancelled`: the caller decides that first, as today's path
+/// does, over the covered window the runner answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_during_the_verdict_beats_the_covered_window_the_runner_answered() {
+    let (_dir, _relay, _app, mut client) = direct_client(false).await;
+    let bound = PassBound::within(Duration::from_secs(60));
+    let (_sender, mut turns) = tokio::sync::mpsc::channel::<RunnerTurn>(1);
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let repair = async {
+        // The verdict turn: covered, with the stop not yet tripped.
+        cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        Some(RepairEnd::Covered)
+    };
+    let served = serve_repair(&mut client, repair, &mut turns, &bound, &|| {
+        cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    assert!(served.answered);
+    assert!(matches!(served.end, RepairEnd::Cancelled));
+}
+
+/// A cancel that comes after the deadline armed the caller's backstop still
+/// trips the stop, so the runner's quantum in flight is preempted then, and
+/// the repair is `Cancelled`, not the `Deadline` the runner would answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_after_the_deadline_armed_the_backstop_still_preempts() {
+    let (_dir, _relay, _app, mut client) = direct_client(false).await;
+    let bound = PassBound::within(Duration::ZERO);
+    let (_sender, mut turns) = tokio::sync::mpsc::channel::<RunnerTurn>(1);
+    let ends = bound.clone();
+    let repair = async move {
+        // Runs on past its deadline, as a quantum in its interrupt grace may,
+        // until the stop or well inside the backstop.
+        tokio::select! {
+            () = ends.stop.cancelled() => Some(RepairEnd::Cancelled),
+            () = tokio::time::sleep(Duration::from_millis(600)) => Some(RepairEnd::Deadline),
+        }
+    };
+    let cancel_at = tokio::time::Instant::now() + Duration::from_millis(150);
+    let served = serve_repair(&mut client, repair, &mut turns, &bound, &|| {
+        tokio::time::Instant::now() >= cancel_at
+    })
+    .await;
+    assert!(bound.stop.is_cancelled(), "the late cancel trips the stop");
+    assert!(served.answered);
+    assert!(matches!(served.end, RepairEnd::Cancelled));
 }
 
 /// A runner whose turns come back to back, each waiting for the last, as
@@ -807,7 +858,7 @@ async fn a_run_of_turns_never_starves_a_repairs_cancel() {
         Some(RepairEnd::Cancelled)
     };
     let cancelled = std::sync::atomic::AtomicBool::new(false);
-    let end = tokio::time::timeout(Duration::from_secs(10), async {
+    let served = tokio::time::timeout(Duration::from_secs(10), async {
         cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
         serve_repair(&mut client, repair, &mut turns, &bound, &|| {
             cancelled.load(std::sync::atomic::Ordering::SeqCst)
@@ -816,5 +867,6 @@ async fn a_run_of_turns_never_starves_a_repairs_cancel() {
     })
     .await
     .expect("the cancel is seen between turns");
-    assert!(matches!(end, Some(RepairEnd::Cancelled)));
+    assert!(served.answered);
+    assert!(matches!(served.end, RepairEnd::Cancelled));
 }

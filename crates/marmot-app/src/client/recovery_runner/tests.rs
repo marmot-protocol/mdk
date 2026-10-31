@@ -4263,6 +4263,111 @@ async fn recovery_runner_repair_leaves_a_suspended_groups_route_out_of_its_verdi
     assert!(!account.debt(&frozen, RELAY, t0 - 1).is_empty());
 }
 
+/// A repair whose every route is suspended judged nothing, so it never ends
+/// with the window covered: as today's path certifies only a non-empty set
+/// of scopes, it is `CoverageUnproven`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_repair_whose_every_route_is_suspended_is_unproven() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let frozen = group(1);
+    let floor = t0 - HOUR;
+    let relay = ModelRelay::new(RELAY, caps(500, false))
+        .with_events(every([1; 32], floor, t0, 60))
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![RunnerRoute {
+            unrecoverable: true,
+            ..required(&frozen, &[RELAY])
+        }],
+        &[&relay],
+    );
+    account.goal(&frozen, floor);
+    host.tails.stand(&frozen, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    let end = runner
+        .repair(&super::PassBound::within(Duration::from_secs(60)))
+        .await;
+    assert!(matches!(end, super::RepairEnd::Unproven));
+}
+
+/// A route none of whose relays was admitted has no required relay, so
+/// nothing compared it: a repair never ends with its window covered, as
+/// today's path keeps such a scope open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_repair_never_covers_a_route_with_no_required_relay() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (served, unadmitted) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    let relay = ModelRelay::new(RELAY, caps(500, false))
+        .with_events(every([1; 32], floor, t0, 60))
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&served, &[RELAY]), required(&unadmitted, &[])],
+        &[&relay],
+    );
+    for route in [&served, &unadmitted] {
+        account.goal(route, floor);
+    }
+    host.tails.stand(&served, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    let end = runner
+        .repair(&super::PassBound::within(Duration::from_secs(60)))
+        .await;
+    assert!(matches!(end, super::RepairEnd::Unproven));
+    assert_eq!(account.covered_through(&served, RELAY), t0 - 1);
+}
+
+/// A retained route whose goal ended below the retention floor has nothing
+/// a re-check could search, so the survey schedules none, and a repair's
+/// verdict waits for none on its relay that compares: the repair ends with
+/// the window covered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_repair_waits_for_no_recheck_the_survey_never_schedules() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    account
+        .app
+        .record_recovery_relay_caps(
+            RELAY,
+            Some(RecoveryRelayCaps {
+                max_limit: Some(500),
+                negentropy: true,
+            }),
+            t0,
+        )
+        .unwrap();
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![RunnerRoute {
+            goal_until: Some(floor - HOUR / 2),
+            ..required(&route, &[RELAY])
+        }],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    let end = runner
+        .repair(&super::PassBound::within(Duration::from_secs(60)))
+        .await;
+    assert!(matches!(end, super::RepairEnd::Covered));
+}
+
 /// An explicit repair judges a retained route's window only through its
 /// goal's end, where the runner stops serving it, so the repair ends with
 /// it covered though no live tail stands after it.
