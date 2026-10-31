@@ -6999,6 +6999,16 @@ impl AccountManager {
     }
 
     pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
+        self.deactivate_account_marking(account_ref, false).await
+    }
+
+    /// [`Self::deactivate_account`], which also marks the account unlinked,
+    /// in the same write that signs it out, when `unlinked` (D67).
+    async fn deactivate_account_marking(
+        &self,
+        account_ref: &str,
+        unlinked: bool,
+    ) -> Result<(), AppError> {
         // Queued moderation reports never outlive a sign-out: stop and delete
         // them, and admit none until the sign-out below has committed. Fenced
         // before the global lock: the purge may open account storage. A failed
@@ -7022,9 +7032,12 @@ impl AccountManager {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
-            self.app
-                .account_home()
-                .set_account_signed_out(&account.label, true)?;
+            let home = self.app.account_home();
+            if unlinked {
+                home.mark_account_unlinked(&account.label)?;
+            } else {
+                home.set_account_signed_out(&account.label, true)?;
+            }
             self.clear_startup_retry(&account.account_id_hex);
             self.shared
                 .attachment_permissions
@@ -7038,22 +7051,26 @@ impl AccountManager {
     }
 
     /// Deactivate `account_label` once its worker reports that the device
-    /// group unlinked this device. The worker marked the account unlinked and
-    /// stopped; deactivation reaps it and drops what the account holds in
-    /// memory. A worker that ends any other way drops the sender, and this
-    /// task ends with it.
+    /// group unlinked this device. The worker stopped and tried to mark the
+    /// account unlinked; deactivation reaps it, makes the mark again as it
+    /// signs the account out, so a failed mark never leaves a plain sign-out,
+    /// and drops what the account holds in memory. A worker that ends any
+    /// other way drops the sender, and this task ends with it.
     fn deactivate_when_unlinked(&self, account_label: String, unlinked: oneshot::Receiver<()>) {
         let accounts = self.clone();
         tokio::spawn(async move {
             if unlinked.await.is_err() {
                 return;
             }
-            if let Err(error) = accounts.deactivate_account(&account_label).await {
+            if let Err(error) = accounts
+                .deactivate_account_marking(&account_label, true)
+                .await
+            {
                 tracing::warn!(
                     target: "marmot_app::runtime",
                     method = "deactivate_when_unlinked",
                     error_kind = error.privacy_safe_kind(),
-                    "could not deactivate an unlinked account; it stays signed out"
+                    "could not deactivate an unlinked account; its next start stops it again"
                 );
             }
         });
@@ -7901,7 +7918,10 @@ impl AccountManager {
                         AccountHome::account_id_for_public_key(identity)?
                     };
                     match self.app.account_home().account(&account_id) {
-                        Ok(account) => self.require_onboarding_complete(&account.label)?,
+                        Ok(account) => {
+                            refuse_unlinked(&account)?;
+                            self.require_onboarding_complete(&account.label)?;
+                        }
                         Err(AccountHomeError::UnknownAccount(_)) => {}
                         Err(error) => return Err(error.into()),
                     }
@@ -8148,6 +8168,7 @@ impl AccountManager {
                 }
                 let existing_account = self.app.account_home().account(&account_id_hex).ok();
                 if let Some(account) = existing_account.as_ref() {
+                    refuse_unlinked(account)?;
                     self.require_onboarding_complete(&account.label)?;
                 }
                 let created_account = existing_account.is_none();
@@ -9094,6 +9115,18 @@ fn validate_account_setup_request(
         }
     }
 
+    Ok(())
+}
+
+/// Refuse to set up, import or log in to an account whose device group
+/// unlinked this device, before anything is read, written or sent for it:
+/// coming back is a wipe and a new link (D67).
+fn refuse_unlinked(account: &AccountSummary) -> Result<(), AppError> {
+    if account.unlinked {
+        return Err(AppError::AccountHome(AccountHomeError::AccountUnlinked(
+            account.label.clone(),
+        )));
+    }
     Ok(())
 }
 

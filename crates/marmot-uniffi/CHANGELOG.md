@@ -14,8 +14,9 @@
   unlinked (mdk#2628 item 3.6b): the account stops on that device and stays
   signed out. `MarmotEventFfi` adds `DeviceUnlinked { account_id_hex,
   account_label }`, sent once; `AccountSummaryFfi` adds `unlinked`; and
-  `MarmotKitError` adds `AccountUnlinked { account_ref }`, which signing in to
-  such an account returns. Show that this device was unlinked and offer
+  `MarmotKitError` adds `AccountUnlinked { account_ref }`, which signing in,
+  logging in or importing the key of such an account returns. Show that this
+  device was unlinked and offer
   `sign_out_and_wipe`, which skips leaving chats and deleting the slot;
   signing in again is then a new link. Update exhaustive Swift/Kotlin
   handling and regenerate bindings with the matching native library.

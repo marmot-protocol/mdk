@@ -611,6 +611,10 @@ pub struct MarmotApp {
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
     #[cfg(test)]
     audit_v5_peel_slot: Option<(String, Arc<Mutex<client::audit_v5_probe::PeelSlot>>)>,
+    /// Fail every client's durable unlink mark, as a full or read-only disk
+    /// would. The runtime's own mark as it deactivates still lands.
+    #[cfg(test)]
+    test_fail_unlink_mark: Arc<AtomicBool>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
     /// Live KeyPackages of this app's accounts that their clients have not
@@ -1725,6 +1729,8 @@ impl MarmotApp {
             test_relay_client: None,
             #[cfg(test)]
             audit_v5_peel_slot: None,
+            #[cfg(test)]
+            test_fail_unlink_mark: Arc::default(),
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             sign_in_nudges: Arc::new(Default::default()),
@@ -1833,6 +1839,8 @@ impl MarmotApp {
             test_relay_client: None,
             #[cfg(test)]
             audit_v5_peel_slot: None,
+            #[cfg(test)]
+            test_fail_unlink_mark: Arc::default(),
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             sign_in_nudges: Arc::new(Default::default()),
@@ -2108,8 +2116,6 @@ impl MarmotApp {
             test_comparison_results: None,
             #[cfg(test)]
             test_comparison_delay: None,
-            #[cfg(test)]
-            test_fail_unlink_mark: false,
             #[cfg(all(test, feature = "unreleased-device-pairing"))]
             test_fail_roster_read: false,
             #[cfg(test)]

@@ -765,9 +765,6 @@ pub struct AppClient {
     pub(crate) test_comparison_results: Option<sync::ScriptedComparisons>,
     #[cfg(test)]
     pub(crate) test_comparison_delay: Option<std::time::Duration>,
-    /// Fail the durable unlink mark, as a full or read-only disk would.
-    #[cfg(test)]
-    pub(crate) test_fail_unlink_mark: bool,
     /// Fail the device-roster read that tells an unlink from a failed link.
     #[cfg(all(test, feature = "unreleased-device-pairing"))]
     pub(crate) test_fail_roster_read: bool,

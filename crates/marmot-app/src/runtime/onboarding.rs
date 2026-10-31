@@ -1534,6 +1534,7 @@ impl AccountManager {
         let _workers = self.worker_transactions.lock().await;
         let snapshot = match self.app.account_home().account(&id) {
             Ok(account) if account.local_signing => {
+                refuse_unlinked(&account)?;
                 // Reset a completed checkpoint before import clears signed_out.
                 // A crash between the two writes must leave the account gated.
                 let snapshot = self.initialize_onboarding(&account, options)?;
@@ -1585,6 +1586,7 @@ impl AccountManager {
         // signed-out state, and before signer registration makes them runnable.
         let snapshot = match self.app.account_home().account(&id) {
             Ok(account) => {
+                refuse_unlinked(&account)?;
                 let snapshot = self.initialize_onboarding(&account, options)?;
                 self.app
                     .account_home()

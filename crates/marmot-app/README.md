@@ -424,8 +424,9 @@ stands. Show the label the next list returns after `LinkedDevicesChanged`, not t
 
 When another of the account's devices removes this one, the account stops on this device once it reads the removal,
 and nothing more is sent from it. `MarmotAppEvent::DeviceUnlinked` fires once; afterwards `ManagedAccount::unlinked`
-and `signed_out` stay set, `sign_in_account` fails with `AccountHomeError::AccountUnlinked`, and local history is not
-shown. `sign_out_and_wipe` wipes the account without leaving its chats or deleting its slot, which the other devices
+and `signed_out` stay set, and signing in, logging in, importing its key or starting onboarding for it fails with
+`AccountHomeError::AccountUnlinked`. Stop showing its local history; reads still return it, as for any signed-out
+account. `sign_out_and_wipe` wipes the account without leaving its chats or deleting its slot, which the other devices
 did; signing in again is then a new link.
 
 ### Overdue KeyPackage refresh

@@ -1042,16 +1042,20 @@ impl AppClient {
     /// goes out, from this client or any other path, even when the durable
     /// mark fails; the caller
     /// then keeps the device-group copy, and the next open finds the removal
-    /// again and retries the mark before it sends anything. Once the mark
-    /// lands, a crash before the worker stops still leaves the account
-    /// signed out.
+    /// again and retries the mark before it sends anything. Under the runtime,
+    /// the deactivation that follows makes the mark too. Once the mark lands,
+    /// a crash before the worker stops still leaves the account signed out.
     #[cfg(any(test, feature = "unreleased-device-pairing"))]
     pub(crate) fn mark_device_unlinked(&mut self) -> Result<(), AppError> {
         self.device_unlinked = true;
         self.app
             .stop_unlinked_account_publishing(&hex::encode(self.adapter.account_id().as_slice()));
         #[cfg(test)]
-        if self.test_fail_unlink_mark {
+        if self
+            .app
+            .test_fail_unlink_mark
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(AppError::AccountHome(marmot_account::AccountHomeError::Io(
                 std::io::Error::other("injected unlink mark failure"),
             )));

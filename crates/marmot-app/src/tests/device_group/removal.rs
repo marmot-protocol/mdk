@@ -545,7 +545,9 @@ async fn a_failed_unlink_mark_still_stops_and_is_made_again() {
         .remove_linked_device(&own_slot(&laptop))
         .await
         .unwrap();
-    laptop.test_fail_unlink_mark = true;
+    laptop_app
+        .test_fail_unlink_mark
+        .store(true, Ordering::Relaxed);
     let published = published_count(&relay);
     deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
     laptop.sync().await.unwrap();
@@ -566,6 +568,9 @@ async fn a_failed_unlink_mark_still_stops_and_is_made_again() {
     assert_eq!(published_count(&relay), published, "nothing goes out");
 
     drop(laptop);
+    laptop_app
+        .test_fail_unlink_mark
+        .store(false, Ordering::Relaxed);
     let mut laptop = laptop_app.client("alice").await.unwrap();
     laptop
         .drive_device_pairing_at(crate::unix_now_seconds())
@@ -924,6 +929,18 @@ async fn a_removal_applied_before_a_restart_unlinks_before_catch_up() {
 /// and nothing more goes out from it (D67).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removal_arriving_live_stops_the_running_account() {
+    removal_arriving_live(false).await;
+}
+
+/// As above, but the worker's client can't write the unlink mark. The
+/// runtime makes it as it deactivates the account, so the account is not
+/// left merely signed out, which signing in would undo (D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_unlink_mark_is_made_as_the_runtime_deactivates() {
+    removal_arriving_live(true).await;
+}
+
+async fn removal_arriving_live(fail_unlink_mark: bool) {
     let (devices, group) = tagging_devices().await;
     let Devices {
         _dirs,
@@ -943,6 +960,9 @@ async fn a_removal_arriving_live_stops_the_running_account() {
         .account("alice")
         .unwrap()
         .account_id_hex;
+    laptop_app
+        .test_fail_unlink_mark
+        .store(fail_unlink_mark, Ordering::Relaxed);
 
     let _eose = scripted_eose_pump(
         laptop_app.relay_plane.clone(),
@@ -1003,10 +1023,16 @@ async fn a_removal_arriving_live_stops_the_running_account() {
     .expect("the runtime deactivates the account");
     let account = managed();
     assert!(account.unlinked && account.signed_out);
-    assert!(
-        trust(&laptop_app, &group).is_none(),
-        "its copy is forgotten"
-    );
+    assert!(matches!(
+        runtime.accounts().sign_in_account("alice").await,
+        Err(AppError::AccountHome(AccountHomeError::AccountUnlinked(_)))
+    ));
+    if !fail_unlink_mark {
+        assert!(
+            trust(&laptop_app, &group).is_none(),
+            "its copy is forgotten"
+        );
+    }
     assert_eq!(
         relay.attempted_events().len(),
         attempted,
