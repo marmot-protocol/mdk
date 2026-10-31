@@ -1011,10 +1011,18 @@ impl AppClient {
         self.publish_notification_trigger_tokens(tokens).await
     }
 
-    async fn publish_notification_trigger_tokens(
+    pub(crate) async fn publish_notification_trigger_tokens(
         &self,
         tokens: Vec<notifications::GroupPushTokenRecord>,
     ) -> Result<(), AppError> {
+        // An unlinked account wakes no one (mdk#2628 D67). Triggers go out
+        // through the adapter's anonymous publisher, which the account's
+        // publish stop does not cover.
+        if self.device_unlinked {
+            return Err(AppError::AccountHome(
+                marmot_account::AccountHomeError::AccountUnlinked(self.state.label.clone()),
+            ));
+        }
         let account = self.app.account_home().account(&self.state.label)?;
         let by_server = notifications::token_records_by_server(tokens, &account.account_id_hex);
         if by_server.is_empty() {

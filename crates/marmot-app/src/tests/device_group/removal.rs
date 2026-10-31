@@ -641,6 +641,31 @@ async fn a_client_kept_after_its_unlink_publishes_nothing() {
         published,
         "nothing reaches a relay"
     );
+
+    // Push triggers go out through the anonymous publisher, not the
+    // account's, so they are refused before it.
+    let token = crate::notifications::GroupPushTokenRecord {
+        group_id_hex: hex::encode(chat.as_slice()),
+        member_id_hex: "cc".repeat(32),
+        leaf_index: 0,
+        platform: crate::notifications::PushPlatform::Apns,
+        token_fingerprint: "fingerprint".to_owned(),
+        server_pubkey_hex: "bb".repeat(32),
+        relay_hint: Some("wss://push.example".to_owned()),
+        encrypted_token: vec![1, 2, 3],
+        owner_ts: 1,
+        owner_sig: String::new(),
+        updated_at_ms: 1,
+    };
+    assert!(matches!(
+        laptop
+            .publish_notification_trigger_tokens(vec![token])
+            .await,
+        Err(AppError::AccountHome(
+            marmot_account::AccountHomeError::AccountUnlinked(_)
+        ))
+    ));
+    assert_eq!(published_count(&relay), published);
 }
 
 /// The laptop's engine applies its removal but the app never notes it, as
