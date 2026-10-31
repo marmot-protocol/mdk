@@ -188,9 +188,9 @@ mod tests {
 
     #[test]
     fn take_welcome_retries_concurrent_writer_contention() {
-        use crate::protocol::storage::write_contention::SharedDatabase;
+        use crate::protocol::storage::write_contention::{Release, SharedDatabase};
 
-        let db = SharedDatabase::new(50);
+        let db = SharedDatabase::new();
         let store = db.open();
         let welcome = PendingWelcome {
             message_id: mid(1),
@@ -200,13 +200,13 @@ mod tests {
         };
         store.put_welcome(&welcome).unwrap();
 
-        let blocker = db.hold_write_lock(|_| {});
+        let blocker = db.hold_write_lock(Release::AfterAFailedAttempt, |_| {});
         assert_eq!(
             store
                 .take_welcome(&mid(1))
                 .expect("welcome take retries after transient contention"),
             welcome
         );
-        blocker.join().unwrap();
+        blocker.join();
     }
 }

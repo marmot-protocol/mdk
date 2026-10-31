@@ -581,17 +581,14 @@ mod tests {
     // Regression for issue #484: the queued-outbound path is a real user
     // message-send write (`Engine::do_send` queues here when convergence is
     // unsettled). A concurrent writer on a SECOND connection to the same
-    // database file briefly holds the SQLite write lock; with a busy timeout
-    // shorter than the hold, the first attempt sees SQLITE_BUSY. The queued
-    // put/delete must retry-with-backoff and succeed instead of bubbling
-    // "database is locked" to the send caller.
+    // database file holds the SQLite write lock until the first attempt has
+    // failed with SQLITE_BUSY. The queued put/delete must retry-with-backoff
+    // and succeed instead of bubbling "database is locked" to the send caller.
     #[test]
     fn queued_send_contention_is_retried_not_surfaced() {
-        use crate::protocol::storage::write_contention::SharedDatabase;
+        use crate::protocol::storage::write_contention::{Release, SharedDatabase};
 
-        // Short busy timeout so the first attempt fails fast and the win comes
-        // from the retry loop rather than from SQLite's own busy_timeout wait.
-        let db = SharedDatabase::new(50);
+        let db = SharedDatabase::new();
         let writer = db.open();
         writer.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         // Pre-seed an intent to delete under contention later.
@@ -599,17 +596,17 @@ mod tests {
             .put_queued_outbound_intent(&sample_queued_intent(mid(9), gid(1)))
             .unwrap();
 
-        let blocker = db.hold_write_lock(|_| {});
+        let blocker = db.hold_write_lock(Release::AfterAFailedAttempt, |_| {});
         writer
             .put_queued_outbound_intent(&sample_queued_intent(mid(1), gid(1)))
             .expect("contended queued put must succeed via busy retry, not surface as failure");
-        blocker.join().unwrap();
+        blocker.join();
 
-        let blocker = db.hold_write_lock(|_| {});
+        let blocker = db.hold_write_lock(Release::AfterAFailedAttempt, |_| {});
         writer
             .delete_queued_outbound_intent(&mid(9))
             .expect("contended queued delete must succeed via busy retry, not surface as failure");
-        blocker.join().unwrap();
+        blocker.join();
 
         let ids: Vec<_> = writer
             .list_queued_outbound_intents(&gid(1))

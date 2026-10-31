@@ -649,7 +649,7 @@ fn delete_group_labels_on_connection(
 mod tests {
     use super::*;
     use crate::SqliteAccountStorage;
-    use crate::protocol::storage::write_contention::SharedDatabase;
+    use crate::protocol::storage::write_contention::{Release, SharedDatabase};
     use openmls_traits::storage::Entity;
     use serde::{Deserialize, Serialize};
 
@@ -972,7 +972,7 @@ mod tests {
     /// lock survives, rather than being overwritten by a list read before it.
     #[test]
     fn list_mutations_keep_an_append_committed_while_they_wait() {
-        let db = SharedDatabase::new(5_000);
+        let db = SharedDatabase::new();
         let store = db.open();
         let label = OpenMlsValueLabel::test_public(b"List");
         let key = b"list".to_vec();
@@ -990,18 +990,18 @@ mod tests {
             }
         };
 
-        let blocker = db.hold_write_lock(append_elsewhere(2));
+        let blocker = db.hold_write_lock(Release::WhenTheStoreWaits, append_elsewhere(2));
         store
             .openmls
             .append_entity(label, key.clone(), None, &TestEntity(3))
             .unwrap();
-        blocker.join().unwrap();
-        let blocker = db.hold_write_lock(append_elsewhere(4));
+        blocker.join();
+        let blocker = db.hold_write_lock(Release::WhenTheStoreWaits, append_elsewhere(4));
         store
             .openmls
             .remove_entity(label, key.clone(), None, &TestEntity(1))
             .unwrap();
-        blocker.join().unwrap();
+        blocker.join();
 
         assert_eq!(
             store.openmls.read_list::<TestEntity>(label, key).unwrap(),

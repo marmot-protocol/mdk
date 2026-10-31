@@ -585,9 +585,16 @@ mod tests {
             validated_tree_marker: None,
             openmls_values: Vec::new(),
         };
-        // Ends with six one-byte fields: the message and queued option tags,
-        // the retired list, the policy and marker option tags, the values list.
+        // The group, then six one-byte fields: the message and queued option
+        // tags, the retired list, the policy and marker option tags, the
+        // values list. The offsets below count back from the end.
         let good = encode(&snapshot).unwrap().as_slice().to_vec();
+        let mut layout = [SNAPSHOT_MAGIC.as_slice(), &SNAPSHOT_VERSION.to_be_bytes()].concat();
+        let group = serialize(&snapshot.group).unwrap();
+        cgka_traits::app_components::encode_quic_varint(group.len() as u64, &mut layout);
+        layout.extend_from_slice(&group);
+        layout.extend_from_slice(&[0; 6]);
+        assert_eq!(good, layout, "tail layout moved");
         let at = |offset: usize, tag: u8| {
             let mut bytes = good.clone();
             let index = bytes.len() - offset;

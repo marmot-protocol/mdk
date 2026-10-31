@@ -1526,17 +1526,23 @@ mod tests {
         );
     }
 
+    /// Release and consume each commit their effects: the second connection
+    /// reads the journal the first wrote, and the first reads the recovery
+    /// intent and cleared receipts the second's consume left behind.
     #[test]
-    fn released_transport_receipts_are_journaled_and_retire_both_receipt_stores() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        store
+    fn released_transport_receipts_are_committed_and_retire_both_receipt_stores() {
+        use crate::protocol::storage::write_contention::SharedDatabase;
+
+        let db = SharedDatabase::new();
+        let (releaser, consumer) = (db.open(), db.open());
+        releaser
             .app_storage()
             .ensure_account_projection("app-owner")
             .unwrap();
-        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        releaser.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let mut record = sample_message(MessageId::new(vec![42; 32]), gid(1), 3);
         record.state = MessageState::PeelDeferred;
-        store.put_message(&record).unwrap();
+        releaser.put_message(&record).unwrap();
         let seed_receipts = |store: &SqliteAccountStorage| {
             let conn = store.lock().unwrap();
             conn.execute(
@@ -1558,35 +1564,35 @@ mod tests {
                     .unwrap()
             })
         };
-        seed_receipts(&store);
-        store.release_message_for_replay(&record).unwrap();
+        seed_receipts(&releaser);
+        releaser.release_message_for_replay(&record).unwrap();
         assert!(matches!(
-            store.get_message(&record.id),
+            consumer.get_message(&record.id),
             Err(StorageError::NotFound)
         ));
-        assert_eq!(receipt_rows(&store), [0, 0]);
+        assert_eq!(receipt_rows(&consumer), [0, 0]);
         // Model an old app checkpoint before it has consumed the release.
-        seed_receipts(&store);
+        seed_receipts(&releaser);
         assert_eq!(
-            store.consume_released_transport_receipts().unwrap(),
+            consumer.consume_released_transport_receipts().unwrap(),
             vec![record.id.clone()]
         );
-        assert!(
-            store
-                .consume_released_transport_receipts()
-                .unwrap()
-                .is_empty()
-        );
         assert_eq!(
-            store
+            releaser
                 .app_storage()
                 .pending_epoch_backfill_intents()
                 .unwrap()
                 .len(),
             1,
-            "acknowledging the journal must leave the recovery intent"
+            "death after journal acknowledgement must not lose recovery intent"
         );
-        assert_eq!(receipt_rows(&store), [0, 0]);
+        assert_eq!(receipt_rows(&releaser), [0, 0]);
+        assert!(
+            releaser
+                .consume_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2408,9 +2414,9 @@ mod tests {
     /// another connection deleted the row would write it back.
     #[test]
     fn update_message_state_does_not_resurrect_a_row_deleted_while_it_waits() {
-        use crate::protocol::storage::write_contention::SharedDatabase;
+        use crate::protocol::storage::write_contention::{Release, SharedDatabase};
 
-        let db = SharedDatabase::new(5_000);
+        let db = SharedDatabase::new();
         let store = db.open();
         let message = sample_message(mid(1), gid(1), 0);
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
@@ -2429,9 +2435,11 @@ mod tests {
             .unwrap();
 
         let id = message.id.clone();
-        let blocker = db.hold_write_lock(move |other| other.delete_message(&id).unwrap());
+        let blocker = db.hold_write_lock(Release::WhenTheStoreWaits, move |other| {
+            other.delete_message(&id).unwrap()
+        });
         let result = store.update_message_state(&message.id, MessageState::Processed);
-        blocker.join().unwrap();
+        blocker.join();
 
         assert!(matches!(result, Err(StorageError::NotFound)), "{result:?}");
         assert!(matches!(

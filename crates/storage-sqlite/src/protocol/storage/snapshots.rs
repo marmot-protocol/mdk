@@ -946,26 +946,26 @@ mod tests {
 
     #[test]
     fn snapshot_create_and_rollback_retry_writer_contention() {
-        use crate::protocol::storage::write_contention::SharedDatabase;
+        use crate::protocol::storage::write_contention::{Release, SharedDatabase};
 
-        let db = SharedDatabase::new(50);
+        let db = SharedDatabase::new();
         let store = db.open();
         let original = sample_group(gid(1), 0, 1);
         store.put_group(&original).unwrap();
 
-        let blocker = db.hold_write_lock(|_| {});
+        let blocker = db.hold_write_lock(Release::AfterAFailedAttempt, |_| {});
         store
             .create_group_snapshot(&original.id, "contended")
             .expect("snapshot capture retries after transient contention");
-        blocker.join().unwrap();
+        blocker.join();
 
         let changed = sample_group(gid(1), 1, 1);
         store.put_group(&changed).unwrap();
-        let blocker = db.hold_write_lock(|_| {});
+        let blocker = db.hold_write_lock(Release::AfterAFailedAttempt, |_| {});
         store
             .rollback_group_to_snapshot(&original.id, "contended")
             .expect("snapshot rollback retries after transient contention");
-        blocker.join().unwrap();
+        blocker.join();
         assert_eq!(store.get_group(&original.id).unwrap(), original);
     }
 
