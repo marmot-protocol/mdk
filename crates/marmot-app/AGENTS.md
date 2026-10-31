@@ -417,6 +417,19 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
   with the adapter's fence ticket and held routes; `fence_live_frames` answers with that ticket. Nothing calls
   them or `enable_live_fences` before the switch-over. Logs carry aggregates only.
+  An Unrecoverable group's routes are suspended (`RunnerRoute.unrecoverable`, read from the engine's group record
+  each debt turn): never scheduled, charged, broken or noticed, and with the gate on the comparison owner drops their
+  epoch-gap obligations from its grant fence (`suspended_epoch_gaps`); gate off, it fetches them as before. A
+  retained route's ceiling (`retained_route_goal_until`) caps every debt and re-check read through
+  `DebtTurn::owed_until`/`checked_until`; never store it. Route-gone retirement runs only in the runner's debt turn
+  (`settle_recovery_route_changes`), from drops `replace_group_routes` records once a runner tracks them; a full
+  `replace` records only inbox drops, and a group left with no route is forgotten, not retired. A relay the routes
+  carry again reopens only its `RouteGone` spans; do not re-arm units on a route add. Reconnects come from the relay
+  pool's connection generations (`NostrSdkRelayClient::relay_connections`), diffed at each step, and an unknown caps
+  read (`None`) is never evidence. Window hints come from the live conversation captures
+  (`open_conversation_groups`). The breaker's pauses and late findings are process counters
+  (`recovery_runner_counts`) carried only by the v5 `recovery_runner_paused` row, written through the turn's audit
+  sink (`WorkerTurn::audit`).
 - The configured audit OTLP/HTTP sender is `marmot-observability`'s `src/audit_otlp_sender.rs`, which hosts name as
   `marmot_app::audit_otlp_sender`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
