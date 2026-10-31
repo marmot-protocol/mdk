@@ -4,6 +4,17 @@
 
 ### Breaking changes
 
+- The device roster no longer holds rejected KeyPackages, and kind 462 is no
+  longer reserved for an anomaly alert (mdk#2628 D74). The roster's encoding
+  changed under the same component id, so existing development device groups
+  must be recreated: a roster an earlier build wrote no longer decodes.
+  Nothing has shipped it. `CompromiseWarningReason::RejectedKeyPackage` is
+  now `ForeignOwnSlotKeyPackage` (3.7b): a valid KeyPackage of the account
+  that this device found in its own slot and did not make, because its
+  LeafNode's signature key is not this device's. Only that device warns of
+  it, before it replaces the publication; a copy of a KeyPackage it made, an
+  invalid publication or one from before a restored backup never warns.
+
 - `SelfMembership` adds `DeviceRemoved` and `ConversationParticipation` adds
   `DeviceRemoved` (mdk#2628 item 3.6b): this device's leaf was removed from a
   chat the account stays in through another of its devices. It is not a
@@ -129,8 +140,9 @@
   are empty and silent in release builds until the roster's spec lands.
 - `MarmotAppRuntime::compromise_warning` lists the account's open compromise
   warning on this device as `CompromiseWarningItem`s (mdk#2628 item 3.7a):
-  each rejected sign-in or rejected KeyPackage, from this device or its device
-  group's roster, that the user has not seen here. A device's first roster
+  each rejected sign-in, from this device or its device group's roster, and
+  each KeyPackage this device found in its own slot that it did not make,
+  that the user has not seen here. A device's first roster
   counts as seen. `dismiss_compromise_warning` marks everything it gathers as
   seen, on this device only, and `CompromiseWarningChanged` says to re-read.
   `start_fresh` answers every sign-in from before this device Not now, now and
@@ -461,8 +473,8 @@
 ### Fixed
 
 - Kinds sent only in a device group (heartbeat 457, private KeyPackage
-  request 459 and hand-off 460, anomaly alert 462, small-state update 475
-  and broadcast request 476) are ignored in any other group (mdk#2628). One
+  request 459 and hand-off 460, small-state update 475 and broadcast
+  request 476) are ignored in any other group (mdk#2628). One
   received in a chat makes no timeline row, host message or notification,
   and `send_custom_event` refuses each as reserved
   (`is_reserved_app_event_kind`). The device group itself still reads them.

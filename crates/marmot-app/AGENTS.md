@@ -126,14 +126,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   a device, so a link that branch selection drops before the next pass asks again rather than restoring `not_me`, and
   re-arms the rest. A rejection settled from another device's commit is lost when that commit loses convergence, and
   only a device that made the rejection restores it. A slot is its `d` as published, compared as bytes; one the roster
-  cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), and a rejected
-  KeyPackage never makes another slot rejected: the account key can copy any KeyPackage, a real device's included, into
-  a slot the user rejects. Rejected KeyPackages are Scene 8's (3.7). A roster device's KeyPackage matches its slot when
-  the trusted roster announces it now or the engine recorded it from a roster state applied in the last 30 days
-  (`announced_key_packages`, D31 item 7); only this classification reads that record. Hosts read the list as
-  `unrecognized_sign_ins`. A check or answer that changes it, and every roster change (`note_device_roster_changed`),
-  sets `unrecognized_sign_ins_changed`, drained at the device-group seams into one payload-free
-  `UnrecognizedSignInsChanged`; every client opens with it set.
+  cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), never its KeyPackage:
+  the account key can copy any KeyPackage, a real device's included, into a slot the user rejects. A roster device's
+  KeyPackage matches its slot when the trusted roster announces it now or the engine recorded it from a roster state
+  applied in the last 30 days (`announced_key_packages`, D31 item 7); only this classification reads that record. Hosts
+  read the list as `unrecognized_sign_ins`. A check or answer that changes it, and every roster change
+  (`note_device_roster_changed`), sets `unrecognized_sign_ins_changed`, drained at the device-group seams into one
+  payload-free `UnrecognizedSignInsChanged`; every client opens with it set.
   Start fresh (D54, `start_fresh`) answers every before-this-device sign-in Not now, including baseline slots listed
   later (storage writes them as `not_now` while `started_fresh_at` is set); it never rejects and never warns.
 - The own-slot check (mdk#2628 3.4, `src/client/sign_ins.rs`) rides 3.2's read: `read_account_key_package_slots` also
@@ -145,11 +144,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   returned nothing in the slot (`OwnSlotRead::empty`), named as the lifecycle's publication targets name it, to
   `refill_emptied_slot`, which publishes a new KeyPackage when one accepted the current publication, while this
   device's trusted roster, if it has one, lists it as a device (`listed_as_device`). A failed or unfinished read never
-  shows a relay empty. An incomplete own-slot read is retried within the hour.
-- The compromise warning (`src/client/compromise_warning.rs`, mdk#2628 3.7a, D53) is storage's
-  (`account_compromise_warning_items`): every `not_me` slot and rejected KeyPackage in the trusted roster, plus this
-  device's own rejected sign-ins, gathered with insert-or-ignore so a seen mark survives branch selection dropping and
-  restoring an item. Never gather `removed` slots. Gathering is lazy: a roster change (`note_device_roster_changed`)
+  shows a relay empty. An incomplete own-slot read is retried within the hour. Before handing foreign ones over, it
+  records in the compromise warning each valid current-profile KeyPackage of the account among them whose LeafNode
+  signature key is not this device's (`ForeignOwnSlotKeyPackage`, 3.7b): this device made a KeyPackage exactly when it
+  carries its signature key, which never rotates, so a backup restore, a pre-group KeyPackage or a republished copy
+  never warns. Only the device that found it warns.
+- The compromise warning (`src/client/compromise_warning.rs`, mdk#2628 3.7a and 3.7b, D53) is storage's
+  (`account_compromise_warning_items`): every `not_me` slot in the trusted roster, plus this device's own rejected
+  sign-ins, gathered with insert-or-ignore so a seen mark survives branch selection dropping and restoring an item,
+  and the KeyPackages its own-slot check found (a seen one goes a KeyPackage's lifetime after it was found, when it can
+  no longer be valid). Never gather `removed` slots. Gathering is lazy: a roster change (`note_device_roster_changed`)
   or a Reject answer sets `compromise_warning_gather_due`, and the next host read or publication seam gathers once.
   The first roster this device trusts from a device group goes in seen (D68: the user saw those on the devices that
   were there); its own rejections still warn. Storage takes that roster in the same transaction that makes the group
@@ -164,7 +168,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in `observe_device_group_event`
   (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
   D33). That read sees only the current tree, so a message from an earlier epoch has no readable sender. List every kind
-  sent only in a device group in `is_device_group_kind` (457, 459, 460, 462, 475, 476), the one list: `observe_event`
+  sent only in a device group in `is_device_group_kind` (457, 459, 460, 475, 476), the one list: `observe_event`
   drops one received in any other group before the host summary and the stored projection, the notification preview
   refuses it, and the custom path rejects it as reserved. The engine withdraws a message by message id alone (an own
   send's transport id, a received message's content id), so a kind whose withdrawal a feature acts on is listed in

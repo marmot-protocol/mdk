@@ -3,12 +3,13 @@
 //!
 //! - `account_compromise_warning_items`: one row per thing the warning
 //!   gathers, keyed by its reason and subject: a rejected sign-in by its
-//!   slot, a rejected KeyPackage by its `KeyPackageRef`. `reason` is text
+//!   slot, a KeyPackage found in this device's slot (3.7b) by its
+//!   `KeyPackageRef`. `reason` is text
 //!   with no CHECK, so a later reason needs no migration. `occurred_at` is
 //!   when the rejection was made, as its maker wrote it; `recorded_at` is
 //!   when this device first gathered it, by its own clock. `seen_at` is NULL
 //!   until the user dismisses the warning holding it. A seen row stays (a
-//!   rejected KeyPackage until it could no longer be valid), so a rejection
+//!   found KeyPackage until it could no longer be valid), so a rejection
 //!   that branch selection drops and restores does not warn again.
 //! - `account_compromise_warning_baseline`: at most one row, naming the
 //!   device group this device first trusted. It is written in the same

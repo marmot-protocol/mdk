@@ -4,6 +4,14 @@
 
 ### Breaking changes
 
+- `CompromiseWarningReason::RejectedKeyPackage` is now
+  `ForeignOwnSlotKeyPackage`, stored as `foreign_own_slot_key_package`
+  (mdk#2628 D74, 3.7b), and `record_foreign_own_slot_key_packages` records
+  the KeyPackages this device found in its own slot that it did not make. A
+  seen one goes 7,261,200 seconds after it was found, an unseen one stays
+  until dismissed or the 4,096-row cap drops it. No migration: the reason
+  is text, and no build wrote the old one.
+
 - Migration 0143 advances account storage to schema 143 (mdk#2628 item 3.6).
   It adds `device_activity`, one row per sibling the trusted device group's
   roster lists (that entry's `linked_at`, when this device first found it

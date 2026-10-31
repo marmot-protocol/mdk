@@ -11,9 +11,9 @@ c_enum! {
         /// A sign-in the user answered This wasn't me, on this device or
         /// another.
         RejectedSignIn,
-        /// A KeyPackage one of the account's devices found where they had
-        /// not published, and rejected.
-        RejectedKeyPackage,
+        /// A KeyPackage this device found in its own slot that it did not
+        /// make. This device has replaced it.
+        ForeignOwnSlotKeyPackage,
     }
 }
 
@@ -21,10 +21,12 @@ c_mirror! {
     /// One thing the open compromise warning gathers. `reason` is a
     /// `MarmotCompromiseWarningReason` discriminant carried as `uint32_t`, so
     /// a host can show a value it does not know as a generic reason.
-    /// `slot_id_hex` is the KeyPackage slot the rejection names.
-    /// `key_package_ref_hex` is set only for `RejectedKeyPackage`.
-    /// `occurred_at` is when the rejection was made, in Unix seconds, as the
-    /// device that made it wrote it.
+    /// `slot_id_hex` is the KeyPackage slot the item names: the rejected
+    /// sign-in's, or this device's own for a KeyPackage found there.
+    /// `key_package_ref_hex` is set only for `ForeignOwnSlotKeyPackage`.
+    /// `occurred_at` is in Unix seconds: when the rejection was made, as the
+    /// device that made it wrote it, or when this device found the
+    /// KeyPackage.
     MarmotCompromiseWarningItem from CompromiseWarningItemFfi,
     list(MarmotCompromiseWarningItemList, marmot_compromise_warning_item_list_free) {
         enum_val reason: MarmotCompromiseWarningReason,
@@ -51,7 +53,7 @@ mod tests {
                 occurred_at: 7,
             },
             CompromiseWarningItemFfi {
-                reason: CompromiseWarningReasonFfi::RejectedKeyPackage,
+                reason: CompromiseWarningReasonFfi::ForeignOwnSlotKeyPackage,
                 slot_id_hex: "cd".repeat(32),
                 key_package_ref_hex: Some("ef".repeat(32)),
                 occurred_at: 9,
@@ -75,7 +77,7 @@ mod tests {
             let second = &*(*list).items.add(1);
             assert_eq!(
                 second.reason,
-                MarmotCompromiseWarningReason::RejectedKeyPackage as u32
+                MarmotCompromiseWarningReason::ForeignOwnSlotKeyPackage as u32
             );
             assert_eq!(
                 std::ffi::CStr::from_ptr(second.key_package_ref_hex)

@@ -1,6 +1,6 @@
 //! What the account's compromise warning gathers on this device, and what the
-//! user has seen (mdk#2628 item 3.7a, D53). See migration 0148 for the
-//! columns.
+//! user has seen (mdk#2628 items 3.7a and 3.7b, D53). See migration 0148 for
+//! the columns.
 //!
 //! The app decides what counts; this module keeps one row per item. A row is
 //! added once and stays once seen, so a rejection that branch selection drops
@@ -15,16 +15,18 @@ use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::params;
 
-/// How long this device keeps a seen rejected KeyPackage, counted from both
-/// when the user saw it and the latest rejection of it this device gathered:
-/// the longest a KeyPackage can be valid. An unseen one stays until
-/// dismissed.
+/// How long this device keeps a seen KeyPackage it found in its own slot,
+/// counted from when it found it: the longest a KeyPackage can be valid, so
+/// a relay that serves it again by then serves one that no longer passes. An
+/// unseen one stays until dismissed, unless the cap drops it.
 pub const COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS: u64 = 7_261_200;
 
-/// The most items this device keeps. Only a misbehaving sibling gets near
-/// it: rejected sign-ins each take a user's answer, and the roster holds at
-/// most eight rejected KeyPackages for each slot for 30 days. Past it, the
-/// oldest seen items go first.
+/// The most items this device keeps. Rejected sign-ins each take a user's
+/// answer; only someone publishing KeyPackages into this device's slot many
+/// times over gets near it. Past it, the oldest items go, seen ones first,
+/// so the warning stays open while any item is unseen. A seen KeyPackage the
+/// cap dropped warns again if the slot serves it again, which tells the user
+/// no more than a new KeyPackage there would.
 pub const COMPROMISE_WARNING_ITEM_CAP: usize = 4096;
 
 /// Why an item is in the warning.
@@ -32,22 +34,23 @@ pub const COMPROMISE_WARNING_ITEM_CAP: usize = 4096;
 pub enum CompromiseWarningReason {
     /// A slot rejected as `not_me`. The subject is the slot.
     RejectedSignIn,
-    /// A rejected KeyPackage. The subject is its `KeyPackageRef`.
-    RejectedKeyPackage,
+    /// A KeyPackage this device found in its own slot that it did not make.
+    /// The subject is its `KeyPackageRef`.
+    ForeignOwnSlotKeyPackage,
 }
 
 impl CompromiseWarningReason {
     const fn as_str(self) -> &'static str {
         match self {
             Self::RejectedSignIn => "rejected_sign_in",
-            Self::RejectedKeyPackage => "rejected_key_package",
+            Self::ForeignOwnSlotKeyPackage => "foreign_own_slot_key_package",
         }
     }
 
     fn parse(value: &str) -> Option<Self> {
         match value {
             "rejected_sign_in" => Some(Self::RejectedSignIn),
-            "rejected_key_package" => Some(Self::RejectedKeyPackage),
+            "foreign_own_slot_key_package" => Some(Self::ForeignOwnSlotKeyPackage),
             _ => None,
         }
     }
@@ -60,7 +63,8 @@ pub struct ObservedWarningItem {
     /// Lowercase hex of the slot or `KeyPackageRef` the reason names.
     pub subject: String,
     pub slot_id_hex: String,
-    /// When the rejection was made, as its maker wrote it.
+    /// When the rejection was made, as its maker wrote it, or when this
+    /// device found the KeyPackage.
     pub occurred_at: u64,
 }
 
@@ -131,6 +135,34 @@ impl SqliteAppStorage {
             None => None,
         };
         let changed = record_gather(&tx, gather.own, gather.roster, baseline, now)?;
+        tx.commit().storage()?;
+        Ok(changed)
+    }
+
+    /// Record the KeyPackages, by lowercase hex `KeyPackageRef`, that this
+    /// device found at `now` in its own slot `slot_id_hex` and did not make,
+    /// then apply the bounds. One found again is no change, seen or not.
+    /// Returns whether the unseen items changed.
+    pub fn record_foreign_own_slot_key_packages(
+        &self,
+        slot_id_hex: &str,
+        key_package_refs_hex: &[String],
+        now: u64,
+    ) -> StorageResult<bool> {
+        let now_i64 = u64_to_i64(now)?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let mut changed = false;
+        for key_package_ref_hex in key_package_refs_hex {
+            let item = ObservedWarningItem {
+                reason: CompromiseWarningReason::ForeignOwnSlotKeyPackage,
+                subject: key_package_ref_hex.clone(),
+                slot_id_hex: slot_id_hex.to_owned(),
+                occurred_at: now,
+            };
+            changed |= insert_item(&tx, &item, now_i64, None)?;
+        }
+        changed |= prune(&tx, now_i64)?;
         tx.commit().storage()?;
         Ok(changed)
     }
@@ -243,8 +275,7 @@ fn record_gather(
 }
 
 /// Add `item` unless a row for its reason and subject exists, seen or not.
-/// A seen rejected KeyPackage gathered again keeps the later rejection time,
-/// so its retention runs from that. Returns whether it added an unseen row.
+/// Returns whether it added an unseen row.
 fn insert_item(
     tx: &rusqlite::Transaction<'_>,
     item: &ObservedWarningItem,
@@ -254,14 +285,6 @@ fn insert_item(
     // A sibling writes any `u64`; one past the column's range is the latest
     // time there is, never a reason to fail the gather.
     let occurred_at = i64::try_from(item.occurred_at).unwrap_or(i64::MAX);
-    // A KeyPackage rejected longer ago than any KeyPackage can be valid is
-    // past harm, and its seen mark may already be gone: a roster that still
-    // holds it must not warn again.
-    if item.reason == CompromiseWarningReason::RejectedKeyPackage
-        && occurred_at <= now - u64_to_i64(COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS)?
-    {
-        return Ok(false);
-    }
     let inserted = tx
         .execute_cached(
             "INSERT OR IGNORE INTO account_compromise_warning_items
@@ -277,14 +300,6 @@ fn insert_item(
             ],
         )
         .storage()?;
-    if inserted == 0 && item.reason == CompromiseWarningReason::RejectedKeyPackage {
-        tx.execute_cached(
-            "UPDATE account_compromise_warning_items SET occurred_at = ?3
-             WHERE reason = ?1 AND subject = ?2 AND seen_at IS NOT NULL AND occurred_at < ?3",
-            params![item.reason.as_str(), item.subject, occurred_at],
-        )
-        .storage()?;
-    }
     Ok(inserted != 0 && seen_at.is_none())
 }
 
@@ -335,16 +350,16 @@ fn drop_ended_sign_in_rejections(
     Ok(changed)
 }
 
-/// Drop seen rejected KeyPackages once both their seen mark and their latest
-/// rejection are past the retention. `insert_item` refuses a rejection that
-/// old, so one that goes is not added again. Then drop the oldest items past
-/// the cap, seen ones first. Returns whether an unseen item went.
+/// Drop seen KeyPackages found in this device's slot once they were found
+/// longer ago than the retention: by then the KeyPackage has expired, so a
+/// relay that serves it again does not bring it back. Then drop the oldest
+/// items past the cap, seen ones first. Returns whether an unseen item went.
 fn prune(tx: &rusqlite::Transaction<'_>, now: i64) -> StorageResult<bool> {
     tx.execute_cached(
         "DELETE FROM account_compromise_warning_items
-         WHERE reason = ?1 AND seen_at <= ?2 - ?3 AND occurred_at <= ?2 - ?3",
+         WHERE reason = ?1 AND seen_at IS NOT NULL AND occurred_at <= ?2 - ?3",
         params![
-            CompromiseWarningReason::RejectedKeyPackage.as_str(),
+            CompromiseWarningReason::ForeignOwnSlotKeyPackage.as_str(),
             now,
             u64_to_i64(COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS)?
         ],
@@ -496,14 +511,15 @@ mod tests {
         ));
         assert!(open(&store).is_empty());
         // Something new opens the warning again, with only the new item.
-        assert!(gather(
-            &store,
-            &[item(RejectedKeyPackage, "k1", 45)],
-            &[],
-            None,
-            60
-        ));
-        assert_eq!(open(&store), [(RejectedKeyPackage, "k1".to_owned())]);
+        assert!(found(&store, "k1", 60));
+        assert_eq!(open(&store), [(ForeignOwnSlotKeyPackage, "k1".to_owned())]);
+    }
+
+    /// Record `key_package_ref` as found in this device's slot at `now`.
+    fn found(store: &SqliteAppStorage, key_package_ref: &str, now: u64) -> bool {
+        store
+            .record_foreign_own_slot_key_packages("own slot", &[key_package_ref.to_owned()], now)
+            .unwrap()
     }
 
     /// Trust `group` with `own` and `roster` as its first trusted roster.
@@ -553,22 +569,22 @@ mod tests {
         let roster = [item(RejectedSignIn, "aa", 6), item(RejectedSignIn, "bb", 7)];
         assert_eq!(trust(&store, "g1", &own, &roster, 10), Some(true));
         assert_eq!(open(&store), [(RejectedSignIn, "aa".to_owned())]);
-        let later = [roster[1].clone(), item(RejectedKeyPackage, "k1", 8)];
+        let later = [roster[1].clone(), item(RejectedSignIn, "ee", 8)];
         assert!(gather(&store, &own, &later, Some("g1"), 20));
         assert_eq!(
             open(&store),
             [
                 (RejectedSignIn, "aa".to_owned()),
-                (RejectedKeyPackage, "k1".to_owned())
+                (RejectedSignIn, "ee".to_owned())
             ]
         );
-        let g2 = [item(RejectedSignIn, "cc", 9)];
+        let g2 = [later[1].clone(), item(RejectedSignIn, "cc", 9)];
         assert_eq!(trust(&store, "g2", &own, &g2, 30), Some(false));
         assert_eq!(open(&store).len(), 2);
         assert!(gather(
             &store,
             &own,
-            &[g2[0].clone(), item(RejectedSignIn, "dd", 9)],
+            &[g2[0].clone(), g2[1].clone(), item(RejectedSignIn, "dd", 9)],
             Some("g2"),
             40
         ));
@@ -635,18 +651,11 @@ mod tests {
     fn a_rejection_time_out_of_range_still_warns() {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         assert_eq!(trust(&store, "g1", &[], &[], 10), Some(false));
-        let far = [
-            item(RejectedSignIn, "aa", u64::MAX),
-            item(RejectedKeyPackage, "k1", u64::MAX),
-        ];
+        let far = [item(RejectedSignIn, "aa", u64::MAX)];
         assert!(gather(&store, &[], &far, Some("g1"), 20));
         let records = store.compromise_warning().unwrap();
-        assert_eq!(records.len(), 2);
-        assert!(
-            records
-                .iter()
-                .all(|record| record.occurred_at == u64::try_from(i64::MAX).unwrap())
-        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].occurred_at, u64::try_from(i64::MAX).unwrap());
     }
 
     /// An unseen rejected sign-in that neither this device nor the roster
@@ -676,65 +685,41 @@ mod tests {
         assert!(open(&store).is_empty());
     }
 
-    /// A seen rejected KeyPackage goes once both its seen mark and its
-    /// rejection are older than a KeyPackage can be valid, and a roster that
-    /// still holds it does not bring it back. An unseen one stays until
-    /// dismissed; a rejected sign-in stays.
+    /// A KeyPackage found in this device's slot is found once: found again,
+    /// seen or not, it is no change. A seen one goes a KeyPackage's lifetime
+    /// after it was found; an unseen one stays until dismissed; a rejected
+    /// sign-in stays.
     #[test]
-    fn a_seen_rejected_key_package_is_kept_for_a_key_packages_lifetime() {
+    fn a_seen_foreign_key_package_goes_a_key_packages_lifetime_after_it_was_found() {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let aa = [item(RejectedSignIn, "aa", 5)];
-        // Rejected on a clock ahead of this device's.
-        let k1 = [item(RejectedKeyPackage, "k1", 15)];
-        let k2 = [item(RejectedKeyPackage, "k2", 15)];
-        assert!(gather(&store, &aa, &[], Some("g1"), 10));
-        assert!(gather(&store, &aa, &k1, Some("g1"), 10));
-        assert!(store.dismiss_compromise_warning(11).unwrap());
-        assert!(gather(&store, &aa, &k2, Some("g1"), 12));
-        let lapse = 15 + COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS;
-        let roster = [k1[0].clone(), k2[0].clone()];
-        assert!(!gather(&store, &aa, &roster, Some("g1"), lapse - 1));
+        assert!(gather(&store, &aa, &[], None, 5));
+        assert!(found(&store, "k1", 10));
+        assert!(!found(&store, "k1", 11));
+        let records = store.compromise_warning().unwrap();
+        assert_eq!(records[1].reason, ForeignOwnSlotKeyPackage);
+        assert_eq!(records[1].slot_id_hex, "own slot");
+        assert_eq!(records[1].occurred_at, 10);
+        assert!(store.dismiss_compromise_warning(12).unwrap());
+        assert!(found(&store, "k2", 13));
+        assert!(!found(&store, "k1", 20));
+        assert_eq!(open(&store), [(ForeignOwnSlotKeyPackage, "k2".to_owned())]);
+        let lapse = 10 + COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS;
+        assert!(!gather(&store, &aa, &[], None, lapse - 1));
         assert!(stored(&store, "k1"));
-        assert!(!gather(&store, &aa, &roster, Some("g1"), lapse));
-        assert_eq!(open(&store), [(RejectedKeyPackage, "k2".to_owned())]);
+        assert!(!gather(&store, &aa, &[], None, lapse));
         assert!(!stored(&store, "k1"));
-        assert!(stored(&store, "aa"));
-        assert!(store.dismiss_compromise_warning(lapse + 1).unwrap());
-        assert!(!gather(&store, &aa, &roster, Some("g1"), lapse + 2));
-        assert!(open(&store).is_empty());
-        // Seen just now, so kept for a KeyPackage's lifetime from here.
+        // Unseen past its lifetime: still open.
+        let k2_lapse = 13 + COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS;
+        assert!(!gather(&store, &aa, &[], None, k2_lapse + 5));
+        assert_eq!(open(&store), [(ForeignOwnSlotKeyPackage, "k2".to_owned())]);
+        // Seen, and found longer ago than that: gone at the next write.
+        assert!(store.dismiss_compromise_warning(k2_lapse + 6).unwrap());
         assert!(stored(&store, "k2"));
-        let seen_lapse = lapse + 1 + COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS;
-        assert!(!gather(&store, &aa, &roster, Some("g1"), seen_lapse - 1));
-        assert!(stored(&store, "k2"));
-        assert!(!gather(&store, &aa, &roster, Some("g1"), seen_lapse));
+        assert!(found(&store, "k3", k2_lapse + 7));
         assert!(!stored(&store, "k2"));
-        assert!(open(&store).is_empty());
-    }
-
-    /// A seen rejected KeyPackage recorded again with a later time, as after
-    /// the roster dropped it and a device rejected it again, stays seen: its
-    /// retention runs from the later rejection.
-    #[test]
-    fn a_seen_rejected_key_package_recorded_again_stays_seen() {
-        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-        assert_eq!(trust(&store, "g1", &[], &[], 10), Some(false));
-        let first = [item(RejectedKeyPackage, "k1", 100)];
-        assert!(gather(&store, &[], &first, Some("g1"), 100));
-        assert!(store.dismiss_compromise_warning(101).unwrap());
-        assert!(!gather(&store, &[], &[], Some("g1"), 200));
-        let again = [item(RejectedKeyPackage, "k1", 1_000)];
-        assert!(!gather(&store, &[], &again, Some("g1"), 1_000));
-        // Past the first rejection's retention and the seen mark's: kept.
-        let first_lapse = 101 + COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS;
-        assert!(!gather(&store, &[], &again, Some("g1"), first_lapse));
-        assert!(stored(&store, "k1"));
-        assert!(open(&store).is_empty());
-        // Past the later one: gone, and that rejection is not added again.
-        let lapse = 1_000 + COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS;
-        assert!(!gather(&store, &[], &again, Some("g1"), lapse));
-        assert!(!stored(&store, "k1"));
-        assert!(open(&store).is_empty());
+        assert_eq!(open(&store), [(ForeignOwnSlotKeyPackage, "k3".to_owned())]);
+        assert!(stored(&store, "aa"));
     }
 
     /// Past the cap, the oldest seen items go first.
@@ -782,5 +767,29 @@ mod tests {
             None,
             30
         ));
+    }
+
+    /// Past the cap with nothing seen, the oldest unseen item goes and the
+    /// warning stays open with the rest.
+    #[test]
+    fn the_cap_drops_the_oldest_unseen_item_when_none_is_seen() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let refs: Vec<_> = (0..COMPROMISE_WARNING_ITEM_CAP)
+            .map(|index| format!("k{index:05}"))
+            .collect();
+        assert!(
+            store
+                .record_foreign_own_slot_key_packages("own slot", &refs, 10)
+                .unwrap()
+        );
+        assert!(found(&store, "new", 20));
+        let items = open(&store);
+        assert_eq!(items.len(), COMPROMISE_WARNING_ITEM_CAP);
+        assert!(!stored(&store, "k00000"));
+        assert!(stored(&store, "k00001"));
+        assert_eq!(
+            items.last(),
+            Some(&(ForeignOwnSlotKeyPackage, "new".to_owned()))
+        );
     }
 }

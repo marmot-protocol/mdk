@@ -1475,10 +1475,10 @@ typedef enum MarmotCompromiseWarningReason {
    */
   MARMOT_COMPROMISE_WARNING_REASON_REJECTED_SIGN_IN,
   /**
-   * A KeyPackage one of the account's devices found where they had
-   * not published, and rejected.
+   * A KeyPackage this device found in its own slot that it did not
+   * make. This device has replaced it.
    */
-  MARMOT_COMPROMISE_WARNING_REASON_REJECTED_KEY_PACKAGE,
+  MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE,
 } MarmotCompromiseWarningReason;
 
 typedef struct MarmotAccountAttachmentCursor MarmotAccountAttachmentCursor;
@@ -2881,10 +2881,12 @@ typedef struct MarmotUnrecognizedSignInList {
  * One thing the open compromise warning gathers. `reason` is a
  * `MarmotCompromiseWarningReason` discriminant carried as `uint32_t`, so
  * a host can show a value it does not know as a generic reason.
- * `slot_id_hex` is the KeyPackage slot the rejection names.
- * `key_package_ref_hex` is set only for `RejectedKeyPackage`.
- * `occurred_at` is when the rejection was made, in Unix seconds, as the
- * device that made it wrote it.
+ * `slot_id_hex` is the KeyPackage slot the item names: the rejected
+ * sign-in's, or this device's own for a KeyPackage found there.
+ * `key_package_ref_hex` is set only for `ForeignOwnSlotKeyPackage`.
+ * `occurred_at` is in Unix seconds: when the rejection was made, as the
+ * device that made it wrote it, or when this device found the
+ * KeyPackage.
  */
 typedef struct MarmotCompromiseWarningItem {
   uint32_t reason;
