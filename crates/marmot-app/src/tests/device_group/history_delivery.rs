@@ -980,6 +980,47 @@ async fn a_blossom_delivery_of_the_device_group_is_refused_unfetched() {
     );
 }
 
+/// A fetch that completes while this device holds no trusted device group,
+/// as while trust re-settles, is no verdict on its delivery: it stays parked
+/// and waits to be fetched again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fetch_finished_without_a_device_group_keeps_its_delivery() {
+    let mut devices = phone_and_laptop().await;
+    assert!(devices.laptop.device_group_exchange().unwrap().is_none());
+    let laptop_storage = storage(&devices.laptop_app);
+    let parked = storage_sqlite::ParkedHistoryDelivery {
+        app_event_id: "aa".repeat(32),
+        group_id_hex: "bb".repeat(16),
+        sender_slot_hex: "cc".repeat(32),
+        sealed: vec![1; 115],
+        bundle: ParkedBundle::Blossom {
+            servers: vec!["https://blossom.example/".to_owned()],
+            fetch_due_at: 0,
+            fetch_attempts: 0,
+        },
+        received_at: crate::unix_now_seconds(),
+    };
+    laptop_storage.park_history_delivery(&parked).unwrap();
+    let outcome = crate::client::HistoryFetchOutcome::new(parked, Ok(vec![0; 32]));
+    assert!(!devices.laptop.finish_history_fetch(outcome));
+    let [kept] = &laptop_storage
+        .due_parked_history_fetches(i64::MAX as u64, usize::MAX)
+        .unwrap()[..]
+    else {
+        panic!("the delivery stays parked");
+    };
+    let ParkedBundle::Blossom {
+        fetch_due_at,
+        fetch_attempts,
+        ..
+    } = kept.bundle
+    else {
+        panic!("still a Blossom delivery");
+    };
+    assert_eq!(fetch_attempts, 1);
+    assert!(fetch_due_at > crate::unix_now_seconds());
+}
+
 /// A history longer than the cap sends its newest bundles: the walk starts
 /// after the bundle before them, or at the start when the cap holds it all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

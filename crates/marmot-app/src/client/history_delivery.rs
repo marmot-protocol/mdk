@@ -225,6 +225,14 @@ pub(crate) struct HistoryFetchOutcome {
     result: Result<Vec<u8>, AppError>,
 }
 
+#[cfg(all(test, feature = "test-policy-overrides"))]
+impl HistoryFetchOutcome {
+    /// A fetch of `parked` that ended in `result`. Test support only.
+    pub(crate) fn new(parked: ParkedHistoryDelivery, result: Result<Vec<u8>, AppError>) -> Self {
+        Self { parked, result }
+    }
+}
+
 impl HistoryFetch {
     /// Fetch the blob from each server in turn until one returns the bytes
     /// its hash names.
