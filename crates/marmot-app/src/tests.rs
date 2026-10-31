@@ -580,6 +580,9 @@ pub(crate) struct ScriptedPushRelayClient {
     /// Every completion read stops before its end of stored events, as a
     /// relay that timed out or closed the subscription.
     pub(crate) unfinished_directory_reads: std::sync::atomic::AtomicBool,
+    /// Only each completion read's first relay finishes; the others are
+    /// down, so the read as a whole is not complete.
+    pub(crate) other_directory_relays_down: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
     publish_release: tokio::sync::Notify,
@@ -1158,7 +1161,7 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
         let queries = request.queries.clone();
         let endpoints = request.endpoints.clone();
         let records = self.fetch_directory_events(request).await?;
-        let complete = !self
+        let finished = !self
             .unfinished_directory_reads
             .load(std::sync::atomic::Ordering::SeqCst)
             && queries.iter().all(|query| {
@@ -1168,10 +1171,17 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
                     .count()
                     < query.limit
             });
+        let others_down = self
+            .other_directory_relays_down
+            .load(std::sync::atomic::Ordering::SeqCst);
         Ok(transport_nostr::DirectoryFetchOutcome {
             records,
-            complete,
-            complete_endpoints: if complete { endpoints } else { Vec::new() },
+            complete: finished && !others_down,
+            complete_endpoints: match (finished, others_down) {
+                (false, _) => Vec::new(),
+                (true, false) => endpoints,
+                (true, true) => endpoints.into_iter().take(1).collect(),
+            },
         })
     }
 }

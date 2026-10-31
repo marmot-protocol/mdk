@@ -1547,6 +1547,38 @@ async fn an_unfinished_read_never_refills_the_slot() {
     assert!(phone.check_sign_ins().await.unwrap().refilling);
 }
 
+/// A relay whose own read finished shows the slot empty even while another
+/// relay is down and no relay returned any of the account's publications:
+/// the check cannot count sign-ins then, but it still refills the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_empty_relay_is_refilled_while_another_is_down() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let published = publish_two_days_ago(&phone);
+    relay_empties_slot(&account.relay, &slot);
+    account
+        .relay
+        .other_directory_relays_down
+        .store(true, SeqCst);
+
+    let result = phone.check_sign_ins().await;
+    assert!(
+        matches!(
+            result,
+            Err(AppError::DeviceGroupRefused("key_packages_unreachable"))
+        ),
+        "{result:?}"
+    );
+    assert!(phone.runtime.key_package_network_maintenance_due().unwrap());
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > published);
+    assert!(relay_serves_slot(&account.relay, &slot));
+}
+
 /// Only a publication at least a day old is refilled. A refill is a new
 /// publication, so a relay that accepts this device's KeyPackages and keeps
 /// none costs one a day, not one per check.

@@ -56,8 +56,8 @@
 //!   serves nothing in the slot was emptied by a deletion; the runtime
 //!   publishes a new KeyPackage there too, at most once a day, unless this
 //!   device's siblings removed it (3.6b). Only a relay's finished read shows
-//!   it empty. An incomplete read still acts on what it found, and the check
-//!   runs again within the hour.
+//!   it empty, even when no relay returned anything else. An incomplete read
+//!   still acts on what it found, and the check runs again within the hour.
 //!
 //! Everything here runs only while device groups are on.
 
@@ -301,10 +301,14 @@ impl AppClient {
             .app
             .read_account_key_package_slots(&self.state.label, own.slot.as_deref())
             .await?;
+        let trusted = self.trusted_device_roster()?;
         if !read.reached {
+            // A relay whose own read finished still shows the slot empty,
+            // though no relay returned any of the account's publications.
+            let roster = trusted.as_ref().map(|(_, roster)| roster);
+            self.refill_own_slot(&own, read.own_slot.as_ref(), roster)?;
             return Err(AppError::DeviceGroupRefused("key_packages_unreachable"));
         }
-        let trusted = self.trusted_device_roster()?;
         let announced = match &trusted {
             Some((group_id, _)) => self.announced_key_packages(group_id)?,
             None => BTreeSet::new(),
@@ -375,13 +379,29 @@ impl AppClient {
                     .slots
                     .insert(slot_hex.to_owned(), SlotOutcome::OwnSlot);
             }
-            if !self.removed_by_siblings(slot_hex, roster.as_ref())? {
-                report.refilling = self
-                    .runtime
-                    .refill_emptied_slot(&emptied_targets(&own.targets, &own_read.empty))?;
-            }
         }
+        report.refilling = self.refill_own_slot(&own, read.own_slot.as_ref(), roster.as_ref())?;
         Ok(report)
+    }
+
+    /// Publish a new KeyPackage into this device's slot when a relay that
+    /// accepted its current publication, read to its end, serves nothing
+    /// there, unless its siblings removed it. See the module docs.
+    fn refill_own_slot(
+        &mut self,
+        own: &OwnKeyPackages,
+        own_read: Option<&OwnSlotRead>,
+        roster: Option<&DeviceRosterV1>,
+    ) -> Result<bool, AppError> {
+        let (Some(slot_hex), Some(own_read)) = (own.slot.as_deref(), own_read) else {
+            return Ok(false);
+        };
+        if self.removed_by_siblings(slot_hex, roster)? {
+            return Ok(false);
+        }
+        Ok(self
+            .runtime
+            .refill_emptied_slot(&emptied_targets(&own.targets, &own_read.empty))?)
     }
 
     /// Whether this device's siblings removed it (3.6b): the trusted roster
