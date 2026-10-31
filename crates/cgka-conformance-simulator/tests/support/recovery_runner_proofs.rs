@@ -5,10 +5,13 @@
 //! one store and publish the production NIP-11 document.
 //!
 //! Until the gate flips (5g), the earlier recovery owner still runs beside
-//! the runner. Wire bounds count both owners' requests; the runner's own
-//! bounds read its debug trace and the sweep requests only it sends. Two
-//! journeys can only hold once 5g wires live fences and the upgrade
-//! conversion, and are ignored until then: the fence control and the upgrade.
+//! the runner, and in these runs it does the startup recovery itself. So each
+//! journey runs in two modes ([`Owners`]): beside the earlier owner, where the
+//! wire bounds count both owners' requests and the runner's own numbers
+//! (read from its debug trace) are only recorded; and alone, ignored until
+//! 5g, where the runner's bounds and their controls hold too. The fence
+//! control and the upgrade likewise wait for 5g's fence wiring and
+//! conversion.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -44,12 +47,6 @@ const OUTAGE_MS: u64 = 10_000;
 const WATCHDOG: Duration = Duration::from_secs(90 * 60);
 /// Requests on one endpoint at most this far apart form one burst.
 const BURST_GAP_MS: u64 = 2_000;
-/// The recovery runner's time-sliced sweep asks for exactly the relay's
-/// published cap (500 in the harness's NIP-11 document); the earlier owner's
-/// capture pages carry no limit. A window `REQ` with this limit is the
-/// runner's. Both owners compare with the same NIP-77 shape, so `NEG-OPEN`s
-/// are only counted, never attributed.
-const RUNNER_SWEEP_LIMIT: u64 = 500;
 /// Runner attempts on the stalled relay in the loop's second half. 0.14.0
 /// made one about every 30 seconds (a 10-second attempt, then the next about
 /// 20 seconds later), about 16 there.
@@ -57,6 +54,13 @@ const LOOP_SECOND_HALF_ATTEMPTS: usize = 4;
 /// Runner attempts that asked a relay and ended without progress while the
 /// owed group drains from two healthy endpoints.
 const OWED_WASTED_ATTEMPTS: usize = 4;
+/// Bursts of history requests per endpoint while the owed group drains: the
+/// wire's view of the attempts, both owners together.
+const OWED_BURSTS: usize = 4;
+/// The longest a live message may wait with the runner alone: a fence holds
+/// for at most one 30-second replay deadline. Beside the earlier owner its
+/// capture holds live frames until the whole backlog lands.
+const LIVE_HELD_AT_MOST_MS: f64 = 60_000.0;
 /// Messages inside the rebuild lookback (120 s) when bob restarts, so the
 /// counted group's live count is non-empty and under the 500-event clamp.
 const COUNTED_MESSAGES: usize = 30;
@@ -244,15 +248,15 @@ pub(super) fn history_summary(
 ) -> Value {
     let mut by_verb = BTreeMap::<&str, u64>::new();
     let mut by_route = BTreeMap::<&str, u64>::new();
-    let mut windows = BTreeMap::<(&str, Option<u64>, Option<u64>, Option<u64>), u64>::new();
+    let mut windows = BTreeMap::<(&str, (&str, Option<u64>, Option<u64>, Option<u64>)), u64>::new();
     for request in requests {
         *by_verb.entry(&request.verb).or_default() += 1;
         let route = request.route.as_deref().unwrap_or("none");
         let label = labels.get(route).map_or("other", String::as_str);
         *by_route.entry(label).or_default() += 1;
-        if request.verb == "REQ" && request.ids == 0 {
+        if request.ids == 0 {
             let window = (label, request.since, request.until, request.limit);
-            *windows.entry(window).or_default() += 1;
+            *windows.entry((request.verb.as_str(), window)).or_default() += 1;
         }
     }
     let repeated = windows.values().filter(|count| **count > 1);
@@ -268,19 +272,35 @@ pub(super) fn history_summary(
     })
 }
 
-/// The runner's sweep windows on one endpoint, and how many repeat one it
-/// asked before.
-fn runner_sweeps(requests: &[HistoryRequestV1]) -> (usize, u64) {
-    let mut windows = BTreeMap::<(Option<&str>, Option<u64>, Option<u64>), u64>::new();
-    let sweeps = requests.iter().filter(|request| {
-        request.verb == "REQ" && request.ids == 0 && request.limit == Some(RUNNER_SWEEP_LIMIT)
-    });
-    for request in sweeps {
-        let window = (request.route.as_deref(), request.since, request.until);
-        *windows.entry(window).or_default() += 1;
+/// Requests on one endpoint that repeat a history window (a `REQ` without
+/// ids, or a `NEG-OPEN`, by route, bounds and limit) asked before.
+fn repeated_windows(requests: &[HistoryRequestV1]) -> u64 {
+    let mut windows = BTreeMap::<_, u64>::new();
+    for request in requests.iter().filter(|request| request.ids == 0) {
+        let route = request.route.as_deref();
+        let window = (route, request.since, request.until, request.limit);
+        *windows.entry((request.verb.as_str(), window)).or_default() += 1;
     }
-    let asked = windows.values().sum::<u64>() as usize;
-    (asked, windows.values().map(|count| count - 1).sum())
+    windows.values().map(|count| count - 1).sum()
+}
+
+/// Who works history debt in a run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Owners {
+    /// The runner beside the earlier owner, as until 5g: wire bounds count
+    /// both, and the runner's own numbers are recorded only.
+    Both,
+    /// The runner alone, from 5g: its own bounds and their controls hold too.
+    RunnerAlone,
+}
+
+impl Owners {
+    fn label(self, proof: &str) -> String {
+        match self {
+            Self::Both => format!("runner-{proof}"),
+            Self::RunnerAlone => format!("runner-alone-{proof}"),
+        }
+    }
 }
 
 /// The recovery runner's own attempts, from the `quantum` and `recheck`
@@ -627,8 +647,8 @@ where
 /// about 20 s later, for as long as the app ran. The account must recover
 /// from the healthy endpoint, live messages must keep arriving, and the
 /// stalled endpoint's attempts must thin out instead of repeating.
-pub(super) async fn stalled_relay_loop() {
-    let report = run_proof("runner-loop", true, async |subject, out| {
+pub(super) async fn stalled_relay_loop(owners: Owners) {
+    let report = run_proof(&owners.label("loop"), true, async |subject, out| {
         let started = Instant::now();
         let clients = clients();
         let group = create(subject, "loop", &clients).await?;
@@ -702,9 +722,16 @@ pub(super) async fn stalled_relay_loop() {
         if live_visibility["not_visible"] != 0 {
             return Err("live messages stopped arriving behind the stalled relay".into());
         }
+        // The control: something did try the stalled relay.
+        if per_minute(clocks[1], half) == 0.0 {
+            return Err(format!("nothing attempted the stalled relay: {proof}").into());
+        }
         // 0.14.0 attempted about twice a minute for as long as it ran.
         if per_minute(half, clocks[1] + window_ms) > 0.5 {
             return Err(format!("the stalled relay is still attempted every two minutes or more often: {proof}").into());
+        }
+        if owners == Owners::Both {
+            return Ok(json!({"proof": proof}));
         }
         // The control: the runner did try the stalled relay, so the bound
         // below is not met by a runner that never looked at it.
@@ -729,8 +756,8 @@ pub(super) async fn stalled_relay_loop() {
 ///   last durable proof is swept as cold-start work: the busy group's and the
 ///   quiet group's, whose live range is empty. Live messages to the quiet
 ///   group are never held behind it.
-pub(super) async fn owed_history() {
-    let report = run_proof("runner-owed-history", true, async |subject, out| {
+pub(super) async fn owed_history(owners: Owners) {
+    let report = run_proof(&owners.label("owed-history"), true, async |subject, out| {
         let started = Instant::now();
         let clients = clients();
         let pair = clients[..2].to_vec();
@@ -816,11 +843,10 @@ pub(super) async fn owed_history() {
         quiet_expected.push("quiet-after-reconnect".into());
         let reconnected = Instant::now();
         let mut resweep = BTreeSet::new();
-        // The runner's own sweep of each route on endpoint 0, by its shape.
+        // Each route asked again on endpoint 0, by either owner.
         let resweeps = async || {
             let history = history_since(subject, &reconnect_clocks).await?;
-            let runner = history[0].iter().filter(|request| request.limit == Some(RUNNER_SWEEP_LIMIT) && request.ids == 0);
-            resweep = runner.filter_map(|request| request.route.clone()).collect();
+            resweep = history[0].iter().filter_map(|request| request.route.clone()).collect();
             Ok(resweep.contains(&busy_route) && resweep.contains(&quiet_route) && caught_up(&bob).await?)
         };
         let resweep_result = wait_for("the reconnect's re-sweep", RESWEEP_DEADLINE, resweeps).await;
@@ -835,11 +861,12 @@ pub(super) async fn owed_history() {
         let swept = |history: &[Vec<HistoryRequestV1>], route: &str| {
             history.iter().map(|requests| requests.iter().any(|r| r.route.as_deref() == Some(route))).collect::<Vec<_>>()
         };
-        let runner_windows = after_restart.iter().map(|requests| runner_sweeps(requests)).collect::<Vec<_>>();
-        let busy_bursts = after_restart
-            .iter()
-            .map(|requests| bursts(requests.iter().filter(|r| r.route.as_deref() == Some(busy_route.as_str()))).len())
-            .collect::<Vec<_>>();
+        let per_endpoint = |history: &[Vec<HistoryRequestV1>], of: fn(&[HistoryRequestV1]) -> u64| {
+            history.iter().map(|requests| of(requests)).collect::<Vec<_>>()
+        };
+        let restart_repeats = per_endpoint(&after_restart, repeated_windows);
+        let reconnect_repeats = per_endpoint(&after_reconnect, repeated_windows);
+        let restart_bursts = per_endpoint(&after_restart, |requests| bursts(requests).len() as u64);
         let proof = json!({
             "owed_messages": OWED_MESSAGES,
             "backlog_publish_seconds": backlog_seconds,
@@ -852,9 +879,8 @@ pub(super) async fn owed_history() {
                 "quiet_message_visible_ms": quiet_after_restart,
                 "busy_swept_per_endpoint": swept(&after_restart, &busy_route),
                 "quiet_swept_per_endpoint": swept(&after_restart, &quiet_route),
-                "runner_sweep_windows_per_endpoint": runner_windows.iter().map(|(asked, _)| asked).collect::<Vec<_>>(),
-                "runner_sweep_windows_repeated_per_endpoint": runner_windows.iter().map(|(_, repeated)| repeated).collect::<Vec<_>>(),
-                "busy_bursts": busy_bursts,
+                "repeated_window_requests_per_endpoint": restart_repeats,
+                "bursts_per_endpoint": restart_bursts,
                 "runner": runner_summary(&restart_trace),
                 "runner_wasted": wasted(&restart_trace),
                 "history": summaries(&after_restart),
@@ -867,6 +893,7 @@ pub(super) async fn owed_history() {
                 "routes_swept_on_endpoint_0": resweep.iter().map(|r| labels.get(r).map_or("other", String::as_str)).collect::<Vec<_>>(),
                 "quiet_message_visible_ms": quiet_after_reconnect,
                 "quiet_timeline_exact": quiet_exact,
+                "repeated_window_requests_per_endpoint": reconnect_repeats,
                 "history": summaries(&after_reconnect),
                 "runner": runner_summary(&reconnect_trace),
             },
@@ -884,16 +911,14 @@ pub(super) async fn owed_history() {
         if live_visibility["not_visible"] != 0 {
             return failure("live messages were lost while the backlog was owed");
         }
-        if runner_windows.iter().any(|(_, repeated)| *repeated > 0) {
-            return failure("the runner asked one sweep window twice on one endpoint");
+        if restart_repeats.iter().any(|repeats| *repeats > 0) {
+            return failure("a history window was asked twice on one endpoint");
         }
-        if wasted(&restart_trace) > OWED_WASTED_ATTEMPTS {
-            return failure("the runner's attempts kept ending without progress");
+        if restart_bursts.iter().any(|bursts| *bursts as usize > OWED_BURSTS) {
+            return failure("the owed group took too many attempts");
         }
-        // The control: the runner itself worked the owed group over
-        // successive attempts, so an idle runner does not meet the bounds.
-        if advanced(&restart_trace) < 2 {
-            return failure("the runner did not work the debt over successive attempts");
+        if !swept(&after_restart, &busy_route).iter().all(|swept| *swept) {
+            return failure("the owed group was not fetched from both endpoints");
         }
         if !swept(&after_restart, &quiet_route).iter().all(|swept| *swept) {
             return failure("the quiet group's gap was not swept after the restart");
@@ -903,6 +928,26 @@ pub(super) async fn owed_history() {
         }
         if resweep_result.is_err() {
             return failure("the reconnect's owed ranges were not swept");
+        }
+        if reconnect_trace.is_empty() {
+            return failure("the runner re-proved nothing after the reconnect");
+        }
+        if owners == Owners::Both {
+            return Ok(json!({"proof": proof}));
+        }
+        // The control: the runner itself worked the owed group over
+        // successive attempts, so an idle runner does not meet the bounds.
+        if advanced(&restart_trace) < 2 {
+            return failure("the runner did not work the debt over successive attempts");
+        }
+        if wasted(&restart_trace) > OWED_WASTED_ATTEMPTS {
+            return failure("the runner's attempts kept ending without progress");
+        }
+        if reconnect_repeats.iter().any(|repeats| *repeats > 0) {
+            return failure("a history window was asked twice on one endpoint after the reconnect");
+        }
+        if live_visibility["max"].as_f64() > Some(LIVE_HELD_AT_MOST_MS) {
+            return failure("a live message waited longer than one fence");
         }
         Ok(json!({"proof": proof}))
     })

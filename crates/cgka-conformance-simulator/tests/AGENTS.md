@@ -36,9 +36,10 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     It runs with either history owner, and records per-endpoint history requests too.
     `support/recovery_runner_proofs.rs` holds the explicit slow recovery-runner proofs (mdk#2660): a stalled relay
     that never answers history, and tens of thousands of owed events through a restart, an idle window and a
-    reconnect. Its fence control and upgrade journey fail until PR 5g and stay ignored with reasons naming it; give
-    any bound that a runner doing nothing would meet a control like theirs. Bob runs in process with the runner owning debt. While the earlier owner still runs beside it, wire
-    bounds count both owners; runner bounds read its debug trace and the sweep request shape only it sends.
+    reconnect. Bob runs in process with the runner owning debt. While the earlier owner still runs beside it, the
+    both-owners variants bound the wire; the `runner_alone` variants, the fence control and the upgrade journey fail
+    until PR 5g and stay ignored with reasons naming it. Give any bound that an idle runner would meet a control
+    that it fails.
 
 - **File:** `app_runtime_interaction_journeys.rs`
   - **Owns:** Public app interaction journeys that the serialized generated families do not reach: two groups on

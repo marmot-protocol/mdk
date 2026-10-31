@@ -25,6 +25,8 @@ mod recovery_runner_proofs;
 #[path = "support/recovery_scorecard.rs"]
 mod recovery_scorecard;
 
+use recovery_runner_proofs::Owners;
+
 #[derive(Clone, Copy, Debug)]
 enum Journey {
     Messaging,
@@ -716,13 +718,25 @@ async fn public_app_large_account_recovery_scorecard_runner_owns_debt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
 async fn public_app_runner_stalled_relay_does_not_loop() {
-    recovery_runner_proofs::stalled_relay_loop().await;
+    recovery_runner_proofs::stalled_relay_loop(Owners::Both).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "fails until mdk#2660 PR 5g, when the runner works history debt alone"]
+async fn public_app_runner_alone_stalled_relay_does_not_loop() {
+    recovery_runner_proofs::stalled_relay_loop(Owners::RunnerAlone).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
 async fn public_app_runner_finishes_tens_of_thousands_of_owed_events() {
-    recovery_runner_proofs::owed_history().await;
+    recovery_runner_proofs::owed_history(Owners::Both).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "fails until mdk#2660 PR 5g, when the runner works history debt alone"]
+async fn public_app_runner_alone_finishes_tens_of_thousands_of_owed_events() {
+    recovery_runner_proofs::owed_history(Owners::RunnerAlone).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
