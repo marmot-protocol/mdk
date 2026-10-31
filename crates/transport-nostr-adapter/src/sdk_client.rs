@@ -2048,6 +2048,19 @@ impl NostrSdkRelayClient {
         Ok(context)
     }
 
+    /// The client whose pool carries `account_id`'s REQs: the account's own
+    /// context on a multi-account root, otherwise this client when it serves
+    /// that account. `None` when it serves another account, or the account
+    /// has no context yet. It dials nothing.
+    #[doc(hidden)]
+    pub async fn account_relay_client(&self, account_id: &MemberId) -> Option<Self> {
+        match self.account_client(account_id).await {
+            Ok(Some(account)) => Some(account),
+            Ok(None) => Some(self.clone()),
+            Err(_) => None,
+        }
+    }
+
     async fn account_client(
         &self,
         account_id: &MemberId,

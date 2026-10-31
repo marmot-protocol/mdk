@@ -85,7 +85,7 @@ mod push;
 mod receipts;
 pub(crate) mod recovery;
 mod recovery_coverage;
-mod recovery_runner;
+pub(crate) mod recovery_runner;
 mod retention;
 pub(crate) mod sign_ins;
 mod sync;
@@ -740,6 +740,10 @@ pub struct AppClient {
     /// its runtime's pool; a directly owned client uses the process pool.
     pub(crate) recovery_credits:
         Arc<crate::runtime::account_worker::recovery_credits::RecoveryCreditPool>,
+    /// A directly owned client's in-place recovery runner (mdk#2660 phase 4),
+    /// behind the internal `runner_owns_debt` gate. A worker account's runner
+    /// is the worker's own task, so its client's seat stays empty.
+    pub(crate) recovery_runner: recovery_runner::host::RunnerSeat,
     pub(super) comparison_startup_requested: bool,
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<PerformanceRecorder>,

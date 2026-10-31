@@ -401,6 +401,82 @@ async fn recovery_runner_resumes_a_failed_recheck_pass_and_uncovers_nothing() {
     assert!(still_covered(&account));
 }
 
+/// A re-check whose settle commits and whose progress write then fails keeps
+/// its attempt open, and the refund that follows changes nothing: the relay's
+/// answer stands and the account keeps the charge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_keeps_a_settled_recheck_whose_progress_write_failed() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let held = every([1; 32], floor, t0, HOUR);
+    account.hold(&route, &held);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(held)
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    account.live_boundary(&route, RELAY, floor, t0 - 1);
+    host.tails.stand(&route, RELAY, t0);
+    account.record_caps(RELAY, caps(500, true), t0);
+    // The relay failed once before, so an answer shows in its streak.
+    account
+        .app
+        .settle_recovery_recheck(&route, RELAY, Outcome::Unreachable, &test_policy().unit, t0)
+        .unwrap();
+    let streak = || {
+        account
+            .app
+            .recovery_relay_health(RELAY)
+            .unwrap()
+            .unwrap()
+            .unreachable_streak
+    };
+    assert_eq!(streak(), 1);
+    let faults = account.fault_connection();
+    faults
+        .execute_batch(
+            "CREATE TRIGGER fail_recheck_progress BEFORE UPDATE OF recheck_position_seconds
+             ON account_recovery_units BEGIN SELECT RAISE(ABORT, 'recheck progress fault'); END;",
+        )
+        .unwrap();
+    let attempts = || {
+        account
+            .app
+            .recovery_account_usage(clock.now())
+            .unwrap()
+            .attempts
+    };
+    let (mut runner, _handle) = runner(&host, test_policy());
+    let open = runner.open_attempts();
+
+    let failed = ran(runner.step().await);
+    assert_eq!(
+        (failed.recheck, failed.outcome),
+        (true, Outcome::LocalFailure)
+    );
+    let pass = account.unit(&route, RELAY).recheck;
+    assert_eq!(pass.completed_at_seconds, None, "its progress was not kept");
+    assert_eq!(streak(), 0, "its settle committed the relay's answer");
+    assert_eq!(attempts(), 1);
+    assert!(!open.is_empty(), "its attempt stays open");
+
+    faults
+        .execute_batch("DROP TRIGGER fail_recheck_progress;")
+        .unwrap();
+    open.refund(&account.app, &test_policy().unit, clock.now());
+    assert!(open.is_empty());
+    assert_eq!(attempts(), 1, "the refund kept the settled charge");
+    assert_eq!(streak(), 0, "and the relay's answer");
+}
+
 /// A repair that makes a pass due while one of its quanta runs is not
 /// swallowed, though it leaves the pass looking as it did: the quantum
 /// records nothing, and the pass runs again from the floor.

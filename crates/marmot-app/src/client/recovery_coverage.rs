@@ -424,11 +424,13 @@ fn observe_live_counts(
     (input_placed, facts, present)
 }
 
-/// A route the account currently subscribes, with the relays that certify it.
+/// A route the account currently subscribes, with the relays that certify it
+/// and its other admitted relays.
 struct CurrentRoute {
     route: TransportReconciliationRoute,
     group_id: Option<Vec<u8>>,
     required: Vec<String>,
+    best_effort: Vec<String>,
 }
 
 /// The ledger keys relays by one spelling: the adapter and the scope plans
@@ -529,31 +531,55 @@ impl AppClient {
     fn current_coverage_routes(&self) -> Vec<CurrentRoute> {
         let routing = self.routing.snapshot();
         let operated = &self.app.config.deployment.recovery_operated_relays;
-        let required = |endpoints: &[cgka_traits::TransportEndpoint]| {
+        let current = |route, group_id, endpoints: &[cgka_traits::TransportEndpoint]| {
             let admitted = self.adapter.recovery_admitted_endpoints(endpoints);
-            relays(&transport_nostr::recovery_required_endpoints(
+            let required = relays(&transport_nostr::recovery_required_endpoints(
                 &admitted, operated,
-            ))
+            ));
+            let best_effort = relays(&admitted)
+                .into_iter()
+                .filter(|relay| !required.contains(relay))
+                .collect();
+            CurrentRoute {
+                route,
+                group_id,
+                required,
+                best_effort,
+            }
         };
-        let mut routes = vec![CurrentRoute {
-            route: TransportReconciliationRoute::Inbox,
-            group_id: None,
-            required: required(&routing.local_inbox_endpoints),
-        }];
+        let mut routes = vec![current(
+            TransportReconciliationRoute::Inbox,
+            None,
+            &routing.local_inbox_endpoints,
+        )];
         let mut seen = HashSet::new();
         for entry in &routing.group_routes {
             let Ok(id) = <[u8; 32]>::try_from(entry.transport_group_id.as_slice()) else {
                 continue;
             };
             if seen.insert(id) {
-                routes.push(CurrentRoute {
-                    route: TransportReconciliationRoute::Group(id),
-                    group_id: Some(entry.group_id.as_slice().to_vec()),
-                    required: required(&entry.endpoints),
-                });
+                routes.push(current(
+                    TransportReconciliationRoute::Group(id),
+                    Some(entry.group_id.as_slice().to_vec()),
+                    &entry.endpoints,
+                ));
             }
         }
         routes
+    }
+
+    /// The account's current routes as its recovery runner reads them, once
+    /// per debt turn (mdk#2660 phase 4).
+    pub(crate) fn recovery_runner_routes(&self) -> Vec<super::recovery_runner::RunnerRoute> {
+        self.current_coverage_routes()
+            .into_iter()
+            .map(|current| super::recovery_runner::RunnerRoute {
+                route: current.route,
+                group_id: current.group_id,
+                required: current.required,
+                best_effort: current.best_effort,
+            })
+            .collect()
     }
 
     fn coverage_storage(&self) -> Result<storage_sqlite::SqliteAccountStorage, AppError> {
@@ -584,12 +610,24 @@ impl AppClient {
             .map(|current| current.route)
             .collect::<Vec<_>>();
         if let Err(error) = self.coverage_storage().and_then(|storage| {
-            Ok(storage
-                .app_storage()
-                .widen_recovery_coverage_goals(&routes, floor)?)
+            Ok(self.widen_coverage_goals(&storage.app_storage(), &routes, floor)?)
         }) {
             log_failure("record_coverage_loss", &error);
         }
+    }
+
+    /// Widen `routes`' goals to `floor`. Every goal the client widens goes
+    /// through here: it may owe new debt, so the recovery runner, if one
+    /// runs, reads its ledger again.
+    fn widen_coverage_goals(
+        &self,
+        app: &SqliteAppStorage,
+        routes: &[TransportReconciliationRoute],
+        floor: u64,
+    ) -> cgka_traits::storage::StorageResult<()> {
+        app.widen_recovery_coverage_goals(routes, floor)?;
+        self.wake_recovery_runner();
+        Ok(())
     }
 
     /// Where a current route's standing goal starts: the retention floor,
@@ -629,7 +667,7 @@ impl AppClient {
                 .push(current.route.clone());
         }
         for (floor, routes) in by_floor {
-            app.widen_recovery_coverage_goals(&routes, floor)?;
+            self.widen_coverage_goals(app, &routes, floor)?;
         }
         Ok(())
     }
@@ -651,7 +689,7 @@ impl AppClient {
                         .into_iter()
                         .map(|current| current.route)
                         .collect::<Vec<_>>();
-                    Ok(app.widen_recovery_coverage_goals(&routes, retention_floor(now))?)
+                    Ok(self.widen_coverage_goals(&app, &routes, retention_floor(now))?)
                 }
                 _ => Ok(()),
             }
@@ -896,7 +934,7 @@ impl AppClient {
             if let Some(owed) = reach.owed_by(demand.cause) {
                 for route in scopes.iter().filter_map(scope_route) {
                     if let Some(floor) = owed.floor(&route) {
-                        app.widen_recovery_coverage_goals(std::slice::from_ref(&route), floor)?;
+                        self.widen_coverage_goals(app, std::slice::from_ref(&route), floor)?;
                     }
                 }
             }
