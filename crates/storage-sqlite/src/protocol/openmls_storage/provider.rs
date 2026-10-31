@@ -1094,29 +1094,47 @@ mod tests {
 
     #[test]
     fn queued_proposals_propagates_operational_errors_without_clearing_queue() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let mls = &store.openmls;
-        let group_id = TestGroupId(vec![9, 8, 7, 6]);
-        let valid_ref = TestProposalRef(vec![0x11]);
-        let valid_proposal = TestQueuedProposal(vec![0x22]);
+        // A value stored as TEXT fails the BLOB read with a SQLite error while
+        // deletes still work, so a recovery arm that swallowed it would clear
+        // the queue, and the row counts below would show it.
+        for failing_label in [QUEUED_PROPOSAL_LABEL, PROPOSAL_QUEUE_REFS_LABEL] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            let mls = &store.openmls;
+            let group_id = TestGroupId(vec![9, 8, 7, 6]);
 
-        mls.queue_proposal(&group_id, &valid_ref, &valid_proposal)
+            mls.queue_proposal(
+                &group_id,
+                &TestProposalRef(vec![0x11]),
+                &TestQueuedProposal(vec![0x22]),
+            )
             .unwrap();
-        mls.lock()
-            .unwrap()
-            .execute_batch("ALTER TABLE openmls_values RENAME TO openmls_values_hidden;")
-            .unwrap();
+            mls.lock()
+                .unwrap()
+                .execute(
+                    "UPDATE openmls_values SET value = 'not a blob' WHERE label = ?1",
+                    rusqlite::params![failing_label.as_bytes()],
+                )
+                .unwrap();
 
-        let result: Result<Vec<(TestProposalRef, TestQueuedProposal)>, _> =
-            mls.queued_proposals(&group_id);
-        assert!(matches!(result, Err(SqliteOpenMlsStorageError::Sqlite(_))));
+            let result: Result<Vec<(TestProposalRef, TestQueuedProposal)>, _> =
+                mls.queued_proposals(&group_id);
+            assert!(
+                matches!(result, Err(SqliteOpenMlsStorageError::Sqlite(_))),
+                "{result:?}"
+            );
 
-        mls.lock()
-            .unwrap()
-            .execute_batch("ALTER TABLE openmls_values_hidden RENAME TO openmls_values;")
-            .unwrap();
-        let proposals: Vec<(TestProposalRef, TestQueuedProposal)> =
-            mls.queued_proposals(&group_id).unwrap();
-        assert_eq!(proposals, vec![(valid_ref, valid_proposal)]);
+            for label in [QUEUED_PROPOSAL_LABEL, PROPOSAL_QUEUE_REFS_LABEL] {
+                let rows: i64 = mls
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM openmls_values WHERE label = ?1",
+                        rusqlite::params![label.as_bytes()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(rows, 1, "an operational read error cleared the queue");
+            }
+        }
     }
 }
