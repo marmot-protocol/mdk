@@ -162,6 +162,24 @@
   `attachment_history_source` and its insert trigger take a row without a
   transport id when `app_event_imports` marks it, and the attachment tables
   use its app event id as its `source_message_id_hex`.
+- Migration 0149 (mdk#2628 item 4.2b, D76) adds four tables for sealed
+  history deliveries. `cgka_sibling_adds` holds each sibling slot one of this
+  device's own confirmed Commits added to a group, written by the engine
+  through the new `SiblingAddStorage` (`record_sibling_adds`, which also drops
+  adds a week old, `sibling_adds`, `forget_sibling_add`); a rewind keeps its
+  rows and deleting the group drops them. `history_deliveries_owed` holds the
+  histories this device owes
+  its siblings (`owe_history_delivery`, `unsent_history_deliveries`,
+  `mark_history_delivery_sent`, `forget_history_delivery`);
+  `history_delivery_sends` names the chat and receiver of each delivery sent
+  (`record_history_delivery_send`), so `owe_withdrawn_history_delivery` owes a
+  withdrawn delivery's history again; and `history_deliveries_parked` keeps
+  deliveries read before this device holds their chat, at most 1,024
+  (`park_history_delivery`, `parked_history_delivery_chats`,
+  `parked_history_deliveries`, `drop_parked_history_delivery`).
+  `expire_history_deliveries` drops rows a week old, and a local forget of a
+  chat drops its rows. `device_group_message_event_id` reads the app event id
+  of a recorded device-group message.
 - `mark_account_delivery_recovery_observed` takes the routes the relay plane
   holds for the generation it observes (mdk#2660 phase 4). An observation past
   the durable count merges them as `record_account_recovery_loss_routed`

@@ -2,11 +2,10 @@
 //! (mdk#2628 4.2a).
 //!
 //! The sending device packs its history of one chat into bundles
-//! (`history_bundle.rs`), and the receiving device imports each one. The
-//! transport through the device group is not built yet, so the
-//! `test-policy-overrides` hooks are the only callers. An import only adds
-//! rows: storage never overwrites a held row, marks each new one with the
-//! sending device's slot, and never counts it as unread.
+//! (`history_bundle.rs`), and the receiving device imports each one;
+//! `history_delivery.rs` carries them through the device group (4.2b). An
+//! import only adds rows: storage never overwrites a held row, marks each new
+//! one with the sending device's slot, and never counts it as unread.
 //!
 //! The receiver was never in the epochs it imports, so it cannot derive an
 //! attachment's key from the epoch's media secret. The sender puts each
@@ -15,8 +14,7 @@
 
 use super::AppClient;
 use crate::history_bundle::{
-    BundledEvent, ChatPosition, FileKey, HISTORY_BUNDLE_MAX_PLAINTEXT, HistoryBundle,
-    HistoryBundleBuilder, open_history_bundle,
+    BundledEvent, ChatPosition, FileKey, HistoryBundle, HistoryBundleBuilder, open_history_bundle,
 };
 use crate::media::{
     EncryptedMediaVersion, MediaAttachmentReference, media_attachment_from_imeta_tag,
@@ -37,12 +35,13 @@ const EXPORT_PAGE_ROWS: usize = 512;
 
 impl AppClient {
     /// The next bundle of the chat `group_id`'s history after `after`, the
-    /// previous bundle's `to`, or from the start. None once nothing follows.
-    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+    /// previous bundle's `to`, or from the start, of at most `budget` bytes of
+    /// plaintext. None once nothing follows.
     pub(crate) fn export_chat_history(
         &self,
         group_id: &GroupId,
         after: Option<&ChatPosition>,
+        budget: usize,
     ) -> Result<Option<HistoryBundle>, AppError> {
         let group_id_hex = self.history_chat(group_id)?;
         let storage = self.app.account_storage(&self.state.label)?;
@@ -52,11 +51,7 @@ impl AppClient {
         // inside the stretch already read is never vouched for but left out.
         cgka_traits::StorageProvider::with_read_snapshot(&storage, |storage| {
             let storage = storage.app_storage();
-            let mut bundle = HistoryBundleBuilder::new(
-                group_id.as_slice(),
-                after.cloned(),
-                HISTORY_BUNDLE_MAX_PLAINTEXT,
-            );
+            let mut bundle = HistoryBundleBuilder::new(group_id.as_slice(), after.cloned(), budget);
             let mut cursor = after.cloned();
             loop {
                 let page = storage.history_export_page(
@@ -103,7 +98,6 @@ impl AppClient {
     /// breaks the format, or it names another chat. Drops an event outside the
     /// bundle's stretch, or one that carries an authority verdict its kind does
     /// not take.
-    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
     pub(crate) fn import_history_bundle(
         &mut self,
         group_id: &GroupId,
@@ -176,7 +170,7 @@ impl AppClient {
 
     /// The chat's group id as hex, once this device advertises the roster and
     /// holds `group_id` as one of the user's chats, never a device group.
-    fn history_chat(&self, group_id: &GroupId) -> Result<String, AppError> {
+    pub(super) fn history_chat(&self, group_id: &GroupId) -> Result<String, AppError> {
         if !self.app.device_groups_enabled() {
             return Err(AppError::DeviceGroupRefused("roster_unsupported"));
         }
@@ -205,7 +199,11 @@ impl AppClient {
     ) -> Result<Vec<DevSealedHistoryBundle>, AppError> {
         let mut sealed = Vec::new();
         let mut after = None;
-        while let Some(bundle) = self.export_chat_history(group_id, after.as_ref())? {
+        while let Some(bundle) = self.export_chat_history(
+            group_id,
+            after.as_ref(),
+            crate::history_bundle::HISTORY_BUNDLE_MAX_PLAINTEXT,
+        )? {
             let bundle_sealed = crate::history_bundle::seal_history_bundle(&bundle)?;
             sealed.push(DevSealedHistoryBundle {
                 key: *bundle_sealed.key,

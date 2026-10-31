@@ -133,6 +133,24 @@ impl SqliteAppStorage {
             .transpose()
     }
 
+    /// The app event id of the device-group message `message_id_hex` in
+    /// `group_id_hex`, when this device recorded it.
+    pub fn device_group_message_event_id(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> StorageResult<Option<String>> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT app_event_id FROM device_group_messages
+                 WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+                params![group_id_hex, message_id_hex],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .storage()
+    }
+
     /// Every recorded message, oldest first. Test support only.
     #[cfg(any(test, feature = "test-support"))]
     pub fn device_group_messages(&self) -> StorageResult<Vec<RecordedDeviceGroupMessage>> {
@@ -185,7 +203,15 @@ mod tests {
             store.device_group_message_kind("aa", "m1").unwrap(),
             Some(475)
         );
+        assert_eq!(
+            store.device_group_message_event_id("aa", "m1").unwrap(),
+            Some("e1".into())
+        );
         assert_eq!(store.device_group_message_kind("bb", "m9").unwrap(), None);
+        assert_eq!(
+            store.device_group_message_event_id("bb", "m9").unwrap(),
+            None
+        );
         // A known message id stays.
         store
             .note_device_group_message_ids(&[("aa".into(), "e1".into(), "m2".into())])

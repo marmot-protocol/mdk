@@ -38,7 +38,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   notification-trigger publishing),
   `retention.rs` (the engine-owned retention sweep policy, the
   storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `chat_history.rs` (a
-  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_notices.rs` ("history may be incomplete"
+  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_delivery.rs` (owing from the engine's sibling adds, sending, parking and importing sealed history deliveries), `history_notices.rs` ("history may be incomplete"
   notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
   in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
@@ -187,17 +187,19 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   it, or a branch dropped it); a seen one stays seen. Keep `CompromiseWarningReason` exhaustive so each binding maps a new reason
   explicitly; the stored reason is text with no CHECK, and an unknown one is skipped on read.
 - Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
-  `send_device_group_message` (`false` means it reached no relay), one dispatch by kind in `observe_device_group_event`
+  `send_device_group_message` (`false` means it reached no relay; a feature that records the event's id first builds
+  it with `device_group_event` and sends it with `send_device_group_event`), one dispatch by kind in `observe_device_group_event`
   (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
   D33). That read sees only the current tree, so a message from an earlier epoch has no readable sender. List every kind
-  sent only in a device group in `is_device_group_kind` (457, 459, 460, 475, 476), the one list: `observe_event`
+  sent only in a device group in `is_device_group_kind` (457, 459, 460, 473, 475, 476), the one list: `observe_event`
   drops one received in any other group before the host summary and the stored projection, the notification preview
   refuses it, and the custom path rejects it as reserved. The engine withdraws a message by message id alone (an own
   send's transport id, a received message's content id), so a kind whose withdrawal a feature acts on is listed in
   `withdrawal_handled` and dispatched in `device_group_message_withdrawn`. Each such message is recorded with its kind
   in `device_group_messages` when sent (before the send; its message id is filled in from whichever drain's effects
-  publish it, in `retain_effect_projection`) and when read. Records go after a week or past 4,096, so a feature also
-  acts on a withdrawn message with no record, which may be of any kind.
+  publish it, in `retain_effect_projection`) and, unless only its sender acts on a withdrawal
+  (`recorded_when_read`), when read. Records go after a week or past 4,096, so a feature also acts on a withdrawn
+  message with no record, which may be of any kind.
 - Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
   Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
   roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
@@ -207,6 +209,18 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.
+- Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b, D76, `src/history_delivery.rs`
+  for the format, `src/client/history_delivery.rs` for both sides). Only the adder sends: the engine records each
+  sibling an own confirmed Commit adds (`SiblingAddStorage`), and maintenance owes each its chat's history
+  (`owe_added_siblings_history`) before sending anything, never from another trigger. Whether the sibling asks for
+  history and carries a history key is read at send time; a history that cannot be sent is forgotten. Record each
+  delivery's chat and receiver by app event id before its send, so a withdrawal owes the history again; keep it owed
+  until every delivery reached a relay. Seal only the bundle's key and hash, to the receiver's history key, with
+  `delivery_context` binding the purpose, both slots and the chat. Read a delivery only in the trusted device group,
+  addressed to this device, from a sibling through `ensure_sent_by`, and refuse one that does not open rather than
+  park it. Import through 4.2a's `import_history_bundle`, never another path; park a delivery whose chat this device
+  does not hold yet. Keep the inline budget (`INLINE_BUNDLE_MAX_PLAINTEXT`) inside the 32,768-byte content limit for
+  a 256-byte chat id.
 - Heartbeats (mdk#2628 item 3.6, D35) live in `src/client/device_heartbeats.rs`. Send one only from the trusted
   device group, once this device's own leaf reads as its slot, at most once an hour. Record the sent time only once the
   send returns that it went out (published, unresolved or queued), and leave the record alone when it reached no one
@@ -779,7 +793,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   to the deployment operator: config validation, staged outbox, retry, purge; tests in
   `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
   `history_bundle.rs` (the history bundle's encoding, filling in chat order and sealing; tests in
-  `history_bundle/tests.rs`), `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
+  `history_bundle/tests.rs`), `history_delivery.rs` (the sealed history delivery's encoding, sealing context and
+  inline limits), `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
   `nostr_verification.rs` (stateless public-event verification), `relay_caps.rs` (each relay's NIP-11
   `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `profile_pseudonyms.rs` (cosmetic display names; not a

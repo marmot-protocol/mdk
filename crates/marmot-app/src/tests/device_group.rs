@@ -24,6 +24,7 @@ mod chat_kinds;
 mod devices;
 mod heartbeats;
 mod history;
+mod history_delivery;
 mod private_key_packages;
 mod removal;
 

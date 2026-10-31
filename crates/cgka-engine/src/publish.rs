@@ -133,6 +133,7 @@ impl<S: StorageProvider> Engine<S> {
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
                 let mut own_commit_stamp = None;
+                let mut sibling_slots = Vec::new();
                 if has_pending_commit {
                     // `staged` borrows `mls_group`; scope it so the subsequent
                     // `merge_pending_commit` can take `&mut mls_group`.
@@ -143,6 +144,9 @@ impl<S: StorageProvider> Engine<S> {
                         crate::capability_manager::check_added_leaf_profiles(
                             storage, &group_id, staged,
                         )?;
+                        if kind == crate::epoch_manager::PendingKind::GroupEvolution {
+                            sibling_slots = self.sibling_slots_added(storage, &group_id, staged);
+                        }
                         // Capture the convergence ordering stamp while the
                         // staged commit is still attached: stored convergence
                         // cannot re-derive priority or consumed proposal refs
@@ -201,6 +205,18 @@ impl<S: StorageProvider> Engine<S> {
                         &mls_group,
                         self.wall_clock.now(),
                     )?;
+                    // This device owes each sibling the Commit added the
+                    // group's history (mdk#2628 D76), recorded with the
+                    // membership that owes it.
+                    if !sibling_slots.is_empty()
+                        && let Some(sibling_adds) = storage.sibling_add_storage()
+                    {
+                        sibling_adds.record_sibling_adds(
+                            &group_id,
+                            &sibling_slots,
+                            self.wall_clock.now().0,
+                        )?;
+                    }
                     if let Some(stamp) = own_commit_stamp.as_mut() {
                         stamp.resulting_epoch_authenticator = Some(
                             crate::openmls_projection::own_commit_post_merge_epoch_authenticator(

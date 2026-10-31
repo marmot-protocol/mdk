@@ -18,6 +18,7 @@ pub(crate) mod device_renames;
 pub(crate) mod encrypted_media_secrets;
 pub(crate) mod group_system;
 pub(crate) mod handle;
+pub(crate) mod history_deliveries;
 pub(crate) mod local_submissions;
 pub(crate) mod media_catalog;
 pub(crate) mod message_drafts;

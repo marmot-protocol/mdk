@@ -97,6 +97,21 @@
   coverage-ledger route's notice, shown and dismissed, with the route's
   one-way tag as `obligation_ref` (mdk#2660). Unproduced until the recovery
   runner owns history; strict v5 receivers must accept it before then.
+- A chat's history goes to a sibling device through the device group as
+  sealed history deliveries (kind 473, mdk#2628 item 4.2b, D76). Only the
+  device whose own confirmed Commit added the sibling to the chat sends it.
+  Each delivery carries one bundle of at most 23,552 bytes of plaintext
+  inline, with the bundle's key and hash sealed to the receiver's history key
+  for that sender, receiver and chat. The sender owes the history from the
+  add before sending, keeps it owed until every delivery reached a relay,
+  owes it again when branch selection withdraws a delivery, and forgets it a
+  week after the add, or at once when the history needs more than eight
+  inline bundles or the receiver does not ask for history. The receiver reads
+  a delivery only from a sibling whose leaf is tagged, addressed to it, and
+  opening with its own history key; it imports the bundle once it holds the
+  chat and parks it for up to a week until then. A delivery read after a
+  later device-group commit has no readable sender and is refused, and there
+  are no receipts, so its history is lost. Only behind `dev_device_groups`.
 - `MarmotAppConfig::device_platform` (`with_device_platform`) names the
   platform this device runs on. Each device writes it and
   `key_package_client_name` into its own roster entry with its next KeyPackage
