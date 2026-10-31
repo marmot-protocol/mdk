@@ -12,7 +12,7 @@ const DEVICE_GROUP_KINDS: [u64; 6] = [457, 459, 460, 461, 475, 476];
 
 /// Alice cannot send any of them as a custom event, so she sends each the way
 /// a device-group message goes out. Bob's chat shows the custom event and the
-/// chat message she sends after them, and nothing of the five.
+/// chat message she sends after them, and nothing of the six.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn device_group_kinds_in_a_chat_are_ignored_and_never_sent_as_custom_events() {
     let dir = tempfile::tempdir().unwrap();
@@ -73,7 +73,7 @@ async fn device_group_kinds_in_a_chat_are_ignored_and_never_sent_as_custom_event
         .collect();
     assert_eq!(kinds, vec![30078, MARMOT_APP_EVENT_KIND_CHAT]);
 
-    // Nothing of the four is stored, in the timeline or the app events.
+    // Nothing of the six is stored, in the timeline or the app events.
     let timeline: Vec<u64> = app
         .timeline_messages_with_query(
             "bob",
