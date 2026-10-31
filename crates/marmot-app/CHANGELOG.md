@@ -43,7 +43,10 @@
   (`device_group_busy`) while an earlier change of this device's in the
   device group is in flight. A rename whose commit loses a fork
   is made again on a later maintenance pass, unless another rename of that
-  device won; that one stands (D37). Refused in release builds until the roster's spec lands.
+  device won; that one stands (D37). Every roster entry this device creates,
+  its own founding entry and every linked device's, carries a fresh rename id, so
+  a device linked again after a failed link never inherits a rename kept for
+  its earlier entry. Refused in release builds until the roster's spec lands.
 - `AppGroupMlsState.convergence_parked` reports a group whose convergence
   pass spent its failure budget (mdk#2684). Show it as stuck syncing until
   new group activity arrives or the user retries;
@@ -75,6 +78,12 @@
   this device first (mdk#2628 item 3.1). `LinkedDevicesChanged` says to
   re-read it, since the device group's own events never reach hosts. Both are
   empty and silent in release builds until the roster's spec lands.
+- Each device sends a heartbeat (kind 457) in the device group at most once
+  an hour while it runs, never with a push (mdk#2628 item 3.6). `LinkedDevice`
+  gains `last_active_at`, when a sibling's heartbeat last showed it running,
+  and `inactive`, this device's own judgement 30 days after the later of that
+  and when it first found the sibling in the roster. Release builds send and
+  show neither.
 - `MarmotAppRuntime::key_package_refresh_overdue` says when this device's
   device group has held its KeyPackage refresh back for a week (mdk#2628 item
   3.4), so hosts can tell the user before inviters stop treating the device as

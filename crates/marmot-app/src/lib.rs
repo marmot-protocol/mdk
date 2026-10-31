@@ -2124,6 +2124,7 @@ impl MarmotApp {
             history_notice_baseline: None,
             // A fresh client cannot know what hosts last read.
             linked_devices_changed: true,
+            inactive_siblings: None,
             key_package_refresh_overdue: None,
             key_package_refresh_overdue_changed: true,
             sign_in_schedule: Default::default(),

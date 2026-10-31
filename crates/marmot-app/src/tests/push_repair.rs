@@ -186,8 +186,15 @@ async fn four_members() -> Fixture {
 /// An offline owner's record reaches a joiner through repair: the adder's
 /// snapshot never came, so the joiner's announce at the end of its window
 /// names nothing, and the adder relays Bob's record as Bob signed it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_offline_owners_record_reaches_a_joiner_through_repair() {
+#[test]
+fn an_offline_owners_record_reaches_a_joiner_through_repair() {
+    run_composed_app_runtime_test(
+        "push-repair-offline-owner",
+        an_offline_owners_record_reaches_a_joiner_through_repair_body,
+    );
+}
+
+async fn an_offline_owners_record_reaches_a_joiner_through_repair_body() {
     let mut fx = Fixture::new().await;
     let relay = fx.relay.clone();
     let group = fx.group.clone();
@@ -223,8 +230,15 @@ async fn an_offline_owners_record_reaches_a_joiner_through_repair() {
 
 /// A request draws replies from the top three ranked leaves only, each
 /// carrying every record, since a request names nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_request_draws_replies_from_at_most_the_top_three_leaves() {
+#[test]
+fn a_request_draws_replies_from_at_most_the_top_three_leaves() {
+    run_composed_app_runtime_test(
+        "push-repair-top-three",
+        a_request_draws_replies_from_at_most_the_top_three_leaves_body,
+    );
+}
+
+async fn a_request_draws_replies_from_at_most_the_top_three_leaves_body() {
     let mut fx = four_members().await;
     let relay = fx.relay.clone();
     let group = fx.group.clone();
@@ -279,8 +293,15 @@ async fn a_request_draws_replies_from_at_most_the_top_three_leaves() {
 
 /// A lower rank waits its slots, and cancels once a higher rank's reply,
 /// carried in the announce's epoch or later, covers what it would send.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lower_rank_cancels_when_a_higher_ranks_reply_covers_it() {
+#[test]
+fn a_lower_rank_cancels_when_a_higher_ranks_reply_covers_it() {
+    run_composed_app_runtime_test(
+        "push-repair-lower-rank-cancels",
+        a_lower_rank_cancels_when_a_higher_ranks_reply_covers_it_body,
+    );
+}
+
+async fn a_lower_rank_cancels_when_a_higher_ranks_reply_covers_it_body() {
     let mut fx = four_members().await;
     let relay = fx.relay.clone();
     let group = fx.group.clone();
@@ -333,8 +354,15 @@ async fn a_lower_rank_cancels_when_a_higher_ranks_reply_covers_it() {
 /// A cover applies to the entry it carries and older ones: when this device
 /// comes to hold a newer record for a key after a higher rank's reply covered
 /// the one it decided on, it still sends the newer record.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_newer_entry_than_a_cover_is_still_sent() {
+#[test]
+fn a_newer_entry_than_a_cover_is_still_sent() {
+    run_composed_app_runtime_test(
+        "push-repair-newer-entry",
+        a_newer_entry_than_a_cover_is_still_sent_body,
+    );
+}
+
+async fn a_newer_entry_than_a_cover_is_still_sent_body() {
     let mut fx = four_members().await;
     let relay = fx.relay.clone();
     let group = fx.group.clone();
@@ -392,8 +420,15 @@ async fn a_newer_entry_than_a_cover_is_still_sent() {
 /// A device catching up decides only after it has processed its backlog: a
 /// reply another member sent while it was away cancels its own, though its
 /// leaf ranks first.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_device_catching_up_decides_after_its_backlog() {
+#[test]
+fn a_device_catching_up_decides_after_its_backlog() {
+    run_composed_app_runtime_test(
+        "push-repair-catching-up",
+        a_device_catching_up_decides_after_its_backlog_body,
+    );
+}
+
+async fn a_device_catching_up_decides_after_its_backlog_body() {
     let mut fx = four_members().await;
     let relay = fx.relay.clone();
     let group = fx.group.clone();
@@ -439,8 +474,15 @@ async fn a_device_catching_up_decides_after_its_backlog() {
 
 /// A member answers each announcer's leaf at most once in 24 hours, however
 /// many announces or requests that leaf sends.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_member_replies_to_each_leaf_at_most_once_a_day() {
+#[test]
+fn a_member_replies_to_each_leaf_at_most_once_a_day() {
+    run_composed_app_runtime_test(
+        "push-repair-daily-reply",
+        a_member_replies_to_each_leaf_at_most_once_a_day_body,
+    );
+}
+
+async fn a_member_replies_to_each_leaf_at_most_once_a_day_body() {
     let mut fx = four_members().await;
     let relay = fx.relay.clone();
     let group = fx.group.clone();
@@ -478,8 +520,15 @@ async fn a_member_replies_to_each_leaf_at_most_once_a_day() {
 
 /// A `have` that is not an array, or has more than 4,096 elements, draws no
 /// reply. Elements that are not 8 bytes in base64 name nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_malformed_or_oversized_have_draws_no_reply() {
+#[test]
+fn a_malformed_or_oversized_have_draws_no_reply() {
+    run_composed_app_runtime_test(
+        "push-repair-malformed-have",
+        a_malformed_or_oversized_have_draws_no_reply_body,
+    );
+}
+
+async fn a_malformed_or_oversized_have_draws_no_reply_body() {
     let mut fx = four_members().await;
     let relay = fx.relay.clone();
     let group = fx.group.clone();
@@ -526,8 +575,15 @@ async fn a_malformed_or_oversized_have_draws_no_reply() {
 }
 
 /// An announce naming everything its peers hold draws no reply.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_converged_group_sends_no_repair() {
+#[test]
+fn a_converged_group_sends_no_repair() {
+    run_composed_app_runtime_test(
+        "push-repair-converged",
+        a_converged_group_sends_no_repair_body,
+    );
+}
+
+async fn a_converged_group_sends_no_repair_body() {
     let mut fx = four_members().await;
     let relay = fx.relay.clone();
     let group = fx.group.clone();
@@ -554,8 +610,15 @@ async fn a_converged_group_sends_no_repair() {
 
 /// A repair reply is not an announce: it settles neither the announce a
 /// device owes nor its join window.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_repair_reply_settles_no_announce_owed() {
+#[test]
+fn a_repair_reply_settles_no_announce_owed() {
+    run_composed_app_runtime_test(
+        "push-repair-settles-announce",
+        a_repair_reply_settles_no_announce_owed_body,
+    );
+}
+
+async fn a_repair_reply_settles_no_announce_owed_body() {
     let mut fx = four_members().await;
     let relay = fx.relay.clone();
     let group = fx.group.clone();

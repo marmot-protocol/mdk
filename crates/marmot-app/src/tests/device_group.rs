@@ -21,6 +21,7 @@ use storage_sqlite::DeviceGroupTrust;
 
 mod chat_kinds;
 mod devices;
+mod heartbeats;
 mod private_key_packages;
 mod removal;
 
@@ -1058,6 +1059,8 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         add_to_all_chats: true,
         bring_history: true,
         keep_while_inactive: false,
+        last_active_at: None,
+        inactive: false,
         removal_pending: false,
     };
     // The dev hook links the new device with both settings off.
@@ -1153,6 +1156,8 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         add_to_all_chats: true,
         bring_history: true,
         keep_while_inactive: false,
+        last_active_at: None,
+        inactive: false,
         removal_pending: false,
     };
     let desk = LinkedDevice {

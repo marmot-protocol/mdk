@@ -48,7 +48,7 @@
 
 mod messages;
 
-pub(crate) use messages::is_device_group_kind;
+pub(crate) use messages::{Exchange, KIND_DEVICE_HEARTBEAT, is_device_group_kind};
 
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
@@ -65,9 +65,12 @@ use cgka_traits::{EpochId, Group, GroupId, KeyPackage, Timestamp, TransportGroup
 use marmot_session::DeviceSelfReport;
 use rand::RngCore as _;
 use rand::rngs::OsRng;
-use storage_sqlite::{DeviceGroupRecord, DeviceGroupTrust};
+use std::collections::BTreeMap;
+use storage_sqlite::{DeviceActivityRecord, DeviceGroupRecord, DeviceGroupTrust};
 
+use super::device_heartbeats::sibling_inactive;
 use super::device_pairing::DeviceLinkChoices;
+use super::device_renames::fresh_rename_id;
 use super::{AppClient, UnpublishedWelcomeDelivery, UnpublishedWelcomeKind, group_is_terminal};
 use crate::{AppError, unix_now_seconds};
 
@@ -129,6 +132,16 @@ pub struct LinkedDevice {
     pub bring_history: bool,
     /// Inactivity never removes it.
     pub keep_while_inactive: bool,
+    /// When a heartbeat last showed it running, in Unix seconds: the newest,
+    /// over its heartbeats that counted, of when each was created or, if
+    /// earlier, when this device read it (D35). `None` for this device, and
+    /// for a sibling none of whose heartbeats has counted yet.
+    pub last_active_at: Option<u64>,
+    /// This device judges it inactive: 30 days have passed since its last
+    /// activity or since this device first found it in the roster,
+    /// whichever is later. Never this device. Judged here only; `status`
+    /// [`LinkedDeviceStatus::Inactive`] is the roster's mark.
+    pub inactive: bool,
     /// The user removed it on this device, and the device group has not
     /// taken the removal yet (mdk#2628 item 3.6b).
     pub removal_pending: bool,
@@ -322,10 +335,13 @@ impl AppClient {
         // announcement writes if it cannot be read now; the new device sets
         // both of its own once it joins. Nobody chose settings for the
         // founder, so it takes the defaults a new device starts with:
-        // siblings add it to chats it is missing, with their history.
+        // siblings add it to chats it is missing, with their history. Each
+        // entry is created with a fresh rename id (3.6a), so a later rename
+        // of either never reads as one made before it existed.
         roster.devices.insert(
             own_slot,
             DeviceEntryV1 {
+                rename_id: Some(fresh_rename_id()),
                 linked_at: now,
                 settings: DeviceSettingsV1 {
                     add_to_all_chats: true,
@@ -340,6 +356,7 @@ impl AppClient {
         );
         let sibling_entry = DeviceEntryV1 {
             label: choices.label.clone(),
+            rename_id: Some(fresh_rename_id()),
             linked_at: now,
             linked_by: Some(own_slot),
             settings: DeviceSettingsV1 {
@@ -960,6 +977,13 @@ impl AppClient {
         let own_slot = storage
             .key_package_lifecycle()?
             .and_then(|lifecycle| device_slot(&lifecycle.stable_slot_id).ok());
+        let activity: BTreeMap<String, DeviceActivityRecord> = storage
+            .app_storage()
+            .device_activity()?
+            .into_iter()
+            .map(|activity| (activity.slot_id_hex.clone(), activity))
+            .collect();
+        let now = unix_now_seconds();
         let group_id_hex = hex::encode(group_id.as_slice());
         let removing: std::collections::BTreeSet<String> = storage
             .app_storage()
@@ -973,6 +997,15 @@ impl AppClient {
             .into_iter()
             .map(|(slot, entry)| {
                 let mut device = linked_device(slot, entry, own_slot.as_ref());
+                if !device.is_this_device {
+                    // A row kept for an earlier entry of the slot, linked
+                    // again since the last pass, says nothing of this one.
+                    let activity = activity
+                        .get(&device.slot_id_hex)
+                        .filter(|activity| activity.linked_at == device.linked_at);
+                    device.last_active_at = activity.and_then(|activity| activity.last_active_at);
+                    device.inactive = sibling_inactive(activity, now);
+                }
                 device.removal_pending = removing.contains(&device.slot_id_hex);
                 device
             })
@@ -1051,6 +1084,8 @@ fn linked_device(
         add_to_all_chats: entry.settings.add_to_all_chats,
         bring_history: entry.settings.bring_history,
         keep_while_inactive: entry.settings.keep_while_inactive,
+        last_active_at: None,
+        inactive: false,
         removal_pending: false,
     }
 }
