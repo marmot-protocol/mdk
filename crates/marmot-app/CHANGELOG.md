@@ -119,9 +119,8 @@
   sender, receiver and chat. The sender owes the history from the add before
   sending, keeps it owed until every delivery reached a relay, owes it again
   when branch selection withdraws a delivery or its queued publish later fails
-  for good, and forgets it a week after the add, or at once when the history
-  needs more than eight inline bundles or the receiver does not ask for
-  history. An event too large for one delivery is left out. The receiver reads
+  for good, and forgets it a week after the add, or at once when the receiver
+  does not ask for history. The receiver reads
   a delivery only from a sibling whose leaf is tagged, addressed to it, and
   opening with its own history key; it imports the bundle once it holds the
   chat and parks it for up to a week until then. A delivery from an epoch
@@ -131,6 +130,26 @@
   when the sender hears of the withdrawal, so one whose record was evicted, or
   that a crash interrupted, is lost too. A history is still sent when branch
   selection later withdraws the adding Commit. Only behind
+  `dev_device_groups`.
+- A history too long for eight inline deliveries, or holding an event too
+  large for one, goes through Blossom (mdk#2628 item 4.2c, D77): its newest 16
+  bundles of up to 8 MiB of plaintext each, older ones left out, each uploaded
+  as one blob to the first of the chat's Blossom endpoints that takes it, off
+  the account worker. A delivery then names that server (`blossom`, without
+  the query a v1 endpoint may carry) instead of carrying the bundle, and is
+  sent only once every blob is uploaded. The receiver parks it and fetches
+  the blob off the worker once it holds the chat, through the dial-safe
+  Blossom transport, reading at most the largest bundle ciphertext; one
+  naming the device group is refused unfetched. A failed upload, send or fetch tries again after a wait
+  that doubles up to an hour, until the delivery is a week old, and so does a
+  delivery a relay refuses for good. A chat with no Blossom endpoint, or with
+  no media servers at all, gets no such history, and blobs are never deleted:
+  the server keeps the ciphertext, its size and its timing until it expires
+  them. Imported messages reach subscribers as the fetch completes, and a host
+  that runs maintenance itself (`run_due_maintenance`) starts the uploads and
+  fetches it makes due.
+  A received delivery that fails for any reason but a refusal now fails the
+  projection, so it is read again rather than lost. Only behind
   `dev_device_groups`.
 - `MarmotAppConfig::device_platform` (`with_device_platform`) names the
   platform this device runs on. Each device writes it and

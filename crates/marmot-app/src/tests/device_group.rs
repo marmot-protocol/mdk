@@ -35,7 +35,8 @@ fn device_group_app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClie
         MarmotAppConfig::white_noise()
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
-            .with_dev_device_groups(true),
+            .with_dev_device_groups(true)
+            .with_allow_loopback_blob_endpoints(true),
     )
     .with_test_relay_client(relay)
 }

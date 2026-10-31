@@ -38,7 +38,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   notification-trigger publishing),
   `retention.rs` (the engine-owned retention sweep policy, the
   storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `chat_history.rs` (a
-  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_delivery.rs` (owing from the engine's sibling adds, sending, parking and importing sealed history deliveries), `history_notices.rs` ("history may be incomplete"
+  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_delivery.rs` (owing from the engine's sibling adds, sending inline or through Blossom, parking, fetching and importing sealed history deliveries), `history_notices.rs` ("history may be incomplete"
   notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
   in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
@@ -220,8 +220,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.
-- Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b, D76, `src/history_delivery.rs`
-  for the format, `src/client/history_delivery.rs` for both sides). Only the adder sends: the engine records each
+- Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77,
+  `src/history_delivery.rs` for the format, `src/client/history_delivery.rs` for both sides). Only the adder sends: the engine records each
   sibling an own confirmed Commit adds (`SiblingAddStorage`), and maintenance owes each its chat's history
   (`owe_added_siblings_history`) before sending anything, never from another trigger. Whether the sibling asks for
   history and carries a history key is read at send time; a history that cannot be sent is forgotten. Record each
@@ -232,7 +232,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   addressed to this device, from a sibling through `ensure_sent_by`, and refuse one that does not open rather than
   park it. Import through 4.2a's `import_history_bundle`, never another path; park a delivery whose chat this device
   does not hold yet. Keep the inline budget (`INLINE_BUNDLE_MAX_PLAINTEXT`) inside the 32,768-byte content limit for
-  a 256-byte chat id.
+  a 256-byte chat id. A history that needs more than `MAX_INLINE_BUNDLES`, or holds an event too large for one, goes
+  through Blossom as a whole, never mixed: upload its newest `MAX_BLOSSOM_BUNDLES` bundles off the worker
+  (`HistoryUpload`, dispatched by `dispatch_history_blobs` on the media executor), each to the first of the chat's
+  Blossom endpoints that takes it, keeping bundle keys only in memory; send its deliveries, each naming its server,
+  only once every blob is uploaded. A receiver parks a Blossom delivery (refusing one whose chat could carry no
+  history, as `history_chat` does) and fetches the blob off the worker once it holds the chat (`HistoryFetch`), through the dial-safe Blossom transport, bounded by the largest bundle
+  ciphertext; a failed upload, send or fetch waits and tries again, and a row that fails to prepare waits alone
+  rather than block the rest. A chat with no Blossom endpoint forgets such a history. Only a refusal drops a
+  received delivery: any other error fails the projection so it is read again.
 - Heartbeats (mdk#2628 item 3.6, D35) live in `src/client/device_heartbeats.rs`. Send one only from the trusted
   device group, once this device's own leaf reads as its slot, at most once an hour. Record the sent time only once the
   send returns that it went out (published, unresolved or queued), and leave the record alone when it reached no one
@@ -823,8 +831,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   to the deployment operator: config validation, staged outbox, retry, purge; tests in
   `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
   `history_bundle.rs` (the history bundle's encoding, filling in chat order and sealing; tests in
-  `history_bundle/tests.rs`), `history_delivery.rs` (the sealed history delivery's encoding, sealing context and
-  inline limits), `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
+  `history_bundle/tests.rs`), `history_delivery.rs` (the sealed history delivery's encoding, sealing context,
+  inline limits and Blossom server rules), `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
   `nostr_verification.rs` (stateless public-event verification), `relay_caps.rs` (each relay's NIP-11
   `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `profile_pseudonyms.rs` (cosmetic display names; not a

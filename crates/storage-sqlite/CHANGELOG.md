@@ -172,6 +172,18 @@
   `attachment_history_source` and its insert trigger take a row without a
   transport id when `app_event_imports` marks it, and the attachment tables
   use its app event id as its `source_message_id_hex`.
+- Migration 0166 (mdk#2628 item 4.2c, D77) sends a history too long for
+  inline deliveries through Blossom. `history_deliveries_owed` gains
+  `blossom_due_at` and `blossom_attempts` (`send_history_delivery_by_blossom`,
+  `due_blossom_history_deliveries`, `defer_blossom_history_delivery`; owing a
+  history afresh clears them), and `history_deliveries_parked` is rebuilt so a
+  delivery parks either its bundle or the Blossom servers that hold it, with
+  when to fetch it (`ParkedBundle`, `due_parked_history_fetches`,
+  `defer_parked_history_fetch`). `OwedHistoryDelivery` gains the two fields and
+  `ParkedHistoryDelivery::bundle` is a `ParkedBundle`.
+  `owe_history_delivery_again` returns the history it owes again
+  (`Option<OwedHistoryDelivery>`) instead of `bool`, so the caller can back off
+  one going through Blossom. Test support gains `execute_batch_for_test`.
 - Migration 0149 (mdk#2628 item 4.2b, D76) adds four tables for sealed
   history deliveries. `cgka_sibling_adds` holds each sibling slot one of this
   device's own confirmed Commits added to a group, written by the engine

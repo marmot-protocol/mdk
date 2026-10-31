@@ -315,7 +315,8 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
     let mut bundle = alice
         .export_chat_history(&chat, None, HISTORY_BUNDLE_MAX_PLAINTEXT)
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .bundle;
     let event = bundle
         .events
         .iter_mut()
@@ -412,7 +413,8 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
     let passed_on = bob
         .export_chat_history(&chat, None, HISTORY_BUNDLE_MAX_PLAINTEXT)
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .bundle;
     let event = passed_on
         .events
         .iter()
