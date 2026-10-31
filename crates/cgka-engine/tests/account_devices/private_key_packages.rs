@@ -924,10 +924,7 @@ async fn a_full_chat_evicts_a_withdrawn_sibling_offer_first() {
     }
     withdraw_carrier(&chat.laptop, b"B");
     assert_eq!(chat.arrive(4, b"E").await, offered());
-    let carriers: Vec<_> = [b'A', b'C', b'D', b'E']
-        .into_iter()
-        .map(|carrier| hash_id(&[carrier]))
-        .collect();
+    let carriers: Vec<_> = b"ACDE".iter().map(|&carrier| hash_id(&[carrier])).collect();
     assert_eq!(chat.carriers(), carriers);
     for carrier in b'C'..=b'E' {
         withdraw_carrier(&chat.laptop, &[carrier]);
