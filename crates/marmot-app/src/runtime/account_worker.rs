@@ -2355,6 +2355,14 @@ async fn run_app_runtime_account_worker(
                 match done {
                     Some(done) => {
                         complete_media_http(&mut client, done, &shared, &media_http).await;
+                        // A fetched history imports messages; show them now,
+                        // not at the next maintenance pass.
+                        publish_client_pending_projection_updates(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
                         avatar_due = true;
                         attachment_due = true;
                         schedule_pending_convergence_groups(

@@ -567,6 +567,84 @@ async fn a_history_too_long_to_send_inline_goes_through_blossom() {
     );
 }
 
+/// Through the runtime, the account worker's maintenance pass fetches a
+/// parked Blossom delivery off the worker, and its messages reach
+/// subscribers as the fetch completes, not at the next pass 15 s later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_runtime_fetches_a_blossom_history_and_shows_it_at_once() {
+    let (mut devices, _group, _chat, _first) = history_devices().await;
+    let blossom = local_blossom();
+    let long = "x".repeat(15_000);
+    let longer = devices.phone.create_group("longer", &[]).await.unwrap();
+    let longer_hex = hex::encode(longer.as_slice());
+    use_blossom(
+        &mut devices.phone,
+        &longer,
+        BLOSSOM_LOCATOR_KIND_V1,
+        &blossom.url,
+    )
+    .await;
+    for index in 0..=MAX_INLINE_BUNDLES {
+        send_text(&mut devices.phone, &longer, &format!("{index}{long}")).await;
+    }
+    add_laptop(&mut devices, &longer).await;
+    devices.phone.drive_history_deliveries().await;
+    devices.phone.drive_history_blobs().await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let laptop_storage = storage(&devices.laptop_app);
+    assert_eq!(
+        laptop_storage.parked_history_delivery_chats().unwrap(),
+        std::slice::from_ref(&longer_hex)
+    );
+
+    let Devices {
+        _dirs,
+        relay,
+        laptop_app,
+        laptop,
+        ..
+    } = devices;
+    drop(laptop);
+    let account_id_hex = laptop_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let _eose = scripted_eose_pump(laptop_app.relay_plane.clone(), relay, every_subscription);
+    let runtime = MarmotAppRuntime::new(laptop_app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !laptop_storage
+            .parked_history_delivery_chats()
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker fetches and imports the blob");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::ProjectionUpdated(published))
+                    if published.account_id_hex == account_id_hex
+                        && published.update.group_id_hex == longer_hex
+                        && !published.update.timeline_messages.is_empty() =>
+                {
+                    break;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("events closed"),
+            }
+        }
+    })
+    .await
+    .expect("the imported history is published as the fetch completes");
+    runtime.shutdown().await;
+}
+
 /// An upload the server refuses leaves the history owed until its wait ends,
 /// then it goes. A blob the server no longer holds, or serves altered, keeps
 /// the delivery parked until its wait ends; the laptop imports it once the
