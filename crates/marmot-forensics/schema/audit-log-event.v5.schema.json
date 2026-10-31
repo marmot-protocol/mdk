@@ -2576,6 +2576,9 @@
         },
         {
           "$ref": "#/$defs/OperationalEvent_subscription_refused"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_recovery_runner_paused"
         }
       ]
     },
@@ -3291,6 +3294,13 @@
       "enum": [
         "notification_lag",
         "follow_up"
+      ]
+    },
+    "Operational_recoveryRunnerCap": {
+      "enum": [
+        "attempts",
+        "event_bytes",
+        "both"
       ]
     },
     "Operational_subscriptionRefusalRoute": {
@@ -5150,6 +5160,47 @@
           }
         },
         "dropped": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+
+    "OperationalEvent_recovery_runner_paused": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "cap",
+        "attempts",
+        "event_bytes",
+        "paused_for_secs",
+        "pauses",
+        "late_findings"
+      ],
+      "properties": {
+        "type": {
+          "const": "recovery_runner_paused"
+        },
+        "cap": {
+          "$ref": "#/$defs/Operational_recoveryRunnerCap"
+        },
+        "attempts": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "event_bytes": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "paused_for_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "pauses": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "late_findings": {
           "$ref": "#/$defs/Operational_u64"
         },
         "record_context": {

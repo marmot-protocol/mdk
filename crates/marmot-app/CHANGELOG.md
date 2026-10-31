@@ -14,6 +14,8 @@
   account_label }` (mdk#2628). Exhaustive matches add an arm for it.
 - `MarmotAppEvent` adds `UnrecognizedSignInsChanged { account_id_hex,
   account_label }` (mdk#2628). Exhaustive matches add an arm for it.
+- `MarmotAppEvent` adds `CompromiseWarningChanged { account_id_hex,
+  account_label }` (mdk#2628). Exhaustive matches add an arm for it.
 
 - `MarmotDeployment::key_package_client_preference` and
   `KeyPackageClientPreference` are removed (mdk#2628). The KeyPackage `client`
@@ -99,6 +101,16 @@
   the last 30 days counts as that device's, even after a newer announcement
   or a rewind. `UnrecognizedSignInsChanged` says to re-read the list. All
   are empty and silent in release builds until the roster's spec lands.
+- `MarmotAppRuntime::compromise_warning` lists the account's open compromise
+  warning on this device as `CompromiseWarningItem`s (mdk#2628 item 3.7a):
+  each rejected sign-in or rejected KeyPackage, from this device or its device
+  group's roster, that the user has not seen here. A device's first roster
+  counts as seen. `dismiss_compromise_warning` marks everything it gathers as
+  seen, on this device only, and `CompromiseWarningChanged` says to re-read.
+  `start_fresh` answers every sign-in from before this device Not now, now and
+  later, rejecting nothing, and `started_fresh` says whether the device did so
+  and still has no device group. All are empty, false and silent in release
+  builds until the roster's spec lands.
 - Device pairing links a new device of the account through the account runtime (mdk#2628 item 3.3b), behind the
   unreleased `unreleased-device-pairing` feature and `dev_device_groups`. The new device starts a link naming its
   published KeyPackage (`MarmotAppRuntime::start_device_link`), both devices show the same seven emoji with their
@@ -405,6 +417,20 @@
   fixtures and `_for_test` hooks, including methods on `ProductAnalytics`
   (mdk#2627). Enable it only as a dev-dependency, as before. Builds without
   it are unchanged.
+- Diagnostics log events carry the module that emits them (mdk#2627). The
+  relay-telemetry exporter's events move from the
+  `marmot_app::relay_telemetry_export` target to
+  `marmot_observability::relay_telemetry_export`, and the app-performance
+  recorder's from `marmot_app::app_telemetry` to
+  `marmot_observability::app_telemetry`. The runtime's warning that relay
+  telemetry export was requested in a build without `otlp-export` moves from
+  `marmot_app::relay_telemetry_export` to `marmot_app::runtime`, and
+  `configure_product_analytics_from_environment`'s warning from
+  `marmot_app::product_analytics` to `marmot_app::usage_diagnostics`. A log
+  filter that named an old target must name the new one to keep its events,
+  and one that selected the whole `marmot_app` crate must add
+  `marmot_observability` to keep the exporter's and the recorder's. Every
+  event keeps its fields, level, message and `method`.
 
 ### Fixed
 

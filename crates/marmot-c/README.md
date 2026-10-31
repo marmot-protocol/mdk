@@ -469,6 +469,22 @@ its `slot_id_hex` handle, `client` (empty when none), `appeared_at`, `last_seen_
 `MARMOT_STATUS_INVALID_ARGUMENT`. The list is empty in every release build until the roster's spec lands. Re-read it on
 `MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED`. See the [shared contract](../marmot-uniffi/README.md#unrecognized-sign-ins).
 
+`marmot_start_fresh` answers every sign-in from before this device Not now, now and when one is listed later, without
+rejecting any, and `marmot_started_fresh` writes whether the device did so and still has no device group; re-read it
+on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`.
+
+## Compromise warning
+
+`marmot_compromise_warning` blocks on the account worker, reads local state only, and writes the account's open
+compromise warning on this device as an owned `MarmotCompromiseWarningItemList`; free it with
+`marmot_compromise_warning_item_list_free`. An empty list means no warning is open. Each `MarmotCompromiseWarningItem`
+has its `reason`, the `slot_id_hex` the rejection names, a `key_package_ref_hex` set only for
+`MARMOT_COMPROMISE_WARNING_REASON_REJECTED_KEY_PACKAGE`, and `occurred_at`. `reason` is a
+`MarmotCompromiseWarningReason` discriminant carried as `uint32_t`: later releases add values, so show one the host
+does not know as a generic reason. `marmot_dismiss_compromise_warning` closes the warning on this device only. Re-read
+it on `MARMOT_EVENT_COMPROMISE_WARNING_CHANGED`. It is empty in every release build until the roster's spec lands. See
+the [shared contract](../marmot-uniffi/README.md#compromise-warning).
+
 ## Linking a new device
 
 `marmot_start_device_link`, `marmot_confirm_device_link_match` and `marmot_cancel_device_link` (on the new device),

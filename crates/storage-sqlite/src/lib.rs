@@ -12,6 +12,11 @@ mod cross;
 pub mod media_store_bench;
 mod protocol;
 
+pub use app::compromise_warning::{
+    COMPROMISE_WARNING_ITEM_CAP, COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS,
+    CompromiseWarningGather, CompromiseWarningReason, CompromiseWarningRecord, FirstTrustedRoster,
+    ObservedWarningItem,
+};
 pub use app::device_activity::{DeviceActivityRecord, DeviceHeartbeatSent};
 pub use app::device_renames::DeviceRenameRecord;
 pub use app::group_system::{

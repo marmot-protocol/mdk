@@ -1118,6 +1118,35 @@ Signed-in local/external accounts, independent of any list or active worker.
 </details>
 
 <details>
+<summary>commands/compromise_warning.rs</summary>
+
+### `Marmot::compromise_warning`
+
+**Current.**
+
+```rust
+pub async fn compromise_warning( &self, account_ref: String, ) -> Result<Vec<CompromiseWarningItemFfi>, MarmotKitError>
+```
+
+List the account's open compromise warning on this device: each rejection the user has not seen here, the earliest gathered first. An empty list means no warning is open. A rejection means someone holding the account's signing key, or a session with its remote signer, published where the account's devices did not: a sign-in answered This wasn't me (`RejectedSignIn`), or a KeyPackage one of the account's devices found where they had not published (`RejectedKeyPackage`, with its `key_package_ref_hex`). Later releases add reasons; show one the app does not know as a generic one. The warning gathers this device's rejections and those in its device group's roster, so a rejection made on another device warns here too; rejections already in the first roster this device trusts count as seen. A rejected sign-in leaves the warning once its slot is linked as a device. The app writes the wording, and never says the account's devices stopped them. Read from local state with no network I/O. Always empty in release builds until the roster's spec lands. Refresh on `MarmotEventFfi::CompromiseWarningChanged`, which also fires once each time the account's worker opens, so it may fire with no visible change. Runs on the account worker.
+
+[Source](src/commands/compromise_warning.rs#L17)
+
+### `Marmot::dismiss_compromise_warning`
+
+**Current.**
+
+```rust
+pub async fn dismiss_compromise_warning( &self, account_ref: String, ) -> Result<(), MarmotKitError>
+```
+
+Dismiss the compromise warning on this device: everything it gathers now is marked seen here, and it stays closed until a new rejection arrives. Other devices' warnings are unchanged, and a rejection that branch selection drops and brings back stays seen. A refusal is `MarmotKitError::Runtime` whose details read `device group refused: roster_unsupported`, while device groups are off. Raises `CompromiseWarningChanged` when something was marked seen. Runs on the account worker.
+
+[Source](src/commands/compromise_warning.rs#L33)
+
+</details>
+
+<details>
 <summary>commands/conversation_window.rs</summary>
 
 ### `Marmot::open_conversation_window`
@@ -3547,6 +3576,30 @@ pub async fn check_sign_ins( &self, account_ref: String, ) -> Result<Vec<Unrecog
 Check the account's KeyPackage slots for new sign-ins now, for a pull-to-refresh or a Check now action, and return the list after the check. The check reads every slot from each of the account's KeyPackage relays, and restarts the six-hour schedule. Only a complete read marks a sign-in as signed out. A read that reached no relay fails with `MarmotKitError::Runtime` (`device group refused: key_packages_unreachable`), and the list is unchanged. Runs on the account worker and waits on the network.
 
 [Source](src/commands/sign_in.rs#L45)
+
+### `Marmot::start_fresh`
+
+**Current.**
+
+```rust
+pub async fn start_fresh(&self, account_ref: String) -> Result<(), MarmotKitError>
+```
+
+Start this device without the devices its first sign-in check found, for "No, start fresh" when the user no longer has them: every sign-in from before this device is answered `NotNow`, now and when one is listed later, so none prompts. It rejects nothing and raises no compromise warning, so one of those devices can still link this one. A refusal is `MarmotKitError::Runtime` whose details read `device group refused: <reason>`, the reason being `sign_ins_unchecked` (before the first check), `device_group_exists` (this device trusts a device group), or `roster_unsupported`. Raises `UnrecognizedSignInsChanged` when a listed sign-in changed. Runs on the account worker.
+
+[Source](src/commands/sign_in.rs#L63)
+
+### `Marmot::started_fresh`
+
+**Current.**
+
+```rust
+pub async fn started_fresh(&self, account_ref: String) -> Result<bool, MarmotKitError>
+```
+
+Whether this device started fresh and still trusts no device group, so the app can say that only chats it is invited to from now on are here. It turns false once the device trusts a device group; re-read after `start_fresh` and on `LinkedDevicesChanged`. Read from local state with no network I/O. Always false in release builds until the roster's spec lands. Runs on the account worker.
+
+[Source](src/commands/sign_in.rs#L70)
 
 ### `Marmot::unrecognized_sign_ins`
 

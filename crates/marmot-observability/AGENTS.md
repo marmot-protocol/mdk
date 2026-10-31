@@ -36,8 +36,8 @@ The code that ships diagnostics off the device (step 6 of the 2026-10 architectu
   before the helper; product analytics and relay telemetry have no denylist (adding one is its own change). See
   `docs/marmot-architecture/overview/dial-safety.md`.
 - **Privacy-safe logs only:** explicit `target` and `method` fields and aggregate values
-  (`docs/marmot-architecture/overview/observability.md`). The targets still read `marmot_app::<module>`; mdk#2627
-  PR 9 renames them.
+  (`docs/marmot-architecture/overview/observability.md`). Each target is `marmot_observability::<module>`, the module
+  that emits the event: `marmot_observability::app_telemetry` or `marmot_observability::relay_telemetry_export` today.
 
 ## Code map
 

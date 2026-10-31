@@ -1346,7 +1346,7 @@ pub async fn bounded_advisory_step<F: std::future::Future>(
         }
         Err(_) => {
             tracing::debug!(
-                target: "marmot_app::app_telemetry",
+                target: "marmot_observability::app_telemetry",
                 method = "bounded_advisory_step",
                 step,
                 cap_ms = cap.as_millis() as u64,

@@ -127,7 +127,7 @@ pub(super) fn survey(
             let due = due_at(pass, policy);
             let start = floor.max(pass.position_seconds.unwrap_or(0));
             let to_check = if due <= now {
-                let seconds = ranges_to_check(app, &key, start, now)?
+                let seconds = ranges_to_check(app, &key, start, turn.checked_until(route))?
                     .iter()
                     .map(|planned| planned.range.until - planned.range.since + 1)
                     .fold(0u64, u64::saturating_add);
@@ -245,16 +245,15 @@ pub(super) fn begin(
     let TransportReconciliationRoute::Group(nostr_group_id) = key.route else {
         return Ok(None);
     };
-    let current = sweepable(turn.routes).any(|route| {
+    let Some(route) = sweepable(turn.routes).find(|route| {
         route.route == key.route
             && !suspended(route)
             && route
                 .relays()
                 .any(|(relay, best_effort)| relay == key.relay && !best_effort)
-    });
-    if !current {
+    }) else {
         return Ok(None);
-    }
+    };
     if let Some(read) = caps.map(recovery_caps) {
         app.record_recovery_relay_caps(&key.relay, Some(read), now)?;
     }
@@ -282,7 +281,7 @@ pub(super) fn begin(
         .saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS)
         .max(inventory.since)
         .max(pass.position_seconds.unwrap_or(0));
-    let ranges = ranges_to_check(app, key, start, now)?;
+    let ranges = ranges_to_check(app, key, start, turn.checked_until(route))?;
     let (Some(first), Some(last)) = (ranges.first(), ranges.last()) else {
         app.record_recovery_recheck(&key.route, &key.relay, pass.revision, start, true, now)?;
         return Ok(None);
