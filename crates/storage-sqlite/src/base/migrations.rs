@@ -318,6 +318,8 @@ mod migration_0161_small_state;
 mod migration_0162_imported_media_file_keys;
 #[path = "migrations/0163_backup_recovery_key.rs"]
 mod migration_0163_backup_recovery_key;
+#[path = "migrations/0166_blossom_history_deliveries.rs"]
+mod migration_0166_blossom_history_deliveries;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1250,6 +1252,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0163_backup_recovery_key",
         suspend_foreign_keys: &[],
         apply: migration_0163_backup_recovery_key::apply,
+    },
+    Migration {
+        version: 166,
+        name: "0166_blossom_history_deliveries",
+        suspend_foreign_keys: &[],
+        apply: migration_0166_blossom_history_deliveries::apply,
     },
 ];
 
