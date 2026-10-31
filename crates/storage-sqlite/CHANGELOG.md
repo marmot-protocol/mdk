@@ -306,6 +306,13 @@
   published announce was built under, and settles the debt only while it
   still holds that value; a new Welcome drops it.
 
+### Changed
+
+- `put_welcome` replaces a stored Welcome in place, so `list_welcomes` keeps
+  reading it in the order it was first stored. The engine rewrites a sibling
+  Welcome's rejoin offer as its carriers change, and the offer's age decides
+  which one a full chat evicts.
+
 ### Fixed
 
 - `delete_group` joins a caller's `with_transaction` instead of beginning its

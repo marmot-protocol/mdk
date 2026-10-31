@@ -33,11 +33,13 @@ pub struct RejoinWelcome {
     pub sibling: Option<SiblingWelcomeRoute>,
 }
 
-/// How a sibling Welcome joins: the device-group message that carried it,
-/// the sibling slot that sent it and the private KeyPackage it names.
+/// How a sibling Welcome joins: the device-group messages that carried it,
+/// oldest first, the sibling slot that sent it and the private KeyPackage it
+/// names. A Welcome is one offer whatever carried it, and it joins through
+/// any carrier still delivered.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SiblingWelcomeRoute {
-    pub carrier: MessageId,
+    pub carriers: Vec<MessageId>,
     pub from: DeviceSlotId,
     pub key_package_ref: Vec<u8>,
 }

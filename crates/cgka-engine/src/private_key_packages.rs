@@ -32,7 +32,7 @@ use cgka_traits::storage::{
     IssuedPrivateKeyPackage, PrivateKeyPackageStorage, StorageProvider, private_key_package_halfway,
 };
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
-use cgka_traits::welcome::SiblingWelcomeRoute;
+use cgka_traits::welcome::{PendingWelcome, SiblingWelcomeRoute};
 use cgka_traits::{MemberId, MessageId};
 use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
@@ -302,6 +302,25 @@ pub(crate) fn sibling_welcome_id(message_id: &MessageId) -> MessageId {
     MessageId::new(hasher.finalize().to_vec())
 }
 
+/// A sibling offer's Welcome as `carrier` delivered it, and its join route:
+/// the join records the id that carrier gives the Welcome.
+pub(crate) fn sibling_offer_welcome(
+    stored: &TransportMessage,
+    route: &SiblingWelcomeRoute,
+    carrier: &MessageId,
+) -> (TransportMessage, crate::group_lifecycle::WelcomeRoute) {
+    (
+        TransportMessage {
+            id: sibling_welcome_id(carrier),
+            ..stored.clone()
+        },
+        crate::group_lifecycle::WelcomeRoute::Sibling(SiblingWelcomeRoute {
+            carriers: vec![carrier.clone()],
+            ..route.clone()
+        }),
+    )
+}
+
 /// Whether `bytes` are exactly one `mls_welcome` MLSMessage.
 fn is_one_welcome(mut bytes: &[u8]) -> bool {
     MlsMessageIn::tls_deserialize(&mut bytes)
@@ -533,7 +552,7 @@ impl<S: StorageProvider> Engine<S> {
                 msg.clone(),
                 Some((peeled, content_id.clone())),
                 crate::group_lifecycle::WelcomeRoute::Sibling(SiblingWelcomeRoute {
-                    carrier: message_id.clone(),
+                    carriers: vec![message_id.clone()],
                     from: welcome.from,
                     key_package_ref: welcome.key_package_ref.clone(),
                 }),
@@ -566,10 +585,43 @@ impl<S: StorageProvider> Engine<S> {
         Ok((peeled, content_id))
     }
 
+    /// The carrier a sibling offer joins through: the oldest still
+    /// delivered. The offer drops its withdrawn carriers, and once none is
+    /// left it is retired with no marker, since redelivery may bring the
+    /// Welcome back (mdk#2628 3.5b).
+    pub(crate) fn delivered_sibling_carrier(
+        &mut self,
+        offer: &PendingWelcome,
+        route: &SiblingWelcomeRoute,
+    ) -> Result<Option<MessageId>, EngineError> {
+        let mut delivered = Vec::new();
+        for carrier in &route.carriers {
+            if self.sibling_carrier_delivered(carrier)? {
+                delivered.push(carrier.clone());
+            }
+        }
+        if delivered.is_empty() {
+            self.storage.take_welcome(&offer.message_id)?;
+            return Ok(None);
+        }
+        if delivered.len() < route.carriers.len() {
+            let mut offer = offer.clone();
+            if let Some(sibling) = offer
+                .rejoin
+                .as_mut()
+                .and_then(|rejoin| rejoin.sibling.as_mut())
+            {
+                sibling.carriers = delivered.clone();
+            }
+            self.storage.put_welcome(&offer)?;
+        }
+        Ok(delivered.into_iter().next())
+    }
+
     /// Whether the device-group message that carried a sibling Welcome is
     /// still delivered. A branch switch that withdrew it, or a rollback that
-    /// dropped it, withdraws the Welcome too, so a rejoin offer it left joins
-    /// only while it is.
+    /// dropped it, withdraws the Welcome too, so a rejoin offer joins only
+    /// through a carrier that is.
     pub(crate) fn sibling_carrier_delivered(
         &self,
         carrier: &MessageId,
