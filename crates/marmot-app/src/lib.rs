@@ -74,6 +74,7 @@ use transport_nostr_adapter::{
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 mod close_registry;
+mod unlinked_publish_gate;
 mod user_blocks;
 pub use runtime::RuntimeBlockListSubscription;
 pub use user_blocks::{BlockListSnapshot, BlockedUser};
@@ -615,6 +616,10 @@ pub struct MarmotApp {
     /// Live KeyPackages of this app's accounts that their clients have not
     /// checked for new sign-ins yet (mdk#2628 3.2).
     pub(crate) sign_in_nudges: Arc<client::sign_ins::SignInNudges>,
+    /// Each account's publish stop, by account id: set once its device group
+    /// unlinked this device, and shared by every publisher
+    /// [`Self::relay_client_for_account_id`] hands out for it (mdk#2628 D67).
+    unlinked_publish_stops: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
@@ -1723,6 +1728,7 @@ impl MarmotApp {
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             sign_in_nudges: Arc::new(Default::default()),
+            unlinked_publish_stops: Arc::default(),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
@@ -1830,6 +1836,7 @@ impl MarmotApp {
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             sign_in_nudges: Arc::new(Default::default()),
+            unlinked_publish_stops: Arc::default(),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
@@ -2100,6 +2107,8 @@ impl MarmotApp {
             test_comparison_delay: None,
             #[cfg(test)]
             test_fail_unlink_mark: false,
+            #[cfg(all(test, feature = "unreleased-device-pairing"))]
+            test_fail_roster_read: false,
             #[cfg(test)]
             test_comparison_saved_cursor: None,
             recovery_owner,
@@ -7832,12 +7841,57 @@ impl MarmotApp {
         account_id_hex: &str,
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     ) -> Arc<dyn NostrRelayClient> {
+        // An account unlinked before this app opened has no stop set here.
+        let stop = if self
+            .account_home()
+            .account(account_id_hex)
+            .is_ok_and(|account| account.unlinked)
+        {
+            Arc::new(AtomicBool::new(true))
+        } else {
+            self.unlinked_publish_stop(account_id_hex)
+        };
         #[cfg(test)]
         if let Some(client) = &self.test_relay_client {
-            return client.clone();
+            return Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
+                client.clone(),
+                stop,
+            ));
         }
-        self.relay_plane
-            .account_publish_client(account_id_hex, signer)
+        let client = self
+            .relay_plane
+            .account_publish_client(account_id_hex, signer);
+        Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
+            client, stop,
+        ))
+    }
+
+    /// The publish stop every publisher of this account shares while this
+    /// app is open.
+    fn unlinked_publish_stop(&self, account_id_hex: &str) -> Arc<AtomicBool> {
+        self.unlinked_publish_stops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(account_id_hex.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// Forget a removed account's publish stop. Publishers already handed
+    /// out keep it.
+    pub(crate) fn forget_unlinked_publish_stop(&self, account_id_hex: &str) {
+        self.unlinked_publish_stops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(account_id_hex);
+    }
+
+    /// Refuse every publish of this account on this device from now on: its
+    /// device group unlinked this device (mdk#2628 D67).
+    #[cfg(any(test, feature = "unreleased-device-pairing"))]
+    pub(crate) fn stop_unlinked_account_publishing(&self, account_id_hex: &str) {
+        self.unlinked_publish_stop(account_id_hex)
+            .store(true, Ordering::Release);
     }
 
     #[cfg(test)]

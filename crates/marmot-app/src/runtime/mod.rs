@@ -6856,6 +6856,9 @@ impl AccountManager {
             // account live, and a live external-signer account still needs its
             // signer to reconcile.
             self.app.forget_external_signer(&account.account_id_hex);
+            // Nor does its publish stop: a new link under this id publishes.
+            self.app
+                .forget_unlinked_publish_stop(&account.account_id_hex);
             self.onboarding_updates
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())

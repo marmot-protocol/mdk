@@ -1037,8 +1037,10 @@ impl AppClient {
     }
 
     /// Stop the account on this device for good: the device group removed
-    /// it after its link was made (mdk#2628 D67). The client stops first, so
-    /// nothing more goes out even when the durable mark fails; the caller
+    /// it after its link was made (mdk#2628 D67). The client stops first and
+    /// every publisher of the account refuses from then on, so nothing more
+    /// goes out, from this client or any other path, even when the durable
+    /// mark fails; the caller
     /// then keeps the device-group copy, and the next open finds the removal
     /// again and retries the mark before it sends anything. Once the mark
     /// lands, a crash before the worker stops still leaves the account
@@ -1046,6 +1048,8 @@ impl AppClient {
     #[cfg(any(test, feature = "unreleased-device-pairing"))]
     pub(crate) fn mark_device_unlinked(&mut self) -> Result<(), AppError> {
         self.device_unlinked = true;
+        self.app
+            .stop_unlinked_account_publishing(&hex::encode(self.adapter.account_id().as_slice()));
         #[cfg(test)]
         if self.test_fail_unlink_mark {
             return Err(AppError::AccountHome(marmot_account::AccountHomeError::Io(

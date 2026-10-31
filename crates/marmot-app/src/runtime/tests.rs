@@ -682,6 +682,7 @@ async fn an_unlinked_device_stops_its_account_for_good() {
     runtime.reconcile_accounts().await.unwrap();
     assert!(!managed().running);
 
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
     let attempted = relay.attempted_events().len();
     let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
     assert_eq!(outcome.groups_left, 0);
@@ -695,6 +696,20 @@ async fn an_unlinked_device_stops_its_account_for_good() {
         "an unlinked wipe sends nothing"
     );
     assert!(app.account_home().accounts().unwrap().is_empty());
+
+    // The account's publish stop went with it: linked again here, it
+    // publishes.
+    app.account_home()
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while relay.attempted_events().len() == attempted {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the account linked again publishes");
     runtime.shutdown().await;
 }
 

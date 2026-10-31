@@ -768,6 +768,9 @@ pub struct AppClient {
     /// Fail the durable unlink mark, as a full or read-only disk would.
     #[cfg(test)]
     pub(crate) test_fail_unlink_mark: bool,
+    /// Fail the device-roster read that tells an unlink from a failed link.
+    #[cfg(all(test, feature = "unreleased-device-pairing"))]
+    pub(crate) test_fail_roster_read: bool,
     /// A cursor a scripted comparison saves before its delay, as the adapter
     /// does before each exact-ID fetch.
     #[cfg(test)]
@@ -1496,6 +1499,12 @@ impl AppClient {
     }
 
     pub async fn run_due_maintenance(&mut self) -> Result<crate::MaintenanceRunSummary, AppError> {
+        // An unlinked account does no more work here (mdk#2628 D67).
+        if self.device_unlinked {
+            return Err(AppError::AccountHome(
+                marmot_account::AccountHomeError::AccountUnlinked(self.state.label.clone()),
+            ));
+        }
         if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
             self.runtime.sweep_expired_key_package_private_material()?;
             self.discard_expired_sibling_key_packages();

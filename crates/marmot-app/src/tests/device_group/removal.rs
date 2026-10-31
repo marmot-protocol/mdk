@@ -568,6 +568,81 @@ async fn a_failed_unlink_mark_still_stops_and_is_made_again() {
     );
 }
 
+/// The laptop can't read its device-group roster when it applies its
+/// removal with its join still held, so it can't tell an unlink from a
+/// failed link. It counts the removal as an unlink and stops (D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_whose_roster_cannot_be_read_unlinks() {
+    let (devices, group) = tagging_devices().await;
+    let mut laptop_cursor = published_count(&devices.relay);
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        laptop_app,
+        mut laptop,
+        ..
+    } = devices;
+    phone
+        .remove_linked_device(&own_slot(&laptop))
+        .await
+        .unwrap();
+    laptop.test_fail_roster_read = true;
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    assert!(laptop.runtime.group_record(&group).unwrap().removed);
+    assert!(
+        laptop.device_unlinked(),
+        "an unreadable roster counts as an unlink"
+    );
+    let account = laptop_app.account_home().account("alice").unwrap();
+    assert!(account.unlinked && account.signed_out);
+}
+
+/// A caller keeps the laptop's client after its unlink and calls it again.
+/// The laptop is still in the chat, as the removal reached it before any
+/// clean-up, so a send would go out. Nothing reaches a relay: every
+/// publisher of the account refuses once the device is unlinked, and
+/// maintenance refuses outright (D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_kept_after_its_unlink_publishes_nothing() {
+    let (mut devices, group) = tagging_devices().await;
+    let chat = chat_with_both(&mut devices).await;
+    let mut laptop_cursor = published_count(&devices.relay);
+    let Devices {
+        _dirs,
+        relay,
+        mut phone,
+        mut laptop,
+        ..
+    } = devices;
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    commit_removal_decided_elsewhere(&mut phone, &group, slot_of(&laptop)).await;
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    assert!(laptop.device_unlinked());
+    assert!(
+        !laptop.runtime.group_record(&chat).unwrap().removed,
+        "the laptop is still in the chat"
+    );
+
+    let published = published_count(&relay);
+    let sent = laptop.send(&chat, b"still here").await.unwrap();
+    assert_eq!(sent.published, 0, "the message is not published");
+    assert!(laptop.rotate_key_package().await.is_err());
+    assert!(matches!(
+        laptop.run_due_maintenance().await,
+        Err(AppError::AccountHome(
+            marmot_account::AccountHomeError::AccountUnlinked(_)
+        ))
+    ));
+    assert_eq!(
+        published_count(&relay),
+        published,
+        "nothing reaches a relay"
+    );
+}
+
 /// The laptop's engine applies its removal but the app never notes it, as
 /// after a crash between the two (here, device groups are off when it is
 /// applied). Started again under the runtime, its worker follows the removal

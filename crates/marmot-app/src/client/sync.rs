@@ -3486,6 +3486,11 @@ impl AppClient {
             } else {
                 self.pending_native_sync_summary.merge(committed);
             }
+            // An unlinked account receives nothing more; the drain ends as a
+            // quiet relay ends it (mdk#2628 D67).
+            if self.device_unlinked {
+                break false;
+            }
             let wait = if first_wait {
                 SDK_FIRST_SYNC_WAIT
             } else {

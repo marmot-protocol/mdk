@@ -2091,6 +2091,10 @@ async fn run_app_runtime_account_worker(
                 false
             }
         };
+        // Admission can apply this device's removal; the loop top stops.
+        if client.device_unlinked() {
+            continue 'worker;
+        }
         // A pass whose network wait ended admits its owned batch a few events
         // per turn. The select below then serves commands and live input
         // before the next turn.
@@ -2106,6 +2110,11 @@ async fn run_app_runtime_account_worker(
                 }
                 None => Ok(true),
             };
+            // The turn can apply this device's removal: stop before the
+            // pass settles and runs maintenance.
+            if client.device_unlinked() {
+                continue 'worker;
+            }
             if turn.is_ok()
                 && let Some(admission) = job.admission.as_mut()
             {

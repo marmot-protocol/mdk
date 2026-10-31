@@ -1754,7 +1754,9 @@ impl AppClient {
         {
             return Ok(None);
         }
-        let link_failed = self.removal_undid_failed_link(&group_id)?;
+        // A classification that fails counts as an unlink: stopping is the
+        // safe side, and a failed link ends in a new link either way.
+        let link_failed = self.removal_undid_failed_link(&group_id).unwrap_or(false);
         if !link_failed {
             self.mark_device_unlinked()?;
         }
@@ -1770,8 +1772,9 @@ impl AppClient {
     /// record for its slot; a failed link's undo drops the slot's entry and
     /// leaves none. So the roster the removal left decides, even when this
     /// device applied its first commit and the removal in one catch-up. Only
-    /// a device that joined the group can have a failed link; a roster it
-    /// cannot read counts as an unlink.
+    /// a device that joined the group can have a failed link; a missing or
+    /// undecodable roster counts as an unlink, and the caller counts an
+    /// error as one too.
     fn removal_undid_failed_link(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
         let joined = self
             .app
@@ -1782,6 +1785,10 @@ impl AppClient {
             .any(|(group_id_hex, _)| *group_id_hex == hex::encode(group_id.as_slice()));
         if !joined {
             return Ok(false);
+        }
+        #[cfg(test)]
+        if self.test_fail_roster_read {
+            return Err(AppError::DeviceGroupRefused("roster_unavailable"));
         }
         if !self
             .runtime

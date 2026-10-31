@@ -15,16 +15,18 @@
   it, before it replaces the publication; a copy of a KeyPackage it made, an
   invalid publication or one from before a restored backup never warns.
 
-- A device that its device group removes after its link was made is
-  unlinked (mdk#2628 item 3.6b): the account stops on that device and stays
-  signed out. `MarmotAppEvent` adds `DeviceUnlinked { account_id_hex,
-  account_label }`, sent once; `ManagedAccount` and `marmot_account`'s
-  `AccountSummary` add `unlinked`; `AccountHomeError` adds `AccountUnlinked`,
-  which `sign_in_account` and `MarmotApp::client` return for such an
-  account. `sign_out_and_wipe` wipes it without leaving its chats or deleting
-  its slot, since its other devices did both; signing in again is then a new
-  link. Local history is not shown after an unlink. Exhaustive matches and
-  struct literals add the new arm and field.
+- A device that its device group removes after its link was made is unlinked
+  (mdk#2628 item 3.6b): the account stops on that device and stays signed
+  out, and nothing more is published for it from that device.
+  `MarmotAppEvent` adds `DeviceUnlinked { account_id_hex, account_label }`,
+  sent once; `ManagedAccount` and `marmot_account`'s `AccountSummary` add
+  `unlinked`; `AccountHomeError` adds `AccountUnlinked`, which
+  `sign_in_account`, `MarmotApp::client` and an open client's
+  `run_due_maintenance` return for such an account. `sign_out_and_wipe`
+  wipes it without leaving its chats or deleting its slot, since its other
+  devices did both; signing in again is then a new link. Local history is
+  not shown after an unlink. Exhaustive matches and struct literals add the
+  new arm and field.
 
 - `SelfMembership` adds `DeviceRemoved` and `ConversationParticipation` adds
   `DeviceRemoved` (mdk#2628 item 3.6b): this device's leaf was removed from a

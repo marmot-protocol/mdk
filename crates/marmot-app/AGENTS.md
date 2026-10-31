@@ -233,14 +233,18 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   its first commit there (`set_device_tag_key`) on each drive rather than waiting for maintenance, and drops the row
   once that commit landed. Removed from the device group, it forgets its copy (`forget_group_local`). The roster the
   removal left decides how: a failed link's undo leaves the slot no entry and no rejected slot, so it shows
-  `Ended { LinkFailed }`; any other removal, from a group it founded or read from an unreadable roster, unlinks it
-  (D67). Never decide that from the `device_group_joins` row: one catch-up can apply the first commit and the removal.
-  Every ingest notes the removal as it applies it (`note_device_group_removal` in `retain_effect_projection`): it sets
-  the stop flag, then `mark_account_unlinked` writes `unlinked` and `signed_out`, and the copy is forgotten only once
-  that mark lands, so a failed mark is made again at the next open. The pairing drive notes a removal before it sends
-  anything; the worker stops right after an ingest that unlinked it (startup and maintenance catch-ups, deliveries)
-  with `DeviceUnlinked`, and the runtime then deactivates the account. `MarmotApp::client` and `sign_in_account` refuse
-  an unlinked account; `sign_out_and_wipe` of one skips leaving chats and deleting the slot. A later link's Welcome into
+  `Ended { LinkFailed }`; any other removal, from a group it founded or from a roster it can't read (a failed read
+  included), unlinks it (D67). Never decide that from the `device_group_joins` row: one catch-up can apply the first
+  commit and the removal. Every ingest notes the removal as it applies it (`note_device_group_removal` in
+  `retain_effect_projection`): it sets the stop flag and the account's publish stop, then `mark_account_unlinked` writes
+  `unlinked` and `signed_out`, and the copy is forgotten only once that mark lands, so a failed mark is made again at
+  the next open. Every publisher `relay_client_for_account_id` hands out refuses to publish once the publish stop is set
+  or the record says unlinked, so nothing goes out whichever path a publish comes from; build account publishers only
+  through it. The stop is in memory and cleared only when the account is removed. Admission stops taking input once the
+  flag is set; the pairing drive notes a removal before it sends anything; the worker stops right after an ingest that
+  unlinked it (startup and maintenance catch-ups, admission turns, deliveries) with `DeviceUnlinked`, and the runtime
+  then deactivates the account. `MarmotApp::client`, `sign_in_account` and `run_due_maintenance` refuse an unlinked
+  account; `sign_out_and_wipe` of one skips leaving chats and deleting the slot. A later link's Welcome into
   that group is a first join, held by the engine to the link rather than to the forget's date. A new device never
   starts a link by a KeyPackage it already joined by (`last_consumed_key_package_ref`): the link binds its Welcome by
   KeyPackage alone, so a used one would also admit the Welcome that installed the forgotten copy. The start waits for
