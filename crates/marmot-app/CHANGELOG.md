@@ -623,6 +623,16 @@
   It makes that record once: not again after a roster state it applied held
   it, even across a restart or after branch selection dropped it.
   Release builds hold no device group.
+- Every text send a device queued while offline now publishes as soon as the
+  host reports restored connectivity (mdk#2762). The wake used to clear only
+  targets whose dial had failed. A send that a stale socket swallowed as the
+  device dropped offline is possibly exposed, so it kept its ambiguity backoff
+  of 30 s doubling to an hour, through a cold restart, and held every later
+  send in its group behind it. The wake now makes possibly-exposed targets
+  eligible too. Their retry resends the same signed event, which a relay that
+  already stored it acknowledges as a duplicate, and their attempt counts are
+  kept, so a retry that fails again resumes the backoff.
+
 - An invite, device link or legacy-profile group create whose Welcome cannot
   be wrapped for the transport, such as an invite of a private KeyPackage, is
   refused with nothing written. Each used to fail after writing its commit or

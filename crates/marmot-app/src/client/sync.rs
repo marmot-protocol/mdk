@@ -835,13 +835,16 @@ struct EventProjectionProgress {
 }
 
 impl AppClient {
-    /// Persist a host connectivity-restored edge into every exact fanout whose
-    /// prior attempt was proven unavailable, then schedule its group for an
-    /// immediate worker pass. Ambiguous fanouts keep their original clocks.
+    /// Persist a host connectivity-restored edge into every exact fanout with a
+    /// retryable target, then schedule its group for an immediate worker pass.
+    /// Possibly-exposed targets wake too: their retry resends the same signed
+    /// event, which a relay that already holds it acknowledges as a duplicate.
+    /// Leaving them on the ambiguity clock held a reconnecting device's queued
+    /// sends for up to an hour (mdk#2762).
     pub(crate) fn note_connectivity_restored(&mut self) -> Result<usize, AppError> {
         let mut woken_targets = 0;
         for mut fanout in self.runtime.outbound_fanouts()? {
-            let woken = fanout.wake_retryable_unavailable_targets();
+            let woken = fanout.wake_targets_for_restored_connectivity();
             if woken == 0 {
                 continue;
             }
