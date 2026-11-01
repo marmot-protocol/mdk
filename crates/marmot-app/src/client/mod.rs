@@ -3794,10 +3794,15 @@ impl AppClient {
 
         // Once the MLS leave commits we can no longer author an in-group token
         // removal. Drain that durable intent first; if the leave later fails,
-        // queue the current registration update as compensation.
-        let removed_registration = self
-            .drain_push_registration_removal_before_departure(group_id)
-            .await?;
+        // queue the current registration update as compensation. A device
+        // removed while it signs out sends only its SelfRemove (mdk#2628 D67).
+        let removed_while_signing_out = self.removed_while_signing_out()?;
+        let removed_registration = if removed_while_signing_out {
+            None
+        } else {
+            self.drain_push_registration_removal_before_departure(group_id)
+                .await?
+        };
         let effects = match async {
             self.sync_runtime_groups_for_send("leave_group").await?;
             let effects = self
@@ -3817,13 +3822,15 @@ impl AppClient {
         {
             Ok(effects) => effects,
             Err(err) => {
-                self.compensate_group_push_registration_removal(
-                    group_id,
-                    removed_registration.as_ref(),
-                );
-                let _ = self
-                    .retry_pending_push_registration_shares_best_effort()
-                    .await;
+                if !removed_while_signing_out {
+                    self.compensate_group_push_registration_removal(
+                        group_id,
+                        removed_registration.as_ref(),
+                    );
+                    let _ = self
+                        .retry_pending_push_registration_shares_best_effort()
+                        .await;
+                }
                 return Err(err);
             }
         };

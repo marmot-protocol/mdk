@@ -129,6 +129,13 @@ impl AppClient {
             .signing_out(&hex::encode(self.adapter.account_id().as_slice()))
     }
 
+    /// Whether this device's device group removed it while it signs out. It
+    /// then sends only its remaining SelfRemoves and its slot's deletion
+    /// (D67): no push token removal before a leave.
+    pub(crate) fn removed_while_signing_out(&self) -> Result<bool, AppError> {
+        Ok(self.signing_out() && self.app.removed_device_group(&self.state.label)?.is_some())
+    }
+
     /// Move signing out through siblings one step on: commit this device's
     /// own entry as `leaving` when the device group takes a commit, then
     /// report it confirmed once the device group is quiet with the entry

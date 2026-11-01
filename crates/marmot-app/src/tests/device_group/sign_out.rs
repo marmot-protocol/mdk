@@ -8,6 +8,7 @@
 use super::removal::{chat_with_both, pending_removals, published_count};
 use super::*;
 use crate::client::sign_out::SiblingSignOut;
+use crate::notifications::PushPlatform;
 
 fn account_id_hex(app: &MarmotApp) -> String {
     app.account_home().account("alice").unwrap().account_id_hex
@@ -216,7 +217,9 @@ async fn a_device_without_a_made_link_signs_out_on_its_own() {
 /// The laptop starts signing out, then the phone's user removes it. The
 /// removal reaches the laptop, which is not unlinked and is told nothing:
 /// its account's publishing is not stopped, so it can still delete its own
-/// slot.
+/// slot. It sends nothing else: leaving a chat its account administers
+/// takes an admin-policy update it may no longer commit, so the leave fails
+/// without the push token removal a leave sends first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_removed_while_signing_out_is_not_unlinked() {
     let (devices, group) = tagging_devices().await;
@@ -231,6 +234,16 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
     laptop
         .drive_device_pairing_at(crate::unix_now_seconds())
         .await;
+    let notes = laptop.create_group("notes", &[]).await.unwrap();
+    laptop
+        .upsert_and_share_push_registration(
+            PushPlatform::Fcm,
+            "laptop-token",
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
+            None,
+        )
+        .await
+        .unwrap();
     let mut laptop_cursor = published_count(&relay);
     let account_id_hex = account_id_hex(&laptop_app);
     let _laptop_signing_out = laptop_app.begin_signing_out(&account_id_hex);
@@ -250,6 +263,17 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
         laptop.sign_out_through_siblings_step().await.unwrap(),
         SiblingSignOut::OnItsOwn
     );
+
+    let published = published_count(&relay);
+    assert!(matches!(
+        laptop.leave_group(&notes).await,
+        Err(AppError::Account(marmot_session::AccountError::Session(
+            marmot_session::SessionError::Engine(
+                cgka_traits::error::EngineError::AdminCannotSelfRemove { .. }
+            )
+        )))
+    ));
+    assert_eq!(published_count(&relay), published, "nothing goes out");
 
     let published = published_count(&relay);
     assert_eq!(laptop.withdraw_key_package_slot().await.unwrap(), 1);
