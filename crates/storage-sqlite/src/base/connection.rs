@@ -2090,7 +2090,10 @@ mod tests {
 
         assert_eq!(store.get_group(&gid(1)).unwrap().epoch, EpochId(1));
         assert!(store.get_group(&gid(2)).is_ok());
-        assert!(store.get_message(&mid(1)).is_err());
+        assert!(matches!(
+            store.get_message(&mid(1)),
+            Err(StorageError::NotFound)
+        ));
         let partial: Option<TestGroupState> = store.mls_storage().group_state(&mls_id).unwrap();
         assert_eq!(partial, None);
         assert_eq!(outer_wakeup.load(Ordering::SeqCst), 1);
@@ -2168,6 +2171,10 @@ mod tests {
         let path = dir.path().join("savepoint-rollback-failure.db");
         let key = SqlCipherKey::raw([0x42; 32]);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let latched = |result: &StorageResult<()>| {
+            matches!(result, Err(StorageError::Backend(detail))
+                if detail.starts_with("sqlite ROLLBACK TO SAVEPOINT failed"))
+        };
 
         let committed = store.with_transaction(|outer| -> StorageResult<()> {
             let failed: StorageResult<()> =
@@ -2181,18 +2188,18 @@ mod tests {
                         .storage()?;
                     Err(StorageError::Backend("abandon the unit".into()))
                 });
-            assert!(failed.is_err());
+            assert!(latched(&failed), "{failed:?}");
             Ok(())
         });
 
         assert!(
-            committed.is_err(),
-            "a failed savepoint rollback must fail the enclosing commit"
+            latched(&committed),
+            "a failed savepoint rollback must fail the enclosing commit: {committed:?}"
         );
         drop(store);
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert!(
-            reopened.get_group(&gid(1)).is_err(),
+            matches!(reopened.get_group(&gid(1)), Err(StorageError::NotFound)),
             "the abandoned unit's write must not persist"
         );
     }
@@ -2545,7 +2552,7 @@ mod tests {
     #[test]
     fn transaction_boundaries_retry_busy_in_place_and_keep_failure_classes() {
         use rusqlite::ffi::{
-            SQLITE_BUSY, SQLITE_CONSTRAINT, SQLITE_CORRUPT, SQLITE_FULL, SQLITE_LOCKED,
+            SQLITE_BUSY, SQLITE_CORRUPT, SQLITE_FULL, SQLITE_IOERR, SQLITE_LOCKED,
         };
         // `None` is the class of a boundary that succeeded.
         type Class = Option<fn(String) -> StorageError>;
@@ -2561,7 +2568,7 @@ mod tests {
         let rows: [(&str, &[std::os::raw::c_int], bool, Class, u32); 5] = [
             ("ROLLBACK", &[SQLITE_BUSY, SQLITE_LOCKED], true, ok, 3),
             ("ROLLBACK", &[SQLITE_LOCKED], false, busy, BUSY_MAX_ATTEMPTS),
-            ("ROLLBACK", &[SQLITE_CONSTRAINT], false, backend, 1),
+            ("ROLLBACK", &[SQLITE_IOERR], false, backend, 1),
             ("COMMIT", &[SQLITE_FULL], false, capacity, 1),
             ("COMMIT", &[SQLITE_CORRUPT], false, corruption, 1),
         ];
@@ -2598,8 +2605,8 @@ mod tests {
         }
     }
 
-    /// One key kind: both reach the same `apply_sqlcipher_key` path, and the
-    /// raw key is the one the app uses.
+    /// One key kind: both kinds reach the same `apply_sqlcipher_key` call,
+    /// which has no branch by key kind.
     #[test]
     fn encrypted_connection_applies_operational_defaults() {
         use_production_storage_for_test_process();
@@ -2958,13 +2965,9 @@ mod tests {
         let writer_store = store.clone();
         let (committed_tx, committed_rx) = mpsc::channel();
         let writer = std::thread::spawn(move || {
-            // Writes until the close stops it.
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            // Writes until the close stops it, which comes once it commits.
+            let mut deadline = None;
             for id in 0i64.. {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the close never stopped the writer"
-                );
                 // Both inserts land, or neither does. Nothing else is allowed.
                 let result: Result<(), StorageError> =
                     writer_store.connection.with_transaction(|| {
@@ -2984,6 +2987,12 @@ mod tests {
                     return;
                 }
                 let _ = committed_tx.send(());
+                let stop_by = *deadline
+                    .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(10));
+                assert!(
+                    std::time::Instant::now() < stop_by,
+                    "the close never stopped the writer"
+                );
             }
         });
 
@@ -3178,8 +3187,8 @@ mod tests {
         );
     }
 
-    /// One key kind for this and the next test: both reach the same
-    /// `apply_sqlcipher_key` path, and the raw key is the one the app uses.
+    /// One key kind for this and the next test: both kinds reach the same
+    /// `apply_sqlcipher_key` call, which has no branch by key kind.
     #[test]
     fn encrypted_connection_pins_cipher_pragmas_before_keying() {
         use_production_storage_for_test_process();
@@ -3265,9 +3274,11 @@ mod tests {
 
         // Wrong key cannot read the data.
         let connection = rusqlite::Connection::open(&path).unwrap();
+        let wrong =
+            open_hardened_sqlcipher(&connection, &wrong_key, SqlCipherHardening::live_cache());
         assert!(
-            open_hardened_sqlcipher(&connection, &wrong_key, SqlCipherHardening::live_cache())
-                .is_err()
+            matches!(&wrong, Err(StorageError::Backend(detail)) if detail.contains("file is not a database")),
+            "{wrong:?}"
         );
         drop(connection);
 
@@ -3365,6 +3376,20 @@ mod tests {
                 7
             );
         }
+
+        // A different passphrase does not open a passphrase database.
+        let connection =
+            rusqlite::Connection::open(dir.path().join("passphrase-0.sqlite")).unwrap();
+        let wrong = open_hardened_sqlcipher(
+            &connection,
+            &SqlCipherKey::new("a different passphrase").unwrap(),
+            SqlCipherHardening::cipher_only(),
+        );
+        assert!(
+            matches!(&wrong, Err(StorageError::Backend(detail)) if detail.contains("file is not a database")),
+            "{wrong:?}"
+        );
+        drop(connection);
 
         // Reopen through the public hardened path as well as account storage.
         let connection = rusqlite::Connection::open(&raw_path).unwrap();
@@ -3520,10 +3545,12 @@ mod tests {
     }
 
     /// Regression for issue #484: while another connection to the same file
-    /// holds the write lock, a transaction's `BEGIN IMMEDIATE` fails with
-    /// `SQLITE_BUSY`. The storage layer must retry it, so the send-path write
-    /// succeeds instead of surfacing "database is locked" to the user. The
-    /// holder commits only after the first attempt has failed.
+    /// holds the write lock, a write fails with `SQLITE_BUSY`. The storage
+    /// layer must retry it, so the send-path write succeeds instead of
+    /// surfacing "database is locked" to the user: a transaction retries its
+    /// `BEGIN IMMEDIATE`, and a message written on its own retries the whole
+    /// autocommit write. Each holder commits only after the first attempt
+    /// has failed.
     #[test]
     fn concurrent_writer_contention_is_retried_not_surfaced() {
         use crate::base::test_support::{gid, mid, sample_group, sample_message};
@@ -3537,16 +3564,21 @@ mod tests {
         let blocker = db.hold_write_lock(Release::AfterAFailedAttempt, |other| {
             other.put_group(&sample_group(gid(2), 0, 0)).unwrap();
         });
-        let result: StorageResult<()> =
+        let in_transaction: StorageResult<()> =
             store.with_transaction(|s| s.put_message(&sample_message(mid(1), gid(1), 0)));
         blocker.join();
+        in_transaction.expect("a contended BEGIN IMMEDIATE must be retried, not surfaced");
 
-        result.expect("contended write must succeed via busy retry, not surface as failure");
-        assert_eq!(store.get_message(&mid(1)).unwrap().id, mid(1));
-        assert!(
-            store.get_group(&gid(2)).is_ok(),
-            "the holder's write committed first"
-        );
+        let blocker = db.hold_write_lock(Release::AfterAFailedAttempt, |other| {
+            other.put_group(&sample_group(gid(3), 0, 0)).unwrap();
+        });
+        let on_its_own = store.put_message(&sample_message(mid(2), gid(1), 0));
+        blocker.join();
+        on_its_own.expect("a contended autocommit write must be retried, not surfaced");
+
+        for id in [mid(1), mid(2)] {
+            assert_eq!(store.get_message(&id).unwrap().id, id);
+        }
     }
 
     fn pragma_i64(connection: &rusqlite::Connection, name: &str) -> i64 {
