@@ -2851,6 +2851,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::UnknownGroup(_)
         | AppError::GroupInviteNotPending
         | AppError::GroupCreateIncludesCreator
+        | AppError::GroupCreateAdminNotMember
         | AppError::GroupInviteIncludesInviter
         | AppError::DeviceGroupRefused(_)
         | AppError::GroupDisbanding(_)

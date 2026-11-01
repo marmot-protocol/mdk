@@ -4,6 +4,12 @@
 
 ### Breaking changes
 
+- `AppCreateGroupOptions` adds `initial_admins` for founding co-admin selection.
+  Add the field to exhaustive struct literals, or use `..Default::default()`
+  to retain creator-only admin defaults.
+- `AppError` adds `GroupCreateAdminNotMember` for founding admin references
+  outside the founding membership. Update exhaustive error matches.
+
 - `sign_out_and_wipe` signs out through the account's other devices
   (mdk#2628 item 3.6b, D67(2)) when this device trusts a device group, its
   link is made and the roster lists another device that is not leaving. It

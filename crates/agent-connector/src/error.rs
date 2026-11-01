@@ -78,6 +78,7 @@ impl ConnectorError {
             Self::App(AppError::AgentStreamFinishMismatch) => "stream_finalize_mismatch",
             Self::App(AppError::AgentStreamSendFailed(_)) => "stream_send_failed",
             Self::App(AppError::InvalidGroupProfile(_)) => "invalid_group_profile",
+            Self::App(AppError::GroupCreateAdminNotMember) => "invalid_group_create",
             Self::App(AppError::InvalidEditTarget) => "invalid_edit_target",
             Self::App(AppError::MissingRelayLists(_) | AppError::MissingDefaultRelays) => {
                 "missing_relay_lists"
@@ -138,6 +139,7 @@ impl ConnectorError {
                 "stream durable send failed; retry the same finish request"
             }
             Self::App(AppError::InvalidGroupProfile(_)) => "invalid group profile",
+            Self::App(AppError::GroupCreateAdminNotMember) => "invalid group create request",
             Self::App(AppError::InvalidEditTarget) => {
                 "edit target must be an available chat message this account sent"
             }

@@ -139,6 +139,8 @@ pub enum AppError {
     /// The creator is already an MLS member and cannot be added again.
     #[error("group members must not include the creator")]
     GroupCreateIncludesCreator,
+    #[error("initial admins must be founding members")]
+    GroupCreateAdminNotMember,
     /// An invite named the inviter's own account. A device never adds its own
     /// account's other devices from published KeyPackages (mdk#2628 D14).
     #[error("invited members must not include the inviter")]
@@ -589,6 +591,7 @@ impl AppError {
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
             Self::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
             Self::GroupCreateIncludesCreator => "group_create_includes_creator",
+            Self::GroupCreateAdminNotMember => "group_create_admin_not_member",
             Self::GroupInviteIncludesInviter => "group_invite_includes_inviter",
             Self::DeviceGroupRefused(_) => "device_group_refused",
             Self::UnknownGroup(_) => "unknown_group",
