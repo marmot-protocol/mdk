@@ -792,4 +792,23 @@ mod tests {
             Some(&(ForeignOwnSlotKeyPackage, "new".to_owned()))
         );
     }
+
+    /// A reason a newer build stored stays stored and unshown, so a downgrade
+    /// neither fails the read nor loses the item.
+    #[test]
+    fn a_reason_this_build_does_not_know_stays_stored_and_unshown() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO account_compromise_warning_items
+                     (reason, subject, slot_id_hex, occurred_at, recorded_at, seen_at)
+                 VALUES ('future_reason', 'later', 'slot later', 1, 1, NULL),
+                        ('rejected_sign_in', 'known', 'slot known', 2, 2, NULL)",
+            )
+            .unwrap();
+        assert_eq!(open(&store), [(RejectedSignIn, "known".to_owned())]);
+        assert!(stored(&store, "later"));
+    }
 }

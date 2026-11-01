@@ -407,4 +407,128 @@ mod tests {
             assert_eq!(raw_row(&context), before);
         }
     }
+
+    /// A publisher holding a stale snapshot would reserve sequence numbers it
+    /// already sent; an empty reservation would leave a token that disables
+    /// the preview. Both are refused and change nothing.
+    #[test]
+    fn stale_or_empty_reservations_are_refused_and_write_nothing() {
+        let storage = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let after = [3_u8; 32];
+        let first = storage
+            .reserve_agent_stream_publisher_records(request(&CONTEXT, &INITIAL, 0, &after, 1, 4))
+            .unwrap();
+        storage
+            .confirm_agent_stream_publisher_reservation(&CONTEXT, &first.token)
+            .unwrap();
+        let state = storage.agent_stream_publisher_state(&CONTEXT).unwrap();
+
+        for (expected, chunks) in [(INITIAL, 0), (after, 0), (INITIAL, 1)] {
+            assert_eq!(
+                refusal(storage.reserve_agent_stream_publisher_records(request(
+                    &CONTEXT, &expected, chunks, &[5; 32], 1, 6
+                ))),
+                "agent stream publisher state changed concurrently",
+                "expected {chunks} chunks"
+            );
+            assert_eq!(
+                storage.agent_stream_publisher_state(&CONTEXT).unwrap(),
+                state
+            );
+        }
+        // An unseen context that does not start from the initial transcript
+        // keeps no row either.
+        let unseen = [8_u8; 32];
+        assert_eq!(
+            refusal(storage.reserve_agent_stream_publisher_records(request(
+                &unseen, &[9; 32], 0, &[5; 32], 1, 6
+            ))),
+            "agent stream publisher state changed concurrently"
+        );
+        assert_eq!(storage.agent_stream_publisher_state(&unseen).unwrap(), None);
+
+        for context in [CONTEXT, unseen] {
+            let expected = if context == CONTEXT { after } else { INITIAL };
+            let chunks = u64::from(context == CONTEXT);
+            assert_eq!(
+                refusal(storage.reserve_agent_stream_publisher_records(request(
+                    &context, &expected, chunks, &[5; 32], 0, 6
+                ))),
+                "agent stream reservation cannot be empty"
+            );
+        }
+        assert_eq!(
+            storage.agent_stream_publisher_state(&CONTEXT).unwrap(),
+            state
+        );
+        assert_eq!(storage.agent_stream_publisher_state(&unseen).unwrap(), None);
+    }
+
+    /// Evicting a context would drop its nonce tombstone and permit sequence
+    /// reuse, so a full table refuses new contexts and keeps the old ones.
+    #[test]
+    fn a_full_context_table_refuses_new_contexts_and_keeps_the_old_ones() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let seeded = |index: u64| {
+            let mut context = [0_u8; 32];
+            context[..8].copy_from_slice(&index.to_be_bytes());
+            context
+        };
+        {
+            let mut connection = store.lock().unwrap();
+            let tx = connection.transaction().unwrap();
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO agent_stream_publisher_sequences (
+                        context_id, next_seq, transcript_hash, chunk_count,
+                        reservation_token, disabled, updated_at_ms
+                     ) VALUES (?1, 1, ?2, 0, NULL, 0, 0)",
+                )
+                .unwrap();
+            for index in 0..MAX_AGENT_STREAM_PUBLISHER_CONTEXTS {
+                insert
+                    .execute(params![seeded(index).as_slice(), INITIAL.as_slice()])
+                    .unwrap();
+            }
+            drop(insert);
+            tx.commit().unwrap();
+        }
+        let count = || {
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM agent_stream_publisher_sequences",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        let storage = store.app_storage();
+
+        assert_eq!(
+            refusal(storage.reserve_agent_stream_publisher_records(request(
+                &[0xff; 32],
+                &INITIAL,
+                0,
+                &[5; 32],
+                1,
+                6
+            ))),
+            "agent stream publisher state limit reached"
+        );
+        assert_eq!(count(), 4096);
+        assert!(
+            storage
+                .agent_stream_publisher_state(&seeded(0))
+                .unwrap()
+                .is_some()
+        );
+        let oldest = seeded(0);
+        let reserved = storage
+            .reserve_agent_stream_publisher_records(request(&oldest, &INITIAL, 0, &[5; 32], 1, 6))
+            .unwrap();
+        assert_eq!(reserved.first_seq, 1);
+        assert_eq!(count(), 4096);
+    }
 }

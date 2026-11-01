@@ -355,6 +355,18 @@ mod tests {
         store.insert_received_private_key_packages(&batch).unwrap();
         let taken = store.take_received_private_key_package("aa", 10).unwrap();
         assert_eq!(taken.unwrap().key_package_ref_hex, "a1");
+        // The taken private bytes are gone, not only hidden.
+        let kept: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT length(key_package) FROM private_key_packages_received
+                 WHERE key_package_ref_hex = 'a1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 0);
         assert_eq!(
             store.insert_received_private_key_packages(&batch).unwrap(),
             0

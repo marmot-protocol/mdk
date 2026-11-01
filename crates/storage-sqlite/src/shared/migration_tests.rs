@@ -438,6 +438,19 @@ fn conversion_errors_keep_categories_without_names_values_or_causes() {
             "out of range",
         ),
         (rusqlite::Error::QueryReturnedNoRows, "no rows"),
+        (
+            rusqlite::Error::QueryReturnedMoreThanOneRow,
+            "multiple rows",
+        ),
+        (rusqlite::Error::InvalidColumnIndex(7), "column index 7"),
+        (
+            rusqlite::Error::InvalidColumnName("private-column".into()),
+            "operation failed",
+        ),
+        (
+            rusqlite::Error::InvalidParameterName("private-param".into()),
+            "operation failed",
+        ),
     ] {
         let message = sqlite_error(error).to_string();
         assert!(message.contains(category), "{message}");
