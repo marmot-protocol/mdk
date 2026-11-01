@@ -234,11 +234,16 @@ impl Harness for SqliteHarness {
         );
     }
 
+    /// The user's explicit removal: its acquisition goes, the reference
+    /// cascades, and the removal reports the files it released.
     fn release(&self, slot: u32) -> Vec<FileId> {
+        self.token(slot);
+        let asset = self.slots.borrow()[&slot].1.clone();
         self.storage
             .app_storage()
-            .release_media_reference(&self.token(slot))
+            .remove_attachment_reference_releasing(&asset)
             .unwrap()
+            .expect("the slot is removed")
     }
 
     fn delete_row(&self, id: FileId) {

@@ -522,22 +522,6 @@ impl SqliteSharedStorage {
             .storage()
     }
 
-    pub fn set_telemetry_install_id(&self, install_id: &str) -> StorageResult<()> {
-        retry_on_busy(|| {
-            self.lock()?
-                .execute_cached(
-                    "INSERT INTO telemetry_install (id, install_id, updated_at_ms)
-                 VALUES (1, ?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET
-                    install_id = excluded.install_id,
-                    updated_at_ms = excluded.updated_at_ms",
-                    params![install_id, unix_now_ms()],
-                )
-                .storage()?;
-            Ok(())
-        })
-    }
-
     pub fn audit_log_settings(&self) -> StorageResult<StoredAuditLogSettings> {
         self.ensure_audit_log_settings()?;
         self.lock()?

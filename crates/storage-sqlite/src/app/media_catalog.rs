@@ -433,39 +433,6 @@ impl SqliteAppStorage {
     ) -> StorageResult<Option<FileId>> {
         Ok(ready_twin(&*self.lock()?, category, digest, None)?.map(|(id, _)| id))
     }
-
-    /// Removes slot `token`'s media reference. Returns the ids whose rows
-    /// (keys) the removal deleted, for the store to unlink once this commits.
-    pub fn release_media_reference(&self, token: &[u8]) -> StorageResult<Vec<FileId>> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let file: Option<Vec<u8>> = conn
-                .query_row(
-                    "SELECT file_id FROM media_file_refs WHERE token=?1",
-                    [token],
-                    |row| row.get(0),
-                )
-                .optional()
-                .storage()?;
-            let Some(file) = file else {
-                return Ok(Vec::new());
-            };
-            conn.execute("DELETE FROM media_file_refs WHERE token=?1", [token])
-                .storage()?;
-            let gone: bool = conn
-                .query_row(
-                    "SELECT NOT EXISTS(SELECT 1 FROM media_files WHERE id=?1)",
-                    [&file],
-                    |row| row.get(0),
-                )
-                .storage()?;
-            Ok(if gone {
-                vec![id_from_sql(file)?]
-            } else {
-                Vec::new()
-            })
-        })
-    }
 }
 
 #[cfg(test)]
