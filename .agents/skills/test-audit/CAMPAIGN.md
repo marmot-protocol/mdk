@@ -16,9 +16,14 @@ Pin an `origin/master` SHA and record for the scope:
 - the number of tests and of test binaries
   (`cargo nextest list -p <crate> --message-format json`);
 - each test's result and wall time from one run with the exact features of
-  the crate's CI job (the crate `AGENTS.md` names them). Where a feature
-  changes harness defaults, as `test-policy-overrides` does in the simulator,
-  apply it only to the tests CI selects with it;
+  the crate's CI job. Take them from `.github/workflows/ci.yml` and the
+  `test-features` list at the top of the `Justfile`; a crate's `AGENTS.md`
+  may name only some. A crate whose CI job passes no features runs without
+  `--features`. Where a feature changes harness defaults, as
+  `test-policy-overrides` does in the simulator, apply it only to the tests
+  CI selects with it. Record any feature-gated suite CI does not run (the
+  engine's `test-conformance-snapshot` tests) in a separate run, so its owner
+  appears in the baseline too;
 - what the shared setup costs: time one store open, fixture or process start
   alone, and count how many each test pays for. nextest runs every test in
   its own process, so anything a test binary builds once per process is built
@@ -26,8 +31,9 @@ Pin an `origin/master` SHA and record for the scope:
 - line coverage of the production owner, saved for later diffs.
 
 ```sh
-SCRATCH=<your scratch directory>
-cargo nextest run -p <crate> --locked --no-fail-fast --features <ci-features> \
+SCRATCH=<your scratch directory>; mkdir -p "$SCRATCH"
+FEATURES=(--features <ci-features>)   # FEATURES=() when the CI job passes none
+cargo nextest run -p <crate> --locked --no-fail-fast "${FEATURES[@]}" \
   > "$SCRATCH/<crate>-baseline.log" 2>&1; echo "exit=$?"   # PASS [ 1.234s] lines carry wall time
 ```
 
@@ -40,16 +46,17 @@ export CARGO_TARGET_DIR="$PWD/target/coverage"
 export RUSTFLAGS='-C instrument-coverage --cfg=coverage --cfg=trybuild_no_target'
 export LLVM_PROFILE_FILE="$SCRATCH/profraw/%p-%14m.profraw"
 mkdir -p "$SCRATCH/profraw"     # the profile runtime does not create it
-cargo nextest run -p <crate> --locked --no-fail-fast --features <ci-features>
+cargo nextest run -p <crate> --locked --no-fail-fast "${FEATURES[@]}"
 TOOLS="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
 find "$SCRATCH/profraw" -name '*.profraw' > "$SCRATCH/profraw.list"
 test -s "$SCRATCH/profraw.list" || echo "no profiles written"
 "$TOOLS/llvm-profdata" merge -sparse -f "$SCRATCH/profraw.list" -o "$SCRATCH/<crate>.profdata"
-set -- $(cargo nextest list -p <crate> --locked --features <ci-features> --message-format json |
+set -- $(cargo nextest list -p <crate> --locked "${FEATURES[@]}" --message-format json |
   jq -r '.["rust-suites"][]["binary-path"]')
 first=$1; shift
+objects=(); for binary in "$@"; do objects+=(-object "$binary"); done
 "$TOOLS/llvm-cov" export -format=lcov -instr-profile "$SCRATCH/<crate>.profdata" "$first" \
-  $(printf -- '-object %s ' "$@") -ignore-filename-regex='/\.cargo/registry/|/rustc/|/target/' \
+  "${objects[@]}" -ignore-filename-regex='/\.cargo/registry/|/rustc/|/target/' \
   > "$SCRATCH/<crate>-baseline.lcov"
 ```
 

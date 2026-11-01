@@ -146,15 +146,18 @@ the tests do.
   security, so tests that assert production settings
   (`crates/storage-sqlite/tests/test_support_defaults.rs`) and the encrypted
   rail (`crates/cgka-engine/tests/sqlite_storage.rs`) keep their own stores.
-- **Documented fault and observation seams:** a feature a nested `AGENTS.md`
-  names for a contract no public boundary can reach, such as
-  `test-crash-hooks` (a crash between two writes) or
-  `test-conformance-snapshot` (a parked convergence pass's backoff). Keep it
-  and its tests.
+- **Fault, observation and replay seams:** a feature that serves a contract
+  no public boundary can reach, such as `test-crash-hooks` (a crash between
+  two writes), `test-conformance-snapshot` (a parked convergence pass's
+  backoff) or storage's `test-conformance-replay` (the simulator replays
+  captured commit bytes from a checkpoint). Keep it and its tests. Before
+  judging any seam unused, check which features dependent crates enable in
+  their `Cargo.toml`.
 - **Not acceptable:** any other seam that skips a production step, injects
   state the owner should produce, or exposes internals so a test can assert
   on them. Move the proof to the public boundary first, then delete the seam
-  together with the tests that needed it.
+  together with the tests that needed it. If the proof cannot move, the seam
+  belongs in the category above: keep it.
 - A seam whose last test caller you delete is dead: remove it in the same
   change. The compiler does not warn about unused `pub` items or
   feature-gated code, so grep for callers.
