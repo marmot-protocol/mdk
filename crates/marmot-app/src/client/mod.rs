@@ -856,6 +856,10 @@ pub struct AppClient {
     /// The siblings this client found `leaving`, by slot, and when it
     /// decides to remove each: after its own random delay (mdk#2628 D67).
     pub(crate) leaving_siblings: HashMap<cgka_traits::app_components::DeviceSlotId, u64>,
+    /// The removals, by group and slot hex, whose `removed` record this
+    /// client committed on its own after a failed link's undo took the entry
+    /// (mdk#2761): in memory, so each is made at most once a run.
+    pub(crate) removed_records_made_alone: HashSet<(String, String)>,
     /// Recovery words shown and not yet confirmed (mdk#2628 4.4a): in memory
     /// only, until they are confirmed or cancelled, or the client closes.
     pub(crate) pending_recovery_words: Option<backups::PendingRecoveryWords>,

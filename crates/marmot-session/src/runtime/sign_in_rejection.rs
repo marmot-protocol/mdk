@@ -1,7 +1,9 @@
-//! Recording sign-ins the user rejected (mdk#2628 item 3.2).
+//! Recording rejected slots on their own (mdk#2628 item 3.2, mdk#2761).
 //!
 //! "This wasn't me" records the sign-in's KeyPackage slot alone, as a
 //! `not_me` rejected slot in the roster of this device's device group. A
+//! removal that a failed link's undo outran records the removed device's
+//! slot alone too, as a `removed` record keeping its tag signature key. A
 //! rejection never replaces an entry: a slot the roster already holds, as a
 //! device or as a rejected slot, stays as it is. The update goes through the
 //! runtime's rejected-slot send, behind the gate its other roster updates

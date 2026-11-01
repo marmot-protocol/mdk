@@ -30,7 +30,7 @@ use cgka_traits::maintenance::{
     RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition, TransportFanoutAttemptState,
     TransportFanoutTarget,
 };
-use cgka_traits::storage::DeviceGroupWelcomeExpectation;
+use cgka_traits::storage::{DeviceGroupWelcomeExpectation, RosterTagKey};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     EngineError, EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, MessageState,
@@ -830,6 +830,21 @@ where
         roster: &DeviceRosterV1,
     ) -> AccountResult<Vec<(Vec<u8>, DeviceTagClaim)>> {
         Ok(self.session.own_account_leaf_claims(group_id, roster)?)
+    }
+
+    /// This account's other leaves in `group_id`, by signature key, whose
+    /// device tag reads under `leaf_tag_key` as one of `keys`: tag signature
+    /// keys this device remembers a roster listing. See
+    /// [`cgka_engine::engine::Engine::own_account_leaves_tagged_by`].
+    pub fn own_account_leaves_tagged_by(
+        &self,
+        group_id: &GroupId,
+        leaf_tag_key: &[u8; 32],
+        keys: &[RosterTagKey],
+    ) -> AccountResult<Vec<Vec<u8>>> {
+        Ok(self
+            .session
+            .own_account_leaves_tagged_by(group_id, leaf_tag_key, keys)?)
     }
 
     pub fn app_component(

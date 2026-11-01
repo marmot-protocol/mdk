@@ -47,7 +47,9 @@ use cgka_traits::maintenance::{
     WallClock,
 };
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{DeviceGroupWelcomeExpectation, MaintenanceStorage, StorageError};
+use cgka_traits::storage::{
+    DeviceGroupWelcomeExpectation, MaintenanceStorage, RosterTagKey, StorageError,
+};
 use cgka_traits::transport::{Timestamp, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::SiblingWelcomeJoin;
@@ -1057,6 +1059,18 @@ impl AccountDeviceSession {
         roster: &DeviceRosterV1,
     ) -> SessionResult<Vec<(Vec<u8>, DeviceTagClaim)>> {
         Ok(self.engine.own_account_leaf_claims(group_id, roster)?)
+    }
+
+    /// See [`cgka_engine::engine::Engine::own_account_leaves_tagged_by`].
+    pub fn own_account_leaves_tagged_by(
+        &self,
+        group_id: &GroupId,
+        leaf_tag_key: &[u8; 32],
+        keys: &[RosterTagKey],
+    ) -> SessionResult<Vec<Vec<u8>>> {
+        Ok(self
+            .engine
+            .own_account_leaves_tagged_by(group_id, leaf_tag_key, keys)?)
     }
 
     pub fn app_component(
