@@ -7,8 +7,9 @@
 - `sign_out_and_wipe` signs out through the account's other devices
   (mdk#2628 item 3.6b, D67(2)) when this device trusts a device group, its
   link is made and the roster lists another device that is not leaving. It
-  commits its own roster entry as `leaving` and waits about 30 seconds for
-  that commit to be confirmed, then leaves only the chats no sibling takes
+  commits its own roster entry as `leaving` and waits up to about 30
+  seconds, however busy the account is, for that commit to be confirmed,
+  then leaves only the chats no sibling takes
   it out of, deletes its slot and wipes. `WipeOutcome` adds
   `groups_left_to_siblings`, the chats it left to them, and
   `siblings_not_reached`, set when it could not ask them in time and left

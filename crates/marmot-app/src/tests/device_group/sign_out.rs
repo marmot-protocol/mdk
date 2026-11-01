@@ -472,6 +472,69 @@ async fn sign_out_and_wipe_leaves_every_chat_when_siblings_are_not_reached() {
     runtime.shutdown().await;
 }
 
+/// A step that answers after the `leaving` deadline counts as not reached,
+/// a confirmation included, so a busy worker does not stretch the wait. The
+/// laptop's entry already reads `leaving`, so the wipe's first step would
+/// confirm it, but that step waits behind a message held at its relay until
+/// the deadline has passed: the laptop leaves every chat itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmation_after_the_deadline_counts_as_not_reached() {
+    let (mut devices, group) = tagging_devices().await;
+    let chat = chat_with_both(&mut devices).await;
+    let Devices {
+        _dirs,
+        relay,
+        laptop_app,
+        mut laptop,
+        ..
+    } = devices;
+    assert_eq!(
+        laptop.sign_out_through_siblings_step().await.unwrap(),
+        SiblingSignOut::Pending
+    );
+    assert_eq!(status_of(&laptop, &group, &laptop), DeviceStatusV1::Leaving);
+    drop(laptop);
+    let _eose = scripted_eose_pump(
+        laptop_app.relay_plane.clone(),
+        relay.clone(),
+        every_subscription,
+    );
+    let runtime = MarmotAppRuntime::new(laptop_app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    // The worker's first maintenance pass sends before the message is held.
+    runtime.run_due_maintenance("alice").await.unwrap();
+    let wait = Duration::from_millis(500);
+    laptop_app.set_sign_out_leaving_wait(wait);
+    relay.block_next_publish();
+    let send = tokio::spawn({
+        let runtime = runtime.clone();
+        let chat = chat.clone();
+        async move { runtime.send_message("alice", &chat, b"held".to_vec()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), relay.wait_for_blocked_publish())
+        .await
+        .expect("the message reaches its relay");
+
+    let mut wipe = Box::pin(runtime.sign_out_and_wipe("alice"));
+    tokio::select! {
+        _ = &mut wipe => panic!("the wipe's steps wait behind the held message"),
+        // Past the deadline, which starts once the wipe has started.
+        () = tokio::time::sleep(wait * 4) => {}
+    }
+    relay.release_publish();
+    let outcome = wipe.await.unwrap();
+    assert!(outcome.siblings_not_reached);
+    assert_eq!(outcome.groups_left_to_siblings, 0);
+    let [failure] = outcome.group_leave_failures.as_slice() else {
+        panic!("one chat it could not leave: {outcome:?}");
+    };
+    assert_eq!(failure.group_id_hex, hex::encode(chat.as_slice()));
+    assert!(outcome.local_cleanup.completed);
+    send.await.unwrap().unwrap();
+    runtime.shutdown().await;
+}
+
 /// The laptop's `sign_out_and_wipe` sends its `leaving` commit, and the
 /// phone sees it and removes the laptop before the laptop learns that the
 /// commit went out, and out of the chat both are in. The removal reaches
