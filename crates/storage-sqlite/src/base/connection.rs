@@ -396,6 +396,10 @@ struct SharedConnectionInner {
     transaction_owner: Mutex<Option<ThreadId>>,
     transaction_unusable: Mutex<Option<String>>,
     transaction_released: Condvar,
+    /// Threads parked on `transaction_released` right now, so a test can wait
+    /// until its threads are parked instead of guessing a delay.
+    #[cfg(test)]
+    transaction_waiters: std::sync::atomic::AtomicUsize,
     post_commit: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     /// Bumped before every write to `openmls_values` and on every rollback;
     /// see `StorageProvider::mls_write_generation`.
@@ -427,6 +431,8 @@ impl SharedConnection {
                 transaction_owner: Mutex::new(None),
                 transaction_unusable: Mutex::new(None),
                 transaction_released: Condvar::new(),
+                #[cfg(test)]
+                transaction_waiters: std::sync::atomic::AtomicUsize::new(0),
                 post_commit: Mutex::new(Vec::new()),
                 openmls_writes: AtomicU64::new(0),
                 wal_truncate_pending: AtomicBool::new(false),
@@ -667,11 +673,7 @@ impl SharedConnection {
                 if let Some(err) = self.unusable_error() {
                     return Err(E::from(err));
                 }
-                owner = self
-                    .inner
-                    .transaction_released
-                    .wait(owner)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                owner = self.wait_for_transaction_release(owner);
             }
             if let Some(err) = self.unusable_error() {
                 return Err(E::from(err));
@@ -840,12 +842,29 @@ impl SharedConnection {
             if !owner.as_ref().is_some_and(|owner| owner != &current) {
                 return Ok(());
             }
-            owner = self
-                .inner
-                .transaction_released
-                .wait(owner)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            owner = self.wait_for_transaction_release(owner);
         }
+    }
+
+    /// Parks until the transaction slot is released or a close wakes it.
+    fn wait_for_transaction_release<'a>(
+        &self,
+        owner: MutexGuard<'a, Option<ThreadId>>,
+    ) -> MutexGuard<'a, Option<ThreadId>> {
+        #[cfg(test)]
+        self.inner
+            .transaction_waiters
+            .fetch_add(1, Ordering::SeqCst);
+        let owner = self
+            .inner
+            .transaction_released
+            .wait(owner)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(test)]
+        self.inner
+            .transaction_waiters
+            .fetch_sub(1, Ordering::SeqCst);
+        owner
     }
 
     /// Finish the active transaction without releasing its in-process owner.
@@ -1904,6 +1923,19 @@ mod tests {
         (writer, reader)
     }
 
+    /// Waits until `count` threads are parked for the connection's
+    /// transaction slot, and fails rather than waiting forever.
+    fn wait_until_parked(connection: &SharedConnection, count: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while connection.inner.transaction_waiters.load(Ordering::SeqCst) < count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{count} thread(s) never parked for the transaction slot"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     fn insert_boundary_probe(storage: &SqliteAccountStorage, value: i64) -> StorageResult<()> {
         storage
             .lock()?
@@ -2360,10 +2392,7 @@ mod tests {
                 insert_boundary_probe(storage, 2)
             })
         });
-        assert!(
-            entered_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "the second transaction entered while the first was open"
-        );
+        wait_until_parked(&store.connection, 1);
 
         release_tx.send(()).unwrap();
         first
@@ -2919,10 +2948,7 @@ mod tests {
                 .send(transaction_connection.with_transaction(|| Ok::<_, StorageError>(())));
         });
 
-        // Give the waiters time to park on the condvar, then close under
-        // them. Losing that race only lets a waiter see the close without
-        // parking; it cannot make the test fail.
-        std::thread::sleep(Duration::from_millis(100));
+        wait_until_parked(&shared, 2);
         shared.close().unwrap();
 
         // The holder still holds the slot: only the close can wake a waiter.
@@ -2945,11 +2971,31 @@ mod tests {
 
     /// Closing under a live writer is the case that matters most: a host
     /// suspending in a hurry will not always have quiesced cleanly. The close
-    /// must be prompt, and every transaction must be all-or-nothing across the
-    /// cut — a half-applied multi-table write would be worse than the crash
-    /// this whole change exists to avoid.
+    /// must not wait for an open transaction to finish, and every transaction
+    /// must be all-or-nothing across the cut: a half-applied multi-table write
+    /// would be worse than the crash this whole change exists to avoid. The
+    /// close lands between the two inserts of an open transaction.
     #[test]
     fn close_under_a_live_writer_is_prompt_and_leaves_no_torn_transaction() {
+        fn write_pair(
+            store: &SqliteAccountStorage,
+            id: i64,
+            between: impl FnOnce(),
+        ) -> StorageResult<()> {
+            store.connection.with_transaction(|| {
+                store
+                    .lock()?
+                    .execute("INSERT INTO torn_left VALUES (?1)", [id])
+                    .storage()?;
+                between();
+                store
+                    .lock()?
+                    .execute("INSERT INTO torn_right VALUES (?1)", [id])
+                    .storage()?;
+                Ok(())
+            })
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
         let key = SqlCipherKey::raw([0x46; 32]);
@@ -2961,68 +3007,57 @@ mod tests {
                 "CREATE TABLE torn_left (id INTEGER); CREATE TABLE torn_right (id INTEGER);",
             )
             .unwrap();
+        write_pair(&store, 1, || {}).unwrap();
 
         let writer_store = store.clone();
-        let (committed_tx, committed_rx) = mpsc::channel();
+        let (half_written_tx, half_written_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::channel::<()>();
         let writer = std::thread::spawn(move || {
-            // Writes until the close stops it, which comes once it commits.
-            let mut deadline = None;
-            for id in 0i64.. {
-                // Both inserts land, or neither does. Nothing else is allowed.
-                let result: Result<(), StorageError> =
-                    writer_store.connection.with_transaction(|| {
-                        let conn = writer_store.lock()?;
-                        conn.execute("INSERT INTO torn_left VALUES (?1)", [id])
-                            .storage()?;
-                        conn.execute("INSERT INTO torn_right VALUES (?1)", [id])
-                            .storage()?;
-                        Ok(())
-                    });
-                if let Err(error) = result {
-                    // The only acceptable way to stop is the close itself.
-                    assert!(
-                        error.is_closed(),
-                        "writer should only ever fail with Closed, got {error:?}",
-                    );
-                    return;
-                }
-                let _ = committed_tx.send(());
-                let stop_by = *deadline
-                    .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(10));
-                assert!(
-                    std::time::Instant::now() < stop_by,
-                    "the close never stopped the writer"
-                );
-            }
+            write_pair(&writer_store, 2, || {
+                half_written_tx.send(()).unwrap();
+                closed_rx.recv().unwrap();
+            })
         });
-
-        // Close out from under the writer once it has committed.
-        committed_rx
+        half_written_rx
             .recv_timeout(Duration::from_secs(30))
-            .expect("the writer commits before the close");
-        let started_at = std::time::Instant::now();
-        store.close().unwrap();
-        let close_elapsed = started_at.elapsed();
-        writer.join().unwrap();
+            .expect("the writer opens its second pair");
 
+        // The writer waits for the close, so a close that waited for its
+        // transaction would never return.
+        let closer_store = store.clone();
+        let (close_result_tx, close_result_rx) = mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            let _ = close_result_tx.send(closer_store.close());
+        });
+        close_result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("close must not wait for the open transaction")
+            .unwrap();
+        closer.join().unwrap();
+        closed_tx.send(()).unwrap();
+        let interrupted = writer.join().unwrap();
         assert!(
-            close_elapsed < Duration::from_secs(1),
-            "close should wait only for the executing statement, took {close_elapsed:?}",
+            matches!(interrupted, Err(StorageError::Closed(_))),
+            "the writer stops only on the close: {interrupted:?}"
         );
 
         let reopened = rusqlite::Connection::open(&path).unwrap();
         apply_sqlcipher_key(&reopened, &key).unwrap();
-        let left: i64 = reopened
-            .query_row("SELECT count(*) FROM torn_left", [], |row| row.get(0))
-            .unwrap();
-        let right: i64 = reopened
-            .query_row("SELECT count(*) FROM torn_right", [], |row| row.get(0))
-            .unwrap();
+        let ids = |table: &str| -> Vec<i64> {
+            reopened
+                .prepare(&format!("SELECT id FROM {table} ORDER BY id"))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
         assert_eq!(
-            left, right,
-            "a transaction interrupted by close must be rolled back whole",
+            ids("torn_left"),
+            [1],
+            "the committed pair survives, and the open pair's first insert is rolled back"
         );
-        assert!(left > 0, "the writer committed before the close");
+        assert_eq!(ids("torn_right"), [1]);
     }
 
     #[test]
