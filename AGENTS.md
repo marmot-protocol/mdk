@@ -125,9 +125,11 @@ the pre-check passes, and own the queue result until the change merges.
 
 GitHub CI is the full gate. Local verification proves your change and stays scoped to it: several agents usually
 build on the same machine, so workspace-wide builds and suites run locally only when a rule below calls for one. By
-default, CI runs a pre-check of a few minutes on a PR: fmt, the static gates, `cargo audit`, clippy (default and
-`--all-features`) and the WASM build. It runs no tests, so unless the PR carries `ci:full`, your local tests are the
-only test signal before the merge queue. The merge queue runs the whole matrix (every crate's tests, the simulator,
+default, CI runs a pre-check of a few minutes on a PR: fmt, the static gates (including the tracing audit),
+`cargo audit`, clippy (default and `--all-features`), the WASM build, and the workspace tests with the `precheck`
+nextest profile. That profile stops each test after half a second and counts it as passed, so it catches only a test
+that fails quickly; unless the PR carries `ci:full`, your local tests are the only signal from the slower tests before
+the merge queue. The merge queue runs the whole matrix (every crate's tests, the simulator,
 and the C, iOS and Windows lanes) and is the merge gate; the `ci:full` label runs that matrix on a PR, `ci:apple`
 adds only the iOS lane. Master pushes only refresh CI's Rust caches, and only when a dependency or toolchain input
 changes.
