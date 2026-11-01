@@ -779,7 +779,7 @@ impl AppClient {
             // error, leaves the Welcome owed again: a second 461 for it
             // joins nothing twice.
             let result = self
-                .send_device_group_event_at(&exchange.group_id, event, Some(exchange.epoch))
+                .send_device_group_event_at(&exchange.group_id, event, Some(exchange.pin))
                 .await;
             if matches!(result, Ok(true)) {
                 sent += 1;

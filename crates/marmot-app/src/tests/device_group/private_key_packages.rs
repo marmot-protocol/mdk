@@ -1480,6 +1480,87 @@ async fn a_refused_pinned_sibling_welcome_is_sent_by_the_next_pass() {
     assert_eq!(stashed(&devices.phone), 1);
 }
 
+/// A 461 is pinned to the branch its tag was read on, not only the epoch
+/// number. A rival device-group commit from the same epoch that wins branch
+/// selection inside the 461's own send refuses it before anything is
+/// encrypted; the Welcome stays owed, and the next pass sends it on the
+/// selected branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_welcome_refused_by_a_same_number_rival_is_sent_by_the_next_pass() {
+    let (mut devices, group) = tagging_devices().await;
+    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    add_the_phone_unpublished(&mut devices, &chat).await;
+    let settling = |ms| CanonicalizationPolicy {
+        settlement_quiescence_ms: ms,
+        ..CanonicalizationPolicy::default()
+    };
+    devices
+        .laptop
+        .runtime
+        .session_mut()
+        .set_convergence_policy(settling(3_600_000))
+        .unwrap();
+
+    // The laptop's own ordinary commit, and the phone's privileged one from
+    // the same epoch, which wins branch selection whatever the digests.
+    let source = devices.laptop.runtime.epoch_pin(&group).unwrap();
+    confirm_unpublished(
+        &mut devices.laptop,
+        SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        },
+    )
+    .await;
+    let mut cursor = devices.relay.published_events.lock().unwrap().len();
+    devices
+        .phone
+        .runtime
+        .send(SendIntent::UpdateGroupData {
+            group_id: group.clone(),
+            name: Some("devices".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    deliver_new(&mut devices.laptop, &devices.relay, &mut cursor).await;
+    let pin = devices.laptop.runtime.epoch_pin(&group).unwrap();
+    assert_eq!(pin.epoch.0, source.epoch.0 + 1);
+    let rival = devices.phone.runtime.epoch_pin(&group).unwrap();
+    assert_eq!(rival.epoch, pin.epoch);
+    assert_ne!(rival, pin);
+    assert!(
+        devices
+            .laptop
+            .device_group_exchange()
+            .unwrap()
+            .unwrap()
+            .tagged
+    );
+
+    devices
+        .laptop
+        .runtime
+        .session_mut()
+        .set_convergence_policy(settling(0))
+        .unwrap();
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert_eq!(
+        devices.laptop.runtime.epoch_pin(&group).unwrap(),
+        rival,
+        "the 461's send must have selected the phone's branch"
+    );
+    let [waiting] = <[_; 1]>::try_from(owed(&devices.laptop)).unwrap();
+    assert_eq!(waiting.carrier, None);
+    assert!(devices.laptop.sibling_welcome_carriers.is_empty());
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 0);
+
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert!(owed(&devices.laptop).is_empty());
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    assert_eq!(stashed(&devices.phone), 1);
+}
+
 /// A sibling Welcome goes out only once its Add's Commit is published: an
 /// Add whose Commit every relay refused fails, and neither it nor a later
 /// pass sends the Welcome. The failed Add spent its KeyPackage, which is not
