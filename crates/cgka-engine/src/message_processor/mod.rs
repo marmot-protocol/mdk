@@ -24,6 +24,7 @@ enum OutboundQueueReason {
     ForegroundBudgetExhausted,
     SelfRemoveAutoCommit,
     ReplayRotation,
+    EarlierIntentQueued,
     ExplicitQueueRequest,
 }
 
@@ -35,6 +36,7 @@ impl OutboundQueueReason {
             Self::ForegroundBudgetExhausted => "foreground_budget_exhausted",
             Self::SelfRemoveAutoCommit => "self_remove_auto_commit",
             Self::ReplayRotation => "replay_rotation",
+            Self::EarlierIntentQueued => "earlier_intent_queued",
             Self::ExplicitQueueRequest => "explicit_queue_request",
         };
         tracing::debug!(
@@ -1451,9 +1453,40 @@ impl<S: StorageProvider> Engine<S> {
             self.schedule_pending_convergence_group(group_id);
             return Ok(Some(OutboundQueueReason::ReplayRotation));
         }
-        self.stage_due_self_remove_auto_commit(group_id, now_ms)
-            .await
-            .map(|staged| staged.then_some(OutboundQueueReason::SelfRemoveAutoCommit))
+        if self
+            .stage_due_self_remove_auto_commit(group_id, now_ms)
+            .await?
+        {
+            return Ok(Some(OutboundQueueReason::SelfRemoveAutoCommit));
+        }
+        // A send never goes ahead of one queued earlier for the same group
+        // (mdk#2842). Prepared now, an application message would take the
+        // sender's next generation while the queued ones wait for the
+        // scheduled drain, so their generations would run against send order.
+        // A member reading the group's history in `created_at` order, which
+        // is send order, would then reach the drained messages first and
+        // could step that sender's ratchet past its out-of-order window,
+        // losing the messages that went ahead. A group change going ahead
+        // would apply before a message sent ahead of it. So this send queues
+        // behind them, or is refused by the intents that never queue, and the
+        // drain prepares all of them in queue order.
+        Ok(self
+            .has_queued_intent_awaiting_preparation(group_id)?
+            .then_some(OutboundQueueReason::EarlierIntentQueued))
+    }
+
+    /// Whether an intent queued for `group_id` still waits for the drain to
+    /// prepare it. One the drain prepared and the host has not yet confirmed
+    /// or retried is in flight, not waiting: its generation is already taken.
+    fn has_queued_intent_awaiting_preparation(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        Ok(self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .iter()
+            .any(|record| !self.queued_outbound_intent_in_flight(group_id, &record.id)))
     }
 
     /// Settle authenticated input and give current-fingerprint deferred rows

@@ -93,6 +93,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     would pick the phantom still applies on its first attempt. Also an ignored measurement of host advances and
     wall time to the first delivered message over a widened group.
 
+- **File:** `distributed_convergence/queued_send_order.rs`
+  - **Owns:** A send made once the group settles, while sends queued during convergence still wait for the drain,
+    is queued behind them, so the sender's generations follow its send order and a member reading the history in
+    `created_at` order decrypts every message (mdk#2842).
+
 - **File:** `distributed_convergence/refused_queued_intents.rs`
   - **Owns:** A queued admin change the settled state refuses (the sender was demoted while it waited) is retired and
     announced as `GroupEvent::QueuedIntentRefused` for each admin intent kind, the work queued behind it still drains,

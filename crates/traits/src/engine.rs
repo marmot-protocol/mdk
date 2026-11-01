@@ -154,8 +154,9 @@ pub enum SendIntent {
         /// tag ships at N+1, or at another N after branch selection.
         ///
         /// `None` (the default, and every ordinary message) lets the engine
-        /// retain the intent while the group's epoch is unsettled and encrypt
-        /// it under whatever epoch the group lands on. A pinned message has
+        /// retain the intent while the group's epoch is unsettled, or behind
+        /// an earlier send still queued for the group, and encrypt it under
+        /// whatever epoch the group lands on. A pinned message has
         /// no such freedom: the engine refuses it with
         /// [`EngineError::AppMessageEpochUnsettled`] instead of retaining it,
         /// and with [`EngineError::AppMessageEpochMismatch`] at encryption
@@ -432,9 +433,11 @@ pub enum SendResult {
         authority: Option<crate::app_event::AppMessageAuthority>,
     },
     /// The engine accepted the local intent but did not publish anything
-    /// yet because the group has unresolved convergence input. The intent
-    /// will be regenerated from the canonical state when the group becomes
-    /// stable. If that state refuses it, the engine drops it and announces
+    /// yet because the group has unresolved convergence input, or an earlier
+    /// send to the group is still queued: a send never goes ahead of one
+    /// queued before it. The intent will be regenerated from the canonical
+    /// state when the group becomes stable, after those queued before it. If
+    /// that state refuses it, the engine drops it and announces
     /// [`GroupEvent::QueuedIntentRefused`] with this `intent_id`.
     Queued {
         group_id: GroupId,
