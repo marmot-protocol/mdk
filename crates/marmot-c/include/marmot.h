@@ -2202,8 +2202,8 @@ typedef struct MarmotWipeOutcome {
    */
   uint32_t groups_left_to_siblings;
   /**
-   * The siblings could not be asked within about 30 seconds, so this
-   * device left every chat itself. Tell the user.
+   * This device could not ask its siblings within about 30 seconds,
+   * so it left every chat itself. Tell the user.
    */
   bool siblings_not_reached;
 } MarmotWipeOutcome;

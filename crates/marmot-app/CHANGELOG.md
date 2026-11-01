@@ -10,8 +10,9 @@
   commits its own roster entry as `leaving` and waits about 30 seconds for
   that commit to be confirmed, then leaves only the chats no sibling takes
   it out of, deletes its slot and wipes. `WipeOutcome` adds
-  `groups_left_to_siblings` and `siblings_not_reached`, set when the commit
-  was not confirmed in time and the device left every chat itself. A device
+  `groups_left_to_siblings`, the chats it left to them, and
+  `siblings_not_reached`, set when it could not ask them in time and left
+  every chat itself. A device
   that finds a sibling `leaving` removes it after a random delay of up to 30
   seconds, as if its user had. A device removed while it signs out is not
   unlinked. Struct literals add the new fields.

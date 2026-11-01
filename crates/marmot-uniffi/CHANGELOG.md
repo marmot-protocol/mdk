@@ -9,9 +9,10 @@
   first records in the device group that it is leaving, which can take about
   30 seconds, and leaves those devices the chats they can take it out of.
   `WipeOutcomeFfi` adds `groups_left_to_siblings` and `siblings_not_reached`,
-  which says the request did not settle in time and the device left every
-  chat itself; tell the user. Regenerate bindings with the matching native
-  library.
+  which says it could not ask them in time and left every chat itself; tell
+  the user. The call now keeps running when the host cancels it, so a
+  sign-out that has asked its siblings always finishes. Regenerate bindings
+  with the matching native library.
 
 - `CompromiseWarningReasonFfi::RejectedKeyPackage` is now
   `ForeignOwnSlotKeyPackage` (mdk#2628 D74, 3.7b): a KeyPackage this device

@@ -232,8 +232,8 @@ c_mirror! {
         /// Chats this device did not leave itself because another of the
         /// account's devices takes it out of them.
         copy groups_left_to_siblings: u32,
-        /// The siblings could not be asked within about 30 seconds, so this
-        /// device left every chat itself. Tell the user.
+        /// This device could not ask its siblings within about 30 seconds,
+        /// so it left every chat itself. Tell the user.
         copy siblings_not_reached: bool,
     }
 }

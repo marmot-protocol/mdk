@@ -1089,10 +1089,10 @@ pub struct WipeOutcome {
     /// sibling that is in it (mdk#2628 D67).
     #[serde(default)]
     pub groups_left_to_siblings: u32,
-    /// This device asked its siblings to take it out, but the request was
-    /// not confirmed within about 30 seconds, so it left every chat itself.
-    /// Tell the user its other devices could not be asked; they still list
-    /// it until one of them removes it.
+    /// This device could not ask its siblings to take it out within about
+    /// 30 seconds, so it left every chat itself. Tell the user its other
+    /// devices could not be asked: they may still list it until the user
+    /// removes it from one of them.
     #[serde(default)]
     pub siblings_not_reached: bool,
 }
@@ -4786,14 +4786,16 @@ impl MarmotAppRuntime {
     /// about 30 seconds for that commit to be confirmed. Returns the chats a
     /// sibling takes it out of, as hex group ids, which stage 1 does not
     /// leave. Empty when it signs out on its own, and when the commit was not
-    /// confirmed in time, which `siblings_not_reached` reports.
+    /// confirmed in time, which `siblings_not_reached` reports. A step that
+    /// fails is taken again until then, so a passing error does not cost the
+    /// sibling path, and one that persists ends as not reached.
     async fn sign_out_through_siblings(
         &self,
         account_ref: &str,
         outcome: &mut WipeOutcome,
     ) -> HashSet<String> {
         let deadline = tokio::time::Instant::now() + self.accounts.app.sign_out_leaving_wait();
-        let mut asked = false;
+        let mut logged = false;
         loop {
             match self
                 .accounts
@@ -4804,18 +4806,16 @@ impl MarmotAppRuntime {
                     return left_to_siblings.into_iter().collect();
                 }
                 Ok(SiblingSignOut::OnItsOwn) => return HashSet::new(),
-                Ok(SiblingSignOut::Pending) => asked = true,
+                Ok(SiblingSignOut::Pending) => {}
                 Err(err) => {
-                    tracing::warn!(
-                        target: "marmot_app::runtime",
-                        method = "sign_out_through_siblings",
-                        error_kind = err.privacy_safe_kind(),
-                        "could not take a sign-out step"
-                    );
-                    // Before anything was asked, an account whose worker
-                    // cannot take the step signs out on its own at once.
-                    if !asked {
-                        return HashSet::new();
+                    if !logged {
+                        tracing::warn!(
+                            target: "marmot_app::runtime",
+                            method = "sign_out_through_siblings",
+                            error_kind = err.privacy_safe_kind(),
+                            "could not take a sign-out step; retrying"
+                        );
+                        logged = true;
                     }
                 }
             }

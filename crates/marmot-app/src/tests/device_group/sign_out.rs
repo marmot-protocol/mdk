@@ -280,13 +280,10 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
             .retry_pending_push_registration_shares_best_effort()
             .await
     );
+    let refused = laptop.leave_group(&notes).await.unwrap_err();
     assert!(matches!(
-        laptop.leave_group(&notes).await,
-        Err(AppError::Account(marmot_session::AccountError::Session(
-            marmot_session::SessionError::Engine(
-                cgka_traits::error::EngineError::AdminCannotSelfRemove { .. }
-            )
-        )))
+        refused.as_engine_error(),
+        Some(cgka_traits::error::EngineError::AdminCannotSelfRemove { .. })
     ));
     assert_eq!(published_count(&relay), published, "nothing goes out");
 
@@ -436,8 +433,10 @@ async fn sign_out_and_wipe_leaves_every_chat_when_siblings_are_not_reached() {
     runtime.shutdown().await;
 }
 
-/// A wipe the host cancels while it waits on the siblings leaves the account
-/// as it was: not signing out, so its maintenance and removal note run again.
+/// A Rust caller that drops a wipe while it waits on its siblings, here
+/// before its `leaving` commit could go out, leaves the account not signing
+/// out, so its maintenance and removal note run again. MarmotKit's export
+/// keeps the wipe running instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_sign_out_leaves_the_account_not_signing_out() {
     let (mut devices, _group) = tagging_devices().await;
@@ -468,7 +467,6 @@ async fn a_cancelled_sign_out_leaves_the_account_not_signing_out() {
             while !laptop_app.signing_out(&account_id_hex) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
         } => {}
     }
     drop(wipe);

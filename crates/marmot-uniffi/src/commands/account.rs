@@ -74,7 +74,9 @@ impl Marmot {
     /// partial-failure sheet (mdk#478). In a device group, it first asks the
     /// account's other devices to take it out, which can take about 30
     /// seconds, and leaves them the chats they can take it out of
-    /// (mdk#2628).
+    /// (mdk#2628). It keeps running when the call is cancelled: once it has
+    /// asked them, its siblings take it out whatever the host does.
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn sign_out_and_wipe(
         &self,
         account_ref: String,

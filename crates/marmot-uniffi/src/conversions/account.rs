@@ -330,10 +330,10 @@ pub struct WipeOutcomeFfi {
     /// account's devices takes it out of them: it signed out through its
     /// siblings.
     pub groups_left_to_siblings: u32,
-    /// This device asked its siblings to take it out, but the request was not
-    /// confirmed within about 30 seconds, so it left every chat itself. Tell
-    /// the user its other devices could not be asked; they still list it
-    /// until one of them removes it.
+    /// This device could not ask its siblings to take it out within about 30
+    /// seconds, so it left every chat itself. Tell the user its other devices
+    /// could not be asked: they may still list it until the user removes it
+    /// from one of them.
     pub siblings_not_reached: bool,
 }
 
