@@ -385,6 +385,11 @@ fn legacy_database_bodies_stay_readable_beside_media_files() {
     ));
     assert_eq!(fixture.read(&legacy).unwrap(), content);
     assert_eq!(fixture.read(&media).unwrap(), other);
+    // A body smaller than one staging chunk is kept in its row, not chunked.
+    let small = sized(4_000, 4);
+    let in_row = fixture.claimed(&"7".repeat(64), &small);
+    fixture.legacy(&in_row, &small);
+    assert_eq!(fixture.read(&in_row).unwrap(), small);
 }
 
 // Manage storage (mdk#2314 step 5) across both layouts.

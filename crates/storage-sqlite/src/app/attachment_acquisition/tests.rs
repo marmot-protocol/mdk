@@ -1090,6 +1090,12 @@ fn attachment_partial_reclaim_preserves_prefix_and_fences_old_attempts() {
         "the reclaimed attempt cannot grow the checkpoint"
     );
     assert!(
+        app.load_attachment_partial(&old, 13, 10, None)
+            .unwrap()
+            .is_none(),
+        "the reclaimed attempt cannot resume the prefix"
+    );
+    assert!(
         !app.clear_attachment_partial(&old, 13, None)
             .unwrap()
             .is_some()
