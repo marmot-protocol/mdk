@@ -188,4 +188,45 @@ mod tests {
                 .is_err()
         );
     }
+
+    /// Rows written by an older build must still read: ids persist as 16-byte
+    /// runs and 17-byte replaced cells (a presence byte, then the id). The
+    /// schema checks only the widths, so a cell this build cannot read is
+    /// refused, not guessed.
+    #[test]
+    fn rename_ids_persist_in_fixed_cells_and_malformed_cells_are_refused() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        app.put_device_rename(&rename("aa", "Phone", &[2, 3], &[Some(9), None]))
+            .unwrap();
+        let (written, replaced): (Vec<u8>, Vec<u8>) = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT written, replaced FROM device_renames WHERE slot_id_hex = 'aa'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(written, [[2; 16], [3; 16]].concat());
+        assert_eq!(replaced, [&[1][..], &[9; 16], &[0], &[0; 16]].concat());
+
+        // A presence byte this build does not know, and an absent id with
+        // bytes after it.
+        let unknown_presence = [&[2][..], &[0; 16]].concat();
+        let absent_with_bytes = [&[0][..], &[0; 15], &[1]].concat();
+        for cell in [unknown_presence, absent_with_bytes] {
+            store
+                .lock()
+                .unwrap()
+                .execute("UPDATE device_renames SET replaced = ?1", [&cell])
+                .unwrap();
+            match app.device_rename("aa") {
+                Err(StorageError::Backend(message)) => {
+                    assert_eq!(message, "device rename ids are malformed", "{cell:?}");
+                }
+                other => panic!("{cell:?}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
 }

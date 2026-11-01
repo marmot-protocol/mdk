@@ -277,12 +277,12 @@ mod tests {
     fn handed_over_key_packages_survive_reopen_and_are_kept_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("local identity key").unwrap();
+        let key = SqlCipherKey::raw([7; 32]);
+        let batch = [received("a1", "aa", 0), received("a2", "aa", 10)];
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key)
                 .unwrap()
                 .app_storage();
-            let batch = [received("a1", "aa", 0), received("a2", "aa", 10)];
             assert_eq!(
                 store.insert_received_private_key_packages(&batch).unwrap(),
                 2
@@ -302,7 +302,7 @@ mod tests {
         let store = SqliteAccountStorage::open_encrypted(&path, &key)
             .unwrap()
             .app_storage();
-        assert_eq!(store.received_private_key_packages().unwrap().len(), 2);
+        assert_eq!(store.received_private_key_packages().unwrap(), batch);
         assert_eq!(
             store.private_key_package_need("aa").unwrap(),
             Some(PrivateKeyPackageNeed {
@@ -355,6 +355,18 @@ mod tests {
         store.insert_received_private_key_packages(&batch).unwrap();
         let taken = store.take_received_private_key_package("aa", 10).unwrap();
         assert_eq!(taken.unwrap().key_package_ref_hex, "a1");
+        // The taken private bytes are gone, not only hidden.
+        let kept: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT length(key_package) FROM private_key_packages_received
+                 WHERE key_package_ref_hex = 'a1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 0);
         assert_eq!(
             store.insert_received_private_key_packages(&batch).unwrap(),
             0

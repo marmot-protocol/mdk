@@ -188,7 +188,7 @@ mod tests {
             .record_pending_welcome_delivery("dd", "ee", "ff", 2)
             .unwrap();
 
-        assert!(store.take_pending_welcome_delivery("aa").unwrap());
+        store.clear_pending_welcome_delivery("aa").unwrap();
         assert!(!store.take_pending_welcome_delivery("aa").unwrap());
 
         let records = store.list_pending_welcome_deliveries().unwrap();

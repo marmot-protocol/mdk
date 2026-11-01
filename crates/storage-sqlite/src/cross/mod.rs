@@ -12,5 +12,7 @@ pub(crate) mod outbound;
 pub(crate) mod projection;
 pub(crate) mod release;
 pub(crate) mod routes;
+#[cfg(test)]
+mod tests;
 pub(crate) mod views;
 mod wipe;
