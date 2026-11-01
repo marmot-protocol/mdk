@@ -477,7 +477,8 @@ async fn sign_out_and_wipe_leaves_every_chat_when_siblings_are_not_reached() {
 /// commit went out, and out of the chat both are in. The removal reaches
 /// the laptop mid-wait: it is not unlinked but signs out on its own, does
 /// not try to leave the chat it is no longer in, and from then on sends
-/// nothing but its slot's deletion.
+/// only its SelfRemove from a chat bob administers and its slot's
+/// deletion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
     let (mut devices, group) = tagging_devices().await;
@@ -488,10 +489,24 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
         phone_app,
         mut phone,
         laptop_app,
-        laptop,
+        mut laptop,
         ..
     } = devices;
     let laptop_slot = slot_of(&laptop);
+    // A chat with bob that bob administers and no sibling is in: the laptop
+    // leaves it itself, even once removed.
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bob_id = AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap()
+        .account_id_hex;
+    let bob_app = device_group_app_at(&bob_dir, relay.clone());
+    let mut bob = bob_app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    remember_test_member_inbox(&laptop_app, &bob_id, "wss://relay.example");
+    let with_bob = laptop.create_group("with bob", &[&bob_id]).await.unwrap();
+    laptop.promote_admin(&with_bob, &bob_id).await.unwrap();
+    laptop.self_demote_admin(&with_bob).await.unwrap();
     drop(laptop);
     let mut phone_cursor = published_count(&relay);
     let _eose = scripted_eose_pump(
@@ -552,8 +567,9 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
     let outcome = wipe.await.unwrap();
     assert!(!outcome.siblings_not_reached);
     assert_eq!(outcome.groups_left_to_siblings, 0);
-    // It is no longer in the chat: nothing to leave, nothing to report.
-    assert_eq!(outcome.groups_left, 0);
+    // It leaves bob's chat; the shared chat it is no longer in is neither
+    // left nor reported.
+    assert_eq!(outcome.groups_left, 1);
     assert!(
         outcome.group_leave_failures.is_empty(),
         "{:?}",
@@ -566,8 +582,8 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
             .iter()
             .map(|event| event.kind)
             .collect::<Vec<_>>(),
-        vec![5],
-        "only its slot's deletion goes out"
+        vec![445, 5],
+        "only its SelfRemove in bob's chat and its slot's deletion go out"
     );
     runtime.shutdown().await;
 }
@@ -611,5 +627,51 @@ async fn a_cancelled_sign_out_leaves_the_account_not_signing_out() {
     drop(wipe);
 
     assert!(!laptop_app.signing_out(&account_id_hex));
+    runtime.shutdown().await;
+}
+
+/// A host that cancels a wipe and starts another overlaps two sign-outs of
+/// one account: it stays signing out until the last of them ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_account_signs_out_until_its_last_sign_out_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = device_group_app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
+    let account_id_hex = "aa".repeat(32);
+    let first = app.begin_signing_out(&account_id_hex);
+    let second = app.begin_signing_out(&account_id_hex);
+    drop(first);
+    assert!(app.signing_out(&account_id_hex));
+    drop(second);
+    assert!(!app.signing_out(&account_id_hex));
+}
+
+/// An account signed out without a wipe has no worker to ask its siblings
+/// through, so wiping it signs out on its own at once instead of waiting out
+/// the `leaving` deadline and reporting its siblings not reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wiping_a_signed_out_account_does_not_wait_on_siblings() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = device_group_app_at(&dir, relay.clone());
+    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime
+        .sign_out(
+            "alice",
+            crate::runtime::SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    app.set_sign_out_leaving_wait(Duration::from_secs(1));
+
+    let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
+    assert!(!outcome.siblings_not_reached);
+    assert!(outcome.local_cleanup.completed);
     runtime.shutdown().await;
 }

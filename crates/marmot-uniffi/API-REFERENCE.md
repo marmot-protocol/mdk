@@ -97,6 +97,8 @@ pub async fn sign_out_and_wipe( &self, account_ref: String, ) -> Result<conversi
 
 Destructive sign-out: leave every active MLS group (best-effort), delete this device's relay-published KeyPackage slot, then wipe all local state for this account (MLS state DB, cached media/secrets, SQL account row, and the secret-store nsec). After this returns the account ref is no longer valid for any further FFI call. The returned `WipeOutcomeFfi` reports each stage independently so the app can show progress and a partial-failure sheet (mdk#478).
 
+With linked devices, it first asks the account's other devices to take it out, which can take about 30 seconds: show progress meanwhile. It leaves them the chats they can take it out of, counted in `groups_left_to_siblings`, and leaves the rest itself. When it could not ask them in time it leaves every chat itself and sets `siblings_not_reached`: tell the user its other devices may still list it until the user removes it from one of them. A chat this device is no longer in is neither left nor reported. The call keeps running when it is cancelled (mdk#2628).
+
 [Source](src/commands/account.rs#L80)
 
 ### `Marmot::sign_out`

@@ -631,9 +631,10 @@ pub struct MarmotApp {
     /// [`Self::relay_client_for_account_id`] hands out for it (mdk#2628 D67).
     unlinked_publish_stops: Arc<Mutex<HashMap<String, unlinked_publish_gate::AccountPublishStop>>>,
     /// The accounts signing out through `sign_out_and_wipe` on this device,
-    /// by account id: their device group's removal of this device does not
-    /// unlink it (mdk#2628 D67).
-    signing_out_accounts: Arc<Mutex<HashSet<String>>>,
+    /// by account id, with how many sign-outs of each are running: their
+    /// device group's removal of this device does not unlink it (mdk#2628
+    /// D67).
+    signing_out_accounts: Arc<Mutex<HashMap<String, usize>>>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,

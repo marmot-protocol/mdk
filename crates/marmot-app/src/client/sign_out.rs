@@ -28,7 +28,7 @@
 //! deletes it, so a sign-out that is cancelled or fails leaves the removal
 //! stored, still held back, and the next pairing drive unlinks the device.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -67,19 +67,26 @@ pub(crate) enum SiblingSignOut {
 }
 
 /// Marks an account as signing out on this device until dropped, so a
-/// sign-out that fails or is cancelled leaves no mark behind.
+/// sign-out that fails or is cancelled leaves no mark behind. The account
+/// stays marked while any of its sign-outs runs.
 #[must_use]
 pub(crate) struct SigningOut {
-    accounts: Arc<Mutex<HashSet<String>>>,
+    accounts: Arc<Mutex<HashMap<String, usize>>>,
     account_id_hex: String,
 }
 
 impl Drop for SigningOut {
     fn drop(&mut self) {
-        self.accounts
+        let mut accounts = self
+            .accounts
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.account_id_hex);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(running) = accounts.get_mut(&self.account_id_hex) {
+            *running -= 1;
+            if *running == 0 {
+                accounts.remove(&self.account_id_hex);
+            }
+        }
     }
 }
 
@@ -110,10 +117,12 @@ impl crate::MarmotApp {
     /// the returned mark drops, its device group's removal of this device
     /// does not unlink it.
     pub(crate) fn begin_signing_out(&self, account_id_hex: &str) -> SigningOut {
-        self.signing_out_accounts
+        *self
+            .signing_out_accounts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(account_id_hex.to_owned());
+            .entry(account_id_hex.to_owned())
+            .or_default() += 1;
         SigningOut {
             accounts: Arc::clone(&self.signing_out_accounts),
             account_id_hex: account_id_hex.to_owned(),
@@ -148,7 +157,7 @@ impl crate::MarmotApp {
         self.signing_out_accounts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(account_id_hex)
+            .contains_key(account_id_hex)
     }
 }
 
@@ -215,7 +224,15 @@ impl AppClient {
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Ok(SiblingSignOut::OnItsOwn);
         };
-        let own_slot = self.own_slot()?;
+        let own_slot = match self.own_slot() {
+            Ok(slot) => slot,
+            // A device with no slot of its own has no entry a sibling could
+            // take out.
+            Err(AppError::DeviceGroupRefused("slot_unavailable")) => {
+                return Ok(SiblingSignOut::OnItsOwn);
+            }
+            Err(error) => return Err(error),
+        };
         // No device removes an entry without its tag signature key, so a
         // device whose link is not made yet signs out on its own.
         let Some(own) = roster

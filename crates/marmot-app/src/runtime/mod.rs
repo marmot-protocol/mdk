@@ -4808,6 +4808,10 @@ impl MarmotAppRuntime {
         account_ref: &str,
         outcome: &mut WipeOutcome,
     ) -> HashSet<String> {
+        // Without device groups no sibling can take this device out.
+        if !self.accounts.app.device_groups_enabled() {
+            return HashSet::new();
+        }
         if let Err(err) = self.accounts.worker_commands(account_ref).await {
             tracing::info!(
                 target: "marmot_app::runtime",

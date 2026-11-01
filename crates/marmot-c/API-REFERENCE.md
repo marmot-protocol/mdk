@@ -4452,7 +4452,7 @@ Free a string returned by this library (`marmot_last_error_message`, string out-
 MarmotStatus marmot_sign_out_and_wipe(const struct MarmotClient *client, const char *account_ref, struct MarmotWipeOutcome **out);
 ```
 
-Destructive sign-out: leave groups, delete relay KeyPackages, wipe local state. Every stage is reported in the outcome. Free with `marmot_wipe_outcome_free`.
+Destructive sign-out: leave groups, delete relay KeyPackages, wipe local state. With linked devices it first asks them to take it out, which can take about 30 seconds; `groups_left_to_siblings` and `siblings_not_reached` report how that went. Every stage is reported in the outcome. Free with `marmot_wipe_outcome_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsign_out_and_wipe) · [Header contract](include/marmot.h#L7290)
 
