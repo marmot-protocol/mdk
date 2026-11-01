@@ -391,8 +391,11 @@ fn cancelled_staging_releases_committed_chunks_without_blocking_account_commands
 }
 
 #[test]
-fn file_import_reads_across_chunk_boundaries() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+fn file_import_reads_across_chunk_boundaries_and_reopens_encrypted_storage() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("chunked.sqlite");
+    let key = SqlCipherKey::raw([0x38; 32]);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let app = store.app_storage();
     seed(&store, "chunked");
     let body = (0..(2 * 1024 * 1024 + 17))
@@ -426,7 +429,10 @@ fn file_import_reads_across_chunk_boundaries() {
         .unwrap(),
         AttachmentPublishResult::Published
     );
-    assert_eq!(usage(&store), body.len() as u64);
+    store.close().unwrap();
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let reopened_app = reopened.app_storage();
+    assert_eq!(usage(&reopened), body.len() as u64);
     for (offset, limit) in [
         (0, 11),
         (65530, 30),
@@ -434,7 +440,7 @@ fn file_import_reads_across_chunk_boundaries() {
         (body.len() - 17, 100),
         (body.len(), 100),
     ] {
-        let bytes = app
+        let bytes = reopened_app
             .read_retained_attachment(&asset, 12, offset as u64, limit)
             .unwrap()
             .unwrap();
@@ -444,15 +450,18 @@ fn file_import_reads_across_chunk_boundaries() {
         );
     }
     assert_eq!(
-        app.retained_attachment_asset(GROUP, "chunked", "source-chunked", 0, 12)
+        reopened_app
+            .retained_attachment_asset(GROUP, "chunked", "source-chunked", 0, 12)
             .unwrap()
             .unwrap()
             .byte_count,
         body.len() as u64
     );
-    app.remove_local_attachment(GROUP, "chunked", 0).unwrap();
-    assert_eq!(usage(&store), 0);
-    assert_eq!(count(&store, "attachment_chunk_bodies"), 0);
+    reopened_app
+        .remove_local_attachment(GROUP, "chunked", 0)
+        .unwrap();
+    assert_eq!(usage(&reopened), 0);
+    assert_eq!(count(&reopened, "attachment_chunk_bodies"), 0);
 }
 
 #[test]

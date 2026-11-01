@@ -96,12 +96,13 @@ fn outgoing_owner_batch_rolls_back_late_insert_failure() {
     }
 }
 
-/// A real pending owner prevents TTL cleanup, and its confirmation promotes
-/// the staged bytes without charging them twice.
+/// Verify a real pending owner prevents TTL cleanup through encrypted reopen.
 #[test]
-fn outgoing_pending_send_outlives_orphan_ttl_and_promotes_on_confirmation() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let app = store.app_storage();
+fn outgoing_staging_survives_restart_and_pending_send_outlives_orphan_ttl() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("outgoing.sqlite");
+    let key = SqlCipherKey::raw([0x36; 32]);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     store
         .lock()
         .unwrap()
@@ -114,19 +115,30 @@ fn outgoing_pending_send_outlives_orphan_ttl_and_promotes_on_confirmation() {
     pending.direction = "sent".into();
     pending.source_message_id_hex = None;
     pending.source_epoch = None;
-    app.record_app_event(&pending).unwrap();
-    staged(&app, "pending");
+    store.app_storage().record_app_event(&pending).unwrap();
+    staged(&store.app_storage(), "pending");
+    store
+        .app_storage()
+        .protect_attachment_uploads(GROUP, "pending", &source("pending").tags)
+        .unwrap();
     assert_eq!(
-        app.prune_attachment_uploads(11 + 8 * 24 * 3600, 64)
+        store
+            .app_storage()
+            .prune_attachment_uploads(11 + 8 * 24 * 3600, 64)
             .unwrap(),
         0
     );
     assert_eq!(usage(&store), BODY.len() as u64);
     assert_eq!(
-        app.promote_attachment_uploads(GROUP, "pending", 20, 10000)
+        store
+            .app_storage()
+            .promote_attachment_uploads(GROUP, "pending", 20, 10000)
             .unwrap(),
         0
     );
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
     sent(&store, "pending");
     assert_eq!(
         app.promote_attachment_uploads(GROUP, "pending", 20, 10000)
@@ -761,11 +773,14 @@ fn outgoing_retention_waits_for_outer_commit_and_preserves_source_on_fault() {
     assert_eq!(read(&app, &request(&app, "projection")), BODY);
 }
 
-/// Source identity repairs the post-commit/pre-owner gap even after the TTL.
+/// Source identity repairs the post-commit/pre-owner gap even after TTL and encrypted reopen.
 #[test]
 fn ownerless_pending_and_confirmed_uploads_survive_ttl_and_recover() {
     for pending in [false, true] {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::raw([0x37; 32]);
+        let path = dir.path().join("account.sqlite");
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         seed(&store, "seed");
         let mut event = source("crash-gap");
         event.direction = "sent".into();
@@ -775,6 +790,8 @@ fn ownerless_pending_and_confirmed_uploads_survive_ttl_and_recover() {
         }
         store.app_storage().record_app_event(&event).unwrap();
         bound(&store.app_storage(), "crash-gap");
+        store.close().unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let app = store.app_storage();
         let now = 11 + 8 * 24 * 3600;
         assert_eq!(app.prune_attachment_uploads(now, 64).unwrap(), 0);
@@ -830,7 +847,10 @@ fn corrupt_shared_upload_is_quarantined_without_reacquisition() {
 /// Accepted pending and confirmed sources survive cleanup when optional owner INSERT fails.
 #[test]
 fn ownerless_committed_sources_survive_both_abandonment_paths() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ownerless.sqlite");
+    let key = SqlCipherKey::raw([0x39; 32]);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     seed(&store, "seed");
     for (id, pending) in [("pending-ownerless", true), ("confirmed-ownerless", false)] {
         let mut event = source(id);
@@ -862,6 +882,8 @@ fn ownerless_committed_sources_survive_both_abandonment_paths() {
             .unwrap();
     }
     assert_eq!(usage(&store), 2 * BODY.len() as u64);
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let app = store.app_storage();
     sent(&store, "pending-ownerless");
     assert_eq!(app.recover_attachment_uploads(20, 64, 10000).unwrap(), 2);

@@ -479,11 +479,13 @@ fn an_upload_with_a_lost_file_is_dropped() {
 
 /// A file-backed upload whose optional owner registration failed survives
 /// both abandonment paths while its pending or confirmed message carries it,
-/// and the worker's page still finds and promotes it.
+/// and the worker's page still finds and promotes it after a reopen.
 #[test]
 fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
     let dir = tempfile::tempdir().unwrap();
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let path = dir.path().join("ownerless.sqlite");
+    let key = SqlCipherKey::raw([0x3a; 32]);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let files = media(&dir, &store.app_storage());
     seed(&store, "seed");
     for (id, pending) in [("pending-ownerless", true), ("confirmed-ownerless", false)] {
@@ -549,7 +551,11 @@ fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
         )
         .unwrap();
     assert_eq!(staged, 2, "both uploads survive abandonment");
+    drop(files);
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let app = store.app_storage();
+    let files = media(&dir, &app);
     let mut event = source("pending-ownerless");
     event.direction = "sent".into();
     app.record_app_event(&event).unwrap();
@@ -631,6 +637,44 @@ fn promotion_attaches_only_files_that_are_present() {
         ),
         1
     );
+
+    // An upload whose media row is gone attaches nothing.
+    let (gone, id) = staged_send(&store, &media, "gone");
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM media_files WHERE id=?1",
+            [id.as_bytes().as_slice()],
+        )
+        .unwrap();
+    assert_eq!(
+        media
+            .promote(
+                &app.attachment_upload_promotion(GROUP, "gone", &gone, || 12),
+                id
+            )
+            .unwrap(),
+        PromoteOutcome::Superseded
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM media_file_refs WHERE file_id=?1",
+            &id
+        ),
+        0
+    );
+    let retained: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM attachment_acquisition WHERE message_id_hex='gone' AND state=3",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, 0);
 
     let (lost, id) = staged_send(&store, &media, "lost");
     std::fs::remove_file(media.path(&id)).unwrap();

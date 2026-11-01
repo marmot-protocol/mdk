@@ -216,6 +216,41 @@ fn seventh_backlog_promotion_preserves_single_owner_and_retry_positive_control()
     assert_eq!(budget(&store, &assets[6]).1, 0);
 }
 
+/// Durable promotion survives restart without moving the retry deadline.
+#[test]
+fn promotion_survives_encrypted_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("promotion.sqlite");
+    let key = SqlCipherKey::raw([0x3c; 32]);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    seed(&store, "restart");
+    let asset = request(&store.app_storage(), "restart");
+    store.lock().unwrap().execute("UPDATE attachment_acquisition SET state=2,due=100,retry_not_before=100,automatic_history=1,acquisition_attempts=2,network_attempts=7 WHERE token=?1",[&asset.token]).unwrap();
+    let before = budget(&store, &asset);
+    assert!(
+        store
+            .app_storage()
+            .promote_attachment_demand(&asset, 20)
+            .unwrap()
+    );
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    assert_eq!(budget(&store, &asset), before);
+    assert!(
+        store
+            .app_storage()
+            .attachment_request_is_explicit(&asset)
+            .unwrap()
+    );
+    assert!(
+        store
+            .app_storage()
+            .attachment_transfer_candidates(99, 64, false)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// An already admitted final attempt may be promoted without funding another one.
 #[test]
 fn active_budget_ceiling_promotion_preserves_partials_and_progress() {
