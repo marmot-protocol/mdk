@@ -1997,16 +1997,23 @@ mod unix_tests {
         assert_eq!(mode_of(&target), 0o755);
     }
 
-    /// A symlink an unprivileged test user owns is never a trusted platform
-    /// alias.
+    /// Alias verification refuses the test's `link` symlink for its owner.
+    /// Run as root the link is trusted-owned and only its parent chain can
+    /// refuse it.
     fn assert_untrusted_alias_refusal(error: &io::Error) {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
-        assert!(
-            error
-                .to_string()
-                .starts_with("refusing untrusted directory alias at "),
-            "{error}"
-        );
+        let message = error.to_string();
+        if effectively_root() {
+            assert!(
+                message.starts_with("refusing untrusted directory alias at "),
+                "{message}"
+            );
+        } else {
+            assert!(
+                message.ends_with("/link: symlink is not trusted-owned"),
+                "{message}"
+            );
+        }
     }
 
     #[test]
@@ -2135,6 +2142,11 @@ mod unix_tests {
                 .status()
                 .unwrap();
             assert!(status.success(), "unveiled directory creation failed");
+            // A child filter that matches nothing exits 0 having checked nothing.
+            assert!(
+                root.join("new/leaf").is_dir(),
+                "the unveiled child must run"
+            );
             assert!(!outside.join("leaf").exists());
             assert!(!root.join("aliased").exists());
             return;
